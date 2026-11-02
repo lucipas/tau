@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tau-p2p"
+version = "0.1.0"
+description = "Peer-to-peer messaging and discovery over the Reticulum Network Stack"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "tau contributors" }]
+keywords = ["reticulum", "p2p", "mesh", "networking", "encryption"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+  "Topic :: System :: Networking",
+]
+dependencies = ["rns>=1.4.1,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2.3"]
+
+[project.scripts]
+tau = "tau.cli:main"
+
+[project.urls]
+Repository = "https://github.com/lucipas/tau"
+
+[tool.setuptools.packages.find]
+include = ["tau*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "integration: exercises real Reticulum instances over TCP (set TAU_INTEGRATION=1)",
+]
+timeout = 120
