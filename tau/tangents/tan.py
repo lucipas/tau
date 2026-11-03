@@ -884,9 +884,14 @@ class TanApp:
             for author in authors:
                 _require_hex(author, AUTHOR_HEX_LENGTH, "author")
                 local_seq = max_seq(conn, author)
-                candidates = [
+                author_peers = [
                     peer for peer in peers if getattr(peer, "hexhash", "") == author
-                ] or peers
+                ]
+                # Prefer the author's node, but use relays when it is offline or
+                # does not have the requested chain cached.
+                candidates = author_peers + [
+                    peer for peer in peers if peer not in author_peers
+                ]
                 for peer in candidates:
                     for _ in range(MAX_SYNC_PAGES):
                         payload = encode(
@@ -932,9 +937,10 @@ class TanApp:
                             else:
                                 duplicates += 1
                         new_seq = max_seq(conn, author)
-                        if new_seq <= local_seq or len(posts) < page_limit:
-                            local_seq = new_seq
+                        if new_seq <= local_seq:
                             break
+                        # A page may be short because it was limited by the
+                        # response byte budget, not because the chain ended.
                         local_seq = new_seq
 
             if explore:
