@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+@theme {
+  --color-void: #05080a;
+  --color-panel: #0a1114;
+  --color-line: #183035;
+  --color-mist: #8aa4a9;
+  --color-signal: #2dd4bf;
+  --color-amber: #fbbf24;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo,
+    Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+html {
+  color-scheme: dark;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background-color: var(--color-void);
+  color: #e4e4e7;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(45, 212, 191, 0.25);
+  color: #f4fffd;
+}
+
+.mesh-grid {
+  background-image:
+    linear-gradient(rgba(45, 212, 191, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45, 212, 191, 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(
+    ellipse 80% 60% at 50% 0%,
+    black 20%,
+    transparent 75%
+  );
+  opacity: 0.55;
+}
+
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.thin-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--color-line);
+  border-radius: 999px;
+}
+
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}

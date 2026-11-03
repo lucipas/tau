@@ -2,7 +2,7 @@ PYTHON ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: venv install test test-all demo lint clean
+.PHONY: venv install test test-all demo lint clean web-install web-build web-dev web-clean
 
 venv:
 	@test -d "$(VENV)" || $(PYTHON) -m venv "$(VENV)"
@@ -22,6 +22,18 @@ demo: venv
 
 lint:
 	$(BIN)/python -m compileall -q tau scripts tests
+
+web-install:
+	cd web && npm install --no-audit --no-fund
+
+web-build: web-install
+	cd web && npm run build
+
+web-dev: web-install
+	cd web && npm run dev
+
+web-clean:
+	rm -rf web/out web/.next
 
 clean:
 	rm -rf build dist .pytest_cache *.egg-info
