@@ -42,3 +42,5 @@ When assigned a task or processing a queue item, the agent must follow this stri
 - **Resource Discipline:** Avoid memory-heavy processes or high-overhead runtime packages. Keep resource consumption minimal.
 - **Strict Boundaries:** Do not execute destructive system commands (e.g., `rm -rf /`, unauthorized network scans, or credential leaks). Operate strictly within repository boundaries and designated local paths.
 - **Novel Branches:** If you plan to edit **ANY** file, make a new branch before you do. At the end of the work, commit your changes and do a pr to the main branch.
+
+## 6. Design Rules

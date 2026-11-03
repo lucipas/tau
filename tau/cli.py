@@ -137,9 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not enable Reticulum's AutoInterface (LAN discovery)",
     )
     init.add_argument(
-        "--force",
+        "--init",
         action="store_true",
-        help="overwrite an existing Reticulum config",
+        help="write default Reticulum config (overwrites)",
     )
     init.set_defaults(func=cmd_init)
 
