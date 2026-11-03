@@ -9,7 +9,13 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages     send ``{"to": "...", "text": "..."}``
     POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
-    GET  /api/events       server-sent events for live messages and peers
+    GET  /api/events       server-sent events for live messages, peers and posts
+    GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/following followed authors
+    POST /api/tan/posts    publish a Tan post
+    POST /api/tan/follow   follow an author
+    POST /api/tan/unfollow stop following an author
+    POST /api/tan/sync     pull missing posts from peers
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -164,6 +170,7 @@ class WebBridge:
         self.bus = EventBus()
         self._lock = threading.Lock()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
+        self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -236,6 +243,108 @@ class WebBridge:
         )
         self.bus.publish({"type": "message", "message": message})
         return message
+
+    def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Record a Tan post and fan it out to SSE subscribers."""
+        with self._lock:
+            self._tan_posts.append(dict(record))
+        self.bus.publish({"type": "post", "post": dict(record)})
+        return record
+
+    # -- Tan social feed ---------------------------------------------------
+
+    def _tan_app(self) -> Optional[Any]:
+        app = getattr(self.node, "app", None)
+        return app if getattr(app, "db_path", None) is not None else None
+
+    def _tan_db_path(self) -> Path:
+        app = self._tan_app()
+        if app is not None:
+            return Path(app.db_path)
+        return Path(self.node.config.social_db_path)
+
+    def _tan_conn(self) -> Any:
+        from .tangents.tan import init_db
+
+        return init_db(self._tan_db_path())
+
+    def tan_timeline(
+        self,
+        *,
+        limit: int = 30,
+        include_all: bool = False,
+        author: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import feed, following, resolve_author, timeline
+
+        conn = self._tan_conn()
+        try:
+            if author:
+                target, _ = resolve_author(conn, author, registry=self.node.registry)
+                return list(reversed(feed(conn, author=target, limit=limit)))
+            if include_all:
+                return timeline(conn, include_all=True, limit=limit)
+            authors = [record["author"] for record in following(conn)]
+            app = self._tan_app()
+            if app is not None:
+                authors.append(app.author)
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                if identity is not None:
+                    authors.append(destination_hash(identity).hex())
+            return timeline(conn, authors, limit=limit)
+        finally:
+            conn.close()
+
+    def tan_following(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import author_stats, following
+
+        conn = self._tan_conn()
+        try:
+            records = following(conn)
+            for record in records:
+                record.update(author_stats(conn, record["author"]))
+            return records
+        finally:
+            conn.close()
+
+    def tan_follow(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import follow, resolve_author
+
+        conn = self._tan_conn()
+        try:
+            author, name = resolve_author(conn, target, registry=self.node.registry)
+            return follow(conn, author, name=name)
+        finally:
+            conn.close()
+
+    def tan_unfollow(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import resolve_author, unfollow
+
+        conn = self._tan_conn()
+        try:
+            author, name = resolve_author(conn, target, registry=self.node.registry)
+            return {"author": author, "name": name, "unfollowed": unfollow(conn, author)}
+        finally:
+            conn.close()
+
+    def tan_posts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = list(self._tan_posts)
+        return items[-limit:] if limit >= 0 else items
+
+    def tan_post(self, text: str) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        return app.create_post(text, publish=True)
+
+    def tan_sync(self, *, explore: bool = True) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        return app.sync(self.node, explore=explore)
 
     def send_message(
         self,
@@ -315,6 +424,10 @@ class WebBridge:
                 "version": __version__,
                 "web": self.web_dir is not None,
                 "url": self.url,
+            },
+            "social": {
+                "enabled": self._tan_app() is not None,
+                "posts": len(self.tan_posts(limit=0)),
             },
         }
 
@@ -474,6 +587,30 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/tan/timeline":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                include_all = _query_flag(query, "all")
+                author = (query.get("author") or [None])[0]
+                try:
+                    posts = self.bridge.tan_timeline(
+                        limit=limit, include_all=include_all, author=author
+                    )
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/following":
+                records = self.bridge.tan_following()
+                self._send_json(
+                    {"following": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/posts":
+                limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
+                posts = self.bridge.tan_posts(limit=limit)
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
 
@@ -488,6 +625,57 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/tan/posts":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    post = self.bridge.tan_post(text)
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "post": post}, head_only)
+                return
+            if path in ("/api/tan/follow", "/api/tan/unfollow"):
+                target = body.get("target") or body.get("author")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unfollow"):
+                        result = self.bridge.tan_unfollow(target.strip())
+                    else:
+                        result = self.bridge.tan_follow(target.strip())
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "follow": result}, head_only)
+                return
+            if path == "/api/tan/sync":
+                try:
+                    result = self.bridge.tan_sync(
+                        explore=bool(body.get("explore", True))
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except NodeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+                    return
+                self._send_json({"ok": True, "sync": result}, head_only)
                 return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
@@ -726,6 +914,13 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def _send_error(self, status: int, message: str, head_only: bool = False) -> None:
         self._send_json({"error": {"message": message}}, head_only, status)
+
+
+def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int_param(

@@ -113,6 +113,7 @@ class TauNode:
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
         self._shutdown = False
+        self.app: Optional[Any] = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -220,6 +221,13 @@ class TauNode:
                 link.teardown()
             except Exception:  # pragma: no cover - defensive
                 pass
+
+        if self.app is not None:
+            try:
+                self.app.detach()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Could not detach app layer", exc_info=True)
+            self.app = None
 
         self._save_peers(force=True)
 
@@ -409,6 +417,28 @@ class TauNode:
             node=self.destination_hexhash,
         )
 
+    # -- application layer -------------------------------------------------
+
+    def add_request_handler(self, path: str, handler: Any) -> None:
+        """Register an extra request handler on this node's destination."""
+        if self.destination is None:
+            raise NodeError("node has not been started")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise NodeError("request path must start with '/'")
+        self.destination.register_request_handler(
+            path, handler, allow=RNS.Destination.ALLOW_ALL
+        )
+
+    def attach_app(self, app: Any) -> Any:
+        """Attach an application layer such as ``TanApp`` to this node."""
+        if self.destination is None:
+            raise NodeError("node has not been started")
+        if self.app is not None:
+            raise NodeError("an application layer is already attached")
+        app.attach(self)
+        self.app = app
+        return app
+
     # -- outgoing requests -------------------------------------------------
 
     def info(self) -> Dict[str, Any]:
@@ -565,6 +595,24 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def request(
+        self,
+        target: Union[str, bytes, Peer],
+        path: str,
+        payload: bytes = b"{}",
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send an arbitrary request to a peer and decode the response."""
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        return self._request(peer, path, payload, timeout)
 
     # -- links and requests ------------------------------------------------
 

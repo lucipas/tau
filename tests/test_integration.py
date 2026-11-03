@@ -184,3 +184,189 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+
+
+def test_two_nodes_exchange_tan_posts(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(bob_dir),
+            "--name",
+            "bob",
+            "--tcp-connect",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+
+    log_path = tmp_path / "alice-tan.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tau",
+                "serve",
+                "--data-dir",
+                str(alice_dir),
+                "--announce-interval",
+                "1",
+                "--social",
+                "--json",
+            ],
+            cwd=str(ROOT),
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            text=True,
+        )
+
+    try:
+        time.sleep(2.0)
+        assert server.poll() is None, log_path.read_text()
+
+        discovered = {}
+        for _ in range(3):
+            result = run_tau(
+                "discover",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "6",
+                "--json",
+                timeout=40.0,
+            )
+            payload = json.loads(require_ok(result))
+            discovered = {
+                peer["destination"]: peer for peer in payload.get("peers", [])
+            }
+            if alice_hash in discovered:
+                break
+        assert alice_hash in discovered, log_path.read_text()
+
+        posted = json.loads(
+            require_ok(
+                run_tau(
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--no-publish",
+                    "--json",
+                    "hello from alice",
+                    timeout=30.0,
+                )
+            )
+        )
+        assert posted["post"]["text"] == "hello from alice"
+
+        synced = json.loads(
+            require_ok(
+                run_tau(
+                    "tan",
+                    "sync",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--to",
+                    alice_hash,
+                    "--author",
+                    alice_hash,
+                    "--json",
+                    timeout=60.0,
+                )
+            )
+        )
+        assert synced["stored"] == 1, synced
+
+        timeline = json.loads(
+            require_ok(
+                run_tau(
+                    "tan",
+                    "timeline",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--all",
+                    "--json",
+                    timeout=30.0,
+                )
+            )
+        )
+        assert [post["text"] for post in timeline["posts"]] == ["hello from alice"]
+
+        require_ok(
+            run_tau(
+                "tan",
+                "follow",
+                "--data-dir",
+                str(bob_dir),
+                alice_hash,
+                "--json",
+                timeout=30.0,
+            )
+        )
+
+        pushed = json.loads(
+            require_ok(
+                run_tau(
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--to",
+                    alice_hash,
+                    "--json",
+                    "hello from bob",
+                    timeout=60.0,
+                )
+            )
+        )
+        assert pushed["post"]["text"] == "hello from bob"
+        assert pushed["published"]["delivered"] >= 1, pushed
+
+        time.sleep(1.0)
+        alice_timeline = json.loads(
+            require_ok(
+                run_tau(
+                    "tan",
+                    "timeline",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--all",
+                    "--json",
+                    timeout=30.0,
+                )
+            )
+        )
+        assert "hello from bob" in [
+            post["text"] for post in alice_timeline["posts"]
+        ], alice_timeline
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
