@@ -1,0 +1,2 @@
+- Persist identity across sessions
+- have support for many instances on one machine. (i.e port colliding)

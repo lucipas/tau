@@ -7,6 +7,12 @@ dist/
 .venv/
 venv/
 
+# Web console
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+
 # Tooling
 .pytest_cache/
 .coverage

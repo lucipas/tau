@@ -29,6 +29,21 @@ def test_parser_send_arguments():
     assert args.timeout == 20.0
 
 
+def test_parser_serve_http_options():
+    parser = cli.build_parser()
+
+    default = parser.parse_args(["serve", "--http"])
+    assert default.http == "127.0.0.1:8787"
+    assert default.web_dir is None
+    assert default.http_allow_remote is False
+
+    explicit = parser.parse_args(
+        ["serve", "--http", "0.0.0.0:9000", "--http-allow-remote"]
+    )
+    assert explicit.http == "0.0.0.0:9000"
+    assert explicit.http_allow_remote is True
+
+
 def test_parser_requires_a_command():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):

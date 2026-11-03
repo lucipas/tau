@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -136,9 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not enable Reticulum's AutoInterface (LAN discovery)",
     )
     init.add_argument(
-        "--force",
+        "--init",
         action="store_true",
-        help="overwrite an existing Reticulum config",
+        help="write default Reticulum config (overwrites)",
     )
     init.set_defaults(func=cmd_init)
 
@@ -165,6 +166,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help="stop after this many seconds (default: run until interrupted)",
+    )
+    serve.add_argument(
+        "--http",
+        nargs="?",
+        const="127.0.0.1:8787",
+        metavar="[HOST:]PORT",
+        help=("serve the web console and JSON API (default: 127.0.0.1:8787)"),
+    )
+    serve.add_argument(
+        "--web-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="static console build to serve (default: $TAU_WEB_DIR or web/out)",
+    )
+    serve.add_argument(
+        "--http-allow-remote",
+        action="store_true",
+        help="allow binding the console to a non-loopback address",
     )
     serve.set_defaults(func=cmd_serve)
 
@@ -468,19 +488,70 @@ def _node_callbacks(args: argparse.Namespace):
     return on_peer, on_message
 
 
+def _default_web_dir() -> Optional[Path]:
+    override = os.environ.get("TAU_WEB_DIR")
+    if override:
+        return Path(override).expanduser()
+    candidate = Path(__file__).resolve().parent.parent / "web" / "out"
+    return candidate if candidate.exists() else None
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     interval = max(
         0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
     )
     config = _make_config(args, announce_interval=interval)
-    on_peer, on_message = _node_callbacks(args)
+
+    bridge = None
+    web_settings = None
+    http_bind = getattr(args, "http", None)
+    if http_bind:
+        from .webapi import parse_bind
+
+        web_dir = getattr(args, "web_dir", None) or _default_web_dir()
+        try:
+            host, port = parse_bind(http_bind)
+        except ValueError as exc:
+            raise NodeError(str(exc)) from exc
+        web_settings = (host, port, web_dir)
+
+    console_peer, console_message = _node_callbacks(args)
     node = TauNode(
         config,
         name=config.name,
-        on_message=on_message,
-        on_peer=on_peer,
+        on_message=console_message,
+        on_peer=console_peer,
     )
+    if web_settings is not None:
+        from .webapi import WebBridge, WebBridgeError
+
+        host, port, web_dir = web_settings
+        try:
+            bridge = WebBridge(
+                node,
+                host=host,
+                port=port,
+                web_dir=web_dir,
+                allow_remote=bool(getattr(args, "http_allow_remote", False)),
+            )
+        except WebBridgeError as exc:
+            raise NodeError(str(exc)) from exc
+
+        def on_peer(peer: Peer) -> None:
+            console_peer(peer)
+            bridge.record_peer(peer)
+
+        def on_message(record: Dict[str, Any]) -> None:
+            console_message(record)
+            bridge.record_inbound(record)
+
+        node.on_peer = on_peer
+        node.on_message = on_message
     node.start(announce=not getattr(args, "no_announce", False))
+
+    console_url = None
+    if bridge is not None:
+        console_url = bridge.start()
 
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
@@ -488,11 +559,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     info = node.info()
     if _json_mode(args):
         _emit_event(args, "ready", node=info)
+        if console_url is not None:
+            _emit_event(args, "web", url=console_url, api=f"{console_url}api/")
     else:
         print(f'tau node "{info["name"]}" ready', flush=True)
         print(f"  destination: {info['destination']}")
         print(f"  rns:         {info['rns_version']}")
         print(f"  data dir:    {config.data_dir}")
+        if console_url is not None:
+            print(f"  console:     {console_url}")
+            print(f"  api:         {console_url}api/")
         print("Listening for peers and messages. Press Ctrl-C to stop.", flush=True)
 
     duration = getattr(args, "duration", None)
@@ -503,6 +579,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             while not stop.wait(0.5):
                 pass
     finally:
+        if bridge is not None:
+            bridge.stop()
         node.stop()
         _restore_stop_handlers(previous_handlers)
     return _EXIT_OK

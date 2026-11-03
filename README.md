@@ -103,6 +103,48 @@ If multicast is unavailable (some containers, firewalled networks), use
 I2P, RNode/LoRa, serial, KISS, ...). All tau nodes must use the `tau` app name
 and the `node` aspect, which is hard-coded in the protocol.
 
+## Web console
+
+A small Next.js + Tailwind console can mirror everything that reaches a node
+and send messages back over the mesh. It is exported as static files and served
+by the Python bridge, so no Node process is needed at runtime.
+
+```bash
+make web-build            # npm install && next build -> web/out
+tau serve --http          # console + JSON API on http://127.0.0.1:8787/
+```
+
+Open <http://127.0.0.1:8787/>. The page streams inbound messages, peers and
+their latency in real time over server-sent events.
+
+The same bridge is the local integration point for scripts:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/status` | GET | node info, peers, recent messages |
+| `/api/peers` | GET | peer registry |
+| `/api/messages` | GET | recent inbound/outbound messages |
+| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/ping` | POST | measure a peer's round trip |
+| `/api/announce` | POST | announce this node immediately |
+| `/api/events` | GET | SSE stream of messages and peer updates |
+
+```bash
+# What arrived from the mesh, as JSON:
+curl -s http://127.0.0.1:8787/api/messages | jq .
+
+# Send a message from this machine:
+curl -s -X POST http://127.0.0.1:8787/api/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"to": "alice", "text": "hello from a script"}'
+```
+
+The bridge binds to loopback by default. It can send messages as this node, so
+only pass `--http-allow-remote` together with a non-loopback `--http` address
+when you really mean to expose it. Use `--web-dir` or `TAU_WEB_DIR` to serve a
+different build, and `make web-dev` for the Next.js dev server on port 3000
+(the console automatically talks to the bridge on port 8787).
+
 ## Command reference
 
 Global options may appear before or after the command:
@@ -132,10 +174,16 @@ Useful flags:
 
 ```bash
 # Don't overwrite an existing config, but add a TCP server alongside AutoInterface
-tau init --tcp-listen 0.0.0.0:4343 --force
+tau init --tcp-listen 0.0.0.0:4343 --init
 
 # Announce every 30 seconds, stop after one minute
 tau serve --announce-interval 30 --duration 60
+
+# Serve the web console and JSON API on loopback (port 8787)
+tau serve --http
+
+# Serve on a specific address (remote bind needs an explicit opt-in)
+tau serve --http 0.0.0.0:8787 --http-allow-remote
 
 # Read the message from a file or stdin
 tau send --to alice --file message.txt
@@ -286,6 +334,7 @@ tau/
   util.py       atomic file helpers
 tests/          unit tests + optional Reticulum integration test
 scripts/demo.py two-node loopback demonstration
+web/            Next.js + Tailwind console (static export served by tau)
 ```
 
 ## Troubleshooting
