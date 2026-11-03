@@ -1075,14 +1075,17 @@ class TanApp:
                 conn.close()
         except (ProtocolError, TanError) as exc:
             return response_error("invalid_feed_request", str(exc))
-        try:
-            return response_ok(
-                posts=posts,
-                count=len(posts),
-                author=None if all_authors else author,
-            )
-        except ProtocolError as exc:
-            return response_error("feed_too_large", str(exc))
+        while True:
+            try:
+                return response_ok(
+                    posts=posts,
+                    count=len(posts),
+                    author=None if all_authors else author,
+                )
+            except ProtocolError as exc:
+                if len(posts) <= 1:
+                    return response_error("feed_too_large", str(exc))
+                posts = posts[:-1]
 
     def _handle_post(
         self,
