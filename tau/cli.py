@@ -26,6 +26,19 @@ from .node import NodeError, TauNode
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .tangents.tan import (
+    DEFAULT_FEED_LIMIT,
+    MAX_GOSSIP_TTL,
+    TanApp,
+    author_stats,
+    feed,
+    follow,
+    following,
+    init_db,
+    resolve_author,
+    timeline,
+    unfollow,
+)
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +199,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow binding the console to a non-loopback address",
     )
+    serve.add_argument(
+        "--social",
+        action="store_true",
+        help="enable the Tan social feed request handlers",
+    )
+    serve.add_argument(
+        "--social-sync-interval",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="periodically pull the Tan feed from peers (0 disables)",
+    )
     serve.set_defaults(func=cmd_serve)
 
     discover = subparsers.add_parser(
@@ -263,6 +288,104 @@ def build_parser() -> argparse.ArgumentParser:
         "id", parents=[common], help="show this node's name and destination"
     )
     identity.set_defaults(func=cmd_id)
+
+    tan = subparsers.add_parser(
+        "tan",
+        parents=[common],
+        help="use the Tan federated social feed",
+    )
+    tan_sub = tan.add_subparsers(dest="tan_command", metavar="TAN_COMMAND")
+    tan_sub.required = True
+
+    tan_post = tan_sub.add_parser(
+        "post",
+        parents=[common],
+        help="sign and store a post, then publish it to known peers",
+    )
+    tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
+    tan_post.add_argument("--file", type=Path, help="read the post text from a file")
+    tan_post.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_post.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_post.set_defaults(func=cmd_tan_post)
+
+    tan_timeline = tan_sub.add_parser(
+        "timeline",
+        parents=[common],
+        help="show posts from you and the authors you follow",
+    )
+    tan_timeline.add_argument(
+        "--all", action="store_true", help="show every cached post"
+    )
+    tan_timeline.add_argument(
+        "--author", metavar="NAME|HASH", help="show one author's posts"
+    )
+    tan_timeline.add_argument(
+        "--limit", type=int, default=30, metavar="N", help="maximum posts"
+    )
+    tan_timeline.set_defaults(func=cmd_tan_timeline)
+
+    tan_follow = tan_sub.add_parser(
+        "follow", parents=[common], help="follow a peer or author"
+    )
+    tan_follow.add_argument("target", metavar="NAME|HASH")
+    tan_follow.set_defaults(func=cmd_tan_follow)
+
+    tan_unfollow = tan_sub.add_parser(
+        "unfollow", parents=[common], help="stop following an author"
+    )
+    tan_unfollow.add_argument("target", metavar="NAME|HASH")
+    tan_unfollow.set_defaults(func=cmd_tan_unfollow)
+
+    tan_following = tan_sub.add_parser(
+        "following", parents=[common], help="list followed authors"
+    )
+    tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_sync = tan_sub.add_parser(
+        "sync",
+        parents=[common],
+        help="pull missing posts from known peers",
+    )
+    tan_sync.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="sync only with these peers (repeatable)",
+    )
+    tan_sync.add_argument(
+        "--author",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="sync only these authors (repeatable)",
+    )
+    tan_sync.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="posts per request (default: %(default)s)",
+    )
+    tan_sync.add_argument(
+        "--explore",
+        action="store_true",
+        help="also fetch recent public posts to discover new authors",
+    )
+    tan_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_sync.set_defaults(func=cmd_tan_sync)
 
     return parser
 
@@ -405,8 +528,11 @@ def _read_message(args: argparse.Namespace) -> str:
             return Path(args.file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             raise NodeError(f"could not read {args.file}: {exc}") from exc
-    if getattr(args, "message", None):
-        return args.message
+    text = getattr(args, "message", None)
+    if text is None:
+        text = getattr(args, "text", None)
+    if text is not None:
+        return text
     if not sys.stdin.isatty():
         return sys.stdin.read()
     raise NodeError("provide a message, --file, or pipe text on stdin")
@@ -496,6 +622,218 @@ def _default_web_dir() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _print_tan_posts(posts: Sequence[Dict[str, Any]], *, json_output: bool) -> None:
+    if json_output:
+        _emit({"posts": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No posts yet. Try `tau tan post \"hello\"` or `tau tan sync --explore`.")
+        return
+    for post in posts:
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({author})")
+        for line in str(post.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+
+
+def _tan_identity(config: TauConfig) -> Any:
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    return identity
+
+
+def cmd_tan_post(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        post = app.create_post(text)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            post = app.create_post(text)
+            published = app.publish(
+                post,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"post": post, "published": published}, True)
+    else:
+        print(f"posted {short_hash(post['hash'])}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_timeline(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        if getattr(args, "author", None):
+            author, _ = resolve_author(
+                conn, args.author, registry=PeerRegistry(config.peers_path)
+            )
+            posts = list(reversed(feed(conn, author=author, limit=args.limit)))
+        elif getattr(args, "all", False):
+            posts = timeline(conn, include_all=True, limit=args.limit)
+        else:
+            authors = [record["author"] for record in following(conn)]
+            identity = load_identity(config.identity_path)
+            if identity is not None:
+                authors.append(destination_hash(identity).hex())
+            posts = timeline(conn, authors, limit=args.limit)
+    finally:
+        conn.close()
+    _print_tan_posts(posts, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_follow(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = resolve_author(
+            conn, args.target, registry=PeerRegistry(config.peers_path)
+        )
+        record = follow(conn, author, name=name)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"following {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_unfollow(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = resolve_author(
+            conn, args.target, registry=PeerRegistry(config.peers_path)
+        )
+        removed = unfollow(conn, author)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit({"author": author, "unfollowed": removed}, True)
+    else:
+        if removed:
+            print(f"unfollowed {name or author} ({short_hash(author)})")
+        else:
+            print(f"was not following {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_following(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = following(conn)
+        for record in records:
+            record.update(author_stats(conn, record["author"]))
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"following": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("Not following anyone. Try `tau tan follow alice`.")
+        for record in records:
+            name = record.get("name") or "unknown"
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s)"
+            )
+    return _EXIT_OK
+
+
+def cmd_tan_sync(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_or_create_identity(config.identity_path)
+    node = TauNode(config, name=config.name)
+    node.start(announce=False)
+    try:
+        app = TanApp(
+            config,
+            identity,
+            name=config.name,
+            request_timeout=float(getattr(args, "timeout", 15.0)),
+        )
+        node.attach_app(app)
+        targets = None
+        if getattr(args, "to", None):
+            targets = [node.resolve_peer(target) for target in args.to]
+
+        authors = None
+        if getattr(args, "author", None):
+            conn = app.connect()
+            try:
+                authors = [
+                    resolve_author(
+                        conn, target, registry=PeerRegistry(config.peers_path)
+                    )[0]
+                    for target in args.author
+                ]
+            finally:
+                conn.close()
+
+        summary = app.sync(
+            node,
+            targets=targets,
+            authors=authors,
+            limit=int(getattr(args, "limit", DEFAULT_FEED_LIMIT)),
+            explore=bool(getattr(args, "explore", False)),
+            timeout=float(getattr(args, "timeout", 15.0)),
+        )
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit(summary, True)
+    else:
+        print(
+            f"synced {summary['stored']} new post(s) "
+            f"from {summary['peers']} peer(s); "
+            f"{summary['duplicates']} duplicate(s)"
+        )
+        for error in summary["errors"]:
+            print(f"  {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     interval = max(
         0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
@@ -549,6 +887,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
         node.on_message = on_message
     node.start(announce=not getattr(args, "no_announce", False))
 
+    social_app = None
+    if getattr(args, "social", False):
+        def on_tan_post(record: Dict[str, Any]) -> None:
+            if _json_mode(args):
+                _emit_event(args, "post", post=record)
+            else:
+                name = record.get("name") or "anonymous"
+                author = short_hash(str(record.get("author", "")))
+                print(
+                    f"[{_stamp(record.get('created_at'))}] post from {name} ({author}):",
+                    flush=True,
+                )
+                for line in str(record.get("text", "")).splitlines() or [""]:
+                    print(f"  {line}", flush=True)
+            if bridge is not None:
+                try:
+                    bridge.record_tan_post(record)
+                except Exception:  # pragma: no cover - optional web layer
+                    log.debug("Could not forward Tan post to web console", exc_info=True)
+
+        social_app = TanApp(
+            config,
+            node.identity,
+            name=config.name,
+            on_post=on_tan_post,
+        )
+        node.attach_app(social_app)
+
     console_url = None
     if bridge is not None:
         console_url = bridge.start()
@@ -556,11 +922,40 @@ def cmd_serve(args: argparse.Namespace) -> int:
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
 
+    social_interval = max(
+        0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0)
+    )
+    if social_app is not None and social_interval > 0:
+        def social_sync_loop() -> None:
+            while not stop.wait(social_interval):
+                try:
+                    summary = social_app.sync(
+                        node, limit=DEFAULT_FEED_LIMIT, explore=True
+                    )
+                    if summary.get("stored"):
+                        log.info(
+                            "Tan sync stored %s new post(s)", summary["stored"]
+                        )
+                except Exception:  # pragma: no cover - network dependent
+                    log.warning("Tan background sync failed", exc_info=True)
+
+        threading.Thread(
+            target=social_sync_loop, name="tau-tan-sync", daemon=True
+        ).start()
+
     info = node.info()
     if _json_mode(args):
         _emit_event(args, "ready", node=info)
         if console_url is not None:
             _emit_event(args, "web", url=console_url, api=f"{console_url}api/")
+        if social_app is not None:
+            _emit_event(
+                args,
+                "social",
+                enabled=True,
+                db=str(config.social_db_path),
+                feed="/tan/feed",
+            )
     else:
         print(f'tau node "{info["name"]}" ready', flush=True)
         print(f"  destination: {info['destination']}")
@@ -569,6 +964,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if console_url is not None:
             print(f"  console:     {console_url}")
             print(f"  api:         {console_url}api/")
+        if social_app is not None:
+            print(f"  social:      Tan feed at /tan/feed")
+            if social_interval > 0:
+                print(f"  social sync: every {social_interval:g}s")
         print("Listening for peers and messages. Press Ctrl-C to stop.", flush=True)
 
     duration = getattr(args, "duration", None)

@@ -14,6 +14,17 @@ export function formatTime(timestamp: number): string {
   });
 }
 
+export function formatDateTime(timestamp: number): string {
+  if (!timestamp) return "unknown";
+  return new Date(timestamp * 1000).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 export function formatAge(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "unknown";
   if (seconds < 5) return "just now";

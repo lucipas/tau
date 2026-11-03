@@ -72,3 +72,51 @@ export interface SendResponse {
 export interface ApiErrorBody {
   error?: { message?: string };
 }
+
+
+export interface TanPost {
+  v: number;
+  author: string;
+  key: string;
+  name: string;
+  text: string;
+  created_at: number;
+  prev: string;
+  hash: string;
+  sig: string;
+}
+
+export interface TanFollow {
+  author: string;
+  name: string;
+  added_at: number;
+  posts?: number;
+  seq?: number;
+  last_post?: number;
+}
+
+export interface TanTimelineResponse {
+  posts: TanPost[];
+  count: number;
+}
+
+export interface TanFollowingResponse {
+  following: TanFollow[];
+  count: number;
+}
+
+export interface TanPostResponse {
+  ok: boolean;
+  post: TanPost;
+}
+
+export interface TanSyncResponse {
+  ok: boolean;
+  sync: {
+    peers: number;
+    authors: number;
+    stored: number;
+    duplicates: number;
+    errors: Array<{ peer: string; author: string; error: string }>;
+  };
+}

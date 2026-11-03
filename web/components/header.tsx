@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+
 import type { ConnectionState } from "@/lib/use-tau";
 import type { NodeInfo } from "@/lib/types";
 import { shortHash } from "@/lib/format";
@@ -50,6 +52,21 @@ export function Header({
             </p>
           </div>
         </div>
+
+        <nav className="hidden items-center gap-1 rounded-xl border border-line/70 bg-panel/60 p-1 text-xs sm:flex">
+          <Link
+            href="/"
+            className="rounded-lg bg-signal/15 px-2.5 py-1.5 text-signal"
+          >
+            chat
+          </Link>
+          <Link
+            href="/social/"
+            className="rounded-lg px-2.5 py-1.5 text-mist transition hover:text-zinc-100"
+          >
+            social
+          </Link>
+        </nav>
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <span
