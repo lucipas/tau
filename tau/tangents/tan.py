@@ -884,9 +884,14 @@ class TanApp:
             for author in authors:
                 _require_hex(author, AUTHOR_HEX_LENGTH, "author")
                 local_seq = max_seq(conn, author)
-                candidates = [
+                author_peers = [
                     peer for peer in peers if getattr(peer, "hexhash", "") == author
-                ] or peers
+                ]
+                # Prefer the author's node, but use relays when it is offline or
+                # does not have the requested chain cached.
+                candidates = author_peers + [
+                    peer for peer in peers if peer not in author_peers
+                ]
                 for peer in candidates:
                     for _ in range(MAX_SYNC_PAGES):
                         payload = encode(
@@ -932,9 +937,10 @@ class TanApp:
                             else:
                                 duplicates += 1
                         new_seq = max_seq(conn, author)
-                        if new_seq <= local_seq or len(posts) < page_limit:
-                            local_seq = new_seq
+                        if new_seq <= local_seq:
                             break
+                        # A page may be short because it was limited by the
+                        # response byte budget, not because the chain ended.
                         local_seq = new_seq
 
             if explore:
@@ -1075,11 +1081,27 @@ class TanApp:
                 conn.close()
         except (ProtocolError, TanError) as exc:
             return response_error("invalid_feed_request", str(exc))
+        response_author = None if all_authors else author
+        fitting_posts: List[Dict[str, Any]] = []
+        for post in posts:
+            candidate = fitting_posts + [post]
+            try:
+                # Check each complete post against the wire limit so a large
+                # page is shortened rather than rejected wholesale.
+                response_ok(
+                    posts=candidate,
+                    count=len(candidate),
+                    author=response_author,
+                )
+            except ProtocolError:
+                break
+            fitting_posts = candidate
+
         try:
             return response_ok(
-                posts=posts,
-                count=len(posts),
-                author=None if all_authors else author,
+                posts=fitting_posts,
+                count=len(fitting_posts),
+                author=response_author,
             )
         except ProtocolError as exc:
             return response_error("feed_too_large", str(exc))
