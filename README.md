@@ -174,7 +174,7 @@ Useful flags:
 
 ```bash
 # Don't overwrite an existing config, but add a TCP server alongside AutoInterface
-tau init --tcp-listen 0.0.0.0:4343 --force
+tau init --tcp-listen 0.0.0.0:4343 --init
 
 # Announce every 30 seconds, stop after one minute
 tau serve --announce-interval 30 --duration 60
