@@ -329,3 +329,51 @@ def test_worker_threads_can_send_concurrently(bridge):
     _, _, feed = _json(bridge, "/api/messages")
     assert len(feed["messages"]) == 5
     assert len({m["id"] for m in feed["messages"]}) == 5
+
+
+def test_tan_timeline_and_follow(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "hello from tan", name="bob", now=1000)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/follow",
+            method="POST",
+            body={"target": post["author"]},
+        )
+        assert status == 200
+        assert payload["follow"]["author"] == post["author"]
+
+        status, _, payload = _json(bridge, "/api/tan/following")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["following"][0]["posts"] == 1
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "nope"},
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()

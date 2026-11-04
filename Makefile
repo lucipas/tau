@@ -2,7 +2,7 @@ PYTHON ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: venv install test test-all demo lint clean web-install web-build web-dev web-clean
+.PHONY: venv install test test-all demo social-demo lint clean web-install web-build web-dev web-clean
 
 venv:
 	@test -d "$(VENV)" || $(PYTHON) -m venv "$(VENV)"
@@ -19,6 +19,9 @@ test-all: venv
 
 demo: venv
 	$(BIN)/python scripts/demo.py
+
+social-demo: venv
+	$(BIN)/python scripts/social_demo.py
 
 lint:
 	$(BIN)/python -m compileall -q tau scripts tests

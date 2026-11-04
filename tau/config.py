@@ -43,6 +43,7 @@ class TauConfig:
     peers_path: Path
     mailbox_path: Path
     node_file: Path
+    social_db_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -74,6 +75,7 @@ class TauConfig:
             peers_path=base / PEERS_FILE_NAME,
             mailbox_path=base / MAILBOX_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
+            social_db_path=base / SOCIAL_DB_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,

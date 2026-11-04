@@ -127,7 +127,14 @@ The same bridge is the local integration point for scripts:
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
-| `/api/events` | GET | SSE stream of messages and peer updates |
+| `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/following` | GET | followed authors and their post counts |
+| `/api/tan/posts` | GET | recent Tan posts received by this node |
+| `/api/tan/posts` | POST | publish `{"text": "hello"}` |
+| `/api/tan/follow` | POST | follow `{"target": "alice"}` |
+| `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
+| `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
 # What arrived from the mesh, as JSON:
@@ -144,6 +151,55 @@ only pass `--http-allow-remote` together with a non-loopback `--http` address
 when you really mean to expose it. Use `--web-dir` or `TAU_WEB_DIR` to serve a
 different build, and `make web-dev` for the Next.js dev server on port 3000
 (the console automatically talks to the bridge on port 8787).
+
+## Social feed: Tan
+
+`tan` is a federated social feed built on the same tau destinations. Every
+post is signed by its author, chained to that author's previous post by SHA-256,
+and cached in SQLite. Posts can be relayed by any node without giving that node
+the author's private key.
+
+```bash
+# Terminal 1: serve the feed and the normal tau request handlers
+tau serve --social --announce-interval 5
+
+# Terminal 2: write a post and publish it to known peers
+tau tan post "hello mesh"
+
+# Read your timeline (your posts plus authors you follow)
+tau tan timeline
+
+# Discover cached posts from peers, then follow someone
+tau tan sync --explore
+tau tan follow alice
+tau tan timeline --json
+```
+
+`tau serve --social --social-sync-interval 60` also pulls the public timeline
+from known peers every minute, so a long-running node keeps its cache fresh.
+
+Useful flags:
+
+```bash
+# Store a post without starting Reticulum or contacting peers
+tau tan post --no-publish "draft"
+
+# Publish only to one peer
+tau tan post --to alice "direct delivery"
+
+# Show every cached post, or one author's chain
+tau tan timeline --all
+tau tan timeline --author alice
+
+# Follow by destination hash or by a unique hash prefix
+tau tan follow 5c04c868
+tau tan following
+```
+
+Posts are limited to 2,000 characters and 20 posts per feed response. A
+long-running node stores only posts it created, received or synced. Tan is
+public-feed oriented: there are no private posts, likes, comments or deletions
+yet. The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 
@@ -170,6 +226,12 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry |
 | `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
+| `tau tan post TEXT` | Sign, store and publish a social post |
+| `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan follow PEER` | Follow a peer or destination hash |
+| `tau tan unfollow PEER` | Stop following an author |
+| `tau tan following` | List followed authors |
+| `tau tan sync` | Pull missing posts from known peers |
 
 Useful flags:
 
@@ -185,6 +247,12 @@ tau serve --http
 
 # Serve on a specific address (remote bind needs an explicit opt-in)
 tau serve --http 0.0.0.0:8787 --http-allow-remote
+
+# Enable the social feed and refresh it every minute
+tau serve --social --social-sync-interval 60
+
+# Pull the public feed from peers to discover new authors
+tau tan sync --explore
 
 # Read the message from a file or stdin
 tau send --to alice --file message.txt
@@ -312,6 +380,43 @@ escape sequences) before display. Delivered messages are not written to
 disk; a message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
 
+### Tan posts
+
+A Tan post is a small JSON object:
+
+```json
+{
+  "v": 1,
+  "author": "<tau destination hash>",
+  "key": "<author public key>",
+  "name": "alice",
+  "text": "hello mesh",
+  "created_at": 1760000000.0,
+  "prev": "<hash of alice's previous post, or empty>",
+  "hash": "<sha256(prev || canonical post body)>",
+  "sig": "<Ed25519 signature over hash>"
+}
+```
+
+The hash chain is per author: the first post has an empty `prev`, and every
+later post points at the previous one. Editing a post changes its hash, and a
+gap or reordering is visible in the chain. Because the signature covers the
+hash and the public key derives the author's destination, a relayed post can be
+verified even when the relay is not its author.
+
+Two request paths are added when a node runs with `--social`:
+
+| Path | Request | Response |
+| --- | --- | --- |
+| `/tan/feed` | `{"author": "...", "after_seq": 0, "limit": 20}` or `{"all": true}` | cached posts |
+| `/tan/post` | `{"post": {...}, "ttl": 2}` | store result |
+
+`tan post` publishes to known peers, and `/tan/post` relays new posts to a
+small, random fan-out. `tan sync` is pull-based: it asks peers for posts after
+the highest sequence it already has, so an author can be offline as long as any
+peer still caches their feed. Posts that arrive before their parent are stored
+as orphans and linked automatically when the parent arrives.
+
 ## Security model
 
 - **Confidentiality and integrity** come from Reticulum: links are encrypted
@@ -319,9 +424,12 @@ disk; a message waiting in the outbox is stored in `mailbox.json` (mode
 - **No accounts or central authority.** Trust is key-based. Names can collide,
   so compare destination hashes out of band when it matters.
 - **Open by default.** The request handlers use `ALLOW_ALL`: any node that can
-  reach the destination may send a message. This is appropriate for a mesh
-  chat; deployments that need allow-lists should add one in
-  `TauNode._handle_message`.
+  reach the destination may send a message or a Tan post. This is appropriate
+  for a mesh chat; deployments that need allow-lists should add one in
+  `TauNode._handle_message` and `TanApp._handle_post`.
+- **Posts are signed and hash-chained.** Tan validates every post before it is
+  stored, rejects edits, impersonation and broken chains, and can verify posts
+  that were relayed by a third party. Names are still self-asserted.
 - **Not anonymous.** The destination hash is a stable pseudonym. Peers can
   correlate your identity across sessions and transports.
 - **Store-and-forward is sealed.** Queued messages wait in the sender's
@@ -345,12 +453,17 @@ disk; a message waiting in the outbox is stored in `mailbox.json` (mode
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
+- Tan is a public timeline: no private posts, likes, comments, media or
+  deletions yet. It is not a full ActivityPub-style federation protocol.
+- A node only has the posts it created, received or synced. If every peer that
+  cached an author's feed disappears, the feed is gone until the author returns.
 - Peer information is self-asserted and can be stale; prune with
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
 - Natural extensions: group destinations, file transfer using Reticulum
-  resources, allow-lists, typed messages, LXMF interop, and a shared-instance
-  mode for running several local clients against one node.
+  resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
+  for running several local clients against one node, and richer Tan clients
+  (threads, media, moderation, follow recommendations).
 
 ## Development
 
@@ -358,7 +471,8 @@ disk; a message waiting in the outbox is stored in `mailbox.json` (mode
 make venv        # create .venv and install the package + dev tools
 make test        # unit tests (no network)
 make test-all    # unit + two-node TCP integration test
-make demo        # run the loopback demo
+make demo        # run the loopback messaging demo
+make social-demo # run the loopback Tan social demo
 make lint        # byte-compile every module
 ```
 
@@ -373,8 +487,11 @@ tau/
   peers.py      persistent peer registry
   protocol.py   JSON wire format, validation and size limits
   util.py       atomic file helpers
+  tangents/
+    tan.py      signed, hash-chained social feed and its network app
 tests/          unit tests + optional Reticulum integration test
-scripts/demo.py two-node loopback demonstration
+scripts/demo.py two-node messaging demonstration
+scripts/social_demo.py two-node Tan social demonstration
 web/            Next.js + Tailwind console (static export served by tau)
 ```
 
