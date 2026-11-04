@@ -25,11 +25,18 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
+
+try:  # POSIX only; mailbox cross-process locking is a no-op without it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import RNS
 
@@ -665,10 +672,4 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
-    }
-itize_name(payload.get("from_name")),
-        "text": text,
-        "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
-    }
-eelse Noneelse None,
     }
