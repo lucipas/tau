@@ -22,6 +22,7 @@ from .identity import (
     load_identity,
     load_or_create_identity,
 )
+from .mailbox import Mailbox
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
@@ -229,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for an unknown peer to announce",
     )
+    send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
     send.set_defaults(func=cmd_send)
 
     ping = subparsers.add_parser(
@@ -263,6 +269,13 @@ def build_parser() -> argparse.ArgumentParser:
         "id", parents=[common], help="show this node's name and destination"
     )
     identity.set_defaults(func=cmd_id)
+
+    outbox = subparsers.add_parser(
+        "outbox",
+        parents=[common],
+        help="list messages queued for offline peers (store-and-forward)",
+    )
+    outbox.set_defaults(func=cmd_outbox)
 
     return parser
 
@@ -566,6 +579,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f"  destination: {info['destination']}")
         print(f"  rns:         {info['rns_version']}")
         print(f"  data dir:    {config.data_dir}")
+        mailbox_counts = info.get("mailbox") or {}
+        if mailbox_counts.get("outbox") or mailbox_counts.get("held"):
+            print(
+                f"  mail:        {mailbox_counts.get('outbox', 0)} queued, "
+                f"{mailbox_counts.get('held', 0)} held for others"
+            )
         if console_url is not None:
             print(f"  console:     {console_url}")
             print(f"  api:         {console_url}api/")
@@ -676,12 +695,31 @@ def cmd_send(args: argparse.Namespace) -> int:
             text,
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            queue=not getattr(args, "no_queue", False),
         )
+        if response.get("queued"):
+            # One-shot send: give reachable peers a brief chance to take a
+            # sealed copy (or the message itself) before this process exits.
+            node.flush_outbox(timeout=3.0, max_peers=5)
+            if node.mailbox.get_outbox(response["id"]) is None:
+                response = {
+                    "ok": True,
+                    "delivered": True,
+                    "id": response["id"],
+                    "to": response["to"],
+                }
     finally:
         node.stop()
 
     if _json_mode(args):
         _emit(response, True)
+    elif response.get("queued"):
+        print(f"queued for {args.to} — they are unreachable right now")
+        print(f"  id:      {response['id']}")
+        print("  it will be delivered automatically when they are heard from;")
+        print("  check `tau outbox` for the queue, or just leave a node serving")
+    elif response.get("delivered"):
+        print(f"delivered to {args.to}")
     else:
         print(f"delivered to {args.to}")
         echo = response.get("echo")
@@ -690,6 +728,60 @@ def cmd_send(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         if isinstance(rtt, (int, float)):
             print(f"round trip: {rtt * 1000:.0f} ms")
+    return _EXIT_OK
+
+
+def cmd_outbox(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    entries = mailbox.outbox_list()
+    counts = mailbox.counts()
+
+    def describe(entry: Any) -> Dict[str, Any]:
+        peer = registry.get(entry.to)
+        payload = entry.to_dict()
+        payload["to_name"] = peer.display_name if peer is not None else entry.to_name
+        payload["held_by"] = sorted(entry.held_by)
+        return payload
+
+    if _json_mode(args):
+        _emit(
+            {
+                "outbox": [describe(entry) for entry in entries],
+                "count": len(entries),
+                "held_for_others": counts["held"],
+            },
+            True,
+        )
+    else:
+        if not entries:
+            print("Outbox is empty — nothing waiting on offline peers.")
+        else:
+            now = time.time()
+            header = ("ID", "TO", "NAME", "AGE", "TRIES", "EXPIRES IN")
+            rows: List[tuple] = [header]
+            for entry in entries:
+                peer = registry.get(entry.to)
+                name = peer.display_name if peer is not None else entry.to_name
+                rows.append(
+                    (
+                        entry.id[:8],
+                        entry.to_hex,
+                        name or "-",
+                        _ago(now - entry.created_at),
+                        str(entry.attempts),
+                        _ago(entry.expires_at - now),
+                    )
+                )
+            widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+            for row in rows:
+                print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+            print(f"\n{len(entries)} message(s) waiting for offline peers.")
+        if counts["held"]:
+            print(
+                f"Also holding {counts['held']} sealed message(s) for other peers."
+            )
     return _EXIT_OK
 
 

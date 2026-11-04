@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import random
 import sys
@@ -17,23 +18,41 @@ from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
 )
+from .mailbox import (
+    MAX_HOLDERS_PER_MESSAGE,
+    Mailbox,
+    MailboxError,
+    MailboxFull,
+    open_message,
+    seal_message,
+)
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import (
     APP_NAME,
     ASPECT,
     ASPECT_FILTER,
+    MAX_MAIL_REQUEST_BYTES,
+    MAX_MAIL_TTL,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
     REQUEST_INFO,
+    REQUEST_MAIL_FETCH,
+    REQUEST_MAIL_STORE,
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
     ProtocolError,
     build_announce,
+    build_mail_fetch,
+    build_mail_store,
     decode,
     encode_message,
+    generate_message_id,
+    normalize_message,
     parse_announce,
+    parse_mail_fetch,
+    parse_mail_store,
     parse_message,
     response_error,
     response_ok,
@@ -43,10 +62,15 @@ log = logging.getLogger(__name__)
 
 # Reticulum adds framing and resource overhead on top of request payloads.
 _REQUEST_WIRE_LIMIT = MAX_REQUEST_BYTES + 2 * 1024
+_MAIL_WIRE_LIMIT = MAX_MAIL_REQUEST_BYTES + 2 * 1024
 _RESPONSE_WIRE_LIMIT = MAX_RESPONSE_BYTES + 2 * 1024
 _DEFAULT_LINK_TIMEOUT = 15.0
 _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
+_MAIL_INTERVAL = 45.0
+_MAIL_REQUEST_TIMEOUT = 6.0
+_DEPOSIT_RETRY_AFTER = 3600.0
+_FETCH_BLOB_BUDGET = 40 * 1024
 
 
 class NodeError(RuntimeError):
@@ -97,6 +121,7 @@ class TauNode:
         self.registry = (
             registry if registry is not None else PeerRegistry(config.peers_path)
         )
+        self.mailbox = Mailbox(config.mailbox_path)
         self.on_message = on_message
         self.on_peer = on_peer
 
@@ -106,6 +131,8 @@ class TauNode:
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
+        self._mail_thread: Optional[threading.Thread] = None
+        self._mail_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
@@ -167,7 +194,9 @@ class TauNode:
             APP_NAME,
             ASPECT,
         )
-        self.destination.set_max_request_size(_REQUEST_WIRE_LIMIT)
+        self.destination.set_max_request_size(
+            max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT)
+        )
         self.destination.set_default_app_data(lambda: build_announce(self.name))
         self.destination.set_link_established_callback(self._on_incoming_link)
 
@@ -176,6 +205,8 @@ class TauNode:
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
             REQUEST_PEERS: self._handle_peers,
+            REQUEST_MAIL_STORE: self._handle_mail_store,
+            REQUEST_MAIL_FETCH: self._handle_mail_fetch,
         }
         for path, handler in handlers.items():
             self.destination.register_request_handler(
@@ -195,6 +226,13 @@ class TauNode:
                 daemon=True,
             )
             self._announce_thread.start()
+
+        self._mail_thread = threading.Thread(
+            target=self._mail_loop,
+            name="tau-mail",
+            daemon=True,
+        )
+        self._mail_thread.start()
 
         if announce:
             self.announce()
@@ -220,6 +258,11 @@ class TauNode:
                 link.teardown()
             except Exception:  # pragma: no cover - defensive
                 pass
+
+        try:
+            self.mailbox.prune()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not prune mailbox on shutdown", exc_info=True)
 
         self._save_peers(force=True)
 
@@ -300,6 +343,16 @@ class TauNode:
                 self.on_peer(peer)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_peer callback failed", exc_info=True)
+
+        # A peer (re)appearing is the trigger for store-and-forward: try
+        # to hand it anything queued for it, leave sealed copies of other
+        # queued mail with it, and collect anything it holds for us.
+        threading.Thread(
+            target=self._mail_round_for_peer,
+            args=(peer,),
+            name="tau-mail-flush",
+            daemon=True,
+        ).start()
 
     def _save_peers(self, *, force: bool = False) -> None:
         if self.registry.path is None:
@@ -383,17 +436,320 @@ class TauNode:
             peer = self.registry.get(caller_hash)
             caller_name = peer.display_name if peer is not None else caller_hash[:8]
 
+        # Store-and-forward retries and relay copies can deliver the same
+        # message twice; the id makes delivery idempotent.
+        message_id = message.get("id")
+        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+        if not duplicate:
+            if message_id:
+                self.mailbox.mark_seen(message_id)
+            record = {
+                "from": caller_name,
+                "destination": caller_hash,
+                "text": message["text"],
+                "sent_at": message["sent_at"],
+                "received_at": received_at,
+                "id": message_id,
+            }
+            log.info(
+                "Message from %s (%s): %s",
+                caller_name,
+                caller_hash or "anonymous",
+                message["text"],
+            )
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+
+        return response_ok(
+            echo=message["text"],
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            duplicate=duplicate,
+        )
+
+    def _handle_mail_store(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            store = parse_mail_store(data)
+        except ProtocolError as exc:
+            return response_error("invalid_mail", str(exc))
+        if store["expires_at"] <= time.time():
+            return response_error("mail_expired", "envelope has already expired")
+        try:
+            stored = self.mailbox.hold(
+                to=bytes.fromhex(store["to"]),
+                blob=store["blob"],
+                message_id=store["id"],
+                expires_at=store["expires_at"],
+            )
+        except MailboxFull as exc:
+            return response_error("mailbox_full", str(exc))
+        except MailboxError as exc:
+            return response_error("invalid_mail", str(exc))
+        log.info(
+            "Holding sealed mail %s for %s",
+            store["id"],
+            store["to"],
+        )
+        return response_ok(stored=stored, duplicate=not stored, id=store["id"])
+
+    def _handle_mail_fetch(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        if remote_identity is None:
+            return response_error(
+                "unidentified", "identify on the link to fetch held mail"
+            )
+        recipient = tau_destination_hash(remote_identity)
+        try:
+            fetch = parse_mail_fetch(data)
+        except ProtocolError as exc:
+            return response_error("invalid_mail", str(exc))
+        for message_id in fetch["ack"]:
+            self.mailbox.drop_held(message_id, to=recipient)
+
+        messages: List[Dict[str, Any]] = []
+        budget = _FETCH_BLOB_BUDGET
+        for envelope in self.mailbox.held_for(recipient):
+            blob_text = base64.b64encode(envelope.blob).decode("ascii")
+            if messages and len(blob_text) > budget:
+                break
+            messages.append(
+                {
+                    "id": envelope.id,
+                    "blob": blob_text,
+                    "expires_at": envelope.expires_at,
+                }
+            )
+            budget -= len(blob_text)
+            if len(messages) >= 20:
+                break
+        return response_ok(messages=messages, count=len(messages))
+
+    # -- store-and-forward ---------------------------------------------------
+
+    def _mail_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.flush_outbox()
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Mail round failed", exc_info=True)
+            if self._stop_event.wait(_MAIL_INTERVAL):
+                break
+
+    def _mail_round_for_peer(self, peer: Peer) -> None:
+        if not self._mail_lock.acquire(blocking=False):
+            return
+        try:
+            self._flush_peer(peer, _MAIL_REQUEST_TIMEOUT)
+            self._collect_mail(peer, _MAIL_REQUEST_TIMEOUT)
+        except Exception:  # pragma: no cover - network dependent
+            log.debug("Mail round for %s failed", peer.hexhash, exc_info=True)
+        finally:
+            self._mail_lock.release()
+
+    def flush_outbox(
+        self, *, timeout: float = _MAIL_REQUEST_TIMEOUT, max_peers: Optional[int] = None
+    ) -> Dict[str, int]:
+        """Try to move queued mail: direct delivery, deposits, collection.
+
+        Returns a summary with ``delivered``, ``deposited`` and
+        ``received`` counts.  Safe to call any time the node is running;
+        concurrent rounds are skipped rather than queued up.
+        """
+        summary = {"delivered": 0, "deposited": 0, "received": 0}
+        if not self.started:
+            return summary
+        if not self._mail_lock.acquire(blocking=False):
+            return summary
+        try:
+            self.mailbox.prune()
+            summary["received"] += self._process_local_held()
+            peers = self.registry.all()
+            if max_peers is not None:
+                peers = peers[:max_peers]
+            for peer in peers:
+                moved = self._flush_peer(peer, timeout)
+                summary["delivered"] += moved["delivered"]
+                summary["deposited"] += moved["deposited"]
+                summary["received"] += self._collect_mail(peer, timeout)
+        finally:
+            self._mail_lock.release()
+        return summary
+
+    def _flush_peer(self, peer: Peer, timeout: float) -> Dict[str, int]:
+        moved = {"delivered": 0, "deposited": 0}
+        if peer.caps and "mail" not in peer.caps:
+            # A pre-mail peer can still receive direct messages, just not
+            # hold or hand over sealed envelopes.
+            for entry in self.mailbox.outbox_list(to=peer.destination_hash):
+                if self._deliver_entry(peer, entry, timeout):
+                    moved["delivered"] += 1
+            return moved
+
+        for entry in self.mailbox.outbox_list(to=peer.destination_hash):
+            if self._deliver_entry(peer, entry, timeout):
+                moved["delivered"] += 1
+
+        now = time.time()
+        for entry in self.mailbox.outbox_list():
+            if entry.to == peer.destination_hash:
+                continue
+            holders = entry.held_by
+            if (
+                len(holders) >= MAX_HOLDERS_PER_MESSAGE
+                and peer.hexhash not in holders
+            ):
+                continue
+            last_deposit = holders.get(peer.hexhash)
+            if last_deposit is not None and now - last_deposit < _DEPOSIT_RETRY_AFTER:
+                continue
+            if self._deposit_entry(peer, entry, timeout):
+                moved["deposited"] += 1
+        return moved
+
+    def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        payload = encode_message(
+            entry.text, message_id=entry.id, sent_at=entry.created_at
+        )
+        try:
+            self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        except NodeError as exc:
+            self.mailbox.record_attempt(entry.id, error=str(exc))
+            return False
+        self.mailbox.remove_outbox(entry.id)
+        log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        return True
+
+    def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        if self.identity is None:
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None:
+            # Without the recipient's public key the message cannot be
+            # sealed for anyone else to hold; direct delivery only.
+            return False
+        try:
+            blob = seal_message(
+                self.identity,
+                sender_name=self.name,
+                recipient_public_key=recipient.public_key,
+                message_id=entry.id,
+                text=entry.text,
+                sent_at=entry.created_at,
+            )
+            payload = build_mail_store(
+                to=entry.to_hex,
+                message_id=entry.id,
+                blob=blob,
+                expires_at=entry.expires_at,
+            )
+        except (MailboxError, ProtocolError) as exc:
+            log.debug("Could not seal queued message %s: %s", entry.id, exc)
+            return False
+        try:
+            self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
+        except NodeError:
+            return False
+        self.mailbox.record_deposit(entry.id, peer.hexhash)
+        log.info(
+            "Left a sealed copy of %s with %s for %s",
+            entry.id,
+            peer.hexhash,
+            entry.to_hex,
+        )
+        return True
+
+    def _collect_mail(self, peer: Peer, timeout: float) -> int:
+        if self.identity is None or self.destination is None:
+            return 0
+        if peer.caps and "mail" not in peer.caps:
+            return 0
+        acks = self.mailbox.take_pending_acks(peer.hexhash)
+        try:
+            response = self._request(
+                peer, REQUEST_MAIL_FETCH, build_mail_fetch(acks), timeout
+            )
+        except NodeError:
+            if acks:
+                self.mailbox.add_pending_acks(peer.hexhash, acks)
+            return 0
+
+        received = 0
+        new_acks: List[str] = []
+        for item in response.get("messages") or []:
+            if not isinstance(item, dict):
+                continue
+            message_id = item.get("id")
+            blob_text = item.get("blob")
+            if not isinstance(message_id, str) or not isinstance(blob_text, str):
+                continue
+            # Whatever happens next, this envelope has been handed over;
+            # ack it so the holder can drop its copy.
+            new_acks.append(message_id)
+            try:
+                blob = base64.b64decode(blob_text, validate=True)
+                message = open_message(self.identity, blob)
+            except (ValueError, MailboxError) as exc:
+                log.warning("Dropping unreadable held mail %s: %s", message_id, exc)
+                continue
+            if self._deliver_collected(message):
+                received += 1
+        if new_acks:
+            self.mailbox.add_pending_acks(peer.hexhash, new_acks)
+        return received
+
+    def _process_local_held(self) -> int:
+        """Deliver envelopes addressed to this node that it holds itself."""
+        if self.identity is None or self.destination is None:
+            return 0
+        received = 0
+        for envelope in self.mailbox.held_for(self.destination.hash):
+            try:
+                message = open_message(self.identity, envelope.blob)
+            except MailboxError as exc:
+                log.warning(
+                    "Dropping unreadable held mail %s: %s", envelope.id, exc
+                )
+                message = None
+            self.mailbox.drop_held(envelope.id, to=self.destination.hash)
+            if message is not None and self._deliver_collected(message):
+                received += 1
+        return received
+
+    def _deliver_collected(self, message: Dict[str, Any]) -> bool:
+        """Hand a decrypted relayed message to the user, at most once."""
+        if self.mailbox.is_seen(message["id"]):
+            return False
+        self.mailbox.mark_seen(message["id"])
         record = {
-            "from": caller_name,
-            "destination": caller_hash,
+            "from": message["from_name"],
+            "destination": message["from"],
             "text": message["text"],
             "sent_at": message["sent_at"],
-            "received_at": received_at,
+            "received_at": time.time(),
+            "id": message["id"],
+            "relayed": True,
         }
         log.info(
-            "Message from %s (%s): %s",
-            caller_name,
-            caller_hash or "anonymous",
+            "Message from %s (%s) via store-and-forward: %s",
+            message["from_name"],
+            message["from"],
             message["text"],
         )
         if self.on_message is not None:
@@ -401,13 +757,7 @@ class TauNode:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
-
-        return response_ok(
-            echo=message["text"],
-            received_at=received_at,
-            server=self.name,
-            node=self.destination_hexhash,
-        )
+        return True
 
     # -- outgoing requests -------------------------------------------------
 
@@ -434,6 +784,7 @@ class TauNode:
             "rns_version": getattr(RNS, "__version__", "unknown"),
             "uptime": round(time.time() - (self._started_at or time.time()), 1),
             "peers": len(self.registry),
+            "mailbox": self.mailbox.counts(),
             "interfaces": interfaces,
         }
 
@@ -510,16 +861,84 @@ class TauNode:
         *,
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
+        queue: bool = True,
     ) -> Dict[str, Any]:
-        """Send a text message to a peer and return the decoded response."""
-        peer = self.resolve_peer(
-            target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
-        )
-        payload = encode_message(text)
-        return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        """Send a text message to a peer and return the decoded response.
+
+        With ``queue`` enabled (the default), a message whose peer cannot
+        be reached is stored in the local outbox instead of being lost:
+        the returned dict has ``queued: True`` and the message id, and
+        delivery is retried automatically whenever the peer — or any peer
+        willing to hold a sealed copy — is heard from.
+        """
+        normalized = normalize_message(text)
+        message_id = generate_message_id()
+        payload = encode_message(normalized, message_id=message_id)
+        peer: Optional[Peer] = None
+        try:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        except NodeError:
+            if not queue or not self.started:
+                raise
+            dest_hash = (
+                peer.destination_hash
+                if peer is not None
+                else self._target_hash(target)
+            )
+            if dest_hash is None:
+                raise
+            entry = self.mailbox.enqueue(
+                to=dest_hash,
+                text=normalized,
+                to_name=peer.display_name if peer is not None else "",
+                message_id=message_id,
+            )
+            log.info(
+                "Peer %s is unreachable; queued message %s in the outbox",
+                dest_hash.hex(),
+                entry.id,
+            )
+            threading.Thread(
+                target=self.flush_outbox,
+                kwargs={"timeout": _MAIL_REQUEST_TIMEOUT, "max_peers": 5},
+                name="tau-mail-flush",
+                daemon=True,
+            ).start()
+            return {
+                "ok": True,
+                "v": PROTOCOL_VERSION,
+                "queued": True,
+                "id": entry.id,
+                "to": entry.to_hex,
+                "expires_at": entry.expires_at,
+            }
+
+    def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
+        """Best-effort destination hash for a target that failed to resolve."""
+        if isinstance(target, Peer):
+            return target.destination_hash
+        if isinstance(target, bytes):
+            return target if len(target) == 16 else None
+        if isinstance(target, str):
+            try:
+                peer = self.registry.resolve(target)
+            except PeerError:
+                peer = None
+            if peer is not None:
+                return peer.destination_hash
+            value = target.strip()
+            if len(value) == 32:
+                try:
+                    return bytes.fromhex(value)
+                except ValueError:
+                    return None
+        return None
 
     def ping(
         self,

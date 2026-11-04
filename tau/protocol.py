@@ -16,9 +16,11 @@ or buggy peer must not be able to make us buffer large amounts of data.
 
 from __future__ import annotations
 
+import base64
 import json
 import time
-from typing import Any, Dict, Optional
+import uuid
+from typing import Any, Dict, List, Optional
 
 from . import __version__
 
@@ -35,11 +37,29 @@ MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ANNOUNCE_MAX_BYTES = 256
 
+# Store-and-forward mail: a sealed (encrypted + signed) message blob is
+# larger than a plain message — the plaintext envelope plus Reticulum
+# encryption overhead, base64 wrapped for JSON transport — so the mail
+# paths get a bigger, separate budget.  Every handler still enforces its
+# own per-path limit when parsing.
+MAX_MAIL_REQUEST_BYTES = 24 * 1024
+MAX_MAIL_BLOB_BYTES = 12 * 1024
+MAX_MAIL_TTL = 30 * 24 * 60 * 60
+
 REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
 REQUEST_PEERS = "/tau/peers"
-REQUEST_PATHS = (REQUEST_PING, REQUEST_INFO, REQUEST_MESSAGE, REQUEST_PEERS)
+REQUEST_MAIL_STORE = "/tau/mail/store"
+REQUEST_MAIL_FETCH = "/tau/mail/fetch"
+REQUEST_PATHS = (
+    REQUEST_PING,
+    REQUEST_INFO,
+    REQUEST_MESSAGE,
+    REQUEST_PEERS,
+    REQUEST_MAIL_STORE,
+    REQUEST_MAIL_FETCH,
+)
 
 
 class ProtocolError(ValueError):
@@ -124,7 +144,7 @@ def build_announce(name: str) -> bytes:
         "v": PROTOCOL_VERSION,
         "name": sanitize_name(name),
         "proto": APP_NAME,
-        "caps": ["message", "ping", "peers"],
+        "caps": ["message", "ping", "peers", "mail"],
     }
     data = encode(payload)
     # Reticulum announces have a very small payload budget.  Shorten the name
@@ -164,15 +184,27 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
     }
 
 
-def encode_message(text: str) -> bytes:
+def generate_message_id() -> str:
+    """Return a fresh random message identifier (32 hex characters)."""
+    return uuid.uuid4().hex
+
+
+def encode_message(
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+) -> bytes:
     """Encode a chat message for the ``/tau/message`` request."""
     payload = {
         "type": "message",
         "v": PROTOCOL_VERSION,
         "text": normalize_message(text),
-        "sent_at": time.time(),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
         "client": f"tau/{__version__}",
     }
+    if message_id:
+        payload["id"] = message_id
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -185,7 +217,96 @@ def parse_message(raw: Any) -> Dict[str, Any]:
     sent_at = payload.get("sent_at")
     if not isinstance(sent_at, (int, float)):
         sent_at = None
-    return {"text": text, "sent_at": sent_at}
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    return {"text": text, "sent_at": sent_at, "id": message_id}
+
+
+def _clean_hexhash(value: Any, field: str) -> str:
+    if not isinstance(value, str) or len(value) != 32:
+        raise ProtocolError(f"{field} must be a 32 character hex hash")
+    try:
+        bytes.fromhex(value)
+    except ValueError as exc:
+        raise ProtocolError(f"{field} must be a 32 character hex hash") from exc
+    return value.lower()
+
+
+def _clean_message_id(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ProtocolError("message id must be a string of 1-64 characters")
+    return value
+
+
+def build_mail_store(
+    *, to: str, message_id: str, blob: bytes, expires_at: float
+) -> bytes:
+    """Encode a ``/tau/mail/store`` request: hold *blob* for a peer."""
+    payload = {
+        "type": "mail_store",
+        "v": PROTOCOL_VERSION,
+        "to": _clean_hexhash(to, "to"),
+        "id": _clean_message_id(message_id),
+        "blob": base64.b64encode(blob).decode("ascii"),
+        "expires_at": float(expires_at),
+    }
+    return encode(payload, max_bytes=MAX_MAIL_REQUEST_BYTES)
+
+
+def parse_mail_store(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/mail/store`` request body."""
+    payload = decode(raw, max_bytes=MAX_MAIL_REQUEST_BYTES)
+    if payload.get("type") != "mail_store":
+        raise ProtocolError("expected a mail_store payload")
+    to = _clean_hexhash(payload.get("to"), "to")
+    message_id = _clean_message_id(payload.get("id"))
+    blob_text = payload.get("blob")
+    if not isinstance(blob_text, str) or not blob_text:
+        raise ProtocolError("blob must be a base64 string")
+    if len(blob_text) > 4 * (MAX_MAIL_BLOB_BYTES // 3 + 2):
+        raise ProtocolError("blob is too large")
+    try:
+        blob = base64.b64decode(blob_text, validate=True)
+    except ValueError as exc:
+        raise ProtocolError("blob is not valid base64") from exc
+    if len(blob) > MAX_MAIL_BLOB_BYTES:
+        raise ProtocolError(
+            f"blob of {len(blob)} bytes exceeds the {MAX_MAIL_BLOB_BYTES} byte limit"
+        )
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        raise ProtocolError("expires_at must be a number")
+    return {
+        "to": to,
+        "id": message_id,
+        "blob": blob,
+        "expires_at": float(expires_at),
+    }
+
+
+def build_mail_fetch(ack_ids: List[str] = ()) -> bytes:
+    """Encode a ``/tau/mail/fetch`` request, acking delivered mail ids."""
+    payload = {
+        "type": "mail_fetch",
+        "v": PROTOCOL_VERSION,
+        "ack": [_clean_message_id(mid) for mid in list(ack_ids)[:100]],
+    }
+    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+
+
+def parse_mail_fetch(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/mail/fetch`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "mail_fetch":
+        raise ProtocolError("expected a mail_fetch payload")
+    ack = payload.get("ack")
+    if not isinstance(ack, list):
+        ack = []
+    cleaned = [
+        mid for mid in ack if isinstance(mid, str) and 0 < len(mid) <= 64
+    ][:100]
+    return {"ack": cleaned}
 
 
 def response_ok(**fields: Any) -> bytes:

@@ -18,6 +18,7 @@ APP_DIR_NAME = APP_NAME
 NODE_FILE_NAME = "node.json"
 IDENTITY_FILE_NAME = "identity"
 PEERS_FILE_NAME = "peers.json"
+MAILBOX_FILE_NAME = "mailbox.json"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
 
@@ -40,6 +41,7 @@ class TauConfig:
     rns_config_dir: Path
     identity_path: Path
     peers_path: Path
+    mailbox_path: Path
     node_file: Path
     name: str
     rns_loglevel: int = 2
@@ -70,6 +72,7 @@ class TauConfig:
             rns_config_dir=rns_dir,
             identity_path=base / IDENTITY_FILE_NAME,
             peers_path=base / PEERS_FILE_NAME,
+            mailbox_path=base / MAILBOX_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
