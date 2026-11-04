@@ -454,3 +454,49 @@ def test_cli_like_and_unlike(tmp_path):
         assert like_counts(conn, [post["hash"]])[post["hash"]]["likes"] == 0
     finally:
         conn.close()
+
+
+def test_create_post_rejects_oversize_encoded_post(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    # 2,000 four-byte characters pass the character limit but encode to
+    # more than the 8 KiB request budget: the post could never be
+    # published, so it must not be stored as chain head either.
+    with pytest.raises(PostError):
+        create_post(conn, alice, "\U0001F600" * 2000, name="alice", now=1000)
+    assert head(conn, author_of(alice)) is None
+    assert feed(conn, author=author_of(alice)) == []
+
+    # The chain is not poisoned: a normal post still becomes the head.
+    post = create_post(conn, alice, "fits fine", name="alice", now=1001)
+    assert head(conn, author_of(alice)) == post["hash"]
+
+
+def test_multibyte_post_under_budget_is_accepted(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "\U0001F600" * 1500, name="alice", now=1000)
+    assert verify_post(post)["hash"] == post["hash"]
+    # And its real publish envelope fits the request budget.
+    payload = encode({"post": post, "ttl": 3}, max_bytes=8 * 1024)
+    assert len(payload) <= 8 * 1024
+
+
+def test_store_rejects_oversize_post_from_a_peer(identities, tmp_path):
+    alice, _ = identities
+    body = {
+        "v": 1,
+        "author": author_of(alice),
+        "key": alice.get_public_key().hex(),
+        "name": "alice",
+        "text": "\U0001F600" * 2000,
+        "created_at": 1000.0,
+        "prev": "",
+    }
+    digest = hash(body, previous="")
+    mesg = dict(body, hash=digest, sig=alice.sign(bytes.fromhex(digest)).hex())
+    with pytest.raises(PostError):
+        verify_post(mesg)
+    conn = init_db(tmp_path / "tan.sqlite3")
+    with pytest.raises(PostError):
+        store_post(conn, mesg)

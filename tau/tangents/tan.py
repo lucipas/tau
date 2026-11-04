@@ -285,7 +285,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
             raise PostError("posts cannot carry a reaction target")
         target = ""
 
-    return {
+    post = {
         "v": TAN_VERSION,
         "author": author,
         "key": key,
@@ -296,6 +296,30 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "kind": kind,
         "target": target,
     }
+    _check_wire_size(post)
+    return post
+
+
+def _check_wire_size(post: Dict[str, Any]) -> None:
+    """Reject an entry whose publish envelope exceeds the request budget.
+
+    The character limit alone is not enough: 2,000 four-byte characters
+    pass it but overflow the 8 KiB ``/tan/post`` request once encoded.
+    Such a post must be rejected *before* it is stored — otherwise it
+    sits as the author's chain head, undeliverable, and retrying the
+    post forks a duplicate.  Hash and signature are fixed-length hex,
+    so placeholders give the exact encoded size of the real envelope.
+    """
+    wire = _canonical_post(
+        {**post, "hash": "0" * HASH_HEX_LENGTH, "sig": "0" * SIG_HEX_LENGTH}
+    )
+    try:
+        encode({"post": wire, "ttl": MAX_GOSSIP_TTL}, max_bytes=MAX_REQUEST_BYTES)
+    except ProtocolError as exc:
+        raise PostError(
+            f"entry exceeds the {MAX_REQUEST_BYTES} byte encoded limit "
+            "for a Tan request; shorten the post"
+        ) from exc
 
 
 def _identity_from_post(post: Dict[str, Any]) -> RNS.Identity:
