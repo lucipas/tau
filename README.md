@@ -220,10 +220,11 @@ Global options may appear before or after the command:
 | `tau init` | Create the data directory, identity and Reticulum config |
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
-| `tau send --to PEER TEXT` | Send a message over an encrypted link |
+| `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry |
+| `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan timeline` | Show your posts and the authors you follow |
@@ -257,6 +258,12 @@ tau tan sync --explore
 tau send --to alice --file message.txt
 echo "piped message" | tau send --to alice
 
+# Fail fast instead of queueing when the peer is offline
+tau send --to alice "hi" --no-queue
+
+# See what is waiting on offline peers
+tau outbox
+
 # Only show peers heard from in the last day
 tau peers --max-age 1
 
@@ -279,7 +286,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── identity              # private key, chmod 600 — this is your address
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
-├── tan.sqlite3           # Tan posts, follows and hash-chain heads
+├── mailbox.json          # store-and-forward queues, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration
     └── storage/          # Reticulum internals (paths, ratchets, ...)
@@ -309,7 +316,7 @@ identity matters.
 jitter). The announce carries a small, signed JSON payload:
 
 ```json
-{"v": 1, "name": "alice", "proto": "tau", "caps": ["message", "ping", "peers"]}
+{"v": 1, "name": "alice", "proto": "tau", "caps": ["message", "ping", "peers", "mail"]}
 ```
 
 Reticulum verifies the signature and distributes the announce through the
@@ -330,6 +337,26 @@ request paths are implemented:
 | `/tau/info` | `{}` | name, destination, versions, uptime, peer/interface counts |
 | `/tau/message` | `{"type": "message", "v": 1, "text": "...", "sent_at": ...}` | `{"ok": true, "echo": "...", "server": ..., "node": ...}` |
 | `/tau/peers` | `{}` | up to 100 public peer records |
+| `/tau/mail/store` | `{"type": "mail_store", "to": ..., "id": ..., "blob": ..., "expires_at": ...}` | hold a sealed message for an offline peer |
+| `/tau/mail/fetch` | `{"type": "mail_fetch", "ack": [...]}` | hand over held mail for the caller, dropping acked ids |
+
+### Store-and-forward
+
+Direct delivery needs both nodes online at once. When a send cannot reach
+its peer, the message is not lost — it lands in the sender's **outbox**
+(`mailbox.json`, kept for 7 days) and is delivered automatically the next
+time the recipient is heard from. While it waits, the sender also leaves
+**sealed copies** with up to three reachable peers: the message is encrypted
+to the recipient and signed by the sender, so a holder learns only the
+recipient hash, the message id and the expiry — never the content, and it
+cannot forge a message in the sender's name. When the recipient later meets
+any holder, it fetches its envelopes, verifies and decrypts them locally,
+and acks them so holders can drop their copies. Every message carries a
+unique id, and each node remembers ids it has already shown, so direct,
+retried and relayed copies of the same message are delivered to the user
+exactly once. Holders cap what they keep (512 envelopes total, 64 per
+recipient) and everything expires. `tau outbox` shows what is waiting;
+`tau send --no-queue` restores the old fail-fast behaviour.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:
@@ -343,9 +370,15 @@ buggy peer cannot force unbounded buffering:
 | Node name | 48 characters |
 | Peers per `/tau/peers` response | 100 |
 | Peer registry size | 256 entries |
+| Mail store/fetch request | 24 KiB |
+| Sealed message blob | 12 KiB |
+| Outbox / held envelopes | 256 / 512 (64 per recipient) |
+| Queued message lifetime | 7 days |
 
 Names and messages are stripped of control characters (including terminal
-escape sequences) before display, and message text is never written to disk.
+escape sequences) before display. Delivered messages are not written to
+disk; a message waiting in the outbox is stored in `mailbox.json` (mode
+`0600`) until it is delivered or expires.
 
 ### Tan posts
 
@@ -399,8 +432,13 @@ as orphans and linked automatically when the parent arrives.
   that were relayed by a third party. Names are still self-asserted.
 - **Not anonymous.** The destination hash is a stable pseudonym. Peers can
   correlate your identity across sessions and transports.
-- **No store-and-forward.** If the peer is offline, the send fails. Messages
-  are not queued, relayed or persisted by tau.
+- **Store-and-forward is sealed.** Queued messages wait in the sender's
+  outbox in plaintext (`mailbox.json`, mode `0600` — protect it like the
+  peer registry). Copies left with other peers are encrypted to the
+  recipient and signed by the sender: a holder sees only the recipient
+  hash, an id and an expiry, cannot read the content, and cannot forge a
+  message, because the recipient verifies the signature against the
+  sender key inside the envelope.
 - **Identity is the trust anchor.** Protect `identity`; it is stored with mode
   `0600`. The peer registry is also `0600` and contains only public keys and
   announce metadata.
@@ -410,8 +448,10 @@ as orphans and linked automatically when the parent arrives.
 
 ## Limitations and possible next steps
 
-- Live, direct delivery only — no offline mailbox or store-and-forward layer
-  (LXMF would be the natural fit).
+- Store-and-forward is best-effort: a queued message is delivered when the
+  sender next hears from the recipient or from a peer holding a sealed
+  copy, and it expires after 7 days undelivered. There is no guarantee a
+  holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
 - Tan is a public timeline: no private posts, likes, comments, media or
   deletions yet. It is not a full ActivityPub-style federation protocol.

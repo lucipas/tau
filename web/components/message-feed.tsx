@@ -167,7 +167,13 @@ function MessageBubble({ message }: { message: TauMessage }) {
             outbound ? "text-signal/70" : "text-mist/60"
           }`}
         >
-          <span>{outbound ? "delivered" : "received"}</span>
+          <span>
+            {outbound
+              ? message.status === "queued"
+                ? "queued"
+                : "delivered"
+              : "received"}
+          </span>
           {message.rtt_ms !== undefined ? (
             <span>· rtt {formatRtt(message.rtt_ms)}</span>
           ) : null}

@@ -362,6 +362,7 @@ class WebBridge:
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.send_message(peer, text, timeout=timeout)
+        queued = bool(response.get("queued"))
         message = self._append_message(
             direction="out",
             peer=peer.hexhash,
@@ -369,7 +370,7 @@ class WebBridge:
             text=text,
             sent_at=time.time(),
             received_at=time.time(),
-            status="delivered",
+            status="queued" if queued else "delivered",
             rtt=_as_float(response.get("_rtt")),
         )
         self.bus.publish({"type": "message", "message": message})
