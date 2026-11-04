@@ -19,6 +19,7 @@ NODE_FILE_NAME = "node.json"
 IDENTITY_FILE_NAME = "identity"
 PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
+SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
 

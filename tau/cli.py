@@ -302,6 +302,104 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outbox.set_defaults(func=cmd_outbox)
 
+    tan = subparsers.add_parser(
+        "tan",
+        parents=[common],
+        help="use the Tan federated social feed",
+    )
+    tan_sub = tan.add_subparsers(dest="tan_command", metavar="TAN_COMMAND")
+    tan_sub.required = True
+
+    tan_post = tan_sub.add_parser(
+        "post",
+        parents=[common],
+        help="sign and store a post, then publish it to known peers",
+    )
+    tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
+    tan_post.add_argument("--file", type=Path, help="read the post text from a file")
+    tan_post.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_post.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_post.set_defaults(func=cmd_tan_post)
+
+    tan_timeline = tan_sub.add_parser(
+        "timeline",
+        parents=[common],
+        help="show posts from you and the authors you follow",
+    )
+    tan_timeline.add_argument(
+        "--all", action="store_true", help="show every cached post"
+    )
+    tan_timeline.add_argument(
+        "--author", metavar="NAME|HASH", help="show one author's posts"
+    )
+    tan_timeline.add_argument(
+        "--limit", type=int, default=30, metavar="N", help="maximum posts"
+    )
+    tan_timeline.set_defaults(func=cmd_tan_timeline)
+
+    tan_follow = tan_sub.add_parser(
+        "follow", parents=[common], help="follow a peer or author"
+    )
+    tan_follow.add_argument("target", metavar="NAME|HASH")
+    tan_follow.set_defaults(func=cmd_tan_follow)
+
+    tan_unfollow = tan_sub.add_parser(
+        "unfollow", parents=[common], help="stop following an author"
+    )
+    tan_unfollow.add_argument("target", metavar="NAME|HASH")
+    tan_unfollow.set_defaults(func=cmd_tan_unfollow)
+
+    tan_following = tan_sub.add_parser(
+        "following", parents=[common], help="list followed authors"
+    )
+    tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_sync = tan_sub.add_parser(
+        "sync",
+        parents=[common],
+        help="pull missing posts from known peers",
+    )
+    tan_sync.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="sync only with these peers (repeatable)",
+    )
+    tan_sync.add_argument(
+        "--author",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="sync only these authors (repeatable)",
+    )
+    tan_sync.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="posts per request (default: %(default)s)",
+    )
+    tan_sync.add_argument(
+        "--explore",
+        action="store_true",
+        help="also fetch recent public posts to discover new authors",
+    )
+    tan_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_sync.set_defaults(func=cmd_tan_sync)
+
     return parser
 
 

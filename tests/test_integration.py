@@ -250,6 +250,253 @@ def test_store_and_forward_delivers_when_peer_returns(tmp_path: Path) -> None:
         )
     )
     alice_hash = alice_init["destination"]
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(bob_dir),
+            "--name",
+            "bob",
+            "--tcp-connect",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+
+        # Bob learns who alice is while she is online.
+        discovered = {}
+        for _ in range(3):
+            result = run_tau(
+                "discover",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "6",
+                "--json",
+                timeout=40.0,
+            )
+            payload = json.loads(require_ok(result))
+            discovered = {
+                peer["destination"]: peer for peer in payload.get("peers", [])
+            }
+            if alice_hash in discovered:
+                break
+        assert alice_hash in discovered, alice_err.read_text()
+    finally:
+        stop_process(alice)
+
+    # Alice goes offline. Bob's message must queue, not vanish.
+    sent = run_tau(
+        "send",
+        "--data-dir",
+        str(bob_dir),
+        "--to",
+        alice_hash,
+        "while you were away",
+        "--timeout",
+        "8",
+        "--discover-timeout",
+        "3",
+        "--json",
+        timeout=90.0,
+    )
+    response = json.loads(require_ok(sent))
+    assert response["queued"] is True, response
+
+    outbox = json.loads(
+        require_ok(
+            run_tau("outbox", "--data-dir", str(bob_dir), "--json", timeout=30.0)
+        )
+    )
+    assert outbox["count"] == 1
+
+    # Both come back; bob's node must hand the queued message over.
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    bob_out = tmp_path / "bob.out"
+    bob_err = tmp_path / "bob.err"
+    bob = None
+    try:
+        time.sleep(2.0)
+        bob = start_serve(bob_dir, bob_out, bob_err)
+        assert wait_for_text(alice_out, "while you were away"), (
+            f"alice never received the queued message\n"
+            f"alice err:\n{alice_err.read_text()}\n"
+            f"bob err:\n{bob_err.read_text()}"
+        )
+    finally:
+        if bob is not None:
+            stop_process(bob)
+        stop_process(alice)
+
+    outbox = json.loads(
+        require_ok(
+            run_tau("outbox", "--data-dir", str(bob_dir), "--json", timeout=30.0)
+        )
+    )
+    assert outbox["count"] == 0
+
+
+def init_node(tmp_path: Path, name: str, *extra: str) -> dict:
+    return json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(tmp_path / name),
+                "--name",
+                name,
+                "--no-auto-interface",
+                "--json",
+                *extra,
+            )
+        )
+    )
+
+
+def discover_until(data_dir: Path, wanted_hash: str, attempts: int = 4) -> dict:
+    discovered = {}
+    for _ in range(attempts):
+        result = run_tau(
+            "discover",
+            "--data-dir",
+            str(data_dir),
+            "--duration",
+            "6",
+            "--json",
+            timeout=40.0,
+        )
+        payload = json.loads(require_ok(result))
+        discovered = {peer["destination"]: peer for peer in payload.get("peers", [])}
+        if wanted_hash in discovered:
+            break
+    return discovered
+
+
+def test_relay_delivers_via_a_holding_peer(tmp_path: Path) -> None:
+    """Bob -> (alice offline) -> sealed copy with carol -> alice collects."""
+    alice_port = free_port()
+    carol_port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+    carol_dir = tmp_path / "carol"
+
+    alice_hash = init_node(
+        tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{alice_port}"
+    )["destination"]
+    init_node(tmp_path, "carol", "--tcp-connect", f"127.0.0.1:{alice_port}")
+    init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{carol_port}")
+
+    # Carol becomes a transport node and also listens for bob, so the
+    # chain bob <-> carol <-> alice can carry announces and packets.
+    carol_config = carol_dir / "reticulum" / "config"
+    text = carol_config.read_text(encoding="utf-8")
+    text = text.replace("enable_transport = No", "enable_transport = Yes")
+    text += (
+        "\n  [[TCP Server]]\n"
+        "    type = TCPServerInterface\n"
+        "    interface_enabled = True\n"
+        "    listen_ip = 127.0.0.1\n"
+        f"    listen_port = {carol_port}\n"
+    )
+    carol_config.write_text(text, encoding="utf-8")
+
+    alice_out, alice_err = tmp_path / "alice.out", tmp_path / "alice.err"
+    carol_out, carol_err = tmp_path / "carol.out", tmp_path / "carol.err"
+    bob_out, bob_err = tmp_path / "bob.out", tmp_path / "bob.err"
+
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    carol = None
+    bob = None
+    try:
+        time.sleep(2.0)
+        carol = start_serve(carol_dir, carol_out, carol_err)
+        time.sleep(2.0)
+        # Bob learns about alice (and her public key) through carol.
+        discovered = discover_until(bob_dir, alice_hash)
+        assert alice_hash in discovered, carol_err.read_text()
+    finally:
+        stop_process(alice)
+
+    try:
+        # Alice is offline now. Bob sends; the message queues, and once
+        # bob's node is serving it leaves a sealed copy with carol.
+        sent = run_tau(
+            "send",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            "carried by carol",
+            "--timeout",
+            "8",
+            "--discover-timeout",
+            "3",
+            "--json",
+            timeout=90.0,
+        )
+        assert json.loads(require_ok(sent))["queued"] is True
+
+        bob = start_serve(bob_dir, bob_out, bob_err)
+        mailbox_file = carol_dir / "mailbox.json"
+        deadline = time.time() + 90
+        held = 0
+        while time.time() < deadline:
+            if mailbox_file.exists():
+                held = len(json.loads(mailbox_file.read_text())["held"])
+                if held >= 1:
+                    break
+            time.sleep(1.0)
+        assert held >= 1, (
+            f"carol never received a sealed copy\ncarol err:\n{carol_err.read_text()}"
+        )
+        stop_process(bob)
+        bob = None
+
+        # Alice returns while bob stays offline: only the relay can deliver.
+        alice = start_serve(alice_dir, alice_out, alice_err)
+        assert wait_for_text(alice_out, "carried by carol", timeout=150), (
+            f"alice never collected the relayed message\n"
+            f"alice err:\n{alice_err.read_text()}\n"
+            f"carol err:\n{carol_err.read_text()}"
+        )
+        assert '"relayed": true' in alice_out.read_text(encoding="utf-8")
+        stop_process(alice)
+    finally:
+        if bob is not None:
+            stop_process(bob)
+        if carol is not None:
+            stop_process(carol)
+
+
+def test_two_nodes_exchange_tan_posts(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
 
     require_ok(
         run_tau(
