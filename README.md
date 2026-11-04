@@ -236,6 +236,7 @@ Global options may appear before or after the command:
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
 | `tau tan sync` | Pull missing posts from known peers |
+| `tau tan rules` | Show or change which remote entries get committed |
 
 Useful flags:
 
@@ -440,6 +441,32 @@ tau tan timeline               # shows ♥ counts under each post
 
 The web console shows the same counts with a ♥ toggle on every post
 (`POST /api/tan/like` / `POST /api/tan/unlike`).
+
+### Admission rules
+
+By default a node commits any well-signed entry a peer pushes to it. The
+owner can decide otherwise with an admission ruleset, stored as
+`tan-rules.json` in the data directory and managed via the CLI:
+
+```bash
+tau tan rules                                  # show the current ruleset
+tau tan rules --default deny                   # admit nobody by default
+tau tan rules --allow-author alice             # ...except alice
+tau tan rules --followed-only                  # ...and authors you follow
+tau tan rules --block-author 5c04c868          # never admit this author
+tau tan rules --kinds post                     # posts only, no reactions
+```
+
+Rules are evaluated for remote entries only — pushes to `/tan/post` and
+posts imported by `tan sync` — after the entry's signature has been
+verified, so an author identity cannot be spoofed. Order: the node's own
+author is always admitted, the block list denies, the kind filter
+denies, the allow list and (optionally) followed authors admit, and
+everything else falls to the default policy. Entries you create yourself
+are never filtered, and with no rules file everything is admitted, as
+before. A rules file that cannot be parsed fails closed (remote entries
+denied) rather than silently opening the node up. A running `serve`
+applies saved rules when it restarts.
 
 ## Security model
 
