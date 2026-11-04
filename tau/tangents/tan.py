@@ -228,7 +228,12 @@ def hash(mesg: Dict[str, Any], previous: Optional[str] = None) -> str:
     return digest.hexdigest()
 
 
-def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+def _normalize_post(
+    mesg: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+    enforce_wire_size: bool = True,
+) -> Dict[str, Any]:
     """Validate and normalise the signed part of a post."""
     if not isinstance(mesg, dict):
         raise PostError("post must be a JSON object")
@@ -257,8 +262,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         # Reactions carry no text; normalize_message would also reject the
         # empty string it requires here.
         if raw_text not in (None, ""):
-            raise PostError("reaction entries cannot carry text")
-        text = ""
+            rai        text = ""
     else:
         text = normalize_message(raw_text)
         if text != raw_text:
@@ -296,7 +300,8 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "kind": kind,
         "target": target,
     }
-    _check_wire_size(post)
+    if enforce_wire_size:
+        _check_wire_size(post)
     return post
 
 
@@ -542,13 +547,23 @@ def store_post(
     *,
     now: Optional[float] = None,
     verify: bool = True,
+    enforce_wire_size: bool = True,
 ) -> Tuple[Dict[str, Any], bool]:
-    """Validate and store a post, returning ``(post, is_new)``."""
+    """Validate and store a post, returning ``(post, is_new)``.
+
+    ``enforce_wire_size`` applies the publish-request budget.  Feed imports
+    pass ``False`` so that already-signed posts stored by older versions,
+    which fit the larger feed response, can still advance a peer's chain.
+    """
     timestamp = float(now if now is not None else time.time())
     if verify:
-        post = verify_post(mesg, now=timestamp)
+        post = verify_post(
+            mesg, now=timestamp, enforce_wire_size=enforce_wire_size
+        )
     else:
-        base = _normalize_post(mesg, now=timestamp)
+        base = _normalize_post(
+            mesg, now=timestamp, enforce_wire_size=enforce_wire_size
+        )
         post = dict(base)
         post["hash"] = hash(base, previous=base["prev"])
         post["sig"] = _require_hex(mesg.get("sig"), SIG_HEX_LENGTH, "sig")
@@ -1206,7 +1221,9 @@ class TanApp:
                             if not isinstance(raw, dict):
                                 continue
                             try:
-                                _, is_new = store_post(conn, raw)
+                                _, is_new = store_post(
+                                    conn, raw, enforce_wire_size=False
+                                )
                             except PostError as exc:
                                 errors.append(
                                     {
@@ -1253,7 +1270,9 @@ class TanApp:
                         if not isinstance(raw, dict):
                             continue
                         try:
-                            _, is_new = store_post(conn, raw)
+                            _, is_new = store_post(
+                                conn, raw, enforce_wire_size=False
+                            )
                         except PostError as exc:
                             errors.append(
                                 {
