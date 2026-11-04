@@ -38,6 +38,19 @@ export function SocialConsole() {
     }
   }
 
+  async function toggleLike(post: TanPost) {
+    setError(null);
+    try {
+      if (post.liked) {
+        await tan.unlike(post.hash);
+      } else {
+        await tan.like(post.hash);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
   async function submitSync() {
     setError(null);
     setMessage(null);
@@ -224,7 +237,9 @@ export function SocialConsole() {
                 {tan.posts.length === 0 ? (
                   <EmptyState />
                 ) : (
-                  tan.posts.map((post) => <PostCard key={post.hash} post={post} />)
+                  tan.posts.map((post) => (
+                    <PostCard key={post.hash} post={post} onToggleLike={toggleLike} />
+                  ))
                 )}
               </div>
             </section>
@@ -300,7 +315,13 @@ function EmptyState() {
   );
 }
 
-function PostCard({ post }: { post: TanPost }) {
+function PostCard({
+  post,
+  onToggleLike,
+}: {
+  post: TanPost;
+  onToggleLike: (post: TanPost) => void;
+}) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   return (
     <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
@@ -329,6 +350,19 @@ function PostCard({ post }: { post: TanPost }) {
             </span>
             <span>{shortHash(post.hash, 16)}</span>
             <CopyButton value={post.hash} label="hash" className="!px-1.5 !py-0.5" />
+            <button
+              type="button"
+              onClick={() => onToggleLike(post)}
+              aria-pressed={Boolean(post.liked)}
+              title={post.liked ? "Unlike this post" : "Like this post"}
+              className={`rounded border px-1.5 py-0.5 transition-colors ${
+                post.liked
+                  ? "border-rose-400/40 bg-rose-400/10 text-rose-300"
+                  : "border-line/70 bg-panel/60 text-mist/80 hover:text-rose-300"
+              }`}
+            >
+              ♥ {post.likes ?? 0}
+            </button>
           </div>
         </div>
       </div>

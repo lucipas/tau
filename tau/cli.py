@@ -31,12 +31,14 @@ from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
+    annotate_reactions,
     author_stats,
     feed,
     follow,
     following,
     init_db,
     resolve_author,
+    resolve_post,
     timeline,
     unfollow,
 )
@@ -332,6 +334,36 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
+
+    for verb, help_text in (
+        ("like", "like a post (writes a signed like entry to your chain)"),
+        ("unlike", "remove your like from a post (writes an unlike entry)"),
+    ):
+        tan_react = tan_sub.add_parser(verb, parents=[common], help=help_text)
+        tan_react.add_argument(
+            "target", metavar="POST", help="post hash or unique hash prefix"
+        )
+        tan_react.add_argument(
+            "--to",
+            action="append",
+            default=None,
+            metavar="NAME|HASH",
+            help="publish only to these peers (repeatable)",
+        )
+        tan_react.add_argument(
+            "--no-publish",
+            action="store_true",
+            help="store locally without contacting peers",
+        )
+        tan_react.add_argument(
+            "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+        )
+        tan_react.add_argument(
+            "--timeout", type=float, default=15.0, metavar="SECONDS"
+        )
+        tan_react.set_defaults(
+            func=cmd_tan_like if verb == "like" else cmd_tan_unlike
+        )
 
     tan_timeline = tan_sub.add_parser(
         "timeline",
@@ -648,9 +680,13 @@ def _print_tan_posts(posts: Sequence[Dict[str, Any]], *, json_output: bool) -> N
         when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
             "%Y-%m-%d %H:%M"
         )
-        print(f"[{when}] {name} ({author})")
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        likes = int(post.get("likes") or 0)
+        if likes or post.get("liked"):
+            suffix = " (you liked this)" if post.get("liked") else ""
+            print(f"  ♥ {likes}{suffix}")
 
 
 def _tan_identity(config: TauConfig) -> Any:
@@ -707,24 +743,91 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _cmd_tan_react(args: argparse.Namespace, *, liked: bool) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        target = resolve_post(conn, args.target)["hash"]
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.react(target, liked=liked)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            record = app.react(target, liked=liked)
+            published = app.publish(
+                record,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"reaction": record, "published": published}, True)
+    else:
+        verb = "liked" if liked else "unliked"
+        print(f"{verb} {short_hash(target)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_like(args: argparse.Namespace) -> int:
+    return _cmd_tan_react(args, liked=True)
+
+
+def cmd_tan_unlike(args: argparse.Namespace) -> int:
+    return _cmd_tan_react(args, liked=False)
+
+
 def cmd_tan_timeline(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
     conn = init_db(config.social_db_path)
     try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
         if getattr(args, "author", None):
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
-            posts = list(reversed(feed(conn, author=author, limit=args.limit)))
+            posts = list(
+                reversed(
+                    feed(conn, author=author, limit=args.limit, posts_only=True)
+                )
+            )
+            posts = annotate_reactions(conn, posts, viewer=viewer)
         elif getattr(args, "all", False):
-            posts = timeline(conn, include_all=True, limit=args.limit)
+            posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
         else:
             authors = [record["author"] for record in following(conn)]
-            identity = load_identity(config.identity_path)
-            if identity is not None:
-                authors.append(destination_hash(identity).hex())
-            posts = timeline(conn, authors, limit=args.limit)
+            if viewer is not None:
+                authors.append(viewer)
+            posts = timeline(conn, authors, limit=args.limit, viewer=viewer)
     finally:
         conn.close()
     _print_tan_posts(posts, json_output=json_output)

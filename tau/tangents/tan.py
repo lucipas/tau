@@ -15,6 +15,20 @@ A post is the signed record::
       "sig": "<128 hex Ed25519 signature over the hash>"
     }
 
+Reactions are chain entries of the same shape, written by the *reactor* onto
+their own chain with two extra signed fields::
+
+    {
+      ...same fields, with "text": "",
+      "kind": "like" | "unlike",
+      "target": "<64 hex hash of the post being reacted to>"
+    }
+
+A like is therefore committed like any other envelope: signed, hash-chained,
+gossipped and synced.  A post's like count is derived, never stored: for each
+reactor, their latest like/unlike entry for that post decides whether their
+like currently stands.
+
 The hash chain makes edits and reordering detectable, while the signature makes
 a post verifiable even when it is relayed by a node that does not own the
 author's identity.  Nodes can therefore cache and re-serve posts for each other.
@@ -86,6 +100,16 @@ MAX_SYNC_PAGES = 32
 # described ("cat the previous hash to the new message and hash it").
 HASH_FIELDS = ("v", "author", "key", "name", "text", "created_at")
 
+KIND_POST = "post"
+KIND_LIKE = "like"
+KIND_UNLIKE = "unlike"
+REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
+ENTRY_KINDS = (KIND_POST,) + REACTION_KINDS
+
+# Reaction envelopes sign two extra fields on top of the post fields, so a
+# reaction's target cannot be swapped without invalidating its signature.
+REACTION_HASH_FIELDS = HASH_FIELDS + ("kind", "target")
+
 # Column order used by every SELECT so rows can be converted consistently.
 _POST_COLUMNS = (
     "v",
@@ -100,6 +124,8 @@ _POST_COLUMNS = (
     "sig",
     "seq",
     "linked",
+    "kind",
+    "target",
 )
 
 
@@ -136,8 +162,15 @@ def _require_timestamp(value: Any, field: str) -> float:
     return timestamp
 
 
+def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
+    """Fields covered by the hash for *mesg*, based on its entry kind."""
+    if mesg.get("kind") in REACTION_KINDS:
+        return REACTION_HASH_FIELDS
+    return HASH_FIELDS
+
+
 def _canonical_body(post: Dict[str, Any]) -> bytes:
-    body = {field: post[field] for field in HASH_FIELDS}
+    body = {field: post[field] for field in _hash_fields_for(post)}
     return json.dumps(
         body,
         ensure_ascii=False,
@@ -148,7 +181,7 @@ def _canonical_body(post: Dict[str, Any]) -> bytes:
 
 
 def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the public, canonical representation of a post."""
+    """Return the public, canonical representation of a chain entry."""
     return {
         "v": post["v"],
         "author": post["author"],
@@ -159,6 +192,8 @@ def _canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
         "prev": post["prev"],
         "hash": post["hash"],
         "sig": post["sig"],
+        "kind": post.get("kind") or KIND_POST,
+        "target": post.get("target") or "",
     }
 
 
@@ -183,7 +218,7 @@ def hash(mesg: Dict[str, Any], previous: Optional[str] = None) -> str:
     if previous and len(previous) != HASH_HEX_LENGTH:
         raise PostError(f"prev must be {HASH_HEX_LENGTH} hex characters")
 
-    missing = [field for field in HASH_FIELDS if field not in mesg]
+    missing = [field for field in _hash_fields_for(mesg) if field not in mesg]
     if missing:
         raise PostError(f"post is missing fields: {', '.join(missing)}")
 
@@ -213,12 +248,23 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
     if prev:
         _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
+    kind = mesg.get("kind", KIND_POST)
+    if kind not in ENTRY_KINDS:
+        raise PostError(f"unsupported entry kind: {kind!r}")
+
     raw_text = mesg.get("text")
-    text = normalize_message(raw_text)
-    if text != raw_text:
-        # Posts are hashed before they reach us.  Silently cleaning the text
-        # would produce a hash that no longer matches what the author signed.
-        raise PostError("post text is not normalised")
+    if kind in REACTION_KINDS:
+        # Reactions carry no text; normalize_message would also reject the
+        # empty string it requires here.
+        if raw_text not in (None, ""):
+            raise PostError("reaction entries cannot carry text")
+        text = ""
+    else:
+        text = normalize_message(raw_text)
+        if text != raw_text:
+            # Posts are hashed before they reach us.  Silently cleaning the text
+            # would produce a hash that no longer matches what the author signed.
+            raise PostError("post text is not normalised")
 
     raw_name = mesg.get("name", "")
     name = sanitize_name(raw_name)
@@ -229,6 +275,16 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
     if now is not None and created_at > float(now) + 86400.0:
         raise PostError("post timestamp is too far in the future")
 
+    raw_target = mesg.get("target", "")
+    if raw_target is None:
+        raw_target = ""
+    if kind in REACTION_KINDS:
+        target = _require_hex(raw_target, HASH_HEX_LENGTH, "target")
+    else:
+        if raw_target not in ("", None):
+            raise PostError("posts cannot carry a reaction target")
+        target = ""
+
     return {
         "v": TAN_VERSION,
         "author": author,
@@ -237,6 +293,8 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         "text": text,
         "created_at": created_at,
         "prev": prev,
+        "kind": kind,
+        "target": target,
     }
 
 
@@ -301,7 +359,9 @@ CREATE TABLE IF NOT EXISTS posts (
     received_at REAL NOT NULL,
     sig TEXT NOT NULL,
     seq INTEGER NOT NULL DEFAULT 0,
-    linked INTEGER NOT NULL DEFAULT 0
+    linked INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'post',
+    target TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS posts_author_seq ON posts(author, seq);
@@ -353,6 +413,16 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     }
     if columns and "v" not in columns:  # migrate an early scaffold database
         conn.execute("ALTER TABLE posts ADD COLUMN v INTEGER NOT NULL DEFAULT 1")
+    if columns and "kind" not in columns:  # migrate a pre-reactions database
+        conn.execute(
+            "ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'"
+        )
+        conn.execute(
+            "ALTER TABLE posts ADD COLUMN target TEXT NOT NULL DEFAULT ''"
+        )
+    # Created after the migration above: the index references columns a
+    # pre-reactions database does not have yet when _SCHEMA first runs.
+    conn.execute("CREATE INDEX IF NOT EXISTS posts_target ON posts(target)")
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('version', ?)",
         (str(TAN_VERSION),),
@@ -486,8 +556,8 @@ def store_post(
         with conn:
             conn.execute(
                 "INSERT INTO posts(v, hash, author, prev, key, name, text, created_at, "
-                "received_at, sig, seq, linked) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "received_at, sig, seq, linked, kind, target) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     TAN_VERSION,
                     digest,
@@ -501,6 +571,8 @@ def store_post(
                     post["sig"],
                     seq,
                     1 if linked else 0,
+                    post.get("kind") or KIND_POST,
+                    post.get("target") or "",
                 ),
             )
             if linked:
@@ -569,6 +641,144 @@ def create_post(
     return record
 
 
+def create_reaction(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    *,
+    liked: bool,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a like/unlike entry for the post *target*.
+
+    The reaction is appended to the reactor's own chain, exactly like a
+    post: ``liked=True`` writes a ``like`` entry, ``liked=False`` an
+    ``unlike`` entry.  The reactor's latest entry for a target decides
+    whether their like stands, so both operations are idempotent in
+    effect and safe to repeat.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": "",
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_LIKE if liked else KIND_UNLIKE,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
+def reaction_states(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, Dict[str, str]]:
+    """Map each target hash to ``{reactor: latest kind}`` from linked entries.
+
+    Only linked (chain-verified) reactions count; an orphaned reaction
+    starts counting as soon as its chain links up.
+    """
+    clean = []
+    for target in targets:
+        try:
+            clean.append(_require_hex(target, HASH_HEX_LENGTH, "target"))
+        except PostError:
+            continue
+    states: Dict[str, Dict[str, str]] = {target: {} for target in clean}
+    if not clean:
+        return states
+    placeholders = ", ".join("?" for _ in clean)
+    rows = conn.execute(
+        "SELECT target, author, kind FROM posts "
+        f"WHERE kind IN ('like', 'unlike') AND linked = 1 AND target IN ({placeholders}) "
+        "ORDER BY target, author, seq ASC",
+        clean,
+    ).fetchall()
+    for row in rows:
+        # Rows arrive in chain order per reactor, so the last write wins.
+        states[str(row["target"])][str(row["author"])] = str(row["kind"])
+    return states
+
+
+def like_counts(
+    conn: sqlite3.Connection,
+    targets: Sequence[str],
+    *,
+    viewer: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return ``{target: {"likes": n, "liked": bool}}`` for timeline display."""
+    states = reaction_states(conn, targets)
+    result: Dict[str, Dict[str, Any]] = {}
+    for target, reactors in states.items():
+        likers = [a for a, kind in reactors.items() if kind == KIND_LIKE]
+        result[target] = {
+            "likes": len(likers),
+            "liked": viewer is not None and viewer in likers,
+        }
+    return result
+
+
+def annotate_reactions(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    *,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Attach ``likes``/``liked`` fields to post dicts, in place."""
+    counts = like_counts(conn, [post["hash"] for post in posts], viewer=viewer)
+    for post in posts:
+        info = counts.get(post["hash"], {"likes": 0, "liked": False})
+        post["likes"] = info["likes"]
+        post["liked"] = info["liked"]
+    return posts
+
+
+def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Resolve a post hash or unique hash prefix to a stored post."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise TanError("post reference must not be empty")
+    value = ref.strip().lower()
+    if len(value) == HASH_HEX_LENGTH:
+        post = get_post(conn, value)
+        if post is not None and post.get("kind", KIND_POST) == KIND_POST:
+            return post
+        raise TanError(f"unknown post: {ref!r}")
+    if len(value) >= 8:
+        try:
+            bytes.fromhex(value)
+        except ValueError:
+            raise TanError(f"unknown post: {ref!r}") from None
+        rows = conn.execute(
+            "SELECT hash FROM posts WHERE kind = 'post' AND hash LIKE ? LIMIT 8",
+            (value + "%",),
+        ).fetchall()
+        if len(rows) == 1:
+            post = get_post(conn, str(rows[0]["hash"]))
+            if post is not None:
+                return post
+        if len(rows) > 1:
+            raise TanError(f"{len(rows)} posts match prefix {value!r}")
+    raise TanError(f"unknown post: {ref!r}")
+
+
 def _public_posts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
     return [_canonical_post(dict(row)) for row in rows]
 
@@ -581,14 +791,20 @@ def feed(
     limit: int = DEFAULT_FEED_LIMIT,
     all_authors: bool = False,
     before: Optional[float] = None,
+    posts_only: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Read cached posts in chain order or reverse chronological order."""
+    """Read cached entries in chain order or reverse chronological order.
+
+    Sync needs every entry (reactions included) to keep chains complete;
+    display callers pass ``posts_only=True`` to hide reaction entries.
+    """
     count = max(1, min(int(limit), MAX_FEED_POSTS))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        kind_filter = " AND kind = 'post'" if posts_only else ""
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
-            "WHERE author = ? AND linked = 1 AND seq > ? "
+            f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
             "ORDER BY seq ASC LIMIT ?",
             (author, max(0, int(after_seq)), count),
         ).fetchall()
@@ -596,6 +812,8 @@ def feed(
 
     params: List[Any] = []
     where = "linked = 1"
+    if posts_only:
+        where += " AND kind = 'post'"
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -615,10 +833,17 @@ def timeline(
     limit: int = 30,
     include_all: bool = False,
     before: Optional[float] = None,
+    viewer: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return followed posts (and local posts) newest first."""
+    """Return followed posts (and local posts) newest first.
+
+    Reaction entries never appear as timeline items; instead each post
+    is annotated with its derived ``likes`` count and, when *viewer* is
+    given, whether the viewer's like currently stands.
+    """
     if include_all:
-        return feed(conn, limit=limit, before=before)
+        posts = feed(conn, limit=limit, before=before, posts_only=True)
+        return annotate_reactions(conn, posts, viewer=viewer)
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
     ]
@@ -626,7 +851,7 @@ def timeline(
         return []
     placeholders = ", ".join("?" for _ in clean_authors)
     params: List[Any] = list(clean_authors)
-    where = f"linked = 1 AND author IN ({placeholders})"
+    where = f"linked = 1 AND kind = 'post' AND author IN ({placeholders})"
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -636,7 +861,7 @@ def timeline(
         "ORDER BY created_at DESC, hash DESC LIMIT ?",
         params,
     ).fetchall()
-    return _public_posts(rows)
+    return annotate_reactions(conn, _public_posts(rows), viewer=viewer)
 
 
 def follow(
@@ -690,15 +915,19 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
     row = conn.execute(
-        "SELECT COUNT(*) AS posts, COALESCE(MAX(seq), 0) AS seq, "
-        "COALESCE(MAX(created_at), 0) AS last_post FROM posts "
+        "SELECT COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
+        "FROM posts WHERE author = ? AND linked = 1 AND kind = 'post'",
+        (author,),
+    ).fetchone()
+    seq_row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS seq FROM posts "
         "WHERE author = ? AND linked = 1",
         (author,),
     ).fetchone()
     return {
         "author": author,
         "posts": int(row["posts"]),
-        "seq": int(row["seq"]),
+        "seq": int(seq_row["seq"]),
         "last_post": float(row["last_post"]),
     }
 
@@ -832,10 +1061,41 @@ class TanApp:
                 authors = [record["author"] for record in following(conn)]
                 authors.append(self.author)
             return timeline(
-                conn, authors, limit=limit, include_all=include_all
+                conn,
+                authors,
+                limit=limit,
+                include_all=include_all,
+                viewer=self.author,
             )
         finally:
             conn.close()
+
+    def react(
+        self,
+        target: str,
+        *,
+        liked: bool,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Append a like (``liked=True``) or unlike entry for *target*."""
+        conn = self.connect()
+        try:
+            record = create_reaction(
+                conn, self.identity, target, liked=liked, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
+
+    def like(self, target: str, **kwargs: Any) -> Dict[str, Any]:
+        return self.react(target, liked=True, **kwargs)
+
+    def unlike(self, target: str, **kwargs: Any) -> Dict[str, Any]:
+        return self.react(target, liked=False, **kwargs)
 
     def following_ids(self) -> List[str]:
         conn = self.connect()

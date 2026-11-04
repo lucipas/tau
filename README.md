@@ -131,6 +131,8 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/following` | GET | followed authors and their post counts |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
+| `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
+| `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
@@ -227,6 +229,8 @@ Global options may appear before or after the command:
 | `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
+| `tau tan like POST` | Like a post (signed reaction on your chain) |
+| `tau tan unlike POST` | Remove your like from a post |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
@@ -416,6 +420,26 @@ small, random fan-out. `tan sync` is pull-based: it asks peers for posts after
 the highest sequence it already has, so an author can be offline as long as any
 peer still caches their feed. Posts that arrive before their parent are stored
 as orphans and linked automatically when the parent arrives.
+
+### Likes
+
+A like is not a counter stored anywhere: it is a signed *reaction envelope*
+appended to the reactor's own chain, committed exactly like a post. The
+envelope carries two extra signed fields — `"kind": "like"` (or `"unlike"`)
+and `"target": "<hash of the post>"` — and no text. Reactions gossip and sync
+with the rest of the chain, and a post's like count is derived from them: for
+each reactor, their latest like/unlike entry for that post decides whether
+their like stands, so liking twice never counts twice and an unlike is just a
+later entry superseding an earlier one.
+
+```bash
+tau tan like 5c04c868          # by post hash or unique prefix
+tau tan unlike 5c04c868
+tau tan timeline               # shows ♥ counts under each post
+```
+
+The web console shows the same counts with a ♥ toggle on every post
+(`POST /api/tan/like` / `POST /api/tan/unlike`).
 
 ## Security model
 
