@@ -12,7 +12,7 @@ from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import open_message, seal_message
 from tau.node import TauNode
-from tau.peers import PeerRegistry
+from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     build_mail_fetch,
     build_mail_store,
@@ -195,3 +195,53 @@ def test_flush_outbox_is_a_noop_until_started(tmp_path):
     node = make_node(tmp_path)
     node.mailbox.enqueue(to=b"\x01" * 16, text="waiting")
     assert node.flush_outbox() == {"delivered": 0, "deposited": 0, "received": 0}
+
+
+def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    peers = []
+    for i in range(4):
+        identity = RNS.Identity()
+        peer = Peer(
+            destination_hash=destination_hash(identity),
+            name=f"peer{i}",
+            public_key=identity.get_public_key(),
+            first_seen=float(i),
+            last_seen=float(i),
+        )
+        node.registry._peers[peer.destination_hash] = peer
+        peers.append(peer)
+    # peers[0] is the least recently seen, but it is owed mail.
+    node.mailbox.enqueue(
+        to=peers[0].destination_hash, text="for peer0", now=time.time()
+    )
+
+    contacted = []
+    node._flush_peer = lambda peer, timeout: contacted.append(peer.name) or {
+        "delivered": 0,
+        "deposited": 0,
+    }
+    node._collect_mail = lambda peer, timeout: 0
+    node._process_local_held = lambda: 0
+
+    node.flush_outbox(max_peers=2)
+    assert contacted == ["peer0", "peer3"]
+
+
+def test_busy_mail_round_is_queued_not_dropped(tmp_path):
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    peer = Peer(
+        destination_hash=destination_hash(identity),
+        name="busy",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    node._mail_lock.acquire()
+    try:
+        node._mail_round_for_peer(peer)
+    finally:
+        node._mail_lock.release()
+    assert peer.hexhash in node._mail_pending

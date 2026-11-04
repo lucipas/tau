@@ -69,6 +69,11 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+# Peers contacted per background sweep.  Each contact can wait out a
+# request timeout, so an uncapped sweep over a large registry holds the
+# mail lock for minutes and starves announce-triggered rounds; the loop
+# runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
+_MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
@@ -133,6 +138,7 @@ class TauNode:
         self._announce_thread: Optional[threading.Thread] = None
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
+        self._mail_pending: Set[str] = set()
         self._stop_event = threading.Event()
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
@@ -546,7 +552,16 @@ class TauNode:
     def _mail_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self.flush_outbox()
+                # Rounds that found the mail lock busy are retried first,
+                # then a capped sweep (outbox targets prioritised inside
+                # flush_outbox) keeps each pass short.
+                pending = list(self._mail_pending)
+                self._mail_pending.clear()
+                for hexhash in pending:
+                    peer = self.registry.get(bytes.fromhex(hexhash))
+                    if peer is not None:
+                        self._mail_round_for_peer(peer)
+                self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
             if self._stop_event.wait(_MAIL_INTERVAL):
@@ -554,6 +569,10 @@ class TauNode:
 
     def _mail_round_for_peer(self, peer: Peer) -> None:
         if not self._mail_lock.acquire(blocking=False):
+            # Busy: queue the round for the next mail loop instead of
+            # dropping it, so a long sweep can't starve a peer that just
+            # announced itself.
+            self._mail_pending.add(peer.hexhash)
             return
         try:
             self._flush_peer(peer, _MAIL_REQUEST_TIMEOUT)
@@ -581,6 +600,11 @@ class TauNode:
             self.mailbox.prune()
             summary["received"] += self._process_local_held()
             peers = self.registry.all()
+            # Peers we owe mail to go first (stable sort keeps the
+            # registry's most-recently-seen order inside each group), so
+            # a capped sweep still spends its budget on actual delivery.
+            targets = {entry.to for entry in self.mailbox.outbox_list()}
+            peers.sort(key=lambda p: p.destination_hash not in targets)
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
@@ -1031,7 +1055,10 @@ class TauNode:
             log.debug("Could not configure link resources", exc_info=True)
 
     def _on_incoming_link(self, link: RNS.Link) -> None:
-        self._configure_link(link, _REQUEST_WIRE_LIMIT)
+        # Incoming requests can be mail-sized (a sealed envelope store is
+        # up to _MAIL_WIRE_LIMIT on the wire), so accept resources up to
+        # the larger of the two budgets, not just the plain request one.
+        self._configure_link(link, max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT))
         with self._links_lock:
             self._active_links.add(link)
         link.set_link_closed_callback(self._on_link_closed)
