@@ -454,19 +454,26 @@ tau tan rules --default deny                   # admit nobody by default
 tau tan rules --allow-author alice             # ...except alice
 tau tan rules --followed-only                  # ...and authors you follow
 tau tan rules --block-author 5c04c868          # never admit this author
-tau tan rules --kinds post                     # posts only, no reactions
+tau tan rules --kinds post                     # display posts only
 ```
 
 Rules are evaluated for remote entries only — pushes to `/tan/post` and
 posts imported by `tan sync` — after the entry's signature has been
 verified, so an author identity cannot be spoofed. Order: the node's own
-author is always admitted, the block list denies, the kind filter
-denies, the allow list and (optionally) followed authors admit, and
-everything else falls to the default policy. Entries you create yourself
-are never filtered, and with no rules file everything is admitted, as
-before. A rules file that cannot be parsed fails closed (remote entries
-denied) rather than silently opening the node up. A running `serve`
-applies saved rules when it restarts.
+author is always admitted, the block list denies, the allow list and
+(optionally) followed authors admit, and everything else falls to the
+default policy. Entries you create yourself are never filtered, and with
+no rules file everything is admitted, as before. A rules file that
+cannot be parsed fails closed (remote entries denied) rather than
+silently opening the node up. A running `serve` applies saved rules
+when it restarts.
+
+`--kinds` is display-only, on purpose: it selects which entry kinds
+your timeline views present (hiding reactions also hides their like
+counts), but every kind from an admitted author is still stored.
+Filtering kinds at admission time would punch holes in an author's
+hash chain — later entries would point at a missing parent, sit
+unlinked, and stall sync at the gap.
 
 ## Security model
 

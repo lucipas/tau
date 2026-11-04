@@ -33,6 +33,7 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     annotate_reactions,
+    apply_display_rules,
     author_stats,
     feed,
     follow,
@@ -489,12 +490,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--kinds",
         default=None,
         metavar="post,like,unlike",
-        help="comma-separated entry kinds to admit",
+        help="comma-separated entry kinds to display (display-only: "
+        "every kind is still stored, so chains stay complete)",
     )
     tan_rules.add_argument(
         "--all-kinds",
         action="store_true",
-        help="admit every entry kind (clears --kinds)",
+        help="display every entry kind (clears --kinds)",
     )
     tan_rules.set_defaults(func=cmd_tan_rules)
 
@@ -896,6 +898,11 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             posts = timeline(conn, authors, limit=args.limit, viewer=viewer)
     finally:
         conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
     _print_tan_posts(posts, json_output=json_output)
     return _EXIT_OK
 
@@ -1034,7 +1041,10 @@ def cmd_tan_rules(args: argparse.Namespace) -> int:
         print(f"  default: {data['default']}")
         print(f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}")
         kinds = data["kinds"]
-        print(f"  kinds: {', '.join(kinds) if kinds else 'all'}")
+        print(
+            f"  kinds displayed: {', '.join(kinds) if kinds else 'all'}"
+            " (display-only; all kinds are stored)"
+        )
         for label, field_name in (
             ("allow", "allow_authors"),
             ("block", "block_authors"),

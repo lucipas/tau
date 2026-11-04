@@ -11,10 +11,18 @@ A ruleset is evaluated in a fixed order:
 1. The node's own author is always admitted (its entries never arrive
    as remote commits anyway; this guards gossip echoes).
 2. Authors on the block list are denied.
-3. Entries whose kind is outside the allowed kind set are denied.
-4. Authors on the allow list, and — when ``allow_followed`` is on —
+3. Authors on the allow list, and — when ``allow_followed`` is on —
    authors the node follows, are admitted.
-5. Everything else falls to the default policy: ``allow`` or ``deny``.
+4. Everything else falls to the default policy: ``allow`` or ``deny``.
+
+Admission deliberately never filters by entry *kind*.  Tan entries
+form a hash chain, so refusing to store one kind (say, a ``like``)
+would leave that author's later admitted entries pointing at a
+missing parent: they would sit as unlinked orphans, the chain head
+would never advance, and sync would stall at the gap.  The ``kinds``
+setting is therefore display-only: every kind from an admitted author
+is stored so chains stay complete, and ``displays()`` tells the
+node's timeline views which kinds to present.
 
 Identity here means the Tan author hash, which is safe to filter on
 because admission runs only after the entry's signature has been
@@ -87,24 +95,34 @@ class Ruleset:
     def decide(
         self,
         author: str,
-        kind: str,
         *,
         own_author: Optional[str] = None,
         followed: Iterable[str] = (),
     ) -> bool:
-        """Return True when an entry from *author* of *kind* is admitted."""
+        """Return True when entries from *author* are admitted.
+
+        Admission is per-author only: entry kind is never a reason to
+        refuse storage (see the module docstring — a refused kind
+        would punch a hole in the author's hash chain).
+        """
         author = author.strip().lower()
         if own_author is not None and author == own_author.strip().lower():
             return True
         if author in self.block_authors:
-            return False
-        if self.kinds is not None and kind not in self.kinds:
             return False
         if author in self.allow_authors:
             return True
         if self.allow_followed and author in {a.strip().lower() for a in followed}:
             return True
         return self.default_allow
+
+    def displays(self, kind: str) -> bool:
+        """Return True when timeline views should present *kind* entries.
+
+        Display-only counterpart to :meth:`decide`: hidden kinds are
+        still stored, they just do not appear in the node's views.
+        """
+        return self.kinds is None or kind.strip().lower() in self.kinds
 
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -30,11 +30,14 @@ reactor, their latest like/unlike entry for that post decides whether their
 like currently stands.
 
 What gets committed at all is the owner's decision: a ruleset (see
-``tau.tangents.rules``) can allow or block authors by identity, restrict
-kinds, admit only followed authors, or deny by default.  It is consulted
-for remote entries — pushes and sync imports — after signature
+``tau.tangents.rules``) can allow or block authors by identity, admit
+only followed authors, or deny by default.  It is consulted for
+remote entries — pushes and sync imports — after signature
 verification; locally created entries are never filtered, and with no
-ruleset configured every well-signed entry is admitted.
+ruleset configured every well-signed entry is admitted.  Entry kinds
+are never an admission criterion — filtering them at storage time
+would break hash-chain continuity — so the ruleset's ``kinds``
+setting only controls what the node's timeline views display.
 
 The hash chain makes edits and reordering detectable, while the signature makes
 a post verifiable even when it is relayed by a node that does not own the
@@ -759,6 +762,29 @@ def annotate_reactions(
     return posts
 
 
+def apply_display_rules(
+    posts: List[Dict[str, Any]], ruleset: Ruleset
+) -> List[Dict[str, Any]]:
+    """Apply the ruleset's display-only ``kinds`` preference to *posts*.
+
+    Entries whose kind the owner does not display are dropped from the
+    view (they remain stored, keeping chains complete).  When neither
+    reaction kind is displayed, the derived ``likes``/``liked``
+    annotations are stripped as well, so hidden reactions leave no
+    trace in the view.
+    """
+    shown = [
+        post
+        for post in posts
+        if ruleset.displays(str(post.get("kind") or KIND_POST))
+    ]
+    if not (ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE)):
+        for post in shown:
+            post.pop("likes", None)
+            post.pop("liked", None)
+    return shown
+
+
 def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     """Resolve a post hash or unique hash prefix to a stored post."""
     if not isinstance(ref, str) or not ref.strip():
@@ -1040,13 +1066,13 @@ class TanApp:
                 self._ruleset = Ruleset(default_allow=False)
         return self._ruleset
 
-    def _admitted(self, conn: sqlite3.Connection, author: str, kind: str) -> bool:
+    def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
         ruleset = self.ruleset
         followed: Iterable[str] = ()
         if ruleset.allow_followed:
             followed = [record["author"] for record in following(conn)]
         return ruleset.decide(
-            author, kind, own_author=self.author, followed=followed
+            author, own_author=self.author, followed=followed
         )
 
     # -- lifecycle ---------------------------------------------------------
@@ -1098,13 +1124,14 @@ class TanApp:
             if authors is None and not include_all:
                 authors = [record["author"] for record in following(conn)]
                 authors.append(self.author)
-            return timeline(
+            posts = timeline(
                 conn,
                 authors,
                 limit=limit,
                 include_all=include_all,
                 viewer=self.author,
             )
+            return apply_display_rules(posts, self.ruleset)
         finally:
             conn.close()
 
@@ -1222,9 +1249,7 @@ class TanApp:
                             if not isinstance(raw, dict):
                                 continue
                             if not self._admitted(
-                                conn,
-                                str(raw.get("author", "")),
-                                str(raw.get("kind") or KIND_POST),
+                                conn, str(raw.get("author", ""))
                             ):
                                 skipped += 1
                                 continue
@@ -1276,9 +1301,7 @@ class TanApp:
                         if not isinstance(raw, dict):
                             continue
                         if not self._admitted(
-                            conn,
-                            str(raw.get("author", "")),
-                            str(raw.get("kind") or KIND_POST),
+                            conn, str(raw.get("author", ""))
                         ):
                             skipped += 1
                             continue
@@ -1429,9 +1452,7 @@ class TanApp:
             verified = verify_post(raw_post)
             conn = self.connect()
             try:
-                if not self._admitted(
-                    conn, verified["author"], verified.get("kind", KIND_POST)
-                ):
+                if not self._admitted(conn, verified["author"]):
                     log.info(
                         "Tan entry from %s denied by the admission ruleset",
                         verified["author"][:8],

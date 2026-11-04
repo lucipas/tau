@@ -15,9 +15,11 @@ from tau.tangents.tan import (
     TAN_POST_PATH,
     TanApp,
     create_post,
+    create_reaction,
     feed,
     follow,
     init_db,
+    max_seq,
 )
 
 
@@ -34,35 +36,38 @@ def test_decide_matrix(identities):
     alice, bob = identities
     alice_hash, bob_hash = author_of(alice), author_of(bob)
 
-    assert Ruleset().decide(bob_hash, "post") is True
+    assert Ruleset().decide(bob_hash) is True
 
     deny = Ruleset(default_allow=False)
-    assert deny.decide(bob_hash, "post") is False
-    assert deny.decide(bob_hash, "post", own_author=bob_hash) is True
+    assert deny.decide(bob_hash) is False
+    assert deny.decide(bob_hash, own_author=bob_hash) is True
 
     listed = Ruleset(default_allow=False, allow_authors=frozenset({bob_hash}))
-    assert listed.decide(bob_hash, "post") is True
-    assert listed.decide(alice_hash, "post") is False
+    assert listed.decide(bob_hash) is True
+    assert listed.decide(alice_hash) is False
 
     blocked = Ruleset(block_authors=frozenset({bob_hash}))
-    assert blocked.decide(bob_hash, "post") is False
+    assert blocked.decide(bob_hash) is False
 
     # The block list wins over the allow list.
     both = Ruleset(
         allow_authors=frozenset({bob_hash}),
         block_authors=frozenset({bob_hash}),
     )
-    assert both.decide(bob_hash, "post") is False
+    assert both.decide(bob_hash) is False
 
+    # Kinds never gate admission — a refused kind would punch a hole
+    # in the author's hash chain. They only gate display.
     posts_only = Ruleset(kinds=frozenset({"post"}))
-    assert posts_only.decide(bob_hash, "post") is True
-    assert posts_only.decide(bob_hash, "like") is False
+    assert posts_only.decide(bob_hash) is True
+    assert posts_only.displays("post") is True
+    assert posts_only.displays("like") is False
+    assert posts_only.displays("unlike") is False
+    assert Ruleset().displays("like") is True
 
     followed_only = Ruleset(default_allow=False, allow_followed=True)
-    assert followed_only.decide(bob_hash, "post") is False
-    assert (
-        followed_only.decide(bob_hash, "post", followed=[bob_hash]) is True
-    )
+    assert followed_only.decide(bob_hash) is False
+    assert followed_only.decide(bob_hash, followed=[bob_hash]) is True
 
 
 def test_ruleset_persistence_roundtrip(tmp_path, identities):
@@ -221,6 +226,106 @@ def test_sync_skips_denied_authors(identities, tmp_path):
     conn = app.connect()
     try:
         assert feed(conn, all_authors=True) == []
+    finally:
+        conn.close()
+
+
+def test_handler_admits_reaction_despite_display_kinds(identities, tmp_path):
+    # Regression (PR #13 review): admission used to deny kinds outside
+    # the display set, so a skipped reaction orphaned every later
+    # entry on the author's chain. Kinds are display-only now.
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, bob, "hi", name="bob", now=1000)
+    like = create_reaction(
+        scratch, bob, post["hash"], liked=True, name="bob", now=1001
+    )
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    app = TanApp(
+        config, alice, name="alice", gossip=False,
+        ruleset=Ruleset(kinds=frozenset({"post"})),
+    )
+    assert _push(app, post)["ok"] is True
+    assert _push(app, like)["ok"] is True
+    conn = app.connect()
+    try:
+        assert max_seq(conn, post["author"]) == 2
+    finally:
+        conn.close()
+
+
+def test_sync_keeps_chain_complete_across_display_kinds(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, bob, "first", name="bob", now=1000)
+    create_reaction(source, bob, first["hash"], liked=True, name="bob", now=1001)
+    create_post(source, bob, "second", name="bob", now=1002)
+
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    app = TanApp(
+        config, alice, name="alice", gossip=False,
+        ruleset=Ruleset(kinds=frozenset({"post"})),
+    )
+    peer = Peer(
+        destination_hash=bytes.fromhex(first["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, authors=[first["author"]], limit=20)
+    assert summary["stored"] == 3
+    assert summary["skipped"] == 0
+    conn = app.connect()
+    try:
+        assert max_seq(conn, first["author"]) == 3
+    finally:
+        conn.close()
+    texts = {post["text"] for post in app.timeline(authors=[first["author"]])}
+    assert texts == {"first", "second"}
+
+
+def test_timeline_applies_display_kinds(identities, tmp_path):
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, bob, "hi", name="bob", now=1000)
+    like = create_reaction(
+        scratch, bob, post["hash"], liked=True, name="bob", now=1001
+    )
+    bob_hash = author_of(bob)
+
+    def build(dirname, ruleset):
+        config = TauConfig.resolve(data_dir=tmp_path / dirname, name="alice")
+        app = TanApp(
+            config, alice, name="alice", gossip=False, ruleset=ruleset
+        )
+        assert _push(app, post)["ok"] is True
+        assert _push(app, like)["ok"] is True
+        return app
+
+    # Reactions hidden: the post shows, but with no like annotation.
+    posts_hidden = build("a", Ruleset(kinds=frozenset({"post"})))
+    shown = posts_hidden.timeline(authors=[bob_hash])
+    assert [entry["text"] for entry in shown] == ["hi"]
+    assert "likes" not in shown[0]
+    assert "liked" not in shown[0]
+
+    # Everything displayed: the like count is annotated as usual.
+    posts_shown = build("b", Ruleset())
+    shown = posts_shown.timeline(authors=[bob_hash])
+    assert shown[0]["likes"] == 1
+
+    # Posts hidden: the timeline is empty even though both entries
+    # are stored and linked.
+    posts_only_reactions = build("c", Ruleset(kinds=frozenset({"like"})))
+    assert posts_only_reactions.timeline(authors=[bob_hash]) == []
+    conn = posts_only_reactions.connect()
+    try:
+        assert max_seq(conn, bob_hash) == 2
     finally:
         conn.close()
 
