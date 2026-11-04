@@ -218,6 +218,7 @@ class Mailbox:
     def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.RLock()
+        self._txn_depth = 0
         self._outbox: Dict[str, OutboxEntry] = {}
         self._held: Dict[str, HeldEnvelope] = {}
         self._seen: Dict[str, float] = {}
@@ -235,20 +236,30 @@ class Mailbox:
         applies its change, so a process never overwrites another's writes.
         """
         with self._lock:
-            if self.path is None or fcntl is None:
-                if self.path is not None:
-                    self.load()
+            if self._txn_depth:
+                # Nested transaction: the outer one already holds the
+                # flock and reloaded state, so just join it.  (A second
+                # flock from this process would block on the first.)
                 yield
                 return
-            lock_path = self.path.with_name(self.path.name + ".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    self.load()
+            self._txn_depth = 1
+            try:
+                if self.path is None or fcntl is None:
+                    if self.path is not None:
+                        self.load()
                     yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    return
+                lock_path = self.path.with_name(self.path.name + ".lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(lock_path, "a") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        self.load()
+                        yield
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._txn_depth = 0
 
     # -- persistence -------------------------------------------------------
 
@@ -363,7 +374,7 @@ class Mailbox:
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
         entry_id = message_id or generate_message_id()
-        with self._lock:
+        with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
                 return existing
@@ -396,7 +407,7 @@ class Mailbox:
         return entries
 
     def remove_outbox(self, message_id: str) -> bool:
-        with self._lock:
+        with self._transaction():
             if message_id not in self._outbox:
                 return False
             del self._outbox[message_id]
@@ -406,7 +417,7 @@ class Mailbox:
     def record_attempt(
         self, message_id: str, *, error: Optional[str] = None, now: Optional[float] = None
     ) -> None:
-        with self._lock:
+        with self._transaction():
             entry = self._outbox.get(message_id)
             if entry is None:
                 return
@@ -418,7 +429,7 @@ class Mailbox:
     def record_deposit(
         self, message_id: str, holder_hexhash: str, *, now: Optional[float] = None
     ) -> None:
-        with self._lock:
+        with self._transaction():
             entry = self._outbox.get(message_id)
             if entry is None:
                 return
@@ -477,7 +488,7 @@ class Mailbox:
         return envelopes
 
     def drop_held(self, message_id: str, *, to: Optional[bytes] = None) -> bool:
-        with self._lock:
+        with self._transaction():
             envelope = self._held.get(message_id)
             if envelope is None:
                 return False
@@ -494,7 +505,7 @@ class Mailbox:
             return message_id in self._seen
 
     def mark_seen(self, message_id: str, *, now: Optional[float] = None) -> None:
-        with self._lock:
+        with self._transaction():
             self._seen[message_id] = now if now is not None else time.time()
             if len(self._seen) > MAX_SEEN:
                 oldest = sorted(self._seen.items(), key=lambda kv: kv[1])
@@ -507,7 +518,7 @@ class Mailbox:
     def add_pending_acks(self, holder_hexhash: str, message_ids: List[str]) -> None:
         if not message_ids:
             return
-        with self._lock:
+        with self._transaction():
             current = self._pending_acks.setdefault(holder_hexhash, [])
             for mid in message_ids:
                 if mid not in current:

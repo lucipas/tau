@@ -55,7 +55,9 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     first = box.enqueue(to=BOB, text="once", message_id="fixed-id")
     second = box.enqueue(to=BOB, text="once", message_id="fixed-id")
-    assert first is second
+    # Equal, not identical: enqueue now reloads state under the
+    # cross-process transaction, so the deduped entry is a fresh copy.
+    assert first == second
     assert box.counts()["outbox"] == 1
 
 
@@ -336,3 +338,36 @@ def test_mailbox_file_is_owner_only(tmp_path):
     box.enqueue(to=BOB, text="secret-ish", now=time.time())
     assert path.exists()
     assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_sequential_writers_do_not_clobber_each_other(tmp_path):
+    """Two Mailbox instances share one file (``tau serve`` + one-shot
+    ``tau send``).  Every writer reloads under the transaction lock, so
+    a save from a stale instance can't silently drop the other side's
+    changes."""
+    path = tmp_path / "mailbox.json"
+    serve_side = Mailbox(path)
+    cli_side = Mailbox(path)
+
+    entry = cli_side.enqueue(to=BOB, text="queued from the CLI", now=time.time())
+    # serve_side has never seen this entry in memory; both of its writes
+    # must preserve it, and the second must build on the first.
+    serve_side.mark_seen("some-delivered-id", now=time.time())
+    serve_side.record_attempt(entry.id, error="path timeout", now=time.time())
+
+    fresh = Mailbox(path)
+    kept = fresh.get_outbox(entry.id)
+    assert kept is not None
+    assert kept.attempts == 1
+    assert kept.last_error == "path timeout"
+    assert fresh.is_seen("some-delivered-id")
+
+    assert cli_side.remove_outbox(entry.id) is True
+    assert Mailbox(path).get_outbox(entry.id) is None
+
+
+def test_transaction_is_reentrant(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with box._transaction():
+        entry = box.enqueue(to=BOB, text="nested write", now=time.time())
+    assert box.get_outbox(entry.id) is not None
