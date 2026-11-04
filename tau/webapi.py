@@ -13,6 +13,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/following followed authors
     POST /api/tan/posts    publish a Tan post
+    POST /api/tan/like     like a post (signed reaction on your chain)
+    POST /api/tan/unlike   remove your like from a post
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
     POST /api/tan/sync     pull missing posts from peers
@@ -280,20 +282,30 @@ class WebBridge:
 
         conn = self._tan_conn()
         try:
-            if author:
-                target, _ = resolve_author(conn, author, registry=self.node.registry)
-                return list(reversed(feed(conn, author=target, limit=limit)))
-            if include_all:
-                return timeline(conn, include_all=True, limit=limit)
-            authors = [record["author"] for record in following(conn)]
             app = self._tan_app()
             if app is not None:
-                authors.append(app.author)
+                viewer = app.author
             else:
                 identity = load_identity(self.node.config.identity_path)
-                if identity is not None:
-                    authors.append(destination_hash(identity).hex())
-            return timeline(conn, authors, limit=limit)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if author:
+                target, _ = resolve_author(conn, author, registry=self.node.registry)
+                posts = list(
+                    reversed(
+                        feed(conn, author=target, limit=limit, posts_only=True)
+                    )
+                )
+                from .tangents.tan import annotate_reactions
+
+                return annotate_reactions(conn, posts, viewer=viewer)
+            if include_all:
+                return timeline(conn, include_all=True, limit=limit, viewer=viewer)
+            authors = [record["author"] for record in following(conn)]
+            if viewer is not None:
+                authors.append(viewer)
+            return timeline(conn, authors, limit=limit, viewer=viewer)
         finally:
             conn.close()
 
@@ -339,6 +351,19 @@ class WebBridge:
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.create_post(text, publish=True)
+
+    def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_post
+
+            post_hash = resolve_post(conn, target)["hash"]
+        finally:
+            conn.close()
+        return app.react(post_hash, liked=liked, publish=True)
 
     def tan_sync(self, *, explore: bool = True) -> Dict[str, Any]:
         app = self._tan_app()
@@ -664,6 +689,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "follow": result}, head_only)
+                return
+            if path in ("/api/tan/like", "/api/tan/unlike"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    record = self.bridge.tan_react(
+                        target.strip(), liked=(path == "/api/tan/like")
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "reaction": record}, head_only)
                 return
             if path == "/api/tan/sync":
                 try:

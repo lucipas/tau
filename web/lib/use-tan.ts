@@ -95,6 +95,22 @@ export function useTan() {
     [all, load],
   );
 
+  const like = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/like", { target });
+      await load(all);
+    },
+    [all, load],
+  );
+
+  const unlike = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unlike", { target });
+      await load(all);
+    },
+    [all, load],
+  );
+
   const sync = useCallback(async () => {
     setSyncing(true);
     try {
@@ -121,6 +137,8 @@ export function useTan() {
     publish,
     follow,
     unfollow,
+    like,
+    unlike,
     sync,
   };
 }

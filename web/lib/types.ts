@@ -84,6 +84,10 @@ export interface TanPost {
   prev: string;
   hash: string;
   sig: string;
+  kind?: string;
+  target?: string;
+  likes?: number;
+  liked?: boolean;
 }
 
 export interface TanFollow {
