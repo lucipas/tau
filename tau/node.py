@@ -676,6 +676,10 @@ class TauNode:
         return True
 
     def _collect_mail(self, peer: Peer, timeout: float) -> int:
+        # Without a consumer, fetched mail would be marked seen and acked
+        # while never shown to anyone, so leave it held for a live node.
+        if self.on_message is None:
+            return 0
         if self.identity is None or self.destination is None:
             return 0
         if peer.caps and "mail" not in peer.caps:
@@ -716,6 +720,8 @@ class TauNode:
 
     def _process_local_held(self) -> int:
         """Deliver envelopes addressed to this node that it holds itself."""
+        if self.on_message is None:
+            return 0
         if self.identity is None or self.destination is None:
             return 0
         received = 0
