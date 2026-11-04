@@ -218,6 +218,31 @@ class Mailbox:
         if self.path is not None:
             self.load()
 
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Serialise a read-modify-write of the mailbox across processes.
+
+        ``tau serve`` and one-shot commands such as ``tau send`` share the
+        same ``mailbox.json``.  Each mutation takes an exclusive ``flock`` on
+        a sidecar lock file, reloads the latest on-disk state, and then
+        applies its change, so a process never overwrites another's writes.
+        """
+        with self._lock:
+            if self.path is None or fcntl is None:
+                if self.path is not None:
+                    self.load()
+                yield
+                return
+            lock_path = self.path.with_name(self.path.name + ".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "a") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    self.load()
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     # -- persistence -------------------------------------------------------
 
     def load(self) -> None:
@@ -415,8 +440,10 @@ class Mailbox:
             raise MailboxError("destination hash must be 16 bytes")
         if len(blob) > MAX_MAIL_BLOB_BYTES:
             raise MailboxError("sealed message is too large to hold")
+        if not math.isfinite(expires_at):
+            raise MailboxError("expiry must be a finite time")
         timestamp = now if now is not None else time.time()
-        with self._lock:
+        with self._transaction():
             if message_id in self._held:
                 return False
             if len(self._held) >= MAX_HELD_TOTAL:
@@ -482,7 +509,7 @@ class Mailbox:
             self.save()
 
     def take_pending_acks(self, holder_hexhash: str) -> List[str]:
-        with self._lock:
+        with self._transaction():
             ids = self._pending_acks.pop(holder_hexhash, [])
             if ids:
                 self.save()
@@ -493,7 +520,7 @@ class Mailbox:
     def prune(self, *, now: Optional[float] = None) -> Dict[str, int]:
         """Drop expired outbox entries, held envelopes and stale seen ids."""
         timestamp = now if now is not None else time.time()
-        with self._lock:
+        with self._transaction():
             dead_outbox = [
                 key
                 for key, entry in self._outbox.items()
@@ -638,4 +665,10 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+    }
+itize_name(payload.get("from_name")),
+        "text": text,
+        "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+    }
+eelse Noneelse None,
     }
