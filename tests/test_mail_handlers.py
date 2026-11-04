@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import RNS
+import pytest
 
 from tau.config import TauConfig
 from tau.identity import destination_hash
@@ -150,6 +151,26 @@ def test_store_rejects_expired_envelope(tmp_path):
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "mail_expired"
+
+
+@pytest.mark.parametrize(
+    "expires_at", [True, False, float("nan"), float("inf"), float("-inf"), 10**400]
+)
+def test_store_rejects_invalid_expiry(tmp_path, expires_at):
+    holder = make_node(tmp_path)
+    response = call_handler(
+        holder._handle_mail_store,
+        {
+            "type": "mail_store",
+            "to": "ab" * 16,
+            "id": "invalid",
+            "blob": "eA==",
+            "expires_at": expires_at,
+        },
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_mail"
+    assert holder.mailbox.counts()["held"] == 0
 
 
 def test_collected_message_is_delivered_once(tmp_path):

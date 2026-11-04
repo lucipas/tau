@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 
 import RNS
@@ -120,6 +121,16 @@ def test_hold_rejects_oversize_blob(tmp_path):
             message_id="big",
             expires_at=5000.0,
         )
+
+
+@pytest.mark.parametrize("expires_at", [float("nan"), float("inf"), float("-inf")])
+def test_hold_rejects_nonfinite_expiry(tmp_path, expires_at):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    with pytest.raises(MailboxError, match="finite"):
+        box.hold(to=BOB, blob=b"x", message_id="invalid", expires_at=expires_at)
+    assert box.held_for(BOB) == []
+    assert Mailbox(path).held_for(BOB) == []
 
 
 def test_held_persistence_roundtrip(tmp_path):
@@ -277,6 +288,35 @@ def test_mail_store_roundtrip_and_validation():
                 expires_at=1.0,
             )
         )
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [True, False, None, "123", [], float("nan"), float("inf"), float("-inf"), 10**400],
+)
+def test_mail_store_rejects_invalid_expiry(expires_at):
+    payload = {
+        "type": "mail_store",
+        "to": BOB.hex(),
+        "id": "m",
+        "blob": "eA==",
+        "expires_at": expires_at,
+    }
+    for raw in (payload, json.dumps(payload).encode()):
+        with pytest.raises(ProtocolError, match="expires_at must be a finite number"):
+            parse_mail_store(raw)
+
+
+@pytest.mark.parametrize("expires_at", [0, 123, 123.5, -1.5])
+def test_mail_store_accepts_finite_numeric_expiry(expires_at):
+    payload = {
+        "type": "mail_store",
+        "to": BOB.hex(),
+        "id": "m",
+        "blob": "eA==",
+        "expires_at": expires_at,
+    }
+    assert parse_mail_store(json.dumps(payload))["expires_at"] == float(expires_at)
 
 
 def test_mail_fetch_ack_parsing():

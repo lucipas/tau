@@ -276,13 +276,19 @@ def parse_mail_store(raw: Any) -> Dict[str, Any]:
             f"blob of {len(blob)} bytes exceeds the {MAX_MAIL_BLOB_BYTES} byte limit"
         )
     expires_at = payload.get("expires_at")
-    if not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        raise ProtocolError("expires_at must be a finite number")
+    try:
+        expires_at = float(expires_at)
+    except OverflowError as exc:
+        raise ProtocolError("expires_at must be a finite number") from exc
+    if not math.isfinite(expires_at):
         raise ProtocolError("expires_at must be a finite number")
     return {
         "to": to,
         "id": message_id,
         "blob": blob,
-        "expires_at": float(expires_at),
+        "expires_at": expires_at,
     }
 
 
