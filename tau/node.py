@@ -120,7 +120,11 @@ def _probe_tcp_listen(host: str, port: int) -> None:
     family, socktype, proto, _, sockaddr = info
     sock = socket.socket(family, socktype, proto)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows SO_REUSEADDR lets a socket bind a port that another
+        # live listener already holds, so the probe would pass when it
+        # should fail. Only enable it where it means "TIME_WAIT is fine".
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(sockaddr)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
