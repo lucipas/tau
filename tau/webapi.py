@@ -278,7 +278,15 @@ class WebBridge:
         author: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
-        from .tangents.tan import feed, following, resolve_author, timeline
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            annotate_reactions,
+            apply_display_rules,
+            feed,
+            following,
+            resolve_author,
+            timeline,
+        )
 
         conn = self._tan_conn()
         try:
@@ -297,15 +305,24 @@ class WebBridge:
                         feed(conn, author=target, limit=limit, posts_only=True)
                     )
                 )
-                from .tangents.tan import annotate_reactions
-
-                return annotate_reactions(conn, posts, viewer=viewer)
-            if include_all:
-                return timeline(conn, include_all=True, limit=limit, viewer=viewer)
-            authors = [record["author"] for record in following(conn)]
-            if viewer is not None:
-                authors.append(viewer)
-            return timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = annotate_reactions(conn, posts, viewer=viewer)
+            elif include_all:
+                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+            else:
+                authors = [record["author"] for record in following(conn)]
+                if viewer is not None:
+                    authors.append(viewer)
+                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
         finally:
             conn.close()
 

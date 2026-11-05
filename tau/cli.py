@@ -27,11 +27,13 @@ from .node import NodeError, TauNode
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
     annotate_reactions,
+    apply_display_rules,
     author_stats,
     feed,
     follow,
@@ -432,6 +434,72 @@ def build_parser() -> argparse.ArgumentParser:
     tan_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_sync.set_defaults(func=cmd_tan_sync)
 
+    tan_rules = tan_sub.add_parser(
+        "rules",
+        parents=[common],
+        help="show or change which remote Tan entries this node commits",
+    )
+    tan_rules.add_argument(
+        "--default",
+        choices=["allow", "deny"],
+        default=None,
+        help="policy for authors no other rule covers",
+    )
+    tan_rules.add_argument(
+        "--allow-author",
+        action="append",
+        default=None,
+        metavar="PEER",
+        help="always admit this author (repeatable)",
+    )
+    tan_rules.add_argument(
+        "--block-author",
+        action="append",
+        default=None,
+        metavar="PEER",
+        help="never admit this author (repeatable)",
+    )
+    tan_rules.add_argument(
+        "--unallow-author",
+        action="append",
+        default=None,
+        metavar="PEER",
+        help="remove an author from the allow list (repeatable)",
+    )
+    tan_rules.add_argument(
+        "--unblock-author",
+        action="append",
+        default=None,
+        metavar="PEER",
+        help="remove an author from the block list (repeatable)",
+    )
+    tan_rules.add_argument(
+        "--followed-only",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="also admit authors you follow",
+    )
+    tan_rules.add_argument(
+        "--no-followed-only",
+        dest="followed_only",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="stop admitting authors just because you follow them",
+    )
+    tan_rules.add_argument(
+        "--kinds",
+        default=None,
+        metavar="post,like,unlike",
+        help="comma-separated entry kinds to display (display-only: "
+        "every kind is still stored, so chains stay complete)",
+    )
+    tan_rules.add_argument(
+        "--all-kinds",
+        action="store_true",
+        help="display every entry kind (clears --kinds)",
+    )
+    tan_rules.set_defaults(func=cmd_tan_rules)
+
     return parser
 
 
@@ -830,6 +898,11 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             posts = timeline(conn, authors, limit=args.limit, viewer=viewer)
     finally:
         conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
     _print_tan_posts(posts, json_output=json_output)
     return _EXIT_OK
 
@@ -893,6 +966,95 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
             )
+    return _EXIT_OK
+
+
+def cmd_tan_rules(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    data = ruleset.to_dict()
+    changed = False
+
+    author_args = (
+        ("allow_authors", getattr(args, "allow_author", None)),
+        ("block_authors", getattr(args, "block_author", None)),
+    )
+    removal_args = (
+        ("allow_authors", getattr(args, "unallow_author", None)),
+        ("block_authors", getattr(args, "unblock_author", None)),
+    )
+    if any(values for _, values in author_args + removal_args):
+        conn = init_db(config.social_db_path)
+        try:
+            registry = PeerRegistry(config.peers_path)
+            for field_name, values in author_args:
+                for value in values or []:
+                    author, _ = resolve_author(conn, value, registry=registry)
+                    if author not in data[field_name]:
+                        data[field_name].append(author)
+                        changed = True
+            for field_name, values in removal_args:
+                for value in values or []:
+                    author, _ = resolve_author(conn, value, registry=registry)
+                    if author in data[field_name]:
+                        data[field_name].remove(author)
+                        changed = True
+        finally:
+            conn.close()
+
+    if getattr(args, "default", None) is not None:
+        data["default"] = args.default
+        changed = True
+    followed_only = getattr(args, "followed_only", None)
+    if followed_only is not None:
+        data["allow_followed"] = bool(followed_only)
+        changed = True
+    if getattr(args, "all_kinds", False):
+        data["kinds"] = None
+        changed = True
+    elif getattr(args, "kinds", None) is not None:
+        data["kinds"] = [
+            part.strip() for part in str(args.kinds).split(",") if part.strip()
+        ]
+        changed = True
+
+    if changed:
+        try:
+            ruleset = Ruleset.from_dict(data)
+        except RulesError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        data = ruleset.to_dict()
+        save_ruleset(config.tan_rules_path, ruleset)
+
+    if json_output:
+        payload = ruleset.to_dict()
+        payload["path"] = str(config.tan_rules_path)
+        _emit(payload, True)
+    else:
+        print(f"Tan admission rules ({config.tan_rules_path}):")
+        print(f"  default: {data['default']}")
+        print(f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}")
+        kinds = data["kinds"]
+        print(
+            f"  kinds displayed: {', '.join(kinds) if kinds else 'all'}"
+            " (display-only; all kinds are stored)"
+        )
+        for label, field_name in (
+            ("allow", "allow_authors"),
+            ("block", "block_authors"),
+        ):
+            authors = data[field_name]
+            print(f"  {label} list: {len(authors)} author(s)")
+            for author in authors:
+                print(f"    {author}")
+        if changed:
+            print("  (a running serve applies saved rules when it restarts)")
     return _EXIT_OK
 
 

@@ -29,6 +29,16 @@ gossipped and synced.  A post's like count is derived, never stored: for each
 reactor, their latest like/unlike entry for that post decides whether their
 like currently stands.
 
+What gets committed at all is the owner's decision: a ruleset (see
+``tau.tangents.rules``) can allow or block authors by identity, admit
+only followed authors, or deny by default.  It is consulted for
+remote entries — pushes and sync imports — after signature
+verification; locally created entries are never filtered, and with no
+ruleset configured every well-signed entry is admitted.  Entry kinds
+are never an admission criterion — filtering them at storage time
+would break hash-chain continuity — so the ruleset's ``kinds``
+setting only controls what the node's timeline views display.
+
 The hash chain makes edits and reordering detectable, while the signature makes
 a post verifiable even when it is relayed by a node that does not own the
 author's identity.  Nodes can therefore cache and re-serve posts for each other.
@@ -75,6 +85,7 @@ from ..protocol import (
     sanitize_name,
 )
 from ..util import ensure_dir
+from .rules import RulesError, Ruleset, load_ruleset
 
 log = logging.getLogger(__name__)
 
@@ -775,6 +786,29 @@ def annotate_reactions(
     return posts
 
 
+def apply_display_rules(
+    posts: List[Dict[str, Any]], ruleset: Ruleset
+) -> List[Dict[str, Any]]:
+    """Apply the ruleset's display-only ``kinds`` preference to *posts*.
+
+    Entries whose kind the owner does not display are dropped from the
+    view (they remain stored, keeping chains complete).  When neither
+    reaction kind is displayed, the derived ``likes``/``liked``
+    annotations are stripped as well, so hidden reactions leave no
+    trace in the view.
+    """
+    shown = [
+        post
+        for post in posts
+        if ruleset.displays(str(post.get("kind") or KIND_POST))
+    ]
+    if not (ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE)):
+        for post in shown:
+            post.pop("likes", None)
+            post.pop("liked", None)
+    return shown
+
+
 def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     """Resolve a post hash or unique hash prefix to a stored post."""
     if not isinstance(ref, str) or not ref.strip():
@@ -1019,6 +1053,7 @@ class TanApp:
         gossip: bool = True,
         gossip_fanout: int = GOSSIP_FANOUT,
         request_timeout: float = 15.0,
+        ruleset: Optional[Ruleset] = None,
     ) -> None:
         self.config = config
         self.identity = identity
@@ -1034,6 +1069,35 @@ class TanApp:
         self.node: Any = None
         self._gossip_slots = threading.BoundedSemaphore(4)
         self._closed = False
+        self._ruleset = ruleset
+        self._ruleset_path = getattr(config, "tan_rules_path", None)
+
+    @property
+    def ruleset(self) -> Ruleset:
+        """The admission ruleset, loaded lazily from the data directory.
+
+        A ruleset that cannot be parsed fails closed — remote entries
+        are denied — rather than silently reverting to admit-all, but
+        loading is lazy so a broken file never blocks local operations.
+        """
+        if self._ruleset is None:
+            try:
+                self._ruleset = load_ruleset(self._ruleset_path)
+            except RulesError as exc:
+                log.error(
+                    "Tan ruleset unusable (%s); denying remote entries", exc
+                )
+                self._ruleset = Ruleset(default_allow=False)
+        return self._ruleset
+
+    def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
+        ruleset = self.ruleset
+        followed: Iterable[str] = ()
+        if ruleset.allow_followed:
+            followed = [record["author"] for record in following(conn)]
+        return ruleset.decide(
+            author, own_author=self.author, followed=followed
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1084,13 +1148,14 @@ class TanApp:
             if authors is None and not include_all:
                 authors = [record["author"] for record in following(conn)]
                 authors.append(self.author)
-            return timeline(
+            posts = timeline(
                 conn,
                 authors,
                 limit=limit,
                 include_all=include_all,
                 viewer=self.author,
             )
+            return apply_display_rules(posts, self.ruleset)
         finally:
             conn.close()
 
@@ -1149,6 +1214,7 @@ class TanApp:
                 "authors": 0,
                 "stored": 0,
                 "duplicates": 0,
+                "skipped": 0,
                 "errors": [],
             }
 
@@ -1157,6 +1223,7 @@ class TanApp:
         conn = self.connect()
         stored = 0
         duplicates = 0
+        skipped = 0
         errors: List[Dict[str, str]] = []
         try:
             if authors is None:
@@ -1205,6 +1272,11 @@ class TanApp:
                         for raw in posts:
                             if not isinstance(raw, dict):
                                 continue
+                            if not self._admitted(
+                                conn, str(raw.get("author", ""))
+                            ):
+                                skipped += 1
+                                continue
                             try:
                                 _, is_new = store_post(conn, raw)
                             except PostError as exc:
@@ -1252,6 +1324,11 @@ class TanApp:
                     for raw in posts:
                         if not isinstance(raw, dict):
                             continue
+                        if not self._admitted(
+                            conn, str(raw.get("author", ""))
+                        ):
+                            skipped += 1
+                            continue
                         try:
                             _, is_new = store_post(conn, raw)
                         except PostError as exc:
@@ -1275,6 +1352,7 @@ class TanApp:
             "authors": len(authors),
             "stored": stored,
             "duplicates": duplicates,
+            "skipped": skipped,
             "errors": errors,
         }
 
@@ -1395,8 +1473,18 @@ class TanApp:
                 ttl = 0
             ttl = max(0, min(ttl, MAX_GOSSIP_TTL))
 
+            verified = verify_post(raw_post)
             conn = self.connect()
             try:
+                if not self._admitted(conn, verified["author"]):
+                    log.info(
+                        "Tan entry from %s denied by the admission ruleset",
+                        verified["author"][:8],
+                    )
+                    return response_error(
+                        "not_admitted",
+                        "entry denied by this node's Tan ruleset",
+                    )
                 record, is_new = store_post(conn, raw_post)
             finally:
                 conn.close()
