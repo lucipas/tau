@@ -23,7 +23,7 @@ from .identity import (
     load_or_create_identity,
 )
 from .mailbox import Mailbox
-from .node import NodeError, TauNode
+from .node import NodeError, TauNode, check_tcp_listen_ports
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
@@ -1163,6 +1163,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
+    # A port already held by another node would leave Reticulum's TCP
+    # server interface silently dead (panic_on_interface_error = No),
+    # so fail fast here with the port named instead of serving deaf.
+    check_tcp_listen_ports(config)
     node.start(announce=not getattr(args, "no_announce", False))
 
     social_app = None

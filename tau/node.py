@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import errno
 import logging
 import random
+import socket
 import sys
 import threading
 import time
@@ -13,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 import RNS
 
 from . import __version__
-from .config import TauConfig, write_rns_config
+from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -80,6 +82,60 @@ _FETCH_BLOB_BUDGET = 40 * 1024
 
 class NodeError(RuntimeError):
     """Raised when a node operation fails."""
+
+
+def check_tcp_listen_ports(config: TauConfig) -> None:
+    """Fail fast when a configured TCP listen port cannot be bound.
+
+    Reticulum is configured with ``panic_on_interface_error = No``, so
+    a TCP server interface whose port is already in use fails silently
+    inside Reticulum and the node serves with a dead interface.  Probe
+    each configured listen endpoint first — with ``SO_REUSEADDR``, the
+    way Reticulum's own server socket binds, so a socket merely in
+    TIME_WAIT does not trip the check — and raise :class:`NodeError`
+    naming the port instead.
+
+    Only ``tau serve`` calls this.  Transient commands share the data
+    directory (and config) with a running serve and must keep working
+    while it holds the port, so they skip the check.
+    """
+    for host, port in tcp_listen_endpoints(config.rns_config_file):
+        _probe_tcp_listen(host, port)
+
+
+def _probe_tcp_listen(host: str, port: int) -> None:
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise NodeError(
+            f"cannot resolve TCP listen address {host}:{port} ({exc}); "
+            "the TCP server interface cannot come up"
+        ) from exc
+    # Mirror Reticulum's address choice: prefer IPv4, like
+    # TCPServerInterface.get_address_for_host with prefer_ipv6 off.
+    info = next(
+        (entry for entry in infos if entry[0] == socket.AF_INET),
+        infos[0],
+    )
+    family, socktype, proto, _, sockaddr = info
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise NodeError(
+                f"TCP listen port {port} on {host} is already in use; "
+                "another tau node (or another process) is already "
+                "listening there. Stop it, or choose a different "
+                "TCP listen port"
+            ) from exc
+        raise NodeError(
+            f"cannot listen on TCP {host}:{port}: {exc}; "
+            "the TCP server interface cannot come up"
+        ) from exc
+    finally:
+        sock.close()
 
 
 def _rns_log(message: str) -> None:
