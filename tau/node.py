@@ -76,6 +76,7 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+_SHUTDOWN_DRAIN_TIMEOUT = 30.0
 # Peers contacted per background sweep.  Each contact can wait out a
 # request timeout, so an uncapped sweep over a large registry holds the
 # mail lock for minutes and starves announce-triggered rounds; the loop
@@ -347,6 +348,8 @@ class TauNode:
                 log.debug("Could not deregister announce handler", exc_info=True)
             self._announce_handler = None
 
+        self._drain_background_work()
+
         with self._links_lock:
             links = list(self._active_links)
             self._active_links.clear()
@@ -378,6 +381,22 @@ class TauNode:
 
         self._shutdown = True
         self._release_instance_lock()
+
+    def _drain_background_work(self) -> None:
+        """Wait (bounded) for announce and mail work already in progress.
+
+        Holding the mail lock afterwards keeps any further mail round from
+        touching the mailbox or registry while the node shuts down.
+        """
+        deadline = time.monotonic() + _SHUTDOWN_DRAIN_TIMEOUT
+        current = threading.current_thread()
+        for thread in (self._announce_thread, self._mail_thread):
+            if thread is not None and thread is not current:
+                thread.join(max(0.0, deadline - time.monotonic()))
+        if not self._mail_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            log.warning("Timed out waiting for a mail round to finish on shutdown")
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None
@@ -665,6 +684,8 @@ class TauNode:
                 break
 
     def _mail_round_for_peer(self, peer: Peer) -> None:
+        if self._stop_event.is_set():
+            return
         if not self._mail_lock.acquire(blocking=False):
             # Busy: queue the round for the next mail loop instead of
             # dropping it, so a long sweep can't starve a peer that just
