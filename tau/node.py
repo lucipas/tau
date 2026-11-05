@@ -89,6 +89,10 @@ class NodeError(RuntimeError):
     """Raised when a node operation fails."""
 
 
+class InstanceAlreadyRunning(NodeError):
+    """The data directory belongs to another running node."""
+
+
 class InstanceLock:
     """Exclusive advisory lock marking a data directory as in use.
 
@@ -117,7 +121,7 @@ class InstanceLock:
             holder = self._read_holder_pid(handle)
             handle.close()
             detail = f" (pid {holder})" if holder is not None else ""
-            raise NodeError(
+            raise InstanceAlreadyRunning(
                 "another tau node is already running on data directory "
                 f"{self.data_dir}{detail}; stop it before starting a "
                 "second node on the same directory"
@@ -264,6 +268,7 @@ class TauNode:
         try:
             self._start(announce=announce)
         except BaseException:
+            self._stop_workers()
             self._release_instance_lock()
             raise
 
@@ -338,7 +343,7 @@ class TauNode:
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
-        self._stop_event.set()
+        self._stop_workers()
 
         if self._announce_handler is not None:
             try:
@@ -378,6 +383,14 @@ class TauNode:
 
         self._shutdown = True
         self._release_instance_lock()
+
+    def _stop_workers(self) -> None:
+        self._stop_event.set()
+        for worker in (self._announce_thread, self._mail_thread):
+            if worker is not None and worker is not threading.current_thread():
+                # join() rejects threads whose start() failed or was never called.
+                if worker.ident is not None:
+                    worker.join()
 
     def _release_instance_lock(self) -> None:
         lock, self._instance_lock = self._instance_lock, None

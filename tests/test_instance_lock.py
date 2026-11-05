@@ -87,3 +87,50 @@ def test_node_start_fails_fast_when_data_dir_is_locked(tmp_path):
         assert not node.started
     finally:
         holder.release()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_workers_finish_before_lock_release(tmp_path, monkeypatch, failure):
+    import threading
+
+    config = TauConfig.resolve(data_dir=tmp_path)
+    node = TauNode(config)
+    finished = []
+
+    def worker():
+        node._stop_event.wait()
+        # The directory must still be exclusively owned while workers exit.
+        with pytest.raises(NodeError):
+            make_lock(tmp_path).acquire()
+        finished.append(True)
+
+    def start_workers(**kwargs):
+        node._announce_thread = threading.Thread(target=worker)
+        node._mail_thread = threading.Thread(target=worker)
+        node._announce_thread.start()
+        node._mail_thread.start()
+        if failure:
+            raise ValueError("startup failed")
+
+    monkeypatch.setattr(node, "_start", start_workers)
+    if failure:
+        with pytest.raises(ValueError, match="startup failed"):
+            node.start()
+    else:
+        node.start()
+        monkeypatch.setattr(node.mailbox, "prune", lambda: len(finished) == 2 or pytest.fail("workers still running"))
+        node.stop()
+    assert len(finished) == 2
+    lock = make_lock(tmp_path)
+    lock.acquire()
+    lock.release()
+
+
+def test_stop_workers_handles_current_and_unstarted_threads(tmp_path):
+    import threading
+
+    node = TauNode(TauConfig.resolve(data_dir=tmp_path))
+    node._announce_thread = threading.current_thread()
+    node._mail_thread = threading.Thread(target=lambda: None)
+    node._stop_workers()
+    assert node._stop_event.is_set()
