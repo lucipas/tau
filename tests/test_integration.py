@@ -697,7 +697,7 @@ def test_second_serve_on_same_data_dir_fails_fast(tmp_path: Path) -> None:
             timeout=30.0,
         )
         assert second.returncode != 0
-        assert "already running" in second.stderr
+        assert "already serving" in second.stderr
         assert str(alice_dir) in second.stderr
         # The first node is untouched by the rejected start.
         assert server.poll() is None

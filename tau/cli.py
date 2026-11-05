@@ -793,7 +793,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     else:
         node = TauNode(config, name=config.name)
         try:
-            node.start()
+            node.start(exclusive=True)
         except InstanceAlreadyRunning:
             from .local_publish import publish_running
 
@@ -1186,7 +1186,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
-    node.start(announce=not getattr(args, "no_announce", False))
+    node.start(
+        announce=not getattr(args, "no_announce", False), exclusive=True
+    )
 
     social_app = None
     if getattr(args, "social", False):

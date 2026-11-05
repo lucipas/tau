@@ -96,13 +96,13 @@ class InstanceAlreadyRunning(NodeError):
 class InstanceLock:
     """Exclusive advisory lock marking a data directory as in use.
 
-    A started node holds this lock for its whole lifetime, so a second
-    node on the same data directory fails fast instead of corrupting
-    the shared peer registry, mailbox and Tan database.  The lock file
-    records the holder's PID for diagnostics; the ``flock`` itself is
-    the guard, so a file left behind by a crashed node never blocks a
-    restart.  POSIX only — without ``fcntl`` the lock is a no-op,
-    mirroring the mailbox's cross-process locking.
+    A serving node holds this lock for its whole lifetime, so a second
+    serving node on the same data directory fails fast instead of
+    corrupting the shared peer registry, mailbox and Tan database.
+    The lock file records the holder's PID for diagnostics; the
+    ``flock`` itself is the guard, so a file left behind by a crashed
+    node never blocks a restart.  POSIX only — without ``fcntl`` the
+    lock is a no-op, mirroring the mailbox's cross-process locking.
     """
 
     def __init__(self, path: Path, data_dir: Path) -> None:
@@ -122,7 +122,7 @@ class InstanceLock:
             handle.close()
             detail = f" (pid {holder})" if holder is not None else ""
             raise InstanceAlreadyRunning(
-                "another tau node is already running on data directory "
+                "another tau node is already serving on data directory "
                 f"{self.data_dir}{detail}; stop it before starting a "
                 "second node on the same directory"
             ) from None
@@ -243,13 +243,18 @@ class TauNode:
     def started(self) -> bool:
         return self.reticulum is not None
 
-    def start(self, *, announce: bool = True) -> None:
+    def start(self, *, announce: bool = True, exclusive: bool = False) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
-        Starting takes an exclusive lock on the data directory: a second
-        node started on the same directory fails fast instead of
-        corrupting the shared peer registry, mailbox and Tan database.
-        The lock is held until :meth:`stop` (or process exit).
+        With ``exclusive`` — used by ``tau serve``, the long-lived
+        node — starting takes an exclusive lock on the data directory,
+        so a second serving node on the same directory fails fast
+        instead of corrupting the shared peer registry, mailbox and
+        Tan database.  The lock is held until :meth:`stop` (or process
+        exit). Transient commands can leave it off to share the directory
+        briefly (the mailbox serialises its file across processes).
+        Publishing requests the lock and, if it is held, routes the post
+        through the running social node instead.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -260,16 +265,23 @@ class TauNode:
             )
 
         self.config.prepare()
-        lock = InstanceLock(
-            self.config.instance_lock_path, self.config.data_dir
-        )
-        lock.acquire()
-        self._instance_lock = lock
+        if exclusive:
+            lock = InstanceLock(
+                self.config.instance_lock_path, self.config.data_dir
+            )
+            lock.acquire()
+            self._instance_lock = lock
         try:
             self._start(announce=announce)
         except BaseException:
-            self._stop_workers()
-            self._release_instance_lock()
+            # Clean up partial startup, including workers and links, before
+            # returning the directory to another process.
+            try:
+                self.stop()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Cleanup after a failed start failed", exc_info=True)
+                self._stop_workers()
+                self._release_instance_lock()
             raise
 
     def _start(self, *, announce: bool) -> None:
@@ -343,6 +355,7 @@ class TauNode:
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
+        # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
 
         if self._announce_handler is not None:
