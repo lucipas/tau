@@ -560,6 +560,7 @@ web/            Next.js + Tailwind console (static export served by tau)
 | `peer did not announce within ...` | No common interface, wrong port, firewall, or peer not running. Check `tau discover -v` on both sides. |
 | AutoInterface does not work | Multicast is blocked (common in containers). Use TCP loopback/LAN interfaces instead. |
 | `Attempt to reinitialise Reticulum` | Two `TauNode`s (or two `tau` commands sharing a process) — use one node per process. |
+| `another tau node is already running on data directory ...` | A node already holds that data directory's `node.lock`; two nodes on one directory would corrupt the shared peer registry, mailbox and Tan database. Stop the running node (the message names its pid) or use a different `--data-dir`. |
 | `no path to ...` | Reticulum has not learned a route yet. Keep the peer announcing (`tau serve --announce-interval 5`) or wait for a path request to resolve. |
 | Noisy output | Reticulum logs go to stderr. Use `-q`, `--rns-log-level 1`, or `--json` for clean stdout. |
 | Stale peers | `tau peers --max-age 1`, or delete `peers.json`. |

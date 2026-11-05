@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import random
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
+
+try:  # POSIX only; the instance lock is a no-op without it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import RNS
 
@@ -82,6 +89,70 @@ class NodeError(RuntimeError):
     """Raised when a node operation fails."""
 
 
+class InstanceLock:
+    """Exclusive advisory lock marking a data directory as in use.
+
+    A started node holds this lock for its whole lifetime, so a second
+    node on the same data directory fails fast instead of corrupting
+    the shared peer registry, mailbox and Tan database.  The lock file
+    records the holder's PID for diagnostics; the ``flock`` itself is
+    the guard, so a file left behind by a crashed node never blocks a
+    restart.  POSIX only — without ``fcntl`` the lock is a no-op,
+    mirroring the mailbox's cross-process locking.
+    """
+
+    def __init__(self, path: Path, data_dir: Path) -> None:
+        self.path = Path(path)
+        self.data_dir = Path(data_dir)
+        self._handle: Optional[Any] = None
+
+    def acquire(self) -> None:
+        """Take the lock, raising :class:`NodeError` when it is held."""
+        if self._handle is not None or fcntl is None:
+            return
+        handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = self._read_holder_pid(handle)
+            handle.close()
+            detail = f" (pid {holder})" if holder is not None else ""
+            raise NodeError(
+                "another tau node is already running on data directory "
+                f"{self.data_dir}{detail}; stop it before starting a "
+                "second node on the same directory"
+            ) from None
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._handle = handle
+
+    @staticmethod
+    def _read_holder_pid(handle: Any) -> Optional[int]:
+        try:
+            handle.seek(0)
+            text = handle.read().strip()
+        except OSError:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def release(self) -> None:
+        """Release the lock; safe to call when it is not held."""
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - defensive
+            log.debug("Could not unlock %s", self.path, exc_info=True)
+        handle.close()
+
+
 def _rns_log(message: str) -> None:
     """Send Reticulum's own log lines to stderr, never to stdout."""
     print(message, file=sys.stderr, flush=True)
@@ -145,6 +216,7 @@ class TauNode:
         self._active_links: Set[RNS.Link] = set()
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
+        self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
 
@@ -168,7 +240,13 @@ class TauNode:
         return self.reticulum is not None
 
     def start(self, *, announce: bool = True) -> None:
-        """Start Reticulum, load the identity and begin answering requests."""
+        """Start Reticulum, load the identity and begin answering requests.
+
+        Starting takes an exclusive lock on the data directory: a second
+        node started on the same directory fails fast instead of
+        corrupting the shared peer registry, mailbox and Tan database.
+        The lock is held until :meth:`stop` (or process exit).
+        """
         if self.reticulum is not None:
             raise NodeError("node is already running")
         if self._shutdown:
@@ -178,6 +256,18 @@ class TauNode:
             )
 
         self.config.prepare()
+        lock = InstanceLock(
+            self.config.instance_lock_path, self.config.data_dir
+        )
+        lock.acquire()
+        self._instance_lock = lock
+        try:
+            self._start(announce=announce)
+        except BaseException:
+            self._release_instance_lock()
+            raise
+
+    def _start(self, *, announce: bool) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -287,6 +377,12 @@ class TauNode:
             self.reticulum = None
 
         self._shutdown = True
+        self._release_instance_lock()
+
+    def _release_instance_lock(self) -> None:
+        lock, self._instance_lock = self._instance_lock, None
+        if lock is not None:
+            lock.release()
 
     # -- announcing and discovery -----------------------------------------
 
