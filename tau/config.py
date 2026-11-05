@@ -7,7 +7,7 @@ import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from .protocol import APP_NAME, DEFAULT_TCP_PORT, sanitize_name
 from .util import atomic_write_text, ensure_dir, read_json
@@ -272,3 +272,110 @@ def write_rns_config(
     )
     atomic_write_text(target, text, mode=0o600)
     return True
+
+
+def _parse_rns_config_sections(path: Path) -> List[Dict[str, str]]:
+    """Parse a Reticulum config file into its ``[[subsection]]`` maps.
+
+    Reticulum configs are INI-like with ``[section]`` headers and
+    ``[[subsection]]`` interface blocks; each map carries its keys
+    lower-cased plus ``__name__`` with the subsection heading.  Only
+    subsection content is collected — top-level sections reset the
+    current block.  Returns an empty list when the file cannot be read.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    sections: List[Dict[str, str]] = []
+    current: Optional[Dict[str, str]] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[[") and line.endswith("]]"):
+            current = {"__name__": line[2:-2].strip()}
+            sections.append(current)
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = None
+            continue
+        if current is None or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        # Strip a trailing " # comment" / " ; comment" from the value.
+        for marker in (" #", " ;"):
+            cut = value.find(marker)
+            if cut != -1:
+                value = value[:cut]
+        value = value.strip()
+        # Reticulum's ConfigObj strips matching surrounding quotes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        current[key.strip().lower()] = value
+    return sections
+
+
+def _config_bool(value: Optional[str], *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "yes", "true", "on"}
+
+
+class TcpListenEndpoint(NamedTuple):
+    """A TCP server interface a Reticulum config enables.
+
+    ``host`` is the configured ``listen_ip`` (``0.0.0.0`` when absent);
+    ``device`` is the kernel interface name when the section binds by
+    device instead — Reticulum then ignores ``listen_ip`` and binds an
+    address on that device.
+    """
+
+    host: str
+    port: int
+    prefer_ipv6: bool = False
+    device: Optional[str] = None
+
+
+def tcp_listen_endpoints(config_path: Path) -> List[TcpListenEndpoint]:
+    """Return the TCP server interfaces a Reticulum config enables.
+
+    Reads the config file directly, so the result reflects hand-edited
+    configs as well as generated ones.  Returns an empty list when the
+    file does not exist or configures no TCP server interface.
+
+    Enabledness mirrors Reticulum itself: an interface is attached when
+    either ``interface_enabled`` or ``enabled`` is true — a section with
+    neither key is not started.  ``port`` overrides ``listen_port`` in a
+    section, the way Reticulum resolves them; a section without a usable
+    port is skipped.
+    """
+    endpoints: List[TcpListenEndpoint] = []
+    for section in _parse_rns_config_sections(config_path):
+        if section.get("type", "").lower() != "tcpserverinterface":
+            continue
+        enabled = _config_bool(
+            section.get("interface_enabled"), default=False
+        ) or _config_bool(section.get("enabled"), default=False)
+        if not enabled:
+            continue
+        port_text = section.get("port") or section.get("listen_port")
+        if port_text is None:
+            continue
+        try:
+            port = int(port_text)
+        except ValueError:
+            continue
+        if not 1 <= port <= 65535:
+            continue
+        host = section.get("listen_ip") or "0.0.0.0"
+        prefer_ipv6 = _config_bool(section.get("prefer_ipv6"), default=False)
+        endpoints.append(
+            TcpListenEndpoint(
+                host=host,
+                port=port,
+                prefer_ipv6=prefer_ipv6,
+                device=section.get("device") or None,
+            )
+        )
+    return endpoints

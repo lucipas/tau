@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import logging
 import os
 import random
+import socket
 import sys
 import threading
 import time
@@ -20,7 +22,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
-from .config import TauConfig, write_rns_config
+from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -155,6 +157,114 @@ class InstanceLock:
         except OSError:  # pragma: no cover - defensive
             log.debug("Could not unlock %s", self.path, exc_info=True)
         handle.close()
+
+
+def check_tcp_listen_ports(config: TauConfig) -> None:
+    """Fail fast when a configured TCP listen port cannot be bound.
+
+    Reticulum is configured with ``panic_on_interface_error = No``, so
+    a TCP server interface whose port is already in use fails silently
+    inside Reticulum and the node serves with a dead interface.  Probe
+    each configured listen endpoint first — with ``SO_REUSEADDR``, the
+    way Reticulum's own server socket binds, so a socket merely in
+    TIME_WAIT does not trip the check — and raise :class:`NodeError`
+    naming the port instead.
+
+    Only ``tau serve`` calls this.  Transient commands share the data
+    directory (and config) with a running serve and must keep working
+    while it holds the port, so they skip the check.
+    """
+    for endpoint in tcp_listen_endpoints(config.rns_config_file):
+        _probe_tcp_listen(
+            endpoint.host,
+            endpoint.port,
+            prefer_ipv6=endpoint.prefer_ipv6,
+            device=endpoint.device,
+        )
+
+
+def _resolve_device_address(device: str, *, prefer_ipv6: bool) -> Optional[str]:
+    """Resolve a kernel interface name to the address Reticulum binds.
+
+    Mirrors ``TCPServerInterface.get_address_for_if``: the first address
+    of the preferred family on the device, with a scope suffix for
+    link-local IPv6.  Returns ``None`` when the device has no usable
+    address, so the caller can fall back to the configured host.
+    """
+    try:
+        from RNS.Interfaces import netinfo
+    except ImportError:  # pragma: no cover - Reticulum is a hard dep
+        return None
+    try:
+        ifaddr = netinfo.ifaddresses(device)
+    except Exception:
+        return None
+    if not ifaddr:
+        return None
+    if (prefer_ipv6 or netinfo.AF_INET not in ifaddr) and (
+        netinfo.AF_INET6 in ifaddr
+    ):
+        address = ifaddr[netinfo.AF_INET6][0]["addr"]
+        if address.lower().startswith("fe80::"):
+            return f"{address}%{device}"
+        return address
+    if netinfo.AF_INET in ifaddr:
+        return ifaddr[netinfo.AF_INET][0]["addr"]
+    return None
+
+
+def _probe_tcp_listen(
+    host: str,
+    port: int,
+    *,
+    prefer_ipv6: bool = False,
+    device: Optional[str] = None,
+) -> None:
+    if device is not None:
+        # Reticulum binds an address on the device and ignores
+        # listen_ip; probe that address, not the wildcard.
+        resolved = _resolve_device_address(device, prefer_ipv6=prefer_ipv6)
+        if resolved is not None:
+            host = resolved
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise NodeError(
+            f"cannot resolve TCP listen address {host}:{port} ({exc}); "
+            "the TCP server interface cannot come up"
+        ) from exc
+    # Mirror Reticulum's address choice (TCPServerInterface
+    # .get_address_for_host): prefer IPv6 only when the section asks
+    # for it, IPv4 otherwise.
+    preferred = socket.AF_INET6 if prefer_ipv6 else socket.AF_INET
+    info = next(
+        (entry for entry in infos if entry[0] == preferred),
+        infos[0],
+    )
+    family, socktype, proto, _, sockaddr = info
+    sock = socket.socket(family, socktype, proto)
+    try:
+        # On Windows SO_REUSEADDR lets a socket bind a port that
+        # another live listener already holds, so the probe would pass
+        # when it should fail. Only enable it where it means
+        # "TIME_WAIT is fine" (POSIX).
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(sockaddr)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise NodeError(
+                f"TCP listen port {port} on {host} is already in use; "
+                "another tau node (or another process) is already "
+                "listening there. Stop it, or choose a different "
+                "TCP listen port"
+            ) from exc
+        raise NodeError(
+            f"cannot listen on TCP {host}:{port}: {exc}; "
+            "the TCP server interface cannot come up"
+        ) from exc
+    finally:
+        sock.close()
 
 
 def _rns_log(message: str) -> None:

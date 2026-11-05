@@ -24,7 +24,13 @@ from .identity import (
     load_or_create_identity,
 )
 from .mailbox import Mailbox
-from .node import InstanceAlreadyRunning, NodeError, TauNode
+from .node import (
+    InstanceAlreadyRunning,
+    InstanceLock,
+    NodeError,
+    TauNode,
+    check_tcp_listen_ports,
+)
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
@@ -1186,6 +1192,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
+    # The data-directory lock is the more specific guard, so probe it
+    # before the port check: a second serve on the same directory
+    # reports the instance error even though it would also trip the
+    # port check below. node.start(exclusive=True) re-checks it
+    # authoritatively when it takes the lock for real.
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    probe.acquire()
+    probe.release()
+    # A port already held by another node would leave Reticulum's TCP
+    # server interface silently dead (panic_on_interface_error = No),
+    # so fail fast here with the port named instead of serving deaf.
+    check_tcp_listen_ports(config)
     node.start(
         announce=not getattr(args, "no_announce", False), exclusive=True
     )
