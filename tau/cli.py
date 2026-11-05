@@ -1163,7 +1163,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
-    node.start(announce=not getattr(args, "no_announce", False))
+    node.start(
+        announce=not getattr(args, "no_announce", False), exclusive=True
+    )
 
     social_app = None
     if getattr(args, "social", False):

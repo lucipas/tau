@@ -82,6 +82,10 @@ _MAIL_REQUEST_TIMEOUT = 6.0
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
+# Bounded wait for worker threads during shutdown: a mail round in
+# flight can be waiting out request timeouts, and stop() must not
+# hang on it forever.
+_STOP_JOIN_TIMEOUT = 10.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
 
@@ -92,13 +96,13 @@ class NodeError(RuntimeError):
 class InstanceLock:
     """Exclusive advisory lock marking a data directory as in use.
 
-    A started node holds this lock for its whole lifetime, so a second
-    node on the same data directory fails fast instead of corrupting
-    the shared peer registry, mailbox and Tan database.  The lock file
-    records the holder's PID for diagnostics; the ``flock`` itself is
-    the guard, so a file left behind by a crashed node never blocks a
-    restart.  POSIX only — without ``fcntl`` the lock is a no-op,
-    mirroring the mailbox's cross-process locking.
+    A serving node holds this lock for its whole lifetime, so a second
+    serving node on the same data directory fails fast instead of
+    corrupting the shared peer registry, mailbox and Tan database.
+    The lock file records the holder's PID for diagnostics; the
+    ``flock`` itself is the guard, so a file left behind by a crashed
+    node never blocks a restart.  POSIX only — without ``fcntl`` the
+    lock is a no-op, mirroring the mailbox's cross-process locking.
     """
 
     def __init__(self, path: Path, data_dir: Path) -> None:
@@ -118,7 +122,7 @@ class InstanceLock:
             handle.close()
             detail = f" (pid {holder})" if holder is not None else ""
             raise NodeError(
-                "another tau node is already running on data directory "
+                "another tau node is already serving on data directory "
                 f"{self.data_dir}{detail}; stop it before starting a "
                 "second node on the same directory"
             ) from None
@@ -239,13 +243,18 @@ class TauNode:
     def started(self) -> bool:
         return self.reticulum is not None
 
-    def start(self, *, announce: bool = True) -> None:
+    def start(self, *, announce: bool = True, exclusive: bool = False) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
-        Starting takes an exclusive lock on the data directory: a second
-        node started on the same directory fails fast instead of
-        corrupting the shared peer registry, mailbox and Tan database.
-        The lock is held until :meth:`stop` (or process exit).
+        With ``exclusive`` — used by ``tau serve``, the long-lived
+        node — starting takes an exclusive lock on the data directory,
+        so a second serving node on the same directory fails fast
+        instead of corrupting the shared peer registry, mailbox and
+        Tan database.  The lock is held until :meth:`stop` (or process
+        exit).  Transient commands leave it off: they are built to
+        share the directory briefly with a running serve (the mailbox
+        serialises its file across processes) and must keep working
+        alongside it — e.g. ``tau tan post`` while ``tau serve`` runs.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -256,15 +265,25 @@ class TauNode:
             )
 
         self.config.prepare()
-        lock = InstanceLock(
-            self.config.instance_lock_path, self.config.data_dir
-        )
-        lock.acquire()
-        self._instance_lock = lock
+        if exclusive:
+            lock = InstanceLock(
+                self.config.instance_lock_path, self.config.data_dir
+            )
+            lock.acquire()
+            self._instance_lock = lock
         try:
             self._start(announce=announce)
         except BaseException:
-            self._release_instance_lock()
+            if self._instance_lock is not None:
+                # Clean up the partial startup (worker threads, links)
+                # before the lock goes back; stop() releases it last.
+                try:
+                    self.stop()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug(
+                        "Cleanup after a failed start failed", exc_info=True
+                    )
+                    self._release_instance_lock()
             raise
 
     def _start(self, *, announce: bool) -> None:
@@ -340,6 +359,11 @@ class TauNode:
         """Stop announcing, close links and persist the peer registry."""
         self._stop_event.set()
 
+        # Let the worker threads wind down before the state files are
+        # pruned/saved below and the instance lock is released at the
+        # end, so a round already in flight cannot write afterwards.
+        self._join_worker_threads()
+
         if self._announce_handler is not None:
             try:
                 RNS.Transport.deregister_announce_handler(self._announce_handler)
@@ -383,6 +407,19 @@ class TauNode:
         lock, self._instance_lock = self._instance_lock, None
         if lock is not None:
             lock.release()
+
+    def _join_worker_threads(self) -> None:
+        current = threading.current_thread()
+        for thread in (self._announce_thread, self._mail_thread):
+            if thread is None or thread is current:
+                continue
+            thread.join(timeout=_STOP_JOIN_TIMEOUT)
+            if thread.is_alive():
+                log.warning(
+                    "Worker thread %s did not stop within %.0fs",
+                    thread.name,
+                    _STOP_JOIN_TIMEOUT,
+                )
 
     # -- announcing and discovery -----------------------------------------
 
