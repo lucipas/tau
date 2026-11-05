@@ -660,3 +660,58 @@ def test_two_nodes_exchange_tan_posts(tmp_path: Path) -> None:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+
+
+def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
+    """Two nodes, different data dirs, same TCP listen port: the second
+    serve must exit non-zero with the port named, not run deaf with a
+    dead TCP interface (issue #16)."""
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    for data_dir, name in ((alice_dir, "alice"), (bob_dir, "bob")):
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                name,
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+
+        # The second serve must fail fast; if the check regressed it
+        # would serve forever and hit the timeout instead.
+        try:
+            result = run_tau(
+                "serve",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "5",
+                "--json",
+                timeout=30.0,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("second serve kept running instead of failing fast")
+        assert result.returncode != 0, (
+            f"second serve exited 0\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        assert "already in use" in result.stderr, result.stderr
+        assert str(port) in result.stderr, result.stderr
+        assert "ready" not in result.stdout
+    finally:
+        stop_process(alice)
