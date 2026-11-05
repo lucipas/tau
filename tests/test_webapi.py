@@ -383,15 +383,17 @@ def test_tan_delete_via_api(tmp_path):
     import RNS
 
     from tau.config import TauConfig
-    from tau.tangents.tan import TanApp, create_post, init_db
+    from tau.tangents.tan import TanApp, create_post, feed, init_db
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
     identity = RNS.Identity()
+    other = RNS.Identity()
     conn = init_db(node.config.social_db_path)
     try:
         post = create_post(conn, identity, "delete me via api", name="tester", now=1000)
         create_post(conn, identity, "keeper via api", name="tester", now=1001)
+        foreign = create_post(conn, other, "not yours", name="other", now=1002)
     finally:
         conn.close()
 
@@ -411,7 +413,10 @@ def test_tan_delete_via_api(tmp_path):
 
         status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
         assert status == 200
-        assert [item["text"] for item in payload["posts"]] == ["keeper via api"]
+        assert [item["text"] for item in payload["posts"]] == [
+            "not yours",
+            "keeper via api",
+        ]
 
         # Deleting the same post again reports it as deleted.
         status, _, payload = _json(
@@ -422,5 +427,48 @@ def test_tan_delete_via_api(tmp_path):
         )
         assert status == 400
         assert "has been deleted" in payload["error"]["message"]
+
+        # Liking a deleted post fails the same way.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/like",
+            method="POST",
+            body={"target": post["hash"]},
+        )
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+
+        # Someone else's post cannot be deleted through the API.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": foreign["hash"]},
+        )
+        assert status == 400
+        assert "did not author" in payload["error"]["message"]
+
+        # A full hash this node has never seen is still accepted: the
+        # tombstone applies when the post arrives.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": "cd" * 32},
+        )
+        assert status == 200
+        assert payload["delete"]["target"] == "cd" * 32
     finally:
         bridge.stop()
+
+    conn = init_db(node.config.social_db_path)
+    try:
+        entries = feed(conn, author=post["author"])
+    finally:
+        conn.close()
+    assert [entry["kind"] for entry in entries] == [
+        "post",
+        "post",
+        "delete",
+        "delete",
+    ]

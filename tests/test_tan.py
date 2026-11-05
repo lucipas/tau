@@ -17,6 +17,7 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    author_stats,
     create_delete,
     create_post,
     create_reaction,
@@ -423,6 +424,60 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
     with pytest.raises(TanError, match="has been deleted"):
         resolve_post(conn, post["hash"])
 
+    # A second delete fails at the lowest layer, not just in the CLI/API.
+    with pytest.raises(TanError, match="has been deleted"):
+        create_delete(conn, alice, post["hash"], name="alice", now=1004)
+
+
+def test_author_stats_excludes_deleted_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    old = create_post(conn, alice, "old", name="alice", now=1000)
+    new = create_post(conn, alice, "new", name="alice", now=1001)
+    stats = author_stats(conn, old["author"])
+    assert stats["posts"] == 2
+    assert stats["last_post"] == 1001
+
+    create_delete(conn, alice, new["hash"], name="alice", now=1002)
+    stats = author_stats(conn, old["author"])
+    assert stats["posts"] == 1
+    assert stats["last_post"] == 1000
+    # The chain sequence is untouched: the tombstone is still an entry.
+    assert stats["seq"] == 3
+
+
+def test_sync_hides_deleted_posts(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, bob, "bob one", name="bob", now=1000)
+    second = create_post(source, bob, "bob two", name="bob", now=1001)
+    create_delete(source, bob, second["hash"], name="bob", now=1002)
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+    peer = Peer(
+        destination_hash=bytes.fromhex(first["author"]),
+        name="bob",
+        public_key=bob.get_public_key(),
+        first_seen=1000.0,
+        last_seen=1000.0,
+    )
+    node = _FakeNode(peer, source)
+    app.node = node  # type: ignore[assignment]
+
+    summary = app.sync(node, authors=[first["author"]], limit=20)
+    assert summary["stored"] == 3
+    assert summary["errors"] == []
+
+    conn = app.connect()
+    try:
+        assert deleted_targets(conn) == {second["hash"]}
+        assert [item["text"] for item in timeline(conn, [first["author"]])] == [
+            "bob one"
+        ]
+    finally:
+        conn.close()
+
 
 def test_delete_by_non_author_is_inert(identities, tmp_path):
     alice, bob = identities
@@ -570,6 +625,64 @@ def test_cli_delete(tmp_path):
         )
         != 0
     )
+
+    # Liking a deleted post fails too.
+    assert (
+        main(
+            [
+                "tan", "like", "--data-dir", str(data_dir),
+                "--no-publish", "--json", doomed["hash"],
+            ]
+        )
+        != 0
+    )
+
+
+def test_cli_delete_rejects_foreign_post(tmp_path):
+    data_dir = tmp_path / "bob"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "bob"]) == 0
+    # Plant another author's post in bob's cache, as a sync would.
+    alice = RNS.Identity()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = create_post(conn, alice, "not bob's", name="alice", now=1000)
+    finally:
+        conn.close()
+
+    assert (
+        main(
+            [
+                "tan", "delete", "--data-dir", str(data_dir),
+                "--no-publish", "--json", post["hash"],
+            ]
+        )
+        != 0
+    )
+
+
+def test_cli_delete_accepts_uncached_full_hash(tmp_path):
+    data_dir = tmp_path / "carol"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "carol"]) == 0
+    # Carol knows the hash of a post she made on another device; this
+    # node has never seen it, but the tombstone still applies on arrival.
+    unknown = "ab" * 32
+    assert (
+        main(
+            [
+                "tan", "delete", "--data-dir", str(data_dir),
+                "--no-publish", "--json", unknown,
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        entries = feed(conn)
+    finally:
+        conn.close()
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "delete"
+    assert entries[0]["target"] == unknown
 
 
 def test_pre_reaction_database_migrates(tmp_path):

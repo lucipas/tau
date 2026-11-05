@@ -40,6 +40,7 @@ from .tangents.tan import (
     following,
     init_db,
     resolve_author,
+    resolve_delete_target,
     resolve_post,
     timeline,
     unfollow,
@@ -517,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_rules.add_argument(
         "--kinds",
         default=None,
-        metavar="post,like,unlike",
+        metavar="post,like,unlike,delete",
         help="comma-separated entry kinds to display (display-only: "
         "every kind is still stored, so chains stay complete)",
     )
@@ -906,7 +907,7 @@ def cmd_tan_delete(args: argparse.Namespace) -> int:
 
     conn = init_db(config.social_db_path)
     try:
-        target = resolve_post(conn, args.target)["hash"]
+        target = resolve_delete_target(conn, args.target)
     finally:
         conn.close()
 

@@ -389,9 +389,9 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         conn = self._tan_conn()
         try:
-            from .tangents.tan import resolve_post
+            from .tangents.tan import resolve_delete_target
 
-            post_hash = resolve_post(conn, target)["hash"]
+            post_hash = resolve_delete_target(conn, target)
         finally:
             conn.close()
         return app.delete(post_hash, publish=True)
@@ -737,7 +737,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
-                except Exception as exc:
+                except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "reaction": record}, head_only)
@@ -756,7 +756,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
-                except Exception as exc:
+                except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "delete": record}, head_only)

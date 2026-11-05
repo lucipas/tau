@@ -756,6 +756,8 @@ def create_delete(
             raise TanError("only posts can be deleted")
         if existing["author"] != author:
             raise TanError("cannot delete a post you did not author")
+        if _is_deleted(conn, existing):
+            raise TanError("post has been deleted")
     prev = previous
     if prev is None:
         prev = head(conn, author) or ""
@@ -943,6 +945,23 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     raise TanError(f"unknown post: {ref!r}")
 
 
+def resolve_delete_target(conn: sqlite3.Connection, ref: str) -> str:
+    """Resolve a delete target to a post hash.
+
+    A full hash passes through even when the post is not cached — the
+    signed tombstone applies when the post arrives.  A shorter prefix
+    resolves against cached posts, so an unknown or already-deleted
+    post fails here with a clear error.  Cached targets are still
+    checked by :func:`create_delete` for ownership and prior deletion.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise TanError("post reference must not be empty")
+    value = ref.strip().lower()
+    if len(value) == HASH_HEX_LENGTH:
+        return _require_hex(value, HASH_HEX_LENGTH, "post")
+    return resolve_post(conn, ref)["hash"]
+
+
 def _public_posts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
     return [_canonical_post(dict(row)) for row in rows]
 
@@ -1087,7 +1106,7 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
     row = conn.execute(
         "SELECT COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
-        "FROM posts WHERE author = ? AND linked = 1 AND kind = 'post'",
+        f"FROM posts WHERE author = ? AND linked = 1 AND kind = 'post' AND {_NOT_DELETED}",
         (author,),
     ).fetchone()
     seq_row = conn.execute(
