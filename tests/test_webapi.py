@@ -377,3 +377,50 @@ def test_tan_timeline_and_follow(tmp_path):
         assert "not enabled" in payload["error"]["message"]
     finally:
         bridge.stop()
+
+
+def test_tan_delete_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "delete me via api", name="tester", now=1000)
+        create_post(conn, identity, "keeper via api", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": post["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["delete"]["kind"] == "delete"
+        assert payload["delete"]["target"] == post["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["keeper via api"]
+
+        # Deleting the same post again reports it as deleted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": post["hash"]},
+        )
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()

@@ -367,6 +367,34 @@ def build_parser() -> argparse.ArgumentParser:
             func=cmd_tan_like if verb == "like" else cmd_tan_unlike
         )
 
+    tan_delete = tan_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete one of your own posts (writes a signed delete entry to your chain)",
+    )
+    tan_delete.add_argument(
+        "target", metavar="POST", help="post hash or unique hash prefix"
+    )
+    tan_delete.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_delete.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_delete.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    tan_delete.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    tan_delete.set_defaults(func=cmd_tan_delete)
+
     tan_timeline = tan_sub.add_parser(
         "timeline",
         parents=[common],
@@ -870,6 +898,58 @@ def cmd_tan_like(args: argparse.Namespace) -> int:
 
 def cmd_tan_unlike(args: argparse.Namespace) -> int:
     return _cmd_tan_react(args, liked=False)
+
+
+def cmd_tan_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        target = resolve_post(conn, args.target)["hash"]
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.delete(target)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            record = app.delete(target)
+            published = app.publish(
+                record,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"delete": record, "published": published}, True)
+    else:
+        print(f"deleted {short_hash(target)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
 
 
 def cmd_tan_timeline(args: argparse.Namespace) -> int:
