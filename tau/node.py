@@ -99,11 +99,58 @@ def check_tcp_listen_ports(config: TauConfig) -> None:
     directory (and config) with a running serve and must keep working
     while it holds the port, so they skip the check.
     """
-    for host, port in tcp_listen_endpoints(config.rns_config_file):
-        _probe_tcp_listen(host, port)
+    for endpoint in tcp_listen_endpoints(config.rns_config_file):
+        _probe_tcp_listen(
+            endpoint.host,
+            endpoint.port,
+            prefer_ipv6=endpoint.prefer_ipv6,
+            device=endpoint.device,
+        )
 
 
-def _probe_tcp_listen(host: str, port: int) -> None:
+def _resolve_device_address(device: str, *, prefer_ipv6: bool) -> Optional[str]:
+    """Resolve a kernel interface name to the address Reticulum binds.
+
+    Mirrors ``TCPServerInterface.get_address_for_if``: the first address
+    of the preferred family on the device, with a scope suffix for
+    link-local IPv6.  Returns ``None`` when the device has no usable
+    address, so the caller can fall back to the configured host.
+    """
+    try:
+        from RNS.Interfaces import netinfo
+    except ImportError:  # pragma: no cover - Reticulum is a hard dep
+        return None
+    try:
+        ifaddr = netinfo.ifaddresses(device)
+    except Exception:
+        return None
+    if not ifaddr:
+        return None
+    if (prefer_ipv6 or netinfo.AF_INET not in ifaddr) and (
+        netinfo.AF_INET6 in ifaddr
+    ):
+        address = ifaddr[netinfo.AF_INET6][0]["addr"]
+        if address.lower().startswith("fe80::"):
+            return f"{address}%{device}"
+        return address
+    if netinfo.AF_INET in ifaddr:
+        return ifaddr[netinfo.AF_INET][0]["addr"]
+    return None
+
+
+def _probe_tcp_listen(
+    host: str,
+    port: int,
+    *,
+    prefer_ipv6: bool = False,
+    device: Optional[str] = None,
+) -> None:
+    if device is not None:
+        # Reticulum binds an address on the device and ignores
+        # listen_ip; probe that address, not the wildcard.
+        resolved = _resolve_device_address(device, prefer_ipv6=prefer_ipv6)
+        if resolved is not None:
+            host = resolved
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
@@ -111,16 +158,23 @@ def _probe_tcp_listen(host: str, port: int) -> None:
             f"cannot resolve TCP listen address {host}:{port} ({exc}); "
             "the TCP server interface cannot come up"
         ) from exc
-    # Mirror Reticulum's address choice: prefer IPv4, like
-    # TCPServerInterface.get_address_for_host with prefer_ipv6 off.
+    # Mirror Reticulum's address choice (TCPServerInterface
+    # .get_address_for_host): prefer IPv6 only when the section asks
+    # for it, IPv4 otherwise.
+    preferred = socket.AF_INET6 if prefer_ipv6 else socket.AF_INET
     info = next(
-        (entry for entry in infos if entry[0] == socket.AF_INET),
+        (entry for entry in infos if entry[0] == preferred),
         infos[0],
     )
     family, socktype, proto, _, sockaddr = info
     sock = socket.socket(family, socktype, proto)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows SO_REUSEADDR lets a socket bind a port that
+        # another live listener already holds, so the probe would pass
+        # when it should fail. Only enable it where it means
+        # "TIME_WAIT is fine" (POSIX).
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(sockaddr)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
