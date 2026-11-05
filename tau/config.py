@@ -21,6 +21,7 @@ PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
+NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
 
@@ -88,6 +89,10 @@ class TauConfig:
     @property
     def rns_config_file(self) -> Path:
         return self.rns_config_dir / RNS_CONFIG_FILE_NAME
+
+    @property
+    def instance_lock_path(self) -> Path:
+        return self.data_dir / NODE_LOCK_FILE_NAME
 
     def prepare(self) -> "TauConfig":
         ensure_dir(self.data_dir)

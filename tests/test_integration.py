@@ -662,6 +662,61 @@ def test_two_nodes_exchange_tan_posts(tmp_path: Path) -> None:
             server.wait(timeout=5)
 
 
+def test_second_serve_on_same_data_dir_fails_fast(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(alice_dir),
+            "--name",
+            "alice",
+            "--tcp-listen",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+
+    out_path = tmp_path / "alice.out"
+    err_path = tmp_path / "alice.err"
+    server = start_serve(alice_dir, out_path, err_path)
+    try:
+        # Wait until the first node is up (and holds the data-dir lock).
+        assert wait_for_text(out_path, '"ready"', timeout=60), (
+            err_path.read_text(encoding="utf-8")
+        )
+
+        second = run_tau(
+            "serve",
+            "--data-dir",
+            str(alice_dir),
+            "--json",
+            timeout=30.0,
+        )
+        assert second.returncode != 0
+        assert "already serving" in second.stderr
+        assert str(alice_dir) in second.stderr
+        # The first node is untouched by the rejected start.
+        assert server.poll() is None
+    finally:
+        stop_process(server)
+
+    # After the first node exits, the directory can be served again.
+    out2_path = tmp_path / "alice2.out"
+    err2_path = tmp_path / "alice2.err"
+    restarted = start_serve(alice_dir, out2_path, err2_path)
+    try:
+        assert wait_for_text(out2_path, '"ready"', timeout=60), (
+            err2_path.read_text(encoding="utf-8")
+        )
+        assert restarted.poll() is None
+    finally:
+        stop_process(restarted)
+
+
 def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
     """Two nodes, different data dirs, same TCP listen port: the second
     serve must exit non-zero with the port named, not run deaf with a

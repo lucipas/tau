@@ -5,12 +5,19 @@ from __future__ import annotations
 import base64
 import errno
 import logging
+import os
 import random
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
+
+try:  # POSIX only; the instance lock is a no-op without it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import RNS
 
@@ -82,6 +89,74 @@ _FETCH_BLOB_BUDGET = 40 * 1024
 
 class NodeError(RuntimeError):
     """Raised when a node operation fails."""
+
+
+class InstanceAlreadyRunning(NodeError):
+    """The data directory belongs to another running node."""
+
+
+class InstanceLock:
+    """Exclusive advisory lock marking a data directory as in use.
+
+    A serving node holds this lock for its whole lifetime, so a second
+    serving node on the same data directory fails fast instead of
+    corrupting the shared peer registry, mailbox and Tan database.
+    The lock file records the holder's PID for diagnostics; the
+    ``flock`` itself is the guard, so a file left behind by a crashed
+    node never blocks a restart.  POSIX only — without ``fcntl`` the
+    lock is a no-op, mirroring the mailbox's cross-process locking.
+    """
+
+    def __init__(self, path: Path, data_dir: Path) -> None:
+        self.path = Path(path)
+        self.data_dir = Path(data_dir)
+        self._handle: Optional[Any] = None
+
+    def acquire(self) -> None:
+        """Take the lock, raising :class:`NodeError` when it is held."""
+        if self._handle is not None or fcntl is None:
+            return
+        handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = self._read_holder_pid(handle)
+            handle.close()
+            detail = f" (pid {holder})" if holder is not None else ""
+            raise InstanceAlreadyRunning(
+                "another tau node is already serving on data directory "
+                f"{self.data_dir}{detail}; stop it before starting a "
+                "second node on the same directory"
+            ) from None
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._handle = handle
+
+    @staticmethod
+    def _read_holder_pid(handle: Any) -> Optional[int]:
+        try:
+            handle.seek(0)
+            text = handle.read().strip()
+        except OSError:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def release(self) -> None:
+        """Release the lock; safe to call when it is not held."""
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - defensive
+            log.debug("Could not unlock %s", self.path, exc_info=True)
+        handle.close()
 
 
 def check_tcp_listen_ports(config: TauConfig) -> None:
@@ -255,6 +330,7 @@ class TauNode:
         self._active_links: Set[RNS.Link] = set()
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
+        self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
 
@@ -277,8 +353,19 @@ class TauNode:
     def started(self) -> bool:
         return self.reticulum is not None
 
-    def start(self, *, announce: bool = True) -> None:
-        """Start Reticulum, load the identity and begin answering requests."""
+    def start(self, *, announce: bool = True, exclusive: bool = False) -> None:
+        """Start Reticulum, load the identity and begin answering requests.
+
+        With ``exclusive`` — used by ``tau serve``, the long-lived
+        node — starting takes an exclusive lock on the data directory,
+        so a second serving node on the same directory fails fast
+        instead of corrupting the shared peer registry, mailbox and
+        Tan database.  The lock is held until :meth:`stop` (or process
+        exit). Transient commands can leave it off to share the directory
+        briefly (the mailbox serialises its file across processes).
+        Publishing requests the lock and, if it is held, routes the post
+        through the running social node instead.
+        """
         if self.reticulum is not None:
             raise NodeError("node is already running")
         if self._shutdown:
@@ -288,6 +375,26 @@ class TauNode:
             )
 
         self.config.prepare()
+        if exclusive:
+            lock = InstanceLock(
+                self.config.instance_lock_path, self.config.data_dir
+            )
+            lock.acquire()
+            self._instance_lock = lock
+        try:
+            self._start(announce=announce)
+        except BaseException:
+            # Clean up partial startup, including workers and links, before
+            # returning the directory to another process.
+            try:
+                self.stop()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Cleanup after a failed start failed", exc_info=True)
+                self._stop_workers()
+                self._release_instance_lock()
+            raise
+
+    def _start(self, *, announce: bool) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -358,7 +465,8 @@ class TauNode:
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
-        self._stop_event.set()
+        # Workers must finish before pruning/saving state or releasing the lock.
+        self._stop_workers()
 
         if self._announce_handler is not None:
             try:
@@ -397,6 +505,20 @@ class TauNode:
             self.reticulum = None
 
         self._shutdown = True
+        self._release_instance_lock()
+
+    def _stop_workers(self) -> None:
+        self._stop_event.set()
+        for worker in (self._announce_thread, self._mail_thread):
+            if worker is not None and worker is not threading.current_thread():
+                # join() rejects threads whose start() failed or was never called.
+                if worker.ident is not None:
+                    worker.join()
+
+    def _release_instance_lock(self) -> None:
+        lock, self._instance_lock = self._instance_lock, None
+        if lock is not None:
+            lock.release()
 
     # -- announcing and discovery -----------------------------------------
 

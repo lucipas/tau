@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -23,7 +24,13 @@ from .identity import (
     load_or_create_identity,
 )
 from .mailbox import Mailbox
-from .node import NodeError, TauNode, check_tcp_listen_ports
+from .node import (
+    InstanceAlreadyRunning,
+    InstanceLock,
+    NodeError,
+    TauNode,
+    check_tcp_listen_ports,
+)
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
@@ -764,6 +771,22 @@ def _tan_identity(config: TauConfig) -> Any:
     return identity
 
 
+def _publish_local_post(
+    node: TauNode, *, text: str,
+    to: Optional[List[str]] = None, ttl: int = MAX_GOSSIP_TTL,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    # Use a separate app so per-command timeouts do not mutate the serving app.
+    publisher = TanApp(node.config, node.identity, name=node.name,
+                       request_timeout=float(timeout))
+    publisher.node = node
+    targets = [node.resolve_peer(target) for target in to] if to else None
+    post = publisher.create_post(text)
+    published = publisher.publish(post, targets=targets,
+                                  ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)))
+    return {"post": post, "published": published}
+
+
 def cmd_tan_post(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
@@ -775,26 +798,32 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         published = None
     else:
         node = TauNode(config, name=config.name)
-        node.start()
         try:
-            app = TanApp(
-                config,
-                node.identity,
-                name=config.name,
-                request_timeout=float(getattr(args, "timeout", 15.0)),
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir, text=text, to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
             )
-            node.attach_app(app)
-            targets = None
-            if getattr(args, "to", None):
-                targets = [node.resolve_peer(target) for target in args.to]
-            post = app.create_post(text)
-            published = app.publish(
-                post,
-                targets=targets,
-                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
-            )
-        finally:
-            node.stop()
+            post, published = result["post"], result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config, node.identity, name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                result = _publish_local_post(
+                    node, text=text, to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                post, published = result["post"], result["published"]
+            finally:
+                node.stop()
 
     if json_output:
         _emit({"post": post, "published": published}, True)
@@ -1163,11 +1192,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
+    # The data-directory lock is the more specific guard, so probe it
+    # before the port check: a second serve on the same directory
+    # reports the instance error even though it would also trip the
+    # port check below. node.start(exclusive=True) re-checks it
+    # authoritatively when it takes the lock for real.
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    probe.acquire()
+    probe.release()
     # A port already held by another node would leave Reticulum's TCP
     # server interface silently dead (panic_on_interface_error = No),
     # so fail fast here with the port named instead of serving deaf.
     check_tcp_listen_ports(config)
-    node.start(announce=not getattr(args, "no_announce", False))
+    node.start(
+        announce=not getattr(args, "no_announce", False), exclusive=True
+    )
 
     social_app = None
     if getattr(args, "social", False):
@@ -1225,6 +1264,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
             target=social_sync_loop, name="tau-tan-sync", daemon=True
         ).start()
 
+    publish_server = None
+    if social_app is not None and hasattr(socket, "AF_UNIX"):
+        from .local_publish import PublishServer
+
+        try:
+            publish_server = PublishServer(
+                config.data_dir,
+                lambda **request: _publish_local_post(node, **request),
+            )
+        except BaseException:
+            if bridge is not None:
+                bridge.stop()
+            node.stop()
+            _restore_stop_handlers(previous_handlers)
+            raise
+
     info = node.info()
     if _json_mode(args):
         _emit_event(args, "ready", node=info)
@@ -1266,6 +1321,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             while not stop.wait(0.5):
                 pass
     finally:
+        if publish_server is not None:
+            publish_server.stop()
         if bridge is not None:
             bridge.stop()
         node.stop()
