@@ -1042,6 +1042,9 @@ class TauNode:
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
+        if not self.allowlist.is_allowed(message["from"]):
+            log.info("Relayed message from %s denied by the DM allow-list", message["from"])
+            return False
         if self.mailbox.is_seen(message["id"]):
             return False
         self.mailbox.mark_seen(message["id"])
