@@ -207,8 +207,9 @@ on the replier's chain pointing at its parent, so it propagates to peers
 like any other post. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
-(the entry itself stays stored, keeping chains verifiable). The local
-database is `<data-dir>/tan.sqlite3`.
+(the entry itself stays stored, keeping chains verifiable). In the web
+console your own posts show a delete button that calls the same endpoint.
+The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 

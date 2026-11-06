@@ -16,6 +16,12 @@ export function SocialConsole() {
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Hashes with a delete request in flight. While one is pending the card
+  // shows a disabled state instead of the confirm button, so a second
+  // click cannot report the already-deleted post as a failure.
+  const [deleting, setDeleting] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -50,6 +56,23 @@ export function SocialConsole() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
+  async function submitDelete(post: TanPost) {
+    if (deleting.has(post.hash)) return;
+    setDeleting((previous) => new Set(previous).add(post.hash));
+    setError(null);
+    try {
+      await tan.deletePost(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not delete");
+    } finally {
+      setDeleting((previous) => {
+        const next = new Set(previous);
+        next.delete(post.hash);
+        return next;
+      });
     }
   }
 
@@ -245,6 +268,8 @@ export function SocialConsole() {
                       post={post}
                       onToggleLike={toggleLike}
                       onReply={(target) => setReplyTarget(target)}
+                      onDelete={submitDelete}
+                      deleting={deleting.has(post.hash)}
                     />
                   ))
                 )}
@@ -347,12 +372,17 @@ export function PostCard({
   post,
   onToggleLike,
   onReply,
+  onDelete,
+  deleting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
+  onDelete: (post: TanPost) => void;
+  deleting: boolean;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
+  const [confirming, setConfirming] = useState(false);
   return (
     <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
       <div className="flex items-start gap-3">
@@ -418,6 +448,48 @@ export function PostCard({
             >
               reply
             </button>
+            {post.own ? (
+              deleting ? (
+                <button
+                  type="button"
+                  disabled
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/60"
+                >
+                  deleting…
+                </button>
+              ) : confirming ? (
+                <span className="inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirming(false);
+                      onDelete(post);
+                    }}
+                    title="Delete this post"
+                    className="rounded border border-rose-400/40 bg-rose-400/10 px-1.5 py-0.5 text-rose-300 transition-colors hover:bg-rose-400/20"
+                  >
+                    confirm delete
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirming(false)}
+                    title="Keep this post"
+                    className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100"
+                  >
+                    keep
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirming(true)}
+                  title="Delete this post"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-rose-400/40 hover:text-rose-300"
+                >
+                  delete
+                </button>
+              )
+            ) : null}
           </div>
         </div>
       </div>

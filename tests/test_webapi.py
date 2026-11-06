@@ -417,6 +417,11 @@ def test_tan_delete_via_api(tmp_path):
             "not yours",
             "keeper via api",
         ]
+        # The timeline marks the viewer's own posts so the console only
+        # offers the delete button on those.
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["keeper via api"]["own"] is True
+        assert by_text["not yours"]["own"] is False
 
         # Deleting the same post again reports it as deleted.
         status, _, payload = _json(

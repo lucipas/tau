@@ -97,6 +97,7 @@ export interface TanPost {
   reply_to?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  own?: boolean;
 }
 
 export interface TanFollow {

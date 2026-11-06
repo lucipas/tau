@@ -918,12 +918,18 @@ def annotate_reactions(
     *,
     viewer: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Attach ``likes``/``liked`` fields to post dicts, in place."""
+    """Attach ``likes``/``liked``/``own`` fields to post dicts, in place.
+
+    ``own`` is true when *viewer* is given and the post's author is the
+    viewer, so a display surface can offer author-only actions (like
+    deleting the post) without learning the viewer's identity itself.
+    """
     counts = like_counts(conn, [post["hash"] for post in posts], viewer=viewer)
     for post in posts:
         info = counts.get(post["hash"], {"likes": 0, "liked": False})
         post["likes"] = info["likes"]
         post["liked"] = info["liked"]
+        post["own"] = viewer is not None and post["author"] == viewer
     return posts
 
 
@@ -1170,9 +1176,10 @@ def timeline(
 
     Reaction entries never appear as timeline items; instead each post
     is annotated with its derived ``likes`` count and, when *viewer* is
-    given, whether the viewer's like currently stands.  Replies appear
-    as timeline items, annotated with their parent post when it is
-    cached.  Posts their author deleted never appear either.
+    given, whether the viewer's like currently stands and whether the
+    post is the viewer's own.  Replies appear as timeline items,
+    annotated with their parent post when it is cached.  Posts their
+    author deleted never appear either.
     """
     if include_all:
         posts = feed(conn, limit=limit, before=before, posts_only=True)
