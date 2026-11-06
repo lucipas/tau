@@ -42,6 +42,7 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     annotate_reactions,
+    annotate_replies,
     apply_display_rules,
     author_stats,
     feed,
@@ -371,6 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
     tan_post.add_argument("--file", type=Path, help="read the post text from a file")
+    tan_post.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="POST",
+        help="reply to this post instead of posting standalone (post hash or unique hash prefix)",
+    )
     tan_post.add_argument(
         "--to",
         action="append",
@@ -827,6 +834,21 @@ def _print_tan_posts(posts: Sequence[Dict[str, Any]], *, json_output: bool) -> N
             "%Y-%m-%d %H:%M"
         )
         print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        if post.get("kind") == "reply":
+            parent = post.get("reply_to")
+            if isinstance(parent, dict):
+                if parent.get("deleted"):
+                    print("  in reply to a deleted post")
+                else:
+                    parent_text = str(parent.get("text") or "")
+                    if len(parent_text) > 80:
+                        parent_text = parent_text[:80] + "…"
+                    print(
+                        f"  in reply to {parent.get('name') or 'anonymous'}: "
+                        f"{parent_text}"
+                    )
+            else:
+                print(f"  in reply to {short_hash(str(post.get('target', '')))}")
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
         likes = int(post.get("likes") or 0)
@@ -844,6 +866,7 @@ def _tan_identity(config: TauConfig) -> Any:
 
 def _publish_local_post(
     node: TauNode, *, text: str,
+    reply_to: Optional[str] = None,
     to: Optional[List[str]] = None, ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
@@ -852,7 +875,7 @@ def _publish_local_post(
                        request_timeout=float(timeout))
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
-    post = publisher.create_post(text)
+    post = publisher.create_post(text, reply_to=reply_to)
     published = publisher.publish(post, targets=targets,
                                   ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)))
     return {"post": post, "published": published}
@@ -863,9 +886,17 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
 
+    reply_to = None
+    if getattr(args, "reply_to", None):
+        conn = init_db(config.social_db_path)
+        try:
+            reply_to = resolve_post(conn, args.reply_to)["hash"]
+        finally:
+            conn.close()
+
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        post = app.create_post(text)
+        post = app.create_post(text, reply_to=reply_to)
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -875,7 +906,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             from .local_publish import publish_running
 
             result = publish_running(
-                config.data_dir, text=text, to=getattr(args, "to", None),
+                config.data_dir, text=text, reply_to=reply_to,
+                to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
             )
@@ -888,7 +920,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 )
                 node.attach_app(app)
                 result = _publish_local_post(
-                    node, text=text, to=getattr(args, "to", None),
+                    node, text=text, reply_to=reply_to,
+                    to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                 )
@@ -899,7 +932,10 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     if json_output:
         _emit({"post": post, "published": published}, True)
     else:
-        print(f"posted {short_hash(post['hash'])}")
+        verb = "replied" if reply_to is not None else "posted"
+        print(f"{verb} {short_hash(post['hash'])}")
+        if reply_to is not None:
+            print(f"  in reply to {short_hash(reply_to)}")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -1040,7 +1076,9 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                     feed(conn, author=author, limit=args.limit, posts_only=True)
                 )
             )
-            posts = annotate_reactions(conn, posts, viewer=viewer)
+            posts = annotate_replies(
+                conn, annotate_reactions(conn, posts, viewer=viewer)
+            )
         elif getattr(args, "all", False):
             posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
         else:
@@ -1701,11 +1739,16 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print("Outbox is empty — nothing waiting on offline peers.")
         else:
             now = time.time()
-            header = ("ID", "TO", "NAME", "AGE", "TRIES", "EXPIRES IN")
+            header = ("ID", "TO", "NAME", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
             rows: List[tuple] = [header]
             for entry in entries:
                 peer = registry.get(entry.to)
                 name = peer.display_name if peer is not None else entry.to_name
+                next_try = entry.next_attempt_at
+                if next_try is None or next_try <= now:
+                    next_try_text = "now"
+                else:
+                    next_try_text = f"in {_ago(next_try - now)}"
                 rows.append(
                     (
                         entry.id[:8],
@@ -1713,6 +1756,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                         name or "-",
                         _ago(now - entry.created_at),
                         str(entry.attempts),
+                        next_try_text,
                         _ago(entry.expires_at - now),
                     )
                 )
