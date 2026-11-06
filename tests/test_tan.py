@@ -875,6 +875,29 @@ def test_reply_to_uncached_parent_is_rejected_when_authoring(identities, tmp_pat
         create_reply(conn, bob, "cd" * 32, "early reply", name="bob", now=1000)
 
 
+def test_reply_to_unlinked_parent_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # replying to it would produce a reply with no parent context.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        create_reply(
+            destination, bob, second["hash"], "too early", name="bob", now=1002
+        )
+
+    # Once the chain links up, the same reply is accepted.
+    store_post(destination, first)
+    reply = create_reply(
+        destination, bob, second["hash"], "in full", name="bob", now=1003
+    )
+    assert reply["kind"] == "reply"
+
+
 def test_reply_to_parent_not_yet_synced_shows_without_snippet(identities, tmp_path):
     alice, bob = identities
     source = init_db(tmp_path / "source.sqlite3")

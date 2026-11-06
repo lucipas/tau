@@ -760,9 +760,10 @@ def create_reply(
     signed — but unlike a reaction it carries text, like a post.  It is
     appended to the replier's own chain, exactly like a post, and is
     gossipped and synced through the same paths.  When the target is
-    not cached locally this raises: a reply is written to a post the
-    author has seen.  Replies received from peers for parents that
-    have not arrived yet are still stored through the sync path
+    not cached locally, or is cached but has not linked yet (its chain
+    is incomplete), this raises: a reply is written to a post the
+    author has seen in full.  Replies received from peers for parents
+    that have not arrived yet are still stored through the sync path
     (:func:`store_post`) and shown without a parent snippet until the
     parent arrives.
     """
@@ -774,6 +775,10 @@ def create_reply(
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
         raise TanError("only posts and replies can be replied to")
+    if not existing.get("linked"):
+        raise TanError(
+            "post has not linked yet; sync its chain before replying"
+        )
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
     clean_text = normalize_message(text)
