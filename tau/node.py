@@ -902,10 +902,23 @@ class TauNode:
                 moved["deposited"] += 1
         return moved
 
+    def _still_queued(self, message_id: str) -> bool:
+        """True if the outbox still holds this entry, reloaded from disk.
+
+        The sweep works from a snapshot, so a cancel can land after the
+        snapshot was taken; each delivery attempt re-checks instead of
+        trusting the snapshot.  A send already in flight cannot be
+        recalled — cancelling only stops future attempts.
+        """
+        with self.mailbox.transaction():
+            return self.mailbox.get_outbox(message_id) is not None
+
     def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
         payload = encode_message(
             entry.text, message_id=entry.id, sent_at=entry.created_at
         )
+        if not self._still_queued(entry.id):
+            return False
         try:
             self._request(peer, REQUEST_MESSAGE, payload, timeout)
         except NodeError as exc:
@@ -940,6 +953,8 @@ class TauNode:
             )
         except (MailboxError, ProtocolError) as exc:
             log.debug("Could not seal queued message %s: %s", entry.id, exc)
+            return False
+        if not self._still_queued(entry.id):
             return False
         try:
             self._request(peer, REQUEST_MAIL_STORE, payload, timeout)

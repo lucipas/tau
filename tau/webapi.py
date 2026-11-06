@@ -435,27 +435,40 @@ class WebBridge:
         return message, response
 
     def outbox(self) -> Dict[str, Any]:
-        """Queued mail waiting on offline peers, with recipient names."""
-        entries = [self._describe_outbox_entry(e) for e in self.node.mailbox.outbox_list()]
-        return {
-            "outbox": entries,
-            "count": len(entries),
-            "held_for_others": self.node.mailbox.counts()["held"],
-        }
+        """Queued mail waiting on offline peers, with recipient names.
+
+        Read under the mailbox transaction so entries queued by a
+        separate process (e.g. a one-shot ``tau send``) are visible
+        instead of the serving process's cached snapshot.
+        """
+        with self.node.mailbox.transaction():
+            entries = [
+                self._describe_outbox_entry(entry)
+                for entry in self.node.mailbox.outbox_list()
+            ]
+            held = self.node.mailbox.counts()["held"]
+        return {"outbox": entries, "count": len(entries), "held_for_others": held}
 
     def cancel_outbox(self, target: str) -> Dict[str, Any]:
         """Remove one queued message from the outbox and describe it.
 
         Cancelling stops this node's future delivery attempts; sealed
         copies already held by other peers may still be delivered.
+        Resolve and remove happen inside one mailbox transaction, so a
+        cancel cannot miss an entry another process just queued, and a
+        delivery that lands in between is reported instead of silently
+        claimed as cancelled.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("message id is required")
-        entry = self.node.mailbox.resolve_outbox(target.strip())
-        if not self.node.mailbox.remove_outbox(entry.id):
-            # Delivered or expired between resolve and remove.
-            raise MailboxError(f"queued message {target.strip()!r} is no longer queued")
-        return self._describe_outbox_entry(entry)
+        with self.node.mailbox.transaction():
+            entry = self.node.mailbox.resolve_outbox(target.strip())
+            if not self.node.mailbox.remove_outbox(entry.id):
+                # Delivered or expired between resolve and remove.
+                raise MailboxError(
+                    f"queued message {target.strip()!r} is no longer queued"
+                )
+            return self._describe_outbox_entry(entry)
 
     def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
         payload = entry.to_dict()

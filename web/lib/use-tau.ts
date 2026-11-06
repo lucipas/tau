@@ -120,8 +120,15 @@ export function useTau() {
     };
   }, []);
 
+  const refreshSeq = useRef(0);
+
   const refreshOutbox = useCallback(async () => {
+    // Polls and action-triggered refreshes overlap; only the newest
+    // issued request may replace state, so a slow poll cannot restore
+    // an entry a cancel (or a send) already removed.
+    const requestId = ++refreshSeq.current;
     const result = await apiGet<OutboxResponse>("/api/outbox");
+    if (requestId !== refreshSeq.current) return;
     setOutbox(result.outbox);
     setHeldForOthers(result.held_for_others);
   }, []);
@@ -152,7 +159,18 @@ export function useTau() {
         "/api/outbox/cancel",
         { target: id },
       );
-      await refreshOutbox();
+      // The cancel already succeeded: drop the entry locally at once,
+      // and treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful cancel look like a failure.
+      const cancelledId = result.cancelled.id;
+      setOutbox((previous) =>
+        previous.filter((entry) => entry.id !== cancelledId),
+      );
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll reconciles.
+      }
       return result.cancelled;
     },
     [refreshOutbox],

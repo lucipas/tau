@@ -575,3 +575,25 @@ def test_outbox_cancel_errors(bridge, node):
     )
     assert status == 404
     assert "unknown queued message" in payload["error"]["message"]
+
+
+def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
+    from tau.mailbox import Mailbox
+
+    other = Mailbox(tmp_path / "mailbox.json")
+    entry = other.enqueue(to=bytes.fromhex(PEER_HASH), text="queued by cli")
+    # The serving node's in-memory snapshot predates the other process.
+    assert node.mailbox.get_outbox(entry.id) is None
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert [item["id"] for item in payload["outbox"]] == [entry.id]
+    assert payload["outbox"][0]["to_name"] == "alice"
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["cancelled"]["id"] == entry.id
+    # A fresh view of the file agrees the entry is gone.
+    assert Mailbox(tmp_path / "mailbox.json").get_outbox(entry.id) is None
