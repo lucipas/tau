@@ -282,6 +282,7 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             annotate_reactions,
+            annotate_replies,
             apply_display_rules,
             feed,
             following,
@@ -306,7 +307,9 @@ class WebBridge:
                         feed(conn, author=target, limit=limit, posts_only=True)
                     )
                 )
-                posts = annotate_reactions(conn, posts, viewer=viewer)
+                posts = annotate_replies(
+                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                )
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
             else:
@@ -364,11 +367,19 @@ class WebBridge:
             items = list(self._tan_posts)
         return items[-limit:] if limit >= 0 else items
 
-    def tan_post(self, text: str) -> Dict[str, Any]:
+    def tan_post(self, text: str, *, reply_to: Optional[str] = None) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
-        return app.create_post(text, publish=True)
+        if reply_to is not None:
+            conn = self._tan_conn()
+            try:
+                from .tangents.tan import resolve_post
+
+                reply_to = resolve_post(conn, reply_to)["hash"]
+            finally:
+                conn.close()
+        return app.create_post(text, reply_to=reply_to, publish=True)
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -692,8 +703,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                reply_to = body.get("reply_to")
+                if reply_to is not None and (
+                    not isinstance(reply_to, str) or not reply_to.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    post = self.bridge.tan_post(text)
+                    post = self.bridge.tan_post(text, reply_to=reply_to)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return

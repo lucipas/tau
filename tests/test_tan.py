@@ -9,7 +9,7 @@ import pytest
 from tau.cli import main
 from tau.config import TauConfig
 from tau.peers import Peer
-from tau.protocol import APP_NAME, ASPECT, decode, encode
+from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
 from tau.tangents.tan import (
     HASH_FIELDS,
     TAN_FEED_PATH,
@@ -17,10 +17,12 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    annotate_replies,
     author_stats,
     create_delete,
     create_post,
     create_reaction,
+    create_reply,
     deleted_targets,
     feed,
     follow,
@@ -500,8 +502,8 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
     assert deleted_targets(conn) == set()
     assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
 
-    # Only posts can be deleted, even by their own author.
-    with pytest.raises(TanError, match="only posts can be deleted"):
+    # Only posts and replies can be deleted, even by their own author.
+    with pytest.raises(TanError, match="only posts and replies can be deleted"):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
@@ -805,3 +807,180 @@ def test_store_rejects_oversize_post_from_a_peer(identities, tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     with pytest.raises(PostError):
         store_post(conn, mesg)
+
+
+def test_reply_chains_verifies_and_annotates(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+
+    reply = create_reply(
+        conn, bob, post["hash"], "seconded", name="bob", now=1001
+    )
+    assert reply["kind"] == "reply"
+    assert reply["target"] == post["hash"]
+    assert reply["text"] == "seconded"
+    assert verify_post(reply)["hash"] == reply["hash"]
+    assert head(conn, author_of(bob)) == reply["hash"]
+
+    # The sync feed carries the reply; display surfaces show it with
+    # its parent attached.
+    chain = feed(conn, author=author_of(bob))
+    assert [entry["kind"] for entry in chain] == ["reply"]
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [reply["hash"], post["hash"]]
+    assert items[0]["reply_to"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "original thought",
+        "deleted": False,
+    }
+    assert "reply_to" not in items[1]
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [
+        reply["hash"],
+        post["hash"],
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        reply["hash"],
+        post["hash"],
+    ]
+
+
+def test_reply_rejects_tampering(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "target practice", name="alice", now=1000)
+    other = create_post(conn, alice, "decoy", name="alice", now=1001)
+    reply = create_reply(
+        conn, bob, post["hash"], "agreed", name="bob", now=1002
+    )
+
+    # The parent link is signed: swapping it invalidates the signature.
+    with pytest.raises(PostError):
+        verify_post(dict(reply, target=other["hash"]))
+    with pytest.raises(PostError):
+        verify_post(dict(reply, text="sneaky"))
+    # A reply without a parent, and an empty reply, are rejected.
+    with pytest.raises(PostError):
+        verify_post(dict(reply, target=""))
+    with pytest.raises(ProtocolError, match="must not be empty"):
+        create_reply(conn, bob, post["hash"], "   ", name="bob", now=1003)
+
+
+def test_reply_to_uncached_parent_is_stored_orphan(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    reply = create_reply(
+        conn, bob, "cd" * 32, "early reply", name="bob", now=1000
+    )
+    assert reply["kind"] == "reply"
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [reply["hash"]]
+    assert items[0]["reply_to"] is None
+
+
+def test_reply_to_deleted_post_or_reaction_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_reply(conn, bob, like["hash"], "reply to a like", name="bob", now=1002)
+
+    create_delete(conn, alice, post["hash"], name="alice", now=1003)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_reply(conn, bob, post["hash"], "too late", name="bob", now=1004)
+
+
+def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, reply["hash"], "reply to the reply", name="alice", now=1002
+    )
+
+    # Replies are posts for liking and resolving: a nested reply's
+    # parent annotation points at the reply, not the top-level post.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [
+        nested["hash"],
+        reply["hash"],
+        post["hash"],
+    ]
+    assert items[0]["reply_to"]["hash"] == reply["hash"]
+    assert resolve_post(conn, reply["hash"][:12])["hash"] == reply["hash"]
+
+    create_reaction(conn, alice, reply["hash"], liked=True, name="alice", now=1003)
+    assert like_counts(conn, [reply["hash"]])[reply["hash"]]["likes"] == 1
+
+    # Deleting the reply hides it (and the nested reply's parent
+    # annotation reports the deletion without resurfacing the text).
+    create_delete(conn, bob, reply["hash"], name="bob", now=1004)
+    assert deleted_targets(conn) == {reply["hash"]}
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [nested["hash"], post["hash"]]
+    assert items[0]["reply_to"] == {
+        "hash": reply["hash"],
+        "author": reply["author"],
+        "name": "bob",
+        "text": "",
+        "deleted": True,
+    }
+    with pytest.raises(TanError, match="has been deleted"):
+        create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
+
+
+def test_cli_post_reply_to(tmp_path):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "cli thread starter",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json",
+                "--reply-to", post["hash"][:16], "cli reply",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        items = timeline(conn, include_all=True)
+        assert [item["text"] for item in items] == ["cli reply", "cli thread starter"]
+        assert items[0]["kind"] == "reply"
+        assert items[0]["reply_to"]["hash"] == post["hash"]
+    finally:
+        conn.close()
+
+    # Replying to an unknown post fails instead of writing a dangling reply.
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json",
+                "--reply-to", "cd" * 32, "nowhere",
+            ]
+        )
+        != 0
+    )

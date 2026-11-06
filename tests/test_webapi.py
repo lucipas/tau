@@ -472,3 +472,81 @@ def test_tan_delete_via_api(tmp_path):
         "delete",
         "delete",
     ]
+
+
+def test_tan_reply_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api thread starter", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "api reply", "reply_to": post["hash"][:16]},
+        )
+        assert status == 200
+        reply = payload["post"]
+        assert reply["kind"] == "reply"
+        assert reply["target"] == post["hash"]
+        assert reply["text"] == "api reply"
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "api reply",
+            "api thread starter",
+        ]
+        assert payload["posts"][0]["reply_to"] == {
+            "hash": post["hash"],
+            "author": post["author"],
+            "name": "tester",
+            "text": "api thread starter",
+            "deleted": False,
+        }
+
+        # Replying to an unknown post fails.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "nowhere", "reply_to": "cd" * 32},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A non-string reply_to is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "nowhere", "reply_to": 42},
+        )
+        assert status == 400
+        assert "reply_to" in payload["error"]["message"]
+
+        # A plain post still works with no reply_to.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/posts",
+            method="POST",
+            body={"text": "standalone"},
+        )
+        assert status == 200
+        assert payload["post"]["kind"] == "post"
+    finally:
+        bridge.stop()

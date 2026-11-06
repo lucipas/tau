@@ -13,6 +13,7 @@ export function SocialConsole() {
   const tan = useTan();
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
+  const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -20,8 +21,9 @@ export function SocialConsole() {
     if (!text.trim()) return;
     setError(null);
     try {
-      await tan.publish(text.trim());
+      await tan.publish(text.trim(), replyTarget?.hash);
       setText("");
+      setReplyTarget(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not publish");
     }
@@ -238,13 +240,35 @@ export function SocialConsole() {
                   <EmptyState />
                 ) : (
                   tan.posts.map((post) => (
-                    <PostCard key={post.hash} post={post} onToggleLike={toggleLike} />
+                    <PostCard
+                      key={post.hash}
+                      post={post}
+                      onToggleLike={toggleLike}
+                      onReply={(target) => setReplyTarget(target)}
+                    />
                   ))
                 )}
               </div>
             </section>
 
             <section className="mt-3 rounded-2xl border border-line/80 bg-panel/60 p-3">
+              {replyTarget ? (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-signal/30 bg-signal/10 px-2.5 py-1.5 text-[11px] text-signal">
+                  <span className="min-w-0 truncate">
+                    Replying to {replyTarget.name || "anonymous"} ·{" "}
+                    {replyTarget.text.length > 80
+                      ? `${replyTarget.text.slice(0, 80)}…`
+                      : replyTarget.text}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setReplyTarget(null)}
+                    className="shrink-0 font-mono text-[10px] text-mist/80 transition hover:text-zinc-100"
+                  >
+                    cancel
+                  </button>
+                </div>
+              ) : null}
               <div className="flex items-end gap-2">
                 <textarea
                   value={text}
@@ -261,7 +285,11 @@ export function SocialConsole() {
                   }}
                   rows={2}
                   maxLength={2000}
-                  placeholder="Write something to the mesh…"
+                  placeholder={
+                    replyTarget
+                      ? `Reply to ${replyTarget.name || "anonymous"}…`
+                      : "Write something to the mesh…"
+                  }
                   className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
                 />
                 <button
@@ -318,9 +346,11 @@ function EmptyState() {
 function PostCard({
   post,
   onToggleLike,
+  onReply,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onReply: (post: TanPost) => void;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   return (
@@ -341,6 +371,23 @@ function PostCard({
               {formatDateTime(post.created_at)}
             </span>
           </div>
+          {post.kind === "reply" ? (
+            <p className="mt-1 truncate text-[11px] text-mist/80">
+              in reply to{" "}
+              {post.reply_to ? (
+                <>
+                  {post.reply_to.name || "anonymous"} ·{" "}
+                  {post.reply_to.deleted
+                    ? "a deleted post"
+                    : post.reply_to.text.length > 80
+                      ? `${post.reply_to.text.slice(0, 80)}…`
+                      : post.reply_to.text}
+                </>
+              ) : (
+                shortHash(post.target ?? "", 16)
+              )}
+            </p>
+          ) : null}
           <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
             {post.text}
           </p>
@@ -362,6 +409,14 @@ function PostCard({
               }`}
             >
               ♥ {post.likes ?? 0}
+            </button>
+            <button
+              type="button"
+              onClick={() => onReply(post)}
+              title="Reply to this post"
+              className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+            >
+              reply
             </button>
           </div>
         </div>

@@ -60,10 +60,13 @@ export function useTan() {
   }, [all, load]);
 
   const publish = useCallback(
-    async (text: string) => {
+    async (text: string, replyTo?: string) => {
       setPosting(true);
       try {
-        const result = await apiPost<TanPostResponse>("/api/tan/posts", { text });
+        const result = await apiPost<TanPostResponse>("/api/tan/posts", {
+          text,
+          ...(replyTo ? { reply_to: replyTo } : {}),
+        });
         setPosts((previous) => {
           if (previous.some((post) => post.hash === result.post.hash)) {
             return previous;

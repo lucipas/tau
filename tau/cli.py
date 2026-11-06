@@ -330,6 +330,12 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
     tan_post.add_argument("--file", type=Path, help="read the post text from a file")
     tan_post.add_argument(
+        "--reply-to",
+        default=None,
+        metavar="POST",
+        help="reply to this post instead of posting standalone (post hash or unique hash prefix)",
+    )
+    tan_post.add_argument(
         "--to",
         action="append",
         default=None,
@@ -802,6 +808,7 @@ def _tan_identity(config: TauConfig) -> Any:
 
 def _publish_local_post(
     node: TauNode, *, text: str,
+    reply_to: Optional[str] = None,
     to: Optional[List[str]] = None, ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
@@ -810,7 +817,7 @@ def _publish_local_post(
                        request_timeout=float(timeout))
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
-    post = publisher.create_post(text)
+    post = publisher.create_post(text, reply_to=reply_to)
     published = publisher.publish(post, targets=targets,
                                   ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)))
     return {"post": post, "published": published}
@@ -821,9 +828,17 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
 
+    reply_to = None
+    if getattr(args, "reply_to", None):
+        conn = init_db(config.social_db_path)
+        try:
+            reply_to = resolve_post(conn, args.reply_to)["hash"]
+        finally:
+            conn.close()
+
     if getattr(args, "no_publish", False):
         app = TanApp(config, _tan_identity(config), name=config.name)
-        post = app.create_post(text)
+        post = app.create_post(text, reply_to=reply_to)
         published = None
     else:
         node = TauNode(config, name=config.name)
@@ -833,7 +848,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             from .local_publish import publish_running
 
             result = publish_running(
-                config.data_dir, text=text, to=getattr(args, "to", None),
+                config.data_dir, text=text, reply_to=reply_to,
+                to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
             )
@@ -846,7 +862,8 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 )
                 node.attach_app(app)
                 result = _publish_local_post(
-                    node, text=text, to=getattr(args, "to", None),
+                    node, text=text, reply_to=reply_to,
+                    to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
                 )
@@ -857,7 +874,10 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
     if json_output:
         _emit({"post": post, "published": published}, True)
     else:
-        print(f"posted {short_hash(post['hash'])}")
+        verb = "replied" if reply_to is not None else "posted"
+        print(f"{verb} {short_hash(post['hash'])}")
+        if reply_to is not None:
+            print(f"  in reply to {short_hash(reply_to)}")
         if published is None:
             print("  stored locally (not published)")
         else:

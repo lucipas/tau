@@ -74,6 +74,14 @@ export interface ApiErrorBody {
 }
 
 
+export interface TanReplyParent {
+  hash: string;
+  author: string;
+  name: string;
+  text: string;
+  deleted: boolean;
+}
+
 export interface TanPost {
   v: number;
   author: string;
@@ -86,6 +94,7 @@ export interface TanPost {
   sig: string;
   kind?: string;
   target?: string;
+  reply_to?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
 }
