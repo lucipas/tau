@@ -170,6 +170,18 @@ class WebBridge:
         self.web_dir = Path(web_dir).expanduser().resolve() if web_dir else None
         self.allow_remote = bool(allow_remote)
 
+        # The bridge owns the console message log, so it observes queued
+        # deliveries itself; chain any delivery callback the node already
+        # has instead of replacing it.
+        previous_on_delivered = getattr(node, "on_delivered", None)
+
+        def _on_delivered(message_id: str) -> None:
+            if callable(previous_on_delivered):
+                previous_on_delivered(message_id)
+            self.record_delivery(message_id)
+
+        node.on_delivered = _on_delivered
+
         self.bus = EventBus()
         self._lock = threading.Lock()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
@@ -246,6 +258,32 @@ class WebBridge:
         )
         self.bus.publish({"type": "message", "message": message})
         return message
+
+    def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
+        """Mark a queued outbound message delivered.
+
+        Called when the node reports that an outbox entry reached its
+        recipient. The matching console record (by the outbox id stored
+        at send time) flips from ``queued`` to ``delivered`` and the
+        console is told live, so the feed updates in place. Unknown
+        ids — mail queued from the CLI, or from before this was
+        tracked — are a no-op.
+        """
+        updated: Optional[Dict[str, Any]] = None
+        with self._lock:
+            for message in self._messages:
+                if (
+                    message.get("direction") == "out"
+                    and message.get("status") == "queued"
+                    and message.get("mail_id") == mail_id
+                ):
+                    message["status"] = "delivered"
+                    updated = dict(message)
+                    break
+        if updated is None:
+            return None
+        self.bus.publish({"type": "message_updated", "message": updated})
+        return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
@@ -428,6 +466,9 @@ class WebBridge:
             received_at=time.time(),
             status="queued" if queued else "delivered",
             rtt=_as_float(response.get("_rtt")),
+            # The outbox id links this record to a later delivery; only
+            # present while the message is queued.
+            mail_id=response.get("id") if queued else None,
         )
         self.bus.publish({"type": "message", "message": message})
         return message, response
@@ -499,6 +540,7 @@ class WebBridge:
         received_at: float,
         status: str,
         rtt: Optional[float] = None,
+        mail_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -513,6 +555,8 @@ class WebBridge:
             }
             if rtt is not None:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
+            if mail_id is not None:
+                message["mail_id"] = mail_id
             self._next_message_id += 1
             self._messages.append(message)
         return message

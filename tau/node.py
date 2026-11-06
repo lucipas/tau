@@ -305,6 +305,7 @@ class TauNode:
         registry: Optional[PeerRegistry] = None,
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
+        on_delivered: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -314,6 +315,7 @@ class TauNode:
         self.mailbox = Mailbox(config.mailbox_path)
         self.on_message = on_message
         self.on_peer = on_peer
+        self.on_delivered = on_delivered
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -913,6 +915,11 @@ class TauNode:
             return False
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        if self.on_delivered is not None:
+            try:
+                self.on_delivered(entry.id)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_delivered callback failed", exc_info=True)
         return True
 
     def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:

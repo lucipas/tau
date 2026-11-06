@@ -366,7 +366,9 @@ unique id, and each node remembers ids it has already shown, so direct,
 retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
 recipient) and everything expires. `tau outbox` shows what is waiting;
-`tau send --no-queue` restores the old fail-fast behaviour.
+`tau send --no-queue` restores the old fail-fast behaviour. A message sent
+from the web console shows as `queued` while it waits, and flips to
+`delivered` in the feed as soon as the sweep delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

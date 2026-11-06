@@ -472,3 +472,94 @@ def test_tan_delete_via_api(tmp_path):
         "delete",
         "delete",
     ]
+
+
+def _queue_send(node, mail_id="mail-1"):
+    """Make the fake node report a queued send with the given outbox id."""
+
+    def _send(peer, text, **kwargs):
+        return {
+            "ok": True,
+            "v": 1,
+            "queued": True,
+            "id": mail_id,
+            "to": peer.hexhash,
+            "expires_at": 9999.0,
+        }
+
+    node.send_message = _send
+
+
+def test_queued_send_records_outbox_id(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+    assert payload["message"]["mail_id"] == "mail-1"
+
+
+def test_direct_send_records_no_outbox_id(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "delivered"
+    assert "mail_id" not in payload["message"]
+
+
+def test_record_delivery_flips_queued_message_and_publishes(bridge, node):
+    _queue_send(node)
+    _, _, sent = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    message_id = sent["message"]["id"]
+
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["id"] == message_id
+    assert updated["status"] == "delivered"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["status"] == "delivered"
+
+    events = bridge.bus.replay(0)
+    updates = [event for event in events if event["type"] == "message_updated"]
+    assert len(updates) == 1
+    assert updates[0]["message"]["id"] == message_id
+    assert updates[0]["message"]["status"] == "delivered"
+
+
+def test_record_delivery_ignores_unknown_id(bridge, node):
+    _queue_send(node)
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+
+    assert bridge.record_delivery("not-an-outbox-id") is None
+    assert bridge.record_delivery("mail-1") is not None
+    # A second delivery report for the same id is a no-op: it is no
+    # longer queued, so there is nothing left to flip.
+    assert bridge.record_delivery("mail-1") is None
+
+    events = bridge.bus.replay(0)
+    updates = [event for event in events if event["type"] == "message_updated"]
+    assert len(updates) == 1
+
+
+def test_bridge_chains_existing_delivery_callback(node, tmp_path):
+    seen = []
+    node.on_delivered = seen.append
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    chained = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    try:
+        _queue_send(node)
+        message, _ = chained.send_message("alice", "hi")
+        assert message["status"] == "queued"
+
+        node.on_delivered("mail-1")
+        assert seen == ["mail-1"]
+        assert chained.messages()[0]["status"] == "delivered"
+    finally:
+        chained.stop()
