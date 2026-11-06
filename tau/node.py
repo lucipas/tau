@@ -606,11 +606,15 @@ class TauNode:
                 # not accumulate dead entries forever.  Peers with queued
                 # mail are spared: fresh mail for a long-unseen peer must
                 # not be stranded by the prune.
-                owed = {entry.to for entry in self.mailbox.outbox_list()}
-                dropped = self.registry.prune(keep=owed)
-                if dropped:
-                    log.debug("Pruned %d stale peer(s) from the registry", dropped)
-                self.registry.save()
+                # Hold the mailbox lock across the read and the prune so a
+                # one-shot process cannot queue mail for a peer between our
+                # snapshot of the shared mailbox and the registry save.
+                with self.mailbox.transaction():
+                    owed = {entry.to for entry in self.mailbox.outbox_list()}
+                    dropped = self.registry.prune(keep=owed)
+                    if dropped:
+                        log.debug("Pruned %d stale peer(s) from the registry", dropped)
+                    self.registry.save()
                 self._last_peer_save = now
             except OSError:
                 log.warning("Could not save peer registry", exc_info=True)

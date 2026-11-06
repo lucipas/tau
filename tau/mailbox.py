@@ -261,6 +261,10 @@ class Mailbox:
             finally:
                 self._txn_depth = 0
 
+    def transaction(self) -> Iterator[None]:
+        """Public handle on the cross-process mailbox lock (see ``_transaction``)."""
+        return self._transaction()
+
     # -- persistence -------------------------------------------------------
 
     def load(self) -> None:
