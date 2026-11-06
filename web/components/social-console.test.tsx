@@ -31,6 +31,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onReply={() => {}}
         onDelete={onDelete}
         deleting={false}
       />,
@@ -51,6 +52,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onReply={() => {}}
         onDelete={onDelete}
         deleting={false}
       />,
@@ -68,6 +70,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost({ own: false })}
         onToggleLike={() => {}}
+        onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
       />,
@@ -82,6 +85,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onReply={() => {}}
         onDelete={onDelete}
         deleting
       />,
