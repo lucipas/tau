@@ -205,6 +205,12 @@ tau tan search mesh --author alice
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
+
+# Back up your posts (or every cached author's) and restore them later —
+# every entry's signature and hash are re-verified on import
+tau tan export --output tan-backup.json
+tau tan export --all --output tan-backup.json
+tau tan import tan-backup.json
 ```
 
 Posts are limited to 2,000 characters and 20 posts per feed response. A
@@ -259,6 +265,8 @@ Global options may appear before or after the command:
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
 | `tau tan sync` | Pull missing posts from known peers |
+| `tau tan export` | Back up stored Tan posts as a JSON export |
+| `tau tan import FILE` | Restore Tan posts from a JSON export |
 | `tau tan rules` | Show or change which remote entries get committed |
 
 Useful flags:
@@ -610,6 +618,8 @@ unlinked, and stall sync at the gap.
   deletes) unlinked on the old peer until it upgrades and resyncs.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
+  Back up your own chain with `tau tan export` and restore it with
+  `tau tan import` — every entry is re-verified on import.
 - Peer information is self-asserted and can be stale; prune with
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.

@@ -42,20 +42,25 @@ from .node import (
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
+    TanError,
     annotate_reactions,
     annotate_replies,
     apply_display_rules,
     author_stats,
+    export_entries,
     feed,
     follow,
     following,
+    import_entries,
     init_db,
     resolve_author,
+    resolve_cached_author,
     resolve_delete_target,
     resolve_post,
     search_posts,
@@ -617,6 +622,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_sync.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_sync.set_defaults(func=cmd_tan_sync)
+
+    tan_export = tan_sub.add_parser(
+        "export",
+        parents=[common],
+        help="back up stored Tan posts as a JSON export",
+    )
+    tan_export.add_argument(
+        "--author",
+        metavar="NAME|HASH",
+        help="export one author's entries (default: your own)",
+    )
+    tan_export.add_argument(
+        "--all", action="store_true", help="export every stored author's entries"
+    )
+    tan_export.add_argument(
+        "--output",
+        type=Path,
+        metavar="FILE",
+        help="write the export to a file instead of stdout",
+    )
+    tan_export.set_defaults(func=cmd_tan_export)
+
+    tan_import = tan_sub.add_parser(
+        "import",
+        parents=[common],
+        help="restore Tan posts from a JSON export (signatures re-verified)",
+    )
+    tan_import.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='export file to read ("-" reads stdin)',
+    )
+    tan_import.set_defaults(func=cmd_tan_import)
 
     tan_rules = tan_sub.add_parser(
         "rules",
@@ -1438,6 +1477,76 @@ def cmd_tan_sync(args: argparse.Namespace) -> int:
         for error in summary["errors"]:
             print(f"  {short_hash(error['peer'])}: {error['error']}")
     return _EXIT_OK
+
+
+def cmd_tan_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        if getattr(args, "all", False):
+            if getattr(args, "author", None):
+                raise TanError("--author and --all cannot be combined")
+            document = export_entries(conn, all_authors=True)
+            scope = "all authors"
+        else:
+            if getattr(args, "author", None):
+                try:
+                    author, _ = resolve_author(
+                        conn,
+                        args.author,
+                        registry=PeerRegistry(config.peers_path),
+                    )
+                except TanError as exc:
+                    # The peer registry does not know authors whose posts
+                    # are only cached; fall back to the name on the posts.
+                    try:
+                        author, _ = resolve_cached_author(conn, args.author)
+                    except TanError:
+                        raise exc from None
+            else:
+                identity = _tan_identity(config)
+                author = destination_hash(identity).hex()
+            document = export_entries(conn, author=author)
+            scope = f"author {short_hash(author)}"
+    finally:
+        conn.close()
+    count = len(document["entries"])
+    text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+    if getattr(args, "output", None):
+        atomic_write_text(args.output, text + "\n")
+        print(f"Exported {count} entries ({scope}) to {args.output}")
+    else:
+        print(text)
+    return _EXIT_OK
+
+
+def cmd_tan_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if str(args.file) == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = args.file.read_text(encoding="utf-8")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise TanError(f"export file is not valid JSON: {exc}") from exc
+    conn = init_db(config.social_db_path)
+    try:
+        result = import_entries(conn, document)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        print(
+            f"Imported {result['imported']} entries "
+            f"({result['present']} already present, "
+            f"{result['skipped']} skipped)"
+        )
+        for error in result["errors"]:
+            ref = short_hash(error["hash"]) if error["hash"] else "?"
+            print(f"  skipped {ref}: {error['error']}")
+    return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
