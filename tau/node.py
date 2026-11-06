@@ -89,8 +89,7 @@ _EXCHANGE_INTERVAL = 900.0
 # request timeout, so an uncapped sweep over a large registry holds the
 # mail lock for minutes and starves announce-triggered rounds; the loop
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
-# Public: `tau outbox retry` applies the same cap to a one-shot sweep.
-MAIL_SWEEP_PEERS = 16
+_MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
@@ -343,6 +342,8 @@ class TauNode:
         self._announce_thread: Optional[threading.Thread] = None
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
+        self._mail_round_threads: Set[threading.Thread] = set()
+        self._mail_rounds_lock = threading.Lock()
         self._mail_pending: Set[str] = set()
         self._exchanged_at: Dict[bytes, float] = {}
         self._stop_event = threading.Event()
@@ -632,12 +633,58 @@ class TauNode:
         # A peer (re)appearing is the trigger for store-and-forward: try
         # to hand it anything queued for it, leave sealed copies of other
         # queued mail with it, and collect anything it holds for us.
-        threading.Thread(
-            target=self._mail_round_for_peer,
-            args=(peer,),
+        self._spawn_mail_round(peer)
+
+    def _spawn_mail_round(self, peer: Peer) -> None:
+        """Run a mail round for an announcing peer on its own thread.
+
+        The thread is tracked so a one-shot caller (``tau outbox
+        retry``) can wait for in-flight rounds before reading final
+        mailbox state — otherwise a round that delivers after the
+        caller's own flush is missed from the report.
+        """
+
+        def _run() -> None:
+            try:
+                self._mail_round_for_peer(peer)
+            finally:
+                with self._mail_rounds_lock:
+                    self._mail_round_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=_run,
             name="tau-mail-flush",
             daemon=True,
-        ).start()
+        )
+        with self._mail_rounds_lock:
+            self._mail_round_threads.add(thread)
+        thread.start()
+
+    def wait_for_mail_rounds(self, timeout: float = 30.0) -> bool:
+        """Wait for announce-triggered mail rounds to finish.
+
+        Returns True when no round is in flight.  Rounds spawned while
+        waiting are waited for too, until the budget runs out; False
+        means some round is still running and the caller should treat
+        mailbox state read afterwards as possibly stale.
+        """
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            with self._mail_rounds_lock:
+                rounds = [
+                    thread
+                    for thread in self._mail_round_threads
+                    if thread.is_alive()
+                ]
+            if not rounds:
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            for thread in rounds:
+                thread.join(timeout=remaining)
+                if deadline - time.time() <= 0:
+                    break
 
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.
@@ -899,7 +946,7 @@ class TauNode:
                     peer = self.registry.get(bytes.fromhex(hexhash))
                     if peer is not None:
                         self._mail_round_for_peer(peer)
-                self.flush_outbox(max_peers=MAIL_SWEEP_PEERS)
+                self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
             try:
@@ -973,24 +1020,32 @@ class TauNode:
         to: Optional[bytes] = None,
         message_id: Optional[str] = None,
         wait_for_lock: float = 0.0,
-    ) -> Dict[str, int]:
+    ) -> Dict[str, Any]:
         """Try to move queued mail: direct delivery, deposits, collection.
 
         Returns a summary with ``delivered``, ``deposited`` and
-        ``received`` counts.  Safe to call any time the node is running;
-        concurrent rounds are skipped rather than queued up.  With
-        ``respect_backoff`` (the default) entries whose delivery backoff
-        has not elapsed are left for a later round; pass ``False`` when
-        the caller has fresh evidence the peer is reachable (an announce).
-        With ``to`` set, only that recipient is contacted — the other
-        queued entries are left for a later round.  With
+        ``received`` counts, plus ``lock_busy`` — True when the sweep
+        never ran because the mail lock stayed busy.  Safe to call any
+        time the node is running; concurrent rounds are skipped rather
+        than queued up.  With ``respect_backoff`` (the default) entries
+        whose delivery backoff has not elapsed are left for a later
+        round; pass ``False`` when the caller has fresh evidence the
+        peer is reachable (an announce).  With ``to`` set, only that
+        recipient is contacted — the other queued entries are left for
+        a later round.  With ``message_id`` set, only that entry is
+        attempted and nothing is deposited with the peer.  With
         ``wait_for_lock`` > 0, wait up to that many seconds for a
         concurrent mail round to finish instead of skipping the sweep;
         0 (the default) keeps the skip-when-busy behaviour, which is
         what the background loop wants.  A one-shot caller that must
         know the outcome waits; a background round never does.
         """
-        summary = {"delivered": 0, "deposited": 0, "received": 0}
+        summary = {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
         if not self.started:
             return summary
         if wait_for_lock > 0:
@@ -998,6 +1053,7 @@ class TauNode:
         else:
             acquired = self._mail_lock.acquire(blocking=False)
         if not acquired:
+            summary["lock_busy"] = True
             return summary
         try:
             self.mailbox.prune()

@@ -920,12 +920,17 @@ def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
 
 class _FakeRetryNode:
     """Stub TauNode for `tau outbox retry`: records the flush call and,
-    when ``deliver`` is set, removes every queued entry from the shared
-    mailbox file to simulate a successful delivery."""
+    when ``deliver`` is set, removes every matching queued entry from
+    the shared mailbox file to simulate a successful delivery (firing
+    the node's delivery callback, as a real delivery would).  When
+    ``vanish`` is set, matching entries disappear without any delivery
+    callback, as a concurrent cancel would remove them.  When
+    ``deposit`` is set, the remaining entries gain a holder."""
 
     instances: list = []
     summary = {"delivered": 0, "deposited": 0, "received": 0}
     deliver = False
+    vanish = False
     deposit = False
 
     def __init__(self, config, **kwargs):
@@ -933,6 +938,7 @@ class _FakeRetryNode:
 
         self.config = config
         self.mailbox = Mailbox(config.mailbox_path)
+        self.on_delivered = kwargs.get("on_delivered")
         self.started = False
         self.start_kwargs: dict = {}
         self.flush_calls: list = []
@@ -945,13 +951,28 @@ class _FakeRetryNode:
     def stop(self):
         self.started = False
 
+    def wait_for_mail_rounds(self, timeout=30.0):
+        return True
+
     def flush_outbox(self, **kwargs):
         self.flush_calls.append(kwargs)
+        target = kwargs.get("message_id")
+        to = kwargs.get("to")
+        doomed = []
+        for entry in self.mailbox.outbox_list():
+            if target is not None:
+                if entry.id == target:
+                    doomed.append(entry)
+            elif to is None or entry.to == to:
+                doomed.append(entry)
         if _FakeRetryNode.deliver:
-            target = kwargs.get("to")
-            for entry in self.mailbox.outbox_list():
-                if target is None or entry.to == target:
-                    self.mailbox.remove_outbox(entry.id)
+            for entry in doomed:
+                self.mailbox.remove_outbox(entry.id)
+                if self.on_delivered is not None:
+                    self.on_delivered(entry.id)
+        elif _FakeRetryNode.vanish:
+            for entry in doomed:
+                self.mailbox.remove_outbox(entry.id)
         if _FakeRetryNode.deposit:
             # A sealed copy handed to a holder is persisted on the entry.
             for entry in self.mailbox.outbox_list():
@@ -1016,12 +1037,12 @@ def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
 def test_outbox_retry_counts_delivery_by_a_concurrent_round(
     tmp_path, capsys, monkeypatch
 ):
-    """The outcome is read from the queue, not the flush summary.
+    """The outcome is confirmed by delivery callbacks, not the summary.
 
     An announce-triggered mail round can deliver a queued message
     before (or instead of) this command's own flush; the flush then
-    reports zero deliveries while the queue shows the message is gone.
-    The retry must still report it delivered.
+    reports zero deliveries while the node's delivery callback confirms
+    the message is gone. The retry must still report it delivered.
     """
     from tau.mailbox import Mailbox
 
@@ -1039,6 +1060,60 @@ def test_outbox_retry_counts_delivery_by_a_concurrent_round(
     assert payload["delivered"] == 2
     assert payload["still_queued"] == 0
     assert Mailbox(config.mailbox_path).outbox_list() == []
+
+
+def test_outbox_retry_reports_unconfirmed_departures(
+    tmp_path, capsys, monkeypatch
+):
+    """Entries that vanish without a delivery callback are not delivered.
+
+    If another process cancels a queued message mid-retry, the entry
+    disappears from the queue but no delivery was confirmed; the retry
+    must say so instead of reporting a delivery that never happened.
+    """
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, _, _ = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {"delivered": 0, "deposited": 0, "received": 0}
+    _FakeRetryNode.deliver = False
+    monkeypatch.setattr(_FakeRetryNode, "vanish", True)
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == 0
+    assert payload["still_queued"] == 0
+    assert payload["left_queue_unconfirmed"] == 2
+    assert Mailbox(config.mailbox_path).outbox_list() == []
+
+    _seed_retry_outbox(data_dir)
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "2 message(s) left the queue without a delivery confirmation" in out
+
+
+def test_outbox_retry_lock_busy_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {
+        "delivered": 0,
+        "deposited": 0,
+        "received": 0,
+        "lock_busy": True,
+    }
+    _FakeRetryNode.deliver = False
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "still running after 60s; nothing was attempted" in capsys.readouterr().err
+    node = _FakeRetryNode.instances[0]
+    assert node.started is False
 
 
 def test_outbox_retry_all_reports_still_queued(tmp_path, capsys, monkeypatch):

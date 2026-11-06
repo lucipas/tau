@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from . import __version__
 from .allowlist import (
@@ -2374,7 +2374,14 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         # No work to do: do not start a node just to report an empty queue.
         if _json_mode(args):
             _emit(
-                {"delivered": 0, "deposited": 0, "received": 0, "still_queued": 0},
+                {
+                    "delivered": 0,
+                    "deposited": 0,
+                    "received": 0,
+                    "still_queued": 0,
+                    "left_queue_unconfirmed": 0,
+                    "rounds_pending": False,
+                },
                 True,
             )
         else:
@@ -2403,10 +2410,16 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
     # an announce-triggered round instead.  A round that wins the race
     # still moves the mail, so the outcome below is read back from the
     # queue itself rather than trusted from the flush summary alone:
-    # entries that vanished (and had not expired) were delivered, and
-    # new holders on the entries left behind are deposits.
+    # deliveries are confirmed by the node's delivery callback (which
+    # also fires for announce-triggered rounds in this process), and
+    # new holders on the entries left behind are deposits.  An entry
+    # that vanished without a delivery confirmation was cancelled,
+    # expired, or delivered by another process — never counted delivered.
     queued_before = {e.id: e for e in mailbox.outbox_list()}
-    node = TauNode(config, name=config.name)
+    delivered_ids: Set[str] = set()
+    node = TauNode(
+        config, name=config.name, on_delivered=delivered_ids.add
+    )
     node.start(mail_loop=False)
     try:
         summary = node.flush_outbox(
@@ -2424,6 +2437,15 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
             # anyway, so waiting longer buys nothing.
             wait_for_lock=60.0,
         )
+        if summary.get("lock_busy"):
+            raise NodeError(
+                "another mail round is still running after 60s; nothing"
+                " was attempted — try again, or leave a node serving"
+            )
+        # Let a late announce-triggered round finish before reading
+        # final state, so a delivery landing just after this flush is
+        # still reported instead of showing up as still queued.
+        rounds_pending = not node.wait_for_mail_rounds(timeout=30.0)
     finally:
         node.stop()
 
@@ -2433,10 +2455,20 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
     now = time.time()
     remaining = mailbox.outbox_list()
     remaining_ids = {e.id for e in remaining}
-    delivered = sum(
+    delivered = sum(1 for entry_id in queued_before if entry_id in delivered_ids)
+    expired = sum(
         1
         for entry_id, entry in queued_before.items()
-        if entry_id not in remaining_ids and entry.expires_at > now
+        if entry_id not in remaining_ids
+        and entry_id not in delivered_ids
+        and entry.expires_at <= now
+    )
+    left_unconfirmed = sum(
+        1
+        for entry_id, entry in queued_before.items()
+        if entry_id not in remaining_ids
+        and entry_id not in delivered_ids
+        and entry.expires_at > now
     )
     # Deposits are read back from the holders persisted on the entries
     # left in the queue, not from the flush summary: counting both would
@@ -2452,12 +2484,14 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         "deposited": deposited,
         "received": summary["received"],
         "still_queued": len(remaining),
+        "left_queue_unconfirmed": left_unconfirmed,
+        "rounds_pending": rounds_pending,
     }
     fresh = None
     if target_entry is not None:
         fresh = mailbox.get_outbox(target_entry.id)
         payload["target"] = target_entry.id
-        payload["target_delivered"] = fresh is None
+        payload["target_delivered"] = target_entry.id in delivered_ids
         if fresh is not None:
             payload["target_attempts"] = fresh.attempts
             payload["target_next_attempt_at"] = fresh.next_attempt_at
@@ -2466,8 +2500,14 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         _emit(payload, True)
     elif target_entry is not None:
         label = f"{target_entry.id[:8]} for {target_name or target_entry.to_hex}"
-        if fresh is None:
+        if fresh is None and target_entry.id in delivered_ids:
             print(f"delivered {label}")
+        elif fresh is None:
+            print(
+                f"no longer queued: {label} — it left the queue without"
+                " a delivery confirmation (cancelled, expired, or"
+                " delivered by another process)"
+            )
         else:
             next_try = fresh.next_attempt_at
             if next_try is None or next_try <= time.time():
@@ -2492,6 +2532,19 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 f"{len(remaining)} message(s) still queued — they will be"
                 " retried automatically, or run `tau outbox retry` again"
             )
+        if left_unconfirmed:
+            print(
+                f"{left_unconfirmed} message(s) left the queue without a"
+                " delivery confirmation (cancelled, expired, or delivered"
+                " by another process)"
+            )
+        if expired:
+            print(f"{expired} message(s) expired during the retry")
+    if rounds_pending and not _json_mode(args):
+        print(
+            "note: a mail round was still running when the retry"
+            " finished; re-run `tau outbox retry` to confirm the outcome"
+        )
     return _EXIT_OK
 
 
@@ -2634,15 +2687,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _EXIT_INTERRUPTED
     except (NodeError, PeerError, IdentityError, ProtocolError) as exc:
         print(f"tau: error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
-    except (OSError, ValueError) as exc:
-        print(f"tau: error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
-
-
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
-(f"tau: error: {exc}", file=sys.stderr)
         return _EXIT_ERROR
     except (OSError, ValueError) as exc:
         print(f"tau: error: {exc}", file=sys.stderr)

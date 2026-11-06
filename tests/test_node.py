@@ -337,13 +337,24 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
     )[1]
     node._collect_mail = lambda p, timeout: 0
 
-    # A background round holding the lock makes a plain flush skip.
+    # A background round holding the lock makes a plain flush skip,
+    # and the summary says so instead of looking like a quiet sweep.
     node._mail_lock.acquire()
     try:
         assert node.flush_outbox() == {
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "lock_busy": True,
+        }
+        assert calls == []
+        # A bounded wait that expires reports the same, rather than
+        # silently pretending the retry was attempted.
+        assert node.flush_outbox(wait_for_lock=0.2) == {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": True,
         }
         assert calls == []
     finally:
@@ -366,9 +377,34 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
         "delivered": 0,
         "deposited": 0,
         "received": 0,
+        "lock_busy": False,
     }
     holder.join(timeout=5.0)
     assert calls == [peer.hexhash]
+
+
+def test_wait_for_mail_rounds_joins_in_flight_rounds(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    started = threading.Event()
+    finished: list = []
+
+    def _slow_round(other: Peer) -> None:
+        started.set()
+        time.sleep(0.2)
+        finished.append(other.hexhash)
+
+    node._mail_round_for_peer = _slow_round
+    node._spawn_mail_round(peer)
+    assert started.wait(timeout=5.0)
+    assert node.wait_for_mail_rounds(timeout=5.0) is True
+    assert finished == [peer.hexhash]
+
+    # A round that outlasts the budget reports False instead of hanging.
+    node._mail_round_for_peer = lambda other: time.sleep(2.0)
+    node._spawn_mail_round(peer)
+    assert node.wait_for_mail_rounds(timeout=0.1) is False
+    assert node.wait_for_mail_rounds(timeout=5.0) is True
 def test_deliver_entry_skips_message_cancelled_by_another_process(
     tmp_path, monkeypatch
 ):
