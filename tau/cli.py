@@ -40,6 +40,7 @@ from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
+    TanError,
     annotate_reactions,
     apply_display_rules,
     author_stats,
@@ -50,6 +51,7 @@ from .tangents.tan import (
     import_entries,
     init_db,
     resolve_author,
+    resolve_cached_author,
     resolve_delete_target,
     resolve_post,
     timeline,
@@ -1270,9 +1272,19 @@ def cmd_tan_export(args: argparse.Namespace) -> int:
             scope = "all authors"
         else:
             if getattr(args, "author", None):
-                author, _ = resolve_author(
-                    conn, args.author, registry=PeerRegistry(config.peers_path)
-                )
+                try:
+                    author, _ = resolve_author(
+                        conn,
+                        args.author,
+                        registry=PeerRegistry(config.peers_path),
+                    )
+                except TanError as exc:
+                    # The peer registry does not know authors whose posts
+                    # are only cached; fall back to the name on the posts.
+                    try:
+                        author, _ = resolve_cached_author(conn, args.author)
+                    except TanError:
+                        raise exc from None
             else:
                 identity = _tan_identity(config)
                 author = destination_hash(identity).hex()

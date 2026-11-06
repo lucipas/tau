@@ -1026,23 +1026,31 @@ def export_entries(
 
     Entries are the canonical signed envelopes (the same dicts
     :func:`store_post` accepts), ordered per author so a chain replays
-    in order: linked entries by sequence, then any entries whose parent
-    is missing from this store (sequence 0) by creation time.  An entry
-    whose parent is missing stays unlinked on import until that parent
-    arrives, exactly as sync behaves.
+    in order: linked entries by sequence — the stored head first among
+    same-sequence forks, so the restored head matches the source — then
+    any entries whose parent is missing from this store (sequence 0)
+    by creation time.  An entry whose parent is missing stays unlinked
+    on import until that parent arrives, exactly as sync behaves.
     """
+    columns = ", ".join(f"posts.{column}" for column in _POST_COLUMNS)
+    order = (
+        "posts.linked DESC, posts.seq ASC, heads.hash IS NULL ASC, "
+        "posts.created_at ASC, posts.hash ASC"
+    )
     if all_authors:
         rows = conn.execute(
-            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
-            "ORDER BY author ASC, seq ASC, created_at ASC, hash ASC"
+            f"SELECT {columns} FROM posts LEFT JOIN heads "
+            "ON heads.author = posts.author AND heads.hash = posts.hash "
+            f"ORDER BY posts.author ASC, {order}"
         ).fetchall()
     else:
         if author is None:
             raise TanError("export needs an author or --all")
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         rows = conn.execute(
-            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE author = ? "
-            "ORDER BY seq ASC, created_at ASC, hash ASC",
+            f"SELECT {columns} FROM posts LEFT JOIN heads "
+            "ON heads.author = posts.author AND heads.hash = posts.hash "
+            f"WHERE posts.author = ? ORDER BY {order}",
             (author,),
         ).fetchall()
     entries = [_canonical_post(dict(row)) for row in rows]
@@ -1085,7 +1093,19 @@ def import_entries(
             digest = str(entry.get("hash") or "")
         try:
             _, is_new = store_post(conn, entry, verify=True)
-        except (TanError, TypeError, AttributeError) as exc:
+        except (
+            TanError,
+            ProtocolError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+        ) as exc:
+            # A bad entry is recorded and skipped; it never aborts the
+            # rest of the import.  OverflowError needs listing because
+            # float() on a huge JSON integer raises it, and it is not a
+            # ValueError; ProtocolError is listed for the same reason
+            # even though validation currently wraps it as a PostError.
             skipped += 1
             errors.append({"hash": digest, "error": str(exc)})
             continue
@@ -1255,6 +1275,36 @@ def resolve_author(
             raise TanError(f"{len(rows)} cached authors match {value!r}")
 
     raise TanError(f"unknown author or peer: {target!r}")
+
+
+def resolve_cached_author(conn: sqlite3.Connection, name: str) -> Tuple[str, str]:
+    """Resolve an author by the name recorded on their stored posts.
+
+    The peer registry does not know authors whose posts are only cached,
+    so commands that select a stored author by name fall back to this.
+    The match is case-insensitive and must pick out exactly one author.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise TanError("author must not be empty")
+    clean = name.strip()
+    rows = conn.execute(
+        "SELECT DISTINCT author FROM posts WHERE name = ? COLLATE NOCASE",
+        (clean,),
+    ).fetchall()
+    if len(rows) == 1:
+        author = str(rows[0]["author"])
+        latest = conn.execute(
+            "SELECT name FROM posts WHERE author = ? AND name != '' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (author,),
+        ).fetchone()
+        return author, str(latest["name"]) if latest is not None else ""
+    if len(rows) > 1:
+        raise TanError(
+            f"{len(rows)} cached authors are named {clean!r}; "
+            "use a destination hash"
+        )
+    raise TanError(f"no cached posts from an author named {clean!r}")
 
 
 # -- network application ---------------------------------------------------

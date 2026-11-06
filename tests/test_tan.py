@@ -378,6 +378,115 @@ def test_import_skips_tampered_entry(identities, tmp_path):
         target.close()
 
 
+def test_import_skips_bad_signature(identities, tmp_path):
+    alice, _bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        post = create_post(source, alice, "signed", name="alice", now=1000)
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+    entry = document["entries"][0]
+    flipped = ("0" if entry["sig"][0] != "0" else "1") + entry["sig"][1:]
+    entry["sig"] = flipped  # hash still matches; only the signature is bad
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["imported"] == 0
+        assert result["skipped"] == 1
+        assert "signature is invalid" in result["errors"][0]["error"]
+        assert get_post(target, post["hash"]) is None
+    finally:
+        target.close()
+
+
+def test_import_skips_bad_entries_and_continues(identities, tmp_path):
+    alice, _bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        create_post(source, alice, "one", name="alice", now=1000)
+        create_post(source, alice, "two", name="alice", now=1001)
+        third = create_post(source, alice, "three", name="alice", now=1002)
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+    document["entries"][0]["text"] = ""  # ProtocolError from normalize_message
+    document["entries"][1]["created_at"] = 10**400  # OverflowError in float()
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["imported"] == 1
+        assert result["skipped"] == 2
+        assert len(result["errors"]) == 2
+        assert get_post(target, third["hash"]) is not None
+    finally:
+        target.close()
+
+
+def test_export_preserves_forked_head(identities, tmp_path):
+    alice, _bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        parent = create_post(source, alice, "parent", name="alice", now=1000)
+        # Two children of the same parent: a fork, as when one identity is
+        # used on two cloned nodes. The first inserted becomes the head,
+        # even though the second was created earlier.
+        first_child = create_post(
+            source,
+            alice,
+            "head branch",
+            name="alice",
+            now=1002,
+            previous=parent["hash"],
+        )
+        second_child = create_post(
+            source,
+            alice,
+            "other branch",
+            name="alice",
+            now=1001,
+            previous=parent["hash"],
+        )
+        assert head(source, author_of(alice)) == first_child["hash"]
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+    # The head sorts first among the same-sequence fork, ahead of the
+    # earlier-created sibling.
+    assert [entry["hash"] for entry in document["entries"]] == [
+        parent["hash"],
+        first_child["hash"],
+        second_child["hash"],
+    ]
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["imported"] == 3
+        assert head(target, author_of(alice)) == first_child["hash"]
+    finally:
+        target.close()
+
+
+def test_export_orders_orphans_after_linked(identities, tmp_path):
+    alice, _bob = identities
+    conn = init_db(tmp_path / "x.sqlite3")
+    try:
+        first = create_post(conn, alice, "first", name="alice", now=1000)
+        second = create_post(conn, alice, "second", name="alice", now=1001)
+        orphan = create_post(
+            conn, alice, "orphan", name="alice", now=1002, previous="f" * 64
+        )
+        assert get_post(conn, orphan["hash"])["linked"] is False
+        document = export_entries(conn, author=author_of(alice))
+    finally:
+        conn.close()
+    assert [entry["hash"] for entry in document["entries"]] == [
+        first["hash"],
+        second["hash"],
+        orphan["hash"],
+    ]
+
+
 def test_import_rejects_bad_envelope(tmp_path):
     conn = init_db(tmp_path / "empty.sqlite3")
     try:
@@ -444,6 +553,55 @@ def test_cli_tan_export_import(tmp_path):
     assert len(posts) == 1
     assert posts[0]["text"] == "hello backup"
     assert posts[0]["name"] == "alice"
+
+    # Carol has alice's posts cached but alice is not in her peer
+    # registry, so export-by-name must fall back to the cached posts.
+    cached_path = tmp_path / "cached-export.json"
+    assert (
+        main(
+            [
+                "tan",
+                "export",
+                "--data-dir",
+                str(carol_dir),
+                "--author",
+                "alice",
+                "--output",
+                str(cached_path),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(cached_path.read_text(encoding="utf-8"))["entries"][0][
+        "text"
+    ] == "hello backup"
+
+
+def test_cli_tan_export_import_errors(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    # --author and --all conflict: a clean CLI error, not a traceback.
+    assert (
+        main(
+            [
+                "tan",
+                "export",
+                "--data-dir",
+                str(data_dir),
+                "--author",
+                "alice",
+                "--all",
+            ]
+        )
+        == 1
+    )
+    assert "cannot be combined" in capsys.readouterr().err
+    bad_path = tmp_path / "bad.json"
+    bad_path.write_text("not json", encoding="utf-8")
+    assert (
+        main(["tan", "import", "--data-dir", str(data_dir), str(bad_path)]) == 1
+    )
+    assert "not valid JSON" in capsys.readouterr().err
 
 
 def test_reaction_chains_verifies_and_counts(identities, tmp_path):
