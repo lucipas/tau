@@ -184,6 +184,7 @@ class WebBridge:
 
         self.bus = EventBus()
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -270,16 +271,20 @@ class WebBridge:
         tracked — are a no-op.
         """
         updated: Optional[Dict[str, Any]] = None
-        with self._lock:
-            for message in self._messages:
-                if (
-                    message.get("direction") == "out"
-                    and message.get("status") == "queued"
-                    and message.get("mail_id") == mail_id
-                ):
-                    message["status"] = "delivered"
-                    updated = dict(message)
-                    break
+        # Take the send lock first (same order as send_message): a delivery
+        # reported while a send is still recording waits for the record
+        # to exist instead of missing it.
+        with self._send_lock:
+            with self._lock:
+                for message in self._messages:
+                    if (
+                        message.get("direction") == "out"
+                        and message.get("status") == "queued"
+                        and message.get("mail_id") == mail_id
+                    ):
+                        message["status"] = "delivered"
+                        updated = dict(message)
+                        break
         if updated is None:
             return None
         self.bus.publish({"type": "message_updated", "message": updated})
@@ -455,21 +460,27 @@ class WebBridge:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
-        response = self.node.send_message(peer, text, timeout=timeout)
-        queued = bool(response.get("queued"))
-        message = self._append_message(
-            direction="out",
-            peer=peer.hexhash,
-            peer_name=peer.display_name,
-            text=text,
-            sent_at=time.time(),
-            received_at=time.time(),
-            status="queued" if queued else "delivered",
-            rtt=_as_float(response.get("_rtt")),
-            # The outbox id links this record to a later delivery; only
-            # present while the message is queued.
-            mail_id=response.get("id") if queued else None,
-        )
+        # Hold the send lock across queueing and recording: queueing starts
+        # a flush thread that can deliver the entry (and report it via
+        # record_delivery) before the record below exists. record_delivery
+        # takes the same lock first, so it waits for the record and then
+        # flips it instead of silently missing the delivery.
+        with self._send_lock:
+            response = self.node.send_message(peer, text, timeout=timeout)
+            queued = bool(response.get("queued"))
+            message = self._append_message(
+                direction="out",
+                peer=peer.hexhash,
+                peer_name=peer.display_name,
+                text=text,
+                sent_at=time.time(),
+                received_at=time.time(),
+                status="queued" if queued else "delivered",
+                rtt=_as_float(response.get("_rtt")),
+                # The outbox id links this record to a later delivery; only
+                # present while the message is queued.
+                mail_id=response.get("id") if queued else None,
+            )
         self.bus.publish({"type": "message", "message": message})
         return message, response
 

@@ -546,6 +546,46 @@ def test_record_delivery_ignores_unknown_id(bridge, node):
     assert len(updates) == 1
 
 
+def test_delivery_before_record_is_not_lost(bridge, node):
+    """A flush that delivers before send_message records the message.
+
+    Queueing starts a flush thread, so the delivery callback can fire
+    before ``_append_message`` runs. The send lock makes the callback
+    wait for the record, so the message still flips to delivered
+    instead of staying queued forever.
+    """
+    started = []
+
+    def _send(peer, text, **kwargs):
+        thread = threading.Thread(
+            target=node.on_delivered, args=("mail-1",), name="tau-test-deliver"
+        )
+        thread.start()
+        started.append(thread)
+        # Let the delivery thread run first: without the send lock it
+        # would find no record and the message would stay queued.
+        time.sleep(0.05)
+        return {
+            "ok": True,
+            "v": 1,
+            "queued": True,
+            "id": "mail-1",
+            "to": peer.hexhash,
+            "expires_at": 9999.0,
+        }
+
+    node.send_message = _send
+    status, _, _ = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    started[0].join(timeout=5)
+    assert not started[0].is_alive()
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["status"] == "delivered"
+
+
 def test_bridge_chains_existing_delivery_callback(node, tmp_path):
     seen = []
     node.on_delivered = seen.append
