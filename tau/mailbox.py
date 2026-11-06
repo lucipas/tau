@@ -113,8 +113,11 @@ class OutboxEntry:
         """
         if self.attempts <= 0 or self.last_attempt_at is None:
             return None
+        # Clamp the exponent before exponentiating: a large stored attempt
+        # count would otherwise overflow float conversion before the cap.
+        exponent = min(self.attempts - 1, 32)
         delay = min(
-            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** (self.attempts - 1)),
+            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** exponent),
             DELIVERY_BACKOFF_MAX_SECONDS,
         )
         return self.last_attempt_at + delay
