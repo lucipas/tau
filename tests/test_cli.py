@@ -6,15 +6,17 @@ import os
 import stat
 from types import SimpleNamespace
 
+import RNS
 import pytest
 import RNS
 
 from tau import cli
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.peers import PeerRegistry
 from tau.node import InstanceLock
+from tau.peers import PeerRegistry
 
 
 def test_parser_accepts_global_options_before_and_after_command():
@@ -370,6 +372,242 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+def test_parser_messages_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "--peer", "alice", "--limit", "5"])
+    assert args.command == "messages"
+    assert args.peer == "alice"
+    assert args.limit == 5
+
+    defaults = parser.parse_args(["messages"])
+    assert defaults.peer is None
+    assert defaults.limit == 30
+
+
+def _seed_messages(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "first hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "second hello",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "m-2",
+        }
+    )
+    return data_dir, sender_hash
+
+
+def test_messages_lists_newest_first(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "second hello" in out
+    assert "first hello" in out
+    assert out.index("second hello") < out.index("first hello")
+    assert "alice" in out
+
+
+def test_messages_json_and_peer_filter(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "alice", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", sender_hash.hex()[:8], "--limit", "1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "m-2"
+
+
+def test_messages_empty_and_unknown_peer(tmp_path, capsys):
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    assert "No messages received yet" in capsys.readouterr().out
+
+    _, sender_hash = _seed_messages(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(tmp_path / "node"), "--peer", "nobody"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--limit", "-1"])
+    assert code == 1
+    assert "must not be negative" in capsys.readouterr().err
+
+
+def test_messages_peer_filter_for_unregistered_sender(tmp_path, capsys):
+    """--peer works by hash/prefix even when the sender left the registry."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd1111111111111111111111111111",
+            "text": "from a stranger",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "u-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd2222222222222222222222222222",
+            "text": "from another stranger",
+            "sent_at": 10.0,
+            "received_at": 21.0,
+            "id": "u-2",
+        }
+    )
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            "abcd1111111111111111111111111111",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["u-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["u-1"]
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--peer", "abcd"])
+    assert code == 1
+    assert "match the hash prefix" in capsys.readouterr().err
+
+    # A well-formed hash with no stored messages filters to an empty list.
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            "ff" * 16,
+            "--json",
+        ]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_messages_shared_prefix_is_ambiguous(tmp_path, capsys):
+    """A prefix shared by a registered peer and an inbox sender is rejected."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        bytes.fromhex("abcd1111111111111111111111111111"),
+        b"\x02" * 64,
+        name="carol",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "abcd1111111111111111111111111111",
+            "text": "from the registered peer",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "r-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd2222222222222222222222222222",
+            "text": "from the unregistered sender",
+            "sent_at": 10.0,
+            "received_at": 21.0,
+            "id": "r-2",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--peer", "abcd"])
+    assert code == 1
+    assert "2 senders match the hash prefix" in capsys.readouterr().err
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["r-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd2", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["r-2"]
+
+
+def test_messages_out_of_range_timestamp(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "from the far future",
+            "sent_at": 10.0,
+            "received_at": 10**15,
+            "id": "far-1",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "from the far future" in out
+    assert "unknown time" in out
 # -- outbox held / drop-held ---------------------------------------------------
 
 

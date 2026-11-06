@@ -31,6 +31,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
+from .inbox import Inbox
 from .mailbox import Mailbox, MailboxError
 from .node import (
     InstanceAlreadyRunning,
@@ -458,6 +459,26 @@ def build_parser() -> argparse.ArgumentParser:
         "off", parents=[common], help="stop enforcing the DM allow-list"
     )
     allowlist_off.set_defaults(func=cmd_allowlist)
+
+    messages = subparsers.add_parser(
+        "messages",
+        parents=[common],
+        help="list received direct messages kept in the node inbox",
+    )
+    messages.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only show messages from this peer (name, hash or hash prefix)",
+    )
+    messages.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="show the newest N messages (default 30)",
+    )
+    messages.set_defaults(func=cmd_messages)
 
     tan = subparsers.add_parser(
         "tan",
@@ -2111,6 +2132,90 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _is_hex32(value: str) -> bool:
+    return len(value) == 32 and all(
+        char in "0123456789abcdefABCDEF" for char in value
+    )
+
+
+def _format_message_time(timestamp: float) -> str:
+    """One inbox entry's received time; never fails the whole listing."""
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "unknown time"
+
+
+def _resolve_inbox_peer(
+    inbox: Inbox, registry: PeerRegistry, target: str
+) -> str:
+    """Resolve ``--peer`` to a sender hash for inbox filtering.
+
+    A full destination hash filters directly, and an exact name match
+    wins over any prefix.  For a hash prefix, registered peers and
+    senders stored in the inbox are combined before selecting: a
+    prefix shared by two distinct senders is ambiguous, even when one
+    of them is registered and the other is not (pruned, or never
+    discovered — a direct message needs no prior announce).
+    """
+    target = target.strip()
+    if _is_hex32(target):
+        return target.lower()
+    peers = registry.all()
+    by_name = [peer for peer in peers if peer.name.casefold() == target.casefold()]
+    if len(by_name) == 1:
+        return by_name[0].hexhash
+    if len(by_name) > 1:
+        raise NodeError(
+            f"{len(by_name)} peers are named {target!r}; use a destination hash"
+        )
+    if len(target) >= 4:
+        prefix = target.casefold()
+        senders = {
+            peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)
+        }
+        senders |= {
+            str(entry.get("destination") or "").casefold()
+            for entry in inbox.list_messages(limit=None)
+            if str(entry.get("destination") or "")
+            .casefold()
+            .startswith(prefix)
+        }
+        if len(senders) == 1:
+            return senders.pop()
+        if len(senders) > 1:
+            raise NodeError(
+                f"{len(senders)} senders match the hash prefix {target!r}"
+            )
+    raise NodeError(f"unknown peer: {target!r}")
+
+
+def cmd_messages(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    if _json_mode(args):
+        _emit({"messages": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No messages received yet.")
+        return _EXIT_OK
+    for entry in entries:
+        peer = registry.get(entry.get("destination") or "")
+        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+        sender = short_hash(str(entry.get("destination") or ""))
+        when = _format_message_time(float(entry.get("received_at", 0)))
+        print(f"[{when}] {name} ({sender})")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 

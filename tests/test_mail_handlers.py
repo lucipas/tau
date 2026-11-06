@@ -53,6 +53,74 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert second["ok"] is True and second["duplicate"] is True
     assert len(received) == 1
     assert received[0]["id"] == "dup-1"
+    # The first delivery is recorded in the durable inbox; the duplicate
+    # (already seen) is not recorded twice.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["text"] == "hello once"
+    assert node.inbox.path.exists()
+
+
+def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_message,
+        encode_message("hello stranger", message_id="stranger-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    entry = node.inbox.list_messages()[0]
+    # The inbox keys on Tau destination hashes, not the RNS identity hash
+    # _caller_label falls back to for senders outside the registry.
+    assert entry["destination"] == destination_hash(sender).hex()
+    assert entry["destination"] != sender.hexhash
+    assert entry["from"] == destination_hash(sender).hex()[:8]
+
+
+def test_direct_message_with_bad_sent_at_is_still_recorded(tmp_path):
+    import json
+    import math
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    # A peer can send sent_at: 1e400 as raw JSON even though tau's own
+    # encoder refuses non-finite floats; the parser accepts it.
+    raw = json.dumps(
+        {
+            "type": "message",
+            "v": 1,
+            "text": "timeless",
+            "sent_at": math.inf,
+            "id": "bad-ts-1",
+        }
+    ).encode("utf-8")
+    response = call_handler(node._handle_message, raw)
+    assert response["ok"] is True
+    assert len(received) == 1
+    # Delivered and recorded, with the unusable send time normalized
+    # rather than the message dropped from the inbox.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["sent_at"] == 0.0
+
+
+def test_direct_message_survives_a_restart(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    call_handler(node._handle_message, encode_message("see you later", message_id="keep-1"))
+
+    reloaded = make_node(tmp_path)
+    assert len(reloaded.inbox) == 1
+    assert reloaded.inbox.list_messages()[0]["text"] == "see you later"
 
 
 def test_store_then_fetch_roundtrip(tmp_path):
@@ -190,6 +258,23 @@ def test_collected_message_is_delivered_once(tmp_path):
     assert len(received) == 1
     assert received[0]["relayed"] is True
     assert received[0]["text"] == "via a holder"
+    # Relayed delivery is recorded too, marked as relayed.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["relayed"] is True
+
+
+def test_inbox_failure_does_not_break_delivery(tmp_path, monkeypatch):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    monkeypatch.setattr(node.inbox, "append", lambda record: (_ for _ in ()).throw(OSError("disk gone")))
+
+    response = call_handler(node._handle_message, encode_message("still arrives", message_id="fail-1"))
+
+    assert response["ok"] is True
+    assert len(received) == 1
 
 
 def test_flush_outbox_is_a_noop_until_started(tmp_path):

@@ -248,6 +248,7 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
@@ -302,6 +303,10 @@ tau send --to alice "hi" --no-queue
 # See what is waiting on offline peers
 tau outbox
 
+# Read back messages this node received (newest first)
+tau messages
+tau messages --peer alice --limit 10 --json
+
 # Only show peers heard from in the last day
 tau peers --max-age 1
 
@@ -325,6 +330,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
 ├── mailbox.json          # store-and-forward queues, chmod 600
+├── inbox.json            # received direct messages, chmod 600, capped at 500
 ├── messages.json         # console message history, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration
@@ -455,8 +461,10 @@ buggy peer cannot force unbounded buffering:
 | Queued message lifetime | 7 days |
 
 Names and messages are stripped of control characters (including terminal
-escape sequences) before display. Delivered messages are not written to
-disk; a message waiting in the outbox is stored in `mailbox.json` (mode
+escape sequences) before display. Received messages are recorded in the
+node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
+direct and relayed alike — and can be read back with `tau messages`;
+a message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
 
 ### Tan posts
