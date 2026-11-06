@@ -238,7 +238,10 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry |
 | `tau outbox` | List messages queued for offline peers |
 | `tau allowlist` | Show or change who may send this node direct messages |
+| `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
+| `tau id export --to PATH` | Back up the node identity to a file |
+| `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
@@ -311,8 +314,19 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
     └── storage/          # Reticulum internals (paths, ratchets, ...)
 ```
 
-Back up `identity` if you want to keep the same address. Anyone who reads it
-can impersonate the node and decrypt its traffic, so keep it private.
+Back up `identity` if you want to keep the same address:
+
+```bash
+tau id export --to ~/tau-identity.backup   # atomic write, chmod 600
+tau id import --from ~/tau-identity.backup # into a fresh data directory
+```
+
+`export` refuses to overwrite an existing backup unless `--force` is given.
+`import` validates the file first, refuses to replace an existing identity
+unless `--force` is given, and refuses while a node is serving on the same
+data directory. It prints the imported destination hash so you can verify it
+matches the old node. Anyone who reads the backup can impersonate the node
+and decrypt its traffic, so keep it private.
 
 ## How it works
 
@@ -378,10 +392,13 @@ recipient) and everything expires. Failed delivery attempts back off
 exponentially (60s, doubling, capped at an hour), so an unreachable peer
 does not cost a link attempt on every sweep; a peer announcing itself
 retries immediately. `tau outbox` shows what is waiting, including the
-next retry time; `tau send --no-queue` restores the old fail-fast
-behaviour. A message sent from the web console shows as `queued` while
-it waits, and flips to `delivered` in the feed as soon as the sweep
-delivers it.
+next retry time, and `tau outbox cancel ID` takes a queued message
+back — it stops this node's future delivery attempts and deposits, but
+sealed copies already held by other peers may still reach the
+recipient, since the sender cannot recall them. `tau send --no-queue`
+restores the old fail-fast behaviour. A message sent from the web
+console shows as `queued` while it waits, and flips to `delivered` in
+the feed as soon as the sweep delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

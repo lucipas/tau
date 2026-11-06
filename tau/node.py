@@ -962,6 +962,13 @@ class TauNode:
         return moved
 
     def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # The sweep lists the outbox before acting, so a message cancelled
+        # by another process (``tau outbox cancel``) can still be sitting
+        # in this pass's snapshot. Re-check the queue under the mailbox
+        # lock — which reloads the on-disk state — before sending.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         payload = encode_message(
             entry.text, message_id=entry.id, sent_at=entry.created_at
         )
@@ -980,6 +987,11 @@ class TauNode:
         return True
 
     def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # Same re-check as _deliver_entry: do not leave a sealed copy
+        # with a holder for a message cancelled since the sweep listed it.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)
