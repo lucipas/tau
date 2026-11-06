@@ -8,7 +8,9 @@ encrypted Reticulum ``Link``:
     /tau/ping     -> liveness and clock information
     /tau/info     -> static node information
     /tau/message  -> deliver a text message, echo it back
-    /tau/peers    -> ask a peer which peers it has heard from
+    /tau/peers    -> ask a peer which peers it has heard from; the answer
+                    carries each peer's public key, so the receiver can verify
+                    the key derives the reported destination hash (peer exchange)
 
 Payloads are JSON encoded as UTF-8 and deliberately size limited: a compromised
 or buggy peer must not be able to make us buffer large amounts of data.

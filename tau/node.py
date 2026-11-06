@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
+from .allowlist import AllowList, load_allowlist_or_deny_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -79,6 +80,11 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+_EXCHANGE_TIMEOUT = 5.0
+# Background peer exchange: a few known peers per sweep, each asked at most
+# once per _EXCHANGE_INTERVAL, so quiet neighbours still share their peers.
+_EXCHANGE_SWEEP_PEERS = 2
+_EXCHANGE_INTERVAL = 900.0
 # Peers contacted per background sweep.  Each contact can wait out a
 # request timeout, so an uncapped sweep over a large registry holds the
 # mail lock for minutes and starves announce-triggered rounds; the loop
@@ -90,6 +96,15 @@ _FETCH_BLOB_BUDGET = 40 * 1024
 
 class NodeError(RuntimeError):
     """Raised when a node operation fails."""
+
+
+class NotAllowedError(NodeError):
+    """Raised when a peer explicitly rejects a request (allow-list denial).
+
+    Distinct from other :class:`NodeError` failures so callers can tell
+    an explicit refusal apart from an unreachable peer: a refusal must
+    not be silently queued for retry.
+    """
 
 
 class InstanceAlreadyRunning(NodeError):
@@ -328,6 +343,7 @@ class TauNode:
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_pending: Set[str] = set()
+        self._exchanged_at: Dict[bytes, float] = {}
         self._stop_event = threading.Event()
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
@@ -337,6 +353,20 @@ class TauNode:
         self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
+        self._allowlist: Optional[AllowList] = None
+
+    @property
+    def allowlist(self) -> AllowList:
+        """The DM allow-list, loaded lazily from the data directory.
+
+        A list that cannot be parsed fails closed — remote senders are
+        denied — mirroring the Tan admission ruleset.
+        """
+        if self._allowlist is None:
+            self._allowlist = load_allowlist_or_deny_all(
+                getattr(self.config, "allowlist_path", None)
+            )
+        return self._allowlist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -597,6 +627,22 @@ class TauNode:
             daemon=True,
         ).start()
 
+    def _owed_hashes(self) -> Set[bytes]:
+        """Destination hashes the node still owes mail or acks to.
+
+        Peers holding mail we have fetched stay too: their pending
+        acknowledgements go out with the next fetch.
+        """
+        owed = {entry.to for entry in self.mailbox.outbox_list()}
+        for holder in self.mailbox.pending_ack_holders():
+            try:
+                raw = bytes.fromhex(holder)
+            except ValueError:
+                continue
+            if len(raw) == DESTINATION_HASH_BYTES:
+                owed.add(raw)
+        return owed
+
     def _save_peers(self, *, force: bool = False) -> None:
         if self.registry.path is None:
             return
@@ -614,16 +660,7 @@ class TauNode:
                 # one-shot process cannot queue mail for a peer between our
                 # snapshot of the shared mailbox and the registry save.
                 with self.mailbox.transaction():
-                    owed = {entry.to for entry in self.mailbox.outbox_list()}
-                    # Peers holding mail we have fetched stay too: their
-                    # pending acknowledgements go out with the next fetch.
-                    for holder in self.mailbox.pending_ack_holders():
-                        try:
-                            raw = bytes.fromhex(holder)
-                        except ValueError:
-                            continue
-                        if len(raw) == DESTINATION_HASH_BYTES:
-                            owed.add(raw)
+                    owed = self._owed_hashes()
                     dropped = self.registry.prune(keep=owed)
                     if dropped:
                         log.debug("Pruned %d stale peer(s) from the registry", dropped)
@@ -640,7 +677,11 @@ class TauNode:
         for peer in self.registry.all():
             if peer.public_key == remote_identity.get_public_key():
                 return peer.hexhash
-        return remote_identity.hexhash
+        # The caller is not in the local registry: derive the tau
+        # destination hash from the verified identity.  The identity
+        # hash alone is a different value, and the allow-list (and the
+        # peer registry) are keyed by destination hash.
+        return tau_destination_hash(remote_identity).hex()
 
     def _handle_ping(
         self,
@@ -678,7 +719,7 @@ class TauNode:
         remote_identity: Optional[RNS.Identity],
         requested_at: float,
     ) -> bytes:
-        peers = self.registry.public_peers()
+        peers = self.registry.public_peers(include_keys=True)
         return response_ok(peers=peers[:100], count=len(peers))
 
     def _record_received(self, record: Dict[str, Any]) -> None:
@@ -708,6 +749,14 @@ class TauNode:
             # outside the registry; the inbox keys on Tau destination
             # hashes, so derive that here instead.
             caller_hash = tau_destination_hash(remote_identity).hex()
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Message from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
         caller_name = "unknown"
         if caller_hash:
             peer = self.registry.get(caller_hash)
@@ -803,7 +852,12 @@ class TauNode:
 
         messages: List[Dict[str, Any]] = []
         budget = _FETCH_BLOB_BUDGET
-        for envelope in self.mailbox.held_for(recipient):
+        # Reload under the cross-process lock: a `tau outbox drop-held`
+        # in another process removes the envelope from disk, and this
+        # node's cached mailbox would otherwise keep handing it out.
+        with self.mailbox.transaction():
+            envelopes = self.mailbox.held_for(recipient)
+        for envelope in envelopes:
             blob_text = base64.b64encode(envelope.blob).decode("ascii")
             if messages and len(blob_text) > budget:
                 break
@@ -836,8 +890,43 @@ class TauNode:
                 self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
+            try:
+                self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Peer exchange sweep failed", exc_info=True)
             if self._stop_event.wait(_MAIL_INTERVAL):
                 break
+
+    def _exchange_sweep(self, *, max_peers: int) -> None:
+        """Ask a few known peers for their peers, outside the mail lock.
+
+        Mail rounds only exchange with peers that just announced, so a quiet
+        neighbour already in the registry would never share its peers.  This
+        sweep covers them, least-recently-asked first, each at most once per
+        _EXCHANGE_INTERVAL.
+        """
+        now = time.time()
+        known = {p.destination_hash for p in self.registry.all()}
+        self._exchanged_at = {
+            key: value
+            for key, value in self._exchanged_at.items()
+            if key in known
+        }
+        due = [
+            p
+            for p in self.registry.all()
+            if now - self._exchanged_at.get(p.destination_hash, 0.0)
+            >= _EXCHANGE_INTERVAL
+        ]
+        due.sort(key=lambda p: self._exchanged_at.get(p.destination_hash, 0.0))
+        for peer in due[:max_peers]:
+            if self._stop_event.is_set():
+                break
+            self._exchanged_at[peer.destination_hash] = now
+            try:
+                self.exchange_peers(peer, timeout=_EXCHANGE_TIMEOUT)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Peer exchange with %s failed", peer.hexhash, exc_info=True)
 
     def _mail_round_for_peer(self, peer: Peer) -> None:
         if not self._mail_lock.acquire(blocking=False):
@@ -853,6 +942,15 @@ class TauNode:
             log.debug("Mail round for %s failed", peer.hexhash, exc_info=True)
         finally:
             self._mail_lock.release()
+        # Peer exchange runs after the mail lock is released: it is
+        # best-effort gossip, and a slow peer must not hold up mail
+        # delivery.  Stamping first also keeps the background sweep from
+        # re-asking a peer this round just covered.
+        self._exchanged_at[peer.destination_hash] = time.time()
+        try:
+            self.exchange_peers(peer, timeout=_EXCHANGE_TIMEOUT)
+        except Exception:  # pragma: no cover - network dependent
+            log.debug("Peer exchange with %s failed", peer.hexhash, exc_info=True)
 
     def flush_outbox(
         self,
@@ -889,7 +987,12 @@ class TauNode:
                 targets = {entry.to for entry in self.mailbox.due_outbox()}
             else:
                 targets = {entry.to for entry in self.mailbox.outbox_list()}
-            peers.sort(key=lambda p: p.destination_hash not in targets)
+            # Peers heard only through exchange come after directly heard
+            # ones inside each group, so second-hand entries cannot crowd
+            # out reachable peers.
+            peers.sort(
+                key=lambda p: (p.destination_hash not in targets, p.via_exchange)
+            )
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
@@ -940,10 +1043,30 @@ class TauNode:
                 moved["deposited"] += 1
         return moved
 
+    def _still_queued(self, message_id: str) -> bool:
+        """True if the outbox still holds this entry, reloaded from disk.
+
+        The sweep works from a snapshot, so a cancel can land after the
+        snapshot was taken; each delivery attempt re-checks instead of
+        trusting the snapshot.  A send already in flight cannot be
+        recalled — cancelling only stops future attempts.
+        """
+        with self.mailbox.transaction():
+            return self.mailbox.get_outbox(message_id) is not None
+
     def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # The sweep lists the outbox before acting, so a message cancelled
+        # by another process (``tau outbox cancel``) can still be sitting
+        # in this pass's snapshot. Re-check the queue under the mailbox
+        # lock — which reloads the on-disk state — before sending.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         payload = encode_message(
             entry.text, message_id=entry.id, sent_at=entry.created_at
         )
+        if not self._still_queued(entry.id):
+            return False
         try:
             self._request(peer, REQUEST_MESSAGE, payload, timeout)
         except NodeError as exc:
@@ -959,6 +1082,11 @@ class TauNode:
         return True
 
     def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # Same re-check as _deliver_entry: do not leave a sealed copy
+        # with a holder for a message cancelled since the sweep listed it.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)
@@ -983,6 +1111,8 @@ class TauNode:
             )
         except (MailboxError, ProtocolError) as exc:
             log.debug("Could not seal queued message %s: %s", entry.id, exc)
+            return False
+        if not self._still_queued(entry.id):
             return False
         try:
             self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
@@ -1055,13 +1185,33 @@ class TauNode:
                     "Dropping unreadable held mail %s: %s", envelope.id, exc
                 )
                 message = None
-            self.mailbox.drop_held(envelope.id, to=self.destination.hash)
+            still_held = self.mailbox.drop_held(
+                envelope.id, to=self.destination.hash
+            )
+            if not still_held:
+                # Dropped by the owner (tau outbox drop-held) after this
+                # sweep listed it: do not surface a copy we no longer hold.
+                continue
             if message is not None and self._deliver_collected(message):
                 received += 1
         return received
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
+        sender = message.get("from")
+        if not self.allowlist.is_allowed(
+            sender if isinstance(sender, str) else None
+        ):
+            # The sender hash in a sealed envelope is authenticated
+            # (open_message verifies it against the signing key), so
+            # this is the same admission decision as a direct message.
+            # Do not mark it seen: another holder's copy may still be
+            # delivered if the sender is admitted later.
+            log.info(
+                "Relayed message from %s denied by the DM allow-list",
+                sender or "unknown",
+            )
+            return False
         if self.mailbox.is_seen(message["id"]):
             return False
         self.mailbox.mark_seen(message["id"])
@@ -1234,6 +1384,10 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        except NotAllowedError:
+            # The peer is online and explicitly refused the message;
+            # queueing it would retry a refusal until its TTL expires.
+            raise
         except NodeError:
             if not queue or not self.started:
                 raise
@@ -1335,6 +1489,49 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def exchange_peers(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = _EXCHANGE_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Ask a peer for the peers it knows and merge the new ones.
+
+        Discovery is announce-only without this: a peer whose announce we
+        never heard is invisible to us even though our neighbours know it.
+        The answer is validated by :meth:`PeerRegistry.merge_exchanged`
+        (keys must derive their destination hashes) and only new peers are
+        added — a third party's claim never refreshes a known peer's
+        liveness.  Returns a summary with ``source``, ``added``,
+        ``updated`` and ``skipped``.  Raises :class:`NodeError` when the
+        peer cannot be reached or answers with a malformed list.
+        """
+        response = self.request_peers(
+            target, timeout=timeout, discover_timeout=discover_timeout
+        )
+        entries = response.get("peers") if isinstance(response, dict) else None
+        if not isinstance(entries, list):
+            raise NodeError("peer gave an invalid peers response")
+        own_hash = self.destination.hash if self.destination is not None else None
+        # Peers we still owe mail or acks are protected from eviction, so
+        # gossip can never push out the record a delivery depends on.  The
+        # mailbox lock is held across the read and the merge so a one-shot
+        # process cannot queue mail for a peer between the two.
+        with self.mailbox.transaction():
+            owed = self._owed_hashes()
+            summary = self.registry.merge_exchanged(
+                entries[:100], now=None, self_hash=own_hash, keep=owed
+            )
+        if summary["added"] or summary["updated"]:
+            self._save_peers(force=True)
+        peer = self.resolve_peer(target)
+        return {
+            "source": peer.hexhash,
+            "source_name": peer.display_name,
+            **summary,
+        }
 
     def request(
         self,
@@ -1503,9 +1700,10 @@ class TauNode:
             raise NodeError(f"peer returned an invalid response: {exc}") from exc
         if decoded.get("ok") is not True:
             error = decoded.get("error") or {}
-            raise NodeError(
-                f"peer rejected the request: {error.get('message', 'unknown error')}"
-            )
+            message = error.get("message", "unknown error")
+            if error.get("code") == "not_allowed":
+                raise NotAllowedError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded

@@ -421,6 +421,144 @@ def test_busy_mail_round_is_queued_not_dropped(tmp_path):
     assert peer.hexhash in node._mail_pending
 
 
+def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    sender = RNS.Identity()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-1",
+        text="for me",
+        sent_at=55.0,
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-1",
+        expires_at=time.time() + 3600,
+    )
+    assert node._process_local_held() == 1
+    assert len(received) == 1
+    assert received[0]["text"] == "for me"
+
+    # A second envelope, dropped by the owner (tau outbox drop-held) after
+    # the sweep listed it, must not be surfaced. Simulate the drop by
+    # making drop_held report the envelope already gone.
+    blob2 = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-2",
+        text="dropped before delivery",
+        sent_at=56.0,
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob2,
+        message_id="self-2",
+        expires_at=time.time() + 3600,
+    )
+    monkeypatch.setattr(node.mailbox, "drop_held", lambda *a, **k: False)
+    assert node._process_local_held() == 0
+    assert len(received) == 1
+
+
+def test_fetch_ignores_envelope_dropped_by_another_process(tmp_path):
+    from tau.mailbox import Mailbox
+
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    holder = make_node(tmp_path)
+
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="relay-2",
+        text="held for you",
+        sent_at=55.0,
+    )
+    stored = call_handler(
+        holder._handle_mail_store,
+        build_mail_store(
+            to=recipient_hash.hex(),
+            message_id="relay-2",
+            blob=blob,
+            expires_at=time.time() + 3600,
+        ),
+        remote_identity=sender,
+    )
+    assert stored["ok"] is True and stored["stored"] is True
+
+    # A second process (e.g. `tau outbox drop-held`) removes the envelope
+    # from disk; the daemon's cached mailbox must not keep handing it out.
+    other_process = Mailbox(holder.config.mailbox_path)
+    assert other_process.drop_held("relay-2") is True
+
+    fetched = call_handler(
+        holder._handle_mail_fetch, build_mail_fetch(), remote_identity=recipient
+    )
+    assert fetched["messages"] == []
+    assert fetched["count"] == 0
+def _recorded_request():
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True}
+
+    return calls, fake_request
+
+
+def test_deliver_entry_skips_cancelled_message(tmp_path):
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(to=bytes.fromhex("ab" * 16), text="hi")
+    # Cancelled after the sweep snapshotted the outbox: no send.
+    assert node.mailbox.remove_outbox(entry.id) is True
+    assert node._deliver_entry(peer, entry, timeout=5) is False
+    assert calls == []
+
+    # Still queued: sends once and removes the entry.
+    entry = node.mailbox.enqueue(to=bytes.fromhex("ab" * 16), text="hi again")
+    assert node._deliver_entry(peer, entry, timeout=5) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deposit_entry_skips_cancelled_message(tmp_path):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    holder = node.registry.upsert(bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder")
+    node.registry.upsert(recipient_hash, recipient.get_public_key(), name="bob")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(to=recipient_hash, text="held for bob")
+    # Cancelled after the sweep snapshotted the outbox: no deposit.
+    assert node.mailbox.remove_outbox(entry.id) is True
+    assert node._deposit_entry(holder, entry, timeout=5) is False
+    assert calls == []
+
+    # Still queued: deposits the sealed copy once.
+    entry = node.mailbox.enqueue(to=recipient_hash, text="held for bob again")
+    assert node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is not None
 def test_deliver_entry_reports_delivery_via_callback(tmp_path):
     delivered = []
     node = make_node(tmp_path, on_delivered=delivered.append)
