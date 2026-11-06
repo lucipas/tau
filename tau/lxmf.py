@@ -18,6 +18,8 @@ only fails, with a clear error, when the router is actually requested.
 from __future__ import annotations
 
 import importlib
+import logging
+import signal
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +27,8 @@ from typing import Any, Optional
 import RNS
 
 from .identity import load_public_key
+
+log = logging.getLogger(__name__)
 
 LXMF_APP_NAME = "lxmf"
 LXMF_DELIVERY_ASPECT = "delivery"
@@ -105,14 +109,21 @@ def start_lxmf_router(
             "LXMF is not installed; install it with "
             f"{LXMF_INSTALL_HINT}"
         ) from exc
+    previous = _signal_handlers()
     router = lxmf_module.LXMRouter(identity=identity, storagepath=str(data_dir))
-    delivery = router.register_delivery_identity(
-        identity, display_name=display_name
-    )
-    if delivery is None:
-        router.exit_handler()
-        raise LXMFError("could not register the LXMF delivery identity")
-    router.announce(delivery.hash)
+    installed = _signal_handlers()
+    # Remember what LXMRouter replaced so shutdown can put it back.
+    setattr(router, _SIGNAL_STATE_ATTR, (previous, installed))
+    try:
+        delivery = router.register_delivery_identity(
+            identity, display_name=display_name
+        )
+        if delivery is None:
+            raise LXMFError("could not register the LXMF delivery identity")
+        router.announce(delivery.hash)
+    except BaseException:
+        _shutdown_router(router)
+        raise
     return router
 
 
@@ -121,11 +132,49 @@ def stop_lxmf_router(router: Optional[Any]) -> None:
 
     LXMRouter's exit handler is idempotent, so calling this twice — or
     letting the handler it registers with ``atexit`` run at process exit
-    — is safe.  Passing ``None`` is a no-op.
+    — is safe.  Signal handlers that LXMRouter replaced are restored,
+    unless the embedding application has installed its own since.
+    Passing ``None`` is a no-op.
     """
     if router is None:
         return
-    router.exit_handler()
+    _shutdown_router(router)
+
+
+_SIGNAL_STATE_ATTR = "_tau_signal_state"
+_MANAGED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _signal_handlers() -> dict:
+    """Return the current Python-level handler for each managed signal."""
+    return {signum: signal.getsignal(signum) for signum in _MANAGED_SIGNALS}
+
+
+def _shutdown_router(router: Any) -> None:
+    """Run the router's exit handler and restore the signals it replaced."""
+    try:
+        router.exit_handler()
+    finally:
+        state = getattr(router, _SIGNAL_STATE_ATTR, None)
+        if state is not None:
+            previous, installed = state
+            _restore_signal_handlers(previous, installed)
+            setattr(router, _SIGNAL_STATE_ATTR, None)
+
+
+def _restore_signal_handlers(previous: dict, installed: dict) -> None:
+    """Restore *previous* handlers for signals still owned by the router."""
+    for signum, prev in previous.items():
+        # signal.signal() rejects None (handler not set from Python).
+        if prev is None or installed.get(signum) is None:
+            continue
+        if signal.getsignal(signum) != installed[signum]:
+            # The embedding application installed its own handler since.
+            continue
+        try:
+            signal.signal(signum, prev)
+        except (ValueError, OSError, TypeError):  # pragma: no cover - defensive
+            log.debug("Could not restore handler for signal %s", signum, exc_info=True)
 
 
 def lxmf_router_delivery_hash(router: Optional[Any]) -> Optional[bytes]:
