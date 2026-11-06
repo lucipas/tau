@@ -239,6 +239,8 @@ Global options may appear before or after the command:
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
+| `tau id export --to PATH` | Back up the node identity to a file |
+| `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
@@ -311,8 +313,19 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
     └── storage/          # Reticulum internals (paths, ratchets, ...)
 ```
 
-Back up `identity` if you want to keep the same address. Anyone who reads it
-can impersonate the node and decrypt its traffic, so keep it private.
+Back up `identity` if you want to keep the same address:
+
+```bash
+tau id export --to ~/tau-identity.backup   # atomic write, chmod 600
+tau id import --from ~/tau-identity.backup # into a fresh data directory
+```
+
+`export` refuses to overwrite an existing backup unless `--force` is given.
+`import` validates the file first, refuses to replace an existing identity
+unless `--force` is given, and refuses while a node is serving on the same
+data directory. It prints the imported destination hash so you can verify it
+matches the old node. Anyone who reads the backup can impersonate the node
+and decrypt its traffic, so keep it private.
 
 ## How it works
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -10,7 +12,7 @@ import urllib.request
 import pytest
 
 from tau.peers import Peer
-from tau.webapi import WebBridge, WebBridgeError
+from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
 
 PEER_HASH = "ab" * 16
 
@@ -479,6 +481,72 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _hold_port(port: int) -> socket.socket:
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", port))
+    holder.listen(1)
+    return holder
+
+
+def test_check_web_console_bind_passes_on_free_port():
+    check_web_console_bind("127.0.0.1", _free_port())
+
+
+def test_check_web_console_bind_names_held_port():
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        with pytest.raises(WebBridgeError) as excinfo:
+            check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
+
+
+def test_check_web_console_bind_windows_names_live_listener(monkeypatch):
+    # The Windows probe connects instead of binding: a live listener
+    # completes the handshake, so the probe must report it.
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(WebBridgeError) as excinfo:
+            check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
+
+
+def test_check_web_console_bind_windows_passes_on_free_port(monkeypatch):
+    # ...while a free port refuses the connection, so the probe passes
+    # even where a TIME_WAIT straggler could linger.
+    monkeypatch.setattr(sys, "platform", "win32")
+    check_web_console_bind("127.0.0.1", _free_port())
+
+
+def test_bridge_start_names_held_port_instead_of_raw_oserror(node):
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        bridge = WebBridge(node, host="127.0.0.1", port=port)
+        with pytest.raises(WebBridgeError) as excinfo:
+            bridge.start()
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
 def _queue_send(node, mail_id="mail-1"):
     """Make the fake node report a queued send with the given outbox id."""
 
