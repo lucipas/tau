@@ -12,6 +12,8 @@ import type {
   TanTimelineResponse,
 } from "./types";
 
+const POLL_INTERVAL_MS = 5000;
+
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
@@ -29,28 +31,55 @@ export function useTan() {
     allRef.current = all;
   }, [all]);
 
-  // Monotonic generation of feed loads. A slow response (for example a
-  // poll tick started before a delete) must not overwrite a newer refresh.
+  // Monotonic generation of feed loads. A newer load supersedes an older
+  // one, so a slow response (for example a poll tick started before a
+  // delete) must not overwrite a newer refresh.
   const generationRef = useRef(0);
+  // The load currently in flight, if any, and when it started. A routine
+  // poll skips while one is pending instead of invalidating it — otherwise
+  // every response could be discarded while requests stay slow. An action
+  // (delete, filter change) still supersedes. A load pending longer than
+  // two poll intervals is treated as hung and may be superseded by the
+  // next poll, so one stuck request cannot freeze the feed.
+  const pendingRef = useRef<{ generation: number; startedAt: number } | null>(
+    null,
+  );
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (options?: { supersede?: boolean }) => {
+    const supersede = options?.supersede ?? true;
+    const pending = pendingRef.current;
+    if (
+      !supersede &&
+      pending !== null &&
+      Date.now() - pending.startedAt < POLL_INTERVAL_MS * 2
+    ) {
+      return false;
+    }
     const generation = ++generationRef.current;
-    const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-    const [timeline, follows] = await Promise.all([
-      apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
-      apiGet<TanFollowingResponse>("/api/tan/following"),
-    ]);
-    if (generationRef.current !== generation) return;
-    setPosts(timeline.posts);
-    setFollowing(follows.following);
-    setError(null);
+    pendingRef.current = { generation, startedAt: Date.now() };
+    try {
+      const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
+      const [timeline, follows] = await Promise.all([
+        apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+        apiGet<TanFollowingResponse>("/api/tan/following"),
+      ]);
+      if (generationRef.current !== generation) return false;
+      setPosts(timeline.posts);
+      setFollowing(follows.following);
+      setError(null);
+      return true;
+    } finally {
+      if (pendingRef.current?.generation === generation) {
+        pendingRef.current = null;
+      }
+    }
   }, []);
 
   useEffect(() => {
     let disposed = false;
-    async function tick() {
+    async function tick(supersede: boolean) {
       try {
-        await load();
+        await load({ supersede });
       } catch (caught) {
         if (!disposed) {
           setError(
@@ -61,8 +90,11 @@ export function useTan() {
         if (!disposed) setLoading(false);
       }
     }
-    void tick();
-    const timer = setInterval(() => void tick(), 5000);
+    // Re-running on a filter change must load the newly selected filter
+    // even if a poll for the old one is still in flight; routine polls
+    // skip while a load is pending instead of invalidating it.
+    void tick(true);
+    const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);

@@ -74,6 +74,45 @@ describe("useTan deletePost", () => {
     expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
   });
 
+  it("skips a poll while a feed load is already in flight", async () => {
+    vi.useFakeTimers();
+    try {
+      const mine = makePost();
+      const first = deferred();
+      const firstFollowing = deferred();
+      const queue = [first, firstFollowing];
+      let next = 0;
+      mockedGet.mockImplementation(() => queue[next++].promise);
+
+      const { result } = renderHook(() => useTan());
+      // The initial load is in flight; a poll tick must not invalidate it.
+      expect(mockedGet.mock.calls.length).toBe(2);
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(mockedGet.mock.calls.length).toBe(2);
+
+      await act(async () => {
+        first.resolve({ posts: [mine], count: 1 });
+        firstFollowing.resolve(emptyFollowing);
+      });
+      expect(result.current.posts).toEqual([mine]);
+
+      // With no load in flight the next poll proceeds normally.
+      mockedGet.mockImplementation((path: string) =>
+        path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [mine], count: 1 })
+          : Promise.resolve(emptyFollowing),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a stale feed response that resolves after a newer load", async () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
