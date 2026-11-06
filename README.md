@@ -384,7 +384,9 @@ exponentially (60s, doubling, capped at an hour), so an unreachable peer
 does not cost a link attempt on every sweep; a peer announcing itself
 retries immediately. `tau outbox` shows what is waiting, including the
 next retry time; `tau send --no-queue` restores the old fail-fast
-behaviour.
+behaviour. A message sent from the web console shows as `queued` while
+it waits, and flips to `delivered` in the feed as soon as the sweep
+delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

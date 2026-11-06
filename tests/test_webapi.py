@@ -479,6 +479,248 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def _queue_send(node, mail_id="mail-1"):
+    """Make the fake node report a queued send with the given outbox id."""
+
+    def _send(peer, text, **kwargs):
+        return {
+            "ok": True,
+            "v": 1,
+            "queued": True,
+            "id": mail_id,
+            "to": peer.hexhash,
+            "expires_at": 9999.0,
+        }
+
+    node.send_message = _send
+
+
+def test_queued_send_records_outbox_id(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+    assert payload["message"]["mail_id"] == "mail-1"
+
+
+def test_direct_send_records_no_outbox_id(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "delivered"
+    assert "mail_id" not in payload["message"]
+
+
+def test_record_delivery_flips_queued_message_and_publishes(bridge, node):
+    _queue_send(node)
+    _, _, sent = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    message_id = sent["message"]["id"]
+
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["id"] == message_id
+    assert updated["status"] == "delivered"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["status"] == "delivered"
+
+    events = bridge.bus.replay(0)
+    updates = [event for event in events if event["type"] == "message_updated"]
+    assert len(updates) == 1
+    assert updates[0]["message"]["id"] == message_id
+    assert updates[0]["message"]["status"] == "delivered"
+
+
+def test_record_delivery_ignores_unknown_id(bridge, node):
+    _queue_send(node)
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+
+    assert bridge.record_delivery("not-an-outbox-id") is None
+    assert bridge.record_delivery("mail-1") is not None
+    # A second delivery report for the same id is a no-op: it is no
+    # longer queued, so there is nothing left to flip.
+    assert bridge.record_delivery("mail-1") is None
+
+    events = bridge.bus.replay(0)
+    updates = [event for event in events if event["type"] == "message_updated"]
+    assert len(updates) == 1
+
+
+def test_delivery_flip_survives_bridge_restart(node, tmp_path):
+    """The delivered status is persisted, not just held in memory.
+
+    Regression test for the PR #35 / PR #32 merge: record_delivery was
+    written against the in-memory-only bridge, so without a save the
+    flip was lost on restart and the message came back queued.
+    """
+    _queue_send(node)
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        message, _ = bridge.send_message("alice", "hi")
+        assert message["status"] == "queued"
+        assert bridge.record_delivery("mail-1") is not None
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        assert bridge2.messages()[0]["status"] == "delivered"
+    finally:
+        bridge2.stop()
+
+
+def test_queued_message_keeps_mail_id_across_restart(node, tmp_path):
+    """A still-queued message can flip after a restart.
+
+    The persisted record must keep its outbox id; the history loader
+    originally rebuilt records from known keys and dropped it, leaving
+    the message unmatchable when delivery was finally reported.
+    """
+    _queue_send(node)
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.send_message("alice", "hi")
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        assert bridge2.messages()[0]["status"] == "queued"
+        updated = bridge2.record_delivery("mail-1")
+        assert updated is not None
+        assert updated["status"] == "delivered"
+    finally:
+        bridge2.stop()
+
+
+def test_delivery_before_record_is_not_lost(bridge, node):
+    """A flush that delivers before send_message records the message.
+
+    Queueing starts a flush thread, so the delivery callback can fire
+    before ``_append_message`` runs. The report is buffered and
+    reconciled when the record is appended, so the message still flips
+    to delivered instead of staying queued forever.
+    """
+    started = []
+
+    def _send(peer, text, **kwargs):
+        thread = threading.Thread(
+            target=node.on_delivered, args=("mail-1",), name="tau-test-deliver"
+        )
+        thread.start()
+        started.append(thread)
+        # Let the delivery thread run first: without the send lock it
+        # would find no record and the message would stay queued.
+        time.sleep(0.05)
+        return {
+            "ok": True,
+            "v": 1,
+            "queued": True,
+            "id": "mail-1",
+            "to": peer.hexhash,
+            "expires_at": 9999.0,
+        }
+
+    node.send_message = _send
+    status, _, _ = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    started[0].join(timeout=5)
+    assert not started[0].is_alive()
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["status"] == "delivered"
+
+
+def test_delivery_report_not_blocked_by_slow_send(bridge, node):
+    """A delivery report completes while another send is in flight.
+
+    Regression test for the CodeRabbit finding on PR #35: the send lock
+    was held across ``node.send_message``, so a delivery report for an
+    earlier message stalled behind the network send (and with it the
+    node's mail sweep, whose thread invokes the callback).
+    """
+    _queue_send(node, mail_id="mail-a")
+    status, _, _ = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "first"}
+    )
+    assert status == 200
+
+    send_started = threading.Event()
+    release_send = threading.Event()
+
+    def _slow_send(peer, text, **kwargs):
+        send_started.set()
+        release_send.wait(timeout=10)
+        return {"ok": True, "v": 1, "to": peer.hexhash}
+
+    node.send_message = _slow_send
+    send_thread = threading.Thread(
+        target=bridge.send_message, args=("alice", "second")
+    )
+    send_thread.start()
+    try:
+        assert send_started.wait(timeout=5)
+        report_thread = threading.Thread(
+            target=bridge.record_delivery, args=("mail-a",)
+        )
+        report_thread.start()
+        report_thread.join(timeout=5)
+        assert not report_thread.is_alive()
+        assert bridge.messages()[0]["status"] == "delivered"
+    finally:
+        release_send.set()
+        send_thread.join(timeout=5)
+
+
+def test_raising_previous_delivery_callback_still_flips(node, tmp_path):
+    """A previous callback that raises must not lose the status update."""
+
+    def _boom(message_id):
+        raise RuntimeError("boom")
+
+    node.on_delivered = _boom
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    chained = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    try:
+        _queue_send(node)
+        message, _ = chained.send_message("alice", "hi")
+        assert message["status"] == "queued"
+
+        # The failure propagates (the node's callback guard logs it in
+        # production), but only after the record has flipped.
+        with pytest.raises(RuntimeError, match="boom"):
+            node.on_delivered("mail-1")
+        assert chained.messages()[0]["status"] == "delivered"
+    finally:
+        chained.stop()
+
+
+def test_bridge_chains_existing_delivery_callback(node, tmp_path):
+    seen = []
+    node.on_delivered = seen.append
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    chained = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    try:
+        _queue_send(node)
+        message, _ = chained.send_message("alice", "hi")
+        assert message["status"] == "queued"
+
+        node.on_delivered("mail-1")
+        assert seen == ["mail-1"]
+        assert chained.messages()[0]["status"] == "delivered"
+    finally:
+        chained.stop()
 def _stored_message(message_id, text, direction="in"):
     return {
         "id": message_id,

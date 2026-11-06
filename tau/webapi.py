@@ -60,6 +60,9 @@ DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
 MAX_MESSAGE_LOG = 500
+# Delivery reports buffered while their console record does not exist
+# yet (the flush can deliver before send_message records the send).
+MAX_EARLY_DELIVERIES = 128
 MAX_EVENT_LOG = 500
 MAX_SUBSCRIBERS = 32
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -214,6 +217,11 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
+    mail_id = entry.get("mail_id")
+    if isinstance(mail_id, str):
+        # Kept so a message still queued across a restart can be matched
+        # when its delivery is reported.
+        message["mail_id"] = mail_id
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -253,9 +261,31 @@ class WebBridge:
         self.web_dir = Path(web_dir).expanduser().resolve() if web_dir else None
         self.allow_remote = bool(allow_remote)
 
+        # The bridge owns the console message log, so it observes queued
+        # deliveries itself; chain any delivery callback the node already
+        # has instead of replacing it.
+        previous_on_delivered = getattr(node, "on_delivered", None)
+
+        def _on_delivered(message_id: str) -> None:
+            try:
+                if callable(previous_on_delivered):
+                    previous_on_delivered(message_id)
+            finally:
+                # A failing previous callback must not lose the status
+                # update; the exception propagates to the node's callback
+                # guard, which logs it like any other user-callback failure.
+                self.record_delivery(message_id)
+
+        node.on_delivered = _on_delivered
+
         self.bus = EventBus()
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Outbox ids reported delivered before their send was recorded;
+        # send_message reconciles them when it appends the record. An
+        # insertion-ordered dict used as a bounded set.
+        self._early_deliveries: Dict[str, None] = {}
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -401,6 +431,45 @@ class WebBridge:
         )
         self.bus.publish({"type": "message", "message": message})
         return message
+
+    def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
+        """Mark a queued outbound message delivered.
+
+        Called when the node reports that an outbox entry reached its
+        recipient. The matching console record (by the outbox id stored
+        at send time) flips from ``queued`` to ``delivered`` and the
+        console is told live, so the feed updates in place. A report
+        that arrives before the send is recorded (queueing starts a
+        flush that can deliver first) is buffered and reconciled when
+        the record is appended, so it is never lost; reports for mail
+        this bridge never recorded — queued from the CLI, or from
+        before this was tracked — simply age out of that buffer.
+        """
+        updated: Optional[Dict[str, Any]] = None
+        with self._send_lock:
+            with self._lock:
+                for message in self._messages:
+                    if (
+                        message.get("direction") == "out"
+                        and message.get("status") == "queued"
+                        and message.get("mail_id") == mail_id
+                    ):
+                        message["status"] = "delivered"
+                        updated = dict(message)
+                        break
+                if updated is None:
+                    self._early_deliveries[mail_id] = None
+                    while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
+                        self._early_deliveries.popitem(last=False)
+                else:
+                    self._early_deliveries.pop(mail_id, None)
+        if updated is None:
+            return None
+        # Persist the flip like any other log change, so a restart does
+        # not resurrect the message as queued.
+        self._save_messages()
+        self.bus.publish({"type": "message_updated", "message": updated})
+        return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
@@ -587,19 +656,44 @@ class WebBridge:
         text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        # The send lock is NOT held across the network send: queueing
+        # starts a flush thread that can deliver the entry (and report
+        # it via record_delivery) before the record below exists, and
+        # holding the lock across network I/O would stall every other
+        # delivery report behind this send. Instead, record_delivery
+        # buffers a report that beats the record, and the append below
+        # reconciles it.
         response = self.node.send_message(peer, text, timeout=timeout)
         queued = bool(response.get("queued"))
-        message = self._append_message(
-            direction="out",
-            peer=peer.hexhash,
-            peer_name=peer.display_name,
-            text=text,
-            sent_at=time.time(),
-            received_at=time.time(),
-            status="queued" if queued else "delivered",
-            rtt=_as_float(response.get("_rtt")),
-        )
+        # The outbox id links this record to a later delivery; only
+        # present while the message is queued.
+        mail_id = response.get("id") if queued else None
+        flipped = False
+        with self._send_lock:
+            message = self._append_message(
+                direction="out",
+                peer=peer.hexhash,
+                peer_name=peer.display_name,
+                text=text,
+                sent_at=time.time(),
+                received_at=time.time(),
+                status="queued" if queued else "delivered",
+                rtt=_as_float(response.get("_rtt")),
+                mail_id=mail_id,
+            )
+            if mail_id is not None:
+                with self._lock:
+                    if mail_id in self._early_deliveries:
+                        del self._early_deliveries[mail_id]
+                        message["status"] = "delivered"
+                        flipped = True
+                if flipped:
+                    self._save_messages()
         self.bus.publish({"type": "message", "message": message})
+        if flipped:
+            self.bus.publish(
+                {"type": "message_updated", "message": dict(message)}
+            )
         return message, response
 
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
@@ -669,6 +763,7 @@ class WebBridge:
         received_at: float,
         status: str,
         rtt: Optional[float] = None,
+        mail_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -683,6 +778,8 @@ class WebBridge:
             }
             if rtt is not None:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
+            if mail_id is not None:
+                message["mail_id"] = mail_id
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()

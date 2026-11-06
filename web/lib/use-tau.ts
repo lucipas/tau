@@ -81,6 +81,18 @@ export function useTau() {
       });
     };
 
+    const onMessageUpdated = (event: Event) => {
+      const payload = readEventData<{ message: TauMessage }>(event);
+      if (!payload?.message) return;
+      const message = payload.message;
+      // A queued message that the mail sweep has since delivered: the
+      // server re-sends the same console id with status "delivered".
+      // Replace it in place rather than appending a duplicate.
+      setMessages((previous) =>
+        previous.map((entry) => (entry.id === message.id ? message : entry)),
+      );
+    };
+
     const onPeer = (event: Event) => {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
@@ -101,6 +113,7 @@ export function useTau() {
     source.addEventListener("open", onOpen);
     source.addEventListener("snapshot", onSnapshot);
     source.addEventListener("message", onMessage);
+    source.addEventListener("message_updated", onMessageUpdated);
     source.addEventListener("peer", onPeer);
     source.addEventListener("error", onError);
 
@@ -109,6 +122,7 @@ export function useTau() {
       source.removeEventListener("open", onOpen);
       source.removeEventListener("snapshot", onSnapshot);
       source.removeEventListener("message", onMessage);
+      source.removeEventListener("message_updated", onMessageUpdated);
       source.removeEventListener("peer", onPeer);
       source.removeEventListener("error", onError);
       source.close();
