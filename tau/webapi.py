@@ -106,7 +106,18 @@ def check_web_console_bind(host: str, port: int) -> None:
 
     Only ``tau serve`` calls this.  Transient commands never start a
     bridge, so they skip the check.
+
+    On Windows the probe is skipped outright: ``SO_REUSEADDR`` there
+    lets a socket bind a port that another live listener already
+    holds, so the probe cannot tell a live listener from a recently
+    closed connection in TIME_WAIT.  The late-bind path in
+    :meth:`WebBridge.start` still reports the same named error on
+    Windows (and ``cmd_serve`` still stops the node), so a real
+    collision is caught — just after the node starts instead of
+    before it.
     """
+    if sys.platform == "win32":
+        return
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         # On Windows SO_REUSEADDR lets a socket bind a port that another

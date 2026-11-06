@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -504,6 +505,18 @@ def test_check_web_console_bind_names_held_port():
     assert f"web console port {port} on 127.0.0.1 is already in use" in str(
         excinfo.value
     )
+
+
+def test_check_web_console_bind_skips_preflight_on_windows(monkeypatch):
+    # On Windows SO_REUSEADDR cannot tell a live listener from TIME_WAIT,
+    # so the probe is skipped there and the late-bind error does the job.
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
 
 
 def test_bridge_start_names_held_port_instead_of_raw_oserror(node):
