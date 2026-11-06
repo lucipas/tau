@@ -76,7 +76,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 import RNS
 
@@ -1320,6 +1320,17 @@ def timeline(
     )
 
 
+# Upper bound on bound parameters per thread query.  SQLite builds often cap
+# host parameters at 999, so wide generations and long threads are processed
+# in batches of this size.
+_SQL_BATCH = 500
+
+
+def _thread_batches(items: List[Any], size: int) -> Iterator[List[Any]]:
+    for offset in range(0, len(items), size):
+        yield items[offset : offset + size]
+
+
 def thread(
     conn: sqlite3.Connection,
     ref: str,
@@ -1339,9 +1350,14 @@ def thread(
     conversation.  Deleted and unlinked entries never appear, and a
     reply to a deleted entry is hidden with its parent's subtree rather
     than re-parented.  An unknown, ambiguous or deleted reference
-    raises :class:`TanError`, exactly as :func:`resolve_post` does.
+    raises :class:`TanError`, exactly as :func:`resolve_post` does; so
+    does a reference to an unlinked entry or to a reply beneath a
+    deleted entry, since showing it would present a partial thread.
     """
     start = resolve_post(conn, ref)
+    if not start.get("linked"):
+        # A cached entry still awaiting its chain predecessor is not shown.
+        raise TanError(f"unknown post: {ref!r}")
     root = start
     ancestors = {root["hash"]}
     while root.get("kind") == KIND_REPLY and root.get("target"):
@@ -1351,7 +1367,9 @@ def thread(
         if parent["hash"] in ancestors or not parent.get("linked"):
             break
         if _is_deleted(conn, parent):
-            break
+            # Replies under a deleted entry stay hidden, even when named
+            # directly, so refuse rather than showing a fragment.
+            raise TanError(f"post has been deleted: {ref!r}")
         ancestors.add(parent["hash"])
         root = parent
     root = _canonical_post(root)
@@ -1365,19 +1383,22 @@ def thread(
     frontier = [root["hash"]]
     seen = {root["hash"]}
     while frontier:
-        placeholders = ", ".join("?" for _ in frontier)
-        rows = conn.execute(
-            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
-            f"WHERE linked = 1 AND kind IN ('post', 'reply') "
-            f"AND target IN ({placeholders}) AND {_NOT_DELETED} "
-            "ORDER BY created_at ASC, hash ASC",
-            frontier,
-        ).fetchall()
-        children = [
-            child
-            for child in _public_posts(rows)
-            if child["hash"] not in seen
-        ]
+        rows: List[sqlite3.Row] = []
+        for batch in _thread_batches(frontier, _SQL_BATCH):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(
+                conn.execute(
+                    f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+                    f"WHERE linked = 1 AND kind IN ('post', 'reply') "
+                    f"AND target IN ({placeholders}) AND {_NOT_DELETED}",
+                    batch,
+                ).fetchall()
+            )
+        # Batches are merged here, so re-sort the whole generation.
+        generation = sorted(
+            _public_posts(rows), key=lambda post: (post["created_at"], post["hash"])
+        )
+        children = [child for child in generation if child["hash"] not in seen]
         for child in children:
             seen.add(child["hash"])
         if not children:
@@ -1396,7 +1417,11 @@ def thread(
         ordered.append(entry)
         for child in reversed(by_parent.get(entry["hash"], [])):
             stack.append((child, depth + 1))
-    return annotate_reactions(conn, ordered, viewer=viewer)
+    # Annotation fills each entry in place, so batching keeps the reaction
+    # lookup within the parameter limit for long threads.
+    for batch in _thread_batches(ordered, _SQL_BATCH):
+        annotate_reactions(conn, batch, viewer=viewer)
+    return ordered
 
 
 # Search is a display surface like the timeline, so it shares the

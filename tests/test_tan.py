@@ -1592,6 +1592,88 @@ def test_thread_rejects_unknown_and_deleted_references(identities, tmp_path):
         thread(conn, post["hash"])
 
 
+def _insert_stub(conn, digest, *, author, linked):
+    """Store a bare entry row for states the public API cannot produce."""
+    conn.execute(
+        "INSERT INTO posts (hash, author, key, text, created_at, received_at, "
+        "sig, seq, linked, kind, target) "
+        "VALUES (?, ?, '', 'stub', 1000, 1000, '', 1, ?, 'post', '')",
+        (digest, author, 1 if linked else 0),
+    )
+    conn.commit()
+
+
+def test_thread_rejects_ambiguous_prefix(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    shared = "ab" * 4
+    _insert_stub(conn, shared + "1" * 56, author=author_of(alice), linked=True)
+    _insert_stub(conn, shared + "2" * 56, author=author_of(alice), linked=True)
+
+    with pytest.raises(TanError, match="2 posts match prefix"):
+        thread(conn, shared)
+
+
+def test_thread_rejects_unlinked_entry(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    digest = "cd" * 32
+    _insert_stub(conn, digest, author=author_of(alice), linked=False)
+
+    with pytest.raises(TanError, match="unknown post"):
+        thread(conn, digest)
+
+
+def test_thread_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    first = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
+    )
+    create_delete(conn, bob, first["hash"], name="bob", now=1003)
+
+    # Naming the reply directly must not show it as a standalone thread.
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, nested["hash"])
+
+
+def test_thread_batches_wide_generations(identities, tmp_path, monkeypatch):
+    # A batch size of 2 forces every generation and the reaction lookup
+    # to be split across several queries.
+    monkeypatch.setattr("tau.tangents.tan._SQL_BATCH", 2)
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    replies = []
+    children = []
+    for index in range(5):
+        reply = create_reply(
+            conn, bob, post["hash"], f"reply {index}", name="bob", now=1001 + index
+        )
+        replies.append(reply)
+        children.append(
+            create_reply(
+                conn, alice, reply["hash"], f"child {index}", name="alice",
+                now=1010 + index,
+            )
+        )
+    create_reaction(conn, bob, replies[3]["hash"], liked=True, name="bob", now=1020)
+
+    items = thread(conn, post["hash"])
+    expected = [post["hash"]]
+    for reply, child in zip(replies, children):
+        expected.extend([reply["hash"], child["hash"]])
+    assert [item["hash"] for item in items] == expected
+    assert [item["depth"] for item in items] == [0] + [1, 2] * 5
+    likes = {item["hash"]: item["likes"] for item in items}
+    assert likes[replies[3]["hash"]] == 1
+    assert sum(likes.values()) == 1
+
+
 def test_cli_tan_thread(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
