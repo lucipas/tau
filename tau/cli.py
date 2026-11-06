@@ -390,6 +390,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outbox_list.set_defaults(func=cmd_outbox)
 
+    outbox_held = outbox_sub.add_parser(
+        "held",
+        parents=[common],
+        help="list sealed messages held for other peers",
+    )
+    outbox_held.set_defaults(func=cmd_outbox_held)
+
+    outbox_drop_held = outbox_sub.add_parser(
+        "drop-held",
+        parents=[common],
+        help="drop a held message so it is never delivered",
+    )
+    outbox_drop_held.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_drop_held.set_defaults(func=cmd_outbox_drop_held)
     outbox_cancel = outbox_sub.add_parser(
         "cancel",
         parents=[common],
@@ -2089,8 +2105,133 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(f"\n{len(entries)} message(s) waiting for offline peers.")
         if counts["held"]:
             print(
-                f"Also holding {counts['held']} sealed message(s) for other peers."
+                f"Also holding {counts['held']} sealed message(s) for other peers"
+                " — see `tau outbox held`."
             )
+    return _EXIT_OK
+
+
+def _safe_id_prefix(ref: str, length: int = 8) -> str:
+    """First *length* characters of *ref* with control characters dropped.
+
+    Held ids arrive from remote senders and may contain terminal escapes
+    or newlines; never print them verbatim. JSON output keeps the raw id.
+    """
+    return "".join(char for char in ref[:length] if char.isprintable())
+
+
+def cmd_outbox_held(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    envelopes = mailbox.held_list()
+
+    def describe(envelope: Any) -> Dict[str, Any]:
+        peer = registry.get(envelope.to)
+        return {
+            "id": envelope.id,
+            "to": envelope.to_hex,
+            "to_name": peer.display_name if peer is not None else "",
+            "stored_at": envelope.stored_at,
+            "expires_at": envelope.expires_at,
+            "blob_bytes": len(envelope.blob),
+        }
+
+    if _json_mode(args):
+        _emit(
+            {"held": [describe(e) for e in envelopes], "count": len(envelopes)},
+            True,
+        )
+    else:
+        if not envelopes:
+            print("Not holding any sealed messages for other peers.")
+        else:
+            now = time.time()
+            header = ("ID", "TO", "NAME", "AGE", "EXPIRES IN")
+            rows: List[tuple] = [header]
+            for envelope in envelopes:
+                peer = registry.get(envelope.to)
+                name = peer.display_name if peer is not None else "-"
+                rows.append(
+                    (
+                        _safe_id_prefix(envelope.id),
+                        envelope.to_hex,
+                        name,
+                        _ago(now - envelope.stored_at),
+                        _ago(envelope.expires_at - now),
+                    )
+                )
+            widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+            for row in rows:
+                print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+            print(f"\n{len(envelopes)} sealed message(s) held for other peers.")
+    return _EXIT_OK
+
+
+def cmd_outbox_drop_held(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        # Resolve and remove under one cross-process transaction, so the
+        # reported recipient belongs to the envelope actually removed and
+        # a concurrent fetch or prune cannot slip in between.
+        with mailbox.transaction():
+            envelope = mailbox.resolve_held(args.target)
+            dropped = mailbox.drop_held(envelope.id, tombstone=True)
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if not dropped:
+        raise NodeError(f"held message {args.target!r} is no longer present")
+    peer = registry.get(envelope.to)
+    name = peer.display_name if peer is not None else ""
+    if _json_mode(args):
+        payload = {
+            "id": envelope.id,
+            "to": envelope.to_hex,
+            "to_name": name,
+            # The delivery caveat is part of the result, not just the
+            # text rendering: a copy already fetched by the recipient
+            # may still be delivered.
+            "note": (
+                "a copy already fetched by the recipient may still be"
+                " delivered; dropping stops this node handing it out again"
+            ),
+        }
+        _emit({"dropped": payload}, True)
+    else:
+        print(
+            f"dropped {_safe_id_prefix(envelope.id)}"
+            f" — held for {name or envelope.to_hex}"
+        )
+        print(
+            "note: a copy already fetched by the recipient may still be"
+            " delivered; dropping stops this node handing it out again."
+        )
+    return _EXIT_OK
+
+
+def cmd_outbox_cancel(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry = mailbox.resolve_outbox(args.target)
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    mailbox.remove_outbox(entry.id)
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        payload = entry.to_dict()
+        payload["to_name"] = name
+        _emit({"cancelled": payload}, True)
+    else:
+        print(f"cancelled {entry.id[:8]} — queued for {name or entry.to_hex}")
+        print(
+            "note: sealed copies already held by other peers may still be"
+            " delivered; cancelling stops this node's future attempts."
+        )
     return _EXIT_OK
 
 
@@ -2163,30 +2304,6 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
             print(f"  {entry}{name}")
         if changed:
             print("  (a running serve applies saved changes when it restarts)")
-    return _EXIT_OK
-
-
-def cmd_outbox_cancel(args: argparse.Namespace) -> int:
-    config = _make_config(args)
-    mailbox = Mailbox(config.mailbox_path)
-    registry = PeerRegistry(config.peers_path)
-    try:
-        entry = mailbox.resolve_outbox(args.target)
-    except MailboxError as exc:
-        raise NodeError(str(exc)) from exc
-    mailbox.remove_outbox(entry.id)
-    peer = registry.get(entry.to)
-    name = peer.display_name if peer is not None else entry.to_name
-    if _json_mode(args):
-        payload = entry.to_dict()
-        payload["to_name"] = name
-        _emit({"cancelled": payload}, True)
-    else:
-        print(f"cancelled {entry.id[:8]} — queued for {name or entry.to_hex}")
-        print(
-            "note: sealed copies already held by other peers may still be"
-            " delivered; cancelling stops this node's future attempts."
-        )
     return _EXIT_OK
 
 

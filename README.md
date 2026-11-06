@@ -249,6 +249,8 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau outbox` | List messages queued for offline peers |
+| `tau outbox held` | List sealed messages held for other peers |
+| `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
@@ -423,13 +425,17 @@ recipient) and everything expires. Failed delivery attempts back off
 exponentially (60s, doubling, capped at an hour), so an unreachable peer
 does not cost a link attempt on every sweep; a peer announcing itself
 retries immediately. `tau outbox` shows what is waiting, including the
-next retry time, and `tau outbox cancel ID` takes a queued message
-back — it stops this node's future delivery attempts and deposits, but
-sealed copies already held by other peers may still reach the
-recipient, since the sender cannot recall them. `tau send --no-queue`
-restores the old fail-fast behaviour. A message sent from the web
-console shows as `queued` while it waits, and flips to `delivered` in
-the feed as soon as the sweep delivers it.
+next retry time; `tau outbox held` shows the sealed envelopes this node
+is holding for other peers, and `tau outbox drop-held ID` drops one (a
+copy already fetched by the recipient may still be delivered). A drop
+is remembered until the envelope would have expired, so a sender
+retrying its deposit cannot resurrect the copy. `tau outbox cancel ID`
+takes a queued message back — it stops this node's future delivery
+attempts and deposits, but sealed copies already held by other peers
+may still reach the recipient, since the sender cannot recall them.
+`tau send --no-queue` restores the old fail-fast behaviour. A message
+sent from the web console shows as `queued` while it waits, and flips
+to `delivered` in the feed as soon as the sweep delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

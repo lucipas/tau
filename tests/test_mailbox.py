@@ -224,6 +224,77 @@ def test_held_persistence_roundtrip(tmp_path):
     assert envelopes[0].stored_at == 7.0
 
 
+def test_held_list_returns_all_oldest_first(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.hold(to=BOB, blob=b"a", message_id="second", expires_at=5000.0, now=100.0)
+    box.hold(to=ALICE, blob=b"b", message_id="first", expires_at=5000.0, now=50.0)
+    box.hold(to=BOB, blob=b"c", message_id="third", expires_at=5000.0, now=150.0)
+    assert [e.id for e in box.held_list()] == ["first", "second", "third"]
+
+
+def test_resolve_held_full_id_and_prefix(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    full_id = "a" * 32
+    box.hold(to=BOB, blob=b"a", message_id=full_id, expires_at=5000.0)
+    box.hold(to=BOB, blob=b"b", message_id="shared-alpha", expires_at=5000.0)
+    box.hold(to=BOB, blob=b"c", message_id="shared-beta", expires_at=5000.0)
+    assert box.resolve_held(full_id).id == full_id
+    assert box.resolve_held(full_id[:8]).id == full_id
+    assert box.resolve_held("shared-a").id == "shared-alpha"
+    with pytest.raises(MailboxError, match="unknown held message"):
+        box.resolve_held("no-such-id")
+    with pytest.raises(MailboxError, match="2 held messages match prefix"):
+        box.resolve_held("shared-")
+    with pytest.raises(MailboxError, match="must not be empty"):
+        box.resolve_held("  ")
+
+
+def test_resolve_held_mixed_case_and_long_ids(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.hold(to=BOB, blob=b"a", message_id="AbC123XyZ", expires_at=5000.0)
+    long_id = "q" * 32 + "r" * 32
+    box.hold(to=BOB, blob=b"b", message_id=long_id, expires_at=5000.0)
+    # The stored spelling resolves, and so does a differently-cased prefix.
+    assert box.resolve_held("AbC123XyZ").id == "AbC123XyZ"
+    assert box.resolve_held("abc123").id == "AbC123XyZ"
+    # A 32-character reference is a prefix when no exact id matches it.
+    assert box.resolve_held("q" * 32).id == long_id
+
+
+def test_drop_held_tombstone_blocks_redeposit(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    assert box.hold(to=BOB, blob=b"a", message_id="m1", expires_at=5000.0, now=100.0)
+    assert box.drop_held("m1", tombstone=True) is True
+    # A sender retrying its deposit gets a refusal, not a fresh slot.
+    assert (
+        box.hold(to=BOB, blob=b"a", message_id="m1", expires_at=5000.0, now=200.0)
+        is False
+    )
+    assert box.counts()["held"] == 0
+    # The refusal survives a reload, and lifts once the tombstone expires.
+    reloaded = Mailbox(path)
+    assert (
+        reloaded.hold(
+            to=BOB, blob=b"a", message_id="m1", expires_at=5000.0, now=200.0
+        )
+        is False
+    )
+    assert (
+        reloaded.hold(
+            to=BOB, blob=b"a", message_id="m1", expires_at=9000.0, now=6000.0
+        )
+        is True
+    )
+
+
+def test_drop_held_without_tombstone_allows_redeposit(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    assert box.hold(to=BOB, blob=b"a", message_id="m1", expires_at=5000.0, now=100.0)
+    assert box.drop_held("m1") is True
+    assert box.hold(to=BOB, blob=b"a", message_id="m1", expires_at=5000.0, now=200.0)
+
+
 # -- prune / seen / acks ---------------------------------------------------------
 
 
@@ -232,8 +303,10 @@ def test_prune_expires_everything(tmp_path):
     box.enqueue(to=BOB, text="old", ttl=60.0, now=100.0)
     box.hold(to=BOB, blob=b"x", message_id="held-old", expires_at=150.0, now=100.0)
     box.mark_seen("seen-old", now=100.0)
+    box.hold(to=BOB, blob=b"y", message_id="dropped-old", expires_at=150.0, now=100.0)
+    assert box.drop_held("dropped-old", tombstone=True) is True
     removed = box.prune(now=100.0 + 31 * 24 * 60 * 60)
-    assert removed == {"outbox": 1, "held": 1, "seen": 1}
+    assert removed == {"outbox": 1, "held": 1, "seen": 1, "dropped_held": 1}
     assert box.counts() == {"outbox": 0, "held": 0, "seen": 0}
 
 
