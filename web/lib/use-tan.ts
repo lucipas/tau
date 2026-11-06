@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
@@ -21,12 +21,26 @@ export function useTan() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async (includeAll: boolean) => {
-    const suffix = includeAll ? "?all=1&limit=100" : "?limit=100";
+  // The filter the timeline is showing right now. Actions refresh through
+  // this ref instead of a captured `all`, so a filter switch mid-action
+  // does not reload the filter that is no longer selected.
+  const allRef = useRef(all);
+  useEffect(() => {
+    allRef.current = all;
+  }, [all]);
+
+  // Monotonic generation of feed loads. A slow response (for example a
+  // poll tick started before a delete) must not overwrite a newer refresh.
+  const generationRef = useRef(0);
+
+  const load = useCallback(async () => {
+    const generation = ++generationRef.current;
+    const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
     const [timeline, follows] = await Promise.all([
       apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
       apiGet<TanFollowingResponse>("/api/tan/following"),
     ]);
+    if (generationRef.current !== generation) return;
     setPosts(timeline.posts);
     setFollowing(follows.following);
     setError(null);
@@ -36,7 +50,7 @@ export function useTan() {
     let disposed = false;
     async function tick() {
       try {
-        await load(all);
+        await load();
       } catch (caught) {
         if (!disposed) {
           setError(
@@ -56,8 +70,8 @@ export function useTan() {
   }, [all, load]);
 
   const refresh = useCallback(async () => {
-    await load(all);
-  }, [all, load]);
+    await load();
+  }, [load]);
 
   const publish = useCallback(
     async (text: string) => {
@@ -70,53 +84,53 @@ export function useTan() {
           }
           return [result.post, ...previous];
         });
-        await load(all);
+        await load();
         return result.post;
       } finally {
         setPosting(false);
       }
     },
-    [all, load],
+    [load],
   );
 
   const follow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
-      await load(all);
+      await load();
     },
-    [all, load],
+    [load],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
-      await load(all);
+      await load();
     },
-    [all, load],
+    [load],
   );
 
   const like = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/like", { target });
-      await load(all);
+      await load();
     },
-    [all, load],
+    [load],
   );
 
   const unlike = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unlike", { target });
-      await load(all);
+      await load();
     },
-    [all, load],
+    [load],
   );
 
   const deletePost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/delete", { target });
-      await load(all);
+      await load();
     },
-    [all, load],
+    [load],
   );
 
   const sync = useCallback(async () => {
@@ -125,12 +139,12 @@ export function useTan() {
       const result = await apiPost<TanSyncResponse>("/api/tan/sync", {
         explore: true,
       });
-      await load(all);
+      await load();
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [all, load]);
+  }, [load]);
 
   return {
     posts,

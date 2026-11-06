@@ -29,6 +29,9 @@ lint:
 web-install:
 	cd web && npm install --no-audit --no-fund
 
+web-test: web-install
+	cd web && npm test
+
 web-build: web-install
 	cd web && npm run build
 

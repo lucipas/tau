@@ -15,6 +15,12 @@ export function SocialConsole() {
   const [target, setTarget] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Hashes with a delete request in flight. While one is pending the card
+  // shows a disabled state instead of the confirm button, so a second
+  // click cannot report the already-deleted post as a failure.
+  const [deleting, setDeleting] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -52,11 +58,19 @@ export function SocialConsole() {
   }
 
   async function submitDelete(post: TanPost) {
+    if (deleting.has(post.hash)) return;
+    setDeleting((previous) => new Set(previous).add(post.hash));
     setError(null);
     try {
       await tan.deletePost(post.hash);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not delete");
+    } finally {
+      setDeleting((previous) => {
+        const next = new Set(previous);
+        next.delete(post.hash);
+        return next;
+      });
     }
   }
 
@@ -252,6 +266,7 @@ export function SocialConsole() {
                       post={post}
                       onToggleLike={toggleLike}
                       onDelete={submitDelete}
+                      deleting={deleting.has(post.hash)}
                     />
                   ))
                 )}
@@ -329,14 +344,16 @@ function EmptyState() {
   );
 }
 
-function PostCard({
+export function PostCard({
   post,
   onToggleLike,
   onDelete,
+  deleting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  deleting: boolean;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
@@ -381,7 +398,15 @@ function PostCard({
               ♥ {post.likes ?? 0}
             </button>
             {post.own ? (
-              confirming ? (
+              deleting ? (
+                <button
+                  type="button"
+                  disabled
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/60"
+                >
+                  deleting…
+                </button>
+              ) : confirming ? (
                 <span className="inline-flex items-center gap-1">
                   <button
                     type="button"
