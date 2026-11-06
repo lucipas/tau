@@ -191,7 +191,14 @@ def test_mail_round_exchanges_peers(tmp_path):
     calls = []
     node._flush_peer = lambda p, timeout: calls.append(("flush", p.hexhash))
     node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
-    node.exchange_peers = lambda p, **kwargs: calls.append(("exchange", p.hexhash))
+
+    def exchange(p, **kwargs):
+        # The exchange runs after the mail lock is released, so a slow
+        # peer cannot hold up mail delivery.
+        assert not node._mail_lock.locked()
+        calls.append(("exchange", p.hexhash))
+
+    node.exchange_peers = exchange
 
     node._mail_round_for_peer(peer)
 
@@ -200,6 +207,7 @@ def test_mail_round_exchanges_peers(tmp_path):
         ("collect", peer.hexhash),
         ("exchange", peer.hexhash),
     ]
+    assert node._exchanged_at[peer.destination_hash] > 0
 
 
 def test_mail_round_survives_failed_exchange(tmp_path):
@@ -213,3 +221,63 @@ def test_mail_round_survives_failed_exchange(tmp_path):
 
     node.exchange_peers = failing_exchange
     node._mail_round_for_peer(peer)  # must not raise
+
+
+def test_exchange_sweep_asks_least_recent_first(tmp_path):
+    node = make_node(tmp_path)
+    first = make_peer("first")
+    second = make_peer("second")
+    third = make_peer("third")
+    for peer, when in ((first, 100.0), (second, 200.0), (third, 300.0)):
+        node.registry.upsert(
+            peer.destination_hash, peer.public_key, name=peer.name, now=when
+        )
+    # Second was asked recently; the sweep should skip it and ask the
+    # other two.  Never-asked peers keep registry (most-recently-seen) order.
+    node._exchanged_at[second.destination_hash] = time.time()
+    asked = []
+    node.exchange_peers = lambda p, **kwargs: asked.append(p.hexhash)
+
+    node._exchange_sweep(max_peers=2)
+
+    assert asked == [third.hexhash, first.hexhash]
+
+
+def test_exchange_sweep_skips_recently_asked(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("only")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="only", now=100.0
+    )
+    node._exchanged_at[peer.destination_hash] = time.time()
+    asked = []
+    node.exchange_peers = lambda p, **kwargs: asked.append(p.hexhash)
+
+    node._exchange_sweep(max_peers=2)
+
+    assert asked == []
+
+
+def test_flush_outbox_prefers_direct_peers(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    direct = make_peer("direct")
+    node.registry.upsert(
+        direct.destination_hash, direct.public_key, name="direct", now=100.0
+    )
+    # A peer learned only via exchange, with a much fresher reported
+    # last_seen, must still come after directly heard peers in the sweep.
+    entry, destination = make_exchange_entry("gossip", last_seen=time.time())
+    node.registry.merge_exchanged([entry], now=time.time())
+    assert node.registry.get(destination).via_exchange is True
+
+    order = []
+    node._flush_peer = lambda p, timeout: (
+        order.append(p.hexhash),
+        {"delivered": 0, "deposited": 0},
+    )[1]
+    node._collect_mail = lambda p, timeout: 0
+
+    node.flush_outbox()
+
+    assert order == [direct.hexhash, destination.hex()]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -46,6 +47,10 @@ class Peer:
     hops: int = 0
     protocol: int = PROTOCOL_VERSION
     caps: Tuple[str, ...] = field(default_factory=tuple)
+    # True while the peer was learned only from another peer's exchange and
+    # never heard directly.  Its reported liveness is second-hand, so mail
+    # sweeps rank directly heard peers ahead of it.
+    via_exchange: bool = False
 
     @property
     def hexhash(self) -> str:
@@ -68,6 +73,7 @@ class Peer:
             "hops": self.hops,
             "protocol": self.protocol,
             "caps": list(self.caps),
+            "via_exchange": self.via_exchange,
         }
 
     @classmethod
@@ -110,6 +116,7 @@ class Peer:
             hops=hops,
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
+            via_exchange=raw.get("via_exchange") is True,
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -249,6 +256,8 @@ class PeerRegistry:
                 if clean_name != "unknown" or existing.name == "unknown":
                     existing.name = clean_name
                 existing.public_key = public_key
+                # Heard directly (e.g. via announce): this is first-hand now.
+                existing.via_exchange = False
                 existing.last_seen = max(existing.last_seen, timestamp)
                 existing.hops = max(0, int(hops))
                 existing.protocol = int(protocol) or existing.protocol
@@ -301,11 +310,18 @@ class PeerRegistry:
         with self._lock:
             self._peers.clear()
 
-    def _enforce_limit(self) -> None:
+    def _enforce_limit(self, keep: Iterable[bytes] = ()) -> None:
         if len(self._peers) <= self.max_peers:
             return
-        oldest = sorted(self._peers.values(), key=lambda p: p.last_seen)
-        for peer in oldest[: len(self._peers) - self.max_peers]:
+        keep_set = set(keep)
+        excess = len(self._peers) - self.max_peers
+        # Peers in *keep* (e.g. recipients of queued mail) are never evicted;
+        # the registry may briefly exceed the cap rather than lose them.
+        candidates = sorted(
+            (p for p in self._peers.values() if p.destination_hash not in keep_set),
+            key=lambda p: p.last_seen,
+        )
+        for peer in candidates[:excess]:
             del self._peers[peer.destination_hash]
 
     def load(self) -> None:
@@ -374,20 +390,27 @@ class PeerRegistry:
         *,
         now: Optional[float] = None,
         self_hash: Optional[Union[bytes, str]] = None,
+        keep: Iterable[bytes] = (),
     ) -> Dict[str, int]:
         """Merge peer descriptions learned from another peer.
 
         Every entry is validated before it is trusted: the destination must
         be a 32-hex hash, the public key must be 64 bytes, and the key must
         derive the destination hash — a reporter cannot plant a bogus key
-        for a real peer.  Entries for ourselves, malformed entries, and
-        entries older than the prune horizon are skipped.
+        for a real peer.  Entries for ourselves, malformed entries, entries
+        with non-finite or boolean timestamps, and entries older than the
+        prune horizon are skipped.
 
         A new peer is recorded with ``first_seen`` now and the reported
-        ``last_seen`` (clamped to now), so pruning still works honestly.  A
-        peer we already know keeps its own record: only a missing name is
-        filled in — a third party's claim never refreshes our liveness
-        record.  Returns ``{"added": n, "updated": n, "skipped": n}``.
+        ``last_seen`` (clamped to now), so pruning still works honestly, and
+        marked ``via_exchange`` until it is heard directly.  A peer we
+        already know keeps its own record: only a missing name is filled in
+        — a third party's claim never refreshes our liveness record.  A
+        reported name that collides with another known peer's name is
+        dropped, so a reporter cannot shadow a peer's name and misdirect
+        name-based resolution.  Peers in *keep* (e.g. recipients of queued
+        mail) are never evicted by the capacity limit.  Returns
+        ``{"added": n, "updated": n, "skipped": n}``.
         """
         timestamp = now if now is not None else time.time()
         own: Optional[bytes] = None
@@ -402,6 +425,7 @@ class PeerRegistry:
                 own = candidate
 
         added = updated = skipped = 0
+        added_hashes: set = set()
         if not isinstance(entries, list):
             return {"added": 0, "updated": 0, "skipped": 0}
 
@@ -436,19 +460,50 @@ class PeerRegistry:
                     skipped += 1
                     continue
                 last_seen = entry.get("last_seen")
-                if not isinstance(last_seen, (int, float)):
+                # Booleans are ints in Python, and JSON accepts NaN/Infinity:
+                # all three would otherwise smuggle an unprunable timestamp
+                # into the registry (a NaN last_seen never ages out).
+                if isinstance(last_seen, bool) or not isinstance(
+                    last_seen, (int, float)
+                ):
                     skipped += 1
                     continue
-                last_seen = min(float(last_seen), timestamp)
+                try:
+                    last_seen = float(last_seen)
+                except (OverflowError, ValueError):
+                    skipped += 1
+                    continue
+                if not math.isfinite(last_seen):
+                    skipped += 1
+                    continue
+                last_seen = min(last_seen, timestamp)
                 if timestamp - last_seen > DEFAULT_MAX_AGE:
                     skipped += 1
                     continue
                 hops = entry.get("hops")
                 # One more hop than the reporting peer's own distance.
-                hops = hops + 1 if isinstance(hops, int) and hops >= 0 else 1
+                hops = (
+                    hops + 1
+                    if isinstance(hops, int)
+                    and not isinstance(hops, bool)
+                    and hops >= 0
+                    else 1
+                )
                 protocol = entry.get("protocol")
-                protocol = protocol if isinstance(protocol, int) else 0
+                protocol = (
+                    protocol
+                    if isinstance(protocol, int)
+                    and not isinstance(protocol, bool)
+                    else 0
+                )
                 name = sanitize_name(entry.get("name"), fallback="unknown")
+                if name != "unknown" and any(
+                    p.name.casefold() == name.casefold()
+                    for p in self._peers.values()
+                    if p.destination_hash != destination_bytes
+                ):
+                    # A reporter must not shadow a known peer's name.
+                    name = "unknown"
 
                 existing = self._peers.get(destination_bytes)
                 if existing is None:
@@ -460,10 +515,16 @@ class PeerRegistry:
                         last_seen=last_seen,
                         hops=hops,
                         protocol=protocol,
+                        via_exchange=True,
                     )
+                    added_hashes.add(destination_bytes)
                     added += 1
                 elif existing.name == "unknown" and name != "unknown":
                     existing.name = name
                     updated += 1
-            self._enforce_limit()
+            # Newly added peers are protected from eviction in this same
+            # merge: when everything already stored is protected, the
+            # registry briefly exceeds the cap instead of dropping the peer
+            # it just learned (pruning and later upserts bring it back).
+            self._enforce_limit(keep=set(keep) | added_hashes)
         return {"added": added, "updated": updated, "skipped": skipped}

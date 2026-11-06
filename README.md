@@ -341,8 +341,14 @@ carries the peer's public key, and the receiver verifies the key derives the
 reported destination hash before trusting it; records for our own destination,
 malformed records and records older than the 7-day prune horizon are dropped.
 A peer we already know keeps its own liveness record — a third party's claim
-never refreshes it, and only a missing name is filled in. `tau peers
---exchange [--to NAME|HASH]` runs the same exchange on demand.
+never refreshes it, and only a missing name is filled in. A reported name that
+collides with another known peer's name is dropped, so a reporter cannot shadow
+a peer's name. Peers learned only through exchange are marked as such until
+they are heard directly: mail sweeps rank directly heard peers ahead of them,
+and the background sweep asks a few quiet known peers for their lists every 15
+minutes, so discovery does not depend on announces alone. Peers owed mail or
+pending acks are never evicted by the registry cap to make room for gossip.
+`tau peers --exchange [--to NAME|HASH]` runs the same exchange on demand.
 
 ### Messaging
 

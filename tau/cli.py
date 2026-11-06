@@ -1533,7 +1533,9 @@ def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
             f"{totals['skipped']} skipped from {totals['peers']} peer(s)"
             + (f", {totals['failed']} failed" if totals["failed"] else "")
         )
-    return _EXIT_OK
+    # A failed exchange is still reported per peer above, but scripts
+    # checking only the exit status must not read it as success.
+    return _EXIT_ERROR if totals["failed"] else _EXIT_OK
 
 
 def cmd_id(args: argparse.Namespace) -> int:

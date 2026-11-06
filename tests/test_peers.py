@@ -312,3 +312,103 @@ def test_merge_exchanged_ignores_non_list(tmp_path):
         "updated": 0,
         "skipped": 0,
     }
+
+
+def test_merge_exchanged_rejects_nonfinite_and_bool_timestamps(tmp_path):
+    registry = PeerRegistry()
+    entries = []
+    for bad_last_seen in (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        10**400,  # overflows float() conversion
+        "900",
+    ):
+        entry, _identity, _destination = make_exchange_entry(
+            "bad", last_seen=1000.0
+        )
+        entry["last_seen"] = bad_last_seen
+        entries.append(entry)
+
+    summary = registry.merge_exchanged(entries, now=1000.0)
+    assert summary == {"added": 0, "updated": 0, "skipped": len(entries)}
+    assert len(registry) == 0
+
+
+def test_merge_exchanged_marks_via_exchange_and_upsert_clears_it(tmp_path):
+    registry = PeerRegistry()
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0
+    )
+    registry.merge_exchanged([entry], now=1000.0)
+    assert registry.get(destination).via_exchange is True
+
+    # Hearing the peer directly (its own announce) promotes it.
+    peer = registry.get(destination)
+    registry.upsert(
+        destination, peer.public_key, name="carol", now=1100.0
+    )
+    assert registry.get(destination).via_exchange is False
+    assert registry.get(destination).last_seen == 1100.0
+
+
+def test_merge_exchanged_drops_colliding_names(tmp_path):
+    registry = PeerRegistry()
+    make_peer(registry, 1, "alice", now=100.0)
+
+    # A reporter must not shadow alice's name with another identity.
+    entry, _identity, destination = make_exchange_entry(
+        "alice", last_seen=900.0
+    )
+    registry.merge_exchanged([entry], now=1000.0)
+    assert registry.get(destination).name == "unknown"
+
+    # Nor fill in a missing name with one another peer already uses.
+    other_entry, _other_identity, other_destination = make_exchange_entry(
+        "bob", last_seen=900.0
+    )
+    registry.merge_exchanged([dict(other_entry, name="unknown")], now=1000.0)
+    assert registry.get(other_destination).name == "unknown"
+    summary = registry.merge_exchanged(
+        [dict(other_entry, name="alice")], now=1100.0
+    )
+    assert summary["updated"] == 0
+    assert registry.get(other_destination).name == "unknown"
+
+
+def test_merge_exchanged_never_evicts_kept_peers(tmp_path):
+    registry = PeerRegistry(max_peers=2)
+    kept = make_peer(registry, 1, "one", now=100.0)
+    make_peer(registry, 2, "two", now=200.0)
+
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0
+    )
+    summary = registry.merge_exchanged(
+        [entry], now=1000.0, keep=[kept.destination_hash]
+    )
+    assert summary["added"] == 1
+    assert len(registry) == 2
+    assert registry.get(kept.destination_hash) is not None
+    assert registry.get(destination) is not None
+    # The oldest unprotected peer was evicted instead.
+    assert {p.name for p in registry.all()} == {"one", "carol"}
+
+
+def test_merge_exchanged_exceeds_cap_rather_than_evicting_all_kept(tmp_path):
+    registry = PeerRegistry(max_peers=2)
+    first = make_peer(registry, 1, "one", now=100.0)
+    second = make_peer(registry, 2, "two", now=200.0)
+
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0
+    )
+    summary = registry.merge_exchanged(
+        [entry],
+        now=1000.0,
+        keep=[first.destination_hash, second.destination_hash],
+    )
+    assert summary["added"] == 1
+    assert len(registry) == 3
+    assert registry.get(destination) is not None

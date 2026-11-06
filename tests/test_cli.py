@@ -194,7 +194,7 @@ def test_peers_exchange_failure_is_reported_not_fatal(
 
     monkeypatch.setattr(cli, "TauNode", _FailingNode)
     code = cli.main(["peers", "--exchange", "--data-dir", str(tmp_path / "node")])
-    assert code == 0
+    assert code == cli._EXIT_ERROR
     out = capsys.readouterr().out
     assert "failed" in out
     assert "0 new peer(s)" in out
