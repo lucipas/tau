@@ -135,6 +135,49 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     assert box.load() == {"outbox": 0, "held": 0, "pending_acks": 0}
 
 
+def test_load_skips_nonfinite_timestamps(tmp_path):
+    """NaN / infinite timestamps never parse: a corrupt copy cannot
+    replace a newer valid entry in the newest-wins comparison."""
+    path = tmp_path / "mailbox.json"
+    payload = {
+        "version": 1,
+        "outbox": [
+            {
+                "id": "nan-created",
+                "to": BOB.hex(),
+                "text": "bad timestamp",
+                "created_at": float("nan"),
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "good-id",
+                "to": BOB.hex(),
+                "text": "good",
+                "created_at": 1000.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "held": [
+            {
+                "id": "inf-stored",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"bad").decode("ascii"),
+                "stored_at": float("inf"),
+                "expires_at": 9000.0,
+            },
+        ],
+        "seen": {},
+        "pending_acks": {},
+        "dropped_held": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    box = Mailbox(path)
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0}
+    assert box.get_outbox("nan-created") is None
+    assert box.get_outbox("good-id") is not None
+
+
 def test_enqueue_rejects_bad_destination(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError):

@@ -167,6 +167,8 @@ class OutboxEntry:
             expires_at, (int, float)
         ):
             raise ValueError("invalid outbox timestamps")
+        if not math.isfinite(created_at) or not math.isfinite(expires_at):
+            raise ValueError("non-finite outbox timestamps")
         held_by = raw.get("held_by")
         if not isinstance(held_by, dict):
             held_by = {}
