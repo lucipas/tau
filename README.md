@@ -115,7 +115,9 @@ tau serve --http          # console + JSON API on http://127.0.0.1:8787/
 ```
 
 Open <http://127.0.0.1:8787/>. The page streams inbound messages, peers and
-their latency in real time over server-sent events.
+their latency in real time over server-sent events. Message history is kept
+in `messages.json` in the data directory, so earlier conversations are still
+there after the node restarts.
 
 The same bridge is the local integration point for scripts:
 
@@ -207,11 +209,15 @@ tau tan import tan-backup.json
 
 Posts are limited to 2,000 characters and 20 posts per feed response. A
 long-running node stores only posts it created, received or synced. Tan is
-public-feed oriented: there are no private posts, likes or comments yet. An
-author can delete one of their own posts with `tau tan delete <post>` — the
-delete is a signed entry on the author's chain, so it propagates to peers
-and the post disappears from timelines (the entry itself stays stored,
-keeping chains verifiable). The local database is `<data-dir>/tan.sqlite3`.
+public-feed oriented: there are no private posts or media yet. Posts can be
+answered with `tau tan post --reply-to <post>` — a reply is a signed entry
+on the replier's chain pointing at its parent, so it propagates to peers
+like any other post. An author can delete one of their own posts with
+`tau tan delete <post>` — the delete is a signed entry on the author's
+chain, so it propagates to peers and the post disappears from timelines
+(the entry itself stays stored, keeping chains verifiable). In the web
+console your own posts show a delete button that calls the same endpoint.
+The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 
@@ -239,6 +245,7 @@ Global options may appear before or after the command:
 | `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
+| `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
@@ -305,6 +312,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
 ├── mailbox.json          # store-and-forward queues, chmod 600
+├── messages.json         # console message history, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration
     └── storage/          # Reticulum internals (paths, ratchets, ...)
@@ -373,8 +381,14 @@ and acks them so holders can drop their copies. Every message carries a
 unique id, and each node remembers ids it has already shown, so direct,
 retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
-recipient) and everything expires. `tau outbox` shows what is waiting;
-`tau send --no-queue` restores the old fail-fast behaviour.
+recipient) and everything expires. Failed delivery attempts back off
+exponentially (60s, doubling, capped at an hour), so an unreachable peer
+does not cost a link attempt on every sweep; a peer announcing itself
+retries immediately. `tau outbox` shows what is waiting, including the
+next retry time; `tau send --no-queue` restores the old fail-fast
+behaviour. A message sent from the web console shows as `queued` while
+it waits, and flips to `delivered` in the feed as soon as the sweep
+delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:
@@ -524,9 +538,13 @@ unlinked, and stall sync at the gap.
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
-- Tan is a public timeline: no private posts, likes, comments or media yet.
-  Authors can delete their own posts. It is not a full ActivityPub-style
+- Tan is a public timeline: no private posts or media yet.
+  Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
+- Replies are a new entry kind: a peer running a version that predates
+  replies rejects them, and — because entries are hash-chained — a
+  rejected reply also leaves that author's later entries (including
+  deletes) unlinked on the old peer until it upgrades and resyncs.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
   Back up your own chain with `tau tan export` and restore it with
@@ -537,7 +555,7 @@ unlinked, and stall sync at the gap.
 - Natural extensions: group destinations, file transfer using Reticulum
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (threads, media, moderation, follow recommendations).
+  (media, moderation, follow recommendations).
 
 ## Development
 

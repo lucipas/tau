@@ -29,6 +29,15 @@ gossipped and synced.  A post's like count is derived, never stored: for each
 reactor, their latest like/unlike entry for that post decides whether their
 like currently stands.
 
+A reply is a targeted entry of the same shape, but it carries text: it is
+written by the *replier* onto their own chain with ``kind`` ``"reply"`` and
+``target`` set to the parent post's hash, so the parent link is covered by
+the reply's signature and cannot be swapped by a relay.  Replies are
+gossipped and synced like posts, appear in the timeline and feed, can be
+liked, and can be deleted by their own author.  A reply whose parent has
+not arrived yet is stored anyway; the timeline shows it without a parent
+snippet until the parent is cached.
+
 What gets committed at all is the owner's decision: a ruleset (see
 ``tau.tangents.rules``) can allow or block authors by identity, admit
 only followed authors, or deny by default.  It is consulted for
@@ -115,10 +124,16 @@ KIND_POST = "post"
 KIND_LIKE = "like"
 KIND_UNLIKE = "unlike"
 KIND_DELETE = "delete"
+KIND_REPLY = "reply"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-# Targeted entries (reactions and deletes) point at another post.
-TARGETED_KINDS = REACTION_KINDS + (KIND_DELETE,)
+# Reactions and deletes carry no text; replies carry text but are still
+# targeted entries, so their parent link is signed like a reaction's.
+TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE,)
+# Targeted entries (reactions, deletes and replies) point at another post.
+TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY,)
 ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
+# Kinds that appear as timeline items: top-level posts and replies.
+TIMELINE_KINDS = (KIND_POST, KIND_REPLY)
 
 # Targeted envelopes sign two extra fields on top of the post fields, so a
 # reaction's or deletion's target cannot be swapped without invalidating
@@ -269,7 +284,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         raise PostError(f"unsupported entry kind: {kind!r}")
 
     raw_text = mesg.get("text")
-    if kind in TARGETED_KINDS:
+    if kind in TEXTLESS_KINDS:
         # Reactions and deletes carry no text; normalize_message would also
         # reject the empty string it requires here.
         if raw_text not in (None, ""):
@@ -728,6 +743,71 @@ def create_reaction(
     return record
 
 
+def create_reply(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    text: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a reply to the post *target*.
+
+    A reply is a targeted entry like a reaction: ``kind`` is ``reply``
+    and ``target`` is the parent post's hash, so the parent link is
+    signed — but unlike a reaction it carries text, like a post.  It is
+    appended to the replier's own chain, exactly like a post, and is
+    gossipped and synced through the same paths.  When the target is
+    not cached locally, or is cached but has not linked yet (its chain
+    is incomplete), this raises: a reply is written to a post the
+    author has seen in full.  Replies received from peers for parents
+    that have not arrived yet are still stored through the sync path
+    (:func:`store_post`) and shown without a parent snippet until the
+    parent arrives.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
+        raise TanError("only posts and replies can be replied to")
+    if not existing.get("linked"):
+        raise TanError(
+            "post has not linked yet; sync its chain before replying"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("post has been deleted")
+    clean_text = normalize_message(text)
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": clean_text,
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_REPLY,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
 def create_delete(
     conn: sqlite3.Connection,
     identity: RNS.Identity,
@@ -752,8 +832,8 @@ def create_delete(
     author = _author_from_identity(identity)
     existing = get_post(conn, target)
     if existing is not None:
-        if existing.get("kind", KIND_POST) != KIND_POST:
-            raise TanError("only posts can be deleted")
+        if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
+            raise TanError("only posts and replies can be deleted")
         if existing["author"] != author:
             raise TanError("cannot delete a post you did not author")
         if _is_deleted(conn, existing):
@@ -838,12 +918,80 @@ def annotate_reactions(
     *,
     viewer: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Attach ``likes``/``liked`` fields to post dicts, in place."""
+    """Attach ``likes``/``liked``/``own`` fields to post dicts, in place.
+
+    ``own`` is true when *viewer* is given and the post's author is the
+    viewer, so a display surface can offer author-only actions (like
+    deleting the post) without learning the viewer's identity itself.
+    """
     counts = like_counts(conn, [post["hash"] for post in posts], viewer=viewer)
     for post in posts:
         info = counts.get(post["hash"], {"likes": 0, "liked": False})
         post["likes"] = info["likes"]
         post["liked"] = info["liked"]
+        post["own"] = viewer is not None and post["author"] == viewer
+    return posts
+
+
+def annotate_replies(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``reply_to`` parent summary to reply entries, in place.
+
+    The summary carries the parent's hash, author, name and text when
+    the parent is cached locally, and is ``None`` when the parent has
+    not arrived yet — a reply is still shown on its own.  A deleted
+    parent is reported as deleted with its text blanked, so the thread
+    stays readable without resurfacing removed content.  Top-level
+    posts get no ``reply_to`` key.
+
+    Parents are fetched in one query and their deletion status in a
+    second, so a reply-heavy page does not issue one lookup per reply.
+    Only linked posts and replies count as parents: a reply that points
+    at a reaction, a delete or an unlinked entry is shown without a
+    parent snippet, the same as an uncached parent.
+    """
+    targets = [
+        str(post["target"])
+        for post in posts
+        if post.get("kind") == KIND_REPLY and post.get("target")
+    ]
+    parents: Dict[str, Dict[str, Any]] = {}
+    if targets:
+        placeholders = ", ".join("?" for _ in targets)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            f"WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
+            targets,
+        ).fetchall()
+        for row in rows:
+            parents[str(row["hash"])] = _canonical_post(dict(row))
+    deleted: Set[Tuple[str, str]] = set()
+    if parents:
+        placeholders = ", ".join("?" for _ in parents)
+        rows = conn.execute(
+            "SELECT target, author FROM posts WHERE kind = 'delete' "
+            f"AND linked = 1 AND target IN ({placeholders})",
+            list(parents),
+        ).fetchall()
+        deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    for post in posts:
+        if post.get("kind") != KIND_REPLY:
+            continue
+        parent = parents.get(str(post.get("target") or ""))
+        if parent is None:
+            post["reply_to"] = None
+            continue
+        is_deleted = (parent["hash"], parent["author"]) in deleted
+        post["reply_to"] = {
+            "hash": parent["hash"],
+            "author": parent["author"],
+            "name": parent["name"],
+            "text": "" if is_deleted else parent["text"],
+            "deleted": is_deleted,
+        }
     return posts
 
 
@@ -870,7 +1018,7 @@ def deleted_targets(conn: sqlite3.Connection) -> Set[str]:
     rows = conn.execute(
         "SELECT p.hash FROM posts p "
         "JOIN posts d ON d.target = p.hash AND d.author = p.author "
-        "WHERE p.kind = 'post' AND p.linked = 1 "
+        "WHERE p.kind IN ('post', 'reply') AND p.linked = 1 "
         "AND d.kind = 'delete' AND d.linked = 1"
     ).fetchall()
     return {str(row["hash"]) for row in rows}
@@ -910,7 +1058,7 @@ def apply_display_rules(
 
 
 def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
-    """Resolve a post hash or unique hash prefix to a stored post.
+    """Resolve a post or reply hash or unique hash prefix to a stored entry.
 
     A post its author deleted resolves as deleted, not as unknown, so
     callers can tell the two apart.
@@ -920,7 +1068,7 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     value = ref.strip().lower()
     if len(value) == HASH_HEX_LENGTH:
         post = get_post(conn, value)
-        if post is not None and post.get("kind", KIND_POST) == KIND_POST:
+        if post is not None and post.get("kind", KIND_POST) in TIMELINE_KINDS:
             if _is_deleted(conn, post):
                 raise TanError(f"post has been deleted: {ref!r}")
             return post
@@ -931,7 +1079,8 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         except ValueError:
             raise TanError(f"unknown post: {ref!r}") from None
         rows = conn.execute(
-            "SELECT hash FROM posts WHERE kind = 'post' AND hash LIKE ? LIMIT 8",
+            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "AND hash LIKE ? LIMIT 8",
             (value + "%",),
         ).fetchall()
         if len(rows) == 1:
@@ -978,16 +1127,18 @@ def feed(
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
 
-    Sync needs every entry (reactions and deletes included) to keep
-    chains complete; display callers pass ``posts_only=True`` to hide
-    reaction entries and posts their author deleted.
+    Sync needs every entry (reactions, deletes and replies included) to
+    keep chains complete; display callers pass ``posts_only=True`` to
+    hide reaction entries and posts their author deleted.  Replies are
+    timeline items, so ``posts_only`` keeps them alongside top-level
+    posts.
     """
     count = max(1, min(int(limit), MAX_FEED_POSTS))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         kind_filter = ""
         if posts_only:
-            kind_filter = f" AND kind = 'post' AND {_NOT_DELETED}"
+            kind_filter = f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
@@ -999,7 +1150,7 @@ def feed(
     params: List[Any] = []
     where = "linked = 1"
     if posts_only:
-        where += f" AND kind = 'post' AND {_NOT_DELETED}"
+        where += f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -1134,12 +1285,16 @@ def timeline(
 
     Reaction entries never appear as timeline items; instead each post
     is annotated with its derived ``likes`` count and, when *viewer* is
-    given, whether the viewer's like currently stands.  Posts their
+    given, whether the viewer's like currently stands and whether the
+    post is the viewer's own.  Replies appear as timeline items,
+    annotated with their parent post when it is cached.  Posts their
     author deleted never appear either.
     """
     if include_all:
         posts = feed(conn, limit=limit, before=before, posts_only=True)
-        return annotate_reactions(conn, posts, viewer=viewer)
+        return annotate_replies(
+            conn, annotate_reactions(conn, posts, viewer=viewer)
+        )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
     ]
@@ -1148,7 +1303,7 @@ def timeline(
     placeholders = ", ".join("?" for _ in clean_authors)
     params: List[Any] = list(clean_authors)
     where = (
-        f"linked = 1 AND kind = 'post' AND author IN ({placeholders}) "
+        f"linked = 1 AND kind IN ('post', 'reply') AND author IN ({placeholders}) "
         f"AND {_NOT_DELETED}"
     )
     if before is not None:
@@ -1160,7 +1315,9 @@ def timeline(
         "ORDER BY created_at DESC, hash DESC LIMIT ?",
         params,
     ).fetchall()
-    return annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    return annotate_replies(
+        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    )
 
 
 def follow(
@@ -1394,13 +1551,20 @@ class TanApp:
         self,
         text: str,
         *,
+        reply_to: Optional[str] = None,
         publish: bool = False,
         targets: Optional[Sequence[Any]] = None,
         ttl: int = MAX_GOSSIP_TTL,
     ) -> Dict[str, Any]:
+        """Create a post, or a reply when *reply_to* names a parent post."""
         conn = self.connect()
         try:
-            post = create_post(conn, self.identity, text, name=self.name)
+            if reply_to is not None:
+                post = create_reply(
+                    conn, self.identity, reply_to, text, name=self.name
+                )
+            else:
+                post = create_post(conn, self.identity, text, name=self.name)
         finally:
             conn.close()
         if publish and self.node is not None:
