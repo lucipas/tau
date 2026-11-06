@@ -189,7 +189,7 @@ def test_mail_round_exchanges_peers(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("bob")
     calls = []
-    node._flush_peer = lambda p, timeout: calls.append(("flush", p.hexhash))
+    node._flush_peer = lambda p, timeout, **_kwargs: calls.append(("flush", p.hexhash))
     node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
 
     def exchange(p, **kwargs):
@@ -213,7 +213,7 @@ def test_mail_round_exchanges_peers(tmp_path):
 def test_mail_round_survives_failed_exchange(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("bob")
-    node._flush_peer = lambda p, timeout: {"delivered": 0, "deposited": 0}
+    node._flush_peer = lambda p, timeout, **_kwargs: {"delivered": 0, "deposited": 0}
     node._collect_mail = lambda p, timeout: 0
 
     def failing_exchange(p, **kwargs):
@@ -272,7 +272,7 @@ def test_flush_outbox_prefers_direct_peers(tmp_path):
     assert node.registry.get(destination).via_exchange is True
 
     order = []
-    node._flush_peer = lambda p, timeout: (
+    node._flush_peer = lambda p, timeout, **_kwargs: (
         order.append(p.hexhash),
         {"delivered": 0, "deposited": 0},
     )[1]
