@@ -1059,13 +1059,6 @@ def timeline(
 MAX_SEARCH_POSTS = 200
 
 
-def _like_pattern(query: str) -> str:
-    """Escape LIKE wildcards so *query* matches literally."""
-    return (
-        query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    )
-
-
 def search_posts(
     conn: sqlite3.Connection,
     query: str,
@@ -1079,30 +1072,33 @@ def search_posts(
     Only linked ``post`` entries match: reaction entries never appear
     as results, and posts their author deleted are excluded the same
     way the timeline excludes them.  The match is a case-insensitive
-    substring search over the post text — ``%``, ``_`` and backslash in
-    the query match literally, not as LIKE wildcards — and the search
+    substring search over the post text — ``casefold`` on both sides,
+    so it folds Unicode case (``Ä`` matches ``ä``) — and the search
     reads only the local store: it makes no network requests.  Results
     carry the same like annotations as the timeline.
+
+    The match runs in Python rather than as a SQL ``LIKE``: SQLite's
+    ``LIKE`` folds ASCII case only, so a ``LIKE`` query would miss
+    exactly the Unicode matches this promises.  The scan is over the
+    local post table only, which a personal mesh feed keeps small.
     """
     if not isinstance(query, str) or not query.strip():
         raise TanError("search text must not be empty")
     count = max(1, min(int(limit), MAX_SEARCH_POSTS))
-    params: List[Any] = [f"%{_like_pattern(query.strip())}%"]
-    where = (
-        f"linked = 1 AND kind = 'post' AND {_NOT_DELETED} "
-        "AND text LIKE ? ESCAPE '\\'"
-    )
+    needle = query.strip().casefold()
+    params: List[Any] = []
+    where = f"linked = 1 AND kind = 'post' AND {_NOT_DELETED}"
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
         params.append(author)
-    params.append(count)
     rows = conn.execute(
         f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
-        "ORDER BY created_at DESC, hash DESC LIMIT ?",
+        "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    return annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    matches = [row for row in rows if needle in str(row["text"]).casefold()]
+    return annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer)
 
 
 def follow(

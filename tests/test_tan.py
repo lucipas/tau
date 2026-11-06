@@ -502,6 +502,19 @@ def test_search_matches_substring_case_insensitively(identities, tmp_path):
     assert search_posts(conn, "nothing matches") == []
 
 
+
+
+def test_search_folds_unicode_case(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "Äpfel und Öl", name="alice", now=1000)
+    create_post(conn, alice, "plain apples", name="alice", now=1001)
+
+    assert [post["text"] for post in search_posts(conn, "äpfel")] == [
+        "Äpfel und Öl"
+    ]
+    assert [post["text"] for post in search_posts(conn, "ÖL")] == ["Äpfel und Öl"]
+    assert search_posts(conn, "ÄPFEL") == search_posts(conn, "äpfel")
 def test_search_treats_wildcards_literally(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
