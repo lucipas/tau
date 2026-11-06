@@ -12,6 +12,7 @@ from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, decode, encode
 from tau.tangents.tan import (
     HASH_FIELDS,
+    TAN_EXPORT_FORMAT,
     TAN_FEED_PATH,
     TAN_POST_PATH,
     PostError,
@@ -22,11 +23,14 @@ from tau.tangents.tan import (
     create_post,
     create_reaction,
     deleted_targets,
+    export_entries,
     feed,
     follow,
     following,
+    get_post,
     hash,
     head,
+    import_entries,
     init_db,
     like_counts,
     reaction_states,
@@ -273,6 +277,172 @@ def test_cli_post_and_timeline(tmp_path):
         conn.close()
     assert len(posts) == 1
     assert posts[0]["text"] == "hello from the cli"
+    assert posts[0]["name"] == "alice"
+
+
+def test_export_import_roundtrip(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        first = create_post(source, alice, "first", name="alice", now=1000)
+        second = create_post(source, alice, "second", name="alice", now=1001)
+        create_reaction(
+            source, alice, first["hash"], liked=True, name="alice", now=1002
+        )
+        create_delete(source, alice, second["hash"], name="alice", now=1003)
+        create_post(source, bob, "bob's post", name="bob", now=1000)
+        document = export_entries(source, author=author_of(alice))
+        all_document = export_entries(source, all_authors=True)
+    finally:
+        source.close()
+    assert document["format"] == TAN_EXPORT_FORMAT
+    assert document["version"] == 1
+    assert document["authors"] == [author_of(alice)]
+    # Two posts plus the like and the delete on alice's chain; bob excluded.
+    assert [entry["hash"] for entry in document["entries"]] == [
+        first["hash"],
+        second["hash"],
+        document["entries"][2]["hash"],
+        document["entries"][3]["hash"],
+    ]
+    assert [entry["kind"] for entry in document["entries"]] == [
+        "post",
+        "post",
+        "like",
+        "delete",
+    ]
+    assert all_document["authors"] == sorted([author_of(alice), author_of(bob)])
+    assert len(all_document["entries"]) == 5
+
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result == {
+            "imported": 4,
+            "present": 0,
+            "skipped": 0,
+            "errors": [],
+        }
+        posts = feed(target, author=author_of(alice), posts_only=True)
+        # "second" is deleted, so the posts-only feed hides it — but the
+        # entry itself is still stored, keeping the chain verifiable.
+        assert [post["text"] for post in posts] == ["first"]
+        assert get_post(target, second["hash"]) is not None
+        assert like_counts(target, [first["hash"]])[first["hash"]]["likes"] == 1
+        # The imported delete still hides the second post from the timeline.
+        shown = timeline(target, [author_of(alice)])
+        assert [post["hash"] for post in shown] == [first["hash"]]
+        assert feed(target, author=author_of(bob)) == []
+        again = import_entries(target, document)
+        assert again["imported"] == 0
+        assert again["present"] == 4
+        assert again["skipped"] == 0
+    finally:
+        target.close()
+
+
+def test_export_empty_author(tmp_path):
+    conn = init_db(tmp_path / "empty.sqlite3")
+    try:
+        document = export_entries(conn, author="0" * 32)
+    finally:
+        conn.close()
+    assert document["entries"] == []
+    assert document["authors"] == []
+
+
+def test_import_skips_tampered_entry(identities, tmp_path):
+    alice, _bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    try:
+        first = create_post(source, alice, "original", name="alice", now=1000)
+        second = create_post(source, alice, "untouched", name="alice", now=1001)
+        document = export_entries(source, author=author_of(alice))
+    finally:
+        source.close()
+    document["entries"][0]["text"] = "forged"
+    target = init_db(tmp_path / "target.sqlite3")
+    try:
+        result = import_entries(target, document)
+        assert result["imported"] == 1
+        assert result["present"] == 0
+        assert result["skipped"] == 1
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["hash"] == first["hash"]
+        assert get_post(target, first["hash"]) is None
+        # The untouched entry still imports even though its parent is missing.
+        stored = get_post(target, second["hash"])
+        assert stored is not None
+        assert stored["linked"] is False
+    finally:
+        target.close()
+
+
+def test_import_rejects_bad_envelope(tmp_path):
+    conn = init_db(tmp_path / "empty.sqlite3")
+    try:
+        with pytest.raises(TanError, match="must contain a JSON object"):
+            import_entries(conn, ["not", "a", "dict"])
+        with pytest.raises(TanError, match="unsupported export format"):
+            import_entries(conn, {"format": "nope", "version": 1, "entries": []})
+        with pytest.raises(TanError, match="unsupported export version"):
+            import_entries(
+                conn, {"format": TAN_EXPORT_FORMAT, "version": 99, "entries": []}
+            )
+        with pytest.raises(TanError, match="no entries list"):
+            import_entries(conn, {"format": TAN_EXPORT_FORMAT, "version": 1})
+    finally:
+        conn.close()
+
+
+def test_cli_tan_export_import(tmp_path):
+    alice_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(alice_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(alice_dir),
+                "--no-publish",
+                "--json",
+                "hello backup",
+            ]
+        )
+        == 0
+    )
+    export_path = tmp_path / "tan-export.json"
+    assert (
+        main(
+            [
+                "tan",
+                "export",
+                "--data-dir",
+                str(alice_dir),
+                "--output",
+                str(export_path),
+            ]
+        )
+        == 0
+    )
+    assert export_path.exists()
+    assert json.loads(export_path.read_text(encoding="utf-8"))["entries"][0][
+        "text"
+    ] == "hello backup"
+
+    carol_dir = tmp_path / "carol"
+    assert main(["init", "--data-dir", str(carol_dir), "--name", "carol"]) == 0
+    assert (
+        main(["tan", "import", "--data-dir", str(carol_dir), str(export_path)]) == 0
+    )
+    conn = init_db(carol_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn, all_authors=True)
+    finally:
+        conn.close()
+    assert len(posts) == 1
+    assert posts[0]["text"] == "hello backup"
     assert posts[0]["name"] == "alice"
 
 
