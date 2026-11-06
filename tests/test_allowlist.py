@@ -48,6 +48,18 @@ def test_missing_file_is_disabled(tmp_path):
     assert allowlist.is_allowed(None) is True
 
 
+def test_unreadable_location_fails_closed(tmp_path):
+    # A path that cannot even be statted (here: a file where a
+    # directory should be) is not "missing" — it fails closed.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    with pytest.raises(AllowListError):
+        load_allowlist(blocker / "allowlist.json")
+    denied = load_allowlist_or_deny_all(blocker / "allowlist.json")
+    assert denied.enabled is True
+    assert denied.is_allowed(ALICE) is False
+
+
 def test_enabled_list_admits_only_listed():
     allowlist = AllowList(enabled=True, allow=frozenset({ALICE}))
     assert allowlist.is_allowed(ALICE) is True

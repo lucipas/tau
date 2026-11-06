@@ -117,8 +117,15 @@ def load_allowlist(path: Optional[Union[str, Path]]) -> AllowList:
     if path is None:
         return AllowList()
     target = Path(path).expanduser()
-    if not target.exists():
+    try:
+        target.stat()
+    except FileNotFoundError:
         return AllowList()
+    except OSError as exc:
+        # The file is there but cannot be inspected (permissions,
+        # a broken path component): fail closed rather than treat
+        # it as missing and silently disable enforcement.
+        raise AllowListError(f"could not read allow-list {target}: {exc}") from exc
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
