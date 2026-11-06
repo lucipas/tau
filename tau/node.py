@@ -923,6 +923,9 @@ class TauNode:
             # Without the recipient's public key the message cannot be
             # sealed for anyone else to hold; direct delivery only.
             return False
+        if not self.mailbox.still_queued(entry.id):
+            # Cancelled from another process since the outbox was read.
+            return False
         try:
             blob = seal_message(
                 self.identity,

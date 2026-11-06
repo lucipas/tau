@@ -427,6 +427,15 @@ class Mailbox:
         return matches[0]
 
 
+    def still_queued(self, message_id: str) -> bool:
+        """Re-read the on-disk outbox and report whether *message_id* remains.
+
+        Another process (e.g. ``tau outbox cancel``) may have removed the
+        entry since this process last loaded the mailbox.
+        """
+        with self._transaction():
+            return message_id in self._outbox
+
     def outbox_list(self, to: Optional[bytes] = None) -> List[OutboxEntry]:
         with self._lock:
             entries = list(self._outbox.values())
