@@ -21,6 +21,7 @@ PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
+ALLOWLIST_FILE_NAME = "allowlist.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
@@ -48,6 +49,7 @@ class TauConfig:
     node_file: Path
     social_db_path: Path
     tan_rules_path: Path
+    allowlist_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -81,6 +83,7 @@ class TauConfig:
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             tan_rules_path=base / TAN_RULES_FILE_NAME,
+            allowlist_path=base / ALLOWLIST_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,

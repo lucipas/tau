@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
+from .allowlist import AllowList, load_allowlist_or_deny_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -333,6 +334,20 @@ class TauNode:
         self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
+        self._allowlist: Optional[AllowList] = None
+
+    @property
+    def allowlist(self) -> AllowList:
+        """The DM allow-list, loaded lazily from the data directory.
+
+        A list that cannot be parsed fails closed — remote senders are
+        denied — mirroring the Tan admission ruleset.
+        """
+        if self._allowlist is None:
+            self._allowlist = load_allowlist_or_deny_all(
+                getattr(self.config, "allowlist_path", None)
+            )
+        return self._allowlist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -692,6 +707,14 @@ class TauNode:
 
         received_at = time.time()
         caller_hash = self._caller_label(remote_identity)
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Message from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
         caller_name = "unknown"
         if caller_hash:
             peer = self.registry.get(caller_hash)

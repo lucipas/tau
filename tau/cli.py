@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import __version__
+from .allowlist import (
+    AllowListError,
+    clean_destination,
+    load_allowlist,
+    save_allowlist,
+)
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
@@ -313,6 +319,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
+
+    allowlist = subparsers.add_parser(
+        "allowlist",
+        parents=[common],
+        help="restrict who may send this node direct messages",
+    )
+    allowlist_sub = allowlist.add_subparsers(
+        dest="allowlist_command", metavar="ALLOWLIST_COMMAND"
+    )
+    allowlist_sub.required = True
+
+    allowlist_list = allowlist_sub.add_parser(
+        "list", parents=[common], help="show the DM allow-list"
+    )
+    allowlist_list.set_defaults(func=cmd_allowlist)
+
+    allowlist_add = allowlist_sub.add_parser(
+        "add",
+        parents=[common],
+        help="allow direct messages from a peer (name, hash or prefix)",
+    )
+    allowlist_add.add_argument("peer", help="peer name, destination hash or hash prefix")
+    allowlist_add.set_defaults(func=cmd_allowlist)
+
+    allowlist_remove = allowlist_sub.add_parser(
+        "remove",
+        parents=[common],
+        help="stop allowing direct messages from a peer",
+    )
+    allowlist_remove.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
+    allowlist_remove.set_defaults(func=cmd_allowlist)
+
+    allowlist_on = allowlist_sub.add_parser(
+        "on", parents=[common], help="enforce the DM allow-list"
+    )
+    allowlist_on.set_defaults(func=cmd_allowlist)
+
+    allowlist_off = allowlist_sub.add_parser(
+        "off", parents=[common], help="stop enforcing the DM allow-list"
+    )
+    allowlist_off.set_defaults(func=cmd_allowlist)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1588,6 +1637,78 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(
                 f"Also holding {counts['held']} sealed message(s) for other peers."
             )
+    return _EXIT_OK
+
+
+def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
+    """Resolve a peer name, hash or prefix to a destination hash."""
+    peer = registry.resolve(value)
+    if peer is not None:
+        return peer.hexhash
+    try:
+        return clean_destination(value)
+    except AllowListError:
+        raise AllowListError(f"unknown peer or destination: {value!r}") from None
+
+
+def cmd_allowlist(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        allowlist = load_allowlist(config.allowlist_path)
+    except AllowListError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+    command = getattr(args, "allowlist_command", None)
+    registry = PeerRegistry(config.peers_path)
+    changed = False
+
+    if command == "add":
+        destination = _resolve_allowlist_peer(registry, args.peer)
+        if destination not in allowlist.allow:
+            allowlist = allowlist.with_added(destination)
+            changed = True
+    elif command == "remove":
+        destination = _resolve_allowlist_peer(registry, args.peer)
+        if destination in allowlist.allow:
+            allowlist = allowlist.with_removed(destination)
+            changed = True
+    elif command == "on":
+        if not allowlist.enabled:
+            allowlist = allowlist.with_enabled(True)
+            changed = True
+    elif command == "off":
+        if allowlist.enabled:
+            allowlist = allowlist.with_enabled(False)
+            changed = True
+
+    if changed:
+        save_allowlist(config.allowlist_path, allowlist)
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    if json_output:
+        payload = allowlist.to_dict()
+        payload["entries"] = [describe(value) for value in sorted(allowlist.allow)]
+        payload["path"] = str(config.allowlist_path)
+        _emit(payload, True)
+    else:
+        state = "enforced" if allowlist.enabled else "off"
+        print(f"DM allow-list ({config.allowlist_path}): {state}")
+        if not allowlist.allow:
+            print("  no senders listed — when enforced, nobody may message this node")
+        for entry in sorted(allowlist.allow):
+            peer = registry.get(entry)
+            name = f" ({peer.display_name})" if peer is not None else ""
+            print(f"  {entry}{name}")
+        if changed:
+            print("  (a running serve applies saved changes when it restarts)")
     return _EXIT_OK
 
 
