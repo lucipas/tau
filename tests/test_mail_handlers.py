@@ -80,6 +80,35 @@ def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
     assert entry["from"] == destination_hash(sender).hex()[:8]
 
 
+def test_direct_message_with_bad_sent_at_is_still_recorded(tmp_path):
+    import json
+    import math
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    # A peer can send sent_at: 1e400 as raw JSON even though tau's own
+    # encoder refuses non-finite floats; the parser accepts it.
+    raw = json.dumps(
+        {
+            "type": "message",
+            "v": 1,
+            "text": "timeless",
+            "sent_at": math.inf,
+            "id": "bad-ts-1",
+        }
+    ).encode("utf-8")
+    response = call_handler(node._handle_message, raw)
+    assert response["ok"] is True
+    assert len(received) == 1
+    # Delivered and recorded, with the unusable send time normalized
+    # rather than the message dropped from the inbox.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["sent_at"] == 0.0
+
+
 def test_direct_message_survives_a_restart(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

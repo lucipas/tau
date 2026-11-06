@@ -123,6 +123,7 @@ def test_nonfinite_timestamps_are_rejected(tmp_path):
             {
                 "messages": [
                     _record(id="inf-received", received_at=math.inf),
+                    _record(id="nan-received", received_at=math.nan),
                     _record(id="nan-sent", sent_at=math.nan),
                     _record(id="good"),
                 ]
@@ -131,7 +132,12 @@ def test_nonfinite_timestamps_are_rejected(tmp_path):
         encoding="utf-8",
     )
     entries = Inbox(path).list_messages()
-    assert [entry["id"] for entry in entries] == ["good"]
+    # Non-finite received_at is node-generated, so a bad value means a
+    # corrupt entry and it is skipped; a non-finite sent_at comes from
+    # the wire and is kept with an unknown send time instead.
+    assert [entry["id"] for entry in entries] == ["good", "nan-sent"]
+    kept = [entry for entry in entries if entry["id"] == "nan-sent"][0]
+    assert kept["sent_at"] == 0.0
 
 
 def test_memory_only_inbox(tmp_path):

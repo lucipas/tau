@@ -33,7 +33,15 @@ MAX_INBOX = 500
 
 
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
-    """Normalize one stored record, or ``None`` when it is unusable."""
+    """Normalize one stored record, or ``None`` when it is unusable.
+
+    A peer can send a non-finite ``sent_at`` (the message parser
+    accepts any float), and the message is still delivered — so a bad
+    send time is normalized to 0.0 (unknown) instead of dropping the
+    record from the inbox.  ``received_at`` is node-generated, so a
+    non-finite value there means a corrupt file and the entry is
+    skipped instead.
+    """
     if not isinstance(raw, dict):
         return None
     text = raw.get("text")
@@ -48,7 +56,9 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         received_at = float(received_at) if received_at is not None else time.time()
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(sent_at) or not math.isfinite(received_at):
+    if not math.isfinite(sent_at):
+        sent_at = 0.0
+    if not math.isfinite(received_at):
         return None
     return {
         "from": str(raw.get("from") or "unknown"),
