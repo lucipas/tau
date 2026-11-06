@@ -1249,7 +1249,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         on_peer=console_peer,
     )
     if web_settings is not None:
-        from .webapi import WebBridge, WebBridgeError
+        from .webapi import WebBridge, WebBridgeError, check_web_console_bind
 
         host, port, web_dir = web_settings
         try:
@@ -1285,6 +1285,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # server interface silently dead (panic_on_interface_error = No),
     # so fail fast here with the port named instead of serving deaf.
     check_tcp_listen_ports(config)
+    # Same for the web console: its bind used to fail only after the node
+    # had already started, with a bare "[Errno 98] Address already in
+    # use". Probe first so the error names the console address.
+    if web_settings is not None:
+        host, port, _ = web_settings
+        try:
+            check_web_console_bind(host, port)
+        except WebBridgeError as exc:
+            raise NodeError(str(exc)) from exc
     node.start(
         announce=not getattr(args, "no_announce", False), exclusive=True
     )
@@ -1319,7 +1328,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     console_url = None
     if bridge is not None:
-        console_url = bridge.start()
+        try:
+            console_url = bridge.start()
+        except WebBridgeError as exc:
+            # The pre-start probe covers the usual collision; a bind race
+            # can still land here. Stop the node cleanly instead of
+            # exiting with it running, and keep the named error.
+            node.stop()
+            raise NodeError(str(exc)) from exc
 
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
