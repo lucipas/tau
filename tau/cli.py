@@ -32,6 +32,7 @@ from .identity import (
     save_identity,
 )
 from .inbox import Inbox
+from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
     InstanceAlreadyRunning,
@@ -898,7 +899,7 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
         print("No peers known. Run `tau discover` or `tau serve` first.")
         return
     timestamp = now if now is not None else time.time()
-    header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN")
+    header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
         table.append(
@@ -907,6 +908,7 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
                 peer.display_name,
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
+                peer.lxmf_hash or "—",
             )
         )
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
@@ -1998,6 +2000,7 @@ def cmd_id(args: argparse.Namespace) -> int:
         "name": config.name,
         "destination": destination,
         "identity": identity.hexhash,
+        "lxmf": lxmf_delivery_hash(identity).hex(),
         "data_dir": str(config.data_dir),
         "rns_config": str(config.rns_config_file),
     }
@@ -2007,6 +2010,7 @@ def cmd_id(args: argparse.Namespace) -> int:
         print(f"name:        {config.name}")
         print(f"destination: {destination}")
         print(f"identity:    {identity.hexhash}")
+        print(f"lxmf:        {payload['lxmf']}")
         print(f"data dir:    {config.data_dir}")
     return _EXIT_OK
 

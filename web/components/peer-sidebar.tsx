@@ -183,6 +183,14 @@ export function PeerSidebar({
                             {shortHash(peer.destination, 10)} · {peer.hops} hop
                             {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
                           </span>
+                          {peer.lxmf ? (
+                            <span
+                              className="block truncate font-mono text-[10px] text-mist"
+                              title={`LXMF delivery ${peer.lxmf}`}
+                            >
+                              lxmf {shortHash(peer.lxmf, 10)}
+                            </span>
+                          ) : null}
                         </span>
                       </button>
                       <button

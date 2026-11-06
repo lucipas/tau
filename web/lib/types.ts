@@ -21,6 +21,8 @@ export interface Peer {
   age: number;
   hops: number;
   protocol: number;
+  // LXMF delivery destination hash, derived from the peer's public key.
+  lxmf?: string | null;
 }
 
 export interface InterfaceInfo {

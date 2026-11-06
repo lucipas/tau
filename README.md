@@ -258,7 +258,7 @@ Global options may appear before or after the command:
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
-| `tau id` | Show this node's name and destination hash |
+| `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
@@ -649,6 +649,11 @@ unlinked, and stall sync at the gap.
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
   (media, moderation, follow recommendations).
+- LXMF addressing is in place: every peer's LXMF delivery address is
+  derived from its public key and shown by `tau peers` (and the web
+  console); `tau id` shows this node's own address. Nothing is sent over
+  LXMF yet — the router and the migration of store-and-forward follow
+  under #67.
 
 ## Development
 
