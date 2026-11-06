@@ -60,6 +60,9 @@ DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
 MAX_MESSAGE_LOG = 500
+# Delivery reports buffered while their console record does not exist
+# yet (the flush can deliver before send_message records the send).
+MAX_EARLY_DELIVERIES = 128
 MAX_EVENT_LOG = 500
 MAX_SUBSCRIBERS = 32
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -279,6 +282,10 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Outbox ids reported delivered before their send was recorded;
+        # send_message reconciles them when it appends the record. An
+        # insertion-ordered dict used as a bounded set.
+        self._early_deliveries: Dict[str, None] = {}
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -431,14 +438,14 @@ class WebBridge:
         Called when the node reports that an outbox entry reached its
         recipient. The matching console record (by the outbox id stored
         at send time) flips from ``queued`` to ``delivered`` and the
-        console is told live, so the feed updates in place. Unknown
-        ids — mail queued from the CLI, or from before this was
-        tracked — are a no-op.
+        console is told live, so the feed updates in place. A report
+        that arrives before the send is recorded (queueing starts a
+        flush that can deliver first) is buffered and reconciled when
+        the record is appended, so it is never lost; reports for mail
+        this bridge never recorded — queued from the CLI, or from
+        before this was tracked — simply age out of that buffer.
         """
         updated: Optional[Dict[str, Any]] = None
-        # Take the send lock first (same order as send_message): a delivery
-        # reported while a send is still recording waits for the record
-        # to exist instead of missing it.
         with self._send_lock:
             with self._lock:
                 for message in self._messages:
@@ -450,6 +457,12 @@ class WebBridge:
                         message["status"] = "delivered"
                         updated = dict(message)
                         break
+                if updated is None:
+                    self._early_deliveries[mail_id] = None
+                    while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
+                        self._early_deliveries.popitem(last=False)
+                else:
+                    self._early_deliveries.pop(mail_id, None)
         if updated is None:
             return None
         # Persist the flip like any other log change, so a restart does
@@ -643,14 +656,20 @@ class WebBridge:
         text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
-        # Hold the send lock across queueing and recording: queueing starts
-        # a flush thread that can deliver the entry (and report it via
-        # record_delivery) before the record below exists. record_delivery
-        # takes the same lock first, so it waits for the record and then
-        # flips it instead of silently missing the delivery.
+        # The send lock is NOT held across the network send: queueing
+        # starts a flush thread that can deliver the entry (and report
+        # it via record_delivery) before the record below exists, and
+        # holding the lock across network I/O would stall every other
+        # delivery report behind this send. Instead, record_delivery
+        # buffers a report that beats the record, and the append below
+        # reconciles it.
+        response = self.node.send_message(peer, text, timeout=timeout)
+        queued = bool(response.get("queued"))
+        # The outbox id links this record to a later delivery; only
+        # present while the message is queued.
+        mail_id = response.get("id") if queued else None
+        flipped = False
         with self._send_lock:
-            response = self.node.send_message(peer, text, timeout=timeout)
-            queued = bool(response.get("queued"))
             message = self._append_message(
                 direction="out",
                 peer=peer.hexhash,
@@ -660,11 +679,21 @@ class WebBridge:
                 received_at=time.time(),
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
-                # The outbox id links this record to a later delivery; only
-                # present while the message is queued.
-                mail_id=response.get("id") if queued else None,
+                mail_id=mail_id,
             )
+            if mail_id is not None:
+                with self._lock:
+                    if mail_id in self._early_deliveries:
+                        del self._early_deliveries[mail_id]
+                        message["status"] = "delivered"
+                        flipped = True
+                if flipped:
+                    self._save_messages()
         self.bus.publish({"type": "message", "message": message})
+        if flipped:
+            self.bus.publish(
+                {"type": "message_updated", "message": dict(message)}
+            )
         return message, response
 
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:

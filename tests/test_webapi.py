@@ -602,9 +602,9 @@ def test_delivery_before_record_is_not_lost(bridge, node):
     """A flush that delivers before send_message records the message.
 
     Queueing starts a flush thread, so the delivery callback can fire
-    before ``_append_message`` runs. The send lock makes the callback
-    wait for the record, so the message still flips to delivered
-    instead of staying queued forever.
+    before ``_append_message`` runs. The report is buffered and
+    reconciled when the record is appended, so the message still flips
+    to delivered instead of staying queued forever.
     """
     started = []
 
@@ -636,6 +636,47 @@ def test_delivery_before_record_is_not_lost(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["status"] == "delivered"
+
+
+def test_delivery_report_not_blocked_by_slow_send(bridge, node):
+    """A delivery report completes while another send is in flight.
+
+    Regression test for the CodeRabbit finding on PR #35: the send lock
+    was held across ``node.send_message``, so a delivery report for an
+    earlier message stalled behind the network send (and with it the
+    node's mail sweep, whose thread invokes the callback).
+    """
+    _queue_send(node, mail_id="mail-a")
+    status, _, _ = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "first"}
+    )
+    assert status == 200
+
+    send_started = threading.Event()
+    release_send = threading.Event()
+
+    def _slow_send(peer, text, **kwargs):
+        send_started.set()
+        release_send.wait(timeout=10)
+        return {"ok": True, "v": 1, "to": peer.hexhash}
+
+    node.send_message = _slow_send
+    send_thread = threading.Thread(
+        target=bridge.send_message, args=("alice", "second")
+    )
+    send_thread.start()
+    try:
+        assert send_started.wait(timeout=5)
+        report_thread = threading.Thread(
+            target=bridge.record_delivery, args=("mail-a",)
+        )
+        report_thread.start()
+        report_thread.join(timeout=5)
+        assert not report_thread.is_alive()
+        assert bridge.messages()[0]["status"] == "delivered"
+    finally:
+        release_send.set()
+        send_thread.join(timeout=5)
 
 
 def test_raising_previous_delivery_callback_still_flips(node, tmp_path):
