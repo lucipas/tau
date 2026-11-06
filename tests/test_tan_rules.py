@@ -16,6 +16,7 @@ from tau.tangents.tan import (
     TanApp,
     create_post,
     create_reaction,
+    create_reply,
     feed,
     follow,
     init_db,
@@ -364,3 +365,44 @@ def test_cli_rules_roundtrip(tmp_path):
     assert ruleset.allow_followed is True
     assert ruleset.kinds == frozenset({"post"})
     assert main(["tan", "rules", "--data-dir", str(data_dir)]) == 0
+
+
+def test_display_kinds_cover_replies(identities, tmp_path):
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, bob, "hi", name="bob", now=1000)
+    reply = create_reply(
+        scratch, bob, post["hash"], "hello back", name="bob", now=1001
+    )
+    bob_hash = author_of(bob)
+
+    def build(dirname, ruleset):
+        config = TauConfig.resolve(data_dir=tmp_path / dirname, name="alice")
+        app = TanApp(
+            config, alice, name="alice", gossip=False, ruleset=ruleset
+        )
+        assert _push(app, post)["ok"] is True
+        assert _push(app, reply)["ok"] is True
+        return app
+
+    # Replies hidden: only the top-level post shows, but the reply is
+    # still admitted and stored, keeping the chain complete.
+    hidden = build("a", Ruleset(kinds=frozenset({"post"})))
+    assert [entry["text"] for entry in hidden.timeline(authors=[bob_hash])] == ["hi"]
+    conn = hidden.connect()
+    try:
+        assert max_seq(conn, bob_hash) == 2
+    finally:
+        conn.close()
+
+    # Replies displayed alongside posts.
+    shown = build("b", Ruleset(kinds=frozenset({"post", "reply"})))
+    assert [entry["text"] for entry in shown.timeline(authors=[bob_hash])] == [
+        "hello back",
+        "hi",
+    ]
+
+    # "reply" is a known kind for ruleset files; anything else is rejected.
+    with pytest.raises(RulesError, match="unknown entry kinds"):
+        Ruleset.from_dict({"kinds": ["post", "smash"]})
+    assert Ruleset.from_dict({"kinds": ["reply"]}).displays("reply") is True
