@@ -506,6 +506,51 @@ def test_check_web_console_bind_names_held_port():
     )
 
 
+def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
+    from tau import cli
+    from tau.node import NodeError
+
+    events = []
+
+    class RecordingNode:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.identity = None
+
+        def start(self, *, announce=True, exclusive=False):
+            events.append("node.start")
+
+        def stop(self):
+            events.append("node.stop")
+
+    def failing_start(self):
+        events.append("bridge.start")
+        raise WebBridgeError("web console bind raced")
+
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(cli, "TauNode", RecordingNode)
+    monkeypatch.setattr(WebBridge, "start", failing_start)
+
+    port = _free_port()
+    args = cli.build_parser().parse_args(
+        [
+            "serve",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--http",
+            f"127.0.0.1:{port}",
+            "--web-dir",
+            str(web_dir),
+        ]
+    )
+    with pytest.raises(NodeError, match="web console bind raced"):
+        cli.cmd_serve(args)
+
+    assert events == ["node.start", "bridge.start", "node.stop"]
+
+
 def test_bridge_start_names_held_port_instead_of_raw_oserror(node):
     port = _free_port()
     holder = _hold_port(port)
