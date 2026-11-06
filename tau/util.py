@@ -14,9 +14,16 @@ PathLike = Union[str, os.PathLike]
 log = logging.getLogger(__name__)
 
 
-def ensure_dir(path: PathLike, mode: int = 0o700) -> Path:
-    """Create *path* (and parents) if needed and tighten its permissions."""
+def ensure_dir(path: PathLike, mode: int = 0o700, restrict_existing: bool = True) -> Path:
+    """Create *path* (and parents) if needed and tighten its permissions.
+
+    With ``restrict_existing=False`` an already-existing directory is left
+    untouched, so writing into a caller-selected folder never changes
+    that folder's permissions; a newly created directory is still private.
+    """
     directory = Path(path).expanduser()
+    if not restrict_existing and directory.is_dir():
+        return directory
     directory.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(directory, mode)
@@ -25,10 +32,19 @@ def ensure_dir(path: PathLike, mode: int = 0o700) -> Path:
     return directory
 
 
-def atomic_write_bytes(path: PathLike, data: bytes, mode: Optional[int] = None) -> Path:
-    """Write *data* to *path* atomically, optionally setting a file mode."""
+def atomic_write_bytes(
+    path: PathLike,
+    data: bytes,
+    mode: Optional[int] = None,
+    restrict_parent: bool = True,
+) -> Path:
+    """Write *data* to *path* atomically, optionally setting a file mode.
+
+    ``restrict_parent=False`` keeps an existing parent directory's
+    permissions unchanged.
+    """
     target = Path(path).expanduser()
-    ensure_dir(target.parent)
+    ensure_dir(target.parent, restrict_existing=restrict_parent)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
     )

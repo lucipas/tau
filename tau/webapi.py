@@ -28,10 +28,13 @@ who can reach this API can send messages as this node.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import mimetypes
 import queue
+import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -91,6 +94,80 @@ def parse_bind(value: str) -> Tuple[str, int]:
     from .config import parse_host_port
 
     return parse_host_port(value, default_host=DEFAULT_WEB_HOST)
+
+
+def _web_console_bind_error(host: str, port: int, exc: OSError) -> WebBridgeError:
+    """Name a web console bind failure instead of surfacing a bare errno."""
+    if exc.errno == errno.EADDRINUSE:
+        return WebBridgeError(
+            f"web console port {port} on {host} is already in use; "
+            "another tau node (or another process) is already "
+            "listening there. Stop it, or choose a different "
+            "console port with --http"
+        )
+    return WebBridgeError(f"cannot listen for the web console on {host}:{port}: {exc}")
+
+
+def check_web_console_bind(host: str, port: int) -> None:
+    """Fail fast when the web console address cannot be bound.
+
+    Mirrors what :meth:`WebBridge.start` does when it builds its
+    ``ThreadingHTTPServer`` — an ``AF_INET`` socket with ``SO_REUSEADDR``
+    (the server sets ``allow_reuse_address``), so a socket merely in
+    TIME_WAIT does not trip the check — and raises :class:`WebBridgeError`
+    naming the console address instead of a bare errno.
+
+    Only ``tau serve`` calls this.  Transient commands never start a
+    bridge, so they skip the check.
+
+    The probe mirrors the TCP listen probe (``check_tcp_listen_ports``)
+    on POSIX: an ``AF_INET`` socket with ``SO_REUSEADDR``, so a socket
+    merely in TIME_WAIT does not trip the check.  Windows gets a
+    different probe (see :func:`_check_web_console_bind_windows`):
+    ``SO_REUSEADDR`` there lets a socket bind a port that a live
+    listener already holds, so a bind probe cannot tell a live
+    listener from a recently closed connection in TIME_WAIT.
+    """
+    if sys.platform == "win32":
+        _check_web_console_bind_windows(host, port)
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # SO_REUSEADDR here means "TIME_WAIT is fine" (POSIX). Windows
+        # never reaches this branch (see above).
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+    except OSError as exc:
+        raise _web_console_bind_error(host, port, exc) from exc
+    finally:
+        sock.close()
+
+
+def _check_web_console_bind_windows(host: str, port: int) -> None:
+    """Windows console probe: connect, do not bind.
+
+    A bind probe cannot work on Windows: ``SO_REUSEADDR`` there lets a
+    socket bind a port that a live listener already holds, and omitting
+    it makes the probe trip on a recently closed connection in
+    TIME_WAIT — while the server itself binds with ``SO_REUSEADDR``
+    (``_WebServer.allow_reuse_address``), so the late-bind path cannot
+    catch the collision either.  Connecting instead distinguishes the
+    two cases: a live listener completes the handshake, while a port
+    left in TIME_WAIT refuses the connection.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except ConnectionRefusedError:
+        return
+    except OSError as exc:
+        raise _web_console_bind_error(host, port, exc) from exc
+    raise WebBridgeError(
+        f"web console port {port} on {host} is already in use; "
+        "another tau node (or another process) is already "
+        "listening there. Stop it, or choose a different "
+        "console port with --http"
+    )
 
 
 def _is_local_origin(origin: str) -> bool:
@@ -304,7 +381,10 @@ class WebBridge:
         if self._server is not None:
             raise WebBridgeError("web bridge is already running")
         self._closing.clear()
-        server = _WebServer((self.host, self.port), _WebHandler)
+        try:
+            server = _WebServer((self.host, self.port), _WebHandler)
+        except OSError as exc:
+            raise _web_console_bind_error(self.host, self.port, exc) from exc
         server.bridge = self
         server.daemon_threads = True
         self._server = server
