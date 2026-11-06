@@ -67,7 +67,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import RNS
 
@@ -114,12 +114,17 @@ HASH_FIELDS = ("v", "author", "key", "name", "text", "created_at")
 KIND_POST = "post"
 KIND_LIKE = "like"
 KIND_UNLIKE = "unlike"
+KIND_DELETE = "delete"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-ENTRY_KINDS = (KIND_POST,) + REACTION_KINDS
+# Targeted entries (reactions and deletes) point at another post.
+TARGETED_KINDS = REACTION_KINDS + (KIND_DELETE,)
+ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
 
-# Reaction envelopes sign two extra fields on top of the post fields, so a
-# reaction's target cannot be swapped without invalidating its signature.
-REACTION_HASH_FIELDS = HASH_FIELDS + ("kind", "target")
+# Targeted envelopes sign two extra fields on top of the post fields, so a
+# reaction's or deletion's target cannot be swapped without invalidating
+# its signature.
+TARGETED_HASH_FIELDS = HASH_FIELDS + ("kind", "target")
+REACTION_HASH_FIELDS = TARGETED_HASH_FIELDS
 
 # Column order used by every SELECT so rows can be converted consistently.
 _POST_COLUMNS = (
@@ -175,8 +180,8 @@ def _require_timestamp(value: Any, field: str) -> float:
 
 def _hash_fields_for(mesg: Dict[str, Any]) -> Tuple[str, ...]:
     """Fields covered by the hash for *mesg*, based on its entry kind."""
-    if mesg.get("kind") in REACTION_KINDS:
-        return REACTION_HASH_FIELDS
+    if mesg.get("kind") in TARGETED_KINDS:
+        return TARGETED_HASH_FIELDS
     return HASH_FIELDS
 
 
@@ -264,11 +269,11 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
         raise PostError(f"unsupported entry kind: {kind!r}")
 
     raw_text = mesg.get("text")
-    if kind in REACTION_KINDS:
-        # Reactions carry no text; normalize_message would also reject the
-        # empty string it requires here.
+    if kind in TARGETED_KINDS:
+        # Reactions and deletes carry no text; normalize_message would also
+        # reject the empty string it requires here.
         if raw_text not in (None, ""):
-            raise PostError("reaction entries cannot carry text")
+            raise PostError(f"{kind} entries cannot carry text")
         text = ""
     else:
         text = normalize_message(raw_text)
@@ -289,7 +294,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
     raw_target = mesg.get("target", "")
     if raw_target is None:
         raw_target = ""
-    if kind in REACTION_KINDS:
+    if kind in TARGETED_KINDS:
         target = _require_hex(raw_target, HASH_HEX_LENGTH, "target")
     else:
         if raw_target not in ("", None):
@@ -723,6 +728,62 @@ def create_reaction(
     return record
 
 
+def create_delete(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a delete entry for the post *target*.
+
+    The delete is appended to the deleter's own chain, exactly like a
+    reaction: ``kind`` is ``delete`` and ``target`` is the post hash.
+    Only the post's author can delete it.  When the target post is
+    cached locally and belongs to someone else — or is not a post at
+    all — this raises; a delete for a post that is not cached yet is
+    stored anyway and stays inert until the post arrives and its
+    author matches (see :func:`deleted_targets`).
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is not None:
+        if existing.get("kind", KIND_POST) != KIND_POST:
+            raise TanError("only posts can be deleted")
+        if existing["author"] != author:
+            raise TanError("cannot delete a post you did not author")
+        if _is_deleted(conn, existing):
+            raise TanError("post has been deleted")
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": "",
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_DELETE,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
 def reaction_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, str]]:
@@ -786,6 +847,45 @@ def annotate_reactions(
     return posts
 
 
+# SQL fragment excluding posts their author deleted.  The outer query must
+# read from a table named ``posts``.  Deletion is derived at read time, the
+# same way like counts are, so a delete that arrives before its post
+# applies as soon as the post is stored.
+_NOT_DELETED = (
+    "NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+    "AND d.linked = 1 AND d.target = posts.hash AND d.author = posts.author)"
+)
+
+
+def deleted_targets(conn: sqlite3.Connection) -> Set[str]:
+    """Hashes of posts hidden by a delete entry from their own author.
+
+    A post is deleted when a linked ``delete`` entry exists whose author
+    is the post's author.  Deletes from anyone else are inert, and a
+    delete that arrives before its post applies as soon as the post is
+    stored.  Deleted posts stay in the database — the chain must stay
+    verifiable and sync must keep carrying them — they are only hidden
+    from display surfaces.
+    """
+    rows = conn.execute(
+        "SELECT p.hash FROM posts p "
+        "JOIN posts d ON d.target = p.hash AND d.author = p.author "
+        "WHERE p.kind = 'post' AND p.linked = 1 "
+        "AND d.kind = 'delete' AND d.linked = 1"
+    ).fetchall()
+    return {str(row["hash"]) for row in rows}
+
+
+def _is_deleted(conn: sqlite3.Connection, post: Dict[str, Any]) -> bool:
+    """Whether *post* is hidden by a delete entry from its own author."""
+    row = conn.execute(
+        "SELECT 1 FROM posts d WHERE d.kind = 'delete' AND d.linked = 1 "
+        "AND d.target = ? AND d.author = ? LIMIT 1",
+        (post["hash"], post["author"]),
+    ).fetchone()
+    return row is not None
+
+
 def apply_display_rules(
     posts: List[Dict[str, Any]], ruleset: Ruleset
 ) -> List[Dict[str, Any]]:
@@ -810,13 +910,19 @@ def apply_display_rules(
 
 
 def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
-    """Resolve a post hash or unique hash prefix to a stored post."""
+    """Resolve a post hash or unique hash prefix to a stored post.
+
+    A post its author deleted resolves as deleted, not as unknown, so
+    callers can tell the two apart.
+    """
     if not isinstance(ref, str) or not ref.strip():
         raise TanError("post reference must not be empty")
     value = ref.strip().lower()
     if len(value) == HASH_HEX_LENGTH:
         post = get_post(conn, value)
         if post is not None and post.get("kind", KIND_POST) == KIND_POST:
+            if _is_deleted(conn, post):
+                raise TanError(f"post has been deleted: {ref!r}")
             return post
         raise TanError(f"unknown post: {ref!r}")
     if len(value) >= 8:
@@ -831,10 +937,29 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         if len(rows) == 1:
             post = get_post(conn, str(rows[0]["hash"]))
             if post is not None:
+                if _is_deleted(conn, post):
+                    raise TanError(f"post has been deleted: {ref!r}")
                 return post
         if len(rows) > 1:
             raise TanError(f"{len(rows)} posts match prefix {value!r}")
     raise TanError(f"unknown post: {ref!r}")
+
+
+def resolve_delete_target(conn: sqlite3.Connection, ref: str) -> str:
+    """Resolve a delete target to a post hash.
+
+    A full hash passes through even when the post is not cached — the
+    signed tombstone applies when the post arrives.  A shorter prefix
+    resolves against cached posts, so an unknown or already-deleted
+    post fails here with a clear error.  Cached targets are still
+    checked by :func:`create_delete` for ownership and prior deletion.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise TanError("post reference must not be empty")
+    value = ref.strip().lower()
+    if len(value) == HASH_HEX_LENGTH:
+        return _require_hex(value, HASH_HEX_LENGTH, "post")
+    return resolve_post(conn, ref)["hash"]
 
 
 def _public_posts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
@@ -853,13 +978,16 @@ def feed(
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
 
-    Sync needs every entry (reactions included) to keep chains complete;
-    display callers pass ``posts_only=True`` to hide reaction entries.
+    Sync needs every entry (reactions and deletes included) to keep
+    chains complete; display callers pass ``posts_only=True`` to hide
+    reaction entries and posts their author deleted.
     """
     count = max(1, min(int(limit), MAX_FEED_POSTS))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
-        kind_filter = " AND kind = 'post'" if posts_only else ""
+        kind_filter = ""
+        if posts_only:
+            kind_filter = f" AND kind = 'post' AND {_NOT_DELETED}"
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
@@ -871,7 +999,7 @@ def feed(
     params: List[Any] = []
     where = "linked = 1"
     if posts_only:
-        where += " AND kind = 'post'"
+        where += f" AND kind = 'post' AND {_NOT_DELETED}"
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -897,7 +1025,8 @@ def timeline(
 
     Reaction entries never appear as timeline items; instead each post
     is annotated with its derived ``likes`` count and, when *viewer* is
-    given, whether the viewer's like currently stands.
+    given, whether the viewer's like currently stands.  Posts their
+    author deleted never appear either.
     """
     if include_all:
         posts = feed(conn, limit=limit, before=before, posts_only=True)
@@ -909,7 +1038,10 @@ def timeline(
         return []
     placeholders = ", ".join("?" for _ in clean_authors)
     params: List[Any] = list(clean_authors)
-    where = f"linked = 1 AND kind = 'post' AND author IN ({placeholders})"
+    where = (
+        f"linked = 1 AND kind = 'post' AND author IN ({placeholders}) "
+        f"AND {_NOT_DELETED}"
+    )
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -974,7 +1106,7 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
     row = conn.execute(
         "SELECT COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
-        "FROM posts WHERE author = ? AND linked = 1 AND kind = 'post'",
+        f"FROM posts WHERE author = ? AND linked = 1 AND kind = 'post' AND {_NOT_DELETED}",
         (author,),
     ).fetchone()
     seq_row = conn.execute(
@@ -1185,6 +1317,26 @@ class TanApp:
 
     def unlike(self, target: str, **kwargs: Any) -> Dict[str, Any]:
         return self.react(target, liked=False, **kwargs)
+
+    def delete(
+        self,
+        target: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Append a delete entry for *target* (one of your own posts)."""
+        conn = self.connect()
+        try:
+            record = create_delete(
+                conn, self.identity, target, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
 
     def following_ids(self) -> List[str]:
         conn = self.connect()

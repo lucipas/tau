@@ -133,6 +133,7 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
@@ -200,8 +201,11 @@ tau tan following
 
 Posts are limited to 2,000 characters and 20 posts per feed response. A
 long-running node stores only posts it created, received or synced. Tan is
-public-feed oriented: there are no private posts, likes, comments or deletions
-yet. The local database is `<data-dir>/tan.sqlite3`.
+public-feed oriented: there are no private posts, likes or comments yet. An
+author can delete one of their own posts with `tau tan delete <post>` — the
+delete is a signed entry on the author's chain, so it propagates to peers
+and the post disappears from timelines (the entry itself stays stored,
+keeping chains verifiable). The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 
@@ -231,6 +235,7 @@ Global options may appear before or after the command:
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
+| `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
@@ -511,8 +516,9 @@ unlinked, and stall sync at the gap.
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
-- Tan is a public timeline: no private posts, likes, comments, media or
-  deletions yet. It is not a full ActivityPub-style federation protocol.
+- Tan is a public timeline: no private posts, likes, comments or media yet.
+  Authors can delete their own posts. It is not a full ActivityPub-style
+  federation protocol.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
 - Peer information is self-asserted and can be stale; prune with

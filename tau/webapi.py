@@ -15,6 +15,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
+    POST /api/tan/delete   delete one of your own posts
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
     POST /api/tan/sync     pull missing posts from peers
@@ -382,6 +383,19 @@ class WebBridge:
             conn.close()
         return app.react(post_hash, liked=liked, publish=True)
 
+    def tan_delete(self, target: str) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_delete_target
+
+            post_hash = resolve_delete_target(conn, target)
+        finally:
+            conn.close()
+        return app.delete(post_hash, publish=True)
+
     def tan_sync(self, *, explore: bool = True) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
@@ -723,10 +737,29 @@ class _WebHandler(BaseHTTPRequestHandler):
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
-                except Exception as exc:
+                except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "reaction": record}, head_only)
+                return
+            if path == "/api/tan/delete":
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    record = self.bridge.tan_delete(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "delete": record}, head_only)
                 return
             if path == "/api/tan/sync":
                 try:
