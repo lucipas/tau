@@ -19,9 +19,11 @@ from . import __version__
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
+    _identity_lock,
     destination_hash,
     load_identity,
     load_or_create_identity,
+    save_identity,
 )
 from .mailbox import Mailbox
 from .node import (
@@ -304,9 +306,49 @@ def build_parser() -> argparse.ArgumentParser:
     peers.set_defaults(func=cmd_peers)
 
     identity = subparsers.add_parser(
-        "id", parents=[common], help="show this node's name and destination"
+        "id",
+        parents=[common],
+        help="show this node's name and destination, or back up / restore its identity",
     )
     identity.set_defaults(func=cmd_id)
+    id_sub = identity.add_subparsers(dest="id_command", metavar="ID_COMMAND")
+    id_export = id_sub.add_parser(
+        "export",
+        parents=[common],
+        help="write a backup copy of the node identity to a file",
+    )
+    id_export.add_argument(
+        "--to",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help="backup file to write",
+    )
+    id_export.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing backup file",
+    )
+    id_export.set_defaults(func=cmd_id_export)
+    id_import = id_sub.add_parser(
+        "import",
+        parents=[common],
+        help="restore the node identity from a backup file",
+    )
+    id_import.add_argument(
+        "--from",
+        required=True,
+        type=Path,
+        dest="from_path",
+        metavar="PATH",
+        help="backup file to read",
+    )
+    id_import.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing identity",
+    )
+    id_import.set_defaults(func=cmd_id_import)
 
     outbox = subparsers.add_parser(
         "outbox",
@@ -1541,6 +1583,100 @@ def cmd_id(args: argparse.Namespace) -> int:
         print(f"destination: {destination}")
         print(f"identity:    {identity.hexhash}")
         print(f"data dir:    {config.data_dir}")
+    return _EXIT_OK
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Compare two paths after expanding ``~`` and resolving symlinks."""
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except OSError:
+        return False
+
+
+def cmd_id_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    target = Path(args.to).expanduser()
+    if _same_path(target, config.identity_path):
+        raise NodeError(
+            f"cannot export the identity to itself ({target}); "
+            "choose a different backup path"
+        )
+    if target.is_dir():
+        raise NodeError(f"backup path {target} is a directory")
+    # lexists, not exists: a dangling symlink at the target counts as an
+    # existing backup and must not be silently replaced without --force.
+    if os.path.lexists(target) and not getattr(args, "force", False):
+        raise NodeError(
+            f"backup already exists at {target}; pass --force to overwrite it"
+        )
+    # The backup goes into a caller-selected folder: never change that
+    # folder's permissions, only the backup file itself is private.
+    save_identity(identity, target, restrict_parent=False)
+    payload = {
+        "destination": destination_hash(identity).hex(),
+        "identity": identity.hexhash,
+        "path": str(target),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"identity:    {payload['identity']}")
+        print(f"destination: {payload['destination']}")
+        print(f"backup:      {payload['path']}")
+    return _EXIT_OK
+
+
+def cmd_id_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    source = Path(args.from_path).expanduser()
+    if not source.exists():
+        raise NodeError(f"no identity backup at {source}")
+    if _same_path(source, config.identity_path):
+        raise NodeError(f"{source} is already this node's identity file")
+    try:
+        identity = load_identity(source)
+    except Exception as exc:
+        # A backup file is untrusted input: any parse failure is a bad backup.
+        raise NodeError(f"not a valid identity backup: {exc}") from exc
+    if identity is None:  # pragma: no cover - load_identity returns None only when missing
+        raise NodeError(f"no identity backup at {source}")
+    config.prepare()
+    # Hold the instance lock across the whole replacement: a node that
+    # starts after the probe but before the write would load the old
+    # identity and then serve with a different identity than the one on
+    # disk.  The identity-creation lock serialises the check-and-write
+    # against a concurrent `tau init` on the same directory.  Lock order
+    # (instance, then identity) matches `TauNode.start`, which takes the
+    # instance lock before loading or creating its identity.
+    # Note the instance lock is POSIX-only (no-op without fcntl), the
+    # same limitation `tau serve` itself accepts.
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        with _identity_lock(config.identity_path):
+            if config.identity_path.exists() and not getattr(args, "force", False):
+                raise NodeError(
+                    f"an identity already exists at {config.identity_path}; "
+                    "pass --force to replace it"
+                )
+            save_identity(identity, config.identity_path)
+    finally:
+        lock.release()
+    payload = {
+        "destination": destination_hash(identity).hex(),
+        "identity": identity.hexhash,
+        "data_dir": str(config.data_dir),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"identity:    {payload['identity']}")
+        print(f"destination: {payload['destination']}")
+        print(f"data dir:    {payload['data_dir']}")
     return _EXIT_OK
 
 
