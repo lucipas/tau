@@ -44,9 +44,17 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .config import MESSAGES_FILE_NAME
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
-from .protocol import MAX_MESSAGE_CHARS, ProtocolError, sanitize_name, short_hash
+from .protocol import (
+    MAX_MESSAGE_CHARS,
+    ProtocolError,
+    normalize_message,
+    sanitize_name,
+    short_hash,
+)
+from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +63,9 @@ DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
 MAX_MESSAGE_LOG = 500
+# Delivery reports buffered while their console record does not exist
+# yet (the flush can deliver before send_message records the send).
+MAX_EARLY_DELIVERIES = 128
 MAX_EVENT_LOG = 500
 MAX_SUBSCRIBERS = 32
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -224,8 +235,88 @@ class EventBus:
                 pass
 
 
+def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
+    """Validate one message record loaded from ``messages.json``.
+
+    Returns a normalised copy, or ``None`` when the entry is not a
+    recognisable message (corrupt or hand-edited history never blocks
+    startup; the bad entry is simply dropped).
+    """
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("direction") not in ("in", "out"):
+        return None
+    message_id = entry.get("id")
+    if (
+        not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+        or message_id < 1
+    ):
+        return None
+    peer = entry.get("peer")
+    if peer is not None and not isinstance(peer, str):
+        return None
+    peer_name = entry.get("peer_name")
+    text = entry.get("text")
+    status = entry.get("status")
+    if (
+        not isinstance(peer_name, str)
+        or not isinstance(text, str)
+        or not isinstance(status, str)
+    ):
+        return None
+    sent_at = entry.get("sent_at")
+    received_at = entry.get("received_at")
+    if (
+        not isinstance(sent_at, (int, float))
+        or isinstance(sent_at, bool)
+        or not isinstance(received_at, (int, float))
+        or isinstance(received_at, bool)
+    ):
+        return None
+    try:
+        sent_at = float(sent_at)
+        received_at = float(received_at)
+    except (OverflowError, ValueError):
+        # A huge JSON integer timestamp overflows float(); drop the entry
+        # instead of failing bridge startup.
+        return None
+    message: Dict[str, Any] = {
+        "id": message_id,
+        "direction": entry["direction"],
+        "peer": peer,
+        "peer_name": peer_name,
+        "text": text,
+        "sent_at": sent_at,
+        "received_at": received_at,
+        "status": status,
+    }
+    rtt_ms = entry.get("rtt_ms")
+    if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
+        message["rtt_ms"] = rtt_ms
+    mail_id = entry.get("mail_id")
+    if isinstance(mail_id, str):
+        # Kept so a message still queued across a restart can be matched
+        # when its delivery is reported.
+        message["mail_id"] = mail_id
+    try:
+        # The writer serialises with ensure_ascii=False, so a stored
+        # string that is not UTF-8 encodable (e.g. a lone surrogate from a
+        # hand-edited file) would poison every later save; drop it here.
+        json.dumps(message, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, ValueError):
+        return None
+    return message
+
+
 class WebBridge:
-    """Expose a :class:`TauNode` over a loopback HTTP API."""
+    """Expose a :class:`TauNode` over a loopback HTTP API.
+
+    Inbound and outbound messages shown by the console are persisted to
+    ``messages.json`` in the node data directory (when the node has one),
+    so history survives a restart; without a data directory the bridge
+    keeps messages in memory only.
+    """
 
     def __init__(
         self,
@@ -247,11 +338,36 @@ class WebBridge:
         self.web_dir = Path(web_dir).expanduser().resolve() if web_dir else None
         self.allow_remote = bool(allow_remote)
 
+        # The bridge owns the console message log, so it observes queued
+        # deliveries itself; chain any delivery callback the node already
+        # has instead of replacing it.
+        previous_on_delivered = getattr(node, "on_delivered", None)
+
+        def _on_delivered(message_id: str) -> None:
+            try:
+                if callable(previous_on_delivered):
+                    previous_on_delivered(message_id)
+            finally:
+                # A failing previous callback must not lose the status
+                # update; the exception propagates to the node's callback
+                # guard, which logs it like any other user-callback failure.
+                self.record_delivery(message_id)
+
+        node.on_delivered = _on_delivered
+
         self.bus = EventBus()
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        # Outbox ids reported delivered before their send was recorded;
+        # send_message reconciles them when it appends the record. An
+        # insertion-ordered dict used as a bounded set.
+        self._early_deliveries: Dict[str, None] = {}
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
+        self._messages_path = self._resolve_messages_path()
+        self._load_messages()
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
@@ -294,6 +410,75 @@ class WebBridge:
         if thread is not None:
             thread.join(timeout=3.0)
 
+    # -- message history ---------------------------------------------------
+
+    def _resolve_messages_path(self) -> Optional[Path]:
+        """Data-dir path for persisted message history, or ``None``.
+
+        A node without a data directory (tests, embeds) keeps messages in
+        memory only.
+        """
+        data_dir = getattr(self.node, "data_dir", None)
+        if data_dir is None:
+            config = getattr(self.node, "config", None)
+            data_dir = getattr(config, "data_dir", None)
+        if data_dir is None:
+            return None
+        return Path(data_dir) / MESSAGES_FILE_NAME
+
+    def _load_messages(self) -> None:
+        """Load persisted message history into the in-memory log."""
+        path = self._messages_path
+        if path is None:
+            return
+        raw = read_json(path, default=None)
+        if not isinstance(raw, dict):
+            return
+        entries = raw.get("messages")
+        if not isinstance(entries, list):
+            return
+        loaded = []
+        for entry in entries:
+            message = _clean_stored_message(entry)
+            if message is not None:
+                loaded.append(message)
+        loaded = loaded[-MAX_MESSAGE_LOG:]
+        self._messages.extend(loaded)
+        saved_next = raw.get("next_message_id")
+        max_id = max((message["id"] for message in loaded), default=0)
+        if isinstance(saved_next, int) and not isinstance(saved_next, bool):
+            self._next_message_id = max(saved_next, max_id + 1, 1)
+        else:
+            self._next_message_id = max(max_id + 1, 1)
+
+    def _save_messages(self) -> None:
+        """Persist the current message log to ``messages.json``.
+
+        Saves are serialised through ``_save_lock`` and the snapshot is
+        taken inside it, so a slow write can never let an older snapshot
+        overwrite a newer one: the last save to finish always holds the
+        newest log. A failed write only logs a warning: the messages are
+        already in memory, and a full disk (or an unencodable record) must
+        never break sending or receiving.
+        """
+        path = self._messages_path
+        if path is None:
+            return
+        with self._save_lock:
+            with self._lock:
+                messages = list(self._messages)
+                next_id = self._next_message_id
+            try:
+                atomic_write_json(
+                    path,
+                    {"messages": messages, "next_message_id": next_id},
+                    mode=0o600,
+                )
+            except (OSError, ValueError) as exc:
+                log.warning(
+                    "Could not persist message history to %s: %s", path, exc
+                )
+
     @property
     def url(self) -> str:
         host = self.host
@@ -326,6 +511,45 @@ class WebBridge:
         )
         self.bus.publish({"type": "message", "message": message})
         return message
+
+    def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
+        """Mark a queued outbound message delivered.
+
+        Called when the node reports that an outbox entry reached its
+        recipient. The matching console record (by the outbox id stored
+        at send time) flips from ``queued`` to ``delivered`` and the
+        console is told live, so the feed updates in place. A report
+        that arrives before the send is recorded (queueing starts a
+        flush that can deliver first) is buffered and reconciled when
+        the record is appended, so it is never lost; reports for mail
+        this bridge never recorded — queued from the CLI, or from
+        before this was tracked — simply age out of that buffer.
+        """
+        updated: Optional[Dict[str, Any]] = None
+        with self._send_lock:
+            with self._lock:
+                for message in self._messages:
+                    if (
+                        message.get("direction") == "out"
+                        and message.get("status") == "queued"
+                        and message.get("mail_id") == mail_id
+                    ):
+                        message["status"] = "delivered"
+                        updated = dict(message)
+                        break
+                if updated is None:
+                    self._early_deliveries[mail_id] = None
+                    while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
+                        self._early_deliveries.popitem(last=False)
+                else:
+                    self._early_deliveries.pop(mail_id, None)
+        if updated is None:
+            return None
+        # Persist the flip like any other log change, so a restart does
+        # not resurrect the message as queued.
+        self._save_messages()
+        self.bus.publish({"type": "message_updated", "message": updated})
+        return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
@@ -362,6 +586,7 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             annotate_reactions,
+            annotate_replies,
             apply_display_rules,
             feed,
             following,
@@ -386,7 +611,9 @@ class WebBridge:
                         feed(conn, author=target, limit=limit, posts_only=True)
                     )
                 )
-                posts = annotate_reactions(conn, posts, viewer=viewer)
+                posts = annotate_replies(
+                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                )
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
             else:
@@ -444,11 +671,19 @@ class WebBridge:
             items = list(self._tan_posts)
         return items[-limit:] if limit >= 0 else items
 
-    def tan_post(self, text: str) -> Dict[str, Any]:
+    def tan_post(self, text: str, *, reply_to: Optional[str] = None) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
-        return app.create_post(text, publish=True)
+        if reply_to is not None:
+            conn = self._tan_conn()
+            try:
+                from .tangents.tan import resolve_post
+
+                reply_to = resolve_post(conn, reply_to)["hash"]
+            finally:
+                conn.close()
+        return app.create_post(text, reply_to=reply_to, publish=True)
 
     def tan_react(self, target: str, *, liked: bool) -> Dict[str, Any]:
         app = self._tan_app()
@@ -495,21 +730,50 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        # Normalise up front so the recorded text is exactly what gets sent
+        # (and is always UTF-8 encodable for the history file): the node
+        # normalises again before sending, so this cannot change delivery.
+        text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        # The send lock is NOT held across the network send: queueing
+        # starts a flush thread that can deliver the entry (and report
+        # it via record_delivery) before the record below exists, and
+        # holding the lock across network I/O would stall every other
+        # delivery report behind this send. Instead, record_delivery
+        # buffers a report that beats the record, and the append below
+        # reconciles it.
         response = self.node.send_message(peer, text, timeout=timeout)
         queued = bool(response.get("queued"))
-        message = self._append_message(
-            direction="out",
-            peer=peer.hexhash,
-            peer_name=peer.display_name,
-            text=text,
-            sent_at=time.time(),
-            received_at=time.time(),
-            status="queued" if queued else "delivered",
-            rtt=_as_float(response.get("_rtt")),
-        )
+        # The outbox id links this record to a later delivery; only
+        # present while the message is queued.
+        mail_id = response.get("id") if queued else None
+        flipped = False
+        with self._send_lock:
+            message = self._append_message(
+                direction="out",
+                peer=peer.hexhash,
+                peer_name=peer.display_name,
+                text=text,
+                sent_at=time.time(),
+                received_at=time.time(),
+                status="queued" if queued else "delivered",
+                rtt=_as_float(response.get("_rtt")),
+                mail_id=mail_id,
+            )
+            if mail_id is not None:
+                with self._lock:
+                    if mail_id in self._early_deliveries:
+                        del self._early_deliveries[mail_id]
+                        message["status"] = "delivered"
+                        flipped = True
+                if flipped:
+                    self._save_messages()
         self.bus.publish({"type": "message", "message": message})
+        if flipped:
+            self.bus.publish(
+                {"type": "message_updated", "message": dict(message)}
+            )
         return message, response
 
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
@@ -579,6 +843,7 @@ class WebBridge:
         received_at: float,
         status: str,
         rtt: Optional[float] = None,
+        mail_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -593,8 +858,11 @@ class WebBridge:
             }
             if rtt is not None:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
+            if mail_id is not None:
+                message["mail_id"] = mail_id
             self._next_message_id += 1
             self._messages.append(message)
+        self._save_messages()
         return message
 
     # -- static files ------------------------------------------------------
@@ -772,8 +1040,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                reply_to = body.get("reply_to")
+                if reply_to is not None and (
+                    not isinstance(reply_to, str) or not reply_to.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'reply_to' must be a post hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
                 try:
-                    post = self.bridge.tan_post(text)
+                    post = self.bridge.tan_post(text, reply_to=reply_to)
                 except (ValueError, ProtocolError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
