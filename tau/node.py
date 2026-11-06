@@ -830,7 +830,7 @@ class TauNode:
             self._mail_pending.add(peer.hexhash)
             return
         try:
-            self._flush_peer(peer, _MAIL_REQUEST_TIMEOUT)
+            self._flush_peer(peer, _MAIL_REQUEST_TIMEOUT, respect_backoff=False)
             self._collect_mail(peer, _MAIL_REQUEST_TIMEOUT)
         except Exception:  # pragma: no cover - network dependent
             log.debug("Mail round for %s failed", peer.hexhash, exc_info=True)
@@ -838,13 +838,20 @@ class TauNode:
             self._mail_lock.release()
 
     def flush_outbox(
-        self, *, timeout: float = _MAIL_REQUEST_TIMEOUT, max_peers: Optional[int] = None
+        self,
+        *,
+        timeout: float = _MAIL_REQUEST_TIMEOUT,
+        max_peers: Optional[int] = None,
+        respect_backoff: bool = True,
     ) -> Dict[str, int]:
         """Try to move queued mail: direct delivery, deposits, collection.
 
         Returns a summary with ``delivered``, ``deposited`` and
         ``received`` counts.  Safe to call any time the node is running;
-        concurrent rounds are skipped rather than queued up.
+        concurrent rounds are skipped rather than queued up.  With
+        ``respect_backoff`` (the default) entries whose delivery backoff
+        has not elapsed are left for a later round; pass ``False`` when
+        the caller has fresh evidence the peer is reachable (an announce).
         """
         summary = {"delivered": 0, "deposited": 0, "received": 0}
         if not self.started:
@@ -863,7 +870,9 @@ class TauNode:
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
-                moved = self._flush_peer(peer, timeout)
+                moved = self._flush_peer(
+                    peer, timeout, respect_backoff=respect_backoff
+                )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
                 summary["received"] += self._collect_mail(peer, timeout)
@@ -871,17 +880,23 @@ class TauNode:
             self._mail_lock.release()
         return summary
 
-    def _flush_peer(self, peer: Peer, timeout: float) -> Dict[str, int]:
+    def _flush_peer(
+        self, peer: Peer, timeout: float, *, respect_backoff: bool = True
+    ) -> Dict[str, int]:
         moved = {"delivered": 0, "deposited": 0}
+        if respect_backoff:
+            due = self.mailbox.due_outbox(to=peer.destination_hash)
+        else:
+            due = self.mailbox.outbox_list(to=peer.destination_hash)
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
-            for entry in self.mailbox.outbox_list(to=peer.destination_hash):
+            for entry in due:
                 if self._deliver_entry(peer, entry, timeout):
                     moved["delivered"] += 1
             return moved
 
-        for entry in self.mailbox.outbox_list(to=peer.destination_hash):
+        for entry in due:
             if self._deliver_entry(peer, entry, timeout):
                 moved["delivered"] += 1
 

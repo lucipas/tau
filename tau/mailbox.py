@@ -7,7 +7,9 @@ the node's data directory holding three collections:
 ``outbox``
     Messages this node owes a peer that was unreachable when they were
     sent.  Entries are retried whenever the peer is heard from again and
-    expire after a TTL.
+    expire after a TTL.  Failed attempts back off exponentially (60s,
+    doubling, capped at an hour), so a dead peer does not cost a link
+    attempt on every sweep; a peer (re)announcing bypasses the wait.
 ``held``
     Sealed envelopes other nodes asked this node to hold for a third
     peer.  An envelope is encrypted to the recipient and signed by the
@@ -64,6 +66,12 @@ MAX_HELD_PER_RECIPIENT = 64
 MAX_SEEN = 1024
 MAX_HOLDERS_PER_MESSAGE = 3
 
+# Direct-delivery retry pacing: after a failed attempt, wait 60s, then
+# double after each further failure, up to an hour.  An announce from the
+# recipient bypasses the wait (see TauNode._mail_round_for_peer).
+DELIVERY_BACKOFF_BASE_SECONDS = 60.0
+DELIVERY_BACKOFF_MAX_SECONDS = 3600.0
+
 _DESTINATION_BYTES = 16
 _PUBLIC_KEY_BYTES = 64
 
@@ -95,6 +103,29 @@ class OutboxEntry:
     def to_hex(self) -> str:
         return self.to.hex()
 
+    @property
+    def next_attempt_at(self) -> Optional[float]:
+        """Earliest time this entry may be attempted again.
+
+        ``None`` when the entry has never been attempted (always due).
+        Otherwise the last attempt plus an exponential backoff — 60s
+        after the first failure, doubling per failure, capped at an hour.
+        """
+        if self.attempts <= 0 or self.last_attempt_at is None:
+            return None
+        delay = min(
+            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** (self.attempts - 1)),
+            DELIVERY_BACKOFF_MAX_SECONDS,
+        )
+        return self.last_attempt_at + delay
+
+    def is_due(self, now: Optional[float] = None) -> bool:
+        """True when the entry may be attempted at *now* (default: now)."""
+        target = self.next_attempt_at
+        if target is None:
+            return True
+        return (now if now is not None else time.time()) >= target
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -106,6 +137,7 @@ class OutboxEntry:
             "attempts": self.attempts,
             "last_attempt_at": self.last_attempt_at,
             "last_error": self.last_error,
+            "next_attempt_at": self.next_attempt_at,
             "held_by": dict(self.held_by),
         }
 
@@ -409,6 +441,15 @@ class Mailbox:
             entries = [e for e in entries if e.to == to]
         entries.sort(key=lambda e: e.created_at)
         return entries
+
+    def due_outbox(
+        self, to: Optional[bytes] = None, *, now: Optional[float] = None
+    ) -> List[OutboxEntry]:
+        """Outbox entries whose delivery backoff has elapsed, oldest first."""
+        timestamp = now if now is not None else time.time()
+        return [
+            entry for entry in self.outbox_list(to=to) if entry.is_due(timestamp)
+        ]
 
     def remove_outbox(self, message_id: str) -> bool:
         with self._transaction():

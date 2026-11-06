@@ -218,7 +218,9 @@ def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):
     )
 
     contacted = []
-    node._flush_peer = lambda peer, timeout: contacted.append(peer.name) or {
+    node._flush_peer = lambda peer, timeout, **kwargs: contacted.append(
+        peer.name
+    ) or {
         "delivered": 0,
         "deposited": 0,
     }
@@ -227,6 +229,49 @@ def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):
 
     node.flush_outbox(max_peers=2)
     assert contacted == ["peer0", "peer3"]
+
+
+def test_flush_outbox_respects_delivery_backoff(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    identity = RNS.Identity()
+    peer = Peer(
+        destination_hash=destination_hash(identity),
+        name="peer0",
+        public_key=identity.get_public_key(),
+        first_seen=0.0,
+        last_seen=0.0,
+    )
+    node.registry._peers[peer.destination_hash] = peer
+    now = time.time()
+    due = node.mailbox.enqueue(to=peer.destination_hash, text="due", now=now)
+    waiting = node.mailbox.enqueue(
+        to=peer.destination_hash, text="waiting", now=now
+    )
+    node.mailbox.record_attempt(waiting.id, error="no path", now=now)
+
+    attempted = []
+
+    def deliver(p, entry, timeout):
+        # Mirror the real _deliver_entry: success removes the entry.
+        attempted.append(entry.id)
+        node.mailbox.remove_outbox(entry.id)
+        return True
+
+    node._deliver_entry = deliver
+    node._collect_mail = lambda peer, timeout: 0
+    node._process_local_held = lambda: 0
+
+    # The periodic sweep only attempts entries whose backoff has elapsed.
+    summary = node.flush_outbox()
+    assert attempted == [due.id]
+    assert summary["delivered"] == 1
+
+    # An announce-triggered round is fresh evidence the peer is reachable,
+    # so it bypasses the backoff and retries the waiting entry too.
+    attempted.clear()
+    node._mail_round_for_peer(peer)
+    assert attempted == [waiting.id]
 
 
 def test_busy_mail_round_is_queued_not_dropped(tmp_path):
