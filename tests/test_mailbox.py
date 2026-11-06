@@ -118,6 +118,25 @@ def test_delivery_backoff_schedule(tmp_path):
     assert stored.to_dict()["next_attempt_at"] == 2000.0 + 3600.0
 
 
+def test_delivery_backoff_survives_large_attempt_count(tmp_path):
+    # Entries that accumulated thousands of attempts under the old fixed
+    # retry interval must still load, schedule and serialize.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="long offline", now=1000.0)
+    box.record_attempt(entry.id, error="no path", now=2000.0)
+    raw = json.loads(path.read_text())
+    for item in raw["outbox"]:
+        item["attempts"] = 5000
+    path.write_text(json.dumps(raw))
+
+    reloaded = Mailbox(path)
+    stored = reloaded.get_outbox(entry.id)
+    assert stored.next_attempt_at == 2000.0 + 3600.0
+    assert stored.to_dict()["next_attempt_at"] == 2000.0 + 3600.0
+    assert [e.id for e in reloaded.due_outbox(now=5600.0)] == [entry.id]
+
+
 def test_due_outbox_filters_backed_off_entries(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     due = box.enqueue(to=BOB, text="due", now=1000.0)

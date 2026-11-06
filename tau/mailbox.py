@@ -113,8 +113,14 @@ class OutboxEntry:
         """
         if self.attempts <= 0 or self.last_attempt_at is None:
             return None
+        # Clamp the exponent before exponentiating: an entry that
+        # accumulated attempts under the old fixed retry interval can
+        # carry a huge stored count, and 2 ** attempts would overflow
+        # before the cap below could apply.  60s * 2**6 already exceeds
+        # the one-hour cap, so anything larger is indistinguishable.
+        exponent = min(self.attempts - 1, 6)
         delay = min(
-            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** (self.attempts - 1)),
+            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** exponent),
             DELIVERY_BACKOFF_MAX_SECONDS,
         )
         return self.last_attempt_at + delay

@@ -862,10 +862,16 @@ class TauNode:
             self.mailbox.prune()
             summary["received"] += self._process_local_held()
             peers = self.registry.all()
-            # Peers we owe mail to go first (stable sort keeps the
+            # Peers we owe due mail to go first (stable sort keeps the
             # registry's most-recently-seen order inside each group), so
             # a capped sweep still spends its budget on actual delivery.
-            targets = {entry.to for entry in self.mailbox.outbox_list()}
+            # Backed-off recipients fall in with the rest: they still get
+            # visited for deposits and collection when slots remain.
+            # A backoff-ignoring round ranks every owed recipient first.
+            if respect_backoff:
+                targets = {entry.to for entry in self.mailbox.due_outbox()}
+            else:
+                targets = {entry.to for entry in self.mailbox.outbox_list()}
             peers.sort(key=lambda p: p.destination_hash not in targets)
             if max_peers is not None:
                 peers = peers[:max_peers]
