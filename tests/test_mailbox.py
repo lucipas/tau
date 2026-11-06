@@ -61,6 +61,123 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     assert box.counts()["outbox"] == 1
 
 
+def test_load_dedupes_duplicate_message_ids(tmp_path):
+    """A mailbox.json with duplicate ids keeps the newest copy of each
+    and is rewritten on load, so the duplicates do not survive a
+    restart."""
+    path = tmp_path / "mailbox.json"
+    payload = {
+        "version": 1,
+        "outbox": [
+            {
+                "id": "dup-id",
+                "to": BOB.hex(),
+                "text": "newer copy",
+                "created_at": 2000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "dup-id",
+                "to": BOB.hex(),
+                "text": "older copy",
+                "created_at": 1000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "other-id",
+                "to": ALICE.hex(),
+                "text": "untouched",
+                "created_at": 1500.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "held": [
+            {
+                "id": "held-dup",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"newer envelope").decode("ascii"),
+                "stored_at": 3000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "held-dup",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"older envelope").decode("ascii"),
+                "stored_at": 2500.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "seen": {},
+        "pending_acks": {"holder-hash": ["mid-1", "mid-1", "mid-2"]},
+        "dropped_held": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    box = Mailbox(path)
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0}
+    kept = box.get_outbox("dup-id")
+    assert kept is not None
+    assert kept.text == "newer copy"
+    assert kept.created_at == 2000.0
+    held = box.held_for(ALICE)
+    assert len(held) == 1
+    assert held[0].blob == b"newer envelope"
+
+    # The file itself was rewritten without the duplicates.
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert len(reloaded["outbox"]) == 2
+    assert len(reloaded["held"]) == 1
+    assert reloaded["pending_acks"]["holder-hash"] == ["mid-1", "mid-2"]
+
+    # The load report counts what was dropped; a clean file drops none.
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert box.load() == {"outbox": 1, "held": 1, "pending_acks": 1}
+    assert box.load() == {"outbox": 0, "held": 0, "pending_acks": 0}
+
+
+def test_load_skips_nonfinite_timestamps(tmp_path):
+    """NaN / infinite timestamps never parse: a corrupt copy cannot
+    replace a newer valid entry in the newest-wins comparison."""
+    path = tmp_path / "mailbox.json"
+    payload = {
+        "version": 1,
+        "outbox": [
+            {
+                "id": "nan-created",
+                "to": BOB.hex(),
+                "text": "bad timestamp",
+                "created_at": float("nan"),
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "good-id",
+                "to": BOB.hex(),
+                "text": "good",
+                "created_at": 1000.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "held": [
+            {
+                "id": "inf-stored",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"bad").decode("ascii"),
+                "stored_at": float("inf"),
+                "expires_at": 9000.0,
+            },
+        ],
+        "seen": {},
+        "pending_acks": {},
+        "dropped_held": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    box = Mailbox(path)
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0}
+    assert box.get_outbox("nan-created") is None
+    assert box.get_outbox("good-id") is not None
+
+
 def test_enqueue_rejects_bad_destination(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError):
