@@ -90,6 +90,62 @@ def test_attempts_and_deposits_are_recorded(tmp_path):
     assert box.remove_outbox(entry.id) is False
 
 
+def test_delivery_backoff_schedule(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(to=BOB, text="back off", now=1000.0)
+    assert entry.next_attempt_at is None
+    assert entry.is_due(now=1000.0) is True
+    box.record_attempt(entry.id, error="no path", now=1000.0)
+    stored = box.get_outbox(entry.id)
+    assert stored.attempts == 1
+    assert stored.next_attempt_at == 1060.0
+    assert stored.is_due(now=1059.0) is False
+    assert stored.is_due(now=1060.0) is True
+    # Delay doubles after each failure, capped at an hour.
+    for attempt, delay in (
+        (2, 120.0),
+        (3, 240.0),
+        (4, 480.0),
+        (5, 960.0),
+        (6, 1920.0),
+        (7, 3600.0),
+        (8, 3600.0),
+    ):
+        box.record_attempt(entry.id, error="no path", now=2000.0)
+        stored = box.get_outbox(entry.id)
+        assert stored.attempts == attempt
+        assert stored.next_attempt_at == 2000.0 + delay
+    assert stored.to_dict()["next_attempt_at"] == 2000.0 + 3600.0
+
+
+def test_delivery_backoff_survives_large_attempt_count(tmp_path):
+    # Entries that accumulated thousands of attempts under the old fixed
+    # retry interval must still load, schedule and serialize.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="long offline", now=1000.0)
+    box.record_attempt(entry.id, error="no path", now=2000.0)
+    raw = json.loads(path.read_text())
+    for item in raw["outbox"]:
+        item["attempts"] = 5000
+    path.write_text(json.dumps(raw))
+
+    reloaded = Mailbox(path)
+    stored = reloaded.get_outbox(entry.id)
+    assert stored.next_attempt_at == 2000.0 + 3600.0
+    assert stored.to_dict()["next_attempt_at"] == 2000.0 + 3600.0
+    assert [e.id for e in reloaded.due_outbox(now=5600.0)] == [entry.id]
+
+
+def test_due_outbox_filters_backed_off_entries(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    due = box.enqueue(to=BOB, text="due", now=1000.0)
+    waiting = box.enqueue(to=BOB, text="waiting", now=1000.0)
+    box.record_attempt(waiting.id, error="no path", now=1000.0)
+    assert [e.id for e in box.due_outbox(now=1010.0)] == [due.id]
+    assert [e.id for e in box.due_outbox(now=1060.0)] == [due.id, waiting.id]
+
+
 # -- held envelopes ------------------------------------------------------------
 
 

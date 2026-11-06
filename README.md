@@ -370,8 +370,12 @@ and acks them so holders can drop their copies. Every message carries a
 unique id, and each node remembers ids it has already shown, so direct,
 retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
-recipient) and everything expires. `tau outbox` shows what is waiting;
-`tau send --no-queue` restores the old fail-fast behaviour.
+recipient) and everything expires. Failed delivery attempts back off
+exponentially (60s, doubling, capped at an hour), so an unreachable peer
+does not cost a link attempt on every sweep; a peer announcing itself
+retries immediately. `tau outbox` shows what is waiting, including the
+next retry time; `tau send --no-queue` restores the old fail-fast
+behaviour.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

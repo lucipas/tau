@@ -1603,11 +1603,16 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print("Outbox is empty — nothing waiting on offline peers.")
         else:
             now = time.time()
-            header = ("ID", "TO", "NAME", "AGE", "TRIES", "EXPIRES IN")
+            header = ("ID", "TO", "NAME", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
             rows: List[tuple] = [header]
             for entry in entries:
                 peer = registry.get(entry.to)
                 name = peer.display_name if peer is not None else entry.to_name
+                next_try = entry.next_attempt_at
+                if next_try is None or next_try <= now:
+                    next_try_text = "now"
+                else:
+                    next_try_text = f"in {_ago(next_try - now)}"
                 rows.append(
                     (
                         entry.id[:8],
@@ -1615,6 +1620,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                         name or "-",
                         _ago(now - entry.created_at),
                         str(entry.attempts),
+                        next_try_text,
                         _ago(entry.expires_at - now),
                     )
                 )
