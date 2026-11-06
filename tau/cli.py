@@ -58,6 +58,7 @@ from .tangents.tan import (
     resolve_author,
     resolve_delete_target,
     resolve_post,
+    search_posts,
     timeline,
     unfollow,
 )
@@ -548,6 +549,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_timeline.set_defaults(func=cmd_tan_timeline)
 
+    tan_search = tan_sub.add_parser(
+        "search",
+        parents=[common],
+        help="search stored posts by keyword",
+    )
+    tan_search.add_argument("query", metavar="TEXT", help="text to search for")
+    tan_search.add_argument(
+        "--author", metavar="NAME|HASH", help="search one author's posts"
+    )
+    tan_search.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_search.set_defaults(func=cmd_tan_search)
+
     tan_follow = tan_sub.add_parser(
         "follow", parents=[common], help="follow a peer or author"
     )
@@ -900,12 +919,17 @@ def _default_web_dir() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
-def _print_tan_posts(posts: Sequence[Dict[str, Any]], *, json_output: bool) -> None:
+def _print_tan_posts(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+    empty_message: str = "No posts yet. Try `tau tan post \"hello\"` or `tau tan sync --explore`.",
+) -> None:
     if json_output:
         _emit({"posts": list(posts), "count": len(posts)}, True)
         return
     if not posts:
-        print("No posts yet. Try `tau tan post \"hello\"` or `tau tan sync --explore`.")
+        print(empty_message)
         return
     for post in posts:
         name = post.get("name") or "anonymous"
@@ -1174,6 +1198,40 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
         display_ruleset = Ruleset()
     posts = apply_display_rules(posts, display_ruleset)
     _print_tan_posts(posts, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_search(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        author = None
+        if getattr(args, "author", None):
+            author, _ = resolve_author(
+                conn, args.author, registry=PeerRegistry(config.peers_path)
+            )
+        posts = search_posts(
+            conn,
+            args.query,
+            author=author,
+            limit=args.limit,
+            viewer=viewer,
+        )
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_tan_posts(
+        posts,
+        json_output=json_output,
+        empty_message=f"No stored posts match {args.query!r}.",
+    )
     return _EXIT_OK
 
 

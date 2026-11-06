@@ -198,6 +198,10 @@ tau tan post --to alice "direct delivery"
 tau tan timeline --all
 tau tan timeline --author alice
 
+# Search stored posts by keyword (local only, newest first)
+tau tan search mesh --limit 10
+tau tan search mesh --author alice
+
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
@@ -250,6 +254,7 @@ Global options may appear before or after the command:
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
