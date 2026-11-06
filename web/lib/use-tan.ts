@@ -111,6 +111,14 @@ export function useTan() {
     [all, load],
   );
 
+  const deletePost = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/delete", { target });
+      await load(all);
+    },
+    [all, load],
+  );
+
   const sync = useCallback(async () => {
     setSyncing(true);
     try {
@@ -139,6 +147,7 @@ export function useTan() {
     unfollow,
     like,
     unlike,
+    deletePost,
     sync,
   };
 }

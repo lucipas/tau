@@ -205,7 +205,8 @@ public-feed oriented: there are no private posts, likes or comments yet. An
 author can delete one of their own posts with `tau tan delete <post>` — the
 delete is a signed entry on the author's chain, so it propagates to peers
 and the post disappears from timelines (the entry itself stays stored,
-keeping chains verifiable). The local database is `<data-dir>/tan.sqlite3`.
+keeping chains verifiable). In the web console your own posts show a delete
+button that calls the same endpoint. The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 

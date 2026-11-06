@@ -51,6 +51,15 @@ export function SocialConsole() {
     }
   }
 
+  async function submitDelete(post: TanPost) {
+    setError(null);
+    try {
+      await tan.deletePost(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not delete");
+    }
+  }
+
   async function submitSync() {
     setError(null);
     setMessage(null);
@@ -238,7 +247,12 @@ export function SocialConsole() {
                   <EmptyState />
                 ) : (
                   tan.posts.map((post) => (
-                    <PostCard key={post.hash} post={post} onToggleLike={toggleLike} />
+                    <PostCard
+                      key={post.hash}
+                      post={post}
+                      onToggleLike={toggleLike}
+                      onDelete={submitDelete}
+                    />
                   ))
                 )}
               </div>
@@ -318,11 +332,14 @@ function EmptyState() {
 function PostCard({
   post,
   onToggleLike,
+  onDelete,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onDelete: (post: TanPost) => void;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
+  const [confirming, setConfirming] = useState(false);
   return (
     <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
       <div className="flex items-start gap-3">
@@ -363,6 +380,40 @@ function PostCard({
             >
               ♥ {post.likes ?? 0}
             </button>
+            {post.own ? (
+              confirming ? (
+                <span className="inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirming(false);
+                      onDelete(post);
+                    }}
+                    title="Delete this post"
+                    className="rounded border border-rose-400/40 bg-rose-400/10 px-1.5 py-0.5 text-rose-300 transition-colors hover:bg-rose-400/20"
+                  >
+                    confirm delete
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirming(false)}
+                    title="Keep this post"
+                    className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100"
+                  >
+                    keep
+                  </button>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirming(true)}
+                  title="Delete this post"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-rose-400/40 hover:text-rose-300"
+                >
+                  delete
+                </button>
+              )
+            ) : null}
           </div>
         </div>
       </div>
