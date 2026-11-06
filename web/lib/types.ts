@@ -10,6 +10,8 @@ export interface TauMessage {
   received_at: number;
   status: string;
   rtt_ms?: number;
+  // Outbox entry id, present while the message is queued for delivery.
+  mail_id?: string;
 }
 
 export interface Peer {
@@ -98,6 +100,14 @@ export interface ApiErrorBody {
 }
 
 
+export interface TanReplyParent {
+  hash: string;
+  author: string;
+  name: string;
+  text: string;
+  deleted: boolean;
+}
+
 export interface TanPost {
   v: number;
   author: string;
@@ -110,8 +120,10 @@ export interface TanPost {
   sig: string;
   kind?: string;
   target?: string;
+  reply_to?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  own?: boolean;
 }
 
 export interface TanFollow {
