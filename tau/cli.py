@@ -242,6 +242,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="periodically pull the Tan feed from peers (0 disables)",
     )
+    serve.add_argument(
+        "--lxmf",
+        action="store_true",
+        help=(
+            "also run an LXMF router on this node's identity "
+            "(requires the lxmf extra: pip install \"tau-p2p[lxmf]\")"
+        ),
+    )
     serve.set_defaults(func=cmd_serve)
 
     discover = subparsers.add_parser(
@@ -1742,7 +1750,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc
     node.start(
-        announce=not getattr(args, "no_announce", False), exclusive=True
+        announce=not getattr(args, "no_announce", False),
+        exclusive=True,
+        lxmf=bool(getattr(args, "lxmf", False)),
     )
 
     social_app = None
@@ -1841,6 +1851,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f'tau node "{info["name"]}" ready', flush=True)
         print(f"  destination: {info['destination']}")
         print(f"  rns:         {info['rns_version']}")
+        lxmf_info = info.get("lxmf") or {}
+        if lxmf_info.get("enabled"):
+            print(f"  lxmf:        delivery {lxmf_info.get('delivery')}")
         print(f"  data dir:    {config.data_dir}")
         mailbox_counts = info.get("mailbox") or {}
         if mailbox_counts.get("outbox") or mailbox_counts.get("held"):

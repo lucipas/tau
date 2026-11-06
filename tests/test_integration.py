@@ -194,7 +194,9 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
             server.wait(timeout=5)
 
 
-def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path):
+def start_serve(
+    data_dir: Path, stdout_path: Path, stderr_path: Path, *extra: str
+):
     env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}
     stdout_file = stdout_path.open("w", encoding="utf-8")
     stderr_file = stderr_path.open("w", encoding="utf-8")
@@ -209,6 +211,7 @@ def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path):
             "--announce-interval",
             "1",
             "--json",
+            *extra,
         ],
         cwd=str(ROOT),
         env=env,
@@ -862,3 +865,61 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "ready" not in result.stdout
     finally:
         stop_process(alice)
+
+
+def test_serve_with_lxmf_runs_router(tmp_path: Path) -> None:
+    """`tau serve --lxmf` runs a real LXMRouter and exits cleanly.
+
+    The router's delivery destination is registered (its ratchet store
+    appears under the data dir), the ready event reports the LXMF
+    delivery address, and SIGTERM shuts the serve down with exit code 0
+    and no traceback — the router's exit handler runs before Reticulum
+    exits.
+    """
+    pytest.importorskip("LXMF")
+    port = free_port()
+    data_dir = tmp_path / "lxmf-node"
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(data_dir),
+            "--name",
+            "lxmf-node",
+            "--tcp-listen",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+    stdout_path = tmp_path / "serve.out"
+    stderr_path = tmp_path / "serve.err"
+    process = start_serve(
+        data_dir, stdout_path, stderr_path, "--lxmf", "--duration", "60"
+    )
+    try:
+        assert wait_for_text(stdout_path, '"ready"', timeout=60), (
+            stderr_path.read_text(encoding="utf-8")
+            if stderr_path.exists()
+            else "serve produced no output"
+        )
+        assert process.poll() is None, stderr_path.read_text(encoding="utf-8")
+        deadline = time.time() + 60
+        ratchets = data_dir / "lxmf" / "ratchets"
+        while not ratchets.is_dir():
+            if time.time() > deadline:
+                pytest.fail(
+                    "LXMF router storage never appeared; "
+                    f"stderr:\n{stderr_path.read_text(encoding='utf-8')}"
+                )
+            time.sleep(0.5)
+        ready = json.loads(stdout_path.read_text(encoding="utf-8").splitlines()[0])
+        lxmf_info = ready["node"]["lxmf"]
+        assert lxmf_info["enabled"] is True
+        # A 16-byte destination hash, hex-encoded.
+        assert isinstance(lxmf_info["delivery"], str)
+        assert len(lxmf_info["delivery"]) == 32
+    finally:
+        stop_process(process)
+    assert process.returncode == 0, stderr_path.read_text(encoding="utf-8")
+    assert "Traceback" not in stderr_path.read_text(encoding="utf-8")
