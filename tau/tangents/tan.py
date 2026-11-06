@@ -1085,7 +1085,7 @@ def import_entries(
             digest = str(entry.get("hash") or "")
         try:
             _, is_new = store_post(conn, entry, verify=True)
-        except (TanError, TypeError, AttributeError) as exc:
+        except (TanError, ProtocolError, TypeError, AttributeError, OverflowError) as exc:
             skipped += 1
             errors.append({"hash": digest, "error": str(exc)})
             continue
