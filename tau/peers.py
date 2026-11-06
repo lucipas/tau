@@ -46,6 +46,10 @@ class Peer:
     hops: int = 0
     protocol: int = PROTOCOL_VERSION
     caps: Tuple[str, ...] = field(default_factory=tuple)
+    # True while the peer was learned only from another peer's exchange and
+    # never heard directly.  Its reported liveness is second-hand, so mail
+    # sweeps rank directly heard peers ahead of it.
+    via_exchange: bool = False
 
     @property
     def hexhash(self) -> str:
@@ -68,6 +72,7 @@ class Peer:
             "hops": self.hops,
             "protocol": self.protocol,
             "caps": list(self.caps),
+            "via_exchange": self.via_exchange,
         }
 
     @classmethod
@@ -110,6 +115,7 @@ class Peer:
             hops=hops,
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
+            via_exchange=raw.get("via_exchange") is True,
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -249,6 +255,7 @@ class PeerRegistry:
                 if clean_name != "unknown" or existing.name == "unknown":
                     existing.name = clean_name
                 existing.public_key = public_key
+                existing.via_exchange = False
                 existing.last_seen = max(existing.last_seen, timestamp)
                 existing.hops = max(0, int(hops))
                 existing.protocol = int(protocol) or existing.protocol
@@ -301,11 +308,18 @@ class PeerRegistry:
         with self._lock:
             self._peers.clear()
 
-    def _enforce_limit(self) -> None:
+    def _enforce_limit(self, keep: Iterable[bytes] = ()) -> None:
         if len(self._peers) <= self.max_peers:
             return
-        oldest = sorted(self._peers.values(), key=lambda p: p.last_seen)
-        for peer in oldest[: len(self._peers) - self.max_peers]:
+        keep_set = set(keep)
+        excess = len(self._peers) - self.max_peers
+        # Peers in *keep* (e.g. holders of queued mail) are never evicted;
+        # the registry may briefly exceed the cap rather than lose them.
+        candidates = sorted(
+            (p for p in self._peers.values() if p.destination_hash not in keep_set),
+            key=lambda p: p.last_seen,
+        )
+        for peer in candidates[:excess]:
             del self._peers[peer.destination_hash]
 
     def load(self) -> None:
@@ -374,6 +388,7 @@ class PeerRegistry:
         *,
         now: Optional[float] = None,
         self_hash: Optional[Union[bytes, str]] = None,
+        keep: Iterable[bytes] = (),
     ) -> Dict[str, int]:
         """Merge peer descriptions learned from another peer.
 
@@ -460,10 +475,11 @@ class PeerRegistry:
                         last_seen=last_seen,
                         hops=hops,
                         protocol=protocol,
+                        via_exchange=True,
                     )
                     added += 1
                 elif existing.name == "unknown" and name != "unknown":
                     existing.name = name
                     updated += 1
-            self._enforce_limit()
+            self._enforce_limit(keep=keep)
         return {"added": added, "updated": updated, "skipped": skipped}
