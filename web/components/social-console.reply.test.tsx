@@ -37,7 +37,7 @@ describe("PostCard reply display", () => {
       },
     });
     render(
-      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} />,
+      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />,
     );
 
     // The author name appears twice (header + parent line), so assert
@@ -61,7 +61,7 @@ describe("PostCard reply display", () => {
       },
     });
     render(
-      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} />,
+      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />,
     );
 
     expect(screen.getByText(/a deleted post/)).toBeTruthy();
@@ -75,7 +75,7 @@ describe("PostCard reply display", () => {
       reply_to: null,
     });
     render(
-      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} />,
+      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />,
     );
 
     expect(screen.getByText(/in reply to/)).toBeTruthy();
@@ -86,7 +86,7 @@ describe("PostCard reply display", () => {
     const post = makePost();
     const onReply = vi.fn();
     render(
-      <PostCard post={post} onToggleLike={() => {}} onReply={onReply} />,
+      <PostCard post={post} onToggleLike={() => {}} onReply={onReply} onDelete={() => {}} deleting={false} />,
     );
 
     fireEvent.click(screen.getByTitle("Reply to this post"));
@@ -100,6 +100,8 @@ describe("PostCard reply display", () => {
         post={makePost()}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
       />,
     );
 
