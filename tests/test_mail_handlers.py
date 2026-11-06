@@ -280,7 +280,12 @@ def test_inbox_failure_does_not_break_delivery(tmp_path, monkeypatch):
 def test_flush_outbox_is_a_noop_until_started(tmp_path):
     node = make_node(tmp_path)
     node.mailbox.enqueue(to=b"\x01" * 16, text="waiting")
-    assert node.flush_outbox() == {"delivered": 0, "deposited": 0, "received": 0}
+    assert node.flush_outbox() == {
+        "delivered": 0,
+        "deposited": 0,
+        "received": 0,
+        "lock_busy": False,
+    }
 
 
 def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):

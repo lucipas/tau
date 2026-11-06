@@ -344,6 +344,90 @@ def test_store_and_forward_delivers_when_peer_returns(tmp_path: Path) -> None:
     assert outbox["count"] == 0
 
 
+def test_outbox_retry_delivers_when_peer_returns(tmp_path: Path) -> None:
+    """`tau outbox retry` forces delivery past backoff (issue #65).
+
+    Bob queues a message while alice is offline (the failed send records
+    an attempt, so backoff is active), then retries with alice still
+    offline — nothing moves — then retries once alice is back, and the
+    message is delivered without any serving node on bob's side.
+    """
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = init_node(
+        tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{port}"
+    )
+    alice_hash = alice_init["destination"]
+    init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{port}")
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+        discovered = discover_until(bob_dir, alice_hash)
+        assert alice_hash in discovered, alice_err.read_text()
+    finally:
+        stop_process(alice)
+
+    # Alice goes offline. Bob's message must queue, not vanish.
+    sent = run_tau(
+        "send",
+        "--data-dir",
+        str(bob_dir),
+        "--to",
+        alice_hash,
+        "retry me when you are back",
+        "--timeout",
+        "8",
+        "--discover-timeout",
+        "3",
+        "--json",
+        timeout=90.0,
+    )
+    response = json.loads(require_ok(sent))
+    assert response["queued"] is True, response
+
+    def retry_bob() -> dict:
+        return json.loads(
+            require_ok(
+                run_tau(
+                    "outbox",
+                    "retry",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--json",
+                    timeout=90.0,
+                )
+            )
+        )
+
+    # Alice is still offline: the retry attempts delivery (backoff is
+    # ignored) but nothing can move.
+    summary = retry_bob()
+    assert summary["delivered"] == 0, summary
+    assert summary["still_queued"] == 1, summary
+
+    # Alice returns; a one-shot retry from bob delivers the message even
+    # though backoff from the failed send has not elapsed.
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+        summary = retry_bob()
+        assert summary["delivered"] == 1, summary
+        assert summary["still_queued"] == 0, summary
+        assert wait_for_text(alice_out, "retry me when you are back"), (
+            f"alice never received the retried message\n"
+            f"alice err:\n{alice_err.read_text()}"
+        )
+    finally:
+        stop_process(alice)
+
+
 def init_node(tmp_path: Path, name: str, *extra: str) -> dict:
     return json.loads(
         require_ok(

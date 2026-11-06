@@ -342,6 +342,8 @@ class TauNode:
         self._announce_thread: Optional[threading.Thread] = None
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
+        self._mail_round_threads: Set[threading.Thread] = set()
+        self._mail_rounds_lock = threading.Lock()
         self._mail_pending: Set[str] = set()
         self._exchanged_at: Dict[bytes, float] = {}
         self._stop_event = threading.Event()
@@ -387,7 +389,13 @@ class TauNode:
     def started(self) -> bool:
         return self.reticulum is not None
 
-    def start(self, *, announce: bool = True, exclusive: bool = False) -> None:
+    def start(
+        self,
+        *,
+        announce: bool = True,
+        exclusive: bool = False,
+        mail_loop: bool = True,
+    ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
         With ``exclusive`` — used by ``tau serve``, the long-lived
@@ -399,6 +407,10 @@ class TauNode:
         briefly (the mailbox serialises its file across processes).
         Publishing requests the lock and, if it is held, routes the post
         through the running social node instead.
+        With ``mail_loop`` off, no background mail sweep runs: a
+        one-shot command that flushes the outbox itself (``tau outbox
+        retry``) opts out so its own flush cannot lose the mail lock
+        to the loop's first round and silently report nothing moved.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -416,7 +428,7 @@ class TauNode:
             lock.acquire()
             self._instance_lock = lock
         try:
-            self._start(announce=announce)
+            self._start(announce=announce, mail_loop=mail_loop)
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -428,7 +440,7 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool) -> None:
+    def _start(self, *, announce: bool, mail_loop: bool = True) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -485,12 +497,13 @@ class TauNode:
             )
             self._announce_thread.start()
 
-        self._mail_thread = threading.Thread(
-            target=self._mail_loop,
-            name="tau-mail",
-            daemon=True,
-        )
-        self._mail_thread.start()
+        if mail_loop:
+            self._mail_thread = threading.Thread(
+                target=self._mail_loop,
+                name="tau-mail",
+                daemon=True,
+            )
+            self._mail_thread.start()
 
         if announce:
             self.announce()
@@ -620,12 +633,58 @@ class TauNode:
         # A peer (re)appearing is the trigger for store-and-forward: try
         # to hand it anything queued for it, leave sealed copies of other
         # queued mail with it, and collect anything it holds for us.
-        threading.Thread(
-            target=self._mail_round_for_peer,
-            args=(peer,),
+        self._spawn_mail_round(peer)
+
+    def _spawn_mail_round(self, peer: Peer) -> None:
+        """Run a mail round for an announcing peer on its own thread.
+
+        The thread is tracked so a one-shot caller (``tau outbox
+        retry``) can wait for in-flight rounds before reading final
+        mailbox state — otherwise a round that delivers after the
+        caller's own flush is missed from the report.
+        """
+
+        def _run() -> None:
+            try:
+                self._mail_round_for_peer(peer)
+            finally:
+                with self._mail_rounds_lock:
+                    self._mail_round_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=_run,
             name="tau-mail-flush",
             daemon=True,
-        ).start()
+        )
+        with self._mail_rounds_lock:
+            self._mail_round_threads.add(thread)
+        thread.start()
+
+    def wait_for_mail_rounds(self, timeout: float = 30.0) -> bool:
+        """Wait for announce-triggered mail rounds to finish.
+
+        Returns True when no round is in flight.  Rounds spawned while
+        waiting are waited for too, until the budget runs out; False
+        means some round is still running and the caller should treat
+        mailbox state read afterwards as possibly stale.
+        """
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            with self._mail_rounds_lock:
+                rounds = [
+                    thread
+                    for thread in self._mail_round_threads
+                    if thread.is_alive()
+                ]
+            if not rounds:
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            for thread in rounds:
+                thread.join(timeout=remaining)
+                if deadline - time.time() <= 0:
+                    break
 
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.
@@ -958,25 +1017,50 @@ class TauNode:
         timeout: float = _MAIL_REQUEST_TIMEOUT,
         max_peers: Optional[int] = None,
         respect_backoff: bool = True,
-    ) -> Dict[str, int]:
+        to: Optional[bytes] = None,
+        message_id: Optional[str] = None,
+        wait_for_lock: float = 0.0,
+    ) -> Dict[str, Any]:
         """Try to move queued mail: direct delivery, deposits, collection.
 
         Returns a summary with ``delivered``, ``deposited`` and
-        ``received`` counts.  Safe to call any time the node is running;
-        concurrent rounds are skipped rather than queued up.  With
-        ``respect_backoff`` (the default) entries whose delivery backoff
-        has not elapsed are left for a later round; pass ``False`` when
-        the caller has fresh evidence the peer is reachable (an announce).
+        ``received`` counts, plus ``lock_busy`` — True when the sweep
+        never ran because the mail lock stayed busy.  Safe to call any
+        time the node is running; concurrent rounds are skipped rather
+        than queued up.  With ``respect_backoff`` (the default) entries
+        whose delivery backoff has not elapsed are left for a later
+        round; pass ``False`` when the caller has fresh evidence the
+        peer is reachable (an announce).  With ``to`` set, only that
+        recipient is contacted — the other queued entries are left for
+        a later round.  With ``message_id`` set, only that entry is
+        attempted and nothing is deposited with the peer.  With
+        ``wait_for_lock`` > 0, wait up to that many seconds for a
+        concurrent mail round to finish instead of skipping the sweep;
+        0 (the default) keeps the skip-when-busy behaviour, which is
+        what the background loop wants.  A one-shot caller that must
+        know the outcome waits; a background round never does.
         """
-        summary = {"delivered": 0, "deposited": 0, "received": 0}
+        summary = {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
         if not self.started:
             return summary
-        if not self._mail_lock.acquire(blocking=False):
+        if wait_for_lock > 0:
+            acquired = self._mail_lock.acquire(timeout=wait_for_lock)
+        else:
+            acquired = self._mail_lock.acquire(blocking=False)
+        if not acquired:
+            summary["lock_busy"] = True
             return summary
         try:
             self.mailbox.prune()
             summary["received"] += self._process_local_held()
             peers = self.registry.all()
+            if to is not None:
+                peers = [p for p in peers if p.destination_hash == to]
             # Peers we owe due mail to go first (stable sort keeps the
             # registry's most-recently-seen order inside each group), so
             # a capped sweep still spends its budget on actual delivery.
@@ -997,7 +1081,10 @@ class TauNode:
                 peers = peers[:max_peers]
             for peer in peers:
                 moved = self._flush_peer(
-                    peer, timeout, respect_backoff=respect_backoff
+                    peer,
+                    timeout,
+                    respect_backoff=respect_backoff,
+                    message_id=message_id,
                 )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
@@ -1007,13 +1094,20 @@ class TauNode:
         return summary
 
     def _flush_peer(
-        self, peer: Peer, timeout: float, *, respect_backoff: bool = True
+        self,
+        peer: Peer,
+        timeout: float,
+        *,
+        respect_backoff: bool = True,
+        message_id: Optional[str] = None,
     ) -> Dict[str, int]:
         moved = {"delivered": 0, "deposited": 0}
         if respect_backoff:
             due = self.mailbox.due_outbox(to=peer.destination_hash)
         else:
             due = self.mailbox.outbox_list(to=peer.destination_hash)
+        if message_id is not None:
+            due = [entry for entry in due if entry.id == message_id]
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
@@ -1029,6 +1123,8 @@ class TauNode:
         now = time.time()
         for entry in self.mailbox.outbox_list():
             if entry.to == peer.destination_hash:
+                continue
+            if message_id is not None and entry.id != message_id:
                 continue
             holders = entry.held_by
             if (
