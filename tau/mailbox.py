@@ -464,7 +464,6 @@ class Mailbox:
             )
         return matches[0]
 
-
     def outbox_list(self, to: Optional[bytes] = None) -> List[OutboxEntry]:
         with self._lock:
             entries = list(self._outbox.values())

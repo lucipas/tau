@@ -7,7 +7,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}``
-    POST /api/ping         measure reachability of a peer
+    GET  /api/outbox       queued mail waiting on offline peers
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -45,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
+from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
@@ -776,6 +778,49 @@ class WebBridge:
             )
         return message, response
 
+    def outbox(self) -> Dict[str, Any]:
+        """Queued mail waiting on offline peers, with recipient names.
+
+        Read under the mailbox transaction so entries queued by a
+        separate process (e.g. a one-shot ``tau send``) are visible
+        instead of the serving process's cached snapshot.
+        """
+        with self.node.mailbox.transaction():
+            entries = [
+                self._describe_outbox_entry(entry)
+                for entry in self.node.mailbox.outbox_list()
+            ]
+            held = self.node.mailbox.counts()["held"]
+        return {"outbox": entries, "count": len(entries), "held_for_others": held}
+
+    def cancel_outbox(self, target: str) -> Dict[str, Any]:
+        """Remove one queued message from the outbox and describe it.
+
+        Cancelling stops this node's future delivery attempts; sealed
+        copies already held by other peers may still be delivered.
+        Resolve and remove happen inside one mailbox transaction, so a
+        cancel cannot miss an entry another process just queued, and a
+        delivery that lands in between is reported instead of silently
+        claimed as cancelled.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        with self.node.mailbox.transaction():
+            entry = self.node.mailbox.resolve_outbox(target.strip())
+            if not self.node.mailbox.remove_outbox(entry.id):
+                # Delivered or expired between resolve and remove.
+                raise MailboxError(
+                    f"queued message {target.strip()!r} is no longer queued"
+                )
+            return self._describe_outbox_entry(entry)
+
+    def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
+        payload = entry.to_dict()
+        peer = self.node.registry.get(entry.to)
+        payload["to_name"] = peer.display_name if peer is not None else entry.to_name
+        payload["held_by"] = sorted(entry.held_by)
+        return payload
+
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.ping(peer, timeout=timeout)
@@ -992,6 +1037,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/outbox":
+                self._send_json(self.bridge.outbox(), head_only)
+                return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 include_all = _query_flag(query, "all")
@@ -1023,6 +1071,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/outbox/cancel":
+                self._handle_outbox_cancel(body, head_only)
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
@@ -1168,6 +1219,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only
         )
+
+    def _handle_outbox_cancel(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            cancelled = self.bridge.cancel_outbox(target.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")
