@@ -231,6 +231,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry |
 | `tau outbox` | List messages queued for offline peers |
+| `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
@@ -365,8 +366,11 @@ and acks them so holders can drop their copies. Every message carries a
 unique id, and each node remembers ids it has already shown, so direct,
 retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
-recipient) and everything expires. `tau outbox` shows what is waiting;
-`tau send --no-queue` restores the old fail-fast behaviour.
+recipient) and everything expires. `tau outbox` shows what is waiting, and
+`tau outbox cancel ID` takes a queued message back — it stops this node's
+future delivery attempts and deposits, but sealed copies already held by
+other peers may still reach the recipient, since the sender cannot recall
+them. `tau send --no-queue` restores the old fail-fast behaviour.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:

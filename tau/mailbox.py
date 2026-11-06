@@ -402,6 +402,31 @@ class Mailbox:
         with self._lock:
             return self._outbox.get(message_id)
 
+    def resolve_outbox(self, ref: str) -> OutboxEntry:
+        """Resolve a full message id or a unique prefix to its outbox entry.
+
+        ``tau outbox`` shows only the first 8 characters of each id, so a
+        short prefix is the usual way to name a queued message.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise MailboxError("message reference must not be empty")
+        value = ref.strip().lower()
+        with self._lock:
+            if len(value) == 32:
+                entry = self._outbox.get(value)
+                if entry is None:
+                    raise MailboxError(f"unknown queued message: {ref!r}")
+                return entry
+            matches = [e for e in self._outbox.values() if e.id.startswith(value)]
+        if not matches:
+            raise MailboxError(f"unknown queued message: {ref!r}")
+        if len(matches) > 1:
+            raise MailboxError(
+                f"{len(matches)} queued messages match prefix {ref!r}"
+            )
+        return matches[0]
+
+
     def outbox_list(self, to: Optional[bytes] = None) -> List[OutboxEntry]:
         with self._lock:
             entries = list(self._outbox.values())

@@ -123,3 +123,89 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+def test_parser_outbox_subcommands():
+    parser = cli.build_parser()
+
+    bare = parser.parse_args(["outbox"])
+    assert bare.command == "outbox"
+    assert bare.outbox_command is None
+    assert bare.func is cli.cmd_outbox
+
+    listed = parser.parse_args(["outbox", "list"])
+    assert listed.outbox_command == "list"
+    assert listed.func is cli.cmd_outbox
+
+    cancelled = parser.parse_args(["outbox", "cancel", "abcdef12"])
+    assert cancelled.outbox_command == "cancel"
+    assert cancelled.target == "abcdef12"
+    assert cancelled.func is cli.cmd_outbox_cancel
+
+
+def _seed_outbox(data_dir):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    first = box.enqueue(
+        to=b"\xbb" * 16, text="wrong peer", message_id="aa" + "11" * 15
+    )
+    second = box.enqueue(
+        to=b"\xbb" * 16, text="keep me", message_id="bb" + "22" * 15
+    )
+    return config, box, first, second
+
+
+def test_outbox_cancel_by_prefix_removes_only_that_entry(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, first, second = _seed_outbox(data_dir)
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), first.id[:8]]
+    )
+    assert code == 0
+    assert "cancelled aa111111" in capsys.readouterr().out
+    assert [e.id for e in Mailbox(config.mailbox_path).outbox_list()] == [
+        second.id
+    ]
+
+
+def test_outbox_cancel_json_and_unknown(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, first, _ = _seed_outbox(data_dir)
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), "--json", first.id]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cancelled"]["id"] == first.id
+    assert payload["cancelled"]["text"] == "wrong peer"
+
+    code = cli.main(
+        ["outbox", "cancel", "--data-dir", str(data_dir), "ff" * 16]
+    )
+    assert code == 1
+    assert "unknown queued message" in capsys.readouterr().err
+
+
+def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=b"\xbb" * 16, text="one", message_id="aa" + "11" * 15)
+    box.enqueue(to=b"\xbb" * 16, text="two", message_id="aa" + "22" * 15)
+
+    code = cli.main(["outbox", "cancel", "--data-dir", str(data_dir), "aa"])
+    assert code == 1
+    assert "2 queued messages match prefix" in capsys.readouterr().err
+    assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
