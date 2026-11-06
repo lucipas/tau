@@ -229,7 +229,7 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
-| `tau peers` | List peers from the local registry |
+| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
@@ -334,6 +334,16 @@ mesh. Every tau node that hears it stores the peer in `peers.json` and updates
 its path table. A node that is asked to message an unknown destination sends a
 Reticulum path request and waits for the announce before giving up.
 
+Announces are not the only way to learn about a peer. After every mail round
+with a peer, the node also asks it for the peers *it* knows (`/tau/peers`) and
+merges the answer into its own registry — peer exchange. Each exchanged record
+carries the peer's public key, and the receiver verifies the key derives the
+reported destination hash before trusting it; records for our own destination,
+malformed records and records older than the 7-day prune horizon are dropped.
+A peer we already know keeps its own liveness record — a third party's claim
+never refreshes it, and only a missing name is filled in. `tau peers
+--exchange [--to NAME|HASH]` runs the same exchange on demand.
+
 ### Messaging
 
 Messages use a fresh encrypted `RNS.Link` per request. The client announces
@@ -346,7 +356,7 @@ request paths are implemented:
 | `/tau/ping` | `{}` | `{"ok": true, "pong": true, "server": ..., "time": ...}` |
 | `/tau/info` | `{}` | name, destination, versions, uptime, peer/interface counts |
 | `/tau/message` | `{"type": "message", "v": 1, "text": "...", "sent_at": ...}` | `{"ok": true, "echo": "...", "server": ..., "node": ...}` |
-| `/tau/peers` | `{}` | up to 100 public peer records |
+| `/tau/peers` | `{}` | up to 100 peer records, each with its public key (verified against its destination hash on receipt) |
 | `/tau/mail/store` | `{"type": "mail_store", "to": ..., "id": ..., "blob": ..., "expires_at": ...}` | hold a sealed message for an offline peer |
 | `/tau/mail/fetch` | `{"type": "mail_fetch", "ack": [...]}` | hand over held mail for the caller, dropping acked ids |
 

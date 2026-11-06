@@ -4,6 +4,7 @@ import json
 import os
 import stat
 
+import RNS
 import pytest
 
 from tau.peers import (
@@ -13,6 +14,7 @@ from tau.peers import (
     PeerRegistry,
     PUBLIC_KEY_BYTES,
 )
+from tau.protocol import APP_NAME, ASPECT
 
 
 def make_peer(registry: PeerRegistry, index: int, name: str, *, now: float) -> Peer:
@@ -169,3 +171,144 @@ def test_public_dict_hides_keys(tmp_path):
     assert "public_key" not in public
     assert public["age"] == 60.0
     assert "public_key" in peer.to_dict()
+
+
+# -- peer exchange -------------------------------------------------------
+
+def make_exchange_entry(name="carol", *, last_seen=1000.0, hops=2, protocol=1):
+    """A valid exchange entry backed by a real Reticulum identity."""
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    entry = {
+        "destination": destination.hex(),
+        "name": name,
+        "public_key": identity.get_public_key().hex(),
+        "last_seen": last_seen,
+        "hops": hops,
+        "protocol": protocol,
+    }
+    return entry, identity, destination
+
+
+def test_exchange_dict_includes_key(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 11, "dave", now=100.0)
+    exchanged = peer.exchange_dict(now=160.0)
+    assert exchanged["public_key"] == peer.public_key.hex()
+    assert exchanged["destination"] == peer.hexhash
+    assert "public_key" not in peer.public_dict(now=160.0)
+
+
+def test_public_peers_include_keys_only_when_asked(tmp_path):
+    registry = PeerRegistry()
+    make_peer(registry, 12, "erin", now=100.0)
+    assert "public_key" not in registry.public_peers(now=160.0)[0]
+    assert "public_key" in registry.public_peers(now=160.0, include_keys=True)[0]
+
+
+def test_merge_exchanged_adds_new_peer(tmp_path):
+    registry = PeerRegistry()
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0, hops=2
+    )
+    summary = registry.merge_exchanged([entry], now=1000.0)
+
+    assert summary == {"added": 1, "updated": 0, "skipped": 0}
+    peer = registry.get(destination)
+    assert peer is not None
+    assert peer.name == "carol"
+    assert peer.public_key.hex() == entry["public_key"]
+    assert peer.first_seen == 1000.0
+    assert peer.last_seen == 900.0
+    assert peer.hops == 3  # one more hop than the reporting peer's distance
+
+
+def test_merge_exchanged_rejects_key_hash_mismatch(tmp_path):
+    registry = PeerRegistry()
+    entry, _identity, _destination = make_exchange_entry("mallory")
+    other = RNS.Identity()
+    entry["public_key"] = other.get_public_key().hex()
+
+    summary = registry.merge_exchanged([entry], now=1000.0)
+    assert summary == {"added": 0, "updated": 0, "skipped": 1}
+    assert len(registry) == 0
+
+
+def test_merge_exchanged_skips_self_malformed_and_stale(tmp_path):
+    registry = PeerRegistry()
+    own_entry, _own_identity, own_destination = make_exchange_entry(
+        "self", last_seen=900.0
+    )
+    stale_entry, _stale_identity, _stale_destination = make_exchange_entry(
+        "stale", last_seen=1000.0 - 7 * 86400 - 1
+    )
+    good_entry, _good_identity, good_destination = make_exchange_entry(
+        "good", last_seen=900.0
+    )
+    future_entry, _future_identity, future_destination = make_exchange_entry(
+        "future", last_seen=5000.0
+    )
+    bad_entries = [
+        "not a dict",
+        {"destination": "zz", "public_key": "00" * 64, "last_seen": 900.0},
+        {"destination": good_entry["destination"], "last_seen": 900.0},
+        {
+            "destination": good_entry["destination"],
+            "public_key": "00" * 64,
+            "last_seen": 900.0,
+        },
+    ]
+    summary = registry.merge_exchanged(
+        [own_entry, stale_entry, *bad_entries, good_entry, future_entry],
+        now=1000.0,
+        self_hash=own_destination,
+    )
+
+    assert summary == {"added": 2, "updated": 0, "skipped": 6}
+    assert registry.get(good_destination) is not None
+    # A future last_seen is clamped to now, not trusted.
+    assert registry.get(future_destination).last_seen == 1000.0
+
+
+def test_merge_exchanged_never_refreshes_known_peer(tmp_path):
+    registry = PeerRegistry()
+    entry, _identity, destination = make_exchange_entry("carol", last_seen=900.0)
+    registry.merge_exchanged([entry], now=1000.0)
+    known = registry.get(destination)
+    assert known.last_seen == 900.0
+
+    # A later, fresher-sounding claim from a third party must not move our
+    # own liveness record, and a different name must not overwrite ours.
+    fresher = dict(entry, last_seen=1500.0, name="caroline")
+    summary = registry.merge_exchanged([fresher], now=2000.0)
+    assert summary == {"added": 0, "updated": 0, "skipped": 0}
+    assert known.last_seen == 900.0
+    assert known.first_seen == 1000.0
+    assert known.name == "carol"
+
+
+def test_merge_exchanged_fills_in_unknown_name(tmp_path):
+    registry = PeerRegistry()
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0
+    )
+    registry.merge_exchanged([dict(entry, name="unknown")], now=1000.0)
+    assert registry.get(destination).name == "unknown"
+
+    summary = registry.merge_exchanged([entry], now=1100.0)
+    assert summary == {"added": 0, "updated": 1, "skipped": 0}
+    assert registry.get(destination).name == "carol"
+
+
+def test_merge_exchanged_ignores_non_list(tmp_path):
+    registry = PeerRegistry()
+    assert registry.merge_exchanged({"not": "a list"}, now=1000.0) == {
+        "added": 0,
+        "updated": 0,
+        "skipped": 0,
+    }
+    assert registry.merge_exchanged(None, now=1000.0) == {
+        "added": 0,
+        "updated": 0,
+        "skipped": 0,
+    }

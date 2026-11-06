@@ -78,6 +78,7 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+_EXCHANGE_TIMEOUT = 5.0
 # Peers contacted per background sweep.  Each contact can wait out a
 # request timeout, so an uncapped sweep over a large registry holds the
 # mail lock for minutes and starves announce-triggered rounds; the loop
@@ -674,7 +675,7 @@ class TauNode:
         remote_identity: Optional[RNS.Identity],
         requested_at: float,
     ) -> bytes:
-        peers = self.registry.public_peers()
+        peers = self.registry.public_peers(include_keys=True)
         return response_ok(peers=peers[:100], count=len(peers))
 
     def _handle_message(
@@ -832,6 +833,15 @@ class TauNode:
         try:
             self._flush_peer(peer, _MAIL_REQUEST_TIMEOUT)
             self._collect_mail(peer, _MAIL_REQUEST_TIMEOUT)
+            # Peer exchange: learn about peers this one knows that we have
+            # never heard announce.  Best effort only — a failed exchange
+            # must never break the mail round that triggered it.
+            try:
+                self.exchange_peers(peer, timeout=_EXCHANGE_TIMEOUT)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug(
+                    "Peer exchange with %s failed", peer.hexhash, exc_info=True
+                )
         except Exception:  # pragma: no cover - network dependent
             log.debug("Mail round for %s failed", peer.hexhash, exc_info=True)
         finally:
@@ -1291,6 +1301,43 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def exchange_peers(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = _EXCHANGE_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Ask a peer for the peers it knows and merge the new ones.
+
+        Discovery is announce-only without this: a peer whose announce we
+        never heard is invisible to us even though our neighbours know it.
+        The answer is validated by :meth:`PeerRegistry.merge_exchanged`
+        (keys must derive their destination hashes) and only new peers are
+        added — a third party's claim never refreshes a known peer's
+        liveness.  Returns a summary with ``source``, ``added``,
+        ``updated`` and ``skipped``.  Raises :class:`NodeError` when the
+        peer cannot be reached or answers with a malformed list.
+        """
+        response = self.request_peers(
+            target, timeout=timeout, discover_timeout=discover_timeout
+        )
+        entries = response.get("peers") if isinstance(response, dict) else None
+        if not isinstance(entries, list):
+            raise NodeError("peer gave an invalid peers response")
+        own_hash = self.destination.hash if self.destination is not None else None
+        summary = self.registry.merge_exchanged(
+            entries[:100], now=None, self_hash=own_hash
+        )
+        if summary["added"] or summary["updated"]:
+            self._save_peers(force=True)
+        peer = self.resolve_peer(target)
+        return {
+            "source": peer.hexhash,
+            "source_name": peer.display_name,
+            **summary,
+        }
 
     def request(
         self,

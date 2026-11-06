@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-from .protocol import PROTOCOL_VERSION, sanitize_name, short_hash
+import RNS
+
+from .protocol import APP_NAME, ASPECT, PROTOCOL_VERSION, sanitize_name, short_hash
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -120,6 +122,19 @@ class Peer:
             "hops": self.hops,
             "protocol": self.protocol,
         }
+
+    def exchange_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """A peer description for peer exchange: ``public_dict`` plus the key.
+
+        The public key is public by design — it is broadcast in every
+        Reticulum announce — and the destination hash is derived from it,
+        so the receiver can verify a reported key really belongs to the
+        reported destination before trusting it.  The console's
+        ``public_dict`` stays keyless; only the exchange payload carries keys.
+        """
+        payload = self.public_dict(now)
+        payload["public_key"] = self.public_key.hex()
+        return payload
 
 
 class PeerRegistry:
@@ -343,8 +358,112 @@ class PeerRegistry:
         *,
         max_age: Optional[float] = DEFAULT_MAX_AGE,
         now: Optional[float] = None,
+        include_keys: bool = False,
     ) -> List[Dict[str, Any]]:
         timestamp = now if now is not None else time.time()
-        return [
-            p.public_dict(timestamp) for p in self.all(max_age=max_age, now=timestamp)
-        ]
+        describe = (
+            (lambda p: p.exchange_dict(timestamp))
+            if include_keys
+            else (lambda p: p.public_dict(timestamp))
+        )
+        return [describe(p) for p in self.all(max_age=max_age, now=timestamp)]
+
+    def merge_exchanged(
+        self,
+        entries: Any,
+        *,
+        now: Optional[float] = None,
+        self_hash: Optional[Union[bytes, str]] = None,
+    ) -> Dict[str, int]:
+        """Merge peer descriptions learned from another peer.
+
+        Every entry is validated before it is trusted: the destination must
+        be a 32-hex hash, the public key must be 64 bytes, and the key must
+        derive the destination hash — a reporter cannot plant a bogus key
+        for a real peer.  Entries for ourselves, malformed entries, and
+        entries older than the prune horizon are skipped.
+
+        A new peer is recorded with ``first_seen`` now and the reported
+        ``last_seen`` (clamped to now), so pruning still works honestly.  A
+        peer we already know keeps its own record: only a missing name is
+        filled in — a third party's claim never refreshes our liveness
+        record.  Returns ``{"added": n, "updated": n, "skipped": n}``.
+        """
+        timestamp = now if now is not None else time.time()
+        own: Optional[bytes] = None
+        if isinstance(self_hash, bytes) and len(self_hash) == DESTINATION_HASH_BYTES:
+            own = self_hash
+        elif isinstance(self_hash, str):
+            try:
+                candidate = bytes.fromhex(self_hash.strip())
+            except ValueError:
+                candidate = b""
+            if len(candidate) == DESTINATION_HASH_BYTES:
+                own = candidate
+
+        added = updated = skipped = 0
+        if not isinstance(entries, list):
+            return {"added": 0, "updated": 0, "skipped": 0}
+
+        with self._lock:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    skipped += 1
+                    continue
+                try:
+                    destination = entry.get("destination", "")
+                    if not isinstance(destination, str) or not _HEX32.match(destination):
+                        raise ValueError("invalid destination hash")
+                    destination_bytes = bytes.fromhex(destination)
+                    public_key = entry.get("public_key", "")
+                    if not isinstance(public_key, str):
+                        raise ValueError("invalid public key")
+                    public_key_bytes = bytes.fromhex(public_key)
+                    if len(public_key_bytes) != PUBLIC_KEY_BYTES:
+                        raise ValueError("invalid public key length")
+                    identity = RNS.Identity(create_keys=False)
+                    if not identity.load_public_key(public_key_bytes):
+                        raise ValueError("invalid public key")
+                    if (
+                        RNS.Destination.hash(identity, APP_NAME, ASPECT)
+                        != destination_bytes
+                    ):
+                        raise ValueError("public key does not match destination")
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if own is not None and destination_bytes == own:
+                    skipped += 1
+                    continue
+                last_seen = entry.get("last_seen")
+                if not isinstance(last_seen, (int, float)):
+                    skipped += 1
+                    continue
+                last_seen = min(float(last_seen), timestamp)
+                if timestamp - last_seen > DEFAULT_MAX_AGE:
+                    skipped += 1
+                    continue
+                hops = entry.get("hops")
+                # One more hop than the reporting peer's own distance.
+                hops = hops + 1 if isinstance(hops, int) and hops >= 0 else 1
+                protocol = entry.get("protocol")
+                protocol = protocol if isinstance(protocol, int) else 0
+                name = sanitize_name(entry.get("name"), fallback="unknown")
+
+                existing = self._peers.get(destination_bytes)
+                if existing is None:
+                    self._peers[destination_bytes] = Peer(
+                        destination_hash=destination_bytes,
+                        name=name,
+                        public_key=public_key_bytes,
+                        first_seen=timestamp,
+                        last_seen=last_seen,
+                        hops=hops,
+                        protocol=protocol,
+                    )
+                    added += 1
+                elif existing.name == "unknown" and name != "unknown":
+                    existing.name = name
+                    updated += 1
+            self._enforce_limit()
+        return {"added": added, "updated": updated, "skipped": skipped}

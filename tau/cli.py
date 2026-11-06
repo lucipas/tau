@@ -300,6 +300,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DAYS",
         help="only show peers heard within this many days",
     )
+    peers.add_argument(
+        "--exchange",
+        action="store_true",
+        help="ask known peers for the peers they know and merge the answers",
+    )
+    peers.add_argument(
+        "--to",
+        default=None,
+        metavar="NAME|HASH",
+        help="with --exchange, ask only this peer instead of all known peers",
+    )
     peers.set_defaults(func=cmd_peers)
 
     identity = subparsers.add_parser(
@@ -1453,6 +1464,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 def cmd_peers(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    if getattr(args, "exchange", False):
+        return cmd_peers_exchange(args, config)
     registry = PeerRegistry(config.peers_path)
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
@@ -1464,6 +1477,62 @@ def cmd_peers(args: argparse.Namespace) -> int:
         )
     else:
         _print_peer_table(peers)
+    return _EXIT_OK
+
+
+def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
+    """Exchange peer lists with known peers and report what was learned."""
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        target = getattr(args, "to", None)
+        targets = (
+            [node.resolve_peer(target)] if target else node.registry.all()
+        )
+        results: List[Dict[str, Any]] = []
+        for peer in targets:
+            try:
+                summary = node.exchange_peers(peer)
+            except NodeError as exc:
+                results.append(
+                    {
+                        "peer": peer.hexhash,
+                        "name": peer.display_name,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            results.append({"peer": peer.hexhash, "name": peer.display_name, "ok": True, **summary})
+        totals = {
+            key: sum(int(r.get(key, 0)) for r in results if r.get("ok"))
+            for key in ("added", "updated", "skipped")
+        }
+        totals["peers"] = len(results)
+        totals["failed"] = sum(1 for r in results if not r.get("ok"))
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit({"exchanged": results, **totals}, True)
+    else:
+        for result in results:
+            if result.get("ok"):
+                print(
+                    f"{result['name']} ({result['peer'][:8]}): "
+                    f"{result['added']} new, {result['updated']} updated, "
+                    f"{result['skipped']} skipped"
+                )
+            else:
+                print(
+                    f"{result['name']} ({result['peer'][:8]}): "
+                    f"failed — {result['error']}"
+                )
+        print(
+            f"\n{totals['added']} new peer(s), {totals['updated']} updated, "
+            f"{totals['skipped']} skipped from {totals['peers']} peer(s)"
+            + (f", {totals['failed']} failed" if totals["failed"] else "")
+        )
     return _EXIT_OK
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import RNS
 import pytest
@@ -115,3 +116,100 @@ def test_save_peers_keeps_holder_with_pending_acks(tmp_path):
 
     assert node.registry.get(holder.destination_hash) is not None
     assert node.mailbox.pending_ack_holders() == [holder.hexhash]
+
+
+# -- peer exchange -------------------------------------------------------
+
+from tau.protocol import decode  # noqa: E402
+
+
+def make_exchange_entry(name="carol", *, last_seen=1000.0, hops=2):
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    entry = {
+        "destination": destination.hex(),
+        "name": name,
+        "public_key": identity.get_public_key().hex(),
+        "last_seen": last_seen,
+        "hops": hops,
+        "protocol": 1,
+    }
+    return entry, destination
+
+
+def test_handle_peers_serves_exchange_entries(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=time.time()
+    )
+    raw = node._handle_peers("/tau/peers", b"{}", b"request-id", None, time.time())
+    response = decode(raw)
+
+    assert response["ok"] is True
+    assert response["count"] == 1
+    served = response["peers"][0]
+    assert served["destination"] == peer.hexhash
+    assert served["public_key"] == peer.public_key.hex()
+
+
+def test_exchange_peers_merges_new_peers(tmp_path):
+    node = make_node(tmp_path)
+    source = make_peer("bob")
+    node.registry.upsert(
+        source.destination_hash, source.public_key, name="bob", now=100.0
+    )
+    entry, destination = make_exchange_entry("carol", last_seen=time.time())
+    node._request = lambda peer, path, payload, timeout: {
+        "ok": True,
+        "peers": [entry],
+        "count": 1,
+    }
+
+    summary = node.exchange_peers(source)
+
+    assert summary["source"] == source.hexhash
+    assert summary["added"] == 1
+    assert summary["skipped"] == 0
+    learned = node.registry.get(destination)
+    assert learned is not None
+    assert learned.name == "carol"
+    assert learned.public_key.hex() == entry["public_key"]
+
+
+def test_exchange_peers_rejects_malformed_response(tmp_path):
+    node = make_node(tmp_path)
+    source = make_peer("bob")
+    node._request = lambda peer, path, payload, timeout: {"ok": True}
+    with pytest.raises(Exception, match="invalid peers response"):
+        node.exchange_peers(source)
+
+
+def test_mail_round_exchanges_peers(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+    calls = []
+    node._flush_peer = lambda p, timeout: calls.append(("flush", p.hexhash))
+    node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
+    node.exchange_peers = lambda p, **kwargs: calls.append(("exchange", p.hexhash))
+
+    node._mail_round_for_peer(peer)
+
+    assert calls == [
+        ("flush", peer.hexhash),
+        ("collect", peer.hexhash),
+        ("exchange", peer.hexhash),
+    ]
+
+
+def test_mail_round_survives_failed_exchange(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+    node._flush_peer = lambda p, timeout: {"delivered": 0, "deposited": 0}
+    node._collect_mail = lambda p, timeout: 0
+
+    def failing_exchange(p, **kwargs):
+        raise RuntimeError("link broke")
+
+    node.exchange_peers = failing_exchange
+    node._mail_round_for_peer(peer)  # must not raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,3 +124,77 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+# -- peers --exchange ------------------------------------------------------
+
+def test_parser_peers_exchange_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "--exchange", "--to", "bob"])
+    assert args.command == "peers"
+    assert args.exchange is True
+    assert args.to == "bob"
+
+    plain = parser.parse_args(["peers"])
+    assert plain.exchange is False
+    assert plain.to is None
+
+
+class _FakeExchangeNode:
+    instances = []
+
+    def __init__(self, config, name=None):
+        self.config = config
+        self.peer = SimpleNamespace(hexhash="aa" * 16, display_name="bob")
+        self.registry = SimpleNamespace(all=lambda: [self.peer])
+        self.started = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target):
+        return self.peer
+
+    def exchange_peers(self, peer):
+        return {
+            "source": peer.hexhash,
+            "source_name": peer.display_name,
+            "added": 2,
+            "updated": 1,
+            "skipped": 0,
+        }
+
+
+def test_peers_exchange_reports_what_was_learned(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "TauNode", _FakeExchangeNode)
+    _FakeExchangeNode.instances.clear()
+    code = cli.main(
+        ["peers", "--exchange", "--data-dir", str(tmp_path / "node"), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["added"] == 2
+    assert payload["updated"] == 1
+    assert payload["peers"] == 1
+    assert payload["failed"] == 0
+    assert payload["exchanged"][0]["source"] == "aa" * 16
+    assert _FakeExchangeNode.instances[0].started is False
+
+
+def test_peers_exchange_failure_is_reported_not_fatal(
+    tmp_path, capsys, monkeypatch
+):
+    class _FailingNode(_FakeExchangeNode):
+        def exchange_peers(self, peer):
+            raise cli.NodeError("no path to peer")
+
+    monkeypatch.setattr(cli, "TauNode", _FailingNode)
+    code = cli.main(["peers", "--exchange", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "failed" in out
+    assert "0 new peer(s)" in out
