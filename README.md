@@ -115,7 +115,9 @@ tau serve --http          # console + JSON API on http://127.0.0.1:8787/
 ```
 
 Open <http://127.0.0.1:8787/>. The page streams inbound messages, peers and
-their latency in real time over server-sent events.
+their latency in real time over server-sent events. Message history is kept
+in `messages.json` in the data directory, so earlier conversations are still
+there after the node restarts.
 
 The same bridge is the local integration point for scripts:
 
@@ -302,6 +304,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
 ├── mailbox.json          # store-and-forward queues, chmod 600
+├── messages.json         # console message history, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration
     └── storage/          # Reticulum internals (paths, ratchets, ...)
