@@ -223,6 +223,21 @@ def test_merge_exchanged_adds_new_peer(tmp_path):
     assert peer.hops == 3  # one more hop than the reporting peer's distance
 
 
+def test_merge_exchanged_tolerates_none_returning_load(
+    tmp_path, load_public_key_without_return
+):
+    # RNS 1.4.1's load_public_key returns None even on success;
+    # exchanged entries with valid keys must still be accepted.
+    registry = PeerRegistry()
+    entry, _identity, destination = make_exchange_entry(
+        "carol", last_seen=900.0, hops=2
+    )
+    summary = registry.merge_exchanged([entry], now=1000.0)
+
+    assert summary == {"added": 1, "updated": 0, "skipped": 0}
+    assert registry.get(destination) is not None
+
+
 def test_merge_exchanged_rejects_key_hash_mismatch(tmp_path):
     registry = PeerRegistry()
     entry, _identity, _destination = make_exchange_entry("mallory")

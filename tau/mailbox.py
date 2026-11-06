@@ -42,7 +42,10 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 import RNS
 
-from .identity import destination_hash as tau_destination_hash
+from .identity import (
+    destination_hash as tau_destination_hash,
+    load_public_key,
+)
 from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
@@ -767,7 +770,7 @@ def seal_message(
     plaintext = encode(inner, max_bytes=MAX_MAIL_BLOB_BYTES)
 
     recipient = RNS.Identity(create_keys=False)
-    if not recipient.load_public_key(recipient_public_key):
+    if not load_public_key(recipient, recipient_public_key):
         raise MailboxError("could not load recipient public key")
     blob = recipient.encrypt(plaintext)
     if not blob:
@@ -811,7 +814,7 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         raise MailboxError("sealed message sender key has the wrong length")
 
     sender = RNS.Identity(create_keys=False)
-    if not sender.load_public_key(sender_key):
+    if not load_public_key(sender, sender_key):
         raise MailboxError("could not load the sender public key")
     claimed_from = payload.get("from")
     if (

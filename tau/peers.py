@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import RNS
 
+from .identity import load_public_key
 from .lxmf import lxmf_delivery_hash_for_key
 from .protocol import APP_NAME, ASPECT, PROTOCOL_VERSION, sanitize_name, short_hash
 from .util import atomic_write_json, read_json
@@ -463,7 +464,7 @@ class PeerRegistry:
                     if len(public_key_bytes) != PUBLIC_KEY_BYTES:
                         raise ValueError("invalid public key length")
                     identity = RNS.Identity(create_keys=False)
-                    if not identity.load_public_key(public_key_bytes):
+                    if not load_public_key(identity, public_key_bytes):
                         raise ValueError("invalid public key")
                     if (
                         RNS.Destination.hash(identity, APP_NAME, ASPECT)
