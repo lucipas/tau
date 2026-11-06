@@ -146,6 +146,31 @@ def test_held_persistence_roundtrip(tmp_path):
     assert envelopes[0].stored_at == 7.0
 
 
+def test_held_list_returns_all_oldest_first(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.hold(to=BOB, blob=b"a", message_id="second", expires_at=5000.0, now=100.0)
+    box.hold(to=ALICE, blob=b"b", message_id="first", expires_at=5000.0, now=50.0)
+    box.hold(to=BOB, blob=b"c", message_id="third", expires_at=5000.0, now=150.0)
+    assert [e.id for e in box.held_list()] == ["first", "second", "third"]
+
+
+def test_resolve_held_full_id_and_prefix(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    full_id = "a" * 32
+    box.hold(to=BOB, blob=b"a", message_id=full_id, expires_at=5000.0)
+    box.hold(to=BOB, blob=b"b", message_id="shared-alpha", expires_at=5000.0)
+    box.hold(to=BOB, blob=b"c", message_id="shared-beta", expires_at=5000.0)
+    assert box.resolve_held(full_id).id == full_id
+    assert box.resolve_held(full_id[:8]).id == full_id
+    assert box.resolve_held("shared-a").id == "shared-alpha"
+    with pytest.raises(MailboxError, match="unknown held message"):
+        box.resolve_held("no-such-id")
+    with pytest.raises(MailboxError, match="2 held messages match prefix"):
+        box.resolve_held("shared-")
+    with pytest.raises(MailboxError, match="must not be empty"):
+        box.resolve_held("  ")
+
+
 # -- prune / seen / acks ---------------------------------------------------------
 
 

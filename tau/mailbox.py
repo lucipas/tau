@@ -491,6 +491,37 @@ class Mailbox:
         envelopes.sort(key=lambda e: e.stored_at)
         return envelopes
 
+    def held_list(self) -> List[HeldEnvelope]:
+        """All held envelopes, oldest first."""
+        with self._lock:
+            envelopes = list(self._held.values())
+        envelopes.sort(key=lambda e: e.stored_at)
+        return envelopes
+
+    def resolve_held(self, ref: str) -> HeldEnvelope:
+        """Resolve a full message id or a unique prefix to its held envelope.
+
+        ``tau outbox held`` shows only the first 8 characters of each id, so a
+        short prefix is the usual way to name a held envelope.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise MailboxError("message reference must not be empty")
+        value = ref.strip().lower()
+        with self._lock:
+            if len(value) == 32:
+                envelope = self._held.get(value)
+                if envelope is None:
+                    raise MailboxError(f"unknown held message: {ref!r}")
+                return envelope
+            matches = [e for e in self._held.values() if e.id.startswith(value)]
+        if not matches:
+            raise MailboxError(f"unknown held message: {ref!r}")
+        if len(matches) > 1:
+            raise MailboxError(
+                f"{len(matches)} held messages match prefix {ref!r}"
+            )
+        return matches[0]
+
     def drop_held(self, message_id: str, *, to: Optional[bytes] = None) -> bool:
         with self._transaction():
             envelope = self._held.get(message_id)

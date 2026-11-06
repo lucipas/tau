@@ -1012,7 +1012,13 @@ class TauNode:
                     "Dropping unreadable held mail %s: %s", envelope.id, exc
                 )
                 message = None
-            self.mailbox.drop_held(envelope.id, to=self.destination.hash)
+            still_held = self.mailbox.drop_held(
+                envelope.id, to=self.destination.hash
+            )
+            if not still_held:
+                # Dropped by the owner (tau outbox drop-held) after this
+                # sweep listed it: do not surface a copy we no longer hold.
+                continue
             if message is not None and self._deliver_collected(message):
                 received += 1
         return received

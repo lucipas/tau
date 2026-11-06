@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
+import RNS
 
 from tau import cli
+from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
+from tau.mailbox import Mailbox
+from tau.peers import PeerRegistry
 
 
 def test_parser_accepts_global_options_before_and_after_command():
@@ -123,3 +128,116 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+# -- outbox held / drop-held ---------------------------------------------------
+
+
+def _hold_for_cli(tmp_path, entries):
+    """Hold *entries* of (message_id, destination, name) in a fresh data dir."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    box = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    for message_id, destination, name in entries:
+        box.hold(
+            to=destination,
+            blob=b"sealed-bytes",
+            message_id=message_id,
+            expires_at=time.time() + 3600,
+        )
+        if name is not None:
+            registry.upsert(
+                destination,
+                RNS.Identity().get_public_key(),
+                name=name,
+            )
+    registry.save()
+    return data_dir
+
+
+def test_parser_outbox_subcommands():
+    parser = cli.build_parser()
+
+    bare = parser.parse_args(["outbox"])
+    assert bare.func is cli.cmd_outbox
+
+    listed = parser.parse_args(["outbox", "list"])
+    assert listed.func is cli.cmd_outbox
+
+    held = parser.parse_args(["outbox", "held"])
+    assert held.func is cli.cmd_outbox_held
+
+    drop = parser.parse_args(["outbox", "drop-held", "abc123"])
+    assert drop.func is cli.cmd_outbox_drop_held
+    assert drop.target == "abc123"
+
+
+def test_outbox_held_empty(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Not holding any sealed messages" in capsys.readouterr().out
+
+
+def test_outbox_held_lists_envelopes(tmp_path, capsys):
+    bob = b"\xbb" * 16
+    data_dir = _hold_for_cli(
+        tmp_path,
+        [
+            ("a" * 32, bob, "bob"),
+            ("shared-alpha", b"\xaa" * 16, None),
+        ],
+    )
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "aaaaaaaa" in out
+    assert "bob" in out
+    assert "shared-a" in out
+    assert "2 sealed message(s) held" in out
+
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert payload["held"][0]["to_name"] == "bob"
+    assert payload["held"][0]["blob_bytes"] == len(b"sealed-bytes")
+    # The sealed blob itself must never be printed.
+    assert "blob" not in payload["held"][0]
+    assert "sealed-bytes" not in json.dumps(payload)
+
+
+def test_outbox_drop_held_by_prefix(tmp_path, capsys):
+    data_dir = _hold_for_cli(tmp_path, [("a" * 32, b"\xbb" * 16, "bob")])
+    code = cli.main(
+        ["outbox", "drop-held", "aaaaaaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dropped aaaaaaaa" in out
+    assert "bob" in out
+    assert "already fetched" in out
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    assert Mailbox(config.mailbox_path).held_list() == []
+
+
+def test_outbox_drop_held_unknown_and_ambiguous(tmp_path, capsys):
+    data_dir = _hold_for_cli(
+        tmp_path,
+        [
+            ("shared-alpha", b"\xbb" * 16, None),
+            ("shared-beta", b"\xbb" * 16, None),
+        ],
+    )
+    code = cli.main(
+        ["outbox", "drop-held", "no-such", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown held message" in capsys.readouterr().err
+
+    code = cli.main(
+        ["outbox", "drop-held", "shared-", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "2 held messages match prefix" in capsys.readouterr().err
