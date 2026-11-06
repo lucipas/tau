@@ -760,19 +760,22 @@ def create_reply(
     signed — but unlike a reaction it carries text, like a post.  It is
     appended to the replier's own chain, exactly like a post, and is
     gossipped and synced through the same paths.  When the target is
-    cached locally it must be a post or a reply that its author has not
-    deleted; a reply to a post that is not cached yet is stored anyway
-    and links up in the timeline when the parent arrives.
+    not cached locally this raises: a reply is written to a post the
+    author has seen.  Replies received from peers for parents that
+    have not arrived yet are still stored through the sync path
+    (:func:`store_post`) and shown without a parent snippet until the
+    parent arrives.
     """
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
     existing = get_post(conn, target)
-    if existing is not None:
-        if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
-            raise TanError("only posts and replies can be replied to")
-        if _is_deleted(conn, existing):
-            raise TanError("post has been deleted")
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
+        raise TanError("only posts and replies can be replied to")
+    if _is_deleted(conn, existing):
+        raise TanError("post has been deleted")
     clean_text = normalize_message(text)
     prev = previous
     if prev is None:
@@ -931,6 +934,12 @@ def annotate_replies(
     parent is reported as deleted with its text blanked, so the thread
     stays readable without resurfacing removed content.  Top-level
     posts get no ``reply_to`` key.
+
+    Parents are fetched in one query and their deletion status in a
+    second, so a reply-heavy page does not issue one lookup per reply.
+    Only linked posts and replies count as parents: a reply that points
+    at a reaction, a delete or an unlinked entry is shown without a
+    parent snippet, the same as an uncached parent.
     """
     targets = [
         str(post["target"])
@@ -942,11 +951,21 @@ def annotate_replies(
         placeholders = ", ".join("?" for _ in targets)
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
-            f"WHERE hash IN ({placeholders})",
+            f"WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
             targets,
         ).fetchall()
         for row in rows:
             parents[str(row["hash"])] = _canonical_post(dict(row))
+    deleted: Set[Tuple[str, str]] = set()
+    if parents:
+        placeholders = ", ".join("?" for _ in parents)
+        rows = conn.execute(
+            "SELECT target, author FROM posts WHERE kind = 'delete' "
+            f"AND linked = 1 AND target IN ({placeholders})",
+            list(parents),
+        ).fetchall()
+        deleted = {(str(row["target"]), str(row["author"])) for row in rows}
     for post in posts:
         if post.get("kind") != KIND_REPLY:
             continue
@@ -954,13 +973,13 @@ def annotate_replies(
         if parent is None:
             post["reply_to"] = None
             continue
-        deleted = _is_deleted(conn, parent)
+        is_deleted = (parent["hash"], parent["author"]) in deleted
         post["reply_to"] = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if deleted else parent["text"],
-            "deleted": deleted,
+            "text": "" if is_deleted else parent["text"],
+            "deleted": is_deleted,
         }
     return posts
 

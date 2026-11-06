@@ -40,6 +40,7 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     annotate_reactions,
+    annotate_replies,
     apply_display_rules,
     author_stats,
     feed,
@@ -791,6 +792,21 @@ def _print_tan_posts(posts: Sequence[Dict[str, Any]], *, json_output: bool) -> N
             "%Y-%m-%d %H:%M"
         )
         print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        if post.get("kind") == "reply":
+            parent = post.get("reply_to")
+            if isinstance(parent, dict):
+                if parent.get("deleted"):
+                    print("  in reply to a deleted post")
+                else:
+                    parent_text = str(parent.get("text") or "")
+                    if len(parent_text) > 80:
+                        parent_text = parent_text[:80] + "…"
+                    print(
+                        f"  in reply to {parent.get('name') or 'anonymous'}: "
+                        f"{parent_text}"
+                    )
+            else:
+                print(f"  in reply to {short_hash(str(post.get('target', '')))}")
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
         likes = int(post.get("likes") or 0)
@@ -1018,7 +1034,9 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                     feed(conn, author=author, limit=args.limit, posts_only=True)
                 )
             )
-            posts = annotate_reactions(conn, posts, viewer=viewer)
+            posts = annotate_replies(
+                conn, annotate_reactions(conn, posts, viewer=viewer)
+            )
         elif getattr(args, "all", False):
             posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
         else:

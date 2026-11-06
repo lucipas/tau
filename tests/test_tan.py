@@ -868,15 +868,58 @@ def test_reply_rejects_tampering(identities, tmp_path):
         create_reply(conn, bob, post["hash"], "   ", name="bob", now=1003)
 
 
-def test_reply_to_uncached_parent_is_stored_orphan(identities, tmp_path):
+def test_reply_to_uncached_parent_is_rejected_when_authoring(identities, tmp_path):
     _, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
+    with pytest.raises(TanError, match="unknown post"):
+        create_reply(conn, bob, "cd" * 32, "early reply", name="bob", now=1000)
+
+
+def test_reply_to_parent_not_yet_synced_shows_without_snippet(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "original thought", name="alice", now=1000)
     reply = create_reply(
-        conn, bob, "cd" * 32, "early reply", name="bob", now=1000
+        source, bob, post["hash"], "early reply", name="bob", now=1001
     )
-    assert reply["kind"] == "reply"
-    items = timeline(conn, [author_of(bob)])
+
+    # The reply arrives (via gossip or sync) before its parent: the
+    # store path keeps it, and the timeline shows it without a parent
+    # snippet until the parent is cached.
+    replica = init_db(tmp_path / "replica.sqlite3")
+    record, is_new = store_post(replica, reply)
+    assert is_new is True
+    items = timeline(replica, [author_of(bob)])
     assert [item["hash"] for item in items] == [reply["hash"]]
+    assert items[0]["reply_to"] is None
+
+    store(replica, post)
+    items = timeline(replica, [author_of(bob)])
+    assert items[0]["reply_to"]["hash"] == post["hash"]
+
+
+def test_reply_to_reaction_parent_shows_no_snippet(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "parent post", name="alice", now=1000)
+    like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "reply to a like",
+        "created_at": 1002.0,
+        "prev": like["hash"],
+        "kind": "reply",
+        "target": like["hash"],
+    }
+    digest = hash(body, previous=like["hash"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_post(conn, mesg)
+    assert is_new is True
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert items[0]["hash"] == record["hash"]
     assert items[0]["reply_to"] is None
 
 
@@ -984,3 +1027,61 @@ def test_cli_post_reply_to(tmp_path):
         )
         != 0
     )
+
+
+def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "cli thread starter",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json",
+                "--reply-to", post["hash"][:16], "cli reply",
+            ]
+        )
+        == 0
+    )
+
+    # Text output names the parent instead of showing a standalone post.
+    assert (
+        main(
+            [
+                "tan", "timeline", "--data-dir", str(data_dir),
+                "--author", post["author"],
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "in reply to alice: cli thread starter" in out
+    assert "cli reply" in out
+
+    # JSON output carries the reply_to annotation on the author path.
+    assert (
+        main(
+            [
+                "tan", "timeline", "--data-dir", str(data_dir),
+                "--author", post["author"], "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    reply = next(item for item in payload["posts"] if item["kind"] == "reply")
+    assert reply["reply_to"]["hash"] == post["hash"]
+    assert reply["reply_to"]["text"] == "cli thread starter"

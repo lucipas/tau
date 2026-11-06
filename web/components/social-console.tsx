@@ -343,7 +343,7 @@ function EmptyState() {
   );
 }
 
-function PostCard({
+export function PostCard({
   post,
   onToggleLike,
   onReply,
