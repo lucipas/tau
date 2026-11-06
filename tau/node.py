@@ -79,6 +79,11 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+_EXCHANGE_TIMEOUT = 5.0
+# Background peer exchange: a few known peers per sweep, each asked at most
+# once per _EXCHANGE_INTERVAL, so quiet neighbours still share their peers.
+_EXCHANGE_SWEEP_PEERS = 2
+_EXCHANGE_INTERVAL = 900.0
 # Peers contacted per background sweep.  Each contact can wait out a
 # request timeout, so an uncapped sweep over a large registry holds the
 # mail lock for minutes and starves announce-triggered rounds; the loop
@@ -336,6 +341,7 @@ class TauNode:
         self._mail_thread: Optional[threading.Thread] = None
         self._mail_lock = threading.Lock()
         self._mail_pending: Set[str] = set()
+        self._exchanged_at: Dict[bytes, float] = {}
         self._stop_event = threading.Event()
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
@@ -619,6 +625,22 @@ class TauNode:
             daemon=True,
         ).start()
 
+    def _owed_hashes(self) -> Set[bytes]:
+        """Destination hashes the node still owes mail or acks to.
+
+        Peers holding mail we have fetched stay too: their pending
+        acknowledgements go out with the next fetch.
+        """
+        owed = {entry.to for entry in self.mailbox.outbox_list()}
+        for holder in self.mailbox.pending_ack_holders():
+            try:
+                raw = bytes.fromhex(holder)
+            except ValueError:
+                continue
+            if len(raw) == DESTINATION_HASH_BYTES:
+                owed.add(raw)
+        return owed
+
     def _save_peers(self, *, force: bool = False) -> None:
         if self.registry.path is None:
             return
@@ -636,16 +658,7 @@ class TauNode:
                 # one-shot process cannot queue mail for a peer between our
                 # snapshot of the shared mailbox and the registry save.
                 with self.mailbox.transaction():
-                    owed = {entry.to for entry in self.mailbox.outbox_list()}
-                    # Peers holding mail we have fetched stay too: their
-                    # pending acknowledgements go out with the next fetch.
-                    for holder in self.mailbox.pending_ack_holders():
-                        try:
-                            raw = bytes.fromhex(holder)
-                        except ValueError:
-                            continue
-                        if len(raw) == DESTINATION_HASH_BYTES:
-                            owed.add(raw)
+                    owed = self._owed_hashes()
                     dropped = self.registry.prune(keep=owed)
                     if dropped:
                         log.debug("Pruned %d stale peer(s) from the registry", dropped)
@@ -704,7 +717,7 @@ class TauNode:
         remote_identity: Optional[RNS.Identity],
         requested_at: float,
     ) -> bytes:
-        peers = self.registry.public_peers()
+        peers = self.registry.public_peers(include_keys=True)
         return response_ok(peers=peers[:100], count=len(peers))
 
     def _handle_message(
@@ -857,8 +870,43 @@ class TauNode:
                 self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
+            try:
+                self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Peer exchange sweep failed", exc_info=True)
             if self._stop_event.wait(_MAIL_INTERVAL):
                 break
+
+    def _exchange_sweep(self, *, max_peers: int) -> None:
+        """Ask a few known peers for their peers, outside the mail lock.
+
+        Mail rounds only exchange with peers that just announced, so a quiet
+        neighbour already in the registry would never share its peers.  This
+        sweep covers them, least-recently-asked first, each at most once per
+        _EXCHANGE_INTERVAL.
+        """
+        now = time.time()
+        known = {p.destination_hash for p in self.registry.all()}
+        self._exchanged_at = {
+            key: value
+            for key, value in self._exchanged_at.items()
+            if key in known
+        }
+        due = [
+            p
+            for p in self.registry.all()
+            if now - self._exchanged_at.get(p.destination_hash, 0.0)
+            >= _EXCHANGE_INTERVAL
+        ]
+        due.sort(key=lambda p: self._exchanged_at.get(p.destination_hash, 0.0))
+        for peer in due[:max_peers]:
+            if self._stop_event.is_set():
+                break
+            self._exchanged_at[peer.destination_hash] = now
+            try:
+                self.exchange_peers(peer, timeout=_EXCHANGE_TIMEOUT)
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Peer exchange with %s failed", peer.hexhash, exc_info=True)
 
     def _mail_round_for_peer(self, peer: Peer) -> None:
         if not self._mail_lock.acquire(blocking=False):
@@ -874,6 +922,15 @@ class TauNode:
             log.debug("Mail round for %s failed", peer.hexhash, exc_info=True)
         finally:
             self._mail_lock.release()
+        # Peer exchange runs after the mail lock is released: it is
+        # best-effort gossip, and a slow peer must not hold up mail
+        # delivery.  Stamping first also keeps the background sweep from
+        # re-asking a peer this round just covered.
+        self._exchanged_at[peer.destination_hash] = time.time()
+        try:
+            self.exchange_peers(peer, timeout=_EXCHANGE_TIMEOUT)
+        except Exception:  # pragma: no cover - network dependent
+            log.debug("Peer exchange with %s failed", peer.hexhash, exc_info=True)
 
     def flush_outbox(
         self,
@@ -910,7 +967,12 @@ class TauNode:
                 targets = {entry.to for entry in self.mailbox.due_outbox()}
             else:
                 targets = {entry.to for entry in self.mailbox.outbox_list()}
-            peers.sort(key=lambda p: p.destination_hash not in targets)
+            # Peers heard only through exchange come after directly heard
+            # ones inside each group, so second-hand entries cannot crowd
+            # out reachable peers.
+            peers.sort(
+                key=lambda p: (p.destination_hash not in targets, p.via_exchange)
+            )
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
@@ -1400,6 +1462,49 @@ class TauNode:
             else min(timeout, 10.0),
         )
         return self._request(peer, REQUEST_PEERS, b"{}", timeout)
+
+    def exchange_peers(
+        self,
+        target: Union[str, bytes, Peer],
+        *,
+        timeout: float = _EXCHANGE_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Ask a peer for the peers it knows and merge the new ones.
+
+        Discovery is announce-only without this: a peer whose announce we
+        never heard is invisible to us even though our neighbours know it.
+        The answer is validated by :meth:`PeerRegistry.merge_exchanged`
+        (keys must derive their destination hashes) and only new peers are
+        added — a third party's claim never refreshes a known peer's
+        liveness.  Returns a summary with ``source``, ``added``,
+        ``updated`` and ``skipped``.  Raises :class:`NodeError` when the
+        peer cannot be reached or answers with a malformed list.
+        """
+        response = self.request_peers(
+            target, timeout=timeout, discover_timeout=discover_timeout
+        )
+        entries = response.get("peers") if isinstance(response, dict) else None
+        if not isinstance(entries, list):
+            raise NodeError("peer gave an invalid peers response")
+        own_hash = self.destination.hash if self.destination is not None else None
+        # Peers we still owe mail or acks are protected from eviction, so
+        # gossip can never push out the record a delivery depends on.  The
+        # mailbox lock is held across the read and the merge so a one-shot
+        # process cannot queue mail for a peer between the two.
+        with self.mailbox.transaction():
+            owed = self._owed_hashes()
+            summary = self.registry.merge_exchanged(
+                entries[:100], now=None, self_hash=own_hash, keep=owed
+            )
+        if summary["added"] or summary["updated"]:
+            self._save_peers(force=True)
+        peer = self.resolve_peer(target)
+        return {
+            "source": peer.hexhash,
+            "source_name": peer.display_name,
+            **summary,
+        }
 
     def request(
         self,
