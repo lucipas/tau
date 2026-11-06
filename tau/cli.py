@@ -34,7 +34,6 @@ from .identity import (
 from .inbox import Inbox
 from .mailbox import Mailbox, MailboxError
 from .node import (
-    MAIL_SWEEP_PEERS,
     InstanceAlreadyRunning,
     InstanceLock,
     NodeError,
@@ -2412,9 +2411,12 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
     try:
         summary = node.flush_outbox(
             timeout=float(getattr(args, "timeout", 6.0)),
-            max_peers=None if target_to is not None else MAIL_SWEEP_PEERS,
+            # One-shot retry-all visits every queued recipient; the
+            # background sweep's peer cap does not apply here.
+            max_peers=None,
             respect_backoff=False,
             to=target_to,
+            message_id=target_entry.id if target_entry is not None else None,
             # A single announce-triggered round for one peer finishes in
             # seconds when the peer is reachable; only a round stuck on
             # per-request timeouts to an unreachable peer can run long,
@@ -2436,7 +2438,11 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         for entry_id, entry in queued_before.items()
         if entry_id not in remaining_ids and entry.expires_at > now
     )
-    deposited = summary["deposited"]
+    # Deposits are read back from the holders persisted on the entries
+    # left in the queue, not from the flush summary: counting both would
+    # report one deposit twice, and the summary cannot see deposits made
+    # by a concurrent announce round.
+    deposited = 0
     for entry in remaining:
         prior = queued_before.get(entry.id)
         if prior is not None:
@@ -2628,6 +2634,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _EXIT_INTERRUPTED
     except (NodeError, PeerError, IdentityError, ProtocolError) as exc:
         print(f"tau: error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    except (OSError, ValueError) as exc:
+        print(f"tau: error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
+(f"tau: error: {exc}", file=sys.stderr)
         return _EXIT_ERROR
     except (OSError, ValueError) as exc:
         print(f"tau: error: {exc}", file=sys.stderr)

@@ -926,6 +926,7 @@ class _FakeRetryNode:
     instances: list = []
     summary = {"delivered": 0, "deposited": 0, "received": 0}
     deliver = False
+    deposit = False
 
     def __init__(self, config, **kwargs):
         from tau.mailbox import Mailbox
@@ -951,6 +952,10 @@ class _FakeRetryNode:
             for entry in self.mailbox.outbox_list():
                 if target is None or entry.to == target:
                     self.mailbox.remove_outbox(entry.id)
+        if _FakeRetryNode.deposit:
+            # A sealed copy handed to a holder is persisted on the entry.
+            for entry in self.mailbox.outbox_list():
+                self.mailbox.record_deposit(entry.id, "ab" * 16)
         return dict(_FakeRetryNode.summary)
 
 
@@ -998,9 +1003,10 @@ def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
     assert node.flush_calls == [
         {
             "timeout": 6.0,
-            "max_peers": cli.MAIL_SWEEP_PEERS,
+            "max_peers": None,
             "respect_backoff": False,
             "to": None,
+            "message_id": None,
             "wait_for_lock": 60.0,
         }
     ]
@@ -1040,13 +1046,16 @@ def test_outbox_retry_all_reports_still_queued(tmp_path, capsys, monkeypatch):
     _seed_retry_outbox(data_dir)
     monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
     _FakeRetryNode.instances.clear()
-    _FakeRetryNode.summary = {"delivered": 0, "deposited": 1, "received": 0}
+    # Both entries get a real holder persisted, and the flush summary
+    # reports the same two deposits: each must be counted once.
+    _FakeRetryNode.summary = {"delivered": 0, "deposited": 2, "received": 0}
     _FakeRetryNode.deliver = False
+    monkeypatch.setattr(_FakeRetryNode, "deposit", True)
 
     code = cli.main(["outbox", "retry", "--data-dir", str(data_dir)])
     assert code == 0
     out = capsys.readouterr().out
-    assert "retried 2 queued message(s): 0 delivered, 1 deposited, 0 received" in out
+    assert "retried 2 queued message(s): 0 delivered, 2 deposited, 0 received" in out
     assert "2 message(s) still queued" in out
 
 
@@ -1076,6 +1085,7 @@ def test_outbox_retry_target_only_contacts_that_recipient(
             "max_peers": None,
             "respect_backoff": False,
             "to": b"\xbb" * 16,
+            "message_id": first.id,
             "wait_for_lock": 60.0,
         }
     ]

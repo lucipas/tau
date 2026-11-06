@@ -971,6 +971,7 @@ class TauNode:
         max_peers: Optional[int] = None,
         respect_backoff: bool = True,
         to: Optional[bytes] = None,
+        message_id: Optional[str] = None,
         wait_for_lock: float = 0.0,
     ) -> Dict[str, int]:
         """Try to move queued mail: direct delivery, deposits, collection.
@@ -1024,7 +1025,10 @@ class TauNode:
                 peers = peers[:max_peers]
             for peer in peers:
                 moved = self._flush_peer(
-                    peer, timeout, respect_backoff=respect_backoff
+                    peer,
+                    timeout,
+                    respect_backoff=respect_backoff,
+                    message_id=message_id,
                 )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
@@ -1034,13 +1038,20 @@ class TauNode:
         return summary
 
     def _flush_peer(
-        self, peer: Peer, timeout: float, *, respect_backoff: bool = True
+        self,
+        peer: Peer,
+        timeout: float,
+        *,
+        respect_backoff: bool = True,
+        message_id: Optional[str] = None,
     ) -> Dict[str, int]:
         moved = {"delivered": 0, "deposited": 0}
         if respect_backoff:
             due = self.mailbox.due_outbox(to=peer.destination_hash)
         else:
             due = self.mailbox.outbox_list(to=peer.destination_hash)
+        if message_id is not None:
+            due = [entry for entry in due if entry.id == message_id]
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
@@ -1056,6 +1067,8 @@ class TauNode:
         now = time.time()
         for entry in self.mailbox.outbox_list():
             if entry.to == peer.destination_hash:
+                continue
+            if message_id is not None and entry.id != message_id:
                 continue
             holders = entry.held_by
             if (
