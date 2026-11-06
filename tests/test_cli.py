@@ -101,6 +101,34 @@ def test_init_and_id_end_to_end(tmp_path, capsys):
     assert len(id_payload["lxmf"]) == 32
 
 
+def test_id_text_output_includes_lxmf_address(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "alice",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    identity = load_identity(data_dir / "identity")
+    assert identity is not None
+
+    code = cli.main(["id", "--data-dir", str(data_dir)])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    expected = f"lxmf:        {lxmf_delivery_hash(identity).hex()}"
+    assert expected in lines
+
+
 def test_init_keeps_existing_config_without_force(tmp_path, capsys):
     data_dir = tmp_path / "node"
     assert cli.main(["init", "--data-dir", str(data_dir), "--json"]) == 0
