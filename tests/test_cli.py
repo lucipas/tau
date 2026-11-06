@@ -123,3 +123,58 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
+    """A late console bind failure stops the node (issue #36)."""
+    import socket
+
+    from tau.node import NodeError
+    from tau.webapi import WebBridge, WebBridgeError
+
+    events = []
+
+    class RecordingNode:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.identity = None
+
+        def start(self, *, announce=True, exclusive=False):
+            events.append("node.start")
+
+        def stop(self):
+            events.append("node.stop")
+
+    def failing_start(self):
+        events.append("bridge.start")
+        raise WebBridgeError("web console bind raced")
+
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    # A real TauNode creates the data dir in start(), but the instance-lock
+    # probe runs before that, so serve on a fresh dir expects `tau init`
+    # (or an existing dir) to have created it first.
+    (tmp_path / "node").mkdir()
+    monkeypatch.setattr(cli, "TauNode", RecordingNode)
+    monkeypatch.setattr(WebBridge, "start", failing_start)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+
+    args = cli.build_parser().parse_args(
+        [
+            "serve",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--http",
+            f"127.0.0.1:{port}",
+            "--web-dir",
+            str(web_dir),
+        ]
+    )
+    with pytest.raises(NodeError, match="web console bind raced"):
+        cli.cmd_serve(args)
+
+    assert events == ["node.start", "bridge.start", "node.stop"]
