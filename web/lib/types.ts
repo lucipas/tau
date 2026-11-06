@@ -10,6 +10,8 @@ export interface TauMessage {
   received_at: number;
   status: string;
   rtt_ms?: number;
+  // Outbox entry id, present while the message is queued for delivery.
+  mail_id?: string;
 }
 
 export interface Peer {

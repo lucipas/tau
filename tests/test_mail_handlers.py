@@ -11,7 +11,7 @@ import pytest
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import open_message, seal_message
-from tau.node import TauNode
+from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     build_mail_fetch,
@@ -21,12 +21,13 @@ from tau.protocol import (
 )
 
 
-def make_node(tmp_path, name="holder", on_message=None):
+def make_node(tmp_path, name="holder", on_message=None, on_delivered=None):
     config = TauConfig.resolve(data_dir=tmp_path, name=name)
     node = TauNode(
         config,
         registry=PeerRegistry(config.peers_path),
         on_message=on_message,
+        on_delivered=on_delivered,
     )
     return node
 
@@ -333,3 +334,45 @@ def test_busy_mail_round_is_queued_not_dropped(tmp_path):
     finally:
         node._mail_lock.release()
     assert peer.hexhash in node._mail_pending
+
+
+def test_deliver_entry_reports_delivery_via_callback(tmp_path):
+    delivered = []
+    node = make_node(tmp_path, on_delivered=delivered.append)
+    identity = RNS.Identity()
+    peer = Peer(
+        destination_hash=destination_hash(identity),
+        name="alice",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    entry = node.mailbox.enqueue(to=peer.destination_hash, text="hello")
+    node._request = lambda *args, **kwargs: {"ok": True}
+
+    assert node._deliver_entry(peer, entry, timeout=5.0) is True
+    assert node.mailbox.get_outbox(entry.id) is None
+    assert delivered == [entry.id]
+
+
+def test_deliver_entry_reports_nothing_when_delivery_fails(tmp_path):
+    delivered = []
+    node = make_node(tmp_path, on_delivered=delivered.append)
+    identity = RNS.Identity()
+    peer = Peer(
+        destination_hash=destination_hash(identity),
+        name="alice",
+        public_key=identity.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+    )
+    entry = node.mailbox.enqueue(to=peer.destination_hash, text="hello")
+
+    def _fail(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    node._request = _fail
+
+    assert node._deliver_entry(peer, entry, timeout=5.0) is False
+    assert node.mailbox.get_outbox(entry.id) is not None
+    assert delivered == []
