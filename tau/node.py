@@ -35,7 +35,7 @@ from .mailbox import (
     open_message,
     seal_message,
 )
-from .peers import Peer, PeerError, PeerRegistry
+from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .protocol import (
     APP_NAME,
     ASPECT,
@@ -601,7 +601,29 @@ class TauNode:
             if not force and now - self._last_peer_save < _PEER_SAVE_INTERVAL:
                 return
             try:
-                self.registry.save()
+                # Drop peers we have not heard from in a while, so the
+                # registry (and every sweep over it, e.g. mail flush) does
+                # not accumulate dead entries forever.  Peers with queued
+                # mail are spared: fresh mail for a long-unseen peer must
+                # not be stranded by the prune.
+                # Hold the mailbox lock across the read and the prune so a
+                # one-shot process cannot queue mail for a peer between our
+                # snapshot of the shared mailbox and the registry save.
+                with self.mailbox.transaction():
+                    owed = {entry.to for entry in self.mailbox.outbox_list()}
+                    # Peers holding mail we have fetched stay too: their
+                    # pending acknowledgements go out with the next fetch.
+                    for holder in self.mailbox.pending_ack_holders():
+                        try:
+                            raw = bytes.fromhex(holder)
+                        except ValueError:
+                            continue
+                        if len(raw) == DESTINATION_HASH_BYTES:
+                            owed.add(raw)
+                    dropped = self.registry.prune(keep=owed)
+                    if dropped:
+                        log.debug("Pruned %d stale peer(s) from the registry", dropped)
+                    self.registry.save()
                 self._last_peer_save = now
             except OSError:
                 log.warning("Could not save peer registry", exc_info=True)

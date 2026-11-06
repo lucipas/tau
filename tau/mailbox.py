@@ -261,6 +261,10 @@ class Mailbox:
             finally:
                 self._txn_depth = 0
 
+    def transaction(self) -> Iterator[None]:
+        """Public handle on the cross-process mailbox lock (see ``_transaction``)."""
+        return self._transaction()
+
     # -- persistence -------------------------------------------------------
 
     def load(self) -> None:
@@ -532,6 +536,11 @@ class Mailbox:
             if ids:
                 self.save()
             return list(ids)
+
+    def pending_ack_holders(self) -> List[str]:
+        """Hex destination hashes with mail acknowledgements still owed."""
+        with self._lock:
+            return [holder for holder, ids in self._pending_acks.items() if ids]
 
     # -- maintenance -----------------------------------------------------------
 

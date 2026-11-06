@@ -258,14 +258,25 @@ class PeerRegistry:
         return peers
 
     def prune(
-        self, max_age: float = DEFAULT_MAX_AGE, now: Optional[float] = None
+        self,
+        max_age: float = DEFAULT_MAX_AGE,
+        now: Optional[float] = None,
+        *,
+        keep: Iterable[bytes] = (),
     ) -> int:
+        """Drop peers not seen for longer than *max_age*.
+
+        Peers whose destination hash is in *keep* are spared, so a caller
+        can hold on to a stale peer it still owes something (for example
+        queued mail).  Returns the number of peers dropped.
+        """
         timestamp = now if now is not None else time.time()
+        keep_set = set(keep)
         with self._lock:
             stale = [
                 key
                 for key, peer in self._peers.items()
-                if timestamp - peer.last_seen > max_age
+                if timestamp - peer.last_seen > max_age and key not in keep_set
             ]
             for key in stale:
                 del self._peers[key]

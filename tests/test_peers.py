@@ -142,6 +142,16 @@ def test_prune_and_age_filter(tmp_path):
     assert len(registry) == 1
 
 
+def test_prune_keeps_guarded_peers(tmp_path):
+    registry = PeerRegistry()
+    guarded = make_peer(registry, 6, "old", now=100.0)
+    make_peer(registry, 7, "new", now=1000.0)
+
+    assert registry.prune(max_age=500.0, now=1100.0, keep=[guarded.destination_hash]) == 0
+    assert len(registry) == 2
+    assert registry.get(guarded.destination_hash) is guarded
+
+
 def test_max_peers_drops_oldest(tmp_path):
     registry = PeerRegistry(max_peers=2)
     make_peer(registry, 8, "one", now=1.0)
