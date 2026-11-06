@@ -611,3 +611,126 @@ def test_corrupt_message_history_starts_empty(node, tmp_path):
         assert [m["id"] for m in bridge.messages()] == [1]
     finally:
         bridge.stop()
+
+
+def test_concurrent_appends_all_persist(node, tmp_path, monkeypatch):
+    """Overlapping appends with slow writes must not lose history.
+
+    Regression test for the Codex/Qodo finding on PR #32: snapshots taken
+    under the bridge lock but written after releasing it could persist out
+    of order, dropping the later message and reusing its id.
+    """
+    import tau.webapi
+
+    real_write = tau.webapi.atomic_write_json
+
+    def slow_write(path, obj, mode=None):
+        time.sleep(0.02)
+        return real_write(path, obj, mode=mode)
+
+    monkeypatch.setattr(tau.webapi, "atomic_write_json", slow_write)
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    barrier = threading.Barrier(10)
+    try:
+        def append(index):
+            barrier.wait(timeout=10)
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": f"concurrent {index}",
+                    "sent_at": 1000.0 + index,
+                    "received_at": 1001.0 + index,
+                    "id": f"msg-{index}",
+                }
+            )
+
+        threads = [threading.Thread(target=append, args=(i,)) for i in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+        assert len(stored["messages"]) == 10
+        assert len({m["id"] for m in stored["messages"]}) == 10
+        assert {m["text"] for m in stored["messages"]} == {
+            f"concurrent {i}" for i in range(10)
+        }
+        assert stored["next_message_id"] == 11
+    finally:
+        bridge.stop()
+
+
+def test_outbound_text_with_lone_surrogate_stays_persistable(node, tmp_path):
+    """An escaped lone surrogate in a sent message must not poison saves.
+
+    Regression test for the Qodo finding on PR #32: the bridge recorded
+    the raw text while the node sent the normalised one, so the stored
+    record could not be UTF-8 encoded and every later save failed.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            raw=b'{"to": "alice", "text": "hi \\ud800 there"}',
+        )
+        assert status == 200
+        # The surrogate is dropped by normalisation, so the recorded text
+        # is exactly what was sent.
+        assert payload["message"]["text"] == "hi  there"
+
+        # The history file round-trips, and a later message still persists.
+        bridge.send_message("alice", "still saving")
+        stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+        assert [m["text"] for m in stored["messages"]] == [
+            "hi  there",
+            "still saving",
+        ]
+    finally:
+        bridge.stop()
+
+    node2 = FakeNode()
+    bridge2 = _bridge_with_data_dir(node2, tmp_path)
+    try:
+        assert [m["text"] for m in bridge2.messages()] == [
+            "hi  there",
+            "still saving",
+        ]
+    finally:
+        bridge2.stop()
+
+
+def test_huge_timestamp_entry_is_dropped_on_load(node, tmp_path):
+    """A parseable but overflowing integer timestamp must not break startup.
+
+    Regression test for the Qodo warning on PR #32: float() of a huge JSON
+    integer raises OverflowError during bridge construction.
+    """
+    good = _stored_message(1, "good entry")
+    bad = _stored_message(2, "bad timestamp")
+    bad["sent_at"] = 10**400
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [good, bad], "next_message_id": 3}),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages()] == ["good entry"]
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "after load",
+                "sent_at": 2000.0,
+                "received_at": 2001.0,
+                "id": "msg-3",
+            }
+        )
+        assert bridge.messages()[-1]["id"] == 3
+    finally:
+        bridge.stop()

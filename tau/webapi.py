@@ -44,7 +44,13 @@ from . import __version__
 from .config import MESSAGES_FILE_NAME
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
-from .protocol import MAX_MESSAGE_CHARS, ProtocolError, sanitize_name, short_hash
+from .protocol import (
+    MAX_MESSAGE_CHARS,
+    ProtocolError,
+    normalize_message,
+    sanitize_name,
+    short_hash,
+)
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -181,9 +187,19 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         return None
     sent_at = entry.get("sent_at")
     received_at = entry.get("received_at")
-    if not isinstance(sent_at, (int, float)) or not isinstance(
-        received_at, (int, float)
+    if (
+        not isinstance(sent_at, (int, float))
+        or isinstance(sent_at, bool)
+        or not isinstance(received_at, (int, float))
+        or isinstance(received_at, bool)
     ):
+        return None
+    try:
+        sent_at = float(sent_at)
+        received_at = float(received_at)
+    except (OverflowError, ValueError):
+        # A huge JSON integer timestamp overflows float(); drop the entry
+        # instead of failing bridge startup.
         return None
     message: Dict[str, Any] = {
         "id": message_id,
@@ -191,13 +207,20 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         "peer": peer,
         "peer_name": peer_name,
         "text": text,
-        "sent_at": float(sent_at),
-        "received_at": float(received_at),
+        "sent_at": sent_at,
+        "received_at": received_at,
         "status": status,
     }
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
+    try:
+        # The writer serialises with ensure_ascii=False, so a stored
+        # string that is not UTF-8 encodable (e.g. a lone surrogate from a
+        # hand-edited file) would poison every later save; drop it here.
+        json.dumps(message, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, ValueError):
+        return None
     return message
 
 
@@ -232,6 +255,7 @@ class WebBridge:
 
         self.bus = EventBus()
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -317,23 +341,33 @@ class WebBridge:
         else:
             self._next_message_id = max(max_id + 1, 1)
 
-    def _save_messages(self, messages: List[Dict[str, Any]], next_id: int) -> None:
-        """Persist *messages* (already capped) to ``messages.json``.
+    def _save_messages(self) -> None:
+        """Persist the current message log to ``messages.json``.
 
-        A failed write only logs a warning: the messages are already in
-        memory, and a full disk must never break sending or receiving.
+        Saves are serialised through ``_save_lock`` and the snapshot is
+        taken inside it, so a slow write can never let an older snapshot
+        overwrite a newer one: the last save to finish always holds the
+        newest log. A failed write only logs a warning: the messages are
+        already in memory, and a full disk (or an unencodable record) must
+        never break sending or receiving.
         """
         path = self._messages_path
         if path is None:
             return
-        try:
-            atomic_write_json(
-                path,
-                {"messages": messages, "next_message_id": next_id},
-                mode=0o600,
-            )
-        except OSError as exc:
-            log.warning("Could not persist message history to %s: %s", path, exc)
+        with self._save_lock:
+            with self._lock:
+                messages = list(self._messages)
+                next_id = self._next_message_id
+            try:
+                atomic_write_json(
+                    path,
+                    {"messages": messages, "next_message_id": next_id},
+                    mode=0o600,
+                )
+            except (OSError, ValueError) as exc:
+                log.warning(
+                    "Could not persist message history to %s: %s", path, exc
+                )
 
     @property
     def url(self) -> str:
@@ -536,6 +570,10 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        # Normalise up front so the recorded text is exactly what gets sent
+        # (and is always UTF-8 encodable for the history file): the node
+        # normalises again before sending, so this cannot change delivery.
+        text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.send_message(peer, text, timeout=timeout)
@@ -636,9 +674,7 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             self._next_message_id += 1
             self._messages.append(message)
-            snapshot = list(self._messages)
-            next_id = self._next_message_id
-        self._save_messages(snapshot, next_id)
+        self._save_messages()
         return message
 
     # -- static files ------------------------------------------------------
