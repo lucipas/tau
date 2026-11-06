@@ -41,9 +41,11 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .config import MESSAGES_FILE_NAME
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import MAX_MESSAGE_CHARS, ProtocolError, sanitize_name, short_hash
+from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
 
@@ -147,8 +149,66 @@ class EventBus:
                 pass
 
 
+def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
+    """Validate one message record loaded from ``messages.json``.
+
+    Returns a normalised copy, or ``None`` when the entry is not a
+    recognisable message (corrupt or hand-edited history never blocks
+    startup; the bad entry is simply dropped).
+    """
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("direction") not in ("in", "out"):
+        return None
+    message_id = entry.get("id")
+    if (
+        not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+        or message_id < 1
+    ):
+        return None
+    peer = entry.get("peer")
+    if peer is not None and not isinstance(peer, str):
+        return None
+    peer_name = entry.get("peer_name")
+    text = entry.get("text")
+    status = entry.get("status")
+    if (
+        not isinstance(peer_name, str)
+        or not isinstance(text, str)
+        or not isinstance(status, str)
+    ):
+        return None
+    sent_at = entry.get("sent_at")
+    received_at = entry.get("received_at")
+    if not isinstance(sent_at, (int, float)) or not isinstance(
+        received_at, (int, float)
+    ):
+        return None
+    message: Dict[str, Any] = {
+        "id": message_id,
+        "direction": entry["direction"],
+        "peer": peer,
+        "peer_name": peer_name,
+        "text": text,
+        "sent_at": float(sent_at),
+        "received_at": float(received_at),
+        "status": status,
+    }
+    rtt_ms = entry.get("rtt_ms")
+    if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
+        message["rtt_ms"] = rtt_ms
+    return message
+
+
 class WebBridge:
-    """Expose a :class:`TauNode` over a loopback HTTP API."""
+    """Expose a :class:`TauNode` over a loopback HTTP API.
+
+    Inbound and outbound messages shown by the console are persisted to
+    ``messages.json`` in the node data directory (when the node has one),
+    so history survives a restart; without a data directory the bridge
+    keeps messages in memory only.
+    """
 
     def __init__(
         self,
@@ -175,6 +235,8 @@ class WebBridge:
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
+        self._messages_path = self._resolve_messages_path()
+        self._load_messages()
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
@@ -213,6 +275,65 @@ class WebBridge:
         self._thread = None
         if thread is not None:
             thread.join(timeout=3.0)
+
+    # -- message history ---------------------------------------------------
+
+    def _resolve_messages_path(self) -> Optional[Path]:
+        """Data-dir path for persisted message history, or ``None``.
+
+        A node without a data directory (tests, embeds) keeps messages in
+        memory only.
+        """
+        data_dir = getattr(self.node, "data_dir", None)
+        if data_dir is None:
+            config = getattr(self.node, "config", None)
+            data_dir = getattr(config, "data_dir", None)
+        if data_dir is None:
+            return None
+        return Path(data_dir) / MESSAGES_FILE_NAME
+
+    def _load_messages(self) -> None:
+        """Load persisted message history into the in-memory log."""
+        path = self._messages_path
+        if path is None:
+            return
+        raw = read_json(path, default=None)
+        if not isinstance(raw, dict):
+            return
+        entries = raw.get("messages")
+        if not isinstance(entries, list):
+            return
+        loaded = []
+        for entry in entries:
+            message = _clean_stored_message(entry)
+            if message is not None:
+                loaded.append(message)
+        loaded = loaded[-MAX_MESSAGE_LOG:]
+        self._messages.extend(loaded)
+        saved_next = raw.get("next_message_id")
+        max_id = max((message["id"] for message in loaded), default=0)
+        if isinstance(saved_next, int) and not isinstance(saved_next, bool):
+            self._next_message_id = max(saved_next, max_id + 1, 1)
+        else:
+            self._next_message_id = max(max_id + 1, 1)
+
+    def _save_messages(self, messages: List[Dict[str, Any]], next_id: int) -> None:
+        """Persist *messages* (already capped) to ``messages.json``.
+
+        A failed write only logs a warning: the messages are already in
+        memory, and a full disk must never break sending or receiving.
+        """
+        path = self._messages_path
+        if path is None:
+            return
+        try:
+            atomic_write_json(
+                path,
+                {"messages": messages, "next_message_id": next_id},
+                mode=0o600,
+            )
+        except OSError as exc:
+            log.warning("Could not persist message history to %s: %s", path, exc)
 
     @property
     def url(self) -> str:
@@ -515,6 +636,9 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             self._next_message_id += 1
             self._messages.append(message)
+            snapshot = list(self._messages)
+            next_id = self._next_message_id
+        self._save_messages(snapshot, next_id)
         return message
 
     # -- static files ------------------------------------------------------

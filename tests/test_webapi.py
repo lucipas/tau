@@ -472,3 +472,142 @@ def test_tan_delete_via_api(tmp_path):
         "delete",
         "delete",
     ]
+
+
+def _stored_message(message_id, text, direction="in"):
+    return {
+        "id": message_id,
+        "direction": direction,
+        "peer": PEER_HASH,
+        "peer_name": "alice",
+        "text": text,
+        "sent_at": 1000.0 + message_id,
+        "received_at": 1001.0 + message_id,
+        "status": "received" if direction == "in" else "delivered",
+    }
+
+
+def _bridge_with_data_dir(node, tmp_path):
+    from tau.config import TauConfig
+
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    return bridge
+
+
+def test_message_history_survives_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello before restart",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "id": "msg-1",
+            }
+        )
+        bridge.send_message("alice", "reply before restart")
+    finally:
+        bridge.stop()
+
+    stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+    assert [m["text"] for m in stored["messages"]] == [
+        "hello before restart",
+        "reply before restart",
+    ]
+    assert stored["next_message_id"] == 3
+
+    node2 = FakeNode()
+    bridge2 = _bridge_with_data_dir(node2, tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert [m["text"] for m in messages] == [
+            "hello before restart",
+            "reply before restart",
+        ]
+        assert [m["id"] for m in messages] == [1, 2]
+        # Ids continue across the restart instead of restarting at 1.
+        bridge2.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello after restart",
+                "sent_at": 2000.0,
+                "received_at": 2001.0,
+                "id": "msg-2",
+            }
+        )
+        assert bridge2.messages()[-1]["id"] == 3
+    finally:
+        bridge2.stop()
+
+
+def test_message_history_without_data_dir_stays_in_memory(node):
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        assert bridge._messages_path is None
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "memory only",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "id": "msg-1",
+            }
+        )
+        assert [m["text"] for m in bridge.messages()] == ["memory only"]
+    finally:
+        bridge.stop()
+
+
+def test_message_history_load_caps_and_drops_invalid_entries(node, tmp_path):
+    from tau.webapi import MAX_MESSAGE_LOG
+
+    seeded = [_stored_message(i + 1, f"m{i + 1}") for i in range(MAX_MESSAGE_LOG + 5)]
+    seeded.insert(3, {"id": "not-an-int", "text": "bad id"})
+    seeded.insert(5, {"direction": "sideways", "text": "bad direction"})
+    seeded.insert(7, "not a dict at all")
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": seeded, "next_message_id": 9999}),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        messages = bridge.messages(limit=0)
+        assert len(messages) == MAX_MESSAGE_LOG
+        # The three invalid entries were dropped and the oldest valid
+        # messages fell off the cap, so the log starts at m6.
+        assert messages[0]["text"] == "m6"
+        assert messages[-1]["text"] == f"m{MAX_MESSAGE_LOG + 5}"
+        # The saved next id is honoured (and stays above the max id).
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "after load",
+                "sent_at": 2000.0,
+                "received_at": 2001.0,
+                "id": "msg-3",
+            }
+        )
+        assert bridge.messages()[-1]["id"] == 9999
+    finally:
+        bridge.stop()
+
+
+def test_corrupt_message_history_starts_empty(node, tmp_path):
+    (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert bridge.messages() == []
+        bridge.send_message("alice", "fresh start")
+        assert [m["text"] for m in bridge.messages()] == ["fresh start"]
+        assert [m["id"] for m in bridge.messages()] == [1]
+    finally:
+        bridge.stop()
