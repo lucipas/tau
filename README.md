@@ -523,6 +523,10 @@ unlinked, and stall sync at the gap.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
+- Replies are a new entry kind: a peer running a version that predates
+  replies rejects them, and — because entries are hash-chained — a
+  rejected reply also leaves that author's later entries (including
+  deletes) unlinked on the old peer until it upgrades and resyncs.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
 - Peer information is self-asserted and can be stale; prune with
