@@ -9,10 +9,12 @@ import urllib.request
 
 import pytest
 
+from tau.mailbox import Mailbox
 from tau.peers import Peer
 from tau.webapi import WebBridge, WebBridgeError
 
 PEER_HASH = "ab" * 16
+OTHER_HASH = "cd" * 16
 
 
 class FakeRegistry:
@@ -22,10 +24,17 @@ class FakeRegistry:
     def all(self, max_age=None):
         return list(self._peers)
 
+    def get(self, destination_hash):
+        for peer in self._peers:
+            if peer.destination_hash == destination_hash:
+                return peer
+        return None
+
 
 class FakeNode:
-    def __init__(self):
+    def __init__(self, mailbox_path=None):
         self.name = "tester"
+        self.mailbox = Mailbox(mailbox_path)
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -70,8 +79,8 @@ class FakeNode:
 
 
 @pytest.fixture()
-def node():
-    return FakeNode()
+def node(tmp_path):
+    return FakeNode(tmp_path / "mailbox.json")
 
 
 @pytest.fixture()
@@ -472,3 +481,97 @@ def test_tan_delete_via_api(tmp_path):
         "delete",
         "delete",
     ]
+
+
+def _queue(node, to_hex, text, message_id=None):
+    return node.mailbox.enqueue(
+        to=bytes.fromhex(to_hex),
+        text=text,
+        message_id=message_id,
+    )
+
+
+def test_outbox_empty(bridge):
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert payload == {"outbox": [], "count": 0, "held_for_others": 0}
+
+
+def test_outbox_lists_entries_with_names(bridge, node):
+    first = _queue(node, PEER_HASH, "hello alice")
+    second = _queue(node, OTHER_HASH, "hello stranger")
+    node.mailbox.record_attempt(first.id, error="no route")
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert payload["count"] == 2
+    assert payload["held_for_others"] == 0
+    by_id = {entry["id"]: entry for entry in payload["outbox"]}
+    assert by_id[first.id]["to_name"] == "alice"
+    assert by_id[first.id]["attempts"] == 1
+    assert by_id[first.id]["last_error"] == "no route"
+    assert by_id[first.id]["held_by"] == []
+    # Unknown destination: falls back to the name stored at enqueue time.
+    assert by_id[second.id]["to"] == OTHER_HASH
+    assert by_id[second.id]["to_name"] == ""
+    assert by_id[second.id]["text"] == "hello stranger"
+
+
+def test_outbox_cancel_by_id_and_prefix(bridge, node):
+    first = _queue(node, PEER_HASH, "first")
+    second = _queue(node, PEER_HASH, "second")
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": first.id}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["cancelled"]["id"] == first.id
+    assert payload["cancelled"]["to_name"] == "alice"
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/cancel",
+        method="POST",
+        body={"target": second.id[:8]},
+    )
+    assert status == 200
+    assert payload["cancelled"]["id"] == second.id
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert payload == {"outbox": [], "count": 0, "held_for_others": 0}
+
+
+def test_outbox_cancel_errors(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/cancel",
+        method="POST",
+        body={"target": "ff" * 16},
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+    # Two entries sharing a prefix make the prefix ambiguous.
+    _queue(node, PEER_HASH, "one", message_id="aa" + "11" * 15)
+    _queue(node, PEER_HASH, "two", message_id="aa" + "22" * 15)
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": "aa"}
+    )
+    assert status == 404
+    assert "match prefix" in payload["error"]["message"]
+
+    # Cancelling an entry that left the outbox meanwhile is a 404 too.
+    gone = _queue(node, PEER_HASH, "gone", message_id="bb" + "33" * 15)
+    assert node.mailbox.remove_outbox(gone.id) is True
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": gone.id}
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]

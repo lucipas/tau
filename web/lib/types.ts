@@ -69,6 +69,30 @@ export interface SendResponse {
   response: Record<string, unknown>;
 }
 
+export interface OutboxEntry {
+  id: string;
+  to: string;
+  to_name: string;
+  text: string;
+  created_at: number;
+  expires_at: number;
+  attempts: number;
+  last_attempt_at: number | null;
+  last_error: string | null;
+  held_by: string[];
+}
+
+export interface OutboxResponse {
+  outbox: OutboxEntry[];
+  count: number;
+  held_for_others: number;
+}
+
+export interface CancelOutboxResponse {
+  ok: boolean;
+  cancelled: OutboxEntry;
+}
+
 export interface ApiErrorBody {
   error?: { message?: string };
 }

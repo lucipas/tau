@@ -7,6 +7,7 @@ import { useTau } from "@/lib/use-tau";
 import { Composer } from "./composer";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
+import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 
 export function Console() {
@@ -88,6 +89,15 @@ export function Console() {
               node={tau.node}
               live={tau.connection === "live"}
             />
+            {tau.outbox.length > 0 ? (
+              <div className="mt-4">
+                <OutboxSection
+                  entries={tau.outbox}
+                  heldForOthers={tau.heldForOthers}
+                  onCancel={tau.cancelOutbox}
+                />
+              </div>
+            ) : null}
             <Composer
               peers={tau.peers}
               target={target}
