@@ -9,7 +9,7 @@ import pytest
 
 import tau.mailbox as mailbox_module
 from tau.config import TauConfig
-from tau.identity import destination_hash
+from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
     Mailbox,
     MailboxError,
@@ -349,6 +349,25 @@ def test_seal_and_open_roundtrip():
     assert message["sent_at"] == 4242.0
 
 
+def test_seal_and_open_roundtrip_with_none_returning_load(
+    load_public_key_without_return,
+):
+    # RNS 1.4.1's load_public_key returns None even on success; sealing
+    # and opening must still work there.
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-1",
+        text="meet at the dock",
+        sent_at=4242.0,
+    )
+    message = open_message(recipient, blob)
+    assert message["id"] == "msg-1"
+    assert message["text"] == "meet at the dock"
+
+
 def test_open_rejects_wrong_recipient():
     sender, recipient = make_identity_pair()
     stranger = RNS.Identity()
@@ -399,7 +418,7 @@ def test_open_rejects_forged_sender():
     }
     inner["sig"] = base64.b64encode(forger.sign(encode(inner))).decode("ascii")
     box = RNS.Identity(create_keys=False)
-    assert box.load_public_key(recipient.get_public_key())
+    assert load_public_key(box, recipient.get_public_key())
     blob = box.encrypt(encode(inner, max_bytes=MAX_MAIL_BLOB_BYTES))
     with pytest.raises(MailboxError):
         open_message(recipient, blob)

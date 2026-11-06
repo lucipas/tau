@@ -39,6 +39,17 @@ def test_destination_for_rebuilds_the_same_destination(tmp_path):
     assert destination.hexhash == peer.hexhash
 
 
+def test_destination_for_tolerates_none_returning_load(
+    tmp_path, load_public_key_without_return
+):
+    # RNS 1.4.1's load_public_key returns None even on success; the
+    # node must still resolve a peer's destination from its key.
+    node = make_node(tmp_path)
+    peer = make_peer()
+    destination = node._destination_for(peer)
+    assert destination.hash == peer.destination_hash
+
+
 def test_destination_for_rejects_mismatched_identity(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer()

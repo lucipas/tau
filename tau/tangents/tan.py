@@ -80,6 +80,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequ
 
 import RNS
 
+from ..identity import load_public_key
 from ..protocol import (
     APP_NAME,
     ASPECT,
@@ -356,7 +357,7 @@ def _check_wire_size(post: Dict[str, Any]) -> None:
 def _identity_from_post(post: Dict[str, Any]) -> RNS.Identity:
     try:
         identity = RNS.Identity(create_keys=False)
-        if not identity.load_public_key(bytes.fromhex(post["key"])):
+        if not load_public_key(identity, bytes.fromhex(post["key"])):
             raise ValueError("could not load public key")
     except Exception as exc:  # pragma: no cover - depends on RNS internals
         raise PostError(f"invalid public key: {exc}") from exc

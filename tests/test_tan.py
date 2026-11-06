@@ -90,6 +90,18 @@ def test_create_post_chains_and_verifies(identities, tmp_path):
     ]
 
 
+def test_verify_post_tolerates_none_returning_load(
+    identities, tmp_path, load_public_key_without_return
+):
+    # RNS 1.4.1's load_public_key returns None even on success; post
+    # verification (which rebuilds the author's identity from the
+    # advertised key) must still work there.
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, alice, "hello mesh", name="alice", now=1000)
+    assert verify_post(first)["hash"] == first["hash"]
+
+
 def test_store_rejects_tampered_post(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")

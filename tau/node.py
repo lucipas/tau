@@ -27,6 +27,7 @@ from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
+    load_public_key,
 )
 from .inbox import Inbox
 from .mailbox import (
@@ -1651,7 +1652,7 @@ class TauNode:
 
     def _destination_for(self, peer: Peer) -> RNS.Destination:
         identity = RNS.Identity(create_keys=False)
-        if not identity.load_public_key(peer.public_key):
+        if not load_public_key(identity, peer.public_key):
             raise NodeError(f"invalid public key for peer {peer.hexhash}")
         destination = RNS.Destination(
             identity,
