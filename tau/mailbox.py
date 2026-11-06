@@ -313,16 +313,31 @@ class Mailbox:
 
     # -- persistence -------------------------------------------------------
 
-    def load(self) -> None:
+    def load(self) -> Dict[str, int]:
+        """Load the mailbox from disk, dropping duplicate message ids.
+
+        ``mailbox.json`` is a list per collection, so a restored, merged
+        or hand-edited file can carry the same message id twice.  The
+        in-memory collections are keyed by id and already collapse such
+        duplicates, but the file itself never shrank back — every restart
+        re-read the stale copies.  Loading now keeps the newest copy of
+        each duplicated id (by ``created_at`` / ``stored_at``, later in
+        the file winning ties) and, when anything was dropped, rewrites
+        the file so the duplicates are gone for good.
+
+        Returns how many duplicate entries were dropped per collection.
+        """
+        empty: Dict[str, int] = {"outbox": 0, "held": 0, "pending_acks": 0}
         if self.path is None:
-            return
+            return dict(empty)
         raw = read_json(self.path)
         if raw is None:
-            return
+            return dict(empty)
         if not isinstance(raw, dict):
             log.warning("Ignoring mailbox at %s: unexpected format", self.path)
-            return
+            return dict(empty)
 
+        dropped: Dict[str, int] = dict(empty)
         outbox: Dict[str, OutboxEntry] = {}
         entries = raw.get("outbox")
         if isinstance(entries, list):
@@ -334,6 +349,11 @@ class Mailbox:
                 except (TypeError, ValueError) as exc:
                     log.debug("Skipping invalid outbox entry: %s", exc)
                     continue
+                existing = outbox.get(parsed.id)
+                if existing is not None:
+                    dropped["outbox"] += 1
+                    if parsed.created_at < existing.created_at:
+                        continue
                 outbox[parsed.id] = parsed
 
         held: Dict[str, HeldEnvelope] = {}
@@ -347,6 +367,11 @@ class Mailbox:
                 except (TypeError, ValueError) as exc:
                     log.debug("Skipping invalid held envelope: %s", exc)
                     continue
+                existing_held = held.get(parsed_held.id)
+                if existing_held is not None:
+                    dropped["held"] += 1
+                    if parsed_held.stored_at < existing_held.stored_at:
+                        continue
                 held[parsed_held.id] = parsed_held
 
         seen: Dict[str, float] = {}
@@ -363,9 +388,15 @@ class Mailbox:
         if isinstance(raw_acks, dict):
             for holder, ids in raw_acks.items():
                 if isinstance(ids, list):
-                    acks[str(holder)] = [
-                        mid for mid in ids if isinstance(mid, str)
-                    ][:100]
+                    kept: List[str] = []
+                    for mid in ids:
+                        if not isinstance(mid, str):
+                            continue
+                        if mid in kept:
+                            dropped["pending_acks"] += 1
+                            continue
+                        kept.append(mid)
+                    acks[str(holder)] = kept[:100]
 
         dropped_held: Dict[str, float] = {}
         raw_dropped = raw.get("dropped_held")
@@ -388,6 +419,16 @@ class Mailbox:
             len(outbox),
             len(held),
         )
+        if sum(dropped.values()):
+            log.info(
+                "Dropped duplicate mailbox entries at %s: %s",
+                self.path,
+                {k: v for k, v in dropped.items() if v},
+            )
+            # Persist the cleaned state so the duplicates do not come
+            # back on the next restart.
+            self.save()
+        return dropped
 
     def save(self) -> bool:
         if self.path is None:
