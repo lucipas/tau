@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import RNS
 import pytest
 
 from tau.config import TauConfig
+from tau.mailbox import Mailbox
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT
@@ -115,3 +117,226 @@ def test_save_peers_keeps_holder_with_pending_acks(tmp_path):
 
     assert node.registry.get(holder.destination_hash) is not None
     assert node.mailbox.pending_ack_holders() == [holder.hexhash]
+
+
+# -- peer exchange -------------------------------------------------------
+
+from tau.protocol import decode  # noqa: E402
+
+
+def make_exchange_entry(name="carol", *, last_seen=1000.0, hops=2):
+    identity = RNS.Identity()
+    destination = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+    entry = {
+        "destination": destination.hex(),
+        "name": name,
+        "public_key": identity.get_public_key().hex(),
+        "last_seen": last_seen,
+        "hops": hops,
+        "protocol": 1,
+    }
+    return entry, destination
+
+
+def test_handle_peers_serves_exchange_entries(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=time.time()
+    )
+    raw = node._handle_peers("/tau/peers", b"{}", b"request-id", None, time.time())
+    response = decode(raw)
+
+    assert response["ok"] is True
+    assert response["count"] == 1
+    served = response["peers"][0]
+    assert served["destination"] == peer.hexhash
+    assert served["public_key"] == peer.public_key.hex()
+
+
+def test_exchange_peers_merges_new_peers(tmp_path):
+    node = make_node(tmp_path)
+    source = make_peer("bob")
+    node.registry.upsert(
+        source.destination_hash, source.public_key, name="bob", now=100.0
+    )
+    entry, destination = make_exchange_entry("carol", last_seen=time.time())
+    node._request = lambda peer, path, payload, timeout: {
+        "ok": True,
+        "peers": [entry],
+        "count": 1,
+    }
+
+    summary = node.exchange_peers(source)
+
+    assert summary["source"] == source.hexhash
+    assert summary["added"] == 1
+    assert summary["skipped"] == 0
+    learned = node.registry.get(destination)
+    assert learned is not None
+    assert learned.name == "carol"
+    assert learned.public_key.hex() == entry["public_key"]
+
+
+def test_exchange_peers_rejects_malformed_response(tmp_path):
+    node = make_node(tmp_path)
+    source = make_peer("bob")
+    node._request = lambda peer, path, payload, timeout: {"ok": True}
+    with pytest.raises(Exception, match="invalid peers response"):
+        node.exchange_peers(source)
+
+
+def test_mail_round_exchanges_peers(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+    calls = []
+    node._flush_peer = lambda p, timeout, **_kwargs: calls.append(("flush", p.hexhash))
+    node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
+
+    def exchange(p, **kwargs):
+        # The exchange runs after the mail lock is released, so a slow
+        # peer cannot hold up mail delivery.
+        assert not node._mail_lock.locked()
+        calls.append(("exchange", p.hexhash))
+
+    node.exchange_peers = exchange
+
+    node._mail_round_for_peer(peer)
+
+    assert calls == [
+        ("flush", peer.hexhash),
+        ("collect", peer.hexhash),
+        ("exchange", peer.hexhash),
+    ]
+    assert node._exchanged_at[peer.destination_hash] > 0
+
+
+def test_mail_round_survives_failed_exchange(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+    node._flush_peer = lambda p, timeout, **_kwargs: {"delivered": 0, "deposited": 0}
+    node._collect_mail = lambda p, timeout: 0
+
+    def failing_exchange(p, **kwargs):
+        raise RuntimeError("link broke")
+
+    node.exchange_peers = failing_exchange
+    node._mail_round_for_peer(peer)  # must not raise
+
+
+def test_exchange_sweep_asks_least_recent_first(tmp_path):
+    node = make_node(tmp_path)
+    first = make_peer("first")
+    second = make_peer("second")
+    third = make_peer("third")
+    for peer, when in ((first, 100.0), (second, 200.0), (third, 300.0)):
+        node.registry.upsert(
+            peer.destination_hash, peer.public_key, name=peer.name, now=when
+        )
+    # Second was asked recently; the sweep should skip it and ask the
+    # other two.  Never-asked peers keep registry (most-recently-seen) order.
+    node._exchanged_at[second.destination_hash] = time.time()
+    asked = []
+    node.exchange_peers = lambda p, **kwargs: asked.append(p.hexhash)
+
+    node._exchange_sweep(max_peers=2)
+
+    assert asked == [third.hexhash, first.hexhash]
+
+
+def test_exchange_sweep_skips_recently_asked(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("only")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="only", now=100.0
+    )
+    node._exchanged_at[peer.destination_hash] = time.time()
+    asked = []
+    node.exchange_peers = lambda p, **kwargs: asked.append(p.hexhash)
+
+    node._exchange_sweep(max_peers=2)
+
+    assert asked == []
+
+
+def test_flush_outbox_prefers_direct_peers(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    direct = make_peer("direct")
+    node.registry.upsert(
+        direct.destination_hash, direct.public_key, name="direct", now=100.0
+    )
+    # A peer learned only via exchange, with a much fresher reported
+    # last_seen, must still come after directly heard peers in the sweep.
+    entry, destination = make_exchange_entry("gossip", last_seen=time.time())
+    node.registry.merge_exchanged([entry], now=time.time())
+    assert node.registry.get(destination).via_exchange is True
+
+    order = []
+    node._flush_peer = lambda p, timeout, **_kwargs: (
+        order.append(p.hexhash),
+        {"delivered": 0, "deposited": 0},
+    )[1]
+    node._collect_mail = lambda p, timeout: 0
+
+    node.flush_outbox()
+
+    assert order == [direct.hexhash, destination.hex()]
+def test_deliver_entry_skips_message_cancelled_by_another_process(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    entry = node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="do not send", message_id="cc" + "33" * 15
+    )
+    # A second process (``tau outbox cancel``) removes the entry from the
+    # shared mailbox file after this node's sweep listed it.
+    other = Mailbox(node.config.mailbox_path)
+    assert other.remove_outbox(entry.id) is True
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deliver_entry(make_peer(), entry, timeout=1.0) is False
+    assert calls == []
+
+
+def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="send me", message_id="cc" + "44" * 15
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deliver_entry(make_peer(), entry, timeout=1.0) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deposit_entry_skips_message_cancelled_by_another_process(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    recipient = make_peer("bob")
+    node.registry.upsert(
+        recipient.destination_hash, recipient.public_key, name="bob", now=1.0
+    )
+    entry = node.mailbox.enqueue(
+        to=recipient.destination_hash,
+        text="do not hold",
+        message_id="cc" + "55" * 15,
+    )
+    other = Mailbox(node.config.mailbox_path)
+    assert other.remove_outbox(entry.id) is True
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deposit_entry(make_peer("carol"), entry, timeout=1.0) is False
+    assert calls == []

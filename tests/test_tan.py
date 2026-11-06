@@ -38,6 +38,7 @@ from tau.tangents.tan import (
     reaction_states,
     resolve_post,
     max_seq,
+    search_posts,
     store,
     store_post,
     timeline,
@@ -606,6 +607,60 @@ def test_cli_tan_export_import_errors(tmp_path, capsys):
     assert "not valid JSON" in capsys.readouterr().err
 
 
+def test_cli_search(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    for text in ("mesh notes here", "something else"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "tan",
+                "search",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "mesh",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "mesh notes here"
+
+    # No match is a clean empty result, not an error.
+    assert (
+        main(
+            [
+                "tan",
+                "search",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "nope",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
 def test_reaction_chains_verifies_and_counts(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -759,6 +814,104 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
         create_delete(conn, alice, post["hash"], name="alice", now=1004)
 
 
+def test_search_matches_substring_case_insensitively(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "hello mesh world", name="alice", now=1000)
+    create_post(conn, bob, "HELLO from bob", name="bob", now=1001)
+    create_post(conn, alice, "unrelated", name="alice", now=1002)
+
+    results = search_posts(conn, "hello")
+    assert [post["text"] for post in results] == [
+        "HELLO from bob",
+        "hello mesh world",
+    ]
+    assert [post["text"] for post in search_posts(conn, "MESH")] == [
+        "hello mesh world"
+    ]
+    assert search_posts(conn, "nothing matches") == []
+
+
+
+
+def test_search_folds_unicode_case(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "Äpfel und Öl", name="alice", now=1000)
+    create_post(conn, alice, "plain apples", name="alice", now=1001)
+
+    assert [post["text"] for post in search_posts(conn, "äpfel")] == [
+        "Äpfel und Öl"
+    ]
+    assert [post["text"] for post in search_posts(conn, "ÖL")] == ["Äpfel und Öl"]
+    assert search_posts(conn, "ÄPFEL") == search_posts(conn, "äpfel")
+def test_search_treats_wildcards_literally(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "100% sure", name="alice", now=1000)
+    create_post(conn, alice, "under_score", name="alice", now=1001)
+    create_post(conn, alice, "back\\slash", name="alice", now=1002)
+    create_post(conn, alice, "100x sure", name="alice", now=1003)
+
+    assert [post["text"] for post in search_posts(conn, "100%")] == ["100% sure"]
+    assert [post["text"] for post in search_posts(conn, "under_score")] == [
+        "under_score"
+    ]
+    assert [post["text"] for post in search_posts(conn, "back\\slash")] == [
+        "back\\slash"
+    ]
+
+
+def test_search_excludes_deleted_reactions_and_unlinked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    kept = create_post(conn, alice, "keep this mesh post", name="alice", now=1000)
+    doomed = create_post(conn, alice, "mesh regret", name="alice", now=1001)
+    create_reaction(conn, bob, kept["hash"], liked=True, name="bob", now=1002)
+    create_delete(conn, alice, doomed["hash"], name="alice", now=1003)
+
+    results = search_posts(conn, "mesh")
+    assert [post["text"] for post in results] == ["keep this mesh post"]
+    # The surviving post carries its like annotation, like the timeline.
+    assert results[0]["likes"] == 1
+
+    # An unlinked post (parent not yet stored) never matches.
+    orphan = create_post(conn, bob, "mesh orphan", name="bob", now=1004)
+    conn.execute("UPDATE posts SET linked = 0 WHERE hash = ?", (orphan["hash"],))
+    conn.commit()
+    assert [post["text"] for post in search_posts(conn, "mesh")] == [
+        "keep this mesh post"
+    ]
+
+
+def test_search_filters_by_author_and_limit(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for index in range(3):
+        create_post(conn, alice, f"mesh {index}", name="alice", now=1000 + index)
+    create_post(conn, bob, "mesh from bob", name="bob", now=1003)
+
+    author = author_of(alice)
+    assert [post["text"] for post in search_posts(conn, "mesh", author=author)] == [
+        "mesh 2",
+        "mesh 1",
+        "mesh 0",
+    ]
+    assert [post["text"] for post in search_posts(conn, "mesh", limit=2)] == [
+        "mesh from bob",
+        "mesh 2",
+    ]
+    with pytest.raises(TanError, match="author must be"):
+        search_posts(conn, "mesh", author="not-a-hash")
+
+
+def test_search_rejects_empty_query(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "hello", name="alice", now=1000)
+    for query in ("", "   "):
+        with pytest.raises(TanError, match="search text must not be empty"):
+            search_posts(conn, query)
 def test_timeline_marks_own_posts_for_viewer(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
