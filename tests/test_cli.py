@@ -222,6 +222,24 @@ def test_outbox_drop_held_by_prefix(tmp_path, capsys):
     assert Mailbox(config.mailbox_path).held_list() == []
 
 
+def test_outbox_drop_held_json_includes_delivery_caveat(tmp_path, capsys):
+    """The already-fetched caveat is in the JSON result too.
+
+    Regression test for the CodeRabbit Minor on PR #59: the text
+    output printed the caveat but ``--json`` omitted it, so an
+    operator reading the machine output could miss that a fetched
+    copy may still be delivered.
+    """
+    data_dir = _hold_for_cli(tmp_path, [("a" * 32, b"\xbb" * 16, "bob")])
+    code = cli.main(
+        ["outbox", "drop-held", "aaaaaaaa", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dropped"]["id"] == "a" * 32
+    assert "already fetched" in payload["dropped"]["note"]
+
+
 def test_outbox_drop_held_unknown_and_ambiguous(tmp_path, capsys):
     data_dir = _hold_for_cli(
         tmp_path,
