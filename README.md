@@ -492,11 +492,16 @@ tau allowlist off              # stop enforcing; anyone may message again
 When enforced, a message from an unlisted sender is rejected with a
 `not_allowed` error and is never stored, never marked seen, and never
 passed to the message callback — so admitting the sender later and
-having them resend delivers it normally. The sender's identity is the
-verified destination hash from the request, so it cannot be spoofed.
-A list file that cannot be parsed fails closed (nobody admitted)
-rather than silently opening the node up. A running `serve` applies
-saved changes when it restarts.
+having them resend delivers it normally. The same check applies to
+messages delivered through store-and-forward: a sealed copy from an
+unlisted sender is dropped on collection, not delivered. An explicit
+denial is also not queued: `tau send` to a node that rejects you
+fails with an error instead of leaving a message in the outbox to
+retry until its TTL expires. The sender's identity is the verified
+destination hash from the request, so it cannot be spoofed. A list
+file that cannot be parsed fails closed (nobody admitted) rather than
+silently opening the node up. A running `serve` applies saved changes
+when it restarts.
 
 `--kinds` is display-only, on purpose: it selects which entry kinds
 your timeline views present (hiding reactions also hides their like

@@ -24,11 +24,14 @@ another node's hash.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Union
 
 from .util import atomic_write_json
+
+log = logging.getLogger(__name__)
 
 DESTINATION_HEX_LENGTH = 32
 ALLOWLIST_FILE_MODE = 0o600
@@ -98,7 +101,12 @@ class AllowList:
     def from_dict(cls, data: Any) -> "AllowList":
         if not isinstance(data, dict):
             raise AllowListError("allow-list must be a JSON object")
-        enabled = data.get("enabled", False)
+        if "enabled" not in data:
+            # A list that lost its enabled flag must not silently turn
+            # enforcement off; the fail-closed loader treats the file
+            # as corrupt instead.
+            raise AllowListError("enabled is required")
+        enabled = data["enabled"]
         if not isinstance(enabled, bool):
             raise AllowListError("enabled must be a boolean")
         return cls(enabled=enabled, allow=_clean_destinations(data.get("allow")))
@@ -134,5 +142,10 @@ def load_allowlist_or_deny_all(
     """
     try:
         return load_allowlist(path)
-    except AllowListError:
+    except AllowListError as exc:
+        log.warning(
+            "Allow-list at %s is unusable (%s); denying all senders",
+            path,
+            exc,
+        )
         return AllowList(enabled=True, allow=frozenset())

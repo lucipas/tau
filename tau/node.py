@@ -92,6 +92,15 @@ class NodeError(RuntimeError):
     """Raised when a node operation fails."""
 
 
+class NotAllowedError(NodeError):
+    """Raised when a peer explicitly rejects a request (allow-list denial).
+
+    Distinct from other :class:`NodeError` failures so callers can tell
+    an explicit refusal apart from an unreachable peer: a refusal must
+    not be silently queued for retry.
+    """
+
+
 class InstanceAlreadyRunning(NodeError):
     """The data directory belongs to another running node."""
 
@@ -651,7 +660,11 @@ class TauNode:
         for peer in self.registry.all():
             if peer.public_key == remote_identity.get_public_key():
                 return peer.hexhash
-        return remote_identity.hexhash
+        # The caller is not in the local registry: derive the tau
+        # destination hash from the verified identity.  The identity
+        # hash alone is a different value, and the allow-list (and the
+        # peer registry) are keyed by destination hash.
+        return tau_destination_hash(remote_identity).hex()
 
     def _handle_ping(
         self,
@@ -1042,6 +1055,20 @@ class TauNode:
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
+        sender = message.get("from")
+        if not self.allowlist.is_allowed(
+            sender if isinstance(sender, str) else None
+        ):
+            # The sender hash in a sealed envelope is authenticated
+            # (open_message verifies it against the signing key), so
+            # this is the same admission decision as a direct message.
+            # Do not mark it seen: another holder's copy may still be
+            # delivered if the sender is admitted later.
+            log.info(
+                "Relayed message from %s denied by the DM allow-list",
+                sender or "unknown",
+            )
+            return False
         if self.mailbox.is_seen(message["id"]):
             return False
         self.mailbox.mark_seen(message["id"])
@@ -1213,6 +1240,10 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        except NotAllowedError:
+            # The peer is online and explicitly refused the message;
+            # queueing it would retry a refusal until its TTL expires.
+            raise
         except NodeError:
             if not queue or not self.started:
                 raise
@@ -1482,9 +1513,10 @@ class TauNode:
             raise NodeError(f"peer returned an invalid response: {exc}") from exc
         if decoded.get("ok") is not True:
             error = decoded.get("error") or {}
-            raise NodeError(
-                f"peer rejected the request: {error.get('message', 'unknown error')}"
-            )
+            message = error.get("message", "unknown error")
+            if error.get("code") == "not_allowed":
+                raise NotAllowedError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded
