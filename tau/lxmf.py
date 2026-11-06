@@ -37,7 +37,15 @@ def _identity_for_key(public_key: bytes) -> RNS.Identity:
     if not isinstance(public_key, (bytes, bytearray, memoryview)):
         raise ValueError("public key must be bytes")
     identity = RNS.Identity(create_keys=False)
-    if not identity.load_public_key(bytes(public_key)):
+    loaded = identity.load_public_key(bytes(public_key))
+    # RNS 1.4.1's load_public_key returns None even on success — the
+    # True/False return only arrived in a later release — and it also
+    # returns None on failure, so the return value alone cannot tell
+    # the two apart there. A successful load runs update_hashes(),
+    # which sets identity.hash; a failed load never reaches it, so
+    # the hash is the version-tolerant success signal (and an explicit
+    # False still means failure on newer RNS).
+    if loaded is False or identity.hash is None:
         raise ValueError("invalid public key")
     return identity
 

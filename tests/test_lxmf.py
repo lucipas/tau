@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import pytest
 import RNS
 
 from tau import lxmf
@@ -55,12 +56,37 @@ def test_delivery_hash_for_key_matches_identity() -> None:
 
 
 def test_delivery_hash_for_key_rejects_bad_keys() -> None:
-    import pytest
-
     with pytest.raises(ValueError):
         lxmf.lxmf_delivery_hash_for_key(bytes(32))
     with pytest.raises(ValueError):
         lxmf.lxmf_delivery_hash_for_key("not bytes")  # type: ignore[arg-type]
+
+
+def test_delivery_hash_for_key_tolerates_none_return(monkeypatch) -> None:
+    # RNS 1.4.1's load_public_key returns None even on success (the
+    # True/False return came later). The helper must accept that.
+    real_load = RNS.Identity.load_public_key
+
+    def load_without_return(self, pub_bytes):
+        real_load(self, pub_bytes)
+        return None
+
+    monkeypatch.setattr(RNS.Identity, "load_public_key", load_without_return)
+    identity = RNS.Identity()
+    assert lxmf.lxmf_delivery_hash_for_key(
+        identity.get_public_key()
+    ) == lxmf.lxmf_delivery_hash(identity)
+
+
+def test_delivery_hash_for_key_rejects_failed_load_returning_none(monkeypatch) -> None:
+    # 1.4.1 also returns None on failure, so a load that never sets the
+    # identity hash must still be rejected.
+    def load_noop(self, pub_bytes):
+        return None
+
+    monkeypatch.setattr(RNS.Identity, "load_public_key", load_noop)
+    with pytest.raises(ValueError):
+        lxmf.lxmf_delivery_hash_for_key(RNS.Identity().get_public_key())
 
 
 def test_peer_lxmf_hash_derived_from_public_key() -> None:
