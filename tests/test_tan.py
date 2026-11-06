@@ -41,6 +41,7 @@ from tau.tangents.tan import (
     search_posts,
     store,
     store_post,
+    thread,
     timeline,
     unfollow,
     verify_post,
@@ -1504,6 +1505,156 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     }
     with pytest.raises(TanError, match="has been deleted"):
         create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
+
+
+def test_thread_returns_root_and_nested_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    first = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
+    )
+    second = create_reply(
+        conn, bob, post["hash"], "second reply", name="bob", now=1003
+    )
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
+
+    # Depth-first, siblings oldest first: a reply, then its own
+    # replies, then the next sibling.  Reactions never appear as
+    # entries; the like only shows up as a count on the root.
+    items = thread(conn, post["hash"])
+    assert [item["hash"] for item in items] == [
+        post["hash"],
+        first["hash"],
+        nested["hash"],
+        second["hash"],
+    ]
+    assert [item["depth"] for item in items] == [0, 1, 2, 1]
+    assert [item["text"] for item in items] == [
+        "thread starter",
+        "first reply",
+        "reply to the reply",
+        "second reply",
+    ]
+    assert items[0]["likes"] == 1
+    assert items[1]["likes"] == 0
+
+    # Naming any entry in the thread resolves to the same root.
+    assert [item["hash"] for item in thread(conn, nested["hash"][:12])] == [
+        post["hash"],
+        first["hash"],
+        nested["hash"],
+        second["hash"],
+    ]
+    assert [item["hash"] for item in thread(conn, second["hash"])] == [
+        post["hash"],
+        first["hash"],
+        nested["hash"],
+        second["hash"],
+    ]
+
+
+def test_thread_hides_deleted_reply_subtree(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    first = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
+    )
+    second = create_reply(
+        conn, bob, post["hash"], "second reply", name="bob", now=1003
+    )
+
+    # Deleting the first reply hides it and the nested reply that
+    # hangs off it, rather than re-parenting the nested reply.
+    create_delete(conn, bob, first["hash"], name="bob", now=1004)
+    items = thread(conn, post["hash"])
+    assert [item["hash"] for item in items] == [post["hash"], second["hash"]]
+    assert [item["depth"] for item in items] == [0, 1]
+    assert nested["hash"] not in [item["hash"] for item in items]
+
+
+def test_thread_rejects_unknown_and_deleted_references(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+
+    with pytest.raises(TanError, match="unknown post"):
+        thread(conn, "cd" * 32)
+    create_delete(conn, alice, post["hash"], name="alice", now=1001)
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, post["hash"])
+
+
+def test_cli_tan_thread(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "cli thread starter",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json",
+                "--reply-to", post["hash"][:16], "cli reply",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # JSON output carries the nested thread with depths.
+    assert (
+        main(
+            [
+                "tan", "thread", "--data-dir", str(data_dir),
+                "--json", post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [entry["text"] for entry in payload["posts"]] == [
+        "cli thread starter",
+        "cli reply",
+    ]
+    assert [entry["depth"] for entry in payload["posts"]] == [0, 1]
+
+    # Text output indents the reply under its parent.
+    assert (
+        main(
+            ["tan", "thread", "--data-dir", str(data_dir), post["hash"][:16]]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "cli thread starter" in out
+    assert "  cli reply" in out
+
+    # An unknown reference is a clean CLI error, not a traceback.
+    assert (
+        main(["tan", "thread", "--data-dir", str(data_dir), "cd" * 32]) != 0
+    )
+    assert "tau: error: unknown post" in capsys.readouterr().err
 
 
 def test_cli_post_reply_to(tmp_path):

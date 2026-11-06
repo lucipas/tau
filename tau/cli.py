@@ -65,6 +65,7 @@ from .tangents.tan import (
     resolve_delete_target,
     resolve_post,
     search_posts,
+    thread,
     timeline,
     unfollow,
 )
@@ -609,6 +610,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_search.set_defaults(func=cmd_tan_search)
 
+    tan_thread = tan_sub.add_parser(
+        "thread",
+        parents=[common],
+        help="show a post with its replies as a nested thread",
+    )
+    tan_thread.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+    )
+    tan_thread.set_defaults(func=cmd_tan_thread)
+
     tan_follow = tan_sub.add_parser(
         "follow", parents=[common], help="follow a peer or author"
     )
@@ -1037,6 +1048,37 @@ def _print_tan_posts(
             print(f"  ♥ {likes}{suffix}")
 
 
+def _print_tan_thread(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+) -> None:
+    """Print a thread as returned by :func:`tan.thread`, indented by depth."""
+    if json_output:
+        _emit({"posts": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No posts in this thread.")
+        return
+    for post in posts:
+        indent = "  " * int(post.get("depth") or 0)
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(
+            f"{indent}[{when}] {name} ({author}) "
+            f"{short_hash(str(post.get('hash', '')))}"
+        )
+        for line in str(post.get("text", "")).splitlines() or [""]:
+            print(f"{indent}  {line}")
+        likes = int(post.get("likes") or 0)
+        if likes or post.get("liked"):
+            suffix = " (you liked this)" if post.get("liked") else ""
+            print(f"{indent}  ♥ {likes}{suffix}")
+
+
 def _tan_identity(config: TauConfig) -> Any:
     identity = load_identity(config.identity_path)
     if identity is None:
@@ -1308,6 +1350,25 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
         json_output=json_output,
         empty_message=f"No stored posts match {args.query!r}.",
     )
+    return _EXIT_OK
+
+
+def cmd_tan_thread(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        posts = thread(conn, args.ref, viewer=viewer)
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_tan_thread(posts, json_output=json_output)
     return _EXIT_OK
 
 

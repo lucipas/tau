@@ -218,7 +218,10 @@ long-running node stores only posts it created, received or synced. Tan is
 public-feed oriented: there are no private posts or media yet. Posts can be
 answered with `tau tan post --reply-to <post>` — a reply is a signed entry
 on the replier's chain pointing at its parent, so it propagates to peers
-like any other post. An author can delete one of their own posts with
+like any other post. Read a whole conversation with
+`tau tan thread <post>` — it prints the post and its replies nested under
+it, oldest first, and accepts a reply's hash to show the thread it belongs
+to. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
 (the entry itself stays stored, keeping chains verifiable). In the web
@@ -263,6 +266,7 @@ Global options may appear before or after the command:
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |

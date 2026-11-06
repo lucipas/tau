@@ -1320,6 +1320,85 @@ def timeline(
     )
 
 
+def thread(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return the thread rooted at the post *ref* names, oldest first.
+
+    *ref* may name any entry in the thread — a reply resolves to its
+    root post, walking up through cached, linked, non-deleted parents.
+    The root is the highest such ancestor; a reply whose parent has not
+    arrived yet still anchors its own visible thread.  Every entry
+    carries a ``depth`` (the root is 0) and the derived ``likes`` /
+    ``liked`` / ``own`` annotations, like the timeline.  Replies appear
+    in depth-first order — a reply, then its own replies, then the next
+    sibling — with siblings oldest first, so the thread reads as a
+    conversation.  Deleted and unlinked entries never appear, and a
+    reply to a deleted entry is hidden with its parent's subtree rather
+    than re-parented.  An unknown, ambiguous or deleted reference
+    raises :class:`TanError`, exactly as :func:`resolve_post` does.
+    """
+    start = resolve_post(conn, ref)
+    root = start
+    ancestors = {root["hash"]}
+    while root.get("kind") == KIND_REPLY and root.get("target"):
+        parent = get_post(conn, str(root["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in ancestors or not parent.get("linked"):
+            break
+        if _is_deleted(conn, parent):
+            break
+        ancestors.add(parent["hash"])
+        root = parent
+    root = _canonical_post(root)
+    # Collect descendants level by level — one query per depth, so a
+    # deep thread costs a handful of queries instead of one per entry —
+    # then flatten depth-first, siblings oldest first.  The ``seen``
+    # set also stops a pathological target cycle from looping forever;
+    # it is separate from ``ancestors`` above, because an ancestor of
+    # the named entry is also one of the root's children.
+    levels: List[List[Dict[str, Any]]] = [[root]]
+    frontier = [root["hash"]]
+    seen = {root["hash"]}
+    while frontier:
+        placeholders = ", ".join("?" for _ in frontier)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            f"WHERE linked = 1 AND kind IN ('post', 'reply') "
+            f"AND target IN ({placeholders}) AND {_NOT_DELETED} "
+            "ORDER BY created_at ASC, hash ASC",
+            frontier,
+        ).fetchall()
+        children = [
+            child
+            for child in _public_posts(rows)
+            if child["hash"] not in seen
+        ]
+        for child in children:
+            seen.add(child["hash"])
+        if not children:
+            break
+        levels.append(children)
+        frontier = [child["hash"] for child in children]
+    by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for level in levels[1:]:
+        for child in level:
+            by_parent.setdefault(str(child.get("target") or ""), []).append(child)
+    ordered: List[Dict[str, Any]] = []
+    stack: List[Tuple[Dict[str, Any], int]] = [(root, 0)]
+    while stack:
+        entry, depth = stack.pop()
+        entry["depth"] = depth
+        ordered.append(entry)
+        for child in reversed(by_parent.get(entry["hash"], [])):
+            stack.append((child, depth + 1))
+    return annotate_reactions(conn, ordered, viewer=viewer)
+
+
 # Search is a display surface like the timeline, so it shares the
 # timeline's ceiling rather than the feed's 20-post page.
 MAX_SEARCH_POSTS = 200
