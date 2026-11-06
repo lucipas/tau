@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import RNS
 
+from .lxmf import lxmf_delivery_hash_for_key
 from .protocol import APP_NAME, ASPECT, PROTOCOL_VERSION, sanitize_name, short_hash
 from .util import atomic_write_json, read_json
 
@@ -57,6 +58,20 @@ class Peer:
         return self.destination_hash.hex()
 
     @property
+    def lxmf_hash(self) -> Optional[str]:
+        """This peer's LXMF delivery address, derived from its public key.
+
+        LXMF addresses a node at a destination derived from its identity,
+        so the address follows from the advertised key with no extra
+        announcement.  ``None`` when the stored key cannot be loaded
+        (a peer built from untrusted data); real peers always have one.
+        """
+        try:
+            return lxmf_delivery_hash_for_key(self.public_key).hex()
+        except ValueError:
+            return None
+
+    @property
     def display_name(self) -> str:
         return self.name or short_hash(self.hexhash)
 
@@ -74,6 +89,7 @@ class Peer:
             "protocol": self.protocol,
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
+            "lxmf": self.lxmf_hash,
         }
 
     @classmethod
@@ -128,6 +144,7 @@ class Peer:
             "age": round(self.age(now), 1),
             "hops": self.hops,
             "protocol": self.protocol,
+            "lxmf": self.lxmf_hash,
         }
 
     def exchange_dict(self, now: Optional[float] = None) -> Dict[str, Any]:

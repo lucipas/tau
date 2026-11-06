@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tau.lxmf import lxmf_delivery_hash_for_key
+
 if os.environ.get("TAU_INTEGRATION") != "1":
     pytest.skip(
         "set TAU_INTEGRATION=1 to run the Reticulum integration test",
@@ -139,6 +141,12 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
             f"alice was not discovered; alice log:\n{log_path.read_text()}"
         )
         assert discovered[alice_hash]["name"] == "alice"
+        # LXMF addressing: a peer discovered over the network carries its
+        # LXMF delivery address, derived from its announced public key.
+        alice_peer = discovered[alice_hash]
+        assert alice_peer["lxmf"] == lxmf_delivery_hash_for_key(
+            bytes.fromhex(alice_peer["public_key"])
+        ).hex()
 
         sent = run_tau(
             "send",
