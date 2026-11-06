@@ -1592,13 +1592,13 @@ def test_thread_rejects_unknown_and_deleted_references(identities, tmp_path):
         thread(conn, post["hash"])
 
 
-def _insert_stub(conn, digest, *, author, linked):
+def _insert_stub(conn, digest, *, author, linked, kind="post", target=""):
     """Store a bare entry row for states the public API cannot produce."""
     conn.execute(
         "INSERT INTO posts (hash, author, key, text, created_at, received_at, "
         "sig, seq, linked, kind, target) "
-        "VALUES (?, ?, '', 'stub', 1000, 1000, '', 1, ?, 'post', '')",
-        (digest, author, 1 if linked else 0),
+        "VALUES (?, ?, '', 'stub', 1000, 1000, '', 1, ?, ?, ?)",
+        (digest, author, 1 if linked else 0, kind, target),
     )
     conn.commit()
 
@@ -1620,7 +1620,7 @@ def test_thread_rejects_unlinked_entry(identities, tmp_path):
     digest = "cd" * 32
     _insert_stub(conn, digest, author=author_of(alice), linked=False)
 
-    with pytest.raises(TanError, match="unknown post"):
+    with pytest.raises(TanError, match="has not linked yet"):
         thread(conn, digest)
 
 
@@ -1639,6 +1639,31 @@ def test_thread_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
     # Naming the reply directly must not show it as a standalone thread.
     with pytest.raises(TanError, match="has been deleted"):
         thread(conn, nested["hash"])
+
+
+def test_thread_rejects_reply_beneath_deleted_unlinked_ancestor(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = "aa" * 32
+    delete = "bb" * 32
+    reply = "cc" * 32
+    # The parent is cached but its chain never linked up, and its
+    # author deleted it: the deletion must win over the unlinked
+    # shortcut, or the reply below it re-roots as its own thread.
+    _insert_stub(conn, parent, author=author_of(alice), linked=False)
+    _insert_stub(
+        conn, delete, author=author_of(alice), linked=True,
+        kind="delete", target=parent,
+    )
+    _insert_stub(
+        conn, reply, author=author_of(bob), linked=True,
+        kind="reply", target=parent,
+    )
+
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, reply)
 
 
 def test_thread_batches_wide_generations(identities, tmp_path, monkeypatch):

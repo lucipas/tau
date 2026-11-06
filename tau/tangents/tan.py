@@ -1357,19 +1357,24 @@ def thread(
     start = resolve_post(conn, ref)
     if not start.get("linked"):
         # A cached entry still awaiting its chain predecessor is not shown.
-        raise TanError(f"unknown post: {ref!r}")
+        raise TanError(f"post has not linked yet: {ref!r}")
     root = start
     ancestors = {root["hash"]}
     while root.get("kind") == KIND_REPLY and root.get("target"):
         parent = get_post(conn, str(root["target"]))
         if parent is None or parent.get("kind") not in TIMELINE_KINDS:
             break
-        if parent["hash"] in ancestors or not parent.get("linked"):
+        if parent["hash"] in ancestors:
             break
         if _is_deleted(conn, parent):
             # Replies under a deleted entry stay hidden, even when named
-            # directly, so refuse rather than showing a fragment.
+            # directly, so refuse rather than showing a fragment.  The
+            # deletion check comes before the unlinked shortcut: a
+            # deleted parent whose chain never linked up hides its
+            # subtree just the same.
             raise TanError(f"post has been deleted: {ref!r}")
+        if not parent.get("linked"):
+            break
         ancestors.add(parent["hash"])
         root = parent
     root = _canonical_post(root)
