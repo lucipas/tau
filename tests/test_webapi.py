@@ -586,6 +586,31 @@ def test_delivery_before_record_is_not_lost(bridge, node):
     assert feed["messages"][0]["status"] == "delivered"
 
 
+def test_raising_previous_delivery_callback_still_flips(node, tmp_path):
+    """A previous callback that raises must not lose the status update."""
+
+    def _boom(message_id):
+        raise RuntimeError("boom")
+
+    node.on_delivered = _boom
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    chained = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    try:
+        _queue_send(node)
+        message, _ = chained.send_message("alice", "hi")
+        assert message["status"] == "queued"
+
+        # The failure propagates (the node's callback guard logs it in
+        # production), but only after the record has flipped.
+        with pytest.raises(RuntimeError, match="boom"):
+            node.on_delivered("mail-1")
+        assert chained.messages()[0]["status"] == "delivered"
+    finally:
+        chained.stop()
+
+
 def test_bridge_chains_existing_delivery_callback(node, tmp_path):
     seen = []
     node.on_delivered = seen.append

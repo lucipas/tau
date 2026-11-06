@@ -176,9 +176,14 @@ class WebBridge:
         previous_on_delivered = getattr(node, "on_delivered", None)
 
         def _on_delivered(message_id: str) -> None:
-            if callable(previous_on_delivered):
-                previous_on_delivered(message_id)
-            self.record_delivery(message_id)
+            try:
+                if callable(previous_on_delivered):
+                    previous_on_delivered(message_id)
+            finally:
+                # A failing previous callback must not lose the status
+                # update; the exception propagates to the node's callback
+                # guard, which logs it like any other user-callback failure.
+                self.record_delivery(message_id)
 
         node.on_delivered = _on_delivered
 
