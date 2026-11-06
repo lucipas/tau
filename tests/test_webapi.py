@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -504,6 +505,29 @@ def test_check_web_console_bind_names_held_port():
     assert f"web console port {port} on 127.0.0.1 is already in use" in str(
         excinfo.value
     )
+
+
+def test_check_web_console_bind_windows_names_live_listener(monkeypatch):
+    # The Windows probe connects instead of binding: a live listener
+    # completes the handshake, so the probe must report it.
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(WebBridgeError) as excinfo:
+            check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
+
+
+def test_check_web_console_bind_windows_passes_on_free_port(monkeypatch):
+    # ...while a free port refuses the connection, so the probe passes
+    # even where a TIME_WAIT straggler could linger.
+    monkeypatch.setattr(sys, "platform", "win32")
+    check_web_console_bind("127.0.0.1", _free_port())
 
 
 def test_bridge_start_names_held_port_instead_of_raw_oserror(node):

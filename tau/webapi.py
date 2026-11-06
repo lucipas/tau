@@ -108,27 +108,53 @@ def check_web_console_bind(host: str, port: int) -> None:
     bridge, so they skip the check.
 
     The probe mirrors the TCP listen probe (``check_tcp_listen_ports``)
-    including its Windows tradeoff: ``SO_REUSEADDR`` is omitted there
-    because on Windows it would let the probe bind a port that a live
-    listener already holds.  That means a restart straight after a
-    stop can trip the probe while the address is in TIME_WAIT on
-    Windows — the same accepted tradeoff as the TCP probe, and the
-    late-bind error in :meth:`WebBridge.start` still names the
-    address if the server itself cannot bind.
+    on POSIX: an ``AF_INET`` socket with ``SO_REUSEADDR``, so a socket
+    merely in TIME_WAIT does not trip the check.  Windows gets a
+    different probe (see :func:`_check_web_console_bind_windows`):
+    ``SO_REUSEADDR`` there lets a socket bind a port that a live
+    listener already holds, so a bind probe cannot tell a live
+    listener from a recently closed connection in TIME_WAIT.
     """
+    if sys.platform == "win32":
+        _check_web_console_bind_windows(host, port)
+        return
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        # On Windows SO_REUSEADDR lets a socket bind a port that another
-        # live listener already holds, so the probe would pass when it
-        # should fail. Only enable it where it means "TIME_WAIT is fine"
-        # (POSIX).
-        if sys.platform != "win32":
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEADDR here means "TIME_WAIT is fine" (POSIX). Windows
+        # never reaches this branch (see above).
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
     except OSError as exc:
         raise _web_console_bind_error(host, port, exc) from exc
     finally:
         sock.close()
+
+
+def _check_web_console_bind_windows(host: str, port: int) -> None:
+    """Windows console probe: connect, do not bind.
+
+    A bind probe cannot work on Windows: ``SO_REUSEADDR`` there lets a
+    socket bind a port that a live listener already holds, and omitting
+    it makes the probe trip on a recently closed connection in
+    TIME_WAIT — while the server itself binds with ``SO_REUSEADDR``
+    (``_WebServer.allow_reuse_address``), so the late-bind path cannot
+    catch the collision either.  Connecting instead distinguishes the
+    two cases: a live listener completes the handshake, while a port
+    left in TIME_WAIT refuses the connection.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except ConnectionRefusedError:
+        return
+    except OSError as exc:
+        raise _web_console_bind_error(host, port, exc) from exc
+    raise WebBridgeError(
+        f"web console port {port} on {host} is already in use; "
+        "another tau node (or another process) is already "
+        "listening there. Stop it, or choose a different "
+        "console port with --http"
+    )
 
 
 def _is_local_origin(origin: str) -> bool:
