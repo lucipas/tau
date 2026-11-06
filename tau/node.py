@@ -601,6 +601,15 @@ class TauNode:
             if not force and now - self._last_peer_save < _PEER_SAVE_INTERVAL:
                 return
             try:
+                # Drop peers we have not heard from in a while, so the
+                # registry (and every sweep over it, e.g. mail flush) does
+                # not accumulate dead entries forever.  Peers with queued
+                # mail are spared: fresh mail for a long-unseen peer must
+                # not be stranded by the prune.
+                owed = {entry.to for entry in self.mailbox.outbox_list()}
+                dropped = self.registry.prune(keep=owed)
+                if dropped:
+                    log.debug("Pruned %d stale peer(s) from the registry", dropped)
                 self.registry.save()
                 self._last_peer_save = now
             except OSError:

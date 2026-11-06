@@ -74,3 +74,26 @@ def test_node_cannot_be_restarted_after_shutdown(tmp_path):
     node._shutdown = True
     with pytest.raises(NodeError, match="cannot be restarted"):
         node.start()
+
+
+def test_save_peers_prunes_stale_peers_but_keeps_owed_ones(tmp_path):
+    node = make_node(tmp_path)
+    stale = make_peer("stale")
+    fresh = make_peer("fresh")
+    owed = make_peer("owed")
+    node.registry.upsert(
+        stale.destination_hash, stale.public_key, name="stale", now=1.0
+    )
+    node.registry.upsert(fresh.destination_hash, fresh.public_key, name="fresh")
+    node.registry.upsert(owed.destination_hash, owed.public_key, name="owed", now=1.0)
+    node.mailbox.enqueue(to=owed.destination_hash, text="hello")
+
+    node._save_peers(force=True)
+
+    assert node.registry.get(stale.destination_hash) is None
+    assert node.registry.get(fresh.destination_hash) is not None
+    assert node.registry.get(owed.destination_hash) is not None
+
+    reloaded = PeerRegistry(node.registry.path)
+    assert reloaded.get(stale.destination_hash) is None
+    assert len(reloaded) == 2
