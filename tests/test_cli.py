@@ -723,6 +723,16 @@ def test_parser_outbox_subcommands():
     assert cancelled.target == "abcdef12"
     assert cancelled.func is cli.cmd_outbox_cancel
 
+    retried = parser.parse_args(["outbox", "retry", "abcdef12"])
+    assert retried.outbox_command == "retry"
+    assert retried.target == "abcdef12"
+    assert retried.func is cli.cmd_outbox_retry
+
+    retried_all = parser.parse_args(["outbox", "retry"])
+    assert retried_all.outbox_command == "retry"
+    assert retried_all.target is None
+    assert retried_all.func is cli.cmd_outbox_retry
+
 
 def test_outbox_held_empty(tmp_path, capsys):
     data_dir = tmp_path / "node"
@@ -906,6 +916,252 @@ def test_outbox_cancel_ambiguous_prefix_is_an_error(tmp_path, capsys):
     assert code == 1
     assert "2 queued messages match prefix" in capsys.readouterr().err
     assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
+
+
+class _FakeRetryNode:
+    """Stub TauNode for `tau outbox retry`: records the flush call and,
+    when ``deliver`` is set, removes every queued entry from the shared
+    mailbox file to simulate a successful delivery."""
+
+    instances: list = []
+    summary = {"delivered": 0, "deposited": 0, "received": 0}
+    deliver = False
+
+    def __init__(self, config, **kwargs):
+        from tau.mailbox import Mailbox
+
+        self.config = config
+        self.mailbox = Mailbox(config.mailbox_path)
+        self.started = False
+        self.start_kwargs: dict = {}
+        self.flush_calls: list = []
+        _FakeRetryNode.instances.append(self)
+
+    def start(self, **kwargs):
+        self.started = True
+        self.start_kwargs = kwargs
+
+    def stop(self):
+        self.started = False
+
+    def flush_outbox(self, **kwargs):
+        self.flush_calls.append(kwargs)
+        if _FakeRetryNode.deliver:
+            target = kwargs.get("to")
+            for entry in self.mailbox.outbox_list():
+                if target is None or entry.to == target:
+                    self.mailbox.remove_outbox(entry.id)
+        return dict(_FakeRetryNode.summary)
+
+
+def _seed_retry_outbox(data_dir):
+    """Two queued entries for two different recipients, both registered."""
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(b"\xbb" * 16, b"\x02" * 64, name="bob", now=100.0)
+    registry.upsert(b"\xcc" * 16, b"\x03" * 64, name="carol", now=100.0)
+    registry.save()
+    box = Mailbox(config.mailbox_path)
+    first = box.enqueue(to=b"\xbb" * 16, text="for bob", message_id="aa" + "11" * 15)
+    second = box.enqueue(
+        to=b"\xcc" * 16, text="for carol", message_id="bb" + "22" * 15
+    )
+    return config, box, first, second
+
+
+def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, _, _ = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {"delivered": 2, "deposited": 0, "received": 0}
+    _FakeRetryNode.deliver = True
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == 2
+    assert payload["still_queued"] == 0
+    assert len(_FakeRetryNode.instances) == 1
+    node = _FakeRetryNode.instances[0]
+    assert node.started is False
+    # No background mail loop: the retry owns the only flush, so the
+    # loop's first sweep cannot take the mail lock and make this flush
+    # silently report nothing moved.
+    assert node.start_kwargs == {"mail_loop": False}
+    assert node.flush_calls == [
+        {
+            "timeout": 6.0,
+            "max_peers": cli.MAIL_SWEEP_PEERS,
+            "respect_backoff": False,
+            "to": None,
+            "wait_for_lock": 60.0,
+        }
+    ]
+    assert Mailbox(config.mailbox_path).outbox_list() == []
+
+
+def test_outbox_retry_counts_delivery_by_a_concurrent_round(
+    tmp_path, capsys, monkeypatch
+):
+    """The outcome is read from the queue, not the flush summary.
+
+    An announce-triggered mail round can deliver a queued message
+    before (or instead of) this command's own flush; the flush then
+    reports zero deliveries while the queue shows the message is gone.
+    The retry must still report it delivered.
+    """
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, _, _ = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    # A concurrent round delivered both entries; our own flush moved nothing.
+    _FakeRetryNode.summary = {"delivered": 0, "deposited": 0, "received": 0}
+    _FakeRetryNode.deliver = True
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == 2
+    assert payload["still_queued"] == 0
+    assert Mailbox(config.mailbox_path).outbox_list() == []
+
+
+def test_outbox_retry_all_reports_still_queued(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {"delivered": 0, "deposited": 1, "received": 0}
+    _FakeRetryNode.deliver = False
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retried 2 queued message(s): 0 delivered, 1 deposited, 0 received" in out
+    assert "2 message(s) still queued" in out
+
+
+def test_outbox_retry_target_only_contacts_that_recipient(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, first, second = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {"delivered": 1, "deposited": 0, "received": 0}
+    _FakeRetryNode.deliver = True
+
+    code = cli.main(
+        ["outbox", "retry", "--data-dir", str(data_dir), "--json", first.id[:8]]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == first.id
+    assert payload["target_delivered"] is True
+    node = _FakeRetryNode.instances[0]
+    assert node.flush_calls == [
+        {
+            "timeout": 6.0,
+            "max_peers": None,
+            "respect_backoff": False,
+            "to": b"\xbb" * 16,
+            "wait_for_lock": 60.0,
+        }
+    ]
+    # Only the targeted entry was delivered; the other stays queued.
+    assert [e.id for e in Mailbox(config.mailbox_path).outbox_list()] == [
+        second.id
+    ]
+
+
+def test_outbox_retry_target_reports_still_queued(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    _, _, first, _ = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+    _FakeRetryNode.summary = {"delivered": 0, "deposited": 0, "received": 0}
+    _FakeRetryNode.deliver = False
+
+    code = cli.main(
+        ["outbox", "retry", "--data-dir", str(data_dir), first.id[:8]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "still queued: aa111111 for bob (attempt 0, next try now)" in out
+
+
+def test_outbox_retry_empty_does_not_start_a_node(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Outbox is empty" in capsys.readouterr().out
+    assert _FakeRetryNode.instances == []
+
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["still_queued"] == 0
+    assert _FakeRetryNode.instances == []
+
+
+def test_outbox_retry_unknown_and_ambiguous(tmp_path, capsys, monkeypatch):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config, _, _, _ = _seed_retry_outbox(data_dir)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+
+    code = cli.main(
+        ["outbox", "retry", "--data-dir", str(data_dir), "ff" * 16]
+    )
+    assert code == 1
+    assert "unknown queued message" in capsys.readouterr().err
+    assert _FakeRetryNode.instances == []
+    assert len(Mailbox(config.mailbox_path).outbox_list()) == 2
+
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=b"\xbb" * 16, text="third", message_id="aa" + "33" * 15)
+    code = cli.main(["outbox", "retry", "--data-dir", str(data_dir), "aa"])
+    assert code == 1
+    assert "2 queued messages match prefix" in capsys.readouterr().err
+    assert _FakeRetryNode.instances == []
+
+
+def test_outbox_retry_recipient_not_in_registry(tmp_path, capsys, monkeypatch):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    entry = box.enqueue(
+        to=b"\xbb" * 16, text="no such peer", message_id="aa" + "11" * 15
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetryNode)
+    _FakeRetryNode.instances.clear()
+
+    code = cli.main(
+        ["outbox", "retry", "--data-dir", str(data_dir), entry.id[:8]]
+    )
+    assert code == 1
+    assert "not in the peer registry" in capsys.readouterr().err
+    assert _FakeRetryNode.instances == []
+
+
 def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
     """A late console bind failure stops the node (issue #36)."""
     import socket

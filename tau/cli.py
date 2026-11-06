@@ -34,6 +34,7 @@ from .identity import (
 from .inbox import Inbox
 from .mailbox import Mailbox, MailboxError
 from .node import (
+    MAIL_SWEEP_PEERS,
     InstanceAlreadyRunning,
     InstanceLock,
     NodeError,
@@ -416,6 +417,26 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="message id or unique id prefix"
     )
     outbox_cancel.set_defaults(func=cmd_outbox_cancel)
+
+    outbox_retry = outbox_sub.add_parser(
+        "retry",
+        parents=[common],
+        help="try delivering queued messages now, ignoring backoff",
+    )
+    outbox_retry.add_argument(
+        "target",
+        metavar="ID",
+        nargs="?",
+        default=None,
+        help="message id or unique id prefix (default: retry everything queued)",
+    )
+    outbox_retry.add_argument(
+        "--timeout",
+        type=float,
+        default=6.0,
+        help="seconds to wait per peer contact (default: 6.0)",
+    )
+    outbox_retry.set_defaults(func=cmd_outbox_retry)
 
     allowlist = subparsers.add_parser(
         "allowlist",
@@ -2337,6 +2358,134 @@ def cmd_outbox_cancel(args: argparse.Namespace) -> int:
             "note: sealed copies already held by other peers may still be"
             " delivered; cancelling stops this node's future attempts."
         )
+    return _EXIT_OK
+
+
+def cmd_outbox_retry(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    target_entry = None
+    if getattr(args, "target", None):
+        try:
+            target_entry = mailbox.resolve_outbox(args.target)
+        except MailboxError as exc:
+            raise NodeError(str(exc)) from exc
+    elif mailbox.counts()["outbox"] == 0:
+        # No work to do: do not start a node just to report an empty queue.
+        if _json_mode(args):
+            _emit(
+                {"delivered": 0, "deposited": 0, "received": 0, "still_queued": 0},
+                True,
+            )
+        else:
+            print("Outbox is empty — nothing waiting on offline peers.")
+        return _EXIT_OK
+
+    target_to = None
+    target_name = None
+    if target_entry is not None:
+        peer = registry.get(target_entry.to)
+        if peer is None:
+            raise NodeError(
+                "recipient "
+                f"{target_entry.to_name or target_entry.to_hex} is not in the"
+                " peer registry — there is no route to retry delivery on"
+            )
+        target_to = target_entry.to
+        target_name = peer.display_name or target_entry.to_name
+
+    # One-shot attempt, like `tau send`: a transient node shares the data
+    # directory with a running serve by design, and the flush ignores
+    # backoff — the operator asked for a retry *now*, not at the next
+    # scheduled attempt.  The node runs without its background mail loop
+    # so the loop's first sweep cannot take the mail lock and make this
+    # flush silently report nothing moved; the flush waits briefly for
+    # an announce-triggered round instead.  A round that wins the race
+    # still moves the mail, so the outcome below is read back from the
+    # queue itself rather than trusted from the flush summary alone:
+    # entries that vanished (and had not expired) were delivered, and
+    # new holders on the entries left behind are deposits.
+    queued_before = {e.id: e for e in mailbox.outbox_list()}
+    node = TauNode(config, name=config.name)
+    node.start(mail_loop=False)
+    try:
+        summary = node.flush_outbox(
+            timeout=float(getattr(args, "timeout", 6.0)),
+            max_peers=None if target_to is not None else MAIL_SWEEP_PEERS,
+            respect_backoff=False,
+            to=target_to,
+            # A single announce-triggered round for one peer finishes in
+            # seconds when the peer is reachable; only a round stuck on
+            # per-request timeouts to an unreachable peer can run long,
+            # and then there is nothing this flush could have delivered
+            # anyway, so waiting longer buys nothing.
+            wait_for_lock=60.0,
+        )
+    finally:
+        node.stop()
+
+    # The node's mailbox is a separate instance on the same file, so reload
+    # before reporting what is still queued.
+    mailbox.load()
+    now = time.time()
+    remaining = mailbox.outbox_list()
+    remaining_ids = {e.id for e in remaining}
+    delivered = sum(
+        1
+        for entry_id, entry in queued_before.items()
+        if entry_id not in remaining_ids and entry.expires_at > now
+    )
+    deposited = summary["deposited"]
+    for entry in remaining:
+        prior = queued_before.get(entry.id)
+        if prior is not None:
+            deposited += len(set(entry.held_by) - set(prior.held_by))
+    payload: Dict[str, Any] = {
+        "delivered": delivered,
+        "deposited": deposited,
+        "received": summary["received"],
+        "still_queued": len(remaining),
+    }
+    fresh = None
+    if target_entry is not None:
+        fresh = mailbox.get_outbox(target_entry.id)
+        payload["target"] = target_entry.id
+        payload["target_delivered"] = fresh is None
+        if fresh is not None:
+            payload["target_attempts"] = fresh.attempts
+            payload["target_next_attempt_at"] = fresh.next_attempt_at
+
+    if _json_mode(args):
+        _emit(payload, True)
+    elif target_entry is not None:
+        label = f"{target_entry.id[:8]} for {target_name or target_entry.to_hex}"
+        if fresh is None:
+            print(f"delivered {label}")
+        else:
+            next_try = fresh.next_attempt_at
+            if next_try is None or next_try <= time.time():
+                next_text = "now"
+            else:
+                next_text = f"in {_ago(next_try - time.time())}"
+            print(f"still queued: {label} (attempt {fresh.attempts}, next try {next_text})")
+            if deposited:
+                print(
+                    f"  left a sealed copy with {deposited} peer(s)"
+                    " for store-and-forward delivery"
+                )
+    else:
+        print(
+            f"retried {len(queued_before)} queued message(s):"
+            f" {delivered} delivered,"
+            f" {deposited} deposited,"
+            f" {summary['received']} received"
+        )
+        if remaining:
+            print(
+                f"{len(remaining)} message(s) still queued — they will be"
+                " retried automatically, or run `tau outbox retry` again"
+            )
     return _EXIT_OK
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import RNS
@@ -282,6 +283,92 @@ def test_flush_outbox_prefers_direct_peers(tmp_path):
     node.flush_outbox()
 
     assert order == [direct.hexhash, destination.hex()]
+
+
+def test_flush_outbox_to_filter_contacts_only_that_peer(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    alice = make_peer("alice")
+    bob = make_peer("bob")
+    node.registry.upsert(
+        alice.destination_hash, alice.public_key, name="alice", now=100.0
+    )
+    node.registry.upsert(bob.destination_hash, bob.public_key, name="bob", now=100.0)
+    node.mailbox.enqueue(
+        to=alice.destination_hash, text="for alice", message_id="aa" + "11" * 15
+    )
+
+    calls = []
+
+    def _flush_peer(peer, timeout, **kwargs):
+        calls.append((peer.hexhash, kwargs.get("respect_backoff")))
+        return {"delivered": 0, "deposited": 0}
+
+    node._flush_peer = _flush_peer
+    node._collect_mail = lambda p, timeout: 0
+
+    # A retry aimed at bob must not spend its budget on alice.
+    node.flush_outbox(to=bob.destination_hash, respect_backoff=False)
+    assert calls == [(bob.hexhash, False)]
+
+    node.flush_outbox(to=alice.destination_hash, respect_backoff=False)
+    assert calls == [(bob.hexhash, False), (alice.hexhash, False)]
+
+    # An unknown recipient contacts nobody instead of sweeping the registry.
+    node.flush_outbox(to=b"\x00" * 16, respect_backoff=False)
+    assert calls == [(bob.hexhash, False), (alice.hexhash, False)]
+
+
+def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=100.0
+    )
+    node.mailbox.enqueue(
+        to=peer.destination_hash, text="for alice", message_id="aa" + "11" * 15
+    )
+
+    calls = []
+    node._flush_peer = lambda p, timeout, **_kwargs: (
+        calls.append(p.hexhash),
+        {"delivered": 0, "deposited": 0},
+    )[1]
+    node._collect_mail = lambda p, timeout: 0
+
+    # A background round holding the lock makes a plain flush skip.
+    node._mail_lock.acquire()
+    try:
+        assert node.flush_outbox() == {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+        }
+        assert calls == []
+    finally:
+        node._mail_lock.release()
+
+    # With wait_for_lock, the same flush waits for the round to finish
+    # and then runs instead of reporting nothing moved.
+    acquired = threading.Event()
+
+    def _hold_then_release():
+        node._mail_lock.acquire()
+        acquired.set()
+        time.sleep(0.2)
+        node._mail_lock.release()
+
+    holder = threading.Thread(target=_hold_then_release)
+    holder.start()
+    assert acquired.wait(timeout=5.0)
+    assert node.flush_outbox(wait_for_lock=5.0) == {
+        "delivered": 0,
+        "deposited": 0,
+        "received": 0,
+    }
+    holder.join(timeout=5.0)
+    assert calls == [peer.hexhash]
 def test_deliver_entry_skips_message_cancelled_by_another_process(
     tmp_path, monkeypatch
 ):

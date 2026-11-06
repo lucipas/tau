@@ -250,6 +250,7 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
+| `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
@@ -439,6 +440,9 @@ retrying its deposit cannot resurrect the copy. `tau outbox cancel ID`
 takes a queued message back — it stops this node's future delivery
 attempts and deposits, but sealed copies already held by other peers
 may still reach the recipient, since the sender cannot recall them.
+`tau outbox retry [ID]` forces a delivery attempt now instead of waiting
+out the backoff — for one queued message by id or prefix, or for the
+whole queue — and reports what was delivered, deposited and received.
 `tau send --no-queue` restores the old fail-fast behaviour. A message
 sent from the web console shows as `queued` while it waits, and flips
 to `delivered` in the feed as soon as the sweep delivers it.
