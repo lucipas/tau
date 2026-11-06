@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -9,10 +11,12 @@ import urllib.request
 
 import pytest
 
+from tau.mailbox import Mailbox
 from tau.peers import Peer
-from tau.webapi import WebBridge, WebBridgeError
+from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
 
 PEER_HASH = "ab" * 16
+OTHER_HASH = "cd" * 16
 
 
 class FakeRegistry:
@@ -22,10 +26,17 @@ class FakeRegistry:
     def all(self, max_age=None):
         return list(self._peers)
 
+    def get(self, destination_hash):
+        for peer in self._peers:
+            if peer.destination_hash == destination_hash:
+                return peer
+        return None
+
 
 class FakeNode:
-    def __init__(self):
+    def __init__(self, mailbox_path=None):
         self.name = "tester"
+        self.mailbox = Mailbox(mailbox_path)
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -70,8 +81,8 @@ class FakeNode:
 
 
 @pytest.fixture()
-def node():
-    return FakeNode()
+def node(tmp_path):
+    return FakeNode(tmp_path / "mailbox.json")
 
 
 @pytest.fixture()
@@ -479,6 +490,186 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def _queue(node, to_hex, text, message_id=None):
+    return node.mailbox.enqueue(
+        to=bytes.fromhex(to_hex),
+        text=text,
+        message_id=message_id,
+    )
+
+
+def test_outbox_empty(bridge):
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert payload == {"outbox": [], "count": 0, "held_for_others": 0}
+
+
+def test_outbox_lists_entries_with_names(bridge, node):
+    first = _queue(node, PEER_HASH, "hello alice")
+    second = _queue(node, OTHER_HASH, "hello stranger")
+    node.mailbox.record_attempt(first.id, error="no route")
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert payload["count"] == 2
+    assert payload["held_for_others"] == 0
+    by_id = {entry["id"]: entry for entry in payload["outbox"]}
+    assert by_id[first.id]["to_name"] == "alice"
+    assert by_id[first.id]["attempts"] == 1
+    assert by_id[first.id]["last_error"] == "no route"
+    assert by_id[first.id]["held_by"] == []
+    # Unknown destination: falls back to the name stored at enqueue time.
+    assert by_id[second.id]["to"] == OTHER_HASH
+    assert by_id[second.id]["to_name"] == ""
+    assert by_id[second.id]["text"] == "hello stranger"
+
+
+def test_outbox_cancel_by_id_and_prefix(bridge, node):
+    first = _queue(node, PEER_HASH, "first")
+    second = _queue(node, PEER_HASH, "second")
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": first.id}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["cancelled"]["id"] == first.id
+    assert payload["cancelled"]["to_name"] == "alice"
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/cancel",
+        method="POST",
+        body={"target": second.id[:8]},
+    )
+    assert status == 200
+    assert payload["cancelled"]["id"] == second.id
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert payload == {"outbox": [], "count": 0, "held_for_others": 0}
+
+
+def test_outbox_cancel_errors(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/cancel",
+        method="POST",
+        body={"target": "ff" * 16},
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+    # Two entries sharing a prefix make the prefix ambiguous.
+    _queue(node, PEER_HASH, "one", message_id="aa" + "11" * 15)
+    _queue(node, PEER_HASH, "two", message_id="aa" + "22" * 15)
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": "aa"}
+    )
+    assert status == 404
+    assert "match prefix" in payload["error"]["message"]
+
+    # Cancelling an entry that left the outbox meanwhile is a 404 too.
+    gone = _queue(node, PEER_HASH, "gone", message_id="bb" + "33" * 15)
+    assert node.mailbox.remove_outbox(gone.id) is True
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": gone.id}
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+
+def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
+    from tau.mailbox import Mailbox
+
+    other = Mailbox(tmp_path / "mailbox.json")
+    entry = other.enqueue(to=bytes.fromhex(PEER_HASH), text="queued by cli")
+    # The serving node's in-memory snapshot predates the other process.
+    assert node.mailbox.get_outbox(entry.id) is None
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert status == 200
+    assert [item["id"] for item in payload["outbox"]] == [entry.id]
+    assert payload["outbox"][0]["to_name"] == "alice"
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/cancel", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["cancelled"]["id"] == entry.id
+    # A fresh view of the file agrees the entry is gone.
+    assert Mailbox(tmp_path / "mailbox.json").get_outbox(entry.id) is None
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _hold_port(port: int) -> socket.socket:
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", port))
+    holder.listen(1)
+    return holder
+
+
+def test_check_web_console_bind_passes_on_free_port():
+    check_web_console_bind("127.0.0.1", _free_port())
+
+
+def test_check_web_console_bind_names_held_port():
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        with pytest.raises(WebBridgeError) as excinfo:
+            check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
+
+
+def test_check_web_console_bind_windows_names_live_listener(monkeypatch):
+    # The Windows probe connects instead of binding: a live listener
+    # completes the handshake, so the probe must report it.
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(WebBridgeError) as excinfo:
+            check_web_console_bind("127.0.0.1", port)
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
+
+
+def test_check_web_console_bind_windows_passes_on_free_port(monkeypatch):
+    # ...while a free port refuses the connection, so the probe passes
+    # even where a TIME_WAIT straggler could linger.
+    monkeypatch.setattr(sys, "platform", "win32")
+    check_web_console_bind("127.0.0.1", _free_port())
+
+
+def test_bridge_start_names_held_port_instead_of_raw_oserror(node):
+    port = _free_port()
+    holder = _hold_port(port)
+    try:
+        bridge = WebBridge(node, host="127.0.0.1", port=port)
+        with pytest.raises(WebBridgeError) as excinfo:
+            bridge.start()
+    finally:
+        holder.close()
+    assert f"web console port {port} on 127.0.0.1 is already in use" in str(
+        excinfo.value
+    )
 def _queue_send(node, mail_id="mail-1"):
     """Make the fake node report a queued send with the given outbox id."""
 

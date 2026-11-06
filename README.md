@@ -127,6 +127,8 @@ The same bridge is the local integration point for scripts:
 | `/api/peers` | GET | peer registry |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/outbox` | GET | queued mail waiting on offline peers |
+| `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
@@ -196,9 +198,19 @@ tau tan post --to alice "direct delivery"
 tau tan timeline --all
 tau tan timeline --author alice
 
+# Search stored posts by keyword (local only, newest first)
+tau tan search mesh --limit 10
+tau tan search mesh --author alice
+
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
+
+# Back up your posts (or every cached author's) and restore them later —
+# every entry's signature and hash are re-verified on import
+tau tan export --output tan-backup.json
+tau tan export --all --output tan-backup.json
+tau tan import tan-backup.json
 ```
 
 Posts are limited to 2,000 characters and 20 posts per feed response. A
@@ -235,21 +247,28 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
-| `tau peers` | List peers from the local registry |
+| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
+| `tau allowlist` | Show or change who may send this node direct messages |
+| `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
+| `tau id export --to PATH` | Back up the node identity to a file |
+| `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
 | `tau tan sync` | Pull missing posts from known peers |
+| `tau tan export` | Back up stored Tan posts as a JSON export |
+| `tau tan import FILE` | Restore Tan posts from a JSON export |
 | `tau tan rules` | Show or change which remote entries get committed |
 
 Useful flags:
@@ -312,8 +331,19 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
     └── storage/          # Reticulum internals (paths, ratchets, ...)
 ```
 
-Back up `identity` if you want to keep the same address. Anyone who reads it
-can impersonate the node and decrypt its traffic, so keep it private.
+Back up `identity` if you want to keep the same address:
+
+```bash
+tau id export --to ~/tau-identity.backup   # atomic write, chmod 600
+tau id import --from ~/tau-identity.backup # into a fresh data directory
+```
+
+`export` refuses to overwrite an existing backup unless `--force` is given.
+`import` validates the file first, refuses to replace an existing identity
+unless `--force` is given, and refuses while a node is serving on the same
+data directory. It prints the imported destination hash so you can verify it
+matches the old node. Anyone who reads the backup can impersonate the node
+and decrypt its traffic, so keep it private.
 
 ## How it works
 
@@ -344,6 +374,22 @@ mesh. Every tau node that hears it stores the peer in `peers.json` and updates
 its path table. A node that is asked to message an unknown destination sends a
 Reticulum path request and waits for the announce before giving up.
 
+Announces are not the only way to learn about a peer. After every mail round
+with a peer, the node also asks it for the peers *it* knows (`/tau/peers`) and
+merges the answer into its own registry — peer exchange. Each exchanged record
+carries the peer's public key, and the receiver verifies the key derives the
+reported destination hash before trusting it; records for our own destination,
+malformed records and records older than the 7-day prune horizon are dropped.
+A peer we already know keeps its own liveness record — a third party's claim
+never refreshes it, and only a missing name is filled in. A reported name that
+collides with another known peer's name is dropped, so a reporter cannot shadow
+a peer's name. Peers learned only through exchange are marked as such until
+they are heard directly: mail sweeps rank directly heard peers ahead of them,
+and the background sweep asks a few quiet known peers for their lists every 15
+minutes, so discovery does not depend on announces alone. Peers owed mail or
+pending acks are never evicted by the registry cap to make room for gossip.
+`tau peers --exchange [--to NAME|HASH]` runs the same exchange on demand.
+
 ### Messaging
 
 Messages use a fresh encrypted `RNS.Link` per request. The client announces
@@ -356,7 +402,7 @@ request paths are implemented:
 | `/tau/ping` | `{}` | `{"ok": true, "pong": true, "server": ..., "time": ...}` |
 | `/tau/info` | `{}` | name, destination, versions, uptime, peer/interface counts |
 | `/tau/message` | `{"type": "message", "v": 1, "text": "...", "sent_at": ...}` | `{"ok": true, "echo": "...", "server": ..., "node": ...}` |
-| `/tau/peers` | `{}` | up to 100 public peer records |
+| `/tau/peers` | `{}` | up to 100 peer records, each with its public key (verified against its destination hash on receipt) |
 | `/tau/mail/store` | `{"type": "mail_store", "to": ..., "id": ..., "blob": ..., "expires_at": ...}` | hold a sealed message for an offline peer |
 | `/tau/mail/fetch` | `{"type": "mail_fetch", "ack": [...]}` | hand over held mail for the caller, dropping acked ids |
 
@@ -383,10 +429,13 @@ next retry time; `tau outbox held` shows the sealed envelopes this node
 is holding for other peers, and `tau outbox drop-held ID` drops one (a
 copy already fetched by the recipient may still be delivered). A drop
 is remembered until the envelope would have expired, so a sender
-retrying its deposit cannot resurrect the copy. `tau send --no-queue`
-restores the old fail-fast behaviour. A message sent from the web
-console shows as `queued` while it waits, and flips to `delivered` in
-the feed as soon as the sweep delivers it.
+retrying its deposit cannot resurrect the copy. `tau outbox cancel ID`
+takes a queued message back — it stops this node's future delivery
+attempts and deposits, but sealed copies already held by other peers
+may still reach the recipient, since the sender cannot recall them.
+`tau send --no-queue` restores the old fail-fast behaviour. A message
+sent from the web console shows as `queued` while it waits, and flips
+to `delivered` in the feed as soon as the sweep delivers it.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:
@@ -493,6 +542,35 @@ cannot be parsed fails closed (remote entries denied) rather than
 silently opening the node up. A running `serve` applies saved rules
 when it restarts.
 
+### DM allow-list
+
+Direct messages are open by default, like Tan posts. The owner can
+restrict them to known senders with an allow-list, stored as
+`allowlist.json` in the data directory (mode `0600`) and managed via
+the CLI:
+
+```bash
+tau allowlist list             # show whether the list is enforced and who is on it
+tau allowlist add alice        # allow DMs from alice (name, hash or hash prefix)
+tau allowlist remove alice     # stop allowing DMs from alice
+tau allowlist on               # enforce the list: unlisted senders get not_allowed
+tau allowlist off              # stop enforcing; anyone may message again
+```
+
+When enforced, a message from an unlisted sender is rejected with a
+`not_allowed` error and is never stored, never marked seen, and never
+passed to the message callback — so admitting the sender later and
+having them resend delivers it normally. The same check applies to
+messages delivered through store-and-forward: a sealed copy from an
+unlisted sender is dropped on collection, not delivered. An explicit
+denial is also not queued: `tau send` to a node that rejects you
+fails with an error instead of leaving a message in the outbox to
+retry until its TTL expires. The sender's identity is the verified
+destination hash from the request, so it cannot be spoofed. A list
+file that cannot be parsed fails closed (nobody admitted) rather than
+silently opening the node up. A running `serve` applies saved changes
+when it restarts.
+
 `--kinds` is display-only, on purpose: it selects which entry kinds
 your timeline views present (hiding reactions also hides their like
 counts), but every kind from an admitted author is still stored.
@@ -508,8 +586,9 @@ unlinked, and stall sync at the gap.
   so compare destination hashes out of band when it matters.
 - **Open by default.** The request handlers use `ALLOW_ALL`: any node that can
   reach the destination may send a message or a Tan post. This is appropriate
-  for a mesh chat; deployments that need allow-lists should add one in
-  `TauNode._handle_message` and `TanApp._handle_post`.
+  for a mesh chat. Owners who want to restrict direct messages can turn on
+  the DM allow-list (`tau allowlist on`, see below); Tan posts are governed
+  separately by the admission ruleset.
 - **Posts are signed and hash-chained.** Tan validates every post before it is
   stored, rejects edits, impersonation and broken chains, and can verify posts
   that were relayed by a third party. Names are still self-asserted.
@@ -545,6 +624,8 @@ unlinked, and stall sync at the gap.
   deletes) unlinked on the old peer until it upgrades and resyncs.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
+  Back up your own chain with `tau tan export` and restore it with
+  `tau tan import` — every entry is re-verified on import.
 - Peer information is self-asserted and can be stale; prune with
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.

@@ -43,10 +43,17 @@ def load_identity(path: Path) -> Optional[RNS.Identity]:
     return identity
 
 
-def save_identity(identity: RNS.Identity, path: Path) -> Path:
-    """Persist an identity atomically with owner-only permissions."""
+def save_identity(
+    identity: RNS.Identity, path: Path, restrict_parent: bool = True
+) -> Path:
+    """Persist an identity atomically with owner-only permissions.
+
+    ``restrict_parent=False`` leaves an existing parent directory's
+    permissions alone (used for backups written into a caller-selected
+    folder); a newly created parent is still private.
+    """
     path = Path(path).expanduser()
-    ensure_dir(path.parent)
+    ensure_dir(path.parent, restrict_existing=restrict_parent)
     fd, tmp_name = mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
@@ -60,7 +67,7 @@ def save_identity(identity: RNS.Identity, path: Path) -> Path:
             os.unlink(tmp_name)
         except OSError:
             pass
-    atomic_write_bytes(path, data, mode=IDENTITY_FILE_MODE)
+    atomic_write_bytes(path, data, mode=IDENTITY_FILE_MODE, restrict_parent=restrict_parent)
     return path
 
 

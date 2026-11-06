@@ -90,6 +90,28 @@ def test_attempts_and_deposits_are_recorded(tmp_path):
     assert box.remove_outbox(entry.id) is False
 
 
+def test_resolve_outbox_by_full_id_and_prefix(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB, text="find me", message_id="ab" * 16, now=10.0
+    )
+    assert box.resolve_outbox(entry.id) == entry
+    assert box.resolve_outbox(entry.id[:8]) == entry
+    assert box.resolve_outbox(entry.id[:8].upper()) == entry
+
+
+def test_resolve_outbox_rejects_unknown_and_ambiguous(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.enqueue(to=BOB, text="one", message_id="aa" + "11" * 15, now=10.0)
+    box.enqueue(to=BOB, text="two", message_id="aa" + "22" * 15, now=11.0)
+    with pytest.raises(MailboxError, match="unknown queued message"):
+        box.resolve_outbox("ff" * 16)
+    with pytest.raises(MailboxError, match="unknown queued message"):
+        box.resolve_outbox("ff")
+    with pytest.raises(MailboxError, match="2 queued messages match prefix"):
+        box.resolve_outbox("aa")
+    with pytest.raises(MailboxError, match="must not be empty"):
+        box.resolve_outbox("  ")
 def test_delivery_backoff_schedule(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     entry = box.enqueue(to=BOB, text="back off", now=1000.0)
