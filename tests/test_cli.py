@@ -292,6 +292,59 @@ def test_messages_peer_filter_for_unregistered_sender(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["count"] == 0
 
 
+def test_messages_shared_prefix_is_ambiguous(tmp_path, capsys):
+    """A prefix shared by a registered peer and an inbox sender is rejected."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        bytes.fromhex("abcd1111111111111111111111111111"),
+        b"\x02" * 64,
+        name="carol",
+        now=100.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "abcd1111111111111111111111111111",
+            "text": "from the registered peer",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "r-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd2222222222222222222222222222",
+            "text": "from the unregistered sender",
+            "sent_at": 10.0,
+            "received_at": 21.0,
+            "id": "r-2",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--peer", "abcd"])
+    assert code == 1
+    assert "2 senders match the hash prefix" in capsys.readouterr().err
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["r-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd2", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["r-2"]
+
+
 def test_messages_out_of_range_timestamp(tmp_path, capsys):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")

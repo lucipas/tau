@@ -1675,30 +1675,41 @@ def _resolve_inbox_peer(
 ) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
-    Names and registered hashes come from the peer registry; a full
-    destination hash, or a unique prefix of one, may also match a
-    sender stored in the inbox whose registry entry is gone (pruned,
-    or never discovered — a direct message needs no prior announce).
+    A full destination hash filters directly, and an exact name match
+    wins over any prefix.  For a hash prefix, registered peers and
+    senders stored in the inbox are combined before selecting: a
+    prefix shared by two distinct senders is ambiguous, even when one
+    of them is registered and the other is not (pruned, or never
+    discovered — a direct message needs no prior announce).
     """
     target = target.strip()
-    peer = registry.resolve(target)
-    if peer is not None:
-        return peer.hexhash
     if _is_hex32(target):
         return target.lower()
+    peers = registry.all()
+    by_name = [peer for peer in peers if peer.name.casefold() == target.casefold()]
+    if len(by_name) == 1:
+        return by_name[0].hexhash
+    if len(by_name) > 1:
+        raise NodeError(
+            f"{len(by_name)} peers are named {target!r}; use a destination hash"
+        )
     if len(target) >= 4:
         prefix = target.casefold()
         senders = {
+            peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)
+        }
+        senders |= {
             str(entry.get("destination") or "").casefold()
             for entry in inbox.list_messages(limit=None)
-            if entry.get("destination")
+            if str(entry.get("destination") or "")
+            .casefold()
+            .startswith(prefix)
         }
-        matches = sorted(sender for sender in senders if sender.startswith(prefix))
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
+        if len(senders) == 1:
+            return senders.pop()
+        if len(senders) > 1:
             raise NodeError(
-                f"{len(matches)} senders match the hash prefix {target!r}"
+                f"{len(senders)} senders match the hash prefix {target!r}"
             )
     raise NodeError(f"unknown peer: {target!r}")
 
