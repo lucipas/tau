@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import RNS
 import pytest
 
@@ -76,7 +78,7 @@ def test_node_cannot_be_restarted_after_shutdown(tmp_path):
         node.start()
 
 
-def test_save_peers_prunes_stale_peers_but_keeps_owed_ones(tmp_path):
+def test_save_peers_prunes_stale_peers_but_keeps_owed_ones(tmp_path, caplog):
     node = make_node(tmp_path)
     stale = make_peer("stale")
     fresh = make_peer("fresh")
@@ -88,8 +90,10 @@ def test_save_peers_prunes_stale_peers_but_keeps_owed_ones(tmp_path):
     node.registry.upsert(owed.destination_hash, owed.public_key, name="owed", now=1.0)
     node.mailbox.enqueue(to=owed.destination_hash, text="hello")
 
-    node._save_peers(force=True)
+    with caplog.at_level(logging.DEBUG, logger="tau.node"):
+        node._save_peers(force=True)
 
+    assert "Pruned 1 stale peer(s) from the registry" in caplog.text
     assert node.registry.get(stale.destination_hash) is None
     assert node.registry.get(fresh.destination_hash) is not None
     assert node.registry.get(owed.destination_hash) is not None
@@ -97,3 +101,17 @@ def test_save_peers_prunes_stale_peers_but_keeps_owed_ones(tmp_path):
     reloaded = PeerRegistry(node.registry.path)
     assert reloaded.get(stale.destination_hash) is None
     assert len(reloaded) == 2
+
+
+def test_save_peers_keeps_holder_with_pending_acks(tmp_path):
+    node = make_node(tmp_path)
+    holder = make_peer("holder")
+    node.registry.upsert(
+        holder.destination_hash, holder.public_key, name="holder", now=1.0
+    )
+    node.mailbox.add_pending_acks(holder.hexhash, ["message-1"])
+
+    node._save_peers(force=True)
+
+    assert node.registry.get(holder.destination_hash) is not None
+    assert node.mailbox.pending_ack_holders() == [holder.hexhash]

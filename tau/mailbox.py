@@ -537,6 +537,11 @@ class Mailbox:
                 self.save()
             return list(ids)
 
+    def pending_ack_holders(self) -> List[str]:
+        """Hex destination hashes with mail acknowledgements still owed."""
+        with self._lock:
+            return [holder for holder, ids in self._pending_acks.items() if ids]
+
     # -- maintenance -----------------------------------------------------------
 
     def prune(self, *, now: Optional[float] = None) -> Dict[str, int]:

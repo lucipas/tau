@@ -35,7 +35,7 @@ from .mailbox import (
     open_message,
     seal_message,
 )
-from .peers import Peer, PeerError, PeerRegistry
+from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .protocol import (
     APP_NAME,
     ASPECT,
@@ -611,6 +611,15 @@ class TauNode:
                 # snapshot of the shared mailbox and the registry save.
                 with self.mailbox.transaction():
                     owed = {entry.to for entry in self.mailbox.outbox_list()}
+                    # Peers holding mail we have fetched stay too: their
+                    # pending acknowledgements go out with the next fetch.
+                    for holder in self.mailbox.pending_ack_holders():
+                        try:
+                            raw = bytes.fromhex(holder)
+                        except ValueError:
+                            continue
+                        if len(raw) == DESTINATION_HASH_BYTES:
+                            owed.add(raw)
                     dropped = self.registry.prune(keep=owed)
                     if dropped:
                         log.debug("Pruned %d stale peer(s) from the registry", dropped)
