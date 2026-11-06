@@ -44,7 +44,13 @@ from . import __version__
 from .config import MESSAGES_FILE_NAME
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
-from .protocol import MAX_MESSAGE_CHARS, ProtocolError, sanitize_name, short_hash
+from .protocol import (
+    MAX_MESSAGE_CHARS,
+    ProtocolError,
+    normalize_message,
+    sanitize_name,
+    short_hash,
+)
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -536,6 +542,9 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        # Normalize up front so the recorded text is exactly what gets sent
+        # (and is always UTF-8 encodable for the history file).
+        text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.send_message(peer, text, timeout=timeout)
