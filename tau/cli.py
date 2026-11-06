@@ -19,6 +19,7 @@ from . import __version__
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
+    _identity_lock,
     destination_hash,
     load_identity,
     load_or_create_identity,
@@ -1552,11 +1553,15 @@ def cmd_id_export(args: argparse.Namespace) -> int:
         )
     if target.is_dir():
         raise NodeError(f"backup path {target} is a directory")
-    if target.exists() and not getattr(args, "force", False):
+    # lexists, not exists: a dangling symlink at the target counts as an
+    # existing backup and must not be silently replaced without --force.
+    if os.path.lexists(target) and not getattr(args, "force", False):
         raise NodeError(
             f"backup already exists at {target}; pass --force to overwrite it"
         )
-    save_identity(identity, target)
+    # The backup goes into a caller-selected folder: never change that
+    # folder's permissions, only the backup file itself is private.
+    save_identity(identity, target, restrict_parent=False)
     payload = {
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
@@ -1586,17 +1591,27 @@ def cmd_id_import(args: argparse.Namespace) -> int:
     if identity is None:  # pragma: no cover - load_identity returns None only when missing
         raise NodeError(f"no identity backup at {source}")
     config.prepare()
-    if config.identity_path.exists() and not getattr(args, "force", False):
-        raise NodeError(
-            f"an identity already exists at {config.identity_path}; "
-            "pass --force to replace it"
-        )
-    # Replacing the identity file under a running node would corrupt its
-    # session, so refuse while the data directory is in use.
-    probe = InstanceLock(config.instance_lock_path, config.data_dir)
-    probe.acquire()
-    probe.release()
-    save_identity(identity, config.identity_path)
+    # Hold the instance lock across the whole replacement: a node that
+    # starts after the probe but before the write would load the old
+    # identity and then serve with a different identity than the one on
+    # disk.  The identity-creation lock serialises the check-and-write
+    # against a concurrent `tau init` on the same directory.  Lock order
+    # (instance, then identity) matches `TauNode.start`, which takes the
+    # instance lock before loading or creating its identity.
+    # Note the instance lock is POSIX-only (no-op without fcntl), the
+    # same limitation `tau serve` itself accepts.
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        with _identity_lock(config.identity_path):
+            if config.identity_path.exists() and not getattr(args, "force", False):
+                raise NodeError(
+                    f"an identity already exists at {config.identity_path}; "
+                    "pass --force to replace it"
+                )
+            save_identity(identity, config.identity_path)
+    finally:
+        lock.release()
     payload = {
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,

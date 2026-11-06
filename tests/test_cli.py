@@ -229,6 +229,50 @@ def test_id_export_to_identity_file_refused(tmp_path, capsys):
     assert "itself" in capsys.readouterr().err
 
 
+def test_id_export_leaves_existing_parent_permissions_alone(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    backup = shared / "alice.identity"
+    assert (
+        cli.main(["id", "export", "--to", str(backup), "--data-dir", str(node)]) == 0
+    )
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+
+    # A missing parent is still created privately.
+    nested = tmp_path / "new" / "deep" / "alice.identity"
+    assert (
+        cli.main(["id", "export", "--to", str(nested), "--data-dir", str(node)]) == 0
+    )
+    assert stat.S_IMODE(os.stat(nested.parent).st_mode) == 0o700
+
+
+def test_id_export_refuses_dangling_symlink_without_force(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    backup = tmp_path / "backup"
+    os.symlink(tmp_path / "does-not-exist", backup)
+    assert not backup.exists()
+    assert os.path.lexists(backup)
+
+    code = cli.main(["id", "export", "--to", str(backup), "--data-dir", str(node)])
+    assert code == 1
+    assert "already exists" in capsys.readouterr().err
+    assert os.path.islink(backup)
+
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node), "--force"]
+        )
+        == 0
+    )
+    assert not os.path.islink(backup)
+    assert backup.is_file()
+
+
 def test_id_import_rejects_non_identity_file(tmp_path, capsys):
     bad = tmp_path / "bad"
     bad.write_text("not an identity", encoding="utf-8")
