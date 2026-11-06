@@ -237,6 +237,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry |
 | `tau outbox` | List messages queued for offline peers |
+| `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name and destination hash |
 | `tau id export --to PATH` | Back up the node identity to a file |
@@ -504,6 +505,35 @@ cannot be parsed fails closed (remote entries denied) rather than
 silently opening the node up. A running `serve` applies saved rules
 when it restarts.
 
+### DM allow-list
+
+Direct messages are open by default, like Tan posts. The owner can
+restrict them to known senders with an allow-list, stored as
+`allowlist.json` in the data directory (mode `0600`) and managed via
+the CLI:
+
+```bash
+tau allowlist list             # show whether the list is enforced and who is on it
+tau allowlist add alice        # allow DMs from alice (name, hash or hash prefix)
+tau allowlist remove alice     # stop allowing DMs from alice
+tau allowlist on               # enforce the list: unlisted senders get not_allowed
+tau allowlist off              # stop enforcing; anyone may message again
+```
+
+When enforced, a message from an unlisted sender is rejected with a
+`not_allowed` error and is never stored, never marked seen, and never
+passed to the message callback — so admitting the sender later and
+having them resend delivers it normally. The same check applies to
+messages delivered through store-and-forward: a sealed copy from an
+unlisted sender is dropped on collection, not delivered. An explicit
+denial is also not queued: `tau send` to a node that rejects you
+fails with an error instead of leaving a message in the outbox to
+retry until its TTL expires. The sender's identity is the verified
+destination hash from the request, so it cannot be spoofed. A list
+file that cannot be parsed fails closed (nobody admitted) rather than
+silently opening the node up. A running `serve` applies saved changes
+when it restarts.
+
 `--kinds` is display-only, on purpose: it selects which entry kinds
 your timeline views present (hiding reactions also hides their like
 counts), but every kind from an admitted author is still stored.
@@ -519,8 +549,9 @@ unlinked, and stall sync at the gap.
   so compare destination hashes out of band when it matters.
 - **Open by default.** The request handlers use `ALLOW_ALL`: any node that can
   reach the destination may send a message or a Tan post. This is appropriate
-  for a mesh chat; deployments that need allow-lists should add one in
-  `TauNode._handle_message` and `TanApp._handle_post`.
+  for a mesh chat. Owners who want to restrict direct messages can turn on
+  the DM allow-list (`tau allowlist on`, see below); Tan posts are governed
+  separately by the admission ruleset.
 - **Posts are signed and hash-chained.** Tan validates every post before it is
   stored, rejects edits, impersonation and broken chains, and can verify posts
   that were relayed by a third party. Names are still self-asserted.
