@@ -33,7 +33,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 try:  # POSIX only; mailbox cross-process locking is a no-op without it.
     import fcntl
@@ -244,6 +244,8 @@ class HeldEnvelope:
             expires_at, (int, float)
         ):
             raise ValueError("invalid held timestamps")
+        if not math.isfinite(stored_at) or not math.isfinite(expires_at):
+            raise ValueError("non-finite held timestamps")
         return cls(
             id=message_id,
             to=destination,
@@ -292,7 +294,7 @@ class Mailbox:
             try:
                 if self.path is None or fcntl is None:
                     if self.path is not None:
-                        self.load()
+                        self._apply_document()
                     yield
                     return
                 lock_path = self.path.with_name(self.path.name + ".lock")
@@ -300,7 +302,7 @@ class Mailbox:
                 with open(lock_path, "a") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
-                        self.load()
+                        self._apply_document()
                         yield
                     finally:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -327,6 +329,29 @@ class Mailbox:
 
         Returns how many duplicate entries were dropped per collection.
         """
+        dropped = self._apply_document()
+        if not sum(dropped.values()):
+            return dropped
+        log.info(
+            "Found duplicate mailbox entries at %s: %s",
+            self.path,
+            {k: v for k, v in dropped.items() if v},
+        )
+        try:
+            # Re-read and rewrite under the cross-process lock so a write
+            # from another process between our read and write is not lost.
+            with self._transaction():
+                dropped = self._apply_document()
+                if sum(dropped.values()):
+                    self._write_deduplicated()
+        except OSError as exc:
+            # The in-memory state is already deduplicated; a read-only
+            # mailbox must still load.
+            log.warning("Could not persist mailbox dedupe at %s: %s", self.path, exc)
+        return dropped
+
+    def _apply_document(self) -> Dict[str, int]:
+        """Read the mailbox file and replace the in-memory state with it."""
         empty: Dict[str, int] = {"outbox": 0, "held": 0, "pending_acks": 0}
         if self.path is None:
             return dict(empty)
@@ -336,12 +361,80 @@ class Mailbox:
         if not isinstance(raw, dict):
             log.warning("Ignoring mailbox at %s: unexpected format", self.path)
             return dict(empty)
+        state, dropped, _, _ = self._parse_document(raw)
+        with self._lock:
+            self._outbox = state["outbox"]
+            self._held = state["held"]
+            self._seen = state["seen"]
+            self._pending_acks = state["pending_acks"]
+            self._dropped_held = state["dropped_held"]
+        log.debug(
+            "Loaded mailbox from %s: %d outbox, %d held",
+            self.path,
+            len(self._outbox),
+            len(self._held),
+        )
+        return dropped
 
+    def _write_deduplicated(self) -> None:
+        """Rewrite the file minus only the duplicate copies.
+
+        Everything else in the on-disk document (invalid entries, full
+        pending-ack lists) is preserved verbatim rather than being
+        replaced by the filtered in-memory view.
+        """
+        raw = read_json(self.path)
+        if not isinstance(raw, dict):
+            return
+        _, dropped, outbox_drop, held_drop = self._parse_document(raw)
+        if not sum(dropped.values()):
+            return
+        cleaned = dict(raw)
+        if isinstance(raw.get("outbox"), list):
+            cleaned["outbox"] = [
+                e for i, e in enumerate(raw["outbox"]) if i not in outbox_drop
+            ]
+        if isinstance(raw.get("held"), list):
+            cleaned["held"] = [
+                e for i, e in enumerate(raw["held"]) if i not in held_drop
+            ]
+        if isinstance(raw.get("pending_acks"), dict):
+            cleaned_acks: Dict[str, Any] = {}
+            for holder, ids in raw["pending_acks"].items():
+                if isinstance(ids, list):
+                    seen_ids: Set[str] = set()
+                    unique: List[Any] = []
+                    for mid in ids:
+                        if isinstance(mid, str):
+                            if mid in seen_ids:
+                                continue
+                            seen_ids.add(mid)
+                        unique.append(mid)
+                    cleaned_acks[holder] = unique
+                else:
+                    cleaned_acks[holder] = ids
+            cleaned["pending_acks"] = cleaned_acks
+        atomic_write_json(self.path, cleaned, mode=0o600)
+        log.info("Dropped duplicate mailbox entries at %s", self.path)
+
+    def _parse_document(
+        self, raw: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, int], Set[int], Set[int]]:
+        """Parse a raw mailbox document.
+
+        Returns ``(state, dropped, outbox_drop, held_drop)`` where ``state``
+        holds the parsed collections and the two index sets name the list
+        positions of duplicate copies in the raw ``outbox`` / ``held`` lists.
+        """
+        empty: Dict[str, int] = {"outbox": 0, "held": 0, "pending_acks": 0}
         dropped: Dict[str, int] = dict(empty)
+        outbox_drop: Set[int] = set()
+        held_drop: Set[int] = set()
         outbox: Dict[str, OutboxEntry] = {}
+        outbox_index: Dict[str, int] = {}
         entries = raw.get("outbox")
         if isinstance(entries, list):
-            for entry in entries:
+            for index, entry in enumerate(entries):
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -353,13 +446,17 @@ class Mailbox:
                 if existing is not None:
                     dropped["outbox"] += 1
                     if parsed.created_at < existing.created_at:
+                        outbox_drop.add(index)
                         continue
+                    outbox_drop.add(outbox_index[parsed.id])
                 outbox[parsed.id] = parsed
+                outbox_index[parsed.id] = index
 
         held: Dict[str, HeldEnvelope] = {}
+        held_index: Dict[str, int] = {}
         envelopes = raw.get("held")
         if isinstance(envelopes, list):
-            for entry in envelopes:
+            for index, entry in enumerate(envelopes):
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -371,8 +468,11 @@ class Mailbox:
                 if existing_held is not None:
                     dropped["held"] += 1
                     if parsed_held.stored_at < existing_held.stored_at:
+                        held_drop.add(index)
                         continue
+                    held_drop.add(held_index[parsed_held.id])
                 held[parsed_held.id] = parsed_held
+                held_index[parsed_held.id] = index
 
         seen: Dict[str, float] = {}
         raw_seen = raw.get("seen")
@@ -389,12 +489,14 @@ class Mailbox:
             for holder, ids in raw_acks.items():
                 if isinstance(ids, list):
                     kept: List[str] = []
+                    seen_ids: Set[str] = set()
                     for mid in ids:
                         if not isinstance(mid, str):
                             continue
-                        if mid in kept:
+                        if mid in seen_ids:
                             dropped["pending_acks"] += 1
                             continue
+                        seen_ids.add(mid)
                         kept.append(mid)
                     acks[str(holder)] = kept[:100]
 
@@ -407,28 +509,14 @@ class Mailbox:
                 if isinstance(v, (int, float))
             }
 
-        with self._lock:
-            self._outbox = outbox
-            self._held = held
-            self._seen = seen
-            self._pending_acks = acks
-            self._dropped_held = dropped_held
-        log.debug(
-            "Loaded mailbox from %s: %d outbox, %d held",
-            self.path,
-            len(outbox),
-            len(held),
-        )
-        if sum(dropped.values()):
-            log.info(
-                "Dropped duplicate mailbox entries at %s: %s",
-                self.path,
-                {k: v for k, v in dropped.items() if v},
-            )
-            # Persist the cleaned state so the duplicates do not come
-            # back on the next restart.
-            self.save()
-        return dropped
+        state: Dict[str, Any] = {
+            "outbox": outbox,
+            "held": held,
+            "seen": seen,
+            "pending_acks": acks,
+            "dropped_held": dropped_held,
+        }
+        return state, dropped, outbox_drop, held_drop
 
     def save(self) -> bool:
         if self.path is None:
