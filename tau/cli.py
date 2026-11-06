@@ -1592,11 +1592,19 @@ def cmd_id_import(args: argparse.Namespace) -> int:
             "pass --force to replace it"
         )
     # Replacing the identity file under a running node would corrupt its
-    # session, so refuse while the data directory is in use.
-    probe = InstanceLock(config.instance_lock_path, config.data_dir)
-    probe.acquire()
-    probe.release()
-    save_identity(identity, config.identity_path)
+    # session, so hold the instance lock across the write.  Without flock
+    # the lock cannot be enforced, so fail closed instead.
+    if _node_fcntl is None:
+        raise NodeError(
+            "cannot safely replace the identity on this platform: the instance "
+            "lock is unavailable; stop any running node and retry on POSIX"
+        )
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        save_identity(identity, config.identity_path)
+    finally:
+        lock.release()
     payload = {
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
