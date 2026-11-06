@@ -37,7 +37,7 @@ import socket
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -363,8 +363,9 @@ class WebBridge:
         self._save_lock = threading.Lock()
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
-        # insertion-ordered dict used as a bounded set.
-        self._early_deliveries: Dict[str, None] = {}
+        # OrderedDict used as a bounded set (its popitem(last=False)
+        # evicts the oldest report; a plain dict has no such call).
+        self._early_deliveries: OrderedDict[str, None] = OrderedDict()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
