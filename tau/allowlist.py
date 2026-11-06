@@ -98,7 +98,9 @@ class AllowList:
     def from_dict(cls, data: Any) -> "AllowList":
         if not isinstance(data, dict):
             raise AllowListError("allow-list must be a JSON object")
-        enabled = data.get("enabled", False)
+        if "enabled" not in data:
+            raise AllowListError("allow-list is missing the enabled field")
+        enabled = data["enabled"]
         if not isinstance(enabled, bool):
             raise AllowListError("enabled must be a boolean")
         return cls(enabled=enabled, allow=_clean_destinations(data.get("allow")))
