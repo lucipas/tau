@@ -786,7 +786,12 @@ class TauNode:
 
         messages: List[Dict[str, Any]] = []
         budget = _FETCH_BLOB_BUDGET
-        for envelope in self.mailbox.held_for(recipient):
+        # Reload under the cross-process lock: a `tau outbox drop-held`
+        # in another process removes the envelope from disk, and this
+        # node's cached mailbox would otherwise keep handing it out.
+        with self.mailbox.transaction():
+            envelopes = self.mailbox.held_for(recipient)
+        for envelope in envelopes:
             blob_text = base64.b64encode(envelope.blob).decode("ascii")
             if messages and len(blob_text) > budget:
                 break

@@ -241,3 +241,31 @@ def test_outbox_drop_held_unknown_and_ambiguous(tmp_path, capsys):
     )
     assert code == 1
     assert "2 held messages match prefix" in capsys.readouterr().err
+
+
+def test_outbox_held_escapes_control_characters_in_ids(tmp_path, capsys):
+    data_dir = _hold_for_cli(tmp_path, [("evil\x1b[31mred\nid", b"\xbb" * 16, None)])
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "\n" not in out.splitlines()[1]
+    assert "evil" in out
+
+    # JSON keeps the raw id for machines; only human output is cleaned.
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["held"][0]["id"] == "evil\x1b[31mred\nid"
+
+
+def test_outbox_drop_held_reports_vanished_envelope(tmp_path, capsys, monkeypatch):
+    data_dir = _hold_for_cli(tmp_path, [("a" * 32, b"\xbb" * 16, "bob")])
+    # The envelope is gone by removal time (fetch ack / prune in another
+    # process): the command must say so instead of reporting a drop.
+    monkeypatch.setattr(Mailbox, "drop_held", lambda self, *a, **k: False)
+    code = cli.main(
+        ["outbox", "drop-held", "aaaaaaaa", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "no longer present" in capsys.readouterr().err

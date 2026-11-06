@@ -370,7 +370,9 @@ exactly once. Holders cap what they keep (512 envelopes total, 64 per
 recipient) and everything expires. `tau outbox` shows what is waiting;
 `tau outbox held` shows the sealed envelopes this node is holding for
 other peers, and `tau outbox drop-held ID` drops one (a copy already
-fetched by the recipient may still be delivered).
+fetched by the recipient may still be delivered). A drop is remembered
+until the envelope would have expired, so a sender retrying its deposit
+cannot resurrect the copy.
 `tau send --no-queue` restores the old fail-fast behaviour.
 
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or

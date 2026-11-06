@@ -1619,6 +1619,15 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _safe_id_prefix(ref: str, length: int = 8) -> str:
+    """First *length* characters of *ref* with control characters dropped.
+
+    Held ids arrive from remote senders and may contain terminal escapes
+    or newlines; never print them verbatim. JSON output keeps the raw id.
+    """
+    return "".join(char for char in ref[:length] if char.isprintable())
+
+
 def cmd_outbox_held(args: argparse.Namespace) -> int:
     config = _make_config(args)
     mailbox = Mailbox(config.mailbox_path)
@@ -1653,7 +1662,7 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
                 name = peer.display_name if peer is not None else "-"
                 rows.append(
                     (
-                        envelope.id[:8],
+                        _safe_id_prefix(envelope.id),
                         envelope.to_hex,
                         name,
                         _ago(now - envelope.stored_at),
@@ -1672,10 +1681,16 @@ def cmd_outbox_drop_held(args: argparse.Namespace) -> int:
     mailbox = Mailbox(config.mailbox_path)
     registry = PeerRegistry(config.peers_path)
     try:
-        envelope = mailbox.resolve_held(args.target)
+        # Resolve and remove under one cross-process transaction, so the
+        # reported recipient belongs to the envelope actually removed and
+        # a concurrent fetch or prune cannot slip in between.
+        with mailbox.transaction():
+            envelope = mailbox.resolve_held(args.target)
+            dropped = mailbox.drop_held(envelope.id, tombstone=True)
     except MailboxError as exc:
         raise NodeError(str(exc)) from exc
-    mailbox.drop_held(envelope.id)
+    if not dropped:
+        raise NodeError(f"held message {args.target!r} is no longer present")
     peer = registry.get(envelope.to)
     name = peer.display_name if peer is not None else ""
     if _json_mode(args):
@@ -1686,7 +1701,10 @@ def cmd_outbox_drop_held(args: argparse.Namespace) -> int:
         }
         _emit({"dropped": payload}, True)
     else:
-        print(f"dropped {envelope.id[:8]} — held for {name or envelope.to_hex}")
+        print(
+            f"dropped {_safe_id_prefix(envelope.id)}"
+            f" — held for {name or envelope.to_hex}"
+        )
         print(
             "note: a copy already fetched by the recipient may still be"
             " delivered; dropping stops this node handing it out again."

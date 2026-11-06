@@ -295,3 +295,43 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
     monkeypatch.setattr(node.mailbox, "drop_held", lambda *a, **k: False)
     assert node._process_local_held() == 0
     assert len(received) == 1
+
+
+def test_fetch_ignores_envelope_dropped_by_another_process(tmp_path):
+    from tau.mailbox import Mailbox
+
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    holder = make_node(tmp_path)
+
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="relay-2",
+        text="held for you",
+        sent_at=55.0,
+    )
+    stored = call_handler(
+        holder._handle_mail_store,
+        build_mail_store(
+            to=recipient_hash.hex(),
+            message_id="relay-2",
+            blob=blob,
+            expires_at=time.time() + 3600,
+        ),
+        remote_identity=sender,
+    )
+    assert stored["ok"] is True and stored["stored"] is True
+
+    # A second process (e.g. `tau outbox drop-held`) removes the envelope
+    # from disk; the daemon's cached mailbox must not keep handing it out.
+    other_process = Mailbox(holder.config.mailbox_path)
+    assert other_process.drop_held("relay-2") is True
+
+    fetched = call_handler(
+        holder._handle_mail_fetch, build_mail_fetch(), remote_identity=recipient
+    )
+    assert fetched["messages"] == []
+    assert fetched["count"] == 0

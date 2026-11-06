@@ -223,6 +223,11 @@ class Mailbox:
         self._held: Dict[str, HeldEnvelope] = {}
         self._seen: Dict[str, float] = {}
         self._pending_acks: Dict[str, List[str]] = {}
+        # Ids the owner dropped with `tau outbox drop-held`, with the
+        # expiry of the envelope that was dropped: a sender retrying its
+        # deposit must not resurrect the copy until the original would
+        # have expired anyway.
+        self._dropped_held: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -321,11 +326,21 @@ class Mailbox:
                         mid for mid in ids if isinstance(mid, str)
                     ][:100]
 
+        dropped_held: Dict[str, float] = {}
+        raw_dropped = raw.get("dropped_held")
+        if isinstance(raw_dropped, dict):
+            dropped_held = {
+                str(k): float(v)
+                for k, v in raw_dropped.items()
+                if isinstance(v, (int, float))
+            }
+
         with self._lock:
             self._outbox = outbox
             self._held = held
             self._seen = seen
             self._pending_acks = acks
+            self._dropped_held = dropped_held
         log.debug(
             "Loaded mailbox from %s: %d outbox, %d held",
             self.path,
@@ -343,6 +358,7 @@ class Mailbox:
                 "outbox": [entry.to_dict() for entry in self._outbox.values()],
                 "held": [env.to_dict() for env in self._held.values()],
                 "seen": dict(self._seen),
+                "dropped_held": dict(self._dropped_held),
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -468,6 +484,14 @@ class Mailbox:
         with self._transaction():
             if message_id in self._held:
                 return False
+            dropped_until = self._dropped_held.get(message_id)
+            if dropped_until is not None:
+                if dropped_until > timestamp:
+                    # The owner dropped this envelope: a sender retrying
+                    # its deposit must not resurrect it before it would
+                    # have expired anyway.
+                    return False
+                del self._dropped_held[message_id]
             if len(self._held) >= MAX_HELD_TOTAL:
                 raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
             per_recipient = sum(1 for e in self._held.values() if e.to == to)
@@ -502,18 +526,23 @@ class Mailbox:
         """Resolve a full message id or a unique prefix to its held envelope.
 
         ``tau outbox held`` shows only the first 8 characters of each id, so a
-        short prefix is the usual way to name a held envelope.
+        short prefix is the usual way to name a held envelope. Matching is
+        case-insensitive, and a 32-character reference is tried as an exact
+        id first and then as a prefix: a remote sender may store an id in
+        any case, and mail-store ids can be up to 64 characters long.
         """
         if not isinstance(ref, str) or not ref.strip():
             raise MailboxError("message reference must not be empty")
-        value = ref.strip().lower()
+        value = ref.strip()
+        lowered = value.lower()
         with self._lock:
             if len(value) == 32:
                 envelope = self._held.get(value)
-                if envelope is None:
-                    raise MailboxError(f"unknown held message: {ref!r}")
-                return envelope
-            matches = [e for e in self._held.values() if e.id.startswith(value)]
+                if envelope is not None:
+                    return envelope
+            matches = [
+                e for e in self._held.values() if e.id.lower().startswith(lowered)
+            ]
         if not matches:
             raise MailboxError(f"unknown held message: {ref!r}")
         if len(matches) > 1:
@@ -522,7 +551,16 @@ class Mailbox:
             )
         return matches[0]
 
-    def drop_held(self, message_id: str, *, to: Optional[bytes] = None) -> bool:
+    def drop_held(
+        self, message_id: str, *, to: Optional[bytes] = None, tombstone: bool = False
+    ) -> bool:
+        """Drop a held envelope.
+
+        With ``tombstone=True`` (the owner's explicit drop), the id is
+        remembered until the envelope would have expired, so a sender
+        retrying its deposit cannot resurrect it; protocol-driven drops
+        (fetch acks, local delivery) leave no marker.
+        """
         with self._transaction():
             envelope = self._held.get(message_id)
             if envelope is None:
@@ -530,6 +568,8 @@ class Mailbox:
             if to is not None and envelope.to != to:
                 return False
             del self._held[message_id]
+            if tombstone:
+                self._dropped_held[message_id] = envelope.expires_at
             self.save()
             return True
 
@@ -600,12 +640,20 @@ class Mailbox:
             ]
             for key in dead_seen:
                 del self._seen[key]
-            if dead_outbox or dead_held or dead_seen:
+            dead_dropped = [
+                key
+                for key, until in self._dropped_held.items()
+                if until <= timestamp
+            ]
+            for key in dead_dropped:
+                del self._dropped_held[key]
+            if dead_outbox or dead_held or dead_seen or dead_dropped:
                 self.save()
             return {
                 "outbox": len(dead_outbox),
                 "held": len(dead_held),
                 "seen": len(dead_seen),
+                "dropped_held": len(dead_dropped),
             }
 
 
