@@ -6,6 +6,7 @@ import RNS
 import pytest
 
 from tau.config import TauConfig
+from tau.mailbox import Mailbox
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT
@@ -115,3 +116,63 @@ def test_save_peers_keeps_holder_with_pending_acks(tmp_path):
 
     assert node.registry.get(holder.destination_hash) is not None
     assert node.mailbox.pending_ack_holders() == [holder.hexhash]
+
+
+def test_deliver_entry_skips_message_cancelled_by_another_process(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    entry = node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="do not send", message_id="cc" + "33" * 15
+    )
+    # A second process (``tau outbox cancel``) removes the entry from the
+    # shared mailbox file after this node's sweep listed it.
+    other = Mailbox(node.config.mailbox_path)
+    assert other.remove_outbox(entry.id) is True
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deliver_entry(make_peer(), entry, timeout=1.0) is False
+    assert calls == []
+
+
+def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="send me", message_id="cc" + "44" * 15
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deliver_entry(make_peer(), entry, timeout=1.0) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deposit_entry_skips_message_cancelled_by_another_process(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    recipient = make_peer("bob")
+    node.registry.upsert(
+        recipient.destination_hash, recipient.public_key, name="bob", now=1.0
+    )
+    entry = node.mailbox.enqueue(
+        to=recipient.destination_hash,
+        text="do not hold",
+        message_id="cc" + "55" * 15,
+    )
+    other = Mailbox(node.config.mailbox_path)
+    assert other.remove_outbox(entry.id) is True
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deposit_entry(make_peer("carol"), entry, timeout=1.0) is False
+    assert calls == []

@@ -25,7 +25,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
-from .mailbox import Mailbox
+from .mailbox import Mailbox, MailboxError
 from .node import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -356,6 +356,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
+    outbox_sub = outbox.add_subparsers(
+        dest="outbox_command", metavar="OUTBOX_COMMAND"
+    )
+
+    outbox_list = outbox_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list messages queued for offline peers",
+    )
+    outbox_list.set_defaults(func=cmd_outbox)
+
+    outbox_cancel = outbox_sub.add_parser(
+        "cancel",
+        parents=[common],
+        help="cancel a queued message so it is never delivered",
+    )
+    outbox_cancel.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_cancel.set_defaults(func=cmd_outbox_cancel)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1784,6 +1804,30 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(
                 f"Also holding {counts['held']} sealed message(s) for other peers."
             )
+    return _EXIT_OK
+
+
+def cmd_outbox_cancel(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry = mailbox.resolve_outbox(args.target)
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    mailbox.remove_outbox(entry.id)
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        payload = entry.to_dict()
+        payload["to_name"] = name
+        _emit({"cancelled": payload}, True)
+    else:
+        print(f"cancelled {entry.id[:8]} — queued for {name or entry.to_hex}")
+        print(
+            "note: sealed copies already held by other peers may still be"
+            " delivered; cancelling stops this node's future attempts."
+        )
     return _EXIT_OK
 
 
