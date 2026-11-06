@@ -7,7 +7,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}``
-    POST /api/ping         measure reachability of a peer
+    GET  /api/outbox       queued mail waiting on offline peers
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -27,10 +28,13 @@ who can reach this API can send messages as this node.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import mimetypes
 import queue
+import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -42,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
+from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
@@ -89,6 +94,80 @@ def parse_bind(value: str) -> Tuple[str, int]:
     from .config import parse_host_port
 
     return parse_host_port(value, default_host=DEFAULT_WEB_HOST)
+
+
+def _web_console_bind_error(host: str, port: int, exc: OSError) -> WebBridgeError:
+    """Name a web console bind failure instead of surfacing a bare errno."""
+    if exc.errno == errno.EADDRINUSE:
+        return WebBridgeError(
+            f"web console port {port} on {host} is already in use; "
+            "another tau node (or another process) is already "
+            "listening there. Stop it, or choose a different "
+            "console port with --http"
+        )
+    return WebBridgeError(f"cannot listen for the web console on {host}:{port}: {exc}")
+
+
+def check_web_console_bind(host: str, port: int) -> None:
+    """Fail fast when the web console address cannot be bound.
+
+    Mirrors what :meth:`WebBridge.start` does when it builds its
+    ``ThreadingHTTPServer`` — an ``AF_INET`` socket with ``SO_REUSEADDR``
+    (the server sets ``allow_reuse_address``), so a socket merely in
+    TIME_WAIT does not trip the check — and raises :class:`WebBridgeError`
+    naming the console address instead of a bare errno.
+
+    Only ``tau serve`` calls this.  Transient commands never start a
+    bridge, so they skip the check.
+
+    The probe mirrors the TCP listen probe (``check_tcp_listen_ports``)
+    on POSIX: an ``AF_INET`` socket with ``SO_REUSEADDR``, so a socket
+    merely in TIME_WAIT does not trip the check.  Windows gets a
+    different probe (see :func:`_check_web_console_bind_windows`):
+    ``SO_REUSEADDR`` there lets a socket bind a port that a live
+    listener already holds, so a bind probe cannot tell a live
+    listener from a recently closed connection in TIME_WAIT.
+    """
+    if sys.platform == "win32":
+        _check_web_console_bind_windows(host, port)
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # SO_REUSEADDR here means "TIME_WAIT is fine" (POSIX). Windows
+        # never reaches this branch (see above).
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+    except OSError as exc:
+        raise _web_console_bind_error(host, port, exc) from exc
+    finally:
+        sock.close()
+
+
+def _check_web_console_bind_windows(host: str, port: int) -> None:
+    """Windows console probe: connect, do not bind.
+
+    A bind probe cannot work on Windows: ``SO_REUSEADDR`` there lets a
+    socket bind a port that a live listener already holds, and omitting
+    it makes the probe trip on a recently closed connection in
+    TIME_WAIT — while the server itself binds with ``SO_REUSEADDR``
+    (``_WebServer.allow_reuse_address``), so the late-bind path cannot
+    catch the collision either.  Connecting instead distinguishes the
+    two cases: a live listener completes the handshake, while a port
+    left in TIME_WAIT refuses the connection.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except ConnectionRefusedError:
+        return
+    except OSError as exc:
+        raise _web_console_bind_error(host, port, exc) from exc
+    raise WebBridgeError(
+        f"web console port {port} on {host} is already in use; "
+        "another tau node (or another process) is already "
+        "listening there. Stop it, or choose a different "
+        "console port with --http"
+    )
 
 
 def _is_local_origin(origin: str) -> bool:
@@ -302,7 +381,10 @@ class WebBridge:
         if self._server is not None:
             raise WebBridgeError("web bridge is already running")
         self._closing.clear()
-        server = _WebServer((self.host, self.port), _WebHandler)
+        try:
+            server = _WebServer((self.host, self.port), _WebHandler)
+        except OSError as exc:
+            raise _web_console_bind_error(self.host, self.port, exc) from exc
         server.bridge = self
         server.daemon_threads = True
         self._server = server
@@ -696,6 +778,49 @@ class WebBridge:
             )
         return message, response
 
+    def outbox(self) -> Dict[str, Any]:
+        """Queued mail waiting on offline peers, with recipient names.
+
+        Read under the mailbox transaction so entries queued by a
+        separate process (e.g. a one-shot ``tau send``) are visible
+        instead of the serving process's cached snapshot.
+        """
+        with self.node.mailbox.transaction():
+            entries = [
+                self._describe_outbox_entry(entry)
+                for entry in self.node.mailbox.outbox_list()
+            ]
+            held = self.node.mailbox.counts()["held"]
+        return {"outbox": entries, "count": len(entries), "held_for_others": held}
+
+    def cancel_outbox(self, target: str) -> Dict[str, Any]:
+        """Remove one queued message from the outbox and describe it.
+
+        Cancelling stops this node's future delivery attempts; sealed
+        copies already held by other peers may still be delivered.
+        Resolve and remove happen inside one mailbox transaction, so a
+        cancel cannot miss an entry another process just queued, and a
+        delivery that lands in between is reported instead of silently
+        claimed as cancelled.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        with self.node.mailbox.transaction():
+            entry = self.node.mailbox.resolve_outbox(target.strip())
+            if not self.node.mailbox.remove_outbox(entry.id):
+                # Delivered or expired between resolve and remove.
+                raise MailboxError(
+                    f"queued message {target.strip()!r} is no longer queued"
+                )
+            return self._describe_outbox_entry(entry)
+
+    def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
+        payload = entry.to_dict()
+        peer = self.node.registry.get(entry.to)
+        payload["to_name"] = peer.display_name if peer is not None else entry.to_name
+        payload["held_by"] = sorted(entry.held_by)
+        return payload
+
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.ping(peer, timeout=timeout)
@@ -912,6 +1037,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/outbox":
+                self._send_json(self.bridge.outbox(), head_only)
+                return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 include_all = _query_flag(query, "all")
@@ -943,6 +1071,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/outbox/cancel":
+                self._handle_outbox_cancel(body, head_only)
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
@@ -1088,6 +1219,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only
         )
+
+    def _handle_outbox_cancel(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            cancelled = self.bridge.cancel_outbox(target.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")

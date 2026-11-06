@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
+from .allowlist import AllowList, load_allowlist_or_deny_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -94,6 +95,15 @@ _FETCH_BLOB_BUDGET = 40 * 1024
 
 class NodeError(RuntimeError):
     """Raised when a node operation fails."""
+
+
+class NotAllowedError(NodeError):
+    """Raised when a peer explicitly rejects a request (allow-list denial).
+
+    Distinct from other :class:`NodeError` failures so callers can tell
+    an explicit refusal apart from an unreachable peer: a refusal must
+    not be silently queued for retry.
+    """
 
 
 class InstanceAlreadyRunning(NodeError):
@@ -341,6 +351,20 @@ class TauNode:
         self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
+        self._allowlist: Optional[AllowList] = None
+
+    @property
+    def allowlist(self) -> AllowList:
+        """The DM allow-list, loaded lazily from the data directory.
+
+        A list that cannot be parsed fails closed — remote senders are
+        denied — mirroring the Tan admission ruleset.
+        """
+        if self._allowlist is None:
+            self._allowlist = load_allowlist_or_deny_all(
+                getattr(self.config, "allowlist_path", None)
+            )
+        return self._allowlist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -651,7 +675,11 @@ class TauNode:
         for peer in self.registry.all():
             if peer.public_key == remote_identity.get_public_key():
                 return peer.hexhash
-        return remote_identity.hexhash
+        # The caller is not in the local registry: derive the tau
+        # destination hash from the verified identity.  The identity
+        # hash alone is a different value, and the allow-list (and the
+        # peer registry) are keyed by destination hash.
+        return tau_destination_hash(remote_identity).hex()
 
     def _handle_ping(
         self,
@@ -707,6 +735,14 @@ class TauNode:
 
         received_at = time.time()
         caller_hash = self._caller_label(remote_identity)
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Message from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
         caller_name = "unknown"
         if caller_hash:
             peer = self.registry.get(caller_hash)
@@ -987,10 +1023,30 @@ class TauNode:
                 moved["deposited"] += 1
         return moved
 
+    def _still_queued(self, message_id: str) -> bool:
+        """True if the outbox still holds this entry, reloaded from disk.
+
+        The sweep works from a snapshot, so a cancel can land after the
+        snapshot was taken; each delivery attempt re-checks instead of
+        trusting the snapshot.  A send already in flight cannot be
+        recalled — cancelling only stops future attempts.
+        """
+        with self.mailbox.transaction():
+            return self.mailbox.get_outbox(message_id) is not None
+
     def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # The sweep lists the outbox before acting, so a message cancelled
+        # by another process (``tau outbox cancel``) can still be sitting
+        # in this pass's snapshot. Re-check the queue under the mailbox
+        # lock — which reloads the on-disk state — before sending.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         payload = encode_message(
             entry.text, message_id=entry.id, sent_at=entry.created_at
         )
+        if not self._still_queued(entry.id):
+            return False
         try:
             self._request(peer, REQUEST_MESSAGE, payload, timeout)
         except NodeError as exc:
@@ -1006,6 +1062,11 @@ class TauNode:
         return True
 
     def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        # Same re-check as _deliver_entry: do not leave a sealed copy
+        # with a holder for a message cancelled since the sweep listed it.
+        with self.mailbox.transaction():
+            if self.mailbox.get_outbox(entry.id) is None:
+                return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)
@@ -1030,6 +1091,8 @@ class TauNode:
             )
         except (MailboxError, ProtocolError) as exc:
             log.debug("Could not seal queued message %s: %s", entry.id, exc)
+            return False
+        if not self._still_queued(entry.id):
             return False
         try:
             self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
@@ -1109,6 +1172,20 @@ class TauNode:
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
+        sender = message.get("from")
+        if not self.allowlist.is_allowed(
+            sender if isinstance(sender, str) else None
+        ):
+            # The sender hash in a sealed envelope is authenticated
+            # (open_message verifies it against the signing key), so
+            # this is the same admission decision as a direct message.
+            # Do not mark it seen: another holder's copy may still be
+            # delivered if the sender is admitted later.
+            log.info(
+                "Relayed message from %s denied by the DM allow-list",
+                sender or "unknown",
+            )
+            return False
         if self.mailbox.is_seen(message["id"]):
             return False
         self.mailbox.mark_seen(message["id"])
@@ -1280,6 +1357,10 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+        except NotAllowedError:
+            # The peer is online and explicitly refused the message;
+            # queueing it would retry a refusal until its TTL expires.
+            raise
         except NodeError:
             if not queue or not self.started:
                 raise
@@ -1592,9 +1673,10 @@ class TauNode:
             raise NodeError(f"peer returned an invalid response: {exc}") from exc
         if decoded.get("ok") is not True:
             error = decoded.get("error") or {}
-            raise NodeError(
-                f"peer rejected the request: {error.get('message', 'unknown error')}"
-            )
+            message = error.get("message", "unknown error")
+            if error.get("code") == "not_allowed":
+                raise NotAllowedError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded

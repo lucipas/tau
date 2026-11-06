@@ -336,6 +336,56 @@ def test_busy_mail_round_is_queued_not_dropped(tmp_path):
     assert peer.hexhash in node._mail_pending
 
 
+def _recorded_request():
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(args)
+        return {"ok": True}
+
+    return calls, fake_request
+
+
+def test_deliver_entry_skips_cancelled_message(tmp_path):
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(to=bytes.fromhex("ab" * 16), text="hi")
+    # Cancelled after the sweep snapshotted the outbox: no send.
+    assert node.mailbox.remove_outbox(entry.id) is True
+    assert node._deliver_entry(peer, entry, timeout=5) is False
+    assert calls == []
+
+    # Still queued: sends once and removes the entry.
+    entry = node.mailbox.enqueue(to=bytes.fromhex("ab" * 16), text="hi again")
+    assert node._deliver_entry(peer, entry, timeout=5) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deposit_entry_skips_cancelled_message(tmp_path):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    holder = node.registry.upsert(bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder")
+    node.registry.upsert(recipient_hash, recipient.get_public_key(), name="bob")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(to=recipient_hash, text="held for bob")
+    # Cancelled after the sweep snapshotted the outbox: no deposit.
+    assert node.mailbox.remove_outbox(entry.id) is True
+    assert node._deposit_entry(holder, entry, timeout=5) is False
+    assert calls == []
+
+    # Still queued: deposits the sealed copy once.
+    entry = node.mailbox.enqueue(to=recipient_hash, text="held for bob again")
+    assert node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    assert node.mailbox.get_outbox(entry.id) is not None
 def test_deliver_entry_reports_delivery_via_callback(tmp_path):
     delivered = []
     node = make_node(tmp_path, on_delivered=delivered.append)

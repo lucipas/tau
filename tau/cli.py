@@ -16,14 +16,22 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import __version__
+from .allowlist import (
+    AllowListError,
+    clean_destination,
+    load_allowlist,
+    save_allowlist,
+)
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
+    _identity_lock,
     destination_hash,
     load_identity,
     load_or_create_identity,
+    save_identity,
 )
-from .mailbox import Mailbox
+from .mailbox import Mailbox, MailboxError
 from .node import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -315,9 +323,49 @@ def build_parser() -> argparse.ArgumentParser:
     peers.set_defaults(func=cmd_peers)
 
     identity = subparsers.add_parser(
-        "id", parents=[common], help="show this node's name and destination"
+        "id",
+        parents=[common],
+        help="show this node's name and destination, or back up / restore its identity",
     )
     identity.set_defaults(func=cmd_id)
+    id_sub = identity.add_subparsers(dest="id_command", metavar="ID_COMMAND")
+    id_export = id_sub.add_parser(
+        "export",
+        parents=[common],
+        help="write a backup copy of the node identity to a file",
+    )
+    id_export.add_argument(
+        "--to",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help="backup file to write",
+    )
+    id_export.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing backup file",
+    )
+    id_export.set_defaults(func=cmd_id_export)
+    id_import = id_sub.add_parser(
+        "import",
+        parents=[common],
+        help="restore the node identity from a backup file",
+    )
+    id_import.add_argument(
+        "--from",
+        required=True,
+        type=Path,
+        dest="from_path",
+        metavar="PATH",
+        help="backup file to read",
+    )
+    id_import.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing identity",
+    )
+    id_import.set_defaults(func=cmd_id_import)
 
     outbox = subparsers.add_parser(
         "outbox",
@@ -325,6 +373,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
+    outbox_sub = outbox.add_subparsers(
+        dest="outbox_command", metavar="OUTBOX_COMMAND"
+    )
+
+    outbox_list = outbox_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list messages queued for offline peers",
+    )
+    outbox_list.set_defaults(func=cmd_outbox)
+
+    outbox_cancel = outbox_sub.add_parser(
+        "cancel",
+        parents=[common],
+        help="cancel a queued message so it is never delivered",
+    )
+    outbox_cancel.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    outbox_cancel.set_defaults(func=cmd_outbox_cancel)
+
+    allowlist = subparsers.add_parser(
+        "allowlist",
+        parents=[common],
+        help="restrict who may send this node direct messages",
+    )
+    allowlist_sub = allowlist.add_subparsers(
+        dest="allowlist_command", metavar="ALLOWLIST_COMMAND"
+    )
+    allowlist_sub.required = True
+
+    allowlist_list = allowlist_sub.add_parser(
+        "list", parents=[common], help="show the DM allow-list"
+    )
+    allowlist_list.set_defaults(func=cmd_allowlist)
+
+    allowlist_add = allowlist_sub.add_parser(
+        "add",
+        parents=[common],
+        help="allow direct messages from a peer (name, hash or prefix)",
+    )
+    allowlist_add.add_argument("peer", help="peer name, destination hash or hash prefix")
+    allowlist_add.set_defaults(func=cmd_allowlist)
+
+    allowlist_remove = allowlist_sub.add_parser(
+        "remove",
+        parents=[common],
+        help="stop allowing direct messages from a peer",
+    )
+    allowlist_remove.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
+    allowlist_remove.set_defaults(func=cmd_allowlist)
+
+    allowlist_on = allowlist_sub.add_parser(
+        "on", parents=[common], help="enforce the DM allow-list"
+    )
+    allowlist_on.set_defaults(func=cmd_allowlist)
+
+    allowlist_off = allowlist_sub.add_parser(
+        "off", parents=[common], help="stop enforcing the DM allow-list"
+    )
+    allowlist_off.set_defaults(func=cmd_allowlist)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1298,7 +1409,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         on_peer=console_peer,
     )
     if web_settings is not None:
-        from .webapi import WebBridge, WebBridgeError
+        from .webapi import WebBridge, WebBridgeError, check_web_console_bind
 
         host, port, web_dir = web_settings
         try:
@@ -1334,6 +1445,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # server interface silently dead (panic_on_interface_error = No),
     # so fail fast here with the port named instead of serving deaf.
     check_tcp_listen_ports(config)
+    # Same for the web console: its bind used to fail only after the node
+    # had already started, with a bare "[Errno 98] Address already in
+    # use". Probe first so the error names the console address.
+    if web_settings is not None:
+        host, port, _ = web_settings
+        try:
+            check_web_console_bind(host, port)
+        except WebBridgeError as exc:
+            raise NodeError(str(exc)) from exc
     node.start(
         announce=not getattr(args, "no_announce", False), exclusive=True
     )
@@ -1368,7 +1488,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     console_url = None
     if bridge is not None:
-        console_url = bridge.start()
+        try:
+            console_url = bridge.start()
+        except WebBridgeError as exc:
+            # The pre-start probe covers the usual collision; a bind race
+            # can still land here. Stop the node cleanly instead of
+            # exiting with it running, and keep the named error.
+            node.stop()
+            raise NodeError(str(exc)) from exc
 
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
@@ -1599,6 +1726,100 @@ def cmd_id(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    """Compare two paths after expanding ``~`` and resolving symlinks."""
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except OSError:
+        return False
+
+
+def cmd_id_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    target = Path(args.to).expanduser()
+    if _same_path(target, config.identity_path):
+        raise NodeError(
+            f"cannot export the identity to itself ({target}); "
+            "choose a different backup path"
+        )
+    if target.is_dir():
+        raise NodeError(f"backup path {target} is a directory")
+    # lexists, not exists: a dangling symlink at the target counts as an
+    # existing backup and must not be silently replaced without --force.
+    if os.path.lexists(target) and not getattr(args, "force", False):
+        raise NodeError(
+            f"backup already exists at {target}; pass --force to overwrite it"
+        )
+    # The backup goes into a caller-selected folder: never change that
+    # folder's permissions, only the backup file itself is private.
+    save_identity(identity, target, restrict_parent=False)
+    payload = {
+        "destination": destination_hash(identity).hex(),
+        "identity": identity.hexhash,
+        "path": str(target),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"identity:    {payload['identity']}")
+        print(f"destination: {payload['destination']}")
+        print(f"backup:      {payload['path']}")
+    return _EXIT_OK
+
+
+def cmd_id_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    source = Path(args.from_path).expanduser()
+    if not source.exists():
+        raise NodeError(f"no identity backup at {source}")
+    if _same_path(source, config.identity_path):
+        raise NodeError(f"{source} is already this node's identity file")
+    try:
+        identity = load_identity(source)
+    except Exception as exc:
+        # A backup file is untrusted input: any parse failure is a bad backup.
+        raise NodeError(f"not a valid identity backup: {exc}") from exc
+    if identity is None:  # pragma: no cover - load_identity returns None only when missing
+        raise NodeError(f"no identity backup at {source}")
+    config.prepare()
+    # Hold the instance lock across the whole replacement: a node that
+    # starts after the probe but before the write would load the old
+    # identity and then serve with a different identity than the one on
+    # disk.  The identity-creation lock serialises the check-and-write
+    # against a concurrent `tau init` on the same directory.  Lock order
+    # (instance, then identity) matches `TauNode.start`, which takes the
+    # instance lock before loading or creating its identity.
+    # Note the instance lock is POSIX-only (no-op without fcntl), the
+    # same limitation `tau serve` itself accepts.
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        with _identity_lock(config.identity_path):
+            if config.identity_path.exists() and not getattr(args, "force", False):
+                raise NodeError(
+                    f"an identity already exists at {config.identity_path}; "
+                    "pass --force to replace it"
+                )
+            save_identity(identity, config.identity_path)
+    finally:
+        lock.release()
+    payload = {
+        "destination": destination_hash(identity).hex(),
+        "identity": identity.hexhash,
+        "data_dir": str(config.data_dir),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"identity:    {payload['identity']}")
+        print(f"destination: {payload['destination']}")
+        print(f"data dir:    {payload['data_dir']}")
+    return _EXIT_OK
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
@@ -1703,6 +1924,102 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(
                 f"Also holding {counts['held']} sealed message(s) for other peers."
             )
+    return _EXIT_OK
+
+
+def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
+    """Resolve a peer name, hash or prefix to a destination hash."""
+    peer = registry.resolve(value)
+    if peer is not None:
+        return peer.hexhash
+    try:
+        return clean_destination(value)
+    except AllowListError:
+        raise AllowListError(f"unknown peer or destination: {value!r}") from None
+
+
+def cmd_allowlist(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        allowlist = load_allowlist(config.allowlist_path)
+    except AllowListError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+    command = getattr(args, "allowlist_command", None)
+    registry = PeerRegistry(config.peers_path)
+    changed = False
+
+    if command == "add":
+        destination = _resolve_allowlist_peer(registry, args.peer)
+        if destination not in allowlist.allow:
+            allowlist = allowlist.with_added(destination)
+            changed = True
+    elif command == "remove":
+        destination = _resolve_allowlist_peer(registry, args.peer)
+        if destination in allowlist.allow:
+            allowlist = allowlist.with_removed(destination)
+            changed = True
+    elif command == "on":
+        if not allowlist.enabled:
+            allowlist = allowlist.with_enabled(True)
+            changed = True
+    elif command == "off":
+        if allowlist.enabled:
+            allowlist = allowlist.with_enabled(False)
+            changed = True
+
+    if changed:
+        save_allowlist(config.allowlist_path, allowlist)
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    if json_output:
+        payload = allowlist.to_dict()
+        payload["entries"] = [describe(value) for value in sorted(allowlist.allow)]
+        payload["path"] = str(config.allowlist_path)
+        _emit(payload, True)
+    else:
+        state = "enforced" if allowlist.enabled else "off"
+        print(f"DM allow-list ({config.allowlist_path}): {state}")
+        if not allowlist.allow:
+            print("  no senders listed — when enforced, nobody may message this node")
+        for entry in sorted(allowlist.allow):
+            peer = registry.get(entry)
+            name = f" ({peer.display_name})" if peer is not None else ""
+            print(f"  {entry}{name}")
+        if changed:
+            print("  (a running serve applies saved changes when it restarts)")
+    return _EXIT_OK
+
+
+def cmd_outbox_cancel(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry = mailbox.resolve_outbox(args.target)
+    except MailboxError as exc:
+        raise NodeError(str(exc)) from exc
+    mailbox.remove_outbox(entry.id)
+    peer = registry.get(entry.to)
+    name = peer.display_name if peer is not None else entry.to_name
+    if _json_mode(args):
+        payload = entry.to_dict()
+        payload["to_name"] = name
+        _emit({"cancelled": payload}, True)
+    else:
+        print(f"cancelled {entry.id[:8]} — queued for {name or entry.to_hex}")
+        print(
+            "note: sealed copies already held by other peers may still be"
+            " delivered; cancelling stops this node's future attempts."
+        )
     return _EXIT_OK
 
 
