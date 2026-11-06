@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 
+import RNS
 import pytest
 
 from tau import cli
+from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
+from tau.inbox import Inbox
+from tau.peers import PeerRegistry
 
 
 def test_parser_accepts_global_options_before_and_after_command():
@@ -123,3 +127,100 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+def test_parser_messages_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "--peer", "alice", "--limit", "5"])
+    assert args.command == "messages"
+    assert args.peer == "alice"
+    assert args.limit == 5
+
+    defaults = parser.parse_args(["messages"])
+    assert defaults.peer is None
+    assert defaults.limit == 30
+
+
+def _seed_messages(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "first hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "second hello",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "m-2",
+        }
+    )
+    return data_dir, sender_hash
+
+
+def test_messages_lists_newest_first(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "second hello" in out
+    assert "first hello" in out
+    assert out.index("second hello") < out.index("first hello")
+    assert "alice" in out
+
+
+def test_messages_json_and_peer_filter(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "alice", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", sender_hash.hex()[:8], "--limit", "1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "m-2"
+
+
+def test_messages_empty_and_unknown_peer(tmp_path, capsys):
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    assert "No messages received yet" in capsys.readouterr().out
+
+    _, sender_hash = _seed_messages(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(tmp_path / "node"), "--peer", "nobody"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--limit", "-1"])
+    assert code == 1
+    assert "must not be negative" in capsys.readouterr().err

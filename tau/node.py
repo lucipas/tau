@@ -27,6 +27,7 @@ from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
 )
+from .inbox import Inbox
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
     Mailbox,
@@ -312,6 +313,7 @@ class TauNode:
             registry if registry is not None else PeerRegistry(config.peers_path)
         )
         self.mailbox = Mailbox(config.mailbox_path)
+        self.inbox = Inbox(config.inbox_path)
         self.on_message = on_message
         self.on_peer = on_peer
 
@@ -677,6 +679,13 @@ class TauNode:
         peers = self.registry.public_peers()
         return response_ok(peers=peers[:100], count=len(peers))
 
+    def _record_received(self, record: Dict[str, Any]) -> None:
+        """Persist a delivered DM to the inbox; never break delivery."""
+        try:
+            self.inbox.append(record)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not record received message", exc_info=True)
+
     def _handle_message(
         self,
         path: str,
@@ -718,6 +727,7 @@ class TauNode:
                 caller_hash or "anonymous",
                 message["text"],
             )
+            self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1037,6 +1047,7 @@ class TauNode:
             message["from"],
             message["text"],
         )
+        self._record_received(record)
         if self.on_message is not None:
             try:
                 self.on_message(record)

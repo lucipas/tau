@@ -19,6 +19,7 @@ NODE_FILE_NAME = "node.json"
 IDENTITY_FILE_NAME = "identity"
 PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
+INBOX_FILE_NAME = "inbox.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
 NODE_LOCK_FILE_NAME = "node.lock"
@@ -45,6 +46,7 @@ class TauConfig:
     identity_path: Path
     peers_path: Path
     mailbox_path: Path
+    inbox_path: Path
     node_file: Path
     social_db_path: Path
     tan_rules_path: Path
@@ -78,6 +80,7 @@ class TauConfig:
             identity_path=base / IDENTITY_FILE_NAME,
             peers_path=base / PEERS_FILE_NAME,
             mailbox_path=base / MAILBOX_FILE_NAME,
+            inbox_path=base / INBOX_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             tan_rules_path=base / TAN_RULES_FILE_NAME,

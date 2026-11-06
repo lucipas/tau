@@ -23,6 +23,7 @@ from .identity import (
     load_identity,
     load_or_create_identity,
 )
+from .inbox import Inbox
 from .mailbox import Mailbox
 from .node import (
     InstanceAlreadyRunning,
@@ -313,6 +314,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
+
+    messages = subparsers.add_parser(
+        "messages",
+        parents=[common],
+        help="list received direct messages kept in the node inbox",
+    )
+    messages.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only show messages from this peer",
+    )
+    messages.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="show the newest N messages (default 30)",
+    )
+    messages.set_defaults(func=cmd_messages)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1588,6 +1609,39 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(
                 f"Also holding {counts['held']} sealed message(s) for other peers."
             )
+    return _EXIT_OK
+
+
+def cmd_messages(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        peer = registry.resolve(args.peer)
+        if peer is None:
+            raise NodeError(f"unknown peer: {args.peer!r}")
+        peer_hash = peer.hexhash
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    if _json_mode(args):
+        _emit({"messages": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No messages received yet.")
+        return _EXIT_OK
+    for entry in entries:
+        peer = registry.get(entry.get("destination") or "")
+        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+        sender = short_hash(str(entry.get("destination") or ""))
+        when = datetime.fromtimestamp(float(entry.get("received_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({sender})")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
     return _EXIT_OK
 
 

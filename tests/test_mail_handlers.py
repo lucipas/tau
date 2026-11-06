@@ -52,6 +52,24 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert second["ok"] is True and second["duplicate"] is True
     assert len(received) == 1
     assert received[0]["id"] == "dup-1"
+    # The first delivery is recorded in the durable inbox; the duplicate
+    # (already seen) is not recorded twice.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["text"] == "hello once"
+    assert node.inbox.path.exists()
+
+
+def test_direct_message_survives_a_restart(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    call_handler(node._handle_message, encode_message("see you later", message_id="keep-1"))
+
+    reloaded = make_node(tmp_path)
+    assert len(reloaded.inbox) == 1
+    assert reloaded.inbox.list_messages()[0]["text"] == "see you later"
 
 
 def test_store_then_fetch_roundtrip(tmp_path):
@@ -189,6 +207,23 @@ def test_collected_message_is_delivered_once(tmp_path):
     assert len(received) == 1
     assert received[0]["relayed"] is True
     assert received[0]["text"] == "via a holder"
+    # Relayed delivery is recorded too, marked as relayed.
+    assert len(node.inbox) == 1
+    assert node.inbox.list_messages()[0]["relayed"] is True
+
+
+def test_inbox_failure_does_not_break_delivery(tmp_path, monkeypatch):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    monkeypatch.setattr(node.inbox, "append", lambda record: (_ for _ in ()).throw(OSError("disk gone")))
+
+    response = call_handler(node._handle_message, encode_message("still arrives", message_id="fail-1"))
+
+    assert response["ok"] is True
+    assert len(received) == 1
 
 
 def test_flush_outbox_is_a_noop_until_started(tmp_path):
