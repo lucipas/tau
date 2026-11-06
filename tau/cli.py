@@ -324,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--peer",
         default=None,
         metavar="NAME|HASH",
-        help="only show messages from this peer",
+        help="only show messages from this peer (name, hash or hash prefix)",
     )
     messages.add_argument(
         "--limit",
@@ -1612,16 +1612,60 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _is_hex32(value: str) -> bool:
+    return len(value) == 32 and all(
+        char in "0123456789abcdefABCDEF" for char in value
+    )
+
+
+def _format_message_time(timestamp: float) -> str:
+    """One inbox entry's received time; never fails the whole listing."""
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "unknown time"
+
+
+def _resolve_inbox_peer(
+    inbox: Inbox, registry: PeerRegistry, target: str
+) -> str:
+    """Resolve ``--peer`` to a sender hash for inbox filtering.
+
+    Names and registered hashes come from the peer registry; a full
+    destination hash, or a unique prefix of one, may also match a
+    sender stored in the inbox whose registry entry is gone (pruned,
+    or never discovered — a direct message needs no prior announce).
+    """
+    target = target.strip()
+    peer = registry.resolve(target)
+    if peer is not None:
+        return peer.hexhash
+    if _is_hex32(target):
+        return target.lower()
+    if len(target) >= 4:
+        prefix = target.casefold()
+        senders = {
+            str(entry.get("destination") or "").casefold()
+            for entry in inbox.list_messages(limit=None)
+            if entry.get("destination")
+        }
+        matches = sorted(sender for sender in senders if sender.startswith(prefix))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise NodeError(
+                f"{len(matches)} senders match the hash prefix {target!r}"
+            )
+    raise NodeError(f"unknown peer: {target!r}")
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
     peer_hash = None
     if getattr(args, "peer", None):
-        peer = registry.resolve(args.peer)
-        if peer is None:
-            raise NodeError(f"unknown peer: {args.peer!r}")
-        peer_hash = peer.hexhash
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
@@ -1636,9 +1680,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         peer = registry.get(entry.get("destination") or "")
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
-        when = datetime.fromtimestamp(float(entry.get("received_at", 0))).strftime(
-            "%Y-%m-%d %H:%M"
-        )
+        when = _format_message_time(float(entry.get("received_at", 0)))
         print(f"[{when}] {name} ({sender})")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")

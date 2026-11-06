@@ -59,6 +59,27 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert node.inbox.path.exists()
 
 
+def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_message,
+        encode_message("hello stranger", message_id="stranger-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    entry = node.inbox.list_messages()[0]
+    # The inbox keys on Tau destination hashes, not the RNS identity hash
+    # _caller_label falls back to for senders outside the registry.
+    assert entry["destination"] == destination_hash(sender).hex()
+    assert entry["destination"] != sender.hexhash
+    assert entry["from"] == destination_hash(sender).hex()[:8]
+
+
 def test_direct_message_survives_a_restart(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

@@ -701,6 +701,11 @@ class TauNode:
 
         received_at = time.time()
         caller_hash = self._caller_label(remote_identity)
+        if remote_identity is not None:
+            # _caller_label falls back to the identity hash for senders
+            # outside the registry; the inbox keys on Tau destination
+            # hashes, so derive that here instead.
+            caller_hash = tau_destination_hash(remote_identity).hex()
         caller_name = "unknown"
         if caller_hash:
             peer = self.registry.get(caller_hash)

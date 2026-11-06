@@ -93,6 +93,47 @@ def test_list_filters_by_peer_and_limit(tmp_path):
     assert inbox.list_messages(limit=0) == []
 
 
+def test_concurrent_writers_do_not_lose_entries(tmp_path):
+    """Two Inbox handles on one file (serve + one-shot) keep each other's entries."""
+    path = tmp_path / "inbox.json"
+    first = Inbox(path)
+    second = Inbox(path)
+    first.append(_record(id="from-first", received_at=1.0))
+    second.append(_record(id="from-second", received_at=2.0))
+    first.append(_record(id="from-first-again", received_at=3.0))
+    second.append(_record(id="from-second-again", received_at=4.0))
+
+    entries = Inbox(path).list_messages()
+    assert [entry["id"] for entry in entries] == [
+        "from-second-again",
+        "from-first-again",
+        "from-second",
+        "from-first",
+    ]
+    # Each handle reloaded under the lock, so it saw the other's entries.
+    assert len(second) == 4
+
+
+def test_nonfinite_timestamps_are_rejected(tmp_path):
+    import math
+
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="inf-received", received_at=math.inf),
+                    _record(id="nan-sent", sent_at=math.nan),
+                    _record(id="good"),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entries = Inbox(path).list_messages()
+    assert [entry["id"] for entry in entries] == ["good"]
+
+
 def test_memory_only_inbox(tmp_path):
     inbox = Inbox()
     inbox.append(_record())

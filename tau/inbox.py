@@ -12,10 +12,17 @@ is in use.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
+
+try:  # POSIX only; the cross-process lock is a no-op without it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 from .util import atomic_write_json, read_json
 
@@ -40,6 +47,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     try:
         received_at = float(received_at) if received_at is not None else time.time()
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sent_at) or not math.isfinite(received_at):
         return None
     return {
         "from": str(raw.get("from") or "unknown"),
@@ -90,12 +99,39 @@ class Inbox:
         except OSError as exc:
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
 
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Serialise a read-modify-write of the inbox across processes.
+
+        ``tau serve`` and one-shot commands such as ``tau send`` share
+        the same ``inbox.json``.  Each append takes an exclusive
+        ``flock`` on a sidecar lock file, reloads the latest on-disk
+        state, and then applies its change, so a process never
+        overwrites another's entries.  Mirrors
+        :meth:`Mailbox._transaction`.
+        """
+        with self._lock:
+            if self.path is None or fcntl is None:
+                if self.path is not None:
+                    self._load()
+                yield
+                return
+            lock_path = self.path.with_name(self.path.name + ".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "a") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    self._load()
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record one received message, dropping the oldest past the cap."""
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
-        with self._lock:
+        with self._transaction():
             self._messages.append(entry)
             self._messages = self._messages[-MAX_INBOX:]
             self._save()

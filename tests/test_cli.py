@@ -224,3 +224,91 @@ def test_messages_empty_and_unknown_peer(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--limit", "-1"])
     assert code == 1
     assert "must not be negative" in capsys.readouterr().err
+
+
+def test_messages_peer_filter_for_unregistered_sender(tmp_path, capsys):
+    """--peer works by hash/prefix even when the sender left the registry."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd1111111111111111111111111111",
+            "text": "from a stranger",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "u-1",
+        }
+    )
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "abcd2222222222222222222222222222",
+            "text": "from another stranger",
+            "sent_at": 10.0,
+            "received_at": 21.0,
+            "id": "u-2",
+        }
+    )
+
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            "abcd1111111111111111111111111111",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["u-1"]
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "abcd1", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["u-1"]
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--peer", "abcd"])
+    assert code == 1
+    assert "match the hash prefix" in capsys.readouterr().err
+
+    # A well-formed hash with no stored messages filters to an empty list.
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--peer",
+            "ff" * 16,
+            "--json",
+        ]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_messages_out_of_range_timestamp(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "from the far future",
+            "sent_at": 10.0,
+            "received_at": 10**15,
+            "id": "far-1",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "from the far future" in out
+    assert "unknown time" in out
