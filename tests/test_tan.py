@@ -429,6 +429,29 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
         create_delete(conn, alice, post["hash"], name="alice", now=1004)
 
 
+def test_timeline_marks_own_posts_for_viewer(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mine = create_post(conn, alice, "mine", name="alice", now=1000)
+    theirs = create_post(conn, bob, "theirs", name="bob", now=1001)
+
+    # The viewer sees their own posts marked and everyone else's unmarked.
+    items = timeline(conn, include_all=True, viewer=author_of(alice))
+    by_hash = {item["hash"]: item for item in items}
+    assert by_hash[mine["hash"]]["own"] is True
+    assert by_hash[theirs["hash"]]["own"] is False
+
+    # With no viewer there is nothing to mark as own.
+    items = timeline(conn, include_all=True)
+    assert all(item["own"] is False for item in items)
+
+    # A different viewer flips the marks.
+    items = timeline(conn, include_all=True, viewer=author_of(bob))
+    by_hash = {item["hash"]: item for item in items}
+    assert by_hash[mine["hash"]]["own"] is False
+    assert by_hash[theirs["hash"]]["own"] is True
+
+
 def test_author_stats_excludes_deleted_posts(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
