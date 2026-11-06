@@ -201,12 +201,15 @@ tau tan following
 
 Posts are limited to 2,000 characters and 20 posts per feed response. A
 long-running node stores only posts it created, received or synced. Tan is
-public-feed oriented: there are no private posts, likes or comments yet. An
-author can delete one of their own posts with `tau tan delete <post>` — the
-delete is a signed entry on the author's chain, so it propagates to peers
-and the post disappears from timelines (the entry itself stays stored,
-keeping chains verifiable). In the web console your own posts show a delete
-button that calls the same endpoint. The local database is `<data-dir>/tan.sqlite3`.
+public-feed oriented: there are no private posts or media yet. Posts can be
+answered with `tau tan post --reply-to <post>` — a reply is a signed entry
+on the replier's chain pointing at its parent, so it propagates to peers
+like any other post. An author can delete one of their own posts with
+`tau tan delete <post>` — the delete is a signed entry on the author's
+chain, so it propagates to peers and the post disappears from timelines
+(the entry itself stays stored, keeping chains verifiable). In the web
+console your own posts show a delete button that calls the same endpoint.
+The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 
@@ -234,6 +237,7 @@ Global options may appear before or after the command:
 | `tau outbox` | List messages queued for offline peers |
 | `tau id` | Show this node's name and destination hash |
 | `tau tan post TEXT` | Sign, store and publish a social post |
+| `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
@@ -517,9 +521,13 @@ unlinked, and stall sync at the gap.
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
-- Tan is a public timeline: no private posts, likes, comments or media yet.
-  Authors can delete their own posts. It is not a full ActivityPub-style
+- Tan is a public timeline: no private posts or media yet.
+  Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
+- Replies are a new entry kind: a peer running a version that predates
+  replies rejects them, and — because entries are hash-chained — a
+  rejected reply also leaves that author's later entries (including
+  deletes) unlinked on the old peer until it upgrades and resyncs.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
 - Peer information is self-asserted and can be stale; prune with
@@ -528,7 +536,7 @@ unlinked, and stall sync at the gap.
 - Natural extensions: group destinations, file transfer using Reticulum
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (threads, media, moderation, follow recommendations).
+  (media, moderation, follow recommendations).
 
 ## Development
 
