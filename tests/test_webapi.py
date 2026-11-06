@@ -829,6 +829,23 @@ def test_delivery_before_record_is_not_lost(bridge, node):
     assert feed["messages"][0]["status"] == "delivered"
 
 
+def test_early_delivery_buffer_evicts_oldest(bridge):
+    """Unmatched delivery reports are bounded, oldest evicted first.
+
+    Regression test for the CodeRabbit Minor on PR #35: the buffer was
+    a plain dict but eviction called ``popitem(last=False)`` — an
+    OrderedDict-only API — so the 129th unmatched report raised
+    TypeError instead of evicting.
+    """
+    from tau.webapi import MAX_EARLY_DELIVERIES
+
+    for index in range(MAX_EARLY_DELIVERIES + 5):
+        assert bridge.record_delivery(f"unknown-{index}") is None
+    assert len(bridge._early_deliveries) == MAX_EARLY_DELIVERIES
+    assert "unknown-0" not in bridge._early_deliveries
+    assert f"unknown-{MAX_EARLY_DELIVERIES + 4}" in bridge._early_deliveries
+
+
 def test_delivery_report_not_blocked_by_slow_send(bridge, node):
     """A delivery report completes while another send is in flight.
 
