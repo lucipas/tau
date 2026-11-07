@@ -19,6 +19,7 @@ or buggy peer must not be able to make us buffer large amounts of data.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import time
@@ -205,6 +206,27 @@ def generate_group_id() -> str:
     return uuid.uuid4().hex
 
 
+def derive_group_id(creator: str, name: str, members: List[str]) -> str:
+    """Derive a group's id from its creator, name and roster.
+
+    The id commits to the roster: a message carrying a different roster
+    for the same id cannot verify, so a member cannot fork a group id
+    onto a recipient that has not seen it yet — the recipient pins the
+    roster that matches the id, and only that roster.  Creating a group
+    with a fresh id and an arbitrary roster is still possible, but that
+    is unsolicited group creation, gated by the DM allow-list exactly
+    like a direct message from a stranger.
+    """
+    canonical = "\n".join(
+        [
+            _clean_hexhash(creator, "creator"),
+            sanitize_group_name(name),
+            *[member.lower() for member in sorted(_clean_member_list(members))],
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
 def sanitize_group_name(name: Any, fallback: str = "group") -> str:
     """Normalise a human readable group name."""
     if not isinstance(name, str):
@@ -240,6 +262,7 @@ def encode_group_message(
     message_id: Optional[str] = None,
     group_id: str,
     group_name: str,
+    creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
 ) -> bytes:
@@ -247,7 +270,10 @@ def encode_group_message(
 
     The roster rides in every message, signed by the link identity of
     the sender (the same authentication as a direct message), so a
-    recipient that has never seen the group can learn and pin it.
+    recipient that has never seen the group can learn and pin it.  The
+    group id is derived from the creator, name and roster (see
+    :func:`derive_group_id`), so the roster a message carries must match
+    the id it claims.
     """
     payload = {
         "type": "group_message",
@@ -257,6 +283,7 @@ def encode_group_message(
         "client": f"tau/{__version__}",
         "group": _clean_hexhash(group_id, "group"),
         "group_name": sanitize_group_name(group_name),
+        "creator": _clean_hexhash(creator, "creator"),
         "members": _clean_member_list(members),
     }
     if message_id:
@@ -276,13 +303,22 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
+    group = _clean_hexhash(payload.get("group"), "group")
+    group_name = sanitize_group_name(payload.get("group_name"))
+    creator = _clean_hexhash(payload.get("creator"), "creator")
+    members = _clean_member_list(payload.get("members"))
+    if creator not in members:
+        raise ProtocolError("group creator must be a member of the group")
+    if derive_group_id(creator, group_name, members) != group:
+        raise ProtocolError("group id does not match its creator and roster")
     return {
         "text": text,
         "sent_at": sent_at,
         "id": message_id,
-        "group": _clean_hexhash(payload.get("group"), "group"),
-        "group_name": sanitize_group_name(payload.get("group_name")),
-        "members": _clean_member_list(payload.get("members")),
+        "group": group,
+        "group_name": group_name,
+        "creator": creator,
+        "members": members,
     }
 
 

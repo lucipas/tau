@@ -547,6 +547,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_list.set_defaults(func=cmd_group_list)
 
+    group_delete = group_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a group (frees capacity when a group cap is reached)",
+    )
+    group_delete.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_delete.set_defaults(func=cmd_group_delete)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -2460,6 +2470,19 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
         print(f"{group['name']} ({group['id'][:8]}) — {names}")
+    return _EXIT_OK
+
+
+def cmd_group_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    if not store.delete(group["id"]):
+        raise NodeError(f"unknown group: {args.group!r}")
+    if _json_mode(args):
+        _emit({"deleted": group["id"], "name": group["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted group {group['name']} ({group['id'][:8]})")
     return _EXIT_OK
 
 

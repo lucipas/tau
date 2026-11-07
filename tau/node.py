@@ -61,6 +61,7 @@ from .protocol import (
     build_mail_fetch,
     build_mail_store,
     decode,
+    derive_group_id,
     encode_group_message,
     encode_message,
     generate_message_id,
@@ -879,17 +880,26 @@ class TauNode:
 
         Returns the pinned group record, or ``None`` when the message
         must be rejected: the sender is not on the roster, this node is
-        not on the roster, or the roster disagrees with the one already
+        not on the roster, the id does not derive from the creator,
+        name and roster, or the roster disagrees with the one already
         pinned for the group id (a changed roster means a new group).
         The sender is authenticated by the link identity (direct) or by
-        the sealed envelope's signature (relayed), never by the payload.
+        the sealed envelope's signature (relayed), never by the payload;
+        the id derivation is what binds the roster to the id, so a
+        member cannot fork an id onto a recipient that has not seen it.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
         if sender_hash not in members or own_hash not in members:
             return None
+        creator = group.get("creator") or ""
+        try:
+            if derive_group_id(creator, group.get("name") or "group", members) != group["id"]:
+                return None
+        except (ProtocolError, ValueError):
+            return None
         return self.groups.record(
-            group["id"], group.get("name") or "group", members
+            group["id"], group.get("name") or "group", members, creator=creator
         )
 
     def _handle_group_message(
@@ -927,6 +937,7 @@ class TauNode:
             {
                 "id": message["group"],
                 "name": message["group_name"],
+                "creator": message["creator"],
                 "members": message["members"],
             },
         )
@@ -1290,6 +1301,7 @@ class TauNode:
                 sent_at=entry.created_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
+                creator=entry.group_creator,
                 members=entry.group_members,
             )
             if entry.group_id is not None
@@ -1351,6 +1363,7 @@ class TauNode:
                     {
                         "id": entry.group_id,
                         "name": entry.group_name,
+                        "creator": entry.group_creator,
                         "members": entry.group_members,
                     }
                     if entry.group_id is not None
@@ -1716,12 +1729,18 @@ class TauNode:
         """
         if isinstance(group, str):
             group = self.groups.find(group)
+        creator = group.get("creator") or ""
+        if not creator:
+            raise NodeError(
+                "group record has no creator; delete it and re-create it"
+            )
         normalized = normalize_message(text)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
             "id": group["id"],
             "name": group["name"],
+            "creator": creator,
             "members": list(group["members"]),
         }
         results: List[Dict[str, Any]] = []
@@ -1735,6 +1754,7 @@ class TauNode:
                 message_id=generate_message_id(),
                 group_id=group["id"],
                 group_name=group["name"],
+                creator=creator,
                 members=list(group["members"]),
             )
         except ProtocolError as exc:
@@ -1749,6 +1769,7 @@ class TauNode:
                 message_id=message_id,
                 group_id=group["id"],
                 group_name=group["name"],
+                creator=creator,
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None

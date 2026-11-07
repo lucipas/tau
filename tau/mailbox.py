@@ -108,6 +108,7 @@ class OutboxEntry:
     # (destination hashes, hex) so a retry re-sends the same group.
     group_id: Optional[str] = None
     group_name: str = ""
+    group_creator: str = ""
     group_members: List[str] = field(default_factory=list)
 
     @property
@@ -161,6 +162,7 @@ class OutboxEntry:
             payload["group"] = {
                 "id": self.group_id,
                 "name": self.group_name,
+                "creator": self.group_creator,
                 "members": list(self.group_members),
             }
         return payload
@@ -189,13 +191,17 @@ class OutboxEntry:
         group_raw = raw.get("group")
         group_id: Optional[str] = None
         group_name = ""
+        group_creator = ""
         group_members: List[str] = []
         if isinstance(group_raw, dict):
             candidate_id = group_raw.get("id")
+            candidate_creator = group_raw.get("creator")
             candidate_members = group_raw.get("members")
             if (
                 isinstance(candidate_id, str)
                 and len(candidate_id) == 32
+                and isinstance(candidate_creator, str)
+                and len(candidate_creator) == 32
                 and isinstance(candidate_members, list)
                 and all(
                     isinstance(m, str) and len(m) == 32 for m in candidate_members
@@ -203,6 +209,7 @@ class OutboxEntry:
             ):
                 try:
                     bytes.fromhex(candidate_id)
+                    bytes.fromhex(candidate_creator)
                     for member in candidate_members:
                         bytes.fromhex(member)
                 except ValueError:
@@ -210,6 +217,7 @@ class OutboxEntry:
                 else:
                     group_id = candidate_id.lower()
                     group_name = sanitize_group_name(group_raw.get("name"))
+                    group_creator = candidate_creator.lower()
                     group_members = [m.lower() for m in candidate_members]
         return cls(
             id=message_id,
@@ -234,6 +242,7 @@ class OutboxEntry:
             },
             group_id=group_id,
             group_name=group_name,
+            group_creator=group_creator,
             group_members=group_members,
         )
 
@@ -475,7 +484,7 @@ class Mailbox:
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
-        ``group`` (``{"id", "name", "members"}``) marks this entry as one
+        ``group`` (``{"id", "name", "creator", "members"}``) marks this entry as one
         leg of a group message, so a retry re-sends the group payload
         instead of a plain direct message.
         """
@@ -486,27 +495,35 @@ class Mailbox:
         entry_id = message_id or generate_message_id()
         group_id: Optional[str] = None
         group_name = ""
+        group_creator = ""
         group_members: List[str] = []
         if group is not None:
             candidate_id = group.get("id")
+            candidate_creator = group.get("creator")
             candidate_members = group.get("members")
             if not (
                 isinstance(candidate_id, str)
                 and len(candidate_id) == 32
+                and isinstance(candidate_creator, str)
+                and len(candidate_creator) == 32
                 and isinstance(candidate_members, list)
                 and all(
                     isinstance(m, str) and len(m) == 32 for m in candidate_members
                 )
             ):
-                raise MailboxError("group context needs an id and member hashes")
+                raise MailboxError(
+                    "group context needs an id, a creator and member hashes"
+                )
             try:
                 bytes.fromhex(candidate_id)
+                bytes.fromhex(candidate_creator)
                 for member in candidate_members:
                     bytes.fromhex(member)
             except ValueError as exc:
                 raise MailboxError("group context has a non-hex hash") from exc
             group_id = candidate_id.lower()
             group_name = sanitize_group_name(group.get("name"))
+            group_creator = candidate_creator.lower()
             group_members = [m.lower() for m in candidate_members]
         with self._transaction():
             existing = self._outbox.get(entry_id)
@@ -525,6 +542,7 @@ class Mailbox:
                 else "",
                 group_id=group_id,
                 group_name=group_name,
+                group_creator=group_creator,
                 group_members=group_members,
             )
             self._outbox[entry.id] = entry
@@ -825,8 +843,8 @@ def seal_message(
     The plaintext envelope carries the sender's public key and a signature
     over every other field, so the recipient can authenticate the message
     without trusting whichever peer happened to hold it.  ``group``
-    (``{"id", "name", "members"}``) marks the envelope as one leg of a
-    group message; it is covered by the same signature.
+    (``{"id", "name", "creator", "members"}``) marks the envelope as one
+    leg of a group message; it is covered by the same signature.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -843,16 +861,22 @@ def seal_message(
     }
     if group is not None:
         group_id = group.get("id")
+        group_creator = group.get("creator")
         group_members = group.get("members")
         if not (
             isinstance(group_id, str)
             and len(group_id) == 32
+            and isinstance(group_creator, str)
+            and len(group_creator) == 32
             and isinstance(group_members, list)
             and all(isinstance(m, str) and len(m) == 32 for m in group_members)
         ):
-            raise MailboxError("group context needs an id and member hashes")
+            raise MailboxError(
+                "group context needs an id, a creator and member hashes"
+            )
         try:
             bytes.fromhex(group_id)
+            bytes.fromhex(group_creator)
             for member in group_members:
                 bytes.fromhex(member)
         except ValueError as exc:
@@ -860,6 +884,7 @@ def seal_message(
         inner["group"] = {
             "id": group_id.lower(),
             "name": sanitize_group_name(group.get("name")),
+            "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
     canonical = encode(inner)
@@ -951,16 +976,20 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         if not isinstance(group_raw, dict):
             raise MailboxError("sealed message group must be an object")
         group_id = group_raw.get("id")
+        group_creator = group_raw.get("creator")
         group_members = group_raw.get("members")
         if not (
             isinstance(group_id, str)
             and len(group_id) == 32
+            and isinstance(group_creator, str)
+            and len(group_creator) == 32
             and isinstance(group_members, list)
             and all(isinstance(m, str) and len(m) == 32 for m in group_members)
         ):
             raise MailboxError("sealed message group is invalid")
         try:
             bytes.fromhex(group_id)
+            bytes.fromhex(group_creator)
             for member in group_members:
                 bytes.fromhex(member)
         except ValueError as exc:
@@ -968,6 +997,7 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         result["group"] = {
             "id": group_id.lower(),
             "name": sanitize_group_name(group_raw.get("name")),
+            "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
     return result

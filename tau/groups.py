@@ -1,11 +1,15 @@
 """Durable group roster store: private group DMs with fixed membership.
 
-A group is a fixed roster — the creator plus named peers — identified by
-a random id.  The roster is created locally with ``tau group create``
-and travels in every group message, so a recipient that has never seen
-the group learns it from the first message and pins it: the first roster
-seen for an id wins, and a later message carrying a different roster for
-the same id is rejected, so a changed roster means a new group.
+A group is a fixed roster — the creator plus named peers.  The group id
+is derived from the creator, name and roster (see
+:func:`tau.protocol.derive_group_id`), so the id commits to the roster:
+a message carrying a different roster for the same id cannot verify.
+The roster is created locally with ``tau group create`` and travels in
+every group message, so a recipient that has never seen the group learns
+it from the first message and pins it.  Locally created groups and
+remotely learned ones are capped separately and neither cap evicts, so
+a peer flooding group ids can never push out a group this node created;
+``tau group delete`` frees capacity when a cap is reached.
 """
 
 from __future__ import annotations
@@ -25,7 +29,8 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 from .protocol import (
     MAX_GROUP_MEMBERS,
     MIN_GROUP_MEMBERS,
-    generate_group_id,
+    ProtocolError,
+    derive_group_id,
     sanitize_group_name,
 )
 from .util import atomic_write_json, read_json
@@ -33,10 +38,11 @@ from .util import atomic_write_json, read_json
 log = logging.getLogger(__name__)
 
 GROUPS_FILE_NAME = "groups.json"
-# Locally created groups (created_by set) and remotely learned groups
-# (created_by empty) are capped separately, and neither cap evicts: a
-# peer that floods group ids can only fill its own quota and can never
-# push out a group this node created or one it already pinned.
+# Locally created groups and remotely learned groups are capped
+# separately, and neither cap evicts: a peer that floods group ids can
+# only fill its own quota and can never push out a group this node
+# created or one it already pinned.  `tau group delete` frees capacity
+# when a cap is reached.
 MAX_GROUPS = 100
 MAX_LEARNED_GROUPS = 50
 
@@ -70,6 +76,35 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         or len(set(cleaned)) != len(cleaned)
     ):
         return None
+    # Canonical roster order: the id derives from the sorted roster, so
+    # a stored record must too, or the same group recreated with the
+    # members in a different order would look like a different roster.
+    cleaned = sorted(cleaned)
+    creator = raw.get("creator")
+    if creator is None:
+        # Groups written before the creator field existed carry no
+        # derivation to check; treat them as learned.
+        creator = ""
+    elif not isinstance(creator, str) or len(creator) != 32:
+        return None
+    else:
+        try:
+            bytes.fromhex(creator)
+        except ValueError:
+            return None
+        creator = creator.lower()
+    name = sanitize_group_name(raw.get("name"))
+    if creator:
+        if creator not in cleaned:
+            return None
+        try:
+            expected = derive_group_id(creator, name, cleaned)
+        except (ProtocolError, ValueError):
+            return None
+        if group_id.lower() != expected:
+            # The id must commit to the roster; a stored record that
+            # does not verify is corrupt (or hand-edited) and is dropped.
+            return None
     created_at = raw.get("created_at")
     try:
         created_at = float(created_at) if created_at is not None else time.time()
@@ -77,10 +112,12 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     return {
         "id": group_id.lower(),
-        "name": sanitize_group_name(raw.get("name")),
+        "name": name,
         "members": cleaned,
         "created_at": created_at,
-        "created_by": str(raw.get("created_by") or ""),
+        "creator": creator,
+        "created_by": creator,
+        "local": bool(raw.get("local", False)),
     }
 
 
@@ -149,38 +186,70 @@ class GroupStore:
     def create(
         self, name: str, members: List[str], *, created_by: str = ""
     ) -> Dict[str, Any]:
-        """Create a group with a fresh id and persist it."""
+        """Create a group and persist it.
+
+        The id is derived from the creator, name and roster, so creating
+        the same group twice returns the same record.  Raises
+        :class:`ValueError` when the group is invalid or the local cap
+        is reached, and :class:`OSError` when the write fails (the
+        in-memory store is left as it was on disk).
+        """
+        try:
+            group_id = derive_group_id(created_by, name, members)
+        except ProtocolError as exc:
+            raise ValueError(f"invalid group: {exc}") from exc
         group = _valid_group(
             {
-                "id": generate_group_id(),
+                "id": group_id,
                 "name": name,
                 "members": members,
                 "created_at": time.time(),
+                "creator": created_by,
                 "created_by": created_by,
+                "local": True,
             }
         )
         if group is None:  # pragma: no cover - create() validates first
             raise ValueError("invalid group")
         with self._transaction():
-            created = sum(1 for g in self._groups.values() if g["created_by"])
+            existing = self._groups.get(group["id"])
+            if existing is not None:
+                if existing["members"] != group["members"]:
+                    raise ValueError("group id already exists with another roster")
+                return dict(existing)
+            created = sum(1 for g in self._groups.values() if g["local"])
             if created >= MAX_GROUPS:
-                raise ValueError(f"group limit reached ({MAX_GROUPS} created groups)")
+                raise ValueError(
+                    f"group limit reached ({MAX_GROUPS} created groups;"
+                    " delete one with `tau group delete`)"
+                )
             self._groups[group["id"]] = group
             try:
                 self._save()
             except OSError:
+                # The id was not stored before (an existing id returns
+                # above), so dropping it restores the on-disk state.
                 del self._groups[group["id"]]
                 raise
         return dict(group)
 
     def record(
-        self, group_id: str, name: str, members: List[str], *, created_by: str = ""
+        self,
+        group_id: str,
+        name: str,
+        members: List[str],
+        *,
+        creator: str,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
-        The first roster seen for an id wins; a later message carrying
-        a different roster for the same id returns ``None`` so the
-        caller can reject it — a changed roster means a new group.
+        The id must derive from the creator, name and roster, so a
+        message carrying a different roster for the same id returns
+        ``None`` — a changed roster means a new group, and a member
+        cannot fork an id onto a recipient that has not seen it.  A
+        learned group is also refused when the learned cap is full
+        (delete a group to make room); locally created groups are never
+        evicted to make room for one.
         """
         candidate = _valid_group(
             {
@@ -188,7 +257,9 @@ class GroupStore:
                 "name": name,
                 "members": members,
                 "created_at": time.time(),
-                "created_by": created_by,
+                "creator": creator,
+                "created_by": creator,
+                "local": False,
             }
         )
         if candidate is None:
@@ -199,7 +270,7 @@ class GroupStore:
                 if existing["members"] != candidate["members"]:
                     return None
                 return dict(existing)
-            learned = sum(1 for g in self._groups.values() if not g["created_by"])
+            learned = sum(1 for g in self._groups.values() if not g["local"])
             if learned >= MAX_LEARNED_GROUPS:
                 log.info("Refusing to pin group %s: learned-group limit reached", group_id)
                 return None
@@ -212,6 +283,24 @@ class GroupStore:
                 log.warning("Could not persist groups to %s: %s", self.path, exc)
                 return None
         return dict(candidate)
+
+    def delete(self, group_id: str) -> bool:
+        """Delete a known group; ``False`` when it was not stored.
+
+        Raises :class:`OSError` when the write fails, leaving the
+        in-memory store as it was on disk.
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                return False
+            del self._groups[group_id.lower()]
+            try:
+                self._save()
+            except OSError:
+                self._load()
+                raise
+        return True
 
     def get(self, group_id: str) -> Optional[Dict[str, Any]]:
         """One group by id, or ``None``."""
@@ -259,13 +348,6 @@ class GroupStore:
         (for example ``tau group create`` while ``tau serve`` runs) are seen.
         """
         with self._transaction():
-            return [dict(group) for group in self._groups.values()]
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._groups)
- known groups, oldest first."""
-        with self._lock:
             return [dict(group) for group in self._groups.values()]
 
     def __len__(self) -> int:

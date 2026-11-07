@@ -255,6 +255,7 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
+| `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
@@ -644,6 +645,9 @@ unlinked, and stall sync at the gap.
   per member over the existing encrypted links (no MLS or group ratcheting);
   membership is fixed at creation, a changed roster is a new group, and a
   peer running a version that predates groups rejects `/tau/group` requests.
+  The group id is derived from the creator, name and roster, so a roster
+  cannot be forked under an existing id; a peer can still invent a fresh
+  group that includes you, gated by the DM allow-list like a direct message.
   Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
 - Tan is a public timeline: no private posts or media yet.
