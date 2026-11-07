@@ -2130,7 +2130,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                     discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
                     queue=not getattr(args, "no_queue", False),
                 )
-            except (NodeError, PeerError) as exc:
+            except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
                     # Single recipient keeps the historical behaviour:
                     # the error reaches main() and exits non-zero.

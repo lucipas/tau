@@ -79,6 +79,10 @@ class _FakeSendNode:
         mode = _FakeSendNode.behaviour.get(target, "delivered")
         if mode == "error":
             raise NodeError(f"no path to {target}")
+        if mode == "full":
+            from tau.mailbox import MailboxFull
+
+            raise MailboxFull("outbox is full")
         if mode == "queued":
             entry = self.mailbox.enqueue(
                 to=b"\xbb" * 16,
@@ -123,6 +127,20 @@ def test_send_to_several_peers_delivers_each(tmp_path, capsys, monkeypatch):
     assert node.calls == [("alice", "hi"), ("bob", "hi")]
     assert node.started is False
     assert node.flush_calls == []
+
+
+def test_send_full_outbox_does_not_stop_later_recipients(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "full", "bob": "delivered"},
+    )
+    assert code != 0
+    out = capsys.readouterr().out
+    # Later recipients are still attempted and reported.
+    assert _FakeSendNode.instances[0].calls == [("alice", "hi"), ("bob", "hi")]
+    assert "delivered to bob" in out
 
 
 def test_send_mixed_delivered_and_queued(tmp_path, capsys, monkeypatch):
