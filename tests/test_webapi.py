@@ -27,6 +27,11 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
+        if isinstance(destination_hash, str):
+            try:
+                destination_hash = bytes.fromhex(destination_hash)
+            except ValueError:
+                return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
@@ -165,6 +170,56 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["direction"] == "in"
     assert feed["messages"][0]["peer_name"] == "bob"
     assert feed["messages"][0]["text"] == "from the mesh"
+
+
+def test_inbound_group_message_keeps_group_fields(bridge):
+    record = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "hello group",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "kind": "group",
+        "group": "aa" * 16,
+        "group_name": "weekend",
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    message = feed["messages"][0]
+    assert message["group"] == "aa" * 16
+    assert message["group_name"] == "weekend"
+
+    plain = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "plain",
+        "sent_at": 102.0,
+        "received_at": 103.0,
+    }
+    bridge.record_inbound(plain)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "group" not in feed["messages"][1]
+
+
+def test_api_groups_lists_known_groups(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["count"] == 1
+    group = payload["groups"][0]
+    assert group["name"] == "weekend"
+    assert [member["hash"] for member in group["members"]] == [
+        PEER_HASH,
+        OTHER_HASH,
+    ]
+    # The registry resolves the first member's display name.
+    assert group["members"][0]["name"] == "alice"
 
 
 def test_send_validation(bridge):

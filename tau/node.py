@@ -24,6 +24,7 @@ import RNS
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
+from .groups import GroupStore
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -49,6 +50,7 @@ from .protocol import (
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
     REQUEST_INFO,
+    REQUEST_GROUP_MESSAGE,
     REQUEST_MAIL_FETCH,
     REQUEST_MAIL_STORE,
     REQUEST_MESSAGE,
@@ -59,10 +61,12 @@ from .protocol import (
     build_mail_fetch,
     build_mail_store,
     decode,
+    encode_group_message,
     encode_message,
     generate_message_id,
     normalize_message,
     parse_announce,
+    parse_group_message,
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
@@ -331,6 +335,7 @@ class TauNode:
         )
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
+        self.groups = GroupStore(getattr(config, "groups_path", None))
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
@@ -475,6 +480,7 @@ class TauNode:
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
+            REQUEST_GROUP_MESSAGE: self._handle_group_message,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -858,6 +864,116 @@ class TauNode:
             duplicate=duplicate,
         )
 
+    def _accept_group_message(
+        self, sender_hash: str, group: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a group message's roster; pin the group on first sight.
+
+        Returns the pinned group record, or ``None`` when the message
+        must be rejected: the sender is not on the roster, this node is
+        not on the roster, or the roster disagrees with the one already
+        pinned for the group id (a changed roster means a new group).
+        The sender is authenticated by the link identity (direct) or by
+        the sealed envelope's signature (relayed), never by the payload.
+        """
+        members = group.get("members") or []
+        own_hash = self.destination_hexhash
+        if sender_hash not in members or own_hash not in members:
+            return None
+        return self.groups.record(
+            group["id"], group.get("name") or "group", members
+        )
+
+    def _handle_group_message(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            message = parse_group_message(data)
+        except ProtocolError as exc:
+            return response_error("invalid_message", str(exc))
+
+        received_at = time.time()
+        caller_hash = self._caller_label(remote_identity)
+        if remote_identity is not None:
+            caller_hash = tau_destination_hash(remote_identity).hex()
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Group message from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        group = self._accept_group_message(
+            caller_hash,
+            {
+                "id": message["group"],
+                "name": message["group_name"],
+                "members": message["members"],
+            },
+        )
+        if group is None:
+            log.info(
+                "Group message from %s rejected: sender or node not on "
+                "the roster, or the roster changed for group %s",
+                caller_hash or "anonymous",
+                message["group"],
+            )
+            return response_error(
+                "not_a_member", "sender or recipient is not a group member"
+            )
+
+        # Store-and-forward retries and relay copies can deliver the same
+        # message twice; the id makes delivery idempotent.
+        message_id = message.get("id")
+        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+        if not duplicate:
+            if message_id:
+                self.mailbox.mark_seen(message_id)
+            record = {
+                "from": caller_name,
+                "destination": caller_hash,
+                "text": message["text"],
+                "sent_at": message["sent_at"],
+                "received_at": received_at,
+                "id": message_id,
+                "kind": "group",
+                "group": group["id"],
+                "group_name": group["name"],
+            }
+            log.info(
+                "Group message from %s (%s) in %s: %s",
+                caller_name,
+                caller_hash or "anonymous",
+                group["name"],
+                message["text"],
+            )
+            self._record_received(record)
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+
+        return response_ok(
+            echo=message["text"],
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            group=group["id"],
+            duplicate=duplicate,
+        )
+
     def _handle_mail_store(
         self,
         path: str,
@@ -1159,13 +1275,31 @@ class TauNode:
         with self.mailbox.transaction():
             if self.mailbox.get_outbox(entry.id) is None:
                 return False
-        payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+        payload = (
+            encode_group_message(
+                entry.text,
+                message_id=entry.id,
+                sent_at=entry.created_at,
+                group_id=entry.group_id,
+                group_name=entry.group_name,
+                members=entry.group_members,
+            )
+            if entry.group_id is not None
+            else encode_message(
+                entry.text, message_id=entry.id, sent_at=entry.created_at
+            )
         )
         if not self._still_queued(entry.id):
             return False
         try:
-            self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self._request(
+                peer,
+                REQUEST_GROUP_MESSAGE
+                if entry.group_id is not None
+                else REQUEST_MESSAGE,
+                payload,
+                timeout,
+            )
         except NodeError as exc:
             self.mailbox.record_attempt(entry.id, error=str(exc))
             return False
@@ -1199,6 +1333,15 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                group=(
+                    {
+                        "id": entry.group_id,
+                        "name": entry.group_name,
+                        "members": entry.group_members,
+                    }
+                    if entry.group_id is not None
+                    else None
+                ),
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1311,6 +1454,20 @@ class TauNode:
             return False
         if self.mailbox.is_seen(message["id"]):
             return False
+        group = message.get("group")
+        pinned: Optional[Dict[str, Any]] = None
+        if group is not None:
+            sender = message.get("from")
+            pinned = self._accept_group_message(
+                sender if isinstance(sender, str) else "", group
+            )
+            if pinned is None:
+                log.info(
+                    "Relayed group message from %s rejected: sender or "
+                    "node not on the roster, or the roster changed",
+                    sender or "unknown",
+                )
+                return False
         self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
@@ -1321,6 +1478,10 @@ class TauNode:
             "id": message["id"],
             "relayed": True,
         }
+        if pinned is not None:
+            record["kind"] = "group"
+            record["group"] = pinned["id"]
+            record["group_name"] = pinned["name"]
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
             message["from_name"],
@@ -1520,6 +1681,127 @@ class TauNode:
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
             }
+
+    def send_group_message(
+        self,
+        group: Union[str, Dict[str, Any]],
+        text: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        queue: bool = True,
+    ) -> Dict[str, Any]:
+        """Fan *text* out to every member of a group except this node.
+
+        *group* is a group id, id prefix, name, or group record.  Each
+        leg is a ``/tau/group`` request carrying the roster; a member
+        that cannot be reached is queued in the outbox (with the group
+        context, so a retry re-sends the group payload) unless it
+        explicitly refused the message.  Returns a per-member result
+        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        """
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        normalized = normalize_message(text)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        context = {
+            "id": group["id"],
+            "name": group["name"],
+            "members": list(group["members"]),
+        }
+        results: List[Dict[str, Any]] = []
+        any_queued = False
+        for member in members:
+            message_id = generate_message_id()
+            payload = encode_group_message(
+                normalized,
+                message_id=message_id,
+                group_id=group["id"],
+                group_name=group["name"],
+                members=list(group["members"]),
+            )
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=discover_timeout
+                    if discover_timeout is not None
+                    else min(timeout, 10.0),
+                )
+                response = self._request(
+                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "id": message_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except NotAllowedError:
+                # The member is online and explicitly refused; queueing
+                # would retry a refusal until its TTL expires.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed",
+                        "id": message_id,
+                    }
+                )
+            except NodeError as exc:
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "error": str(exc),
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                entry = self.mailbox.enqueue(
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    to_name=peer.display_name if peer is not None else "",
+                    message_id=message_id,
+                    group=context,
+                )
+                any_queued = True
+                log.info(
+                    "Member %s is unreachable; queued group message %s "
+                    "in the outbox",
+                    member,
+                    entry.id,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": entry.to_name,
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                    }
+                )
+        if any_queued:
+            threading.Thread(
+                target=self.flush_outbox,
+                kwargs={"timeout": _MAIL_REQUEST_TIMEOUT, "max_peers": 5},
+                name="tau-mail-flush",
+                daemon=True,
+            ).start()
+        return {
+            "ok": True,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "results": results,
+        }
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""

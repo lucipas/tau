@@ -54,6 +54,7 @@ from .protocol import (
     encode,
     generate_message_id,
     normalize_message,
+    sanitize_group_name,
     sanitize_name,
 )
 from .util import atomic_write_json, read_json
@@ -101,6 +102,13 @@ class OutboxEntry:
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
     held_by: Dict[str, float] = field(default_factory=dict)
+    # Group DM context: when present, this entry is one leg of a group
+    # message — the payload is a /tau/group request carrying this roster
+    # instead of a plain /tau/message.  ``members`` is the full roster
+    # (destination hashes, hex) so a retry re-sends the same group.
+    group_id: Optional[str] = None
+    group_name: str = ""
+    group_members: List[str] = field(default_factory=list)
 
     @property
     def to_hex(self) -> str:
@@ -136,7 +144,7 @@ class OutboxEntry:
         return (now if now is not None else time.time()) >= target
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "id": self.id,
             "to": self.to_hex,
             "to_name": self.to_name,
@@ -149,6 +157,13 @@ class OutboxEntry:
             "next_attempt_at": self.next_attempt_at,
             "held_by": dict(self.held_by),
         }
+        if self.group_id is not None:
+            payload["group"] = {
+                "id": self.group_id,
+                "name": self.group_name,
+                "members": list(self.group_members),
+            }
+        return payload
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OutboxEntry":
@@ -171,6 +186,31 @@ class OutboxEntry:
         if not isinstance(held_by, dict):
             held_by = {}
         attempts = raw.get("attempts")
+        group_raw = raw.get("group")
+        group_id: Optional[str] = None
+        group_name = ""
+        group_members: List[str] = []
+        if isinstance(group_raw, dict):
+            candidate_id = group_raw.get("id")
+            candidate_members = group_raw.get("members")
+            if (
+                isinstance(candidate_id, str)
+                and len(candidate_id) == 32
+                and isinstance(candidate_members, list)
+                and all(
+                    isinstance(m, str) and len(m) == 32 for m in candidate_members
+                )
+            ):
+                try:
+                    bytes.fromhex(candidate_id)
+                    for member in candidate_members:
+                        bytes.fromhex(member)
+                except ValueError:
+                    pass
+                else:
+                    group_id = candidate_id.lower()
+                    group_name = sanitize_group_name(group_raw.get("name"))
+                    group_members = [m.lower() for m in candidate_members]
         return cls(
             id=message_id,
             to=destination,
@@ -192,6 +232,9 @@ class OutboxEntry:
                 for k, v in held_by.items()
                 if isinstance(v, (int, float))
             },
+            group_id=group_id,
+            group_name=group_name,
+            group_members=group_members,
         )
 
 
@@ -428,13 +471,43 @@ class Mailbox:
         ttl: float = DEFAULT_TTL,
         message_id: Optional[str] = None,
         now: Optional[float] = None,
+        group: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
-        """Queue *text* for delivery to destination *to*."""
+        """Queue *text* for delivery to destination *to*.
+
+        ``group`` (``{"id", "name", "members"}``) marks this entry as one
+        leg of a group message, so a retry re-sends the group payload
+        instead of a plain direct message.
+        """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
         entry_id = message_id or generate_message_id()
+        group_id: Optional[str] = None
+        group_name = ""
+        group_members: List[str] = []
+        if group is not None:
+            candidate_id = group.get("id")
+            candidate_members = group.get("members")
+            if not (
+                isinstance(candidate_id, str)
+                and len(candidate_id) == 32
+                and isinstance(candidate_members, list)
+                and all(
+                    isinstance(m, str) and len(m) == 32 for m in candidate_members
+                )
+            ):
+                raise MailboxError("group context needs an id and member hashes")
+            try:
+                bytes.fromhex(candidate_id)
+                for member in candidate_members:
+                    bytes.fromhex(member)
+            except ValueError as exc:
+                raise MailboxError("group context has a non-hex hash") from exc
+            group_id = candidate_id.lower()
+            group_name = sanitize_group_name(group.get("name"))
+            group_members = [m.lower() for m in candidate_members]
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -450,6 +523,9 @@ class Mailbox:
                 to_name=sanitize_name(to_name, fallback="")
                 if to_name
                 else "",
+                group_id=group_id,
+                group_name=group_name,
+                group_members=group_members,
             )
             self._outbox[entry.id] = entry
             self.save()
@@ -742,12 +818,15 @@ def seal_message(
     message_id: str,
     text: str,
     sent_at: float,
+    group: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
     The plaintext envelope carries the sender's public key and a signature
     over every other field, so the recipient can authenticate the message
-    without trusting whichever peer happened to hold it.
+    without trusting whichever peer happened to hold it.  ``group``
+    (``{"id", "name", "members"}``) marks the envelope as one leg of a
+    group message; it is covered by the same signature.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -762,6 +841,27 @@ def seal_message(
         "text": normalize_message(text),
         "sent_at": float(sent_at),
     }
+    if group is not None:
+        group_id = group.get("id")
+        group_members = group.get("members")
+        if not (
+            isinstance(group_id, str)
+            and len(group_id) == 32
+            and isinstance(group_members, list)
+            and all(isinstance(m, str) and len(m) == 32 for m in group_members)
+        ):
+            raise MailboxError("group context needs an id and member hashes")
+        try:
+            bytes.fromhex(group_id)
+            for member in group_members:
+                bytes.fromhex(member)
+        except ValueError as exc:
+            raise MailboxError("group context has a non-hex hash") from exc
+        inner["group"] = {
+            "id": group_id.lower(),
+            "name": sanitize_group_name(group.get("name")),
+            "members": [m.lower() for m in group_members],
+        }
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -839,10 +939,35 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
-    return {
+    result: Dict[str, Any] = {
         "id": message_id,
         "from": claimed_from.lower(),
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
     }
+    group_raw = payload.get("group")
+    if group_raw is not None:
+        if not isinstance(group_raw, dict):
+            raise MailboxError("sealed message group must be an object")
+        group_id = group_raw.get("id")
+        group_members = group_raw.get("members")
+        if not (
+            isinstance(group_id, str)
+            and len(group_id) == 32
+            and isinstance(group_members, list)
+            and all(isinstance(m, str) and len(m) == 32 for m in group_members)
+        ):
+            raise MailboxError("sealed message group is invalid")
+        try:
+            bytes.fromhex(group_id)
+            for member in group_members:
+                bytes.fromhex(member)
+        except ValueError as exc:
+            raise MailboxError("sealed message group has a non-hex hash") from exc
+        result["group"] = {
+            "id": group_id.lower(),
+            "name": sanitize_group_name(group_raw.get("name")),
+            "members": [m.lower() for m in group_members],
+        }
+    return result

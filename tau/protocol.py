@@ -55,6 +55,7 @@ REQUEST_MESSAGE = "/tau/message"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
+REQUEST_GROUP_MESSAGE = "/tau/group"
 REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
@@ -62,7 +63,14 @@ REQUEST_PATHS = (
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
+    REQUEST_GROUP_MESSAGE,
 )
+
+# Group DMs: a fixed roster, carried in every group message so a
+# recipient that has never seen the group can learn (and pin) it.
+MAX_GROUP_NAME_LENGTH = 48
+MAX_GROUP_MEMBERS = 32
+MIN_GROUP_MEMBERS = 2
 
 
 class ProtocolError(ValueError):
@@ -190,6 +198,92 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
 def generate_message_id() -> str:
     """Return a fresh random message identifier (32 hex characters)."""
     return uuid.uuid4().hex
+
+
+def generate_group_id() -> str:
+    """Return a fresh random group identifier (32 hex characters)."""
+    return uuid.uuid4().hex
+
+
+def sanitize_group_name(name: Any, fallback: str = "group") -> str:
+    """Normalise a human readable group name."""
+    if not isinstance(name, str):
+        return fallback
+    cleaned = " ".join(_clean_text(name).split())
+    cleaned = cleaned[:MAX_GROUP_NAME_LENGTH].strip()
+    return cleaned or fallback
+
+
+def _clean_member_list(value: Any) -> List[str]:
+    """Validate a group roster: 2-32 unique 32-hex destination hashes."""
+    if not isinstance(value, list):
+        raise ProtocolError("members must be a list of destination hashes")
+    members: List[str] = []
+    for member in value:
+        members.append(_clean_hexhash(member, "member"))
+    if len(members) < MIN_GROUP_MEMBERS:
+        raise ProtocolError(
+            f"a group needs at least {MIN_GROUP_MEMBERS} members"
+        )
+    if len(members) > MAX_GROUP_MEMBERS:
+        raise ProtocolError(
+            f"a group has at most {MAX_GROUP_MEMBERS} members"
+        )
+    if len(set(members)) != len(members):
+        raise ProtocolError("group members must be unique")
+    return members
+
+
+def encode_group_message(
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    group_id: str,
+    group_name: str,
+    members: List[str],
+    sent_at: Optional[float] = None,
+) -> bytes:
+    """Encode a group chat message for the ``/tau/group`` request.
+
+    The roster rides in every message, signed by the link identity of
+    the sender (the same authentication as a direct message), so a
+    recipient that has never seen the group can learn and pin it.
+    """
+    payload = {
+        "type": "group_message",
+        "v": PROTOCOL_VERSION,
+        "text": normalize_message(text),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+        "group": _clean_hexhash(group_id, "group"),
+        "group_name": sanitize_group_name(group_name),
+        "members": _clean_member_list(members),
+    }
+    if message_id:
+        payload["id"] = message_id
+    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+
+
+def parse_group_message(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/group`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "group_message":
+        raise ProtocolError("expected a group_message payload")
+    text = normalize_message(payload.get("text"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    return {
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "group": _clean_hexhash(payload.get("group"), "group"),
+        "group_name": sanitize_group_name(payload.get("group_name")),
+        "members": _clean_member_list(payload.get("members")),
+    }
 
 
 def encode_message(
