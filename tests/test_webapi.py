@@ -134,6 +134,38 @@ def test_status_snapshot(bridge):
     assert payload["messages"] == []
 
 
+def test_peers_endpoint_includes_verification_state(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["count"] == 1
+    entry = payload["peers"][0]
+    assert entry["verified"] is True
+    assert entry["verified_at"] == 1500.0
+    assert entry["key_change_at"] is None
+    # Verification state is local-only: the public description stays clean.
+    assert "verified" not in peer.public_dict()
+
+
+def test_record_peer_event_carries_trust_fields(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+    peer.key_change_at = 1600.0
+
+    bridge.record_peer(peer)
+    events = bridge.bus.replay(0)
+    peer_events = [event for event in events if event.get("type") == "peer"]
+    assert peer_events
+    # A live announce must not replace the snapshot record with a
+    # trust-free one: the badge and warning survive the event.
+    assert peer_events[-1]["peer"]["verified"] is True
+    assert peer_events[-1]["peer"]["key_change_at"] == 1600.0
+
+
 def test_send_message_is_recorded_and_published(bridge, node):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}

@@ -23,6 +23,10 @@ export interface Peer {
   protocol: number;
   // LXMF delivery destination hash, derived from the peer's public key.
   lxmf?: string | null;
+  // Local trust state, shown only to this node's owner (never sent to peers).
+  verified?: boolean;
+  verified_at?: number | null;
+  key_change_at?: number | null;
 }
 
 export interface InterfaceInfo {

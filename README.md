@@ -250,7 +250,9 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
-| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
+| `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
+| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
@@ -258,7 +260,7 @@ Global options may appear before or after the command:
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
-| `tau id` | Show this node's name, destination hash, and LXMF delivery address |
+| `tau id` | Show this node's name, destination hash, LXMF delivery address, and safety number (fingerprint of this identity) |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
@@ -314,6 +316,16 @@ tau messages --peer alice --limit 10 --json
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
+
+# Compare safety numbers with a peer over another channel (a call, in
+# person), then record the match — verified peers show a ✓ in `tau peers`
+# and the console, and are never pruned away
+tau peers --safety-number
+tau peers verify alice
+
+# Importing a different identity clears every verification: the numbers
+# were compared under the old identity, so they mean nothing under the
+# new one — re-verify each peer
 
 # Everything as JSON
 tau discover --duration 10 --json
@@ -643,7 +655,12 @@ unlinked, and stall sync at the gap.
   Back up your own chain with `tau tan export` and restore it with
   `tau tan import` — every entry is re-verified on import.
 - Peer information is self-asserted and can be stale; prune with
-  `tau peers --max-age`.
+  `tau peers --max-age`. Safety numbers are the check against that: a
+  destination hash is derived from its public key, so a peer whose key
+  ever changes under the same destination is tampering or corruption —
+  the registry keeps the recorded key, warns loudly, and marks the peer
+  in `tau peers` and the console until you re-verify it out of band
+  (`tau peers verify`).
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
 - Natural extensions: group destinations, file transfer using Reticulum
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
@@ -695,7 +712,7 @@ web/            Next.js + Tailwind console (static export served by tau)
 | `another tau node is already serving on data directory ...` | A `tau serve` already holds that data directory's `node.lock`; two serving nodes on one directory would corrupt the shared peer registry, mailbox and Tan database. Stop the running serve (the message names its pid) or use a different `--data-dir`. One-shot commands (`send`, `tan post`, …) are unaffected — they share the directory briefly by design. |
 | `no path to ...` | Reticulum has not learned a route yet. Keep the peer announcing (`tau serve --announce-interval 5`) or wait for a path request to resolve. |
 | Noisy output | Reticulum logs go to stderr. Use `-q`, `--rns-log-level 1`, or `--json` for clean stdout. |
-| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail are kept). `tau peers --max-age 1` lists only peers seen in the last day. |
+| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail and verified peers are kept). `tau peers --max-age 1` lists only peers seen in the last day. |
 
 ## License
 

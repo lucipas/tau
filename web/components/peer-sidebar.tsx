@@ -178,11 +178,27 @@ export function PeerSidebar({
                         <span className="min-w-0">
                           <span className="block truncate text-xs font-medium text-zinc-200">
                             {peer.name || "unknown"}
+                            {peer.verified ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-signal/40 bg-signal/10 px-1.5 py-px text-[10px] text-signal"
+                                title="Safety number compared out of band — this key is confirmed theirs"
+                              >
+                                ✓ verified
+                              </span>
+                            ) : null}
                           </span>
                           <span className="block truncate font-mono text-[10px] text-mist">
                             {shortHash(peer.destination, 10)} · {peer.hops} hop
                             {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
                           </span>
+                          {peer.key_change_at ? (
+                            <span
+                              className="block truncate font-mono text-[10px] text-amber-300"
+                              title="This destination presented a different public key; the recorded key was kept"
+                            >
+                              ⚠ key changed — re-verify before trusting
+                            </span>
+                          ) : null}
                           {peer.lxmf ? (
                             <span
                               className="block truncate font-mono text-[10px] text-mist"
