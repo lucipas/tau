@@ -456,6 +456,9 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "first hello" in out
     assert out.index("second hello") < out.index("first hello")
     assert "alice" in out
+    # The short id is shown so `tau react` has something to take.
+    assert "#m-2" in out
+    assert "#m-1" in out
 
 
 def test_messages_json_and_peer_filter(tmp_path, capsys):

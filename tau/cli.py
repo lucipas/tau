@@ -2327,7 +2327,15 @@ def cmd_messages(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+        # The short id is what `tau react` takes: without it the default
+        # listing gives the user no way to name a message to react to.
+        message_id = entry.get("id")
+        id_suffix = (
+            f" #{_safe_id_prefix(str(message_id))}"
+            if isinstance(message_id, str) and message_id
+            else ""
+        )
+        print(f"[{when}] {name} ({sender}){id_suffix}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
         for reaction in entry.get("reactions") or []:
