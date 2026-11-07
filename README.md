@@ -488,11 +488,16 @@ A DM reaction is its own message kind (`/tau/react`), not a text message:
 `tau react <message-id> <emoji>` sends one emoji or short text token
 (`👍`, `+1`, `lol` — at most 32 characters, never an image) naming the
 message it answers, and `tau react <message-id> --clear` retracts it. The
-sender is authenticated by the encrypted link, exactly as a DM is, and the
-receiver resolves state per (message, reactor) with the latest reaction
-winning — the same derivation Tan likes use, so re-sending a reaction never
-double-counts. Reactions render under the message in `tau messages` and in
-the web console, and `POST /api/react` sends one from the console's API.
+payload is signed with the reactor's Reticulum identity and verified by
+the receiver against the link identity — a reaction carries its own
+proof of attribution, like a sealed mail envelope, so a relayed or
+replayed reaction still has to prove its reactor. The receiver resolves
+state per (message, reactor) with the latest reaction winning, ordered
+by the reactor's `sent_at` — the same derivation Tan likes use, so
+re-sending a reaction never double-counts and a late older copy cannot
+override a newer one or resurrect a retraction. Reactions render under
+the message in `tau messages` and in the web console, and `POST
+/api/react` sends one from the console's API.
 
 Reactions are delivered live in v1: the peer must be online, because the
 sealed-mail path is text-shaped throughout and cannot carry a reaction

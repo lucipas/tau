@@ -15,11 +15,13 @@ from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     ProtocolError,
-    encode_reaction,
     build_mail_fetch,
     build_mail_store,
     decode,
+    encode,
     encode_message,
+    encode_reaction,
+    reaction_dict,
 )
 
 
@@ -39,6 +41,16 @@ def call_handler(handler, data, remote_identity=None):
     return decode(
         handler("/tau/test", data, b"request-id", remote_identity, time.time())
     )
+
+
+def signed_reaction(sender, target, token, message_id, *, sent_at=None):
+    """A reaction payload signed by *sender*, as send_reaction builds it."""
+    import base64
+
+    payload = reaction_dict(target, token, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
 
 
 def test_direct_message_dedupes_by_id(tmp_path):
@@ -617,7 +629,7 @@ def test_reaction_is_recorded_and_fanned_out(tmp_path):
     )
     sender = RNS.Identity()
 
-    payload = encode_reaction("msg-1", "👍", message_id="react-1")
+    payload = signed_reaction(sender, "msg-1", "👍", "react-1")
     response = call_handler(node._handle_reaction, payload, remote_identity=sender)
 
     assert response["ok"] is True
@@ -639,7 +651,7 @@ def test_reaction_dedupes_by_id(tmp_path):
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     sender = RNS.Identity()
-    payload = encode_reaction("msg-1", "👍", message_id="react-dup")
+    payload = signed_reaction(sender, "msg-1", "👍", "react-dup")
     first = call_handler(node._handle_reaction, payload, remote_identity=sender)
     second = call_handler(node._handle_reaction, payload, remote_identity=sender)
     assert first["duplicate"] is False
@@ -655,13 +667,13 @@ def test_reaction_clear_removes_the_reaction(tmp_path):
     sender = RNS.Identity()
     call_handler(
         node._handle_reaction,
-        encode_reaction("msg-1", "👍", message_id="react-1"),
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
         remote_identity=sender,
     )
     assert len(node.inbox.reactions_for("msg-1")) == 1
     response = call_handler(
         node._handle_reaction,
-        encode_reaction("msg-1", "", message_id="react-2"),
+        signed_reaction(sender, "msg-1", "", "react-2"),
         remote_identity=sender,
     )
     assert response["ok"] is True
@@ -677,8 +689,10 @@ def test_reaction_rejects_invalid_payload(tmp_path):
 
 def test_reaction_requires_an_identified_sender(tmp_path):
     node = make_node(tmp_path)
+    sender = RNS.Identity()
     response = call_handler(
-        node._handle_reaction, encode_reaction("msg-1", "👍")
+        node._handle_reaction,
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "unidentified"
@@ -699,7 +713,7 @@ def test_reaction_denied_by_allow_list(tmp_path):
     sender = RNS.Identity()
     response = call_handler(
         node._handle_reaction,
-        encode_reaction("msg-1", "👍"),
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
         remote_identity=sender,
     )
     assert response["ok"] is False
@@ -713,3 +727,57 @@ def test_send_reaction_validates_before_resolving(tmp_path):
         node.send_reaction("alice", "msg-1", "x" * 33)
     with pytest.raises(NodeError):
         node.send_reaction("alice", "", "👍")
+
+
+def test_reaction_requires_a_signature(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        encode_reaction("msg-1", "👍", message_id="react-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert "signature" in response["error"]["message"]
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_rejects_a_tampered_payload(tmp_path):
+    import base64
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    payload = reaction_dict("msg-1", "👍", message_id="react-1")
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    payload["reaction"] = "❤️"  # tampered after signing
+    response = call_handler(
+        node._handle_reaction, encode(payload), remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_rejects_a_signature_from_another_identity(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    signer = RNS.Identity()
+    presenter = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(signer, "msg-1", "👍", "react-1"),
+        remote_identity=presenter,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert node.inbox.reactions_for("msg-1") == []

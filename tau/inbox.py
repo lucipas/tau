@@ -81,10 +81,12 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored reaction, or ``None`` when it is unusable.
 
     A reaction names the target message id, the reactor's destination
-    hash, and the token — an empty token is a retraction and is never
-    stored (``record_reaction`` deletes instead).  Non-finite timestamps
-    are normalized the same way message records are: a bad ``sent_at``
-    becomes 0.0, a bad ``received_at`` drops the entry.
+    hash, and the token.  An empty token is a retraction tombstone: it
+    IS stored (see :func:`merge_reaction`), so a late older reaction
+    cannot resurrect a reaction the reactor already retracted.
+    Non-finite timestamps are normalized the same way message records
+    are: a bad ``sent_at`` becomes 0.0, a bad ``received_at`` drops the
+    entry.
     """
     if not isinstance(raw, dict):
         return None
@@ -95,7 +97,7 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(destination, str) or not destination:
         return None
     reaction = raw.get("reaction")
-    if not isinstance(reaction, str) or not reaction:
+    if not isinstance(reaction, str):
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
@@ -275,76 +277,33 @@ class Inbox:
         entries.sort(key=lambda item: item["received_at"])
         return entries
 
+    def all_reactions(self) -> List[Dict[str, Any]]:
+        """Every stored reaction, including retraction tombstones.
+
+        The web bridge reconciles its history against this in one pass
+        when serving messages, so reactions made from another process
+        (e.g. ``tau react`` from the CLI) show up on the next read.
+        """
+        with self._lock:
+            return [dict(item) for item in self._reactions]
+
     def resolve(self, ref: str) -> Dict[str, Any]:
         """Resolve a full message id or a unique prefix to its record.
 
         ``tau messages`` shows only the first 8 characters of each id,
         so a short prefix is the usual way to name a message — the same
-        convention as ``tau outbox``.
+        convention as ``tau outbox``.  An exact id always wins over a
+        prefix match first, whatever its length: two ids can share a
+        prefix where one is the whole of the other, and the full id must
+        still resolve to its own message.
         """
         if not isinstance(ref, str) or not ref.strip():
             raise ValueError("message reference must not be empty")
         value = ref.strip()
         with self._lock:
-            if len(value) == 32:
-                for entry in self._messages:
-                    if entry.get("id") == value:
-                        return dict(entry)
-                raise ValueError(f"unknown message: {ref!r}")
-            matches = [
-                entry
-                for entry in self._messages
-                if isinstance(entry.get("id"), str)
-                and entry["id"].startswith(value)
-            ]
-        if not matches:
-            raise ValueError(f"unknown message: {ref!r}")
-        if len(matches) > 1:
-            raise ValueError(f"{len(matches)} messages match prefix {ref!r}")
-        return dict(matches[0])
-
-    def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Received messages, newest first.
-
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).  Each entry
-        carries a ``reactions`` list when the message has any — derived
-        from the reaction store, never stored counters.
-        """
-        with self._lock:
-            entries = list(self._messages)
-            by_target: Dict[str, List[Dict[str, Any]]] = {}
-            for item in self._reactions:
-                if item["reaction"]:
-                    by_target.setdefault(item["target"], []).append(dict(item))
-        if peer is not None:
-            entries = [item for item in entries if item.get("destination") == peer]
-        entries.reverse()
-        if limit is not None:
-            entries = entries[: max(0, limit)]
-        annotated = []
-        for item in entries:
-            copy = dict(item)
-            reactions = by_target.get(str(item.get("id") or ""))
-            if reactions:
-                reactions.sort(key=lambda entry: entry["received_at"])
-                copy["reactions"] = reactions
-            annotated.append(copy)
-        return annotated
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._messages)
-t not be empty")
-        value = ref.strip()
-        with self._lock:
-            if len(value) == 32:
-                for entry in self._messages:
-                    if entry.get("id") == value:
-                        return dict(entry)
-                raise ValueError(f"unknown message: {ref!r}")
+            for entry in self._messages:
+                if entry.get("id") == value:
+                    return dict(entry)
             matches = [
                 entry
                 for entry in self._messages

@@ -199,3 +199,52 @@ def test_parse_reaction_rejects_wrong_shape():
                 }
             )
         )
+
+
+def test_reaction_signature_roundtrip():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    parsed = parse_reaction(
+        encode_reaction("msg-123", "👍", message_id="react-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["reaction"] == "👍"
+
+
+def test_reaction_without_signature_parses_with_none():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    assert parse_reaction(encode_reaction("msg-1", "👍"))["sig"] is None
+
+
+def test_parse_reaction_rejects_bad_signature():
+    from tau.protocol import parse_reaction
+
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode({"type": "reaction", "target": "msg-1", "reaction": "👍", "sig": "!!!"})
+        )
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode({"type": "reaction", "target": "msg-1", "reaction": "👍", "sig": 42})
+        )
+
+
+def test_reaction_unsigned_bytes_exclude_the_signature():
+    import base64
+
+    from tau.protocol import (
+        encode,
+        encode_reaction,
+        parse_reaction,
+        reaction_dict,
+        reaction_unsigned_bytes,
+    )
+
+    payload = reaction_dict("msg-1", "👍", message_id="react-1", sent_at=12.0)
+    unsigned = encode(payload)
+    payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
+    signed = encode(payload)
+    assert reaction_unsigned_bytes(signed) == unsigned
+    assert parse_reaction(signed)["sig"] == payload["sig"]
+    assert encode_reaction("msg-1", "👍", message_id="react-1", sent_at=12.0) == unsigned

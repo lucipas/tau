@@ -879,7 +879,7 @@ def _wait_for_inbox_reactions(
             reactions = [
                 item
                 for item in stored.get("reactions", [])
-                if item.get("target") == target
+                if item.get("target") == target and item.get("reaction")
             ]
             if expect_empty and not reactions:
                 return []

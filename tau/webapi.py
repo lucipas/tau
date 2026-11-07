@@ -1015,7 +1015,54 @@ class WebBridge:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
-        return items
+        return [self._with_inbox_reactions(dict(item)) for item in items]
+
+    def _with_inbox_reactions(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Overlay the node inbox's reaction state on one history entry.
+
+        The bridge learns reactions live through its own node's callback,
+        but a reaction made from another process (``tau react`` from the
+        CLI) only lands in the shared ``inbox.json``.  The inbox is the
+        durable authority — per reactor its entry wins over the bridge's
+        live state (the two agree for live traffic; the inbox additionally
+        holds the CLI-made ones, in ``sent_at`` order) — so every read of
+        the history shows the current state.  A live push to an already
+        open console tab for a CLI-made reaction is still a follow-up:
+        this reconciles reads, not the SSE stream.
+        """
+        wire_id = message.get("wire_id")
+        inbox = getattr(self.node, "inbox", None)
+        if not wire_id or inbox is None:
+            return message
+        try:
+            stored = [
+                entry
+                for entry in inbox.all_reactions()
+                if entry.get("target") == wire_id
+            ]
+        except Exception:  # pragma: no cover - defensive
+            return message
+        if not stored:
+            return message
+        merged: Dict[str, Dict[str, Any]] = {
+            str(item.get("reactor")): dict(item)
+            for item in message.get("reactions") or []
+            if item.get("reactor")
+        }
+        for entry in stored:
+            reactor = str(entry.get("destination") or "")
+            if not reactor:
+                continue
+            if entry.get("reaction"):
+                merged[reactor] = {
+                    "reactor": reactor,
+                    "name": str(entry.get("from") or "unknown"),
+                    "reaction": entry["reaction"],
+                }
+            else:
+                merged.pop(reactor, None)
+        message["reactions"] = list(merged.values())
+        return message
 
     def counts(self) -> Dict[str, int]:
         with self._lock:

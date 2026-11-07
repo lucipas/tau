@@ -219,20 +219,24 @@ def clean_reaction(value: Any) -> str:
     return cleaned
 
 
-def encode_reaction(
+def reaction_dict(
     target: str,
     reaction: str,
     *,
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
-) -> bytes:
-    """Encode a DM reaction for the ``/tau/react`` request.
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/react`` payload as a dict, unsigned unless signed.
 
-    ``target`` names the reacted-to message id; ``reaction`` is the token
-    from :func:`clean_reaction` (``""`` retracts the reactor's reaction).
+    The signature — when present — covers every other field, exactly
+    like a sealed mail envelope: the sender signs the canonical
+    encoding of the payload without ``"sig"`` and attaches the base64
+    signature, so the receiver can verify attribution against the link
+    identity independently of the transport.
     """
     target = _clean_message_id(target)
-    payload = {
+    payload: Dict[str, Any] = {
         "type": "reaction",
         "v": PROTOCOL_VERSION,
         "target": target,
@@ -242,7 +246,36 @@ def encode_reaction(
     }
     if message_id:
         payload["id"] = message_id
-    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_reaction(
+    target: str,
+    reaction: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM reaction for the ``/tau/react`` request.
+
+    ``target`` names the reacted-to message id; ``reaction`` is the token
+    from :func:`clean_reaction` (``""`` retracts the reactor's reaction).
+    ``signature`` is the base64 signature over the canonical unsigned
+    payload; see :func:`reaction_dict`.
+    """
+    return encode(
+        reaction_dict(
+            target,
+            reaction,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
 
 
 def parse_reaction(raw: Any) -> Dict[str, Any]:
@@ -260,12 +293,35 @@ def parse_reaction(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("reaction signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "reaction signature is not valid base64"
+            ) from exc
     return {
         "target": target,
         "reaction": reaction,
         "sent_at": sent_at,
         "id": message_id,
+        "sig": signature,
     }
+
+
+def reaction_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of a reaction payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
 
 
 def encode_message(

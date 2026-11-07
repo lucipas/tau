@@ -61,8 +61,8 @@ from .protocol import (
     build_mail_store,
     clean_reaction,
     decode,
+    encode,
     encode_message,
-    encode_reaction,
     generate_message_id,
     normalize_message,
     parse_announce,
@@ -70,6 +70,8 @@ from .protocol import (
     parse_mail_store,
     parse_message,
     parse_reaction,
+    reaction_dict,
+    reaction_unsigned_bytes,
     response_error,
     response_ok,
 )
@@ -906,6 +908,31 @@ class TauNode:
                 "unidentified", "identify on the link to react"
             )
         caller_hash = tau_destination_hash(remote_identity).hex()
+        # Reactions are signed entries, like Tan likes: the signature
+        # covers the whole payload and is verified against the link
+        # identity, so attribution does not depend on trusting the
+        # transport — a relayed or replayed reaction still has to prove
+        # its reactor.  (parse_reaction already checked the base64.)
+        signature_text = reaction.get("sig")
+        if not signature_text:
+            return response_error(
+                "invalid_reaction", "reaction is missing its signature"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = reaction_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_reaction", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_reaction", f"could not verify reaction: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_reaction", "reaction signature does not verify"
+            )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Reaction from %s denied by the DM allow-list",
@@ -1636,9 +1663,10 @@ class TauNode:
         ``message_id`` names the reacted-to message, ``reaction`` is one
         emoji or short text token (``""`` retracts the sender's reaction
         to that message).  Reactions are their own signed message kind:
-        the sender is authenticated by the encrypted link, exactly as a
-        DM is, and the receiver resolves state per (message, reactor)
-        with the latest reaction winning.
+        the payload is signed with this node's Reticulum identity and
+        verified by the receiver against the link identity, exactly like
+        a sealed mail envelope — and the receiver resolves state per
+        (message, reactor) with the latest reaction winning.
 
         Reactions are delivered live in v1: unlike ``send_message``
         there is no outbox queue, because the sealed-mail path is
@@ -1650,15 +1678,23 @@ class TauNode:
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
             raise NodeError("reaction target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
         reaction_id = generate_message_id()
-        payload = encode_reaction(target_id, token, message_id=reaction_id)
+        payload = reaction_dict(target_id, token, message_id=reaction_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign reaction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
             if discover_timeout is not None
             else min(timeout, 10.0),
         )
-        response = self._request(peer, REQUEST_REACT, payload, timeout)
+        response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
         # Record the outgoing reaction locally, so the reactor sees it
         # under the message in their own inbox and console.
         record = {

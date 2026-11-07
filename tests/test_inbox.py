@@ -248,3 +248,34 @@ def test_resolve_ambiguous_prefix(tmp_path):
     inbox.append(_record(id="abcdef02" + "0" * 24))
     with pytest.raises(ValueError, match="2 messages match prefix"):
         inbox.resolve("abcdef")
+
+
+def test_reaction_tombstone_keeps_stale_reactions_cleared(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(sent_at=20.0, received_at=20.0, id="r-1"))
+    inbox.record_reaction(
+        _reaction(reaction="", sent_at=21.0, received_at=21.0, id="r-2")
+    )
+    assert inbox.reactions_for("msg-1") == []
+    # A late copy of the retracted reaction must not resurrect it.
+    inbox.record_reaction(_reaction(sent_at=20.0, received_at=22.0, id="r-1"))
+    assert inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_stale_update_is_ignored(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(reaction="❤️", sent_at=30.0, received_at=30.0, id="r-2")
+    )
+    inbox.record_reaction(
+        _reaction(reaction="👍", sent_at=20.0, received_at=31.0, id="r-1")
+    )
+    assert [item["reaction"] for item in inbox.reactions_for("msg-1")] == ["❤️"]
+
+
+def test_resolve_exact_id_beats_a_longer_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abc", text="short"))
+    inbox.append(_record(id="abcdef", text="long"))
+    assert inbox.resolve("abc")["text"] == "short"
+    assert inbox.resolve("abcdef")["text"] == "long"

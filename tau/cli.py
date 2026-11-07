@@ -2327,7 +2327,15 @@ def cmd_messages(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+        # The short id is what `tau react` takes: without it the default
+        # listing gives the user no way to name a message to react to.
+        message_id = entry.get("id")
+        id_suffix = (
+            f" #{_safe_id_prefix(str(message_id))}"
+            if isinstance(message_id, str) and message_id
+            else ""
+        )
+        print(f"[{when}] {name} ({sender}){id_suffix}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
         for reaction in entry.get("reactions") or []:
@@ -2407,12 +2415,16 @@ def cmd_react(args: argparse.Namespace) -> int:
         print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
     return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
-    """First *length* characters of *ref* with control characters dropped.
+    """First *length* printable characters of *ref*.
 
     Held ids arrive from remote senders and may contain terminal escapes
     or newlines; never print them verbatim. JSON output keeps the raw id.
+    Non-printable characters are dropped from the full id first, then
+    the result is truncated — so the tag is always a true prefix of the
+    stored id that ``Inbox.resolve`` can match.
     """
-    return "".join(char for char in ref[:length] if char.isprintable())
+    cleaned = "".join(char for char in ref if char.isprintable())
+    return cleaned[:length]
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:

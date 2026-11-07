@@ -1450,3 +1450,13 @@ def test_messages_renders_reactions(tmp_path, capsys):
     assert code == 0
     out = capsys.readouterr().out
     assert "❤️ alice" in out
+
+
+def test_react_rejects_a_blank_token_without_clear(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "--clear" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
