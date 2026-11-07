@@ -2327,15 +2327,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        # The short id is what `tau react` takes: without it the default
-        # listing gives the user no way to name a message to react to.
-        message_id = entry.get("id")
-        id_suffix = (
-            f" #{_safe_id_prefix(str(message_id))}"
-            if isinstance(message_id, str) and message_id
-            else ""
-        )
-        print(f"[{when}] {name} ({sender}){id_suffix}")
+        print(f"[{when}] {name} ({sender})")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
         for reaction in entry.get("reactions") or []:
@@ -2364,10 +2356,15 @@ def cmd_react(args: argparse.Namespace) -> int:
     author = target.get("destination") or ""
     if not author:
         raise NodeError("that message has no known sender to react to")
-    token = "" if getattr(args, "clear", False) else str(args.reaction)
-    # Validate the token before starting the node: a bad token is a
-    # usage error, not a delivery failure.
-    clean_reaction(token)
+    if getattr(args, "clear", False):
+        token = ""
+    else:
+        # Validate the token before starting the node: a bad token is a
+        # usage error, not a delivery failure.  A blank argument cleans to
+        # the retraction token, so reject it unless --clear was given.
+        token = clean_reaction(str(args.reaction))
+        if not token:
+            raise NodeError("reaction is empty; use --clear to retract it")
     node = TauNode(config, name=config.name)
     node.start()
     try:
