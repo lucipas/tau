@@ -190,8 +190,12 @@ export function useTau() {
     [refreshOutbox],
   );
 
-  const send = useCallback(async (to: string, text: string) => {
-    const result = await apiPost<SendResponse>("/api/messages", { to, text });
+  const send = useCallback(async (to: string, text: string, replyTo?: string) => {
+    const result = await apiPost<SendResponse>("/api/messages", {
+      to,
+      text,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    });
     setMessages((previous) => {
       if (previous.some((entry) => entry.id === result.message.id)) {
         return previous;

@@ -6,7 +6,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
-    POST /api/messages     send ``{"to": "...", "text": "..."}``
+    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
@@ -52,6 +52,8 @@ from .peers import Peer, PeerError
 from .protocol import (
     MAX_MESSAGE_CHARS,
     ProtocolError,
+    clean_in_reply_to,
+    excerpt_hash,
     normalize_message,
     sanitize_name,
     short_hash,
@@ -301,6 +303,16 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # Kept so a message still queued across a restart can be matched
         # when its delivery is reported.
         message["mail_id"] = mail_id
+    wire_id = entry.get("wire_id")
+    if isinstance(wire_id, str) and wire_id:
+        # The Reticulum message id: how replies name this message.
+        message["wire_id"] = wire_id
+    try:
+        in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
+    except ValueError:
+        in_reply_to = None
+    if in_reply_to is not None:
+        message["in_reply_to"] = in_reply_to
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -308,6 +320,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         json.dumps(message, ensure_ascii=False).encode("utf-8")
     except (UnicodeEncodeError, ValueError):
         return None
+    # The hash is derived from the validated text, never trusted from
+    # the file: a hand-edited messages.json that changes the text but
+    # keeps the old hash must not make a changed quote look verified.
+    # Records written before hashes existed get one here. It is computed
+    # after the UTF-8 check above, because hashing a lone surrogate
+    # would raise instead of dropping the entry.
+    message["excerpt_hash"] = excerpt_hash(text)
     return message
 
 
@@ -511,6 +530,8 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            wire_id=str(record["id"]) if isinstance(record.get("id"), str) else None,
+            in_reply_to=record.get("in_reply_to"),
         )
         self.bus.publish({"type": "message", "message": message})
         return message
@@ -720,12 +741,51 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def _resolve_console_reply(
+        self, peer_hash: str, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a console ``reply_to`` wire id to an ``in_reply_to``.
+
+        The quoted message must be in this conversation — same peer in
+        the console history, matched by full id or unique prefix — so a
+        reply never dangles at a message from another peer or one the
+        console never saw.
+        """
+        if reply_to is None:
+            return None
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            raise ValueError("field 'reply_to' must be a message id")
+        ref = reply_to.strip().lower()
+        with self._lock:
+            matches = [
+                message
+                for message in self._messages
+                if message.get("peer") == peer_hash
+                and isinstance(message.get("wire_id"), str)
+                and str(message["wire_id"]).lower().startswith(ref)
+            ]
+        if not matches:
+            raise ValueError(
+                f"no message {reply_to.strip()!r} in this conversation to reply to"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} messages in this conversation match"
+                f" {reply_to.strip()!r}; use a longer id"
+            )
+        quoted = matches[0]
+        return {
+            "id": str(quoted["wire_id"]),
+            "excerpt": excerpt_hash(str(quoted.get("text") or "")),
+        }
+
     def send_message(
         self,
         target: str,
         text: str,
         *,
         timeout: float = 20.0,
+        reply_to: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -739,6 +799,7 @@ class WebBridge:
         text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        in_reply_to = self._resolve_console_reply(peer.hexhash, reply_to)
         # The send lock is NOT held across the network send: queueing
         # starts a flush thread that can deliver the entry (and report
         # it via record_delivery) before the record below exists, and
@@ -746,11 +807,14 @@ class WebBridge:
         # delivery report behind this send. Instead, record_delivery
         # buffers a report that beats the record, and the append below
         # reconciles it.
-        response = self.node.send_message(peer, text, timeout=timeout)
+        response = self.node.send_message(
+            peer, text, timeout=timeout, in_reply_to=in_reply_to
+        )
         queued = bool(response.get("queued"))
         # The outbox id links this record to a later delivery; only
         # present while the message is queued.
         mail_id = response.get("id") if queued else None
+        wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         flipped = False
         with self._send_lock:
             message = self._append_message(
@@ -763,6 +827,8 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
+                wire_id=wire_id,
+                in_reply_to=in_reply_to,
             )
             if mail_id is not None:
                 with self._lock:
@@ -890,6 +956,8 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        wire_id: Optional[str] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -906,6 +974,12 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if wire_id is not None:
+                message["wire_id"] = wire_id
+            message["excerpt_hash"] = excerpt_hash(text)
+            reply_to = clean_in_reply_to(in_reply_to)
+            if reply_to is not None:
+                message["in_reply_to"] = reply_to
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1206,8 +1280,20 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        reply_to = body.get("reply_to")
+        if reply_to is not None and (
+            not isinstance(reply_to, str) or not reply_to.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'reply_to' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
         try:
-            message, response = self.bridge.send_message(target, text, timeout=timeout)
+            message, response = self.bridge.send_message(
+                target, text, timeout=timeout, reply_to=reply_to
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return

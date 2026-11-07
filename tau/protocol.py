@@ -19,6 +19,7 @@ or buggy peer must not be able to make us buffer large amounts of data.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import time
@@ -192,11 +193,51 @@ def generate_message_id() -> str:
     return uuid.uuid4().hex
 
 
+def excerpt_hash(text: str) -> str:
+    """Short hash of a quoted message's text (first 16 hex of SHA-256).
+
+    A reply carries this alongside the quoted message id so the
+    receiver can check the copy it renders against what the sender
+    quoted, without trusting any excerpt text on the wire.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate an ``in_reply_to`` reference, or ``None`` when absent.
+
+    The reference names a message id and, optionally, the excerpt hash
+    of the text the sender quoted.  A malformed reference is a protocol
+    error — the sender is either buggy or trying to smuggle junk past
+    the size budget — while a missing one simply means a standalone
+    message.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ProtocolError("in_reply_to must be an object")
+    message_id = value.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        raise ProtocolError("in_reply_to id must be a string of 1-64 characters")
+    excerpt = value.get("excerpt")
+    if excerpt is not None:
+        if (
+            not isinstance(excerpt, str)
+            or not excerpt
+            or len(excerpt) > 32
+            or any(char not in "0123456789abcdef" for char in excerpt.lower())
+        ):
+            raise ProtocolError("in_reply_to excerpt must be a short hex hash")
+        excerpt = excerpt.lower()
+    return {"id": message_id, "excerpt": excerpt}
+
+
 def encode_message(
     text: str,
     *,
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request."""
     payload = {
@@ -208,6 +249,9 @@ def encode_message(
     }
     if message_id:
         payload["id"] = message_id
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -223,7 +267,12 @@ def parse_message(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
-    return {"text": text, "sent_at": sent_at, "id": message_id}
+    return {
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+    }
 
 
 def _clean_hexhash(value: Any, field: str) -> str:

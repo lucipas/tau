@@ -14,13 +14,17 @@ export function Composer({
   onTargetChange,
   onModeChange,
   onSend,
+  replyTo,
+  onCancelReply,
 }: {
   peers: Peer[];
   target: string;
   mode: "peer" | "custom";
   onTargetChange: (value: string) => void;
   onModeChange: (mode: "peer" | "custom") => void;
-  onSend: (to: string, text: string) => Promise<TauMessage>;
+  onSend: (to: string, text: string, replyTo?: string) => Promise<TauMessage>;
+  replyTo?: TauMessage | null;
+  onCancelReply?: () => void;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -48,8 +52,9 @@ export function Composer({
     setSending(true);
     setError(null);
     try {
-      await onSend(trimmedTarget, text);
+      await onSend(trimmedTarget, text, replyTo?.wire_id);
       setText("");
+      onCancelReply?.();
       textareaRef.current?.focus();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "send failed");
@@ -120,6 +125,23 @@ export function Composer({
         </span>
       </div>
 
+      {replyTo ? (
+        <div className="mt-2 flex items-center gap-2 rounded-lg border border-signal/30 bg-signal/[0.06] px-3 py-2 text-[11px] text-zinc-300">
+          <span className="min-w-0 flex-1 truncate font-mono">
+            ↩ replying to {replyTo.direction === "out" ? "you" : replyTo.peer_name}:{" "}
+            {replyTo.text.split("\n")[0].slice(0, 80)}
+          </span>
+          <button
+            type="button"
+            title="Cancel reply"
+            onClick={() => onCancelReply?.()}
+            className="shrink-0 rounded px-1.5 py-0.5 font-mono text-mist transition hover:bg-void/60 hover:text-zinc-100"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
+
       <div className="mt-2 flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -132,7 +154,11 @@ export function Composer({
           onKeyDown={onKeyDown}
           rows={2}
           maxLength={MAX_MESSAGE_CHARS}
-          placeholder="Write something to the mesh…"
+          placeholder={
+            replyTo
+              ? `Replying to ${replyTo.direction === "out" ? "you" : replyTo.peer_name}…`
+              : "Write something to the mesh…"
+          }
           className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
         <button
