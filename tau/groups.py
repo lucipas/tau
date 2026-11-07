@@ -33,7 +33,12 @@ from .util import atomic_write_json, read_json
 log = logging.getLogger(__name__)
 
 GROUPS_FILE_NAME = "groups.json"
+# Locally created groups (created_by set) and remotely learned groups
+# (created_by empty) are capped separately, and neither cap evicts: a
+# peer that floods group ids can only fill its own quota and can never
+# push out a group this node created or one it already pinned.
 MAX_GROUPS = 100
+MAX_LEARNED_GROUPS = 50
 
 
 def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
@@ -107,17 +112,15 @@ class GroupStore:
             group = _valid_group(entry)
             if group is not None:
                 loaded[group["id"]] = group
-        self._groups = dict(list(loaded.items())[-MAX_GROUPS:])
+        self._groups = loaded
 
     def _save(self) -> None:
+        """Persist the store; raises :class:`OSError` when the write fails."""
         if self.path is None:
             return
-        try:
-            atomic_write_json(
-                self.path, {"groups": list(self._groups.values())}, mode=0o600
-            )
-        except OSError as exc:
-            log.warning("Could not persist groups to %s: %s", self.path, exc)
+        atomic_write_json(
+            self.path, {"groups": list(self._groups.values())}, mode=0o600
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -159,9 +162,15 @@ class GroupStore:
         if group is None:  # pragma: no cover - create() validates first
             raise ValueError("invalid group")
         with self._transaction():
+            created = sum(1 for g in self._groups.values() if g["created_by"])
+            if created >= MAX_GROUPS:
+                raise ValueError(f"group limit reached ({MAX_GROUPS} created groups)")
             self._groups[group["id"]] = group
-            self._groups = dict(list(self._groups.items())[-MAX_GROUPS:])
-            self._save()
+            try:
+                self._save()
+            except OSError:
+                del self._groups[group["id"]]
+                raise
         return dict(group)
 
     def record(
@@ -190,9 +199,18 @@ class GroupStore:
                 if existing["members"] != candidate["members"]:
                     return None
                 return dict(existing)
+            learned = sum(1 for g in self._groups.values() if not g["created_by"])
+            if learned >= MAX_LEARNED_GROUPS:
+                log.info("Refusing to pin group %s: learned-group limit reached", group_id)
+                return None
             self._groups[candidate["id"]] = candidate
-            self._groups = dict(list(self._groups.items())[-MAX_GROUPS:])
-            self._save()
+            try:
+                self._save()
+            except OSError as exc:
+                # Do not acknowledge a pin that would be lost on restart.
+                del self._groups[candidate["id"]]
+                log.warning("Could not persist groups to %s: %s", self.path, exc)
+                return None
         return dict(candidate)
 
     def get(self, group_id: str) -> Optional[Dict[str, Any]]:
@@ -235,7 +253,18 @@ class GroupStore:
         raise ValueError(f"unknown group: {query!r}")
 
     def list_groups(self) -> List[Dict[str, Any]]:
-        """All known groups, oldest first."""
+        """All known groups, oldest first.
+
+        Reloads from disk first, so groups created by another process
+        (for example ``tau group create`` while ``tau serve`` runs) are seen.
+        """
+        with self._transaction():
+            return [dict(group) for group in self._groups.values()]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._groups)
+ known groups, oldest first."""
         with self._lock:
             return [dict(group) for group in self._groups.values()]
 
