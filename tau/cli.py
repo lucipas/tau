@@ -22,7 +22,13 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .config import TauConfig, write_node_metadata, write_rns_config
+from .config import (
+    TauConfig,
+    accept_files_enabled,
+    set_node_setting,
+    write_node_metadata,
+    write_rns_config,
+)
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -292,6 +298,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     send.set_defaults(func=cmd_send)
 
+    # `send --file` already means "read the message text from a file",
+    # so file transfer gets its own subcommand instead of overloading it.
+    send_file = subparsers.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a small file to a peer over an RNS Resource",
+    )
+    send_file.add_argument(
+        "--to", required=True, metavar="NAME|HASH", help="peer name or destination hash"
+    )
+    send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long the whole transfer may take (default 300)",
+    )
+    send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    send_file.set_defaults(func=cmd_send_file)
+
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
     )
@@ -481,6 +516,27 @@ def build_parser() -> argparse.ArgumentParser:
         "off", parents=[common], help="stop enforcing the DM allow-list"
     )
     allowlist_off.set_defaults(func=cmd_allowlist)
+
+    config_cmd = subparsers.add_parser(
+        "config",
+        parents=[common],
+        help="show or change this node's own settings",
+    )
+    config_sub = config_cmd.add_subparsers(
+        dest="config_command", metavar="CONFIG_COMMAND"
+    )
+    config_files = config_sub.add_parser(
+        "accept-files",
+        parents=[common],
+        help="turn receiving files on or off (default off)",
+    )
+    config_files.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="whether this node accepts file transfers",
+    )
+    config_files.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
 
     messages = subparsers.add_parser(
         "messages",
@@ -1017,7 +1073,21 @@ def _node_callbacks(args: argparse.Namespace):
             for line in str(text).splitlines() or [""]:
                 print(f"  {line}", flush=True)
 
-    return on_peer, on_message
+    def on_file(record: Dict[str, Any]) -> None:
+        if json_output:
+            _emit_event(args, "file", file=record)
+        else:
+            sender = record.get("from", "unknown")
+            destination = short_hash(record.get("destination") or "")
+            suffix = f" ({destination})" if destination else ""
+            print(
+                f"[{_stamp()}] file from {sender}{suffix}: "
+                f"{record.get('name')} ({record.get('size')} bytes)",
+                flush=True,
+            )
+            print(f"  saved to {record.get('path')}", flush=True)
+
+    return on_peer, on_message, on_file
 
 
 def _default_web_dir() -> Optional[Path]:
@@ -1688,12 +1758,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise NodeError(str(exc)) from exc
         web_settings = (host, port, web_dir)
 
-    console_peer, console_message = _node_callbacks(args)
+    console_peer, console_message, console_file = _node_callbacks(args)
     node = TauNode(
         config,
         name=config.name,
         on_message=console_message,
         on_peer=console_peer,
+        on_file=console_file,
     )
     if web_settings is not None:
         from .webapi import WebBridge, WebBridgeError, check_web_console_bind
@@ -1718,8 +1789,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
             console_message(record)
             bridge.record_inbound(record)
 
+        def on_file(record: Dict[str, Any]) -> None:
+            console_file(record)
+            # The console lists messages, not files: record the arrival
+            # as an inbound message so the file shows up in its feed
+            # (a download link can follow later).
+            bridge.record_inbound(
+                {
+                    "destination": record.get("destination"),
+                    "from": record.get("from"),
+                    "text": (
+                        f"Received file: {record.get('name')} "
+                        f"({record.get('size')} bytes, "
+                        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
+                    ),
+                    "sent_at": record.get("sent_at"),
+                    "received_at": record.get("received_at"),
+                }
+            )
+
         node.on_peer = on_peer
         node.on_message = on_message
+        node.on_file = on_file
     # The data-directory lock is the more specific guard, so probe it
     # before the port check: a second serve on the same directory
     # reports the instance error even though it would also trip the
@@ -2156,6 +2247,44 @@ def cmd_send(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_send_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    last_percent = -1
+
+    def on_progress(progress: float) -> None:
+        nonlocal last_percent
+        percent = int(progress * 100)
+        if _json_mode(args) or percent == last_percent:
+            return
+        last_percent = percent
+        print(f"\r  sending… {percent}%", end="", flush=True)
+
+    try:
+        response = node.send_file(
+            args.to,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            progress_callback=on_progress,
+        )
+    finally:
+        node.stop()
+
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_OK
+    if last_percent >= 0:
+        print()
+    print(
+        f"sent {response['name']} ({response['size']} bytes) to {args.to}"
+    )
+    print(f"  id:     {response['id']}")
+    print(f"  sha256: {response['sha256']}")
+    return _EXIT_OK
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     config = _make_config(args)
     mailbox = Mailbox(config.mailbox_path)
@@ -2298,6 +2427,14 @@ def cmd_messages(args: argparse.Namespace) -> int:
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
         print(f"[{when}] {name} ({sender})")
+        if entry.get("kind") == "file":
+            print(
+                f"  file: {entry.get('name')} "
+                f"({entry.get('size')} bytes, "
+                f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
+            )
+            print(f"  saved to {entry.get('path')}")
+            continue
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
@@ -2622,6 +2759,36 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         return clean_destination(value)
     except AllowListError:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show or change this node's own settings (stored in node.json)."""
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    command = getattr(args, "config_command", None)
+
+    if command == "accept-files":
+        enabled = getattr(args, "state", "on") == "on"
+        set_node_setting(config.data_dir, "accept_files", enabled)
+        state = "on" if enabled else "off"
+        if json_output:
+            _emit({"accept_files": enabled}, True)
+        else:
+            print(f"Accept files: {state}")
+            if not enabled:
+                print("  this node refuses file transfers unless the sender")
+                print("  is on its DM allow-list")
+        return _EXIT_OK
+
+    settings = {"accept_files": accept_files_enabled(config.data_dir)}
+    if json_output:
+        _emit(settings, True)
+    else:
+        state = "on" if settings["accept_files"] else "off"
+        print(f"Settings ({config.data_dir / 'node.json'}):")
+        print(f"  accept files: {state}")
+        print("  change with: tau config accept-files on|off")
+    return _EXIT_OK
 
 
 def cmd_allowlist(args: argparse.Namespace) -> int:

@@ -5,6 +5,7 @@ Run with ``TAU_INTEGRATION=1 pytest -m integration``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -860,5 +861,162 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "already in use" in result.stderr, result.stderr
         assert str(port) in result.stderr, result.stderr
         assert "ready" not in result.stdout
+    finally:
+        stop_process(alice)
+
+
+def test_two_nodes_send_a_file(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+    bob_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(bob_dir),
+                "--name",
+                "bob",
+                "--tcp-connect",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    bob_hash = bob_init["destination"]
+
+    # Alice opts in to files before she starts serving.
+    require_ok(
+        run_tau(
+            "config",
+            "accept-files",
+            "on",
+            "--data-dir",
+            str(alice_dir),
+            "--json",
+            timeout=30.0,
+        )
+    )
+
+    payload = b"tau file transfer\n" * 200
+    source = tmp_path / "notes.txt"
+    source.write_bytes(payload)
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+
+        discovered = {}
+        for _ in range(3):
+            result = run_tau(
+                "discover",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "6",
+                "--json",
+                timeout=40.0,
+            )
+            payload_discovered = json.loads(require_ok(result))
+            discovered = {
+                peer["destination"]: peer
+                for peer in payload_discovered.get("peers", [])
+            }
+            if alice_hash in discovered:
+                break
+        assert alice_hash in discovered, alice_err.read_text()
+
+        sent = run_tau(
+            "send-file",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            str(source),
+            "--timeout",
+            "120",
+            "--json",
+            timeout=180.0,
+        )
+        response = json.loads(require_ok(sent))
+        assert response["ok"] is True
+        assert response["name"] == "notes.txt"
+        assert response["size"] == len(payload)
+        assert response["sha256"] == hashlib.sha256(payload).hexdigest()
+
+        # The receiver saves the file once its own Resource concludes,
+        # which trails the sender's conclusion slightly — poll for it.
+        saved = alice_dir / "files" / bob_hash / "notes.txt"
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            if saved.exists() and saved.read_bytes() == payload:
+                break
+            time.sleep(0.5)
+        assert saved.exists(), alice_err.read_text()
+        assert saved.read_bytes() == payload
+
+        messages = json.loads(
+            require_ok(
+                run_tau("messages", "--data-dir", str(alice_dir), "--json", timeout=30.0)
+            )
+        )
+        file_entries = [
+            entry
+            for entry in messages["messages"]
+            if entry.get("kind") == "file"
+        ]
+        assert len(file_entries) == 1
+        assert file_entries[0]["name"] == "notes.txt"
+        assert file_entries[0]["size"] == len(payload)
+        assert file_entries[0]["sha256"] == hashlib.sha256(payload).hexdigest()
+
+        # Policy is re-read per offer, so opting out live refuses the
+        # next transfer instead of queueing it.
+        require_ok(
+            run_tau(
+                "config",
+                "accept-files",
+                "off",
+                "--data-dir",
+                str(alice_dir),
+                "--json",
+                timeout=30.0,
+            )
+        )
+        refused = run_tau(
+            "send-file",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            str(source),
+            "--timeout",
+            "30",
+            "--json",
+            timeout=90.0,
+        )
+        assert refused.returncode != 0
+        assert "does not accept files" in refused.stdout + refused.stderr
     finally:
         stop_process(alice)

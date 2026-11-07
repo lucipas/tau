@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import hashlib
 import logging
 import os
 import random
@@ -23,7 +24,12 @@ import RNS
 
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
-from .config import TauConfig, tcp_listen_endpoints, write_rns_config
+from .config import (
+    TauConfig,
+    accept_files_enabled,
+    tcp_listen_endpoints,
+    write_rns_config,
+)
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -43,11 +49,13 @@ from .protocol import (
     APP_NAME,
     ASPECT,
     ASPECT_FILTER,
+    MAX_FILE_BYTES,
     MAX_MAIL_REQUEST_BYTES,
     MAX_MAIL_TTL,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
+    REQUEST_FILE,
     REQUEST_INFO,
     REQUEST_MAIL_FETCH,
     REQUEST_MAIL_STORE,
@@ -56,6 +64,7 @@ from .protocol import (
     REQUEST_PING,
     ProtocolError,
     build_announce,
+    build_file_offer,
     build_mail_fetch,
     build_mail_store,
     decode,
@@ -63,11 +72,13 @@ from .protocol import (
     generate_message_id,
     normalize_message,
     parse_announce,
+    parse_file_offer,
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
     response_error,
     response_ok,
+    sanitize_file_name,
 )
 
 log = logging.getLogger(__name__)
@@ -93,6 +104,20 @@ _EXCHANGE_INTERVAL = 900.0
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
+# A file offer stays valid this long: the sender advertises the
+# Resource right after the offer is accepted, so an offer that is
+# never followed by bytes expires instead of letting a stranger
+# fill the disk later with an old id.
+_FILE_OFFER_TTL = 300.0
+# Default budget for one file transfer (offer + Resource bytes).
+_FILE_TRANSFER_TIMEOUT = 300.0
+# A Resource advertisement's data size is the file size plus the
+# metadata carried with it (the transfer id: a 3-byte length prefix
+# around a msgpack'd 32-character string, 37 bytes in total).  The
+# receiver matches advertisements against pending offers with this
+# much slack; the exact size and hash are re-checked once the bytes
+# are assembled, so the slack only admits a bounded pre-filter.
+_FILE_METADATA_OVERHEAD = 64
 
 
 class NodeError(RuntimeError):
@@ -305,6 +330,27 @@ class _AnnounceHandler:
         self.node._on_announce(destination_hash, announced_identity, app_data)
 
 
+def _read_resource_data(resource: Any) -> Optional[bytes]:
+    """Read the assembled bytes of a concluded Resource.
+
+    A received Resource keeps its bytes in a file on disk, so
+    ``resource.data`` is an open binary file, not ``bytes`` — read
+    it.  (A locally built Resource holds plain bytes instead.)
+    """
+    raw = getattr(resource, "data", None)
+    if raw is None:
+        return None
+    if hasattr(raw, "read"):
+        try:
+            return bytes(raw.read())
+        except Exception:  # pragma: no cover - defensive
+            return None
+    try:
+        return bytes(raw)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class TauNode:
     """A peer in a tau network.
 
@@ -323,6 +369,7 @@ class TauNode:
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
+        on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -334,6 +381,7 @@ class TauNode:
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
+        self.on_file = on_file
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -351,6 +399,8 @@ class TauNode:
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
         self._active_links: Set[RNS.Link] = set()
+        self._pending_file_offers: Dict[str, Dict[str, Any]] = {}
+        self._file_offers_lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
         self._instance_lock: Optional[InstanceLock] = None
@@ -475,6 +525,7 @@ class TauNode:
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
+            REQUEST_FILE: self._handle_file,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -857,6 +908,73 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
         )
+
+    def _handle_file(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Accept or refuse a signed file offer (``/tau/file``).
+
+        The offer itself carries no bytes — it is the sender asking
+        whether the transfer may start.  Acceptance registers a
+        pending offer (transfer id, name, size, SHA-256) that the
+        link's resource callback matches against the advertised
+        Resource; the bytes are verified against the hash again once
+        assembled, and never written to disk otherwise.
+
+        Policy: files are off unless the owner opted in with
+        ``tau config accept-files on`` — except that a sender on the
+        DM allow-list is always allowed, and a sender the allow-list
+        excludes is refused even when acceptance is on.  A refusal
+        answers ``not_allowed`` so the sender fails fast instead of
+        queueing a file nobody wants.
+        """
+        try:
+            offer = parse_file_offer(data, remote_identity=remote_identity)
+        except ProtocolError as exc:
+            return response_error("invalid_offer", str(exc))
+
+        sender_hash = offer["from"]
+        if not self.allowlist.is_allowed(sender_hash):
+            log.info(
+                "File offer from %s denied by the DM allow-list",
+                sender_hash[:8],
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        explicitly_listed = bool(
+            self.allowlist.enabled and sender_hash in self.allowlist.allow
+        )
+        if not explicitly_listed and not accept_files_enabled(
+            self.config.data_dir
+        ):
+            log.info(
+                "File offer from %s refused: this node does not accept files",
+                sender_hash[:8],
+            )
+            return response_error(
+                "not_allowed",
+                "this node does not accept files "
+                "(see `tau config accept-files on`)",
+            )
+        with self._file_offers_lock:
+            self._pending_file_offers[offer["id"]] = {
+                **offer,
+                "expires_at": time.time() + _FILE_OFFER_TTL,
+            }
+        log.info(
+            "Accepted file offer %s (%s, %d bytes) from %s",
+            offer["id"][:8],
+            offer["name"],
+            offer["size"],
+            sender_hash[:8],
+        )
+        return response_ok(accepted=True, id=offer["id"], name=offer["name"])
 
     def _handle_mail_store(
         self,
@@ -1521,6 +1639,118 @@ class TauNode:
                 "expires_at": entry.expires_at,
             }
 
+    def send_file(
+        self,
+        target: Union[str, bytes, Peer],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> Dict[str, Any]:
+        """Send a small file to a peer over an RNS Resource.
+
+        The receiver first gets a signed ``/tau/file`` offer (name,
+        size, SHA-256) and may refuse it — a refused or unreachable
+        peer raises instead of queueing, because files are direct
+        links only in v1 (no store-and-forward).  Once accepted, the
+        bytes travel as a Resource on the same link; the receiver
+        verifies the hash before writing anything to disk.
+        """
+        source = Path(path).expanduser()
+        if not source.is_file():
+            raise NodeError(f"no such file: {source}")
+        try:
+            data = source.read_bytes()
+        except OSError as exc:
+            raise NodeError(f"could not read {source}: {exc}") from exc
+        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+            raise NodeError(
+                f"file of {len(data)} bytes is outside the 1..{MAX_FILE_BYTES} "
+                "byte limit"
+            )
+        name = sanitize_file_name(source.name)
+        if not name:
+            raise NodeError(f"file name {source.name!r} is not usable")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        transfer_id = generate_message_id()
+        digest = hashlib.sha256(data).hexdigest()
+        offer = build_file_offer(
+            self.identity,
+            transfer_id=transfer_id,
+            name=name,
+            size=len(data),
+            sha256=digest,
+        )
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        link = self._open_link(peer, min(timeout, 30.0))
+        try:
+            # The offer request runs on this link, and the Resource
+            # follows on the same link — the receiver's resource
+            # callback matches the advertisement against this offer.
+            self._request_on_link(link, REQUEST_FILE, offer, 20.0)
+            concluded = threading.Event()
+            state: Dict[str, Any] = {}
+
+            def on_concluded(resource: Any) -> None:
+                state["status"] = getattr(resource, "status", None)
+                concluded.set()
+
+            def on_progress(resource: Any) -> None:
+                if progress_callback is None:
+                    return
+                try:
+                    progress_callback(float(resource.get_progress()))
+                except Exception:  # pragma: no cover - user callback
+                    log.debug("file progress callback failed", exc_info=True)
+
+            resource = RNS.Resource(
+                data,
+                link,
+                metadata=transfer_id,
+                advertise=False,
+                callback=on_concluded,
+                progress_callback=on_progress,
+            )
+            # Advertise exactly once: the constructor would also
+            # advertise by default, and a second advertise job
+            # corrupts the transfer's timing and cancels it.
+            resource.advertise()
+            if not concluded.wait(timeout):
+                try:
+                    resource.cancel()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                raise NodeError(
+                    f"file transfer {transfer_id[:8]} did not finish "
+                    f"within {timeout:.0f}s"
+                )
+            if state.get("status") != RNS.Resource.COMPLETE:
+                raise NodeError(
+                    f"file transfer {transfer_id[:8]} failed "
+                    f"(status={state.get('status')})"
+                )
+            return {
+                "ok": True,
+                "v": PROTOCOL_VERSION,
+                "id": transfer_id,
+                "name": name,
+                "size": len(data),
+                "sha256": digest,
+                "to": peer.hexhash,
+            }
+        finally:
+            try:
+                link.teardown()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""
         if isinstance(target, Peer):
@@ -1678,20 +1908,173 @@ class TauNode:
             time.sleep(0.1)
         raise NodeError(f"no path to {dest_hash.hex()} after {timeout:.1f}s")
 
-    def _configure_link(self, link: RNS.Link, resource_limit: int) -> None:
+    def _configure_link(self, link: RNS.Link) -> None:
+        """Accept plain Resources on *link* only as file transfers.
+
+        Request and response payloads travel as Reticulum request
+        resources and never reach this callback — it only ever sees
+        an advertisement for a standalone Resource, which in tau
+        means a file transfer.  An advertisement is accepted only
+        when a signed ``/tau/file`` offer for exactly that many
+        bytes is pending; anything else is refused before a single
+        part is requested, so a stranger cannot make this node
+        buffer arbitrary data.
+        """
         try:
             link.set_resource_strategy(RNS.Link.ACCEPT_APP)
-            link.set_resource_callback(
-                lambda resource: resource.get_data_size() <= resource_limit
-            )
+            link.set_resource_callback(self._on_resource_advertised)
+            link.set_resource_concluded_callback(self._on_resource_concluded)
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not configure link resources", exc_info=True)
 
+    def _prune_file_offers(self) -> None:
+        now = time.time()
+        with self._file_offers_lock:
+            expired = [
+                transfer_id
+                for transfer_id, offer in self._pending_file_offers.items()
+                if offer["expires_at"] <= now
+            ]
+            for transfer_id in expired:
+                del self._pending_file_offers[transfer_id]
+
+    def _on_resource_advertised(self, advertisement: Any) -> bool:
+        """Accept a Resource only for a pending, matching file offer.
+
+        The advertised data size is the offered file size plus the
+        transfer-id metadata prepended to the Resource (see
+        ``_FILE_METADATA_OVERHEAD``), so the match allows that much
+        slack; the exact size and the SHA-256 are re-checked once
+        the bytes are assembled.
+        """
+        try:
+            size = advertisement.get_data_size()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Resource advertisement without a size", exc_info=True)
+            return False
+        if (
+            not isinstance(size, int)
+            or size < 1
+            or size > MAX_FILE_BYTES + _FILE_METADATA_OVERHEAD
+        ):
+            return False
+        self._prune_file_offers()
+        with self._file_offers_lock:
+            return any(
+                offer["size"] <= size <= offer["size"] + _FILE_METADATA_OVERHEAD
+                for offer in self._pending_file_offers.values()
+            )
+
+    def _on_resource_concluded(self, resource: Any) -> None:
+        """Handle a fully transferred Resource: verify, save, record.
+
+        The Resource's metadata is the transfer id from the signed
+        offer; the bytes are checked against the offer's SHA-256
+        before anything is written to disk, and a transfer nobody
+        offered (or whose hash mismatches) is dropped silently.
+        """
+        try:
+            transfer_id = resource.metadata
+            if isinstance(transfer_id, bytes):
+                transfer_id = transfer_id.decode("utf-8", "ignore")
+            if not isinstance(transfer_id, str):
+                return
+            with self._file_offers_lock:
+                offer = self._pending_file_offers.pop(transfer_id, None)
+            if offer is None:
+                log.info("Ignoring Resource for unknown transfer %r", transfer_id)
+                return
+            if getattr(resource, "status", None) != RNS.Resource.COMPLETE:
+                log.info("File transfer %s did not complete", transfer_id[:8])
+                return
+            data = _read_resource_data(resource)
+            if data is None:
+                log.warning(
+                    "File transfer %s has unreadable data", transfer_id[:8]
+                )
+                return
+            if len(data) != offer["size"]:
+                log.warning(
+                    "File transfer %s size mismatch: got %d, offered %d",
+                    transfer_id[:8],
+                    len(data),
+                    offer["size"],
+                )
+                return
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != offer["sha256"]:
+                log.warning(
+                    "File transfer %s hash mismatch: discarding",
+                    transfer_id[:8],
+                )
+                return
+            peer = self.registry.get(offer["from"])
+            if peer is not None:
+                offer["from_name"] = peer.display_name
+            record = self._save_received_file(offer, data)
+            if record is None:
+                return
+            self._record_received(record)
+            if self.on_file is not None:
+                try:
+                    self.on_file(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_file callback failed", exc_info=True)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not handle concluded Resource", exc_info=True)
+
+    def _save_received_file(
+        self, offer: Dict[str, Any], data: bytes
+    ) -> Optional[Dict[str, Any]]:
+        """Write *data* under ``files/<sender>/<name>`` and describe it.
+
+        Never overwrites: a name that already exists gets a numeric
+        suffix before the extension.  Returns the inbox record, or
+        ``None`` when the write fails.
+        """
+        sender_dir = self.config.files_dir / offer["from"]
+        try:
+            sender_dir.mkdir(parents=True, exist_ok=True)
+            target = sender_dir / offer["name"]
+            if target.exists():
+                stem = target.stem
+                suffix = target.suffix
+                counter = 2
+                while True:
+                    candidate = sender_dir / f"{stem}-{counter}{suffix}"
+                    if not candidate.exists():
+                        target = candidate
+                        break
+                    counter += 1
+            target.write_bytes(data)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:  # pragma: no cover - best effort
+                pass
+        except OSError as exc:
+            log.warning("Could not save received file %s: %s", offer["name"], exc)
+            return None
+        log.info(
+            "Received file %s (%d bytes) from %s",
+            offer["name"],
+            len(data),
+            offer["from"][:8],
+        )
+        return {
+            "kind": "file",
+            "from": offer.get("from_name") or offer["from"][:8],
+            "destination": offer["from"],
+            "name": target.name,
+            "size": len(data),
+            "sha256": offer["sha256"],
+            "path": str(target),
+            "sent_at": offer.get("sent_at") or 0.0,
+            "received_at": time.time(),
+            "id": offer["id"],
+        }
+
     def _on_incoming_link(self, link: RNS.Link) -> None:
-        # Incoming requests can be mail-sized (a sealed envelope store is
-        # up to _MAIL_WIRE_LIMIT on the wire), so accept resources up to
-        # the larger of the two budgets, not just the plain request one.
-        self._configure_link(link, max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT))
+        self._configure_link(link)
         with self._links_lock:
             self._active_links.add(link)
         link.set_link_closed_callback(self._on_link_closed)
@@ -1709,7 +2092,7 @@ class TauNode:
         state: Dict[str, Any] = {}
 
         def on_established(link: RNS.Link) -> None:
-            self._configure_link(link, _RESPONSE_WIRE_LIMIT)
+            self._configure_link(link)
             try:
                 link.identify(self.identity)
             except Exception:  # pragma: no cover - defensive
