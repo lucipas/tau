@@ -23,6 +23,23 @@ def _record(**overrides):
     return record
 
 
+def test_sent_records_do_not_evict_received_history(tmp_path, monkeypatch):
+    from tau import inbox as inbox_module
+
+    monkeypatch.setattr(inbox_module, "MAX_INBOX", 2)
+    monkeypatch.setattr(inbox_module, "MAX_INBOX_SENT", 1)
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in"))
+    inbox.append(_record(id="in-2", direction="in"))
+    for index in range(3):
+        inbox.append(_record(id=f"out-{index}", direction="out"))
+
+    received = inbox.list_messages()
+    assert [item["id"] for item in received] == ["in-2", "in-1"]
+    sent = inbox.list_messages(direction="out")
+    assert [item["id"] for item in sent] == ["out-2"]
+
+
 def test_append_lists_newest_first(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="first", received_at=20.0, text="one"))

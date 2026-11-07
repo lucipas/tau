@@ -31,6 +31,23 @@ log = logging.getLogger(__name__)
 
 INBOX_FILE_NAME = "inbox.json"
 MAX_INBOX = 500
+# Sent records have their own cap so outgoing DMs never evict received ones.
+MAX_INBOX_SENT = 500
+
+
+def _retain(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the newest ``MAX_INBOX`` received and ``MAX_INBOX_SENT`` sent records."""
+    limits = {"in": MAX_INBOX, "out": MAX_INBOX_SENT}
+    counts = {"in": 0, "out": 0}
+    kept: List[Dict[str, Any]] = []
+    for record in reversed(messages):
+        direction = record.get("direction")
+        if counts.get(direction, 0) >= limits.get(direction, MAX_INBOX):
+            continue
+        counts[direction] = counts.get(direction, 0) + 1
+        kept.append(record)
+    kept.reverse()
+    return kept
 
 
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
@@ -113,7 +130,7 @@ class Inbox:
             record = _valid_record(entry)
             if record is not None:
                 loaded.append(record)
-        self._messages = loaded[-MAX_INBOX:]
+        self._messages = _retain(loaded)
 
     def _save(self) -> None:
         if self.path is None:
@@ -151,13 +168,13 @@ class Inbox:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Record one received message, dropping the oldest past the cap."""
+        """Record one message, dropping the oldest past its direction's cap."""
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
         with self._transaction():
             self._messages.append(entry)
-            self._messages = self._messages[-MAX_INBOX:]
+            self._messages = _retain(self._messages)
             self._save()
         return entry
 
