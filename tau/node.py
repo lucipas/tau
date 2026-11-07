@@ -109,6 +109,10 @@ _FETCH_BLOB_BUDGET = 40 * 1024
 # never followed by bytes expires instead of letting a stranger
 # fill the disk later with an old id.
 _FILE_OFFER_TTL = 300.0
+# Bounds on offers awaiting their Resource, so accepted offers that
+# never receive bytes cannot grow memory without limit.
+_MAX_PENDING_FILE_OFFERS = 64
+_MAX_PENDING_FILE_OFFERS_PER_SENDER = 4
 # Default budget for one file transfer (offer + Resource bytes).
 _FILE_TRANSFER_TIMEOUT = 300.0
 # A Resource advertisement's data size is the file size plus the
@@ -349,6 +353,45 @@ def _read_resource_data(resource: Any) -> Optional[bytes]:
         return bytes(raw)
     except Exception:  # pragma: no cover - defensive
         return None
+
+
+def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
+    """Write *data* to a new file in *directory*, never overwriting.
+
+    Each candidate is created with an exclusive open (``O_EXCL``), so
+    an existing name, including a symlink, is never opened for
+    writing; the next numbered name is tried instead.  The check and
+    the create are one syscall, so concurrent transfers cannot pick
+    the same destination.
+    """
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    counter = 1
+    while True:
+        candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
+        candidate = directory / candidate_name
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            counter += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except BaseException:
+            try:
+                os.unlink(candidate)
+            except OSError:  # pragma: no cover - best effort
+                pass
+            raise
+        return candidate
 
 
 class TauNode:
@@ -962,7 +1005,16 @@ class TauNode:
                 "this node does not accept files "
                 "(see `tau config accept-files on`)",
             )
+        self._prune_file_offers()
         with self._file_offers_lock:
+            pending = list(self._pending_file_offers.values())
+            if len(pending) >= _MAX_PENDING_FILE_OFFERS or (
+                sum(1 for item in pending if item["from"] == sender_hash)
+                >= _MAX_PENDING_FILE_OFFERS_PER_SENDER
+            ):
+                return response_error(
+                    "busy", "too many file offers are pending; try again later"
+                )
             self._pending_file_offers[offer["id"]] = {
                 **offer,
                 "expires_at": time.time() + _FILE_OFFER_TTL,
@@ -1660,21 +1712,11 @@ class TauNode:
         source = Path(path).expanduser()
         if not source.is_file():
             raise NodeError(f"no such file: {source}")
-        # Check the size before reading: a multi-gigabyte file must
-        # be rejected without ever being loaded into memory.  The
-        # length is re-checked after the read, in case the file
-        # changed under us between the two.
         try:
-            stated_size = source.stat().st_size
-        except OSError as exc:
-            raise NodeError(f"could not read {source}: {exc}") from exc
-        if stated_size < 1 or stated_size > MAX_FILE_BYTES:
-            raise NodeError(
-                f"file of {stated_size} bytes is outside the 1..{MAX_FILE_BYTES} "
-                "byte limit"
-            )
-        try:
-            data = source.read_bytes()
+            # Read at most one byte past the limit so an oversized (or
+            # growing) file is rejected without loading it all.
+            with source.open("rb") as handle:
+                data = handle.read(MAX_FILE_BYTES + 1)
         except OSError as exc:
             raise NodeError(f"could not read {source}: {exc}") from exc
         if len(data) < 1 or len(data) > MAX_FILE_BYTES:
@@ -1925,23 +1967,26 @@ class TauNode:
         """Accept plain Resources on *link* only as file transfers.
 
         Request and response payloads travel as Reticulum request
-        resources and never reach this callback — RNS dispatches
-        them on the advertisement's request/response flags before
-        consulting the app callback (verified against RNS 1.5.7:
-        ``Link.request`` sets a request id, so ``is_request`` is
-        true for over-MDU protocol requests).  It only ever sees an
-        advertisement for a standalone Resource, which in tau means
-        a file transfer.  An advertisement is accepted only when a
-        signed ``/tau/file`` offer for (nearly) that many bytes is
-        pending — the advertised size includes the transfer-id
-        metadata, see ``_FILE_METADATA_OVERHEAD`` — and anything
-        else is refused before a single part is requested, so a
-        stranger cannot make this node buffer arbitrary data.
+        resources and never reach this callback — it only ever sees
+        an advertisement for a standalone Resource, which in tau
+        means a file transfer.  An advertisement is accepted only
+        when a signed ``/tau/file`` offer for exactly that many
+        bytes is pending; anything else is refused before a single
+        part is requested, so a stranger cannot make this node
+        buffer arbitrary data.
         """
         try:
             link.set_resource_strategy(RNS.Link.ACCEPT_APP)
-            link.set_resource_callback(self._on_resource_advertised)
-            link.set_resource_concluded_callback(self._on_resource_concluded)
+            # Bind each callback to its link: an offer only matches a
+            # Resource arriving from the same authenticated sender.
+            link.set_resource_callback(
+                lambda advertisement: self._on_resource_advertised(
+                    advertisement, link
+                )
+            )
+            link.set_resource_concluded_callback(
+                lambda resource: self._on_resource_concluded(resource, link)
+            )
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not configure link resources", exc_info=True)
 
@@ -1956,15 +2001,29 @@ class TauNode:
             for transfer_id in expired:
                 del self._pending_file_offers[transfer_id]
 
-    def _on_resource_advertised(self, advertisement: Any) -> bool:
+    def _link_sender_hash(self, link: Any) -> Optional[str]:
+        """Destination hash (hex) of the identity authenticated on *link*."""
+        try:
+            identity = link.get_remote_identity()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if identity is None:
+            return None
+        return RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+
+    def _on_resource_advertised(self, advertisement: Any, link: Any = None) -> bool:
         """Accept a Resource only for a pending, matching file offer.
 
         The advertised data size is the offered file size plus the
         transfer-id metadata prepended to the Resource (see
         ``_FILE_METADATA_OVERHEAD``), so the match allows that much
         slack; the exact size and the SHA-256 are re-checked once
-        the bytes are assembled.
+        the bytes are assembled.  Only offers made by the sender
+        authenticated on *link* are considered.
         """
+        sender = self._link_sender_hash(link)
+        if sender is None:
+            return False
         try:
             size = advertisement.get_data_size()
         except Exception:  # pragma: no cover - defensive
@@ -1979,17 +2038,19 @@ class TauNode:
         self._prune_file_offers()
         with self._file_offers_lock:
             return any(
-                offer["size"] <= size <= offer["size"] + _FILE_METADATA_OVERHEAD
+                offer["from"] == sender
+                and offer["size"] <= size <= offer["size"] + _FILE_METADATA_OVERHEAD
                 for offer in self._pending_file_offers.values()
             )
 
-    def _on_resource_concluded(self, resource: Any) -> None:
+    def _on_resource_concluded(self, resource: Any, link: Any = None) -> None:
         """Handle a fully transferred Resource: verify, save, record.
 
         The Resource's metadata is the transfer id from the signed
         offer; the bytes are checked against the offer's SHA-256
         before anything is written to disk, and a transfer nobody
-        offered (or whose hash mismatches) is dropped silently.
+        offered (or whose hash mismatches) is dropped silently.  The
+        offer must have been made by the sender on *link*.
         """
         try:
             transfer_id = resource.metadata
@@ -1997,8 +2058,13 @@ class TauNode:
                 transfer_id = transfer_id.decode("utf-8", "ignore")
             if not isinstance(transfer_id, str):
                 return
+            sender = self._link_sender_hash(link)
             with self._file_offers_lock:
-                offer = self._pending_file_offers.pop(transfer_id, None)
+                offer = self._pending_file_offers.get(transfer_id)
+                if offer is None or offer["from"] != sender:
+                    offer = None
+                else:
+                    del self._pending_file_offers[transfer_id]
             if offer is None:
                 log.info("Ignoring Resource for unknown transfer %r", transfer_id)
                 return
@@ -2053,22 +2119,9 @@ class TauNode:
         sender_dir = self.config.files_dir / offer["from"]
         try:
             sender_dir.mkdir(parents=True, exist_ok=True)
-            target = sender_dir / offer["name"]
-            if target.exists():
-                stem = target.stem
-                suffix = target.suffix
-                counter = 2
-                while True:
-                    candidate = sender_dir / f"{stem}-{counter}{suffix}"
-                    if not candidate.exists():
-                        target = candidate
-                        break
-                    counter += 1
-            target.write_bytes(data)
-            try:
-                os.chmod(target, 0o600)
-            except OSError:  # pragma: no cover - best effort
-                pass
+            if self.config.files_dir.is_symlink() or sender_dir.is_symlink():
+                raise OSError("files directory must not be a symlink")
+            target = _create_unique_file(sender_dir, offer["name"], data)
         except OSError as exc:
             log.warning("Could not save received file %s: %s", offer["name"], exc)
             return None
