@@ -45,18 +45,54 @@ def sender_hash(identity):
     return RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
 
 
-def make_offer(identity, *, name="notes.txt", data=b"hello file", transfer_id="a" * 32):
+# The test receiver is never started, so it has no destination hash of
+# its own; offers default to this stand-in recipient.
+RECIPIENT_HASH = "e" * 32
+
+
+def make_offer(
+    identity,
+    *,
+    to=RECIPIENT_HASH,
+    name="notes.txt",
+    data=b"hello file",
+    transfer_id="a" * 32,
+):
     return build_file_offer(
         identity,
         transfer_id=transfer_id,
+        to=to,
         name=name,
         size=len(data),
         sha256=hashlib.sha256(data).hexdigest(),
     )
 
 
-def handle_offer(node, identity, offer_bytes):
-    raw = node._handle_file("/tau/file", offer_bytes, b"req", identity, 0.0)
+def set_destination(node, destination_hash):
+    """Give an unstarted test node a destination, as if it were serving."""
+    node.destination = SimpleNamespace(hexhash=destination_hash)
+
+
+def sender_link(identity):
+    """A fake link authenticated as *identity* (or unidentified)."""
+    remote = identity if identity is not None else None
+    return SimpleNamespace(get_remote_identity=lambda: remote)
+
+
+def handle_offer(node, identity, offer_bytes, *, remote="sender"):
+    """Deliver *offer_bytes* to *node* as if from *identity*.
+
+    ``remote`` selects the identity authenticated on the link:
+    ``"sender"`` (the signer), another identity (a replay), or
+    ``None`` (an unidentified link).
+    """
+    if remote == "sender":
+        remote_identity = identity
+    else:
+        remote_identity = remote
+    raw = node._handle_file(
+        "/tau/file", offer_bytes, b"req", remote_identity, 0.0
+    )
     return decode(raw)
 
 
@@ -89,12 +125,25 @@ def test_sanitize_file_name_drops_control_characters():
 def test_file_offer_roundtrip():
     identity = sender_identity()
     raw = make_offer(identity)
-    parsed = parse_file_offer(raw, remote_identity=identity)
+    parsed = parse_file_offer(
+        raw, remote_identity=identity, expected_recipient=RECIPIENT_HASH
+    )
     assert parsed["id"] == "a" * 32
+    assert parsed["to"] == RECIPIENT_HASH
     assert parsed["name"] == "notes.txt"
     assert parsed["size"] == len(b"hello file")
     assert parsed["sha256"] == hashlib.sha256(b"hello file").hexdigest()
     assert parsed["from"] == sender_hash(identity)
+
+
+def test_file_offer_rejects_an_offer_addressed_elsewhere():
+    identity = sender_identity()
+    with pytest.raises(ProtocolError, match="addressed to another node"):
+        parse_file_offer(
+            make_offer(identity),
+            remote_identity=identity,
+            expected_recipient="f" * 32,
+        )
 
 
 def test_file_offer_rejects_tampered_payload():
@@ -120,6 +169,7 @@ def test_file_offer_rejects_oversized_and_empty():
         build_file_offer(
             identity,
             transfer_id="b" * 32,
+            to=RECIPIENT_HASH,
             name="big.bin",
             size=MAX_FILE_BYTES + 1,
             sha256="0" * 64,
@@ -128,6 +178,7 @@ def test_file_offer_rejects_oversized_and_empty():
         build_file_offer(
             identity,
             transfer_id="b" * 32,
+            to=RECIPIENT_HASH,
             name="empty.bin",
             size=0,
             sha256="0" * 64,
@@ -139,6 +190,7 @@ def test_file_offer_build_sanitizes_the_name():
     raw = build_file_offer(
         identity,
         transfer_id="b" * 32,
+        to=RECIPIENT_HASH,
         name="../evil.txt",
         size=4,
         sha256="0" * 64,
@@ -156,6 +208,7 @@ def sign_offer(identity, **overrides):
         "type": "file_offer",
         "v": 1,
         "id": "d" * 32,
+        "to": RECIPIENT_HASH,
         "name": "notes.txt",
         "size": 4,
         "sha256": "0" * 64,
@@ -180,6 +233,7 @@ def test_file_offer_rejects_bad_hash():
         build_file_offer(
             identity,
             transfer_id="b" * 32,
+            to=RECIPIENT_HASH,
             name="ok.txt",
             size=4,
             sha256="not-a-digest",
@@ -248,6 +302,53 @@ def test_handle_file_rejects_an_invalid_offer(tmp_path):
     assert response["error"]["code"] == "invalid_offer"
 
 
+def test_handle_file_rejects_an_unidentified_link(tmp_path):
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    response = handle_offer(node, identity, make_offer(identity), remote=None)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_offer"
+    assert node._pending_file_offers == {}
+
+
+def test_handle_file_rejects_a_replayed_offer(tmp_path):
+    # Mallory captured Bob's signed offer and replays it over her own
+    # link: the signature is genuinely Bob's, but the link says
+    # Mallory, so the offer must not be honored as Bob's.
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    bob = sender_identity()
+    mallory = sender_identity()
+    response = handle_offer(
+        node, bob, make_offer(bob), remote=mallory
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_offer"
+    assert node._pending_file_offers == {}
+
+
+def test_handle_file_rejects_an_offer_addressed_elsewhere(tmp_path):
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    set_destination(node, "f" * 32)
+    identity = sender_identity()
+    response = handle_offer(node, identity, make_offer(identity))
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_offer"
+    assert node._pending_file_offers == {}
+
+
+def test_handle_file_accepts_an_offer_addressed_to_this_node(tmp_path):
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    set_destination(node, RECIPIENT_HASH)
+    identity = sender_identity()
+    response = handle_offer(node, identity, make_offer(identity))
+    assert response["ok"] is True
+    assert "a" * 32 in node._pending_file_offers
+
+
 # -- settings --------------------------------------------------------------
 
 
@@ -269,16 +370,33 @@ def test_resource_advertised_only_for_a_matching_pending_offer(tmp_path):
     set_node_setting(tmp_path, "accept_files", True)
     identity = sender_identity()
     handle_offer(node, identity, make_offer(identity, data=b"hello file"))
+    link = sender_link(identity)
 
     assert node._on_resource_advertised(
-        SimpleNamespace(get_data_size=lambda: len(b"hello file"))
+        SimpleNamespace(get_data_size=lambda: len(b"hello file")), link
     )
     assert not node._on_resource_advertised(
-        SimpleNamespace(get_data_size=lambda: 12345)
+        SimpleNamespace(get_data_size=lambda: 12345), link
     )
     assert not node._on_resource_advertised(
-        SimpleNamespace(get_data_size=lambda: MAX_FILE_BYTES + 1)
+        SimpleNamespace(get_data_size=lambda: MAX_FILE_BYTES + 1), link
     )
+
+
+def test_resource_advertised_rejects_other_senders_and_unidentified_links(
+    tmp_path,
+):
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    handle_offer(node, identity, make_offer(identity, data=b"hello file"))
+    advertisement = SimpleNamespace(get_data_size=lambda: len(b"hello file"))
+
+    assert not node._on_resource_advertised(
+        advertisement, sender_link(sender_identity())
+    )
+    assert not node._on_resource_advertised(advertisement, sender_link(None))
+    assert not node._on_resource_advertised(advertisement)
 
 
 def test_resource_concluded_saves_verified_file_and_records_it(tmp_path):
@@ -294,7 +412,7 @@ def test_resource_concluded_saves_verified_file_and_records_it(tmp_path):
         metadata="a" * 32,
         data=b"hello file",
     )
-    node._on_resource_concluded(resource)
+    node._on_resource_concluded(resource, sender_link(identity))
 
     saved = tmp_path / "files" / sender_hash(identity) / "notes.txt"
     assert saved.read_bytes() == b"hello file"
@@ -327,7 +445,7 @@ def test_resource_concluded_reads_file_backed_data(tmp_path):
         metadata="a" * 32,
         data=io.BytesIO(b"hello file"),
     )
-    node._on_resource_concluded(resource)
+    node._on_resource_concluded(resource, sender_link(identity))
 
     saved = tmp_path / "files" / sender_hash(identity) / "notes.txt"
     assert saved.read_bytes() == b"hello file"
@@ -345,7 +463,7 @@ def test_resource_concluded_discards_a_hash_mismatch(tmp_path):
         metadata="a" * 32,
         data=b"tampered bytes",
     )
-    node._on_resource_concluded(resource)
+    node._on_resource_concluded(resource, sender_link(identity))
 
     saved = tmp_path / "files" / sender_hash(identity) / "notes.txt"
     assert not saved.exists()
@@ -359,9 +477,29 @@ def test_resource_concluded_ignores_an_unoffered_transfer(tmp_path):
         metadata="c" * 32,
         data=b"hello file",
     )
-    node._on_resource_concluded(resource)
+    node._on_resource_concluded(resource, sender_link(sender_identity()))
     assert not (tmp_path / "files").exists()
     assert node.inbox.list_messages() == []
+
+
+def test_resource_concluded_ignores_a_wrong_sender_link(tmp_path):
+    # A Resource arriving on a link authenticated as someone other
+    # than the offeror must not consume the offer or save the file.
+    node = make_node(tmp_path)
+    set_node_setting(tmp_path, "accept_files", True)
+    identity = sender_identity()
+    handle_offer(node, identity, make_offer(identity, data=b"hello file"))
+
+    resource = SimpleNamespace(
+        status=RNS.Resource.COMPLETE,
+        metadata="a" * 32,
+        data=b"hello file",
+    )
+    node._on_resource_concluded(resource, sender_link(sender_identity()))
+    assert not (tmp_path / "files").exists()
+    assert node.inbox.list_messages() == []
+    # The offer survives: the real sender can still deliver it.
+    assert "a" * 32 in node._pending_file_offers
 
 
 def test_resource_concluded_never_overwrites_an_existing_file(tmp_path):
@@ -372,7 +510,7 @@ def test_resource_concluded_never_overwrites_an_existing_file(tmp_path):
     first = SimpleNamespace(
         status=RNS.Resource.COMPLETE, metadata="a" * 32, data=b"hello file"
     )
-    node._on_resource_concluded(first)
+    node._on_resource_concluded(first, sender_link(identity))
 
     handle_offer(
         node, identity, make_offer(identity, data=b"hello file", transfer_id="b" * 32)
@@ -380,7 +518,7 @@ def test_resource_concluded_never_overwrites_an_existing_file(tmp_path):
     second = SimpleNamespace(
         status=RNS.Resource.COMPLETE, metadata="b" * 32, data=b"hello file"
     )
-    node._on_resource_concluded(second)
+    node._on_resource_concluded(second, sender_link(identity))
 
     sender_dir = tmp_path / "files" / sender_hash(identity)
     assert (sender_dir / "notes.txt").read_bytes() == b"hello file"
@@ -409,8 +547,15 @@ def test_send_file_rejects_oversized_files(tmp_path, monkeypatch):
         node.send_file("alice", big)
 
 
-def test_send_file_checks_size_before_reading(tmp_path, monkeypatch):
-    """An oversized file is refused from its stat size, never loaded."""
+def test_send_file_never_loads_a_file_with_unbounded_reads(
+    tmp_path, monkeypatch
+):
+    """An oversized file is refused without an unbounded read.
+
+    The sender reads at most one byte past the limit, so a huge
+    file cannot exhaust memory; this guards the shape of that fix
+    by asserting the unbounded ``read_bytes`` path is never taken.
+    """
     from pathlib import Path as _Path
 
     monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)

@@ -259,6 +259,7 @@ def build_file_offer(
     sender_identity: Any,
     *,
     transfer_id: str,
+    to: str,
     name: str,
     size: int,
     sha256: str,
@@ -270,9 +271,12 @@ def build_file_offer(
     move: it names the file, its size and its SHA-256, and carries the
     sender's public key plus a signature over every other field, so
     the receiver can authenticate the offer without trusting the link
-    alone.  The transfer itself follows as an RNS Resource whose
-    metadata is the transfer id, and the receiver re-checks the hash
-    once the bytes are assembled.
+    alone.  It also names its intended recipient (``to``): a signed
+    offer captured by one peer cannot be replayed to another, because
+    the receiver only honors offers addressed to itself.  The transfer
+    itself follows as an RNS Resource whose metadata is the transfer
+    id, and the receiver re-checks the hash once the bytes are
+    assembled.
     """
     clean_name = sanitize_file_name(name)
     if not clean_name:
@@ -294,6 +298,7 @@ def build_file_offer(
         "type": "file_offer",
         "v": PROTOCOL_VERSION,
         "id": _clean_message_id(transfer_id),
+        "to": _clean_hexhash(to, "to"),
         "name": clean_name,
         "size": size,
         "sha256": sha256.lower(),
@@ -309,21 +314,31 @@ def build_file_offer(
 
 
 def parse_file_offer(
-    raw: Any, *, remote_identity: Optional[Any] = None
+    raw: Any,
+    *,
+    remote_identity: Optional[Any] = None,
+    expected_recipient: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Validate a signed ``/tau/file`` request body.
 
     Verifies the signature against the carried public key, checks the
     key derives the claimed sender hash, and — when the link supplied
-    an identity — checks that identity is the claimed sender too.  A
-    forged, oversized or badly named offer is rejected outright; the
-    receiver still re-checks the assembled bytes against ``sha256``
-    after the transfer.
+    an identity — checks that identity is the claimed sender too.  The
+    offer must also name its intended recipient: when
+    ``expected_recipient`` is given, an offer addressed to anyone
+    else is rejected, so a signed offer captured by one peer cannot
+    be replayed to another.  A forged, oversized, badly named or
+    misaddressed offer is rejected outright; the receiver still
+    re-checks the assembled bytes against ``sha256`` after the
+    transfer.
     """
     payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
     if payload.get("type") != "file_offer":
         raise ProtocolError("expected a file_offer payload")
     transfer_id = _clean_message_id(payload.get("id"))
+    to = _clean_hexhash(payload.get("to"), "to")
+    if expected_recipient is not None and to != expected_recipient.lower():
+        raise ProtocolError("file offer is addressed to another node")
     name = payload.get("name")
     if not isinstance(name, str) or sanitize_file_name(name) != name:
         raise ProtocolError("file name is not a safe bare file name")
@@ -386,6 +401,7 @@ def parse_file_offer(
         raise ProtocolError("file offer signature does not verify")
     return {
         "id": transfer_id,
+        "to": to,
         "name": name,
         "size": size,
         "sha256": sha256.lower(),

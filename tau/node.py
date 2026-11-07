@@ -969,6 +969,14 @@ class TauNode:
         Resource; the bytes are verified against the hash again once
         assembled, and never written to disk otherwise.
 
+        Anti-replay: the offer is only honored on a link whose peer
+        identified itself — an unidentified link skips the sender
+        check, so it is refused outright — and only when the signed
+        offer names this node as its recipient, so a captured offer
+        cannot be replayed to a third node.  The Resource stage
+        additionally binds the transfer to the sender authenticated
+        on its link (see ``_on_resource_advertised``).
+
         Policy: files are off unless the owner opted in with
         ``tau config accept-files on`` — except that a sender on the
         DM allow-list is always allowed, and a sender the allow-list
@@ -976,8 +984,20 @@ class TauNode:
         answers ``not_allowed`` so the sender fails fast instead of
         queueing a file nobody wants.
         """
+        if remote_identity is None:
+            log.info("File offer refused: sender did not identify on the link")
+            return response_error(
+                "invalid_offer", "sender did not identify on the link"
+            )
+        expected_recipient = (
+            self.destination.hexhash if self.destination is not None else None
+        )
         try:
-            offer = parse_file_offer(data, remote_identity=remote_identity)
+            offer = parse_file_offer(
+                data,
+                remote_identity=remote_identity,
+                expected_recipient=expected_recipient,
+            )
         except ProtocolError as exc:
             return response_error("invalid_offer", str(exc))
 
@@ -1731,18 +1751,21 @@ class TauNode:
             raise NodeError("node has not been started")
         transfer_id = generate_message_id()
         digest = hashlib.sha256(data).hexdigest()
-        offer = build_file_offer(
-            self.identity,
-            transfer_id=transfer_id,
-            name=name,
-            size=len(data),
-            sha256=digest,
-        )
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
             if discover_timeout is not None
             else min(timeout, 10.0),
+        )
+        # The offer names its recipient, so a captured offer cannot be
+        # replayed to a third node: address it to this peer.
+        offer = build_file_offer(
+            self.identity,
+            transfer_id=transfer_id,
+            to=peer.destination_hash.hex(),
+            name=name,
+            size=len(data),
+            sha256=digest,
         )
         link = self._open_link(peer, min(timeout, 30.0))
         try:
@@ -1967,13 +1990,18 @@ class TauNode:
         """Accept plain Resources on *link* only as file transfers.
 
         Request and response payloads travel as Reticulum request
-        resources and never reach this callback — it only ever sees
-        an advertisement for a standalone Resource, which in tau
-        means a file transfer.  An advertisement is accepted only
-        when a signed ``/tau/file`` offer for exactly that many
-        bytes is pending; anything else is refused before a single
-        part is requested, so a stranger cannot make this node
-        buffer arbitrary data.
+        resources and never reach this callback — RNS dispatches
+        them on the advertisement's request/response flags before
+        consulting the app callback (verified against RNS 1.5.7:
+        ``Link.request`` sets a request id, so ``is_request`` is
+        true for over-MDU protocol requests).  It only ever sees an
+        advertisement for a standalone Resource, which in tau means
+        a file transfer.  An advertisement is accepted only when a
+        signed ``/tau/file`` offer for (nearly) that many bytes is
+        pending — the advertised size includes the transfer-id
+        metadata, see ``_FILE_METADATA_OVERHEAD`` — and anything
+        else is refused before a single part is requested, so a
+        stranger cannot make this node buffer arbitrary data.
         """
         try:
             link.set_resource_strategy(RNS.Link.ACCEPT_APP)
