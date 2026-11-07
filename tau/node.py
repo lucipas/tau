@@ -112,6 +112,12 @@ class InstanceAlreadyRunning(NodeError):
     """The data directory belongs to another running node."""
 
 
+# A `tau status` probe holds the instance lock for an instant; retry briefly
+# so a concurrent `tau serve` startup does not mistake that for a live node.
+_LOCK_PROBE_RETRIES = 10
+_LOCK_PROBE_RETRY_DELAY = 0.05
+
+
 class InstanceLock:
     """Exclusive advisory lock marking a data directory as in use.
 
@@ -134,17 +140,22 @@ class InstanceLock:
         if self._handle is not None or fcntl is None:
             return
         handle = open(self.path, "a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            holder = self._read_holder_pid(handle)
-            handle.close()
-            detail = f" (pid {holder})" if holder is not None else ""
-            raise InstanceAlreadyRunning(
-                "another tau node is already serving on data directory "
-                f"{self.data_dir}{detail}; stop it before starting a "
-                "second node on the same directory"
-            ) from None
+        for attempt in range(_LOCK_PROBE_RETRIES + 1):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt < _LOCK_PROBE_RETRIES:
+                    time.sleep(_LOCK_PROBE_RETRY_DELAY)
+                    continue
+                holder = self._read_holder_pid(handle)
+                handle.close()
+                detail = f" (pid {holder})" if holder is not None else ""
+                raise InstanceAlreadyRunning(
+                    "another tau node is already serving on data directory "
+                    f"{self.data_dir}{detail}; stop it before starting a "
+                    "second node on the same directory"
+                ) from None
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
@@ -184,14 +195,19 @@ def instance_lock_holder(path: Path) -> Optional[int]:
     Returns ``None`` when the lock is free, the file does not exist yet,
     or advisory locking is unavailable (non-POSIX).  A held lock whose
     holder PID cannot be read reports ``-1`` so callers can still tell
-    a node is serving.
+    a node is serving.  A lock file that exists but cannot be opened
+    raises :class:`NodeError`, since the serving state is then unknown.
     """
     if fcntl is None:
         return None
     try:
         handle = open(path, "r", encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise NodeError(
+            f"cannot read instance lock {path}: {exc}; serving state unknown"
+        ) from exc
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1828,6 +1844,11 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+  raise NotAllowedError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
