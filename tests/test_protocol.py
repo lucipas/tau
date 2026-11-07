@@ -129,6 +129,18 @@ def test_message_roundtrip_with_reply():
     assert parsed["in_reply_to"] == reply_to
 
 
+def test_message_reply_respects_request_budget():
+    # Four-byte characters are the worst case: a full-length body fits the
+    # budget alone, but the reference's overhead pushes it past the limit.
+    text = "\U0001F600" * MAX_MESSAGE_CHARS
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    with pytest.raises(ProtocolError):
+        encode_message(text, message_id="b" * 32, in_reply_to=reply_to)
+    # A reply that fits stays under the limit.
+    data = encode_message("x" * 1000, message_id="b" * 32, in_reply_to=reply_to)
+    assert len(data) <= MAX_REQUEST_BYTES
+
+
 def test_message_rejects_malformed_reply():
     with pytest.raises(ProtocolError):
         encode_message("hi", in_reply_to={"id": ""})
