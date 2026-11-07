@@ -892,8 +892,23 @@ class WebBridge:
             return []
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        # Drop disappearing messages whose deadline has passed while the
+        # bridge is running, not only at startup, so snapshots and the
+        # live feed never show an expired entry.
+        now = time.time()
         with self._lock:
+            kept = [
+                message
+                for message in self._messages
+                if message.get("expires_at") is None
+                or float(message["expires_at"]) > now
+            ]
+            removed = len(kept) != len(self._messages)
+            if removed:
+                self._messages[:] = kept
             items = list(self._messages)
+        if removed:
+            self._save_messages()
         if limit >= 0:
             items = items[-limit:]
         return items
@@ -996,6 +1011,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def _valid_expires_in(value: Any) -> bool:
+    """True when ``value`` is a finite lifetime in (0, MAX_MAIL_TTL] seconds.
+
+    Huge JSON integers overflow ``float()``, so the conversion is guarded
+    here instead of raising past the 400 response.
+    """
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL
 
 
 class _WebServer(ThreadingHTTPServer):
@@ -1257,9 +1285,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             if (
                 not isinstance(expires_in, (int, float))
                 or isinstance(expires_in, bool)
-                or not math.isfinite(float(expires_in))
-                or float(expires_in) <= 0
-                or float(expires_in) > MAX_MAIL_TTL
+                or not _valid_expires_in(expires_in)
             ):
                 self._send_json(
                     {
@@ -1512,6 +1538,29 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 
 def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
+    values = query.get(name) or []
+    if not values:
+        return False
+    return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+tr) -> bool:
     values = query.get(name) or []
     if not values:
         return False
