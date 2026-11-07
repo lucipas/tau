@@ -305,6 +305,26 @@ class _AnnounceHandler:
         self.node._on_announce(destination_hash, announced_identity, app_data)
 
 
+def _normalize_direct_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip queue claims from a peer's direct-delivery response.
+
+    Only the node's own enqueue path may report ``queued: True`` with a
+    real outbox id — a well-behaved peer never claims ``queued`` at all.
+    A peer that does (with any id, or none) would otherwise make the CLI
+    and the web console misreport a delivered message as queued, and a
+    claim without an id raises KeyError in the CLI's flush check. The
+    peer's legitimate delivery fields are kept; only queue ownership
+    (``id``, ``expires_at``, ``to``) is removed.
+    """
+    normalized = {
+        key: value
+        for key, value in response.items()
+        if key not in ("id", "expires_at", "to")
+    }
+    normalized["queued"] = False
+    return normalized
+
+
 class TauNode:
     """A peer in a tau network.
 
@@ -1467,7 +1487,9 @@ class TauNode:
         be reached is stored in the local outbox instead of being lost:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
-        willing to hold a sealed copy — is heard from.
+        willing to hold a sealed copy — is heard from. A peer that is
+        reached always reports a direct delivery: the response never
+        claims ``queued``, whatever the peer replies.
         """
         normalized = normalize_message(text)
         message_id = generate_message_id()
@@ -1480,7 +1502,8 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            return _normalize_direct_response(response)
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
