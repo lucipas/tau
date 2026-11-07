@@ -456,6 +456,9 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "first hello" in out
     assert out.index("second hello") < out.index("first hello")
     assert "alice" in out
+    # The short id is shown so `tau react` has something to take.
+    assert "#m-2" in out
+    assert "#m-1" in out
 
 
 def test_messages_json_and_peer_filter(tmp_path, capsys):
@@ -1331,3 +1334,129 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
         cli.cmd_serve(args)
 
     assert events == ["node.start", "bridge.start", "node.stop"]
+
+
+def test_parser_react_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["react", "abcdef12", "👍"])
+    assert args.command == "react"
+    assert args.message == "abcdef12"
+    assert args.reaction == "👍"
+    assert args.clear is False
+
+    cleared = parser.parse_args(["react", "abcdef12", "--clear"])
+    assert cleared.reaction is None
+    assert cleared.clear is True
+
+
+class _FakeReactNode:
+    instances = []
+
+    def __init__(self, config, name=None):
+        self.config = config
+        self.sent = []
+        self.started = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def send_reaction(
+        self, target, message_id, reaction, *, timeout=20.0, discover_timeout=None
+    ):
+        self.sent.append((target, message_id, reaction))
+        return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
+
+
+def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "👍" in out
+    node = _FakeReactNode.instances[0]
+    assert node.started is False
+    assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
+
+
+def test_react_json_and_clear(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["react", "--data-dir", str(data_dir), "m-2", "--clear", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-2"
+    assert payload["to"] == sender_hash.hex()
+    assert payload["cleared"] is True
+    assert _FakeReactNode.instances[0].sent == [
+        (sender_hash.hex(), "m-2", "")
+    ]
+
+
+def test_react_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "zzz", "👍"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_react_requires_exactly_one_of_token_or_clear(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1"])
+    assert code == cli._EXIT_ERROR
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "👍", "--clear"])
+    assert code == cli._EXIT_ERROR
+
+
+def test_react_rejects_an_oversized_token(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "x" * 33])
+    assert code == cli._EXIT_ERROR
+    assert "longer than 32" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_messages_renders_reactions(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.record_reaction(
+        {
+            "target": "m-1",
+            "destination": sender_hash.hex(),
+            "from": "alice",
+            "reaction": "❤️",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "react-1",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "❤️ alice" in out
+
+
+def test_react_rejects_a_blank_token_without_clear(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "--clear" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []

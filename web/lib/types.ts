@@ -1,5 +1,14 @@
 export type Direction = "in" | "out";
 
+export interface MessageReaction {
+  // Reactor's destination hash.
+  reactor: string;
+  // Reactor's display name at reaction time.
+  name: string;
+  // One emoji or short text token; never an image.
+  reaction: string;
+}
+
 export interface TauMessage {
   id: number;
   direction: Direction;
@@ -12,6 +21,10 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Wire message id, so reactions can be matched to this message.
+  wire_id?: string;
+  // Latest reaction per reactor, oldest first.
+  reactions?: MessageReaction[];
 }
 
 export interface Peer {

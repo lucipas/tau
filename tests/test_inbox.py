@@ -152,3 +152,130 @@ def test_append_rejects_record_without_text(tmp_path):
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
     assert len(inbox) == 0
+
+
+def _reaction(**overrides):
+    record = {
+        "target": "msg-1",
+        "destination": "ab" * 16,
+        "from": "alice",
+        "reaction": "👍",
+        "sent_at": 10.0,
+        "received_at": 20.0,
+        "id": "react-1",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_reaction_latest_per_reactor_wins(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(reaction="👍", received_at=20.0))
+    inbox.record_reaction(_reaction(reaction="❤️", received_at=21.0, id="react-2"))
+
+    reactions = inbox.reactions_for("msg-1")
+    assert len(reactions) == 1
+    assert reactions[0]["reaction"] == "❤️"
+    assert reactions[0]["id"] == "react-2"
+
+
+def test_reaction_clear_removes_only_that_reactor(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(destination="ab" * 16))
+    inbox.record_reaction(_reaction(destination="cd" * 16, **{"from": "bob"}))
+    assert len(inbox.reactions_for("msg-1")) == 2
+
+    inbox.record_reaction(_reaction(destination="ab" * 16, reaction=""))
+    remaining = inbox.reactions_for("msg-1")
+    assert len(remaining) == 1
+    assert remaining[0]["destination"] == "cd" * 16
+
+
+def test_reaction_clear_of_unknown_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    assert inbox.record_reaction(_reaction(reaction="")) is None
+    assert inbox.reactions_for("msg-1") == []
+
+
+def test_reactions_annotate_listed_messages(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1"))
+    inbox.append(_record(id="msg-2", text="other"))
+    inbox.record_reaction(_reaction(target="msg-1"))
+
+    entries = inbox.list_messages()
+    annotated = {entry["id"]: entry for entry in entries}
+    assert annotated["msg-1"]["reactions"][0]["reaction"] == "👍"
+    assert "reactions" not in annotated["msg-2"]
+
+
+def test_reactions_persist_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    Inbox(path).record_reaction(_reaction())
+    reloaded = Inbox(path)
+    assert len(reloaded.reactions_for("msg-1")) == 1
+    assert reloaded.reactions_for("msg-1")[0]["reaction"] == "👍"
+
+
+def test_reactions_keep_only_the_cap(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_REACTIONS", 2)
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(4):
+        inbox.record_reaction(
+            _reaction(target=f"msg-{index}", received_at=float(index))
+        )
+    assert [item["target"] for item in inbox._reactions] == ["msg-2", "msg-3"]
+
+
+def test_resolve_by_full_id_and_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a" * 32))
+    inbox.append(_record(id="b" * 32))
+
+    assert inbox.resolve("a" * 32)["id"] == "a" * 32
+    assert inbox.resolve("aaaa")["id"] == "a" * 32
+    with pytest.raises(ValueError, match="unknown message"):
+        inbox.resolve("c" * 32)
+    with pytest.raises(ValueError, match="unknown message"):
+        inbox.resolve("cccc")
+
+
+def test_resolve_ambiguous_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcdef01" + "0" * 24))
+    inbox.append(_record(id="abcdef02" + "0" * 24))
+    with pytest.raises(ValueError, match="2 messages match prefix"):
+        inbox.resolve("abcdef")
+
+
+def test_reaction_tombstone_keeps_stale_reactions_cleared(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(sent_at=20.0, received_at=20.0, id="r-1"))
+    inbox.record_reaction(
+        _reaction(reaction="", sent_at=21.0, received_at=21.0, id="r-2")
+    )
+    assert inbox.reactions_for("msg-1") == []
+    # A late copy of the retracted reaction must not resurrect it.
+    inbox.record_reaction(_reaction(sent_at=20.0, received_at=22.0, id="r-1"))
+    assert inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_stale_update_is_ignored(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(reaction="❤️", sent_at=30.0, received_at=30.0, id="r-2")
+    )
+    inbox.record_reaction(
+        _reaction(reaction="👍", sent_at=20.0, received_at=31.0, id="r-1")
+    )
+    assert [item["reaction"] for item in inbox.reactions_for("msg-1")] == ["❤️"]
+
+
+def test_resolve_exact_id_beats_a_longer_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abc", text="short"))
+    inbox.append(_record(id="abcdef", text="long"))
+    assert inbox.resolve("abc")["text"] == "short"
+    assert inbox.resolve("abcdef")["text"] == "long"

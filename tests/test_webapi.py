@@ -1267,3 +1267,255 @@ def test_tan_reply_via_api(tmp_path):
         assert payload["post"]["kind"] == "post"
     finally:
         bridge.stop()
+
+
+def _reaction_record(**overrides):
+    record = {
+        "target": "wire-1",
+        "reaction": "👍",
+        "from": "alice",
+        "destination": PEER_HASH,
+        "sent_at": 12.0,
+        "received_at": 13.0,
+        "id": "react-1",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_reaction_annotates_matching_history_entry(bridge):
+    record = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-1",
+    }
+    bridge.record_inbound(record)
+
+    updated = bridge.record_reaction(_reaction_record())
+    assert updated is not None
+    assert updated["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+    assert feed["messages"][0]["wire_id"] == "wire-1"
+    events = bridge.bus.replay(0)
+    assert any(
+        e["type"] == "message_updated"
+        and e["message"]["reactions"]
+        for e in events
+    )
+
+
+def test_reaction_latest_per_reactor_and_clear(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    bridge.record_reaction(_reaction_record(reaction="👍"))
+    bridge.record_reaction(_reaction_record(reaction="❤️", id="react-2"))
+    updated = bridge.record_reaction(_reaction_record(reaction="", id="react-3"))
+    assert updated is not None
+    assert updated["reactions"] == []
+
+
+def test_reaction_to_unknown_history_entry_is_dropped(bridge):
+    assert bridge.record_reaction(_reaction_record()) is None
+
+
+def test_reactions_and_wire_id_survive_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        bridge.record_reaction(_reaction_record())
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert len(messages) == 1
+        assert messages[0]["wire_id"] == "wire-1"
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge2.stop()
+
+
+def test_send_message_records_wire_id(node, tmp_path):
+    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "echo": text, "server": "tester", "id": "wire-9"}
+
+    node.send_message = send_with_id
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        message, _ = bridge.send_message("alice", "hi")
+        assert message["wire_id"] == "wire-9"
+    finally:
+        bridge.stop()
+
+
+def test_react_endpoint_reacts_to_a_history_message(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    sent = []
+
+    def send_reaction(peer, target, token, *, timeout=20.0, discover_timeout=None):
+        sent.append((peer, target, token))
+        # Mirror the node's local recording so the console annotates.
+        bridge.record_reaction(
+            {
+                "target": target,
+                "reaction": token,
+                "from": "tester",
+                "destination": "cd" * 16,
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        return {"ok": True, "reaction": token, "target": target, "id": "react-1"}
+
+    node.send_reaction = send_reaction
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["target"] == "wire-1"
+    assert payload["reaction"] == "👍"
+    assert payload["cleared"] is False
+    assert sent == [(PEER_HASH, "wire-1", "👍")]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["reactions"] == [
+        {"reactor": "cd" * 16, "name": "tester", "reaction": "👍"}
+    ]
+
+
+def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
+    status, _, payload = _json(
+        bridge, "/api/react", method="POST", body={"target": "nope", "reaction": "👍"}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "x" * 33},
+    )
+    assert status == 400
+    assert "longer than 32" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍", "clear": True},
+    )
+    assert status == 400
+
+
+def test_messages_reconciles_cli_made_reactions(node, tmp_path):
+    """A reaction written to the shared inbox by another process (the
+    CLI) shows up on the next read of the console history.
+
+    The write goes through a *second* Inbox object on the same path —
+    the way a separate ``tau react`` process writes — so the bridge's
+    own inbox must reload from disk to see it; reading its in-memory
+    cache would stay stale.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        cli_inbox = Inbox(inbox_path)
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        # The CLI process writes only the inbox; the bridge never sees
+        # a live callback for it.
+        cli_inbox.record_reaction(
+            {
+                "target": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        messages = bridge.messages()
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        # ...and a CLI retraction clears it on the next read too.
+        cli_inbox.record_reaction(
+            {
+                "target": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "",
+                "sent_at": 104.0,
+                "received_at": 105.0,
+                "id": "react-2",
+            }
+        )
+        assert bridge.messages()[0]["reactions"] == []
+    finally:
+        bridge.stop()

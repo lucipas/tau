@@ -194,22 +194,25 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
             server.wait(timeout=5)
 
 
-def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path):
+def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path, http_port: int = 0):
     env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}
     stdout_file = stdout_path.open("w", encoding="utf-8")
     stderr_file = stderr_path.open("w", encoding="utf-8")
+    args = [
+        sys.executable,
+        "-m",
+        "tau",
+        "serve",
+        "--data-dir",
+        str(data_dir),
+        "--announce-interval",
+        "1",
+        "--json",
+    ]
+    if http_port:
+        args += ["--http", f"127.0.0.1:{http_port}"]
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tau",
-            "serve",
-            "--data-dir",
-            str(data_dir),
-            "--announce-interval",
-            "1",
-            "--json",
-        ],
+        args,
         cwd=str(ROOT),
         env=env,
         stdout=stdout_file,
@@ -862,3 +865,187 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "ready" not in result.stdout
     finally:
         stop_process(alice)
+
+
+def _wait_for_inbox_reactions(
+    data_dir: Path, target: str, *, expect_empty: bool, timeout: float = 60.0
+):
+    """Poll inbox.json until the reaction state for *target* matches."""
+    deadline = time.time() + timeout
+    inbox_path = data_dir / "inbox.json"
+    while time.time() < deadline:
+        if inbox_path.exists():
+            stored = json.loads(inbox_path.read_text(encoding="utf-8"))
+            reactions = [
+                item
+                for item in stored.get("reactions", [])
+                if item.get("target") == target and item.get("reaction")
+            ]
+            if expect_empty and not reactions:
+                return []
+            if not expect_empty and reactions:
+                return reactions
+        time.sleep(1.0)
+    state = "empty" if expect_empty else "present"
+    raise AssertionError(f"reactions for {target} never became {state}")
+
+
+def _console_request(http_port: int, path: str, *, method="GET", body=None):
+    """One JSON call against a serving node's console API (no proxy)."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{http_port}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=30) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _wait_for_console_message(
+    http_port: int, wire_id: str, *, expect_reactions, timeout: float = 60.0
+):
+    """Poll a console's /api/messages until *wire_id* matches the state.
+
+    ``expect_reactions`` is the exact reactions list expected (``[]``
+    means present without reactions, ``None`` means any state).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, payload = _console_request(http_port, "/api/messages")
+        assert status == 200, payload
+        for entry in payload.get("messages", []):
+            if entry.get("wire_id") != wire_id:
+                continue
+            if expect_reactions is None:
+                return entry
+            if entry.get("reactions", []) == expect_reactions:
+                return entry
+        time.sleep(1.0)
+    raise AssertionError(
+        f"console message {wire_id} never reached reactions={expect_reactions}"
+    )
+
+
+def test_two_nodes_exchange_dm_reactions(tmp_path: Path) -> None:
+    # Both nodes serve with a console: one-shot commands cannot share a
+    # data directory with a serving node (Reticulum refuses the second
+    # bind of the TCP listen port), so the live reaction path is driven
+    # through the serving nodes' own HTTP APIs instead.
+    alice_port = free_port()
+    bob_port = free_port()
+    alice_http = free_port()
+    bob_http = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{alice_port}",
+                "--tcp-connect",
+                f"127.0.0.1:{bob_port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+    bob_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(bob_dir),
+                "--name",
+                "bob",
+                "--tcp-listen",
+                f"127.0.0.1:{bob_port}",
+                "--tcp-connect",
+                f"127.0.0.1:{alice_port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    bob_hash = bob_init["destination"]
+
+    alice_out = tmp_path / "alice.out"
+    alice_err = tmp_path / "alice.err"
+    bob_out = tmp_path / "bob.out"
+    bob_err = tmp_path / "bob.err"
+    alice_server = start_serve(alice_dir, alice_out, alice_err, alice_http)
+    bob_server = start_serve(bob_dir, bob_out, bob_err, bob_http)
+    try:
+        assert wait_for_text(alice_out, '"ready"', timeout=60), alice_err.read_text()
+        assert wait_for_text(bob_out, '"ready"', timeout=60), bob_err.read_text()
+        # Let the two serving nodes exchange announces before sending.
+        time.sleep(5.0)
+
+        status, sent = _console_request(
+            alice_http,
+            "/api/messages",
+            method="POST",
+            body={"to": bob_hash, "text": "hello bob, react to this"},
+        )
+        assert status == 200, sent
+        assert sent["ok"] is True
+        message_id = sent["message"]["wire_id"]
+        assert message_id
+
+        entry = _wait_for_console_message(bob_http, message_id, expect_reactions=[])
+        assert entry["text"] == "hello bob, react to this"
+
+        status, reacted = _console_request(
+            bob_http,
+            "/api/react",
+            method="POST",
+            body={"target": message_id, "reaction": "👍"},
+        )
+        assert status == 200, reacted
+        assert reacted["ok"] is True
+        assert reacted["reaction"] == "👍"
+        assert reacted["target"] == message_id
+
+        # The reactor sees their own reaction under the message...
+        entry = _wait_for_console_message(
+            bob_http,
+            message_id,
+            expect_reactions=[
+                {"reactor": bob_hash, "name": "bob", "reaction": "👍"}
+            ],
+        )
+        assert entry["text"] == "hello bob, react to this"
+        # ...and the author records it even though the sent message is
+        # not in her own inbox (sent messages are not stored there).
+        reactions = _wait_for_inbox_reactions(alice_dir, message_id, expect_empty=False)
+        assert len(reactions) == 1
+        assert reactions[0]["reaction"] == "👍"
+        assert reactions[0]["destination"] == bob_hash
+
+        status, cleared = _console_request(
+            bob_http,
+            "/api/react",
+            method="POST",
+            body={"target": message_id, "clear": True},
+        )
+        assert status == 200, cleared
+        assert cleared["ok"] is True
+        assert cleared["cleared"] is True
+        _wait_for_inbox_reactions(alice_dir, message_id, expect_empty=True)
+        _wait_for_console_message(bob_http, message_id, expect_reactions=[])
+    finally:
+        stop_process(alice_server)
+        stop_process(bob_server)
