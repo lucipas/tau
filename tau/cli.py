@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -63,6 +64,7 @@ from .tangents.tan import (
     following,
     import_entries,
     init_db,
+    open_db_readonly,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -2032,12 +2034,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     A missing Tan database reports zero posts instead of creating one.
     """
     config = _make_config(args)
-    identity = load_identity(config.identity_path)
+    identity = load_identity(config.identity_path, harden=False)
     if identity is None:
         raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
     mailbox = Mailbox(config.mailbox_path)
     counts = mailbox.counts()
-    due = sum(1 for entry in mailbox.outbox_list() if entry.is_due())
+    now = time.time()
+    due = sum(
+        1
+        for entry in mailbox.outbox_list()
+        if entry.expires_at > now and entry.is_due(now)
+    )
     registry = PeerRegistry(config.peers_path)
     inbox = Inbox(config.inbox_path)
     # Fail closed like the running node: an unreadable allow-list file
@@ -2046,16 +2053,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     tan_posts = 0
     tan_following = 0
     if config.social_db_path.exists():
-        conn = init_db(config.social_db_path)
+        # Read-only: never migrate or write a database a node may be serving.
         try:
-            tan_posts = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS n FROM posts WHERE kind = 'post'"
-                ).fetchone()["n"]
-            )
-            tan_following = len(following(conn))
-        finally:
-            conn.close()
+            conn = open_db_readonly(config.social_db_path)
+        except sqlite3.Error:
+            conn = None
+        if conn is not None:
+            try:
+                tan_posts = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM posts WHERE kind = 'post'"
+                    ).fetchone()["n"]
+                )
+                tan_following = len(following(conn))
+            except sqlite3.Error:
+                # Missing or incompatible tables report zero, not an error.
+                tan_posts = 0
+                tan_following = 0
+            finally:
+                conn.close()
     serving_pid = instance_lock_holder(config.instance_lock_path)
     payload = {
         "name": config.name,
