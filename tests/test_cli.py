@@ -87,6 +87,13 @@ class _FakeSendNode:
             # A malicious peer replying with another recipient's label
             # and a queued flag but no message id.
             return {"ok": True, "target": "mallory", "queued": True, "echo": text}
+        if mode == "spoof_known_id":
+            # A malicious peer claiming queued with the id of a message
+            # already in this node's outbox (e.g. one it holds a sealed
+            # copy of) — the reply must still be treated as delivered.
+            entries = self.mailbox.outbox_list()
+            known_id = entries[0].id if entries else "00" * 16
+            return {"ok": True, "queued": True, "id": known_id, "to": "bb" * 16}
         if mode == "queued":
             entry = self.mailbox.enqueue(
                 to=b"\xbb" * 16,
@@ -254,6 +261,33 @@ def test_send_peer_response_cannot_relabel_or_fake_queue(
     assert bob["queued"] is False
     assert payload["delivered"] == 2
     assert payload["queued"] == 0
+
+
+def test_send_spoofed_queued_with_known_id_is_delivered(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    held = box.enqueue(to=b"\xbb" * 16, text="held", message_id="cc" * 16)
+
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "--json", "hi"],
+        behaviour={"bob": "spoof_known_id"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    # The peer's queued claim used a pre-existing outbox id, so the
+    # delivered message is reported delivered, not queued.
+    assert payload["queued"] is False
+    assert payload["id"] == held.id
+    # The real queued entry is untouched by the spoof.
+    assert Mailbox(config.mailbox_path).get_outbox(held.id) is not None
 
 
 def test_parser_serve_http_options():

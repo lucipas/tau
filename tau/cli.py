@@ -2122,6 +2122,13 @@ def cmd_send(args: argparse.Namespace) -> int:
     results: List[Dict[str, Any]] = []
     try:
         for target in targets:
+            # Outbox ids present before this call: only this node's own
+            # queue path creates an entry for the message it just queued,
+            # so a "queued" reply is only genuine when its id is new
+            # since this snapshot. A peer claiming queued with a
+            # pre-existing id (e.g. one it holds a sealed copy of) is
+            # treated as delivered — the link request succeeded.
+            queued_before = {entry.id for entry in node.mailbox.outbox_list()}
             try:
                 response = node.send_message(
                     target,
@@ -2144,17 +2151,16 @@ def cmd_send(args: argparse.Namespace) -> int:
                 continue
             # The peer response is untrusted JSON: keep the local
             # recipient label authoritative, so a peer cannot relabel
-            # this result. A "queued" claim is only trusted with a
-            # string id (only this node's own queue path produces a
-            # queued reply, and it always carries an id); a peer
-            # claiming queued without one is treated as delivered, so
-            # the flush check below cannot KeyError. A direct delivery
-            # keeps no "queued" key at all, preserving the established
-            # single-recipient JSON shape.
+            # this result. A "queued" claim only counts with a new id
+            # (see above); a direct delivery keeps no "queued" key at
+            # all, preserving the established single-recipient JSON shape.
             result = dict(response)
             result["target"] = target
             if response.get("queued"):
-                result["queued"] = isinstance(response.get("id"), str)
+                result["queued"] = (
+                    isinstance(response.get("id"), str)
+                    and response["id"] not in queued_before
+                )
                 if result["queued"] and "to" not in response:
                     result["to"] = target
             results.append(result)
