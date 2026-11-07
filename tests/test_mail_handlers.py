@@ -781,3 +781,52 @@ def test_reaction_rejects_a_signature_from_another_identity(tmp_path):
     assert response["ok"] is False
     assert response["error"]["code"] == "invalid_reaction"
     assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_storage_failure_is_reported_and_retryable(tmp_path, monkeypatch):
+    """A reaction the receiver cannot store is an error, not an ack —
+    and because its id was never marked seen, the same reaction can be
+    retried with the same id."""
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    payload = signed_reaction(sender, "msg-1", "👍", "react-1")
+
+    monkeypatch.setattr(node.inbox, "_save", lambda: False)
+    response = call_handler(node._handle_reaction, payload, remote_identity=sender)
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert "could not store" in response["error"]["message"]
+    assert node.inbox.reactions_for("msg-1") == []
+    assert not node.mailbox.is_seen(
+        f"reaction:{destination_hash(sender).hex()}:react-1"
+    )
+
+    # The write heals; the same id retries cleanly.
+    monkeypatch.setattr(node.inbox, "_save", lambda: True)
+    retry = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    assert retry["ok"] is True
+    assert retry["duplicate"] is False
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+
+
+def test_record_reaction_strict_raises_on_storage_failure(tmp_path, monkeypatch):
+    """The sender's own best-effort record swallows a failed write,
+    but the strict (receive-handler) record raises so the handler can
+    report it."""
+    node = make_node(tmp_path)
+    monkeypatch.setattr(node.inbox, "_save", lambda: False)
+    record = {
+        "target": "msg-1",
+        "reaction": "👍",
+        "from": "alice",
+        "destination": "ab" * 16,
+        "sent_at": 1.0,
+        "received_at": 2.0,
+        "id": "react-1",
+    }
+    node._record_reaction(record)  # non-strict: logged, not raised
+    with pytest.raises(OSError):
+        node._record_reaction(record, strict=True)
+    # The failed merge was rolled back: nothing phantom is served.
+    assert node.inbox.reactions_for("msg-1") == []

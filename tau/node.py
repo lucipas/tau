@@ -798,19 +798,28 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
-    def _record_reaction(self, record: Dict[str, Any]) -> None:
-        """Persist a reaction and fan it out; never break delivery.
+    def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
+        """Persist a reaction and fan it out.
 
         A reaction whose target this node has never seen is still
         stored — the target may arrive later (a relayed copy can land
         after the reaction) — but it is only rendered under a message
         the inbox actually holds, so spraying unknown targets buys a
         peer nothing visible.
+
+        With ``strict=True`` (the receive handler) a storage failure
+        raises, so the handler can answer with an error instead of
+        acknowledging a reaction it did not store.  Otherwise a failed
+        local record is logged and delivery still succeeds — the
+        sender's own copy is best-effort; the peer already accepted
+        the reaction.
         """
         try:
             self.inbox.record_reaction(record)
-        except Exception:  # pragma: no cover - defensive
+        except Exception:  # pragma: no cover - storage failure
             log.warning("Could not record reaction", exc_info=True)
+            if strict:
+                raise
         if self.on_reaction is not None:
             try:
                 self.on_reaction(record)
@@ -955,8 +964,6 @@ class TauNode:
         seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
         duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
-            if seen_key:
-                self.mailbox.mark_seen(seen_key)
             record = {
                 "target": reaction["target"],
                 "reaction": reaction["reaction"],
@@ -966,6 +973,17 @@ class TauNode:
                 "received_at": received_at,
                 "id": reaction_id,
             }
+            try:
+                self._record_reaction(record, strict=True)
+            except OSError as exc:
+                # Do not acknowledge a reaction that was not stored, and
+                # do not mark its id seen — the sender can retry with the
+                # same id and it will be recorded then.
+                return response_error(
+                    "storage_failed", f"could not store reaction: {exc}"
+                )
+            if seen_key:
+                self.mailbox.mark_seen(seen_key)
             log.info(
                 "Reaction from %s (%s) on %s: %s",
                 caller_name,
@@ -973,7 +991,6 @@ class TauNode:
                 reaction["target"][:8],
                 reaction["reaction"] or "(retracted)",
             )
-            self._record_reaction(record)
 
         return response_ok(
             reaction=reaction["reaction"],

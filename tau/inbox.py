@@ -189,9 +189,17 @@ class Inbox:
                     stored.append(record)
             self._reactions = stored[-MAX_REACTIONS:]
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
+        """Persist the inbox; ``True`` when the write landed.
+
+        A path-less (in-memory) inbox has nothing to write and reports
+        success.  A failed write is logged and reported — callers that
+        must not acknowledge unstored state (reaction handling) raise
+        on ``False``; callers that must never break delivery (DM
+        appends) ignore the return value.
+        """
         if self.path is None:
-            return
+            return True
         try:
             atomic_write_json(
                 self.path,
@@ -200,6 +208,8 @@ class Inbox:
             )
         except OSError as exc:
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
+            return False
+        return True
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -248,16 +258,27 @@ class Inbox:
         and a late older reaction or retraction cannot override a newer
         one.  Returns the stored record when it became the reactor's
         current reaction, or ``None`` for a retraction, a stale update,
-        or a malformed record.
+        or a malformed record.  Raises :class:`OSError` when the merged
+        state cannot be persisted — a caller that acknowledges receipt
+        must know the reaction was not stored, instead of marking it
+        seen and losing it on a replay.
         """
         entry = _valid_reaction(record)
         if entry is None:
             return None
         with self._transaction():
+            previous = list(self._reactions)
             if not merge_reaction(self._reactions, entry):
                 return None
             self._reactions = self._reactions[-MAX_REACTIONS:]
-            self._save()
+            if not self._save():
+                # The merge lives in memory only; restore the pre-merge
+                # state so a later read does not show a reaction that
+                # was never stored.  Reloading from disk is not enough:
+                # a file that was never written (or has no reactions
+                # key) would leave the merged entry in place.
+                self._reactions = previous
+                raise OSError(f"could not persist inbox to {self.path}")
         return entry if entry["reaction"] else None
 
     def reactions_for(self, target: str) -> List[Dict[str, Any]]:
