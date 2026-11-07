@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 
 INBOX_FILE_NAME = "inbox.json"
 MAX_INBOX = 500
+INBOX_EXPORT_FORMAT = "tau-messages-export"
+INBOX_EXPORT_VERSION = 1
 
 
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
@@ -69,6 +71,53 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
     }
+
+
+def _record_error(raw: Any) -> Optional[str]:
+    """Why :func:`_valid_record` would reject ``raw``, or ``None``.
+
+    Import reports one reason per skipped entry instead of silently
+    dropping it, so this mirrors the validation above closely enough
+    to name the failing field.  A non-finite ``sent_at`` is normalized
+    to 0.0 by ``_valid_record`` and is not an error here either.
+    """
+    if not isinstance(raw, dict):
+        return "entry is not an object"
+    text = raw.get("text")
+    if not isinstance(text, str) or not text:
+        return "inbox record needs text"
+    try:
+        float(raw.get("sent_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid sent_at"
+    received_at = raw.get("received_at")
+    try:
+        received_at = float(received_at) if received_at is not None else time.time()
+    except (TypeError, ValueError, OverflowError):
+        return "invalid received_at"
+    if not math.isfinite(received_at):
+        return "invalid received_at"
+    return None
+
+
+def _dedupe_key(record: Dict[str, Any]) -> Any:
+    """Identity of a normalized record for import dedupe.
+
+    A record with a message id dedupes on that id; one without an id
+    (older stores predate ids) dedupes on sender, destination, text
+    and send time, so re-importing the same export is a no-op either
+    way.
+    """
+    message_id = record.get("id")
+    if message_id is not None and str(message_id):
+        return ("id", str(message_id))
+    return (
+        "content",
+        str(record.get("from") or ""),
+        str(record.get("destination") or ""),
+        str(record.get("text") or ""),
+        float(record.get("sent_at") or 0.0),
+    )
 
 
 class Inbox:
@@ -163,6 +212,84 @@ class Inbox:
         if limit is not None:
             entries = entries[: max(0, limit)]
         return [dict(item) for item in entries]
+
+    def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Return a portable backup of the stored messages.
+
+        Messages are in stored (oldest-first) order so an import replays
+        them in order; ``peer`` restricts the export to one sender
+        destination hash.  The document is the same shape
+        :meth:`import_messages` accepts.
+        """
+        with self._lock:
+            entries = [dict(item) for item in self._messages]
+        if peer is not None:
+            entries = [item for item in entries if item.get("destination") == peer]
+        return {
+            "format": INBOX_EXPORT_FORMAT,
+            "version": INBOX_EXPORT_VERSION,
+            "exported_at": time.time(),
+            "messages": entries,
+        }
+
+    def import_messages(self, document: Any) -> Dict[str, Any]:
+        """Merge every message in an export document into the inbox.
+
+        Returns ``{"imported": n, "present": n, "skipped": n, "errors":
+        [...]}``.  An entry that fails validation is skipped with its
+        error recorded; it never aborts the rest of the import, and
+        entries already in the inbox are counted as present rather than
+        stored twice.  The whole merge runs in one transaction, so a
+        concurrent ``tau serve`` cannot lose entries, and the 500-record
+        cap still applies.
+        """
+        if not isinstance(document, dict):
+            raise ValueError("export file must contain a JSON object")
+        if document.get("format") != INBOX_EXPORT_FORMAT:
+            raise ValueError(
+                f"unsupported export format: {document.get('format')!r}"
+            )
+        if document.get("version") != INBOX_EXPORT_VERSION:
+            raise ValueError(
+                f"unsupported export version: {document.get('version')!r}"
+            )
+        entries = document.get("messages")
+        if not isinstance(entries, list):
+            raise ValueError("export file has no messages list")
+
+        imported = present = skipped = 0
+        errors: List[Dict[str, Any]] = []
+        with self._transaction():
+            seen = {_dedupe_key(item) for item in self._messages}
+            for entry in entries:
+                record = _valid_record(entry)
+                if record is None:
+                    ref = None
+                    if isinstance(entry, dict) and entry.get("id") is not None:
+                        ref = str(entry.get("id"))
+                    skipped += 1
+                    errors.append(
+                        {
+                            "id": ref,
+                            "error": _record_error(entry) or "invalid inbox record",
+                        }
+                    )
+                    continue
+                key = _dedupe_key(record)
+                if key in seen:
+                    present += 1
+                    continue
+                seen.add(key)
+                self._messages.append(record)
+                imported += 1
+            self._messages = self._messages[-MAX_INBOX:]
+            self._save()
+        return {
+            "imported": imported,
+            "present": present,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
     def __len__(self) -> int:
         with self._lock:

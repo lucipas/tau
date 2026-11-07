@@ -152,3 +152,112 @@ def test_append_rejects_record_without_text(tmp_path):
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
     assert len(inbox) == 0
+
+
+def test_export_document_round_trips_through_import(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    source.append(_record(id="one", text="first"))
+    source.append(_record(id="two", text="second"))
+
+    document = source.export_document()
+    assert document["format"] == "tau-messages-export"
+    assert document["version"] == 1
+    assert [entry["id"] for entry in document["messages"]] == ["one", "two"]
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(document)
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    assert [entry["id"] for entry in target.list_messages()] == ["two", "one"]
+
+    # Re-importing the same export is a no-op, not a duplicate.
+    again = target.import_messages(document)
+    assert again["imported"] == 0
+    assert again["present"] == 2
+    assert len(target) == 2
+
+
+def test_export_document_filters_by_peer(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16))
+    inbox.append(_record(id="b1", destination="bb" * 16))
+
+    document = inbox.export_document(peer="aa" * 16)
+    assert [entry["id"] for entry in document["messages"]] == ["a1"]
+
+
+def test_import_dedupes_records_without_ids_by_content(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {"from": "alice", "destination": "ab" * 16, "text": "hi",
+             "sent_at": 5.0, "received_at": 6.0},
+        ],
+    }
+    first = inbox.import_messages(document)
+    assert first["imported"] == 1
+    second = inbox.import_messages(document)
+    assert second["imported"] == 0
+    assert second["present"] == 1
+    assert len(inbox) == 1
+
+
+def test_import_skips_invalid_entries_with_reasons(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="good"),
+            {"from": "bob", "text": ""},  # empty text
+            {"text": 42},  # non-string text
+            "not a record",
+            _record(id="bad-time", received_at="yesterday"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 1
+    assert result["present"] == 0
+    assert result["skipped"] == 4
+    assert [error["error"] for error in result["errors"]] == [
+        "inbox record needs text",
+        "inbox record needs text",
+        "entry is not an object",
+        "invalid received_at",
+    ]
+    assert len(inbox) == 1
+
+
+def test_import_rejects_bad_documents(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        inbox.import_messages(["not", "a", "dict"])
+    with pytest.raises(ValueError, match="unsupported export format"):
+        inbox.import_messages({"format": "other", "version": 1, "messages": []})
+    with pytest.raises(ValueError, match="unsupported export version"):
+        inbox.import_messages(
+            {"format": "tau-messages-export", "version": 99, "messages": []}
+        )
+    with pytest.raises(ValueError, match="no messages list"):
+        inbox.import_messages({"format": "tau-messages-export", "version": 1})
+    assert len(inbox) == 0
+
+
+def test_import_respects_the_cap(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 3)
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id=f"msg-{index}") for index in range(5)],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 5
+    assert [entry["id"] for entry in inbox.list_messages()] == [
+        "msg-4",
+        "msg-3",
+        "msg-2",
+    ]

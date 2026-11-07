@@ -252,6 +252,8 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
+| `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |

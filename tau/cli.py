@@ -502,6 +502,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages.set_defaults(func=cmd_messages)
 
+    messages_sub = messages.add_subparsers(metavar="COMMAND")
+    messages_export = messages_sub.add_parser(
+        "export",
+        parents=[common],
+        help="back up stored direct messages as a JSON export",
+    )
+    messages_export.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="export one sender's messages (name, hash or hash prefix)",
+    )
+    messages_export.add_argument(
+        "--output",
+        type=Path,
+        metavar="FILE",
+        help="write the export to a file instead of stdout",
+    )
+    messages_export.set_defaults(func=cmd_messages_export)
+
+    messages_import = messages_sub.add_parser(
+        "import",
+        parents=[common],
+        help="restore direct messages from a JSON export",
+    )
+    messages_import.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='export file to read ("-" reads stdin)',
+    )
+    messages_import.set_defaults(func=cmd_messages_import)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -2301,6 +2334,52 @@ def cmd_messages(args: argparse.Namespace) -> int:
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
+
+
+def cmd_messages_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    peer_hash = None
+    scope = "all senders"
+    if getattr(args, "peer", None):
+        registry = PeerRegistry(config.peers_path)
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+        scope = f"sender {short_hash(peer_hash)}"
+    document = inbox.export_document(peer=peer_hash)
+    count = len(document["messages"])
+    text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+    if getattr(args, "output", None):
+        atomic_write_text(args.output, text + "\n")
+        print(f"Exported {count} messages ({scope}) to {args.output}")
+    else:
+        print(text)
+    return _EXIT_OK
+
+
+def cmd_messages_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if str(args.file) == "-":
+        raw = sys.stdin.read()
+    else:
+        raw = args.file.read_text(encoding="utf-8")
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise NodeError(f"export file is not valid JSON: {exc}") from exc
+    inbox = Inbox(config.inbox_path)
+    result = inbox.import_messages(document)
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        print(
+            f"Imported {result['imported']} messages "
+            f"({result['present']} already present, "
+            f"{result['skipped']} skipped)"
+        )
+        for error in result["errors"]:
+            ref = error["id"] if error["id"] else "?"
+            print(f"  skipped {ref}: {error['error']}")
+    return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 
