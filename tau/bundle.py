@@ -30,15 +30,16 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import RNS
 
 from .identity import destination_hash, load_public_key, public_key_hex
 from .mailbox import Mailbox, MailboxError, MailboxFull, seal_message
 from .peers import PeerRegistry
-from .tangents.tan import TanError, export_entries, import_entries
+from .tangents.tan import TanError, export_entries, import_entries, verify_post
 
 BUNDLE_FORMAT = "tau-bundle"
 BUNDLE_VERSION = 1
@@ -46,6 +47,11 @@ BUNDLE_VERSION = 1
 #: ``--max-bytes``).  Sealed blobs are 12 KiB each and Tan posts 8 KiB,
 #: so 8 MiB still holds hundreds of envelopes and posts.
 DEFAULT_MAX_BUNDLE_BYTES = 8 * 1024 * 1024
+#: Most recent Tan posts an export includes, so a long history cannot
+#: crowd the bundle past its size cap.
+MAX_TAN_BUNDLE_POSTS = 256
+#: Mail IDs travel on the wire with a 1-64 character limit.
+MAX_MAIL_ID_CHARS = 64
 
 
 class BundleError(ValueError):
@@ -148,7 +154,9 @@ def build_bundle(
     tan_document: Optional[Dict[str, Any]] = None
     tan_count = 0
     if include_tan:
-        tan_document = export_entries(tan_conn, all_authors=True)
+        tan_document = export_entries(
+            tan_conn, all_authors=True, limit=MAX_TAN_BUNDLE_POSTS
+        )
         tan_count = len(tan_document["entries"])
 
     manifest = {
@@ -250,12 +258,43 @@ def parse_bundle(raw: bytes, *, max_bytes: int = DEFAULT_MAX_BUNDLE_BYTES) -> Di
     return document
 
 
+def _admit_tan_entries(
+    tan_document: Any, admit: Callable[[str], bool]
+) -> Tuple[Any, List[Dict[str, str]]]:
+    """Drop Tan entries whose verified author *admit* refuses.
+
+    Entries that fail verification are kept, so ``import_entries``
+    reports them with its usual error.  Returns the filtered document
+    and one error record per refused entry.
+    """
+    entries = tan_document.get("entries") if isinstance(tan_document, dict) else None
+    if not isinstance(entries, list):
+        return tan_document, []  # import_entries reports the malformed document
+    kept: List[Any] = []
+    denied: List[Dict[str, str]] = []
+    for entry in entries:
+        try:
+            author = verify_post(entry)["author"]
+        except (TanError, ValueError, TypeError, AttributeError, KeyError, OverflowError):
+            kept.append(entry)
+            continue
+        if admit(author):
+            kept.append(entry)
+        else:
+            digest = str(entry.get("hash") or "") if isinstance(entry, dict) else ""
+            denied.append(
+                {"hash": digest, "error": "entry denied by this node's Tan ruleset"}
+            )
+    return {**tan_document, "entries": kept}, denied
+
+
 def apply_bundle(
     *,
     mailbox: Mailbox,
     tan_conn: Any,
     document: Dict[str, Any],
     now: Optional[float] = None,
+    admit: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
     """Merge a verified bundle into this node's mailbox and Tan store.
 
@@ -263,8 +302,10 @@ def apply_bundle(
     normal caps and dedupe rules apply; an envelope already held counts
     as present, a full mailbox or a malformed envelope is skipped with
     its error recorded.  Tan posts go through ``import_entries`` and
-    are verified entry by entry.  Returns a report of what was
-    accepted, already present and skipped.
+    are verified entry by entry.  When *admit* is given it is called
+    with each verified Tan post's author, and posts it refuses are
+    skipped, as the network path would refuse them.  Returns a report
+    of what was accepted, already present and skipped.
     """
     timestamp = now if now is not None else time.time()
     imported = present = skipped = 0
@@ -278,6 +319,10 @@ def apply_bundle(
                 raise BundleError("mail entry is not an object")
             if not isinstance(message_id, str) or not message_id:
                 raise BundleError("mail entry has no id")
+            if len(message_id) > MAX_MAIL_ID_CHARS:
+                raise BundleError(
+                    f"mail entry id is over {MAX_MAIL_ID_CHARS} characters"
+                )
             to_hex = entry.get("to")
             if not isinstance(to_hex, str):
                 raise BundleError("mail entry has no destination")
@@ -288,19 +333,34 @@ def apply_bundle(
             if not isinstance(blob_text, str):
                 raise BundleError("mail entry has no blob")
             blob = base64.b64decode(blob_text, validate=True)
+            if not blob:
+                raise BundleError("mail entry blob is empty")
             expires_at = entry.get("expires_at")
             if not isinstance(expires_at, (int, float)):
                 raise BundleError("mail entry has no expiry")
-            if float(expires_at) <= timestamp:
+            try:
+                expiry = float(expires_at)
+            except OverflowError as exc:
+                raise BundleError("mail entry expiry is out of range") from exc
+            if not math.isfinite(expiry):
+                raise BundleError("mail entry expiry is not finite")
+            if expiry <= timestamp:
                 raise BundleError("mail entry is expired")
             newly_held = mailbox.hold(
                 to=to,
                 blob=blob,
                 message_id=message_id,
-                expires_at=float(expires_at),
+                expires_at=expiry,
                 now=timestamp,
             )
-        except (BundleError, MailboxError, MailboxFull, ValueError, TypeError) as exc:
+        except (
+            BundleError,
+            MailboxError,
+            MailboxFull,
+            ValueError,
+            TypeError,
+            OverflowError,
+        ) as exc:
             skipped += 1
             errors.append({"id": ref, "error": str(exc)})
             continue
@@ -317,7 +377,13 @@ def apply_bundle(
             errors.append({"id": "", "error": "bundle has Tan posts but no Tan store is open"})
         else:
             try:
+                denied: List[Dict[str, str]] = []
+                if admit is not None:
+                    tan_document, denied = _admit_tan_entries(tan_document, admit)
                 tan_result = import_entries(tan_conn, tan_document)
+                if denied:
+                    tan_result["skipped"] += len(denied)
+                    tan_result["errors"] = denied + tan_result["errors"]
             except TanError as exc:
                 skipped += 1
                 errors.append({"id": "", "error": f"Tan section unusable: {exc}"})

@@ -58,6 +58,7 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
+    _author_from_identity,
     annotate_reactions,
     annotate_replies,
     apply_display_rules,
@@ -1768,30 +1769,65 @@ def cmd_bundle_export(args: argparse.Namespace) -> int:
             f"{tan_text} ({summary['bytes']} bytes) to {args.file}"
         )
         for skipped in summary["skipped"]:
-            print(f"  skipped {short_hash(skipped['id'])}: {skipped['reason']}")
+            print(f"  skipped {_safe_id_prefix(skipped['id'])}: {skipped['reason']}")
     return _EXIT_OK
+
+
+def _bundle_tan_admit(
+    config: TauConfig, identity: Any, tan_conn: Any
+) -> Any:
+    """Admission check for Tan posts carried in a bundle.
+
+    Uses the same ruleset the network path applies.  A ruleset that
+    cannot be parsed fails closed, denying remote posts, as ``TanApp``
+    does.
+    """
+    try:
+        ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError as exc:
+        print(
+            f"tau: warning: Tan ruleset unusable ({exc}); denying remote Tan posts",
+            file=sys.stderr,
+        )
+        ruleset = Ruleset(default_allow=False)
+    own_author = _author_from_identity(identity) if identity is not None else None
+    followed: List[str] = []
+    if ruleset.allow_followed:
+        followed = [record["author"] for record in following(tan_conn)]
+    return lambda author: ruleset.decide(
+        author, own_author=own_author, followed=followed
+    )
 
 
 def cmd_bundle_import(args: argparse.Namespace) -> int:
     config = _make_config(args)
+    max_bytes = int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES))
+    if max_bytes <= 0:
+        raise NodeError("max bundle size must be positive")
+    # Read at most one byte past the cap, so an oversized input is
+    # detected without being loaded whole.
     if str(args.file) == "-":
-        raw = sys.stdin.buffer.read()
+        raw = sys.stdin.buffer.read(max_bytes + 1)
     else:
         try:
-            raw = Path(args.file).expanduser().read_bytes()
+            with Path(args.file).expanduser().open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
         except OSError as exc:
             raise NodeError(f"could not read {args.file}: {exc}") from exc
-    document = parse_bundle(
-        raw,
-        max_bytes=int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES)),
-    )
+    if len(raw) > max_bytes:
+        raise NodeError(f"bundle is over the {max_bytes} byte cap")
+    document = parse_bundle(raw, max_bytes=max_bytes)
     mailbox = Mailbox(config.mailbox_path)
     tan_conn = None
     try:
         if document.get("tan") is not None:
             tan_conn = init_db(config.social_db_path)
+        admit = None
+        if tan_conn is not None:
+            identity = load_identity(config.identity_path)
+            admit = _bundle_tan_admit(config, identity, tan_conn)
         result = apply_bundle(
-            mailbox=mailbox, tan_conn=tan_conn, document=document
+            mailbox=mailbox, tan_conn=tan_conn, document=document, admit=admit
         )
     finally:
         if tan_conn is not None:
@@ -1813,7 +1849,7 @@ def cmd_bundle_import(args: argparse.Namespace) -> int:
             f"{result['skipped']} skipped){tan_text}"
         )
         for error in result["errors"]:
-            ref = short_hash(error["id"]) if error["id"] else "?"
+            ref = _safe_id_prefix(error["id"]) if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     tan_clean = result["tan"] is None or result["tan"]["skipped"] == 0
     return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
