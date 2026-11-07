@@ -1079,6 +1079,9 @@ def annotate_replies(
     return posts
 
 
+_SQL_BATCH = 500
+
+
 def edit_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, Any]]:
@@ -1101,32 +1104,65 @@ def edit_states(
     states: Dict[str, Dict[str, Any]] = {}
     if not clean:
         return states
-    placeholders = ", ".join("?" for _ in clean)
-    rows = conn.execute(
-        f"SELECT hash, author FROM posts WHERE hash IN ({placeholders}) "
-        "AND kind IN ('post', 'reply') AND linked = 1",
-        clean,
-    ).fetchall()
-    authors = {str(row["hash"]): str(row["author"]) for row in rows}
+    authors: Dict[str, str] = {}
+    for start in range(0, len(clean), _SQL_BATCH):
+        batch = clean[start : start + _SQL_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT hash, author FROM posts WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
+            batch,
+        ).fetchall()
+        authors.update({str(row["hash"]): str(row["author"]) for row in rows})
     if not authors:
         return states
-    placeholders = ", ".join("?" for _ in authors)
-    rows = conn.execute(
-        "SELECT target, author, text, created_at, hash FROM posts "
-        f"WHERE kind = 'edit' AND linked = 1 AND target IN ({placeholders}) "
-        "ORDER BY target, author, seq ASC",
-        list(authors),
-    ).fetchall()
-    for row in rows:
-        target = str(row["target"])
-        if str(row["author"]) != authors.get(target):
-            continue
-        states[target] = {
-            "text": str(row["text"]),
-            "edited_at": float(row["created_at"]),
-            "edit": str(row["hash"]),
-        }
+    # Only edits on the post author's retained chain (from their head back
+    # through ``prev``) may count; sibling forks with the same seq are ignored.
+    chains: Dict[str, Set[str]] = {}
+    for author in set(authors.values()):
+        chains[author] = _chain_hashes(conn, author)
+    targets = list(authors)
+    for start in range(0, len(targets), _SQL_BATCH):
+        batch = targets[start : start + _SQL_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT target, author, text, created_at, hash FROM posts "
+            f"WHERE kind = 'edit' AND linked = 1 AND target IN ({placeholders}) "
+            "ORDER BY target, author, seq ASC",
+            batch,
+        ).fetchall()
+        for row in rows:
+            target = str(row["target"])
+            author = str(row["author"])
+            if author != authors.get(target):
+                continue
+            if str(row["hash"]) not in chains.get(author, set()):
+                continue
+            states[target] = {
+                "text": str(row["text"]),
+                "edited_at": float(row["created_at"]),
+                "edit": str(row["hash"]),
+            }
     return states
+
+
+def _chain_hashes(conn: sqlite3.Connection, author: str) -> Set[str]:
+    """Hashes of linked entries on *author*'s chain, from the retained head back."""
+    head_row = conn.execute(
+        "SELECT hash FROM heads WHERE author = ?", (author,)
+    ).fetchone()
+    if head_row is None:
+        return set()
+    rows = conn.execute(
+        "WITH RECURSIVE chain(hash, prev) AS ("
+        "SELECT hash, prev FROM posts WHERE hash = ? AND author = ? AND linked = 1 "
+        "UNION ALL "
+        "SELECT p.hash, p.prev FROM posts p JOIN chain c ON p.hash = c.prev "
+        "WHERE p.author = ? AND p.linked = 1"
+        ") SELECT hash FROM chain",
+        (str(head_row["hash"]), author, author),
+    ).fetchall()
+    return {str(row["hash"]) for row in rows}
 
 
 def annotate_edits(
