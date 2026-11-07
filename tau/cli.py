@@ -510,7 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_export.add_argument(
         "--peer",
-        default=None,
+        default=argparse.SUPPRESS,
         metavar="NAME|HASH",
         help="export one sender's messages (name, hash or hash prefix)",
     )

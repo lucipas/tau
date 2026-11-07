@@ -24,6 +24,7 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+from .protocol import MAX_MESSAGE_CHARS
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -51,12 +52,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
     received_at = raw.get("received_at")
     try:
         received_at = float(received_at) if received_at is not None else time.time()
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
     if not math.isfinite(sent_at):
         sent_at = 0.0
@@ -150,12 +151,14 @@ class Inbox:
                 loaded.append(record)
         self._messages = loaded[-MAX_INBOX:]
 
-    def _save(self) -> None:
+    def _save(self, *, strict: bool = False) -> None:
         if self.path is None:
             return
         try:
             atomic_write_json(self.path, {"messages": self._messages}, mode=0o600)
         except OSError as exc:
+            if strict:
+                raise
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
 
     @contextmanager
@@ -259,22 +262,25 @@ class Inbox:
 
         imported = present = skipped = 0
         errors: List[Dict[str, Any]] = []
+        message_ids: List[str] = []
         with self._transaction():
             seen = {_dedupe_key(item) for item in self._messages}
             for entry in entries:
                 record = _valid_record(entry)
+                reason = None
                 if record is None:
+                    reason = _record_error(entry) or "invalid inbox record"
+                elif len(record["text"]) > MAX_MESSAGE_CHARS:
+                    reason = f"message is longer than {MAX_MESSAGE_CHARS} characters"
+                if record is None or reason is not None:
                     ref = None
                     if isinstance(entry, dict) and entry.get("id") is not None:
                         ref = str(entry.get("id"))
                     skipped += 1
-                    errors.append(
-                        {
-                            "id": ref,
-                            "error": _record_error(entry) or "invalid inbox record",
-                        }
-                    )
+                    errors.append({"id": ref, "error": reason})
                     continue
+                if record["id"] is not None and str(record["id"]):
+                    message_ids.append(str(record["id"]))
                 key = _dedupe_key(record)
                 if key in seen:
                     present += 1
@@ -282,13 +288,17 @@ class Inbox:
                 seen.add(key)
                 self._messages.append(record)
                 imported += 1
+            # Keep receipt-time order so restored history never jumps to
+            # the top and the cap evicts the oldest messages, not newer ones.
+            self._messages.sort(key=lambda item: item["received_at"])
             self._messages = self._messages[-MAX_INBOX:]
-            self._save()
+            self._save(strict=True)
         return {
             "imported": imported,
             "present": present,
             "skipped": skipped,
             "errors": errors,
+            "message_ids": message_ids,
         }
 
     def __len__(self) -> int:
