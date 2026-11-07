@@ -307,11 +307,6 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message.
         message["wire_id"] = wire_id
-    # The hash is always derived from the validated text, never trusted
-    # from the file: a hand-edited messages.json that changes the text
-    # but keeps the old hash must not make a changed quote look
-    # verified. Records written before hashes existed get one here.
-    message["excerpt_hash"] = excerpt_hash(text)
     try:
         in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
     except ValueError:
@@ -325,6 +320,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         json.dumps(message, ensure_ascii=False).encode("utf-8")
     except (UnicodeEncodeError, ValueError):
         return None
+    # The hash is derived from the validated text, never trusted from
+    # the file: a hand-edited messages.json that changes the text but
+    # keeps the old hash must not make a changed quote look verified.
+    # Records written before hashes existed get one here. It is computed
+    # after the UTF-8 check above, because hashing a lone surrogate
+    # would raise instead of dropping the entry.
+    message["excerpt_hash"] = excerpt_hash(text)
     return message
 
 

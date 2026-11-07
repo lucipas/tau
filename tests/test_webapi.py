@@ -1286,6 +1286,27 @@ def test_outbound_text_with_lone_surrogate_stays_persistable(node, tmp_path):
         bridge2.stop()
 
 
+def test_lone_surrogate_entry_is_dropped_on_load(node, tmp_path):
+    """A stored lone surrogate must not break startup.
+
+    Regression test for the CodeRabbit finding on PR #95: hashing the
+    text before the UTF-8 check raised UnicodeEncodeError out of
+    _clean_stored_message instead of dropping the entry.
+    """
+    good = _stored_message(1, "good entry")
+    bad = _stored_message(2, "bad \ud800 text")
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [good, bad], "next_message_id": 3}),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages()] == ["good entry"]
+    finally:
+        bridge.stop()
+
+
 def test_huge_timestamp_entry_is_dropped_on_load(node, tmp_path):
     """A parseable but overflowing integer timestamp must not break startup.
 
