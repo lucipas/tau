@@ -522,6 +522,36 @@ def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
     assert calls[0]["deadline"] is not None
 
 
+def test_open_link_checks_deadline_after_path_discovery(tmp_path, monkeypatch):
+    # Path discovery must not hand the full timeout to link
+    # establishment as well: once the deadline has passed, opening the
+    # link fails at once instead of waiting again.
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+
+    def slow_path(dest_hash, timeout):
+        time.sleep(0.25)
+
+    monkeypatch.setattr(node, "_wait_for_path", slow_path)
+    deadline = time.monotonic() + 0.1
+    with pytest.raises(NodeError):
+        node._open_link(peer, 5.0, deadline=deadline)
+
+
+def test_request_on_link_refuses_after_deadline(tmp_path):
+    # A request must not be sent when the link stages already consumed
+    # the deadline.
+    node = make_node(tmp_path)
+
+    class _DeadLink:
+        def request(self, *args, **kwargs):
+            raise AssertionError("must not send after the deadline")
+
+    deadline = time.monotonic() - 1.0
+    with pytest.raises(NodeError):
+        node._request_on_link(_DeadLink(), "/tau/ping", b"{}", 5.0, deadline=deadline)
+
+
 def test_wait_for_delivery_keeps_retries_at_poll_interval(tmp_path, monkeypatch):
     # Retries stay at poll_interval: growing the pause would let the
     # last attempt land long before the deadline, so a peer that

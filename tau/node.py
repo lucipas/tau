@@ -1808,8 +1808,17 @@ class TauNode:
         with self._links_lock:
             self._active_links.discard(link)
 
-    def _open_link(self, peer: Peer, timeout: float) -> RNS.Link:
-        self._wait_for_path(peer.destination_hash, timeout)
+    def _open_link(
+        self, peer: Peer, timeout: float, *, deadline: Optional[float] = None
+    ) -> RNS.Link:
+        # Each stage gets only the time left before the deadline, not
+        # the full timeout again: path discovery first, then link
+        # establishment, and the request itself after that.
+        self._wait_for_path(peer.destination_hash, _budget(timeout, deadline))
+        if _past(deadline):
+            raise NodeError(
+                f"deadline passed before a link to {peer.hexhash} was ready"
+            )
         destination = self._destination_for(peer)
 
         established = threading.Event()
@@ -1837,7 +1846,7 @@ class TauNode:
         with self._links_lock:
             self._active_links.add(link)
 
-        if not established.wait(timeout):
+        if not established.wait(_budget(timeout, deadline)):
             try:
                 link.teardown()
             except Exception:  # pragma: no cover - defensive
@@ -1857,7 +1866,7 @@ class TauNode:
         deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         timeout = _budget(timeout, deadline)
-        link = self._open_link(peer, timeout)
+        link = self._open_link(peer, timeout, deadline=deadline)
         try:
             return self._request_on_link(
                 link, path, payload, timeout, deadline=deadline
@@ -1890,6 +1899,11 @@ class TauNode:
             state["status"] = receipt.get_status()
             concluded.set()
 
+        # Do not send a request the deadline no longer leaves time to
+        # answer: re-check here, after the link stages consumed time.
+        if _past(deadline):
+            raise NodeError(f"deadline passed before sending {path}")
+        timeout = _budget(timeout, deadline)
         receipt = link.request(
             path,
             payload,
