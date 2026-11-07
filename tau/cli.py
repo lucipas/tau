@@ -485,13 +485,24 @@ def build_parser() -> argparse.ArgumentParser:
     messages = subparsers.add_parser(
         "messages",
         parents=[common],
-        help="list received direct messages kept in the node inbox",
+        help="list direct messages kept in the node inbox",
     )
     messages.add_argument(
         "--peer",
         default=None,
         metavar="NAME|HASH",
-        help="only show messages from this peer (name, hash or hash prefix)",
+        help="only show messages with this peer (name, hash or hash prefix)",
+    )
+    direction_group = messages.add_mutually_exclusive_group()
+    direction_group.add_argument(
+        "--sent",
+        action="store_true",
+        help="only show messages this node sent",
+    )
+    direction_group.add_argument(
+        "--received",
+        action="store_true",
+        help="only show messages this node received",
     )
     messages.add_argument(
         "--limit",
@@ -2285,19 +2296,29 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    if getattr(args, "sent", False):
+        direction = "out"
+    elif getattr(args, "received", False):
+        direction = "in"
+    else:
+        direction = None
+    entries = inbox.list_messages(limit=limit, peer=peer_hash, direction=direction)
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
         return _EXIT_OK
     if not entries:
-        print("No messages received yet.")
+        print("No messages yet.")
         return _EXIT_OK
     for entry in entries:
         peer = registry.get(entry.get("destination") or "")
-        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+        if entry.get("direction") == "out":
+            name = peer.display_name if peer is not None else sender
+            print(f"[{when}] You → {name} ({sender})")
+        else:
+            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+            print(f"[{when}] {name} ({sender})")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

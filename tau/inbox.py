@@ -68,6 +68,9 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
+        # Records written before sent messages were kept default to
+        # received; only an explicit "out" marks a sent message.
+        "direction": "out" if raw.get("direction") == "out" else "in",
     }
 
 
@@ -137,7 +140,7 @@ class Inbox:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Record one received message, dropping the oldest past the cap."""
+        """Record one message, dropping the oldest past the cap."""
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
@@ -148,17 +151,27 @@ class Inbox:
         return entry
 
     def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        peer: Optional[str] = None,
+        direction: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Received messages, newest first.
+        """Messages, newest first.
 
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        ``peer`` filters to one sender/recipient destination hash;
+        ``direction`` filters to ``"in"`` (received) or ``"out"``
+        (sent); ``limit`` caps how many are returned (``None`` means
+        all of them).
         """
+        if direction is not None and direction not in ("in", "out"):
+            raise ValueError('direction must be "in" or "out"')
         with self._lock:
             entries = list(self._messages)
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if direction is not None:
+            entries = [item for item in entries if item.get("direction") == direction]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

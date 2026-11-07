@@ -152,3 +152,40 @@ def test_append_rejects_record_without_text(tmp_path):
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
     assert len(inbox) == 0
+
+
+def test_records_default_to_received_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="legacy"))
+
+    entry = inbox.list_messages()[0]
+    assert entry["direction"] == "in"
+
+
+def test_list_filters_by_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in", received_at=1.0))
+    inbox.append(_record(id="out-1", direction="out", received_at=2.0))
+    inbox.append(_record(id="in-2", direction="in", received_at=3.0))
+
+    assert [e["id"] for e in inbox.list_messages(direction="out")] == ["out-1"]
+    assert [e["id"] for e in inbox.list_messages(direction="in")] == [
+        "in-2",
+        "in-1",
+    ]
+    assert [e["id"] for e in inbox.list_messages()] == ["in-2", "out-1", "in-1"]
+
+
+def test_list_rejects_unknown_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ValueError):
+        inbox.list_messages(direction="sideways")
+
+
+def test_sent_record_persists_direction(tmp_path):
+    path = tmp_path / "inbox.json"
+    Inbox(path).append(_record(id="sent-1", direction="out"))
+
+    reloaded = Inbox(path)
+    assert [e["id"] for e in reloaded.list_messages(direction="out")] == ["sent-1"]
+    assert reloaded.list_messages(direction="in") == []

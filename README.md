@@ -251,7 +251,7 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
-| `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages` | List direct messages kept in the node inbox (`--sent` / `--received` to filter by direction) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -311,6 +311,10 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# Sent messages are kept in the same inbox, marked `You → <peer>`
+tau messages --sent
+tau messages --received
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
@@ -471,8 +475,10 @@ buggy peer cannot force unbounded buffering:
 Names and messages are stripped of control characters (including terminal
 escape sequences) before display. Received messages are recorded in the
 node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
-direct and relayed alike — and can be read back with `tau messages`;
-a message waiting in the outbox is stored in `mailbox.json` (mode
+direct and relayed alike — and messages this node sends are recorded
+there too (marked `direction: "out"`, one record per send, whether
+delivered directly or queued); both can be read back with `tau messages`.
+A message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
 
 ### Tan posts

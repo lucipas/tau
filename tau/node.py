@@ -789,6 +789,31 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_sent(
+        self, destination_hash: bytes, text: str, message_id: str
+    ) -> None:
+        """Persist a sent DM to the inbox; never break sending.
+
+        One record per send, written when the message leaves the node
+        (delivered directly or queued to the outbox) — not one per
+        delivery retry.  ``received_at`` is when the node recorded it.
+        """
+        now = time.time()
+        try:
+            self.inbox.append(
+                {
+                    "from": self.name,
+                    "destination": destination_hash.hex(),
+                    "text": text,
+                    "sent_at": now,
+                    "received_at": now,
+                    "id": message_id,
+                    "direction": "out",
+                }
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not record sent message", exc_info=True)
+
     def _handle_message(
         self,
         path: str,
@@ -1480,7 +1505,9 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self._record_sent(peer.destination_hash, normalized, message_id)
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
@@ -1501,6 +1528,7 @@ class TauNode:
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
             )
+            self._record_sent(dest_hash, normalized, message_id)
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",
                 dest_hash.hex(),
