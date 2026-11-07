@@ -23,7 +23,12 @@ import RNS
 
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
-from .config import TauConfig, tcp_listen_endpoints, write_rns_config
+from .config import (
+    TauConfig,
+    send_read_receipts_enabled,
+    tcp_listen_endpoints,
+    write_rns_config,
+)
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -35,8 +40,9 @@ from .mailbox import (
     Mailbox,
     MailboxError,
     MailboxFull,
-    open_message,
+    open_sealed_envelope,
     seal_message,
+    seal_receipt,
 )
 from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .protocol import (
@@ -54,10 +60,12 @@ from .protocol import (
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
+    REQUEST_READ,
     ProtocolError,
     build_announce,
     build_mail_fetch,
     build_mail_store,
+    build_read_receipt,
     decode,
     encode_message,
     generate_message_id,
@@ -66,6 +74,7 @@ from .protocol import (
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
+    parse_read_receipt,
     response_error,
     response_ok,
 )
@@ -323,6 +332,7 @@ class TauNode:
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
+        on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -334,6 +344,7 @@ class TauNode:
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
+        self.on_read = on_read
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -370,6 +381,17 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    @property
+    def read_receipts_enabled(self) -> bool:
+        """Whether this node sends read receipts when it reads a DM.
+
+        Read live from ``node.json`` each time, so `tau config
+        read-receipts off` takes effect without a restart.  A node
+        that never sends receipts simply never does; senders treat
+        the absence of a receipt as unknown, not unread-forever.
+        """
+        return send_read_receipts_enabled(self.config.data_dir)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -475,6 +497,7 @@ class TauNode:
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
+            REQUEST_READ: self._handle_read,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -691,9 +714,12 @@ class TauNode:
         """Destination hashes the node still owes mail or acks to.
 
         Peers holding mail we have fetched stay too: their pending
-        acknowledgements go out with the next fetch.
+        acknowledgements go out with the next fetch.  Peers owed a
+        read receipt are kept as well, so pruning cannot strand a
+        receipt for a long-unseen sender.
         """
         owed = {entry.to for entry in self.mailbox.outbox_list()}
+        owed |= {entry.to for entry in self.mailbox.receipt_outbox_list()}
         for holder in self.mailbox.pending_ack_holders():
             try:
                 raw = bytes.fromhex(holder)
@@ -857,6 +883,62 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
         )
+
+    def _record_receipt(
+        self, *, reader_hash: str, message_ids: List[str], read_at: float
+    ) -> List[str]:
+        """Apply a verified receipt: mark the ids read, notify listeners.
+
+        Returns the ids actually recorded.  An id this node never sent,
+        or sent to someone other than the reader, is rejected by
+        ``Mailbox.record_read`` — a forged receipt changes nothing.
+        Receipts are never receipted themselves.
+        """
+        recorded = []
+        for message_id in message_ids:
+            if self.mailbox.record_read(
+                message_id, read_at, reader_hash=reader_hash
+            ):
+                recorded.append(message_id)
+        if recorded and self.on_read is not None:
+            try:
+                self.on_read(
+                    {
+                        "reader": reader_hash,
+                        "ids": recorded,
+                        "read_at": read_at,
+                    }
+                )
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_read callback failed", exc_info=True)
+        return recorded
+
+    def _handle_read(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Accept a signed read receipt for messages this node sent."""
+        try:
+            receipt = parse_read_receipt(data, remote_identity=remote_identity)
+        except ProtocolError as exc:
+            return response_error("invalid_receipt", str(exc))
+        reader_hash = receipt["from"]
+        recorded = self._record_receipt(
+            reader_hash=reader_hash,
+            message_ids=receipt["ids"],
+            read_at=receipt["read_at"],
+        )
+        log.info(
+            "Read receipt from %s: %d of %d message(s) recorded",
+            reader_hash[:8],
+            len(recorded),
+            len(receipt["ids"]),
+        )
+        return response_ok(recorded=recorded, count=len(recorded))
 
     def _handle_mail_store(
         self,
@@ -1045,6 +1127,7 @@ class TauNode:
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": False,
         }
         if not self.started:
@@ -1089,7 +1172,13 @@ class TauNode:
                 )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
+                summary["receipts"] += moved.get("receipts", 0)
                 summary["received"] += self._collect_mail(peer, timeout)
+            # Receipts for messages a reader displayed but could not
+            # receipt itself (a one-shot `tau messages` shares this
+            # data directory with the serving node and cannot start a
+            # second Reticulum instance on its listen port).
+            summary["receipts"] += self._flush_read_receipts()
         finally:
             self._mail_lock.release()
         return summary
@@ -1102,7 +1191,7 @@ class TauNode:
         respect_backoff: bool = True,
         message_id: Optional[str] = None,
     ) -> Dict[str, int]:
-        moved = {"delivered": 0, "deposited": 0}
+        moved = {"delivered": 0, "deposited": 0, "receipts": 0}
         if respect_backoff:
             due = self.mailbox.due_outbox(to=peer.destination_hash)
         else:
@@ -1115,6 +1204,7 @@ class TauNode:
             for entry in due:
                 if self._deliver_entry(peer, entry, timeout):
                     moved["delivered"] += 1
+            moved["receipts"] = self._flush_receipts(peer, timeout)
             return moved
 
         for entry in due:
@@ -1138,6 +1228,7 @@ class TauNode:
                 continue
             if self._deposit_entry(peer, entry, timeout):
                 moved["deposited"] += 1
+        moved["receipts"] = self._flush_receipts(peer, timeout)
         return moved
 
     def _still_queued(self, message_id: str) -> bool:
@@ -1224,6 +1315,172 @@ class TauNode:
         )
         return True
 
+    def _flush_read_receipts(self) -> int:
+        """Send receipts for inbox messages stamped read but unreceipted.
+
+        A one-shot reader stamps ``read_at`` when it displays a DM;
+        this sweep — run by the serving node's mail loop and by any
+        one-shot flush — is what actually delivers those receipts.
+        Returns how many receipts were sent or queued.
+        """
+        if not self.read_receipts_enabled:
+            return 0
+        if self.identity is None:
+            return 0
+        # The stamp may have been written by a one-shot `tau messages`
+        # in another process; reload before deciding what is owed.
+        try:
+            self.inbox.reload()
+        except Exception:
+            log.debug("Could not reload inbox", exc_info=True)
+            return 0
+        try:
+            pending = self.inbox.read_unreceipted()
+        except Exception:
+            log.debug("Could not list read messages", exc_info=True)
+            return 0
+        if not pending:
+            return 0
+        by_peer: Dict[str, List[str]] = {}
+        read_times: Dict[str, float] = {}
+        for entry in pending:
+            peer_hash = str(entry.get("destination") or "")
+            message_id = str(entry.get("id") or "")
+            if not peer_hash or not message_id:
+                continue
+            ids = by_peer.setdefault(peer_hash, [])
+            if message_id not in ids:
+                ids.append(message_id)
+            read_times[message_id] = float(entry.get("read_at") or time.time())
+        dispatched = 0
+        for peer_hash, ids in by_peer.items():
+            read_at = max(read_times[mid] for mid in ids)
+            try:
+                result = self.send_read_receipts(
+                    peer_hash, ids, read_at=read_at, timeout=_MAIL_REQUEST_TIMEOUT
+                )
+            except Exception:
+                log.debug(
+                    "Could not send read receipt to %s", peer_hash, exc_info=True
+                )
+                continue
+            if result.get("ok"):
+                dispatched += 1
+                try:
+                    self.inbox.mark_receipt_sent(ids)
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not stamp read receipts", exc_info=True)
+        return dispatched
+
+    def _flush_receipts(self, peer: Peer, timeout: float) -> int:
+        """Move queued read receipts for *peer*: direct, then deposits.
+
+        Direct delivery uses the signed ``/tau/read`` request, which
+        needs no mail capability — a pre-mail peer can still be told
+        its messages were read.  Deposits (sealed copies left with a
+        holder) need the mail capability, like message deposits, and
+        are skipped for a recipient that advertises caps without
+        ``read``: an old node would only drop the sealed receipt.
+        """
+        moved = 0
+        if peer.caps and "read" not in peer.caps:
+            return 0
+        for entry in self.mailbox.due_receipts(to=peer.destination_hash):
+            if self._deliver_receipt_entry(peer, entry, timeout):
+                moved += 1
+        if peer.caps and "mail" not in peer.caps:
+            return moved
+        now = time.time()
+        for entry in self.mailbox.receipt_outbox_list():
+            if entry.to == peer.destination_hash:
+                continue
+            recipient = self.registry.get(entry.to)
+            if recipient is not None and recipient.caps and "read" not in recipient.caps:
+                continue
+            holders = entry.held_by
+            if (
+                len(holders) >= MAX_HOLDERS_PER_MESSAGE
+                and peer.hexhash not in holders
+            ):
+                continue
+            last_deposit = holders.get(peer.hexhash)
+            if last_deposit is not None and now - last_deposit < _DEPOSIT_RETRY_AFTER:
+                continue
+            if self._deposit_receipt_entry(peer, entry, timeout):
+                moved += 1
+        return moved
+
+    def _deliver_receipt_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        """Send one queued receipt direct over the link to its sender."""
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        if self.identity is None:
+            return False
+        try:
+            payload = build_read_receipt(
+                self.identity,
+                message_ids=list(entry.message_ids),
+                read_at=entry.read_at,
+            )
+        except ProtocolError as exc:
+            log.debug("Could not sign queued receipt %s: %s", entry.id, exc)
+            return False
+        try:
+            self._request(peer, REQUEST_READ, payload, timeout)
+        except NodeError as exc:
+            self.mailbox.record_receipt_attempt(entry.id, error=str(exc))
+            return False
+        self.mailbox.remove_receipt_outbox(entry.id)
+        log.info("Delivered read receipt %s to %s", entry.id, peer.hexhash)
+        return True
+
+    def _deposit_receipt_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        """Leave a sealed copy of a receipt with *peer* for its sender."""
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        if self.identity is None:
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None:
+            # Without the sender's public key the receipt cannot be
+            # sealed for anyone else to hold; direct delivery only.
+            return False
+        try:
+            blob = seal_receipt(
+                self.identity,
+                sender_name=self.name,
+                recipient_public_key=recipient.public_key,
+                receipt_id=entry.id,
+                message_ids=list(entry.message_ids),
+                read_at=entry.read_at,
+            )
+            payload = build_mail_store(
+                to=entry.to_hex,
+                message_id=entry.id,
+                blob=blob,
+                expires_at=entry.expires_at,
+            )
+        except (MailboxError, ProtocolError) as exc:
+            log.debug("Could not seal queued receipt %s: %s", entry.id, exc)
+            return False
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        try:
+            self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
+        except NodeError:
+            return False
+        self.mailbox.record_receipt_deposit(entry.id, peer.hexhash)
+        log.info(
+            "Left a sealed copy of receipt %s with %s for %s",
+            entry.id,
+            peer.hexhash,
+            entry.to_hex,
+        )
+        return True
+
     def _collect_mail(self, peer: Peer, timeout: float) -> int:
         # Without a consumer, fetched mail would be marked seen and acked
         # while never shown to anyone, so leave it held for a live node.
@@ -1257,10 +1514,21 @@ class TauNode:
             new_acks.append(message_id)
             try:
                 blob = base64.b64decode(blob_text, validate=True)
-                message = open_message(self.identity, blob)
+                kind, payload = open_sealed_envelope(self.identity, blob)
             except (ValueError, MailboxError) as exc:
                 log.warning("Dropping unreadable held mail %s: %s", message_id, exc)
                 continue
+            if kind == "sealed_receipt":
+                # A receipt is not a message: record the reads and move
+                # on.  The envelope is already acked above, and a
+                # receipt is never receipted itself.
+                self._record_receipt(
+                    reader_hash=payload["from"],
+                    message_ids=payload["ids"],
+                    read_at=payload["read_at"],
+                )
+                continue
+            message = payload
             if self._deliver_collected(message):
                 received += 1
         if new_acks:
@@ -1276,12 +1544,13 @@ class TauNode:
         received = 0
         for envelope in self.mailbox.held_for(self.destination.hash):
             try:
-                message = open_message(self.identity, envelope.blob)
+                kind, payload = open_sealed_envelope(self.identity, envelope.blob)
             except MailboxError as exc:
                 log.warning(
                     "Dropping unreadable held mail %s: %s", envelope.id, exc
                 )
-                message = None
+                payload = None
+                kind = None
             still_held = self.mailbox.drop_held(
                 envelope.id, to=self.destination.hash
             )
@@ -1289,7 +1558,16 @@ class TauNode:
                 # Dropped by the owner (tau outbox drop-held) after this
                 # sweep listed it: do not surface a copy we no longer hold.
                 continue
-            if message is not None and self._deliver_collected(message):
+            if kind == "sealed_receipt" and payload is not None:
+                self._record_receipt(
+                    reader_hash=payload["from"],
+                    message_ids=payload["ids"],
+                    read_at=payload["read_at"],
+                )
+                continue
+            if kind != "sealed_message" or payload is None:
+                continue
+            if self._deliver_collected(payload):
                 received += 1
         return received
 
@@ -1452,6 +1730,67 @@ class TauNode:
             f"{timeout:.1f}s; check the interface and announce interval"
         )
 
+    def send_read_receipts(
+        self,
+        target: Union[str, bytes, Peer],
+        message_ids: List[str],
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        read_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Tell *target* that its messages were read.
+
+        One signed receipt covers all *message_ids*.  When the sender
+        is reachable the receipt goes direct over the link; otherwise
+        it is queued in the receipts outbox and rides store-and-forward
+        like a message.  A node that opted out never sends receipts
+        (returns ``{"ok": False, "disabled": True}``).  Receipts are
+        never receipted themselves.
+        """
+        if not self.started:
+            raise NodeError("node has not been started")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        if not self.read_receipts_enabled:
+            return {"ok": False, "disabled": True, "ids": list(message_ids)}
+        ids = []
+        for message_id in message_ids:
+            if isinstance(message_id, str) and message_id and message_id not in ids:
+                ids.append(message_id)
+        if not ids:
+            return {"ok": True, "ids": [], "recorded": []}
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        stamp = read_at if isinstance(read_at, (int, float)) else time.time()
+        if peer.caps and "read" not in peer.caps:
+            # An old peer cannot consume a receipt; queue it anyway so
+            # an upgrade inside the TTL still learns the messages were
+            # read, instead of failing a request it cannot answer.
+            entry = self.mailbox.queue_receipt(
+                to=peer.destination_hash, message_ids=ids, read_at=stamp
+            )
+            return {"ok": True, "queued": True, "receipt_id": entry.id, "ids": ids}
+        try:
+            payload = build_read_receipt(
+                self.identity, message_ids=ids, read_at=stamp
+            )
+            response = self._request(peer, REQUEST_READ, payload, timeout)
+        except (NodeError, ProtocolError):
+            entry = self.mailbox.queue_receipt(
+                to=peer.destination_hash, message_ids=ids, read_at=stamp
+            )
+            return {"ok": True, "queued": True, "receipt_id": entry.id, "ids": ids}
+        return {
+            "ok": True,
+            "ids": ids,
+            "recorded": response.get("recorded", []),
+        }
+
     def send_message(
         self,
         target: Union[str, bytes, Peer],
@@ -1480,7 +1819,19 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            # Remember the send (and its recipient) so a later read
+            # receipt can be verified against it — and so the sender's
+            # history can show the read state.  The wire id is also
+            # returned, so the console can link its record to receipts.
+            self.mailbox.record_sent(
+                message_id,
+                to=peer.destination_hash,
+                text=normalized,
+            )
+            response = dict(response)
+            response.setdefault("id", message_id)
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
@@ -1500,6 +1851,12 @@ class TauNode:
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
+            )
+            self.mailbox.record_sent(
+                entry.id,
+                to=dest_hash,
+                text=normalized,
+                sent_at=entry.created_at,
             )
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",

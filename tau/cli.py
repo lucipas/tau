@@ -22,7 +22,13 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .config import TauConfig, write_node_metadata, write_rns_config
+from .config import (
+    TauConfig,
+    send_read_receipts_enabled,
+    set_node_setting,
+    write_node_metadata,
+    write_rns_config,
+)
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -482,6 +488,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     allowlist_off.set_defaults(func=cmd_allowlist)
 
+    config_cmd = subparsers.add_parser(
+        "config",
+        parents=[common],
+        help="show or change this node's own settings",
+    )
+    config_sub = config_cmd.add_subparsers(
+        dest="config_command", metavar="CONFIG_COMMAND"
+    )
+    config_receipts = config_sub.add_parser(
+        "read-receipts",
+        parents=[common],
+        help="turn sending read receipts on or off (default on)",
+    )
+    config_receipts.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="whether this node sends read receipts when it reads a DM",
+    )
+    config_receipts.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
     messages = subparsers.add_parser(
         "messages",
         parents=[common],
@@ -499,6 +526,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         metavar="N",
         help="show the newest N messages (default 30)",
+    )
+    messages.add_argument(
+        "--sent",
+        action="store_true",
+        help="show messages this node sent, with their read state, instead",
     )
     messages.set_defaults(func=cmd_messages)
 
@@ -2168,6 +2200,9 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         payload = entry.to_dict()
         payload["to_name"] = peer.display_name if peer is not None else entry.to_name
         payload["held_by"] = sorted(entry.held_by)
+        # Still queued, so never read — but the field keeps the shape
+        # identical to the sent history, where read_at is meaningful.
+        payload["read_at"] = mailbox.read_at(entry.id)
         return payload
 
     if _json_mode(args):
@@ -2176,6 +2211,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                 "outbox": [describe(entry) for entry in entries],
                 "count": len(entries),
                 "held_for_others": counts["held"],
+                "receipts_queued": counts["receipts"],
             },
             True,
         )
@@ -2213,6 +2249,11 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print(
                 f"Also holding {counts['held']} sealed message(s) for other peers"
                 " — see `tau outbox held`."
+            )
+        if counts["receipts"]:
+            print(
+                f"Also waiting to send {counts['receipts']} read receipt(s)"
+                " to offline senders."
             )
     return _EXIT_OK
 
@@ -2275,29 +2316,200 @@ def _resolve_inbox_peer(
     raise NodeError(f"unknown peer: {target!r}")
 
 
+def _send_displayed_receipts(
+    config: TauConfig, inbox: Inbox, entries: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    """Receipt the displayed messages, directly or via the serving node.
+
+    Listing a DM is reading it, so displayed messages are stamped
+    ``read_at`` in the inbox first — that stamp is the durable
+    handoff: when a serving node already holds this data directory's
+    TCP listen port, a second Reticulum instance cannot start here
+    (Reticulum exits the process on the bind failure), so the serving
+    node's mail sweep delivers those receipts instead.  When no node
+    is serving, this command sends them directly over a one-shot node.
+    Only messages never receipted before are covered, so listing the
+    same inbox twice does not re-send.  Best-effort: a receipt failure
+    never breaks the listing.  Returns how many peers got a live
+    receipt and how many had one queued for store-and-forward.
+    """
+    unreceipted = [
+        entry
+        for entry in entries
+        if isinstance(entry.get("id"), str)
+        and entry.get("id")
+        and entry.get("receipt_sent_at") is None
+    ]
+    if not unreceipted:
+        return {"sent": 0, "queued": 0}
+    if not send_read_receipts_enabled(config.data_dir):
+        return {"sent": 0, "queued": 0}
+    try:
+        inbox.mark_read([str(entry["id"]) for entry in unreceipted])
+    except Exception:  # pragma: no cover - defensive
+        pass
+    if not config.identity_path.exists():
+        # No identity yet: starting a node here would create one as a
+        # side effect of merely listing messages.  The read stamp above
+        # is the handoff for when a node next serves this directory.
+        return {"sent": 0, "queued": 0}
+    try:
+        check_tcp_listen_ports(config)
+    except NodeError:
+        # A serving node already holds the listen port; its mail sweep
+        # delivers the receipts from the read stamps above.
+        return {"sent": 0, "queued": 0}
+    by_peer: Dict[str, List[str]] = {}
+    for entry in unreceipted:
+        peer_hash = str(entry.get("destination") or "")
+        if peer_hash:
+            by_peer.setdefault(peer_hash, []).append(str(entry["id"]))
+    if not by_peer:
+        return {"sent": 0, "queued": 0}
+    node = TauNode(config, name=config.name)
+    try:
+        node.start()
+    except Exception:
+        return {"sent": 0, "queued": 0}
+    sent = queued = 0
+    stamped: List[str] = []
+    try:
+        for peer_hash, ids in by_peer.items():
+            try:
+                result = node.send_read_receipts(peer_hash, ids)
+            except Exception:
+                continue
+            if result.get("queued"):
+                queued += 1
+            elif result.get("ok"):
+                sent += 1
+            else:
+                continue
+            stamped.extend(ids)
+    finally:
+        node.stop()
+    if stamped:
+        try:
+            inbox.mark_receipt_sent(stamped)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return {"sent": sent, "queued": queued}
+
+
+def _resolve_sent_peer(registry: PeerRegistry, target: str) -> str:
+    """Resolve ``--peer`` to a recipient hash for the sent view.
+
+    A full destination hash filters directly even when the peer has
+    been pruned from the registry; names and prefixes resolve through
+    it.
+    """
+    target = target.strip()
+    if _is_hex32(target):
+        return target.lower()
+    try:
+        peer = registry.resolve(target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"unknown peer: {target!r}")
+    return peer.hexhash
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    peer_hash = None
-    if getattr(args, "peer", None):
-        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
+    if getattr(args, "sent", False):
+        return _cmd_messages_sent(args, config, registry, limit)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     entries = inbox.list_messages(limit=limit, peer=peer_hash)
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
-        return _EXIT_OK
-    if not entries:
+    elif not entries:
         print("No messages received yet.")
         return _EXIT_OK
-    for entry in entries:
-        peer = registry.get(entry.get("destination") or "")
-        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
-        sender = short_hash(str(entry.get("destination") or ""))
-        when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+    else:
+        for entry in entries:
+            peer = registry.get(entry.get("destination") or "")
+            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+            sender = short_hash(str(entry.get("destination") or ""))
+            when = _format_message_time(float(entry.get("received_at", 0)))
+            print(f"[{when}] {name} ({sender})")
+            for line in str(entry.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
+    # Listing a DM is reading it: send the sender a receipt, unless
+    # this node opted out.  Best-effort — failures stay silent.
+    outcome = _send_displayed_receipts(config, inbox, entries)
+    if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
+        parts = []
+        if outcome["sent"]:
+            parts.append(f"{outcome['sent']} peer(s) told their message was read")
+        if outcome["queued"]:
+            parts.append(
+                f"{outcome['queued']} peer(s) unreachable — receipt queued"
+            )
+        print(f"  ({'; '.join(parts)})")
+    return _EXIT_OK
+
+
+def _cmd_messages_sent(
+    args: argparse.Namespace,
+    config: TauConfig,
+    registry: PeerRegistry,
+    limit: Optional[int],
+) -> int:
+    """List messages this node sent, with their read state."""
+    mailbox = Mailbox(config.mailbox_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_sent_peer(registry, args.peer)
+    entries = mailbox.sent_list()
+    if peer_hash is not None:
+        entries = [entry for entry in entries if entry.get("to") == peer_hash]
+    entries.reverse()  # newest first
+    if limit is not None:
+        entries = entries[: max(0, limit)]
+    queued_ids = {entry.id for entry in mailbox.outbox_list()}
+
+    def describe(entry: Dict[str, Any]) -> Dict[str, Any]:
+        peer = registry.get(entry.get("to") or "")
+        read_at = entry.get("read_at")
+        if entry["id"] in queued_ids:
+            state = "queued"
+        elif read_at is not None:
+            state = "read"
+        else:
+            state = "delivered"
+        return {
+            "id": entry["id"],
+            "to": entry.get("to"),
+            "to_name": peer.display_name if peer is not None else "",
+            "text": entry.get("text", ""),
+            "sent_at": entry.get("sent_at"),
+            "read_at": read_at,
+            "state": state,
+        }
+
+    described = [describe(entry) for entry in entries]
+    if _json_mode(args):
+        _emit({"messages": described, "count": len(described)}, True)
+        return _EXIT_OK
+    if not described:
+        print("No messages sent yet.")
+        return _EXIT_OK
+    for entry in described:
+        name = entry["to_name"] or short_hash(entry["to"] or "")
+        when = _format_message_time(float(entry.get("sent_at") or 0))
+        if entry["state"] == "read":
+            state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+        else:
+            state = entry["state"]
+        print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
@@ -2622,6 +2834,36 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         return clean_destination(value)
     except AllowListError:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show or change this node's own settings (stored in node.json)."""
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    command = getattr(args, "config_command", None)
+
+    if command == "read-receipts":
+        enabled = getattr(args, "state", "on") == "on"
+        set_node_setting(config.data_dir, "send_read_receipts", enabled)
+        state = "on" if enabled else "off"
+        if json_output:
+            _emit({"send_read_receipts": enabled}, True)
+        else:
+            print(f"Read receipts: {state}")
+            if not enabled:
+                print("  this node will not send read receipts; senders see")
+                print("  its messages as delivered, never read")
+        return _EXIT_OK
+
+    settings = {"send_read_receipts": send_read_receipts_enabled(config.data_dir)}
+    if json_output:
+        _emit(settings, True)
+    else:
+        state = "on" if settings["send_read_receipts"] else "off"
+        print(f"Settings ({config.data_dir / 'node.json'}):")
+        print(f"  send read receipts: {state}")
+        print("  change with: tau config read-receipts on|off")
+    return _EXIT_OK
 
 
 def cmd_allowlist(args: argparse.Namespace) -> int:
