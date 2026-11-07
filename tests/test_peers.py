@@ -582,3 +582,49 @@ def test_from_dict_tolerates_bad_verification_fields(tmp_path):
     assert not peer.is_verified
     assert peer.verified_fingerprint is None
     assert peer.key_change_at is None
+
+def test_mark_verified_clears_key_change_warning(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.upsert(
+        peer.destination_hash, b"\x02" * PUBLIC_KEY_BYTES, now=200.0
+    )
+    assert peer.key_change_at == 200.0
+
+    registry.mark_verified(peer.destination_hash, "00001", now=300.0)
+    assert peer.is_verified
+    # Re-verifying answers the warning: it must not warn forever after.
+    assert peer.key_change_at is None
+
+
+def test_clear_verifications_drops_all_markers(tmp_path):
+    registry = PeerRegistry()
+    first = make_peer(registry, 1, "alice", now=100.0)
+    second = make_peer(registry, 2, "bob", now=100.0)
+    registry.mark_verified(first.destination_hash, "00001", now=150.0)
+    registry.mark_verified(second.destination_hash, "00002", now=150.0)
+
+    assert registry.clear_verifications() == 2
+    assert not first.is_verified
+    assert first.verified_fingerprint is None
+    assert not second.is_verified
+    assert registry.clear_verifications() == 0
+
+
+def test_forget_removes_peer_and_rejects_unknown(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    make_peer(registry, 2, "bob", now=100.0)
+
+    removed = registry.forget("alice")
+    assert removed is peer
+    assert len(registry) == 1
+    assert registry.get("alice") is None
+
+    with pytest.raises(PeerError):
+        registry.forget("alice")
+
+    make_peer(registry, 3, "duplicate", now=100.0)
+    make_peer(registry, 4, "duplicate", now=100.0)
+    with pytest.raises(PeerError):
+        registry.forget("duplicate")

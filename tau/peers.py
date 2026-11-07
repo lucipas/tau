@@ -401,6 +401,43 @@ class PeerRegistry:
         with self._lock:
             peer.verified_fingerprint = fingerprint
             peer.verified_at = timestamp
+            # The owner just checked this key out of band: any earlier
+            # key-change warning about it is answered, not left to warn
+            # on every subsequent view.
+            peer.key_change_at = None
+            return peer
+
+    def clear_verifications(self) -> int:
+        """Drop every peer's verification state, returning how many cleared.
+
+        Pairwise safety numbers are computed with the local key, so a
+        comparison made under a previous local identity says nothing
+        about the current one — importing a different identity must
+        invalidate them all rather than leave stale checkmarks behind.
+        """
+        with self._lock:
+            cleared = 0
+            for peer in self._peers.values():
+                if peer.is_verified:
+                    peer.verified_at = None
+                    peer.verified_fingerprint = None
+                    cleared += 1
+            return cleared
+
+    def forget(self, target: Union[bytes, str]) -> Peer:
+        """Remove a peer from the registry, returning the removed record.
+
+        The explicit owner-controlled recovery path for a record that
+        cannot repair itself — for example a stored key corrupted on
+        disk, which ``upsert`` rightly refuses to overwrite: forget the
+        peer and the next genuine announce re-adds a clean record.
+        Raises :class:`PeerError` for an unknown or ambiguous target.
+        """
+        peer = self.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        with self._lock:
+            del self._peers[peer.destination_hash]
             return peer
 
     def all(

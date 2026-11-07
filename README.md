@@ -252,6 +252,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
+| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record) |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
@@ -321,6 +322,10 @@ tau peers --max-age 1
 # and the console, and are never pruned away
 tau peers --safety-number
 tau peers verify alice
+
+# Importing a different identity clears every verification: the numbers
+# were compared under the old identity, so they mean nothing under the
+# new one — re-verify each peer
 
 # Everything as JSON
 tau discover --duration 10 --json

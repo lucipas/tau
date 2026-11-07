@@ -550,6 +550,116 @@ def test_peers_safety_number_without_identity_returns_error(tmp_path, capsys):
     assert "run `tau init` first" in capsys.readouterr().err
 
 
+def test_peers_forget_removes_peer(tmp_path, capsys):
+    data_dir, config, _peer_identity = _init_and_seed_peer(
+        tmp_path, capsys=capsys
+    )
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Forgot alice" in capsys.readouterr().out
+    assert PeerRegistry(config.peers_path).get("alice") is None
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_id_import_different_identity_clears_verifications(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    # Seed and verify a peer on node A, then import a different identity.
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verifications_cleared"] == 1
+    assert not PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
+def test_id_import_same_identity_keeps_verifications(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+
+    backup = tmp_path / "alice.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_a), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # Re-importing the same identity is not an identity change.
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verifications_cleared"] == 0
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
 def test_parser_messages_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--peer", "alice", "--limit", "5"])

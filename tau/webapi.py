@@ -496,7 +496,11 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        # local_dict: the console replaces its snapshot record with this
+        # event, so it must carry the same trust fields — a public_dict
+        # event would silently drop the verified badge and any key-change
+        # warning until the next snapshot load.
+        self.bus.publish({"type": "peer", "peer": peer.local_dict()})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")

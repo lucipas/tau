@@ -349,6 +349,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="peer to mark verified",
     )
     peers_verify.set_defaults(func=cmd_peers_verify)
+    peers_forget = peers_sub.add_parser(
+        "forget",
+        parents=[common],
+        help="remove a peer from the local registry (the next genuine "
+        "announce re-adds it; use this to drop a corrupt record)",
+    )
+    peers_forget.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to remove",
+    )
+    peers_forget.set_defaults(func=cmd_peers_forget)
 
     identity = subparsers.add_parser(
         "id",
@@ -2034,6 +2046,26 @@ def cmd_peers_verify(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_peers_forget(args: argparse.Namespace) -> int:
+    """Remove a peer from the local registry."""
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.forget(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    registry.save()
+    if _json_mode(args):
+        _emit(
+            {"peer": peer.hexhash, "name": peer.display_name, "forgotten": True},
+            True,
+        )
+    else:
+        print(f"Forgot {peer.display_name} ({short_hash(peer.hexhash)}).")
+        print("  The next genuine announce from this peer re-adds it.")
+    return _EXIT_OK
+
+
 def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
     """Exchange peer lists with known peers and report what was learned."""
     node = TauNode(config, name=config.name)
@@ -2199,13 +2231,33 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     f"an identity already exists at {config.identity_path}; "
                     "pass --force to replace it"
                 )
+            # Pairwise safety numbers are computed with the local key, so
+            # verifications made under the old identity mean nothing
+            # under the new one.  An unreadable old identity is treated
+            # the same way: its comparisons cannot be trusted either.
+            try:
+                old_identity = load_identity(config.identity_path)
+                old_key = (
+                    old_identity.get_public_key()
+                    if old_identity is not None
+                    else None
+                )
+            except Exception:
+                old_key = None
             save_identity(identity, config.identity_path)
+            verifications_cleared = 0
+            if old_key != identity.get_public_key():
+                registry = PeerRegistry(config.peers_path)
+                verifications_cleared = registry.clear_verifications()
+                if verifications_cleared:
+                    registry.save()
     finally:
         lock.release()
     payload = {
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
         "data_dir": str(config.data_dir),
+        "verifications_cleared": verifications_cleared,
     }
     if _json_mode(args):
         _emit(payload, True)
@@ -2213,6 +2265,11 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
+        if verifications_cleared:
+            print(
+                f"verifications cleared: {verifications_cleared} "
+                "(local identity changed; re-verify peers)"
+            )
     return _EXIT_OK
 
 
