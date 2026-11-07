@@ -148,17 +148,26 @@ class Inbox:
         return entry
 
     def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        peer: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        ``peer`` filters to one sender destination hash; ``query`` keeps
+        only messages whose text contains it (case-insensitive
+        substring); ``limit`` caps how many are returned (``None``
+        means all of them).
         """
         with self._lock:
             entries = list(self._messages)
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if query is not None:
+            needle = query.casefold()
+            entries = [item for item in entries if needle in item["text"].casefold()]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

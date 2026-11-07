@@ -311,6 +311,7 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+tau messages --search hello
 
 # Only show peers heard from in the last day
 tau peers --max-age 1

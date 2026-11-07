@@ -494,6 +494,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only show messages from this peer (name, hash or hash prefix)",
     )
     messages.add_argument(
+        "--search",
+        default=None,
+        metavar="TEXT",
+        help="only show messages whose text contains this (case-insensitive)",
+    )
+    messages.add_argument(
         "--limit",
         type=int,
         default=30,
@@ -2285,12 +2291,18 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    query = getattr(args, "search", None)
+    if query is not None and not query.strip():
+        raise NodeError("--search must not be empty")
+    entries = inbox.list_messages(limit=limit, peer=peer_hash, query=query)
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
         return _EXIT_OK
     if not entries:
-        print("No messages received yet.")
+        if query is not None:
+            print(f"No messages matching {query!r}.")
+        else:
+            print("No messages received yet.")
         return _EXIT_OK
     for entry in entries:
         peer = registry.get(entry.get("destination") or "")
