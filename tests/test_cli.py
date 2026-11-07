@@ -83,6 +83,10 @@ class _FakeSendNode:
             from tau.mailbox import MailboxFull
 
             raise MailboxFull("outbox is full")
+        if mode == "spoof":
+            # A malicious peer replying with another recipient's label
+            # and a queued flag but no message id.
+            return {"ok": True, "target": "mallory", "queued": True, "echo": text}
         if mode == "queued":
             entry = self.mailbox.enqueue(
                 to=b"\xbb" * 16,
@@ -231,6 +235,24 @@ def test_send_json_single_queued_keeps_bare_shape(tmp_path, capsys, monkeypatch)
     payload = json.loads(capsys.readouterr().out)
     assert payload["queued"] is True
     assert "id" in payload
+
+
+def test_send_peer_response_cannot_relabel_or_fake_queue(
+    tmp_path, capsys, monkeypatch
+):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "--json", "hi"],
+        behaviour={"alice": "delivered", "bob": "spoof"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    bob = payload["results"][1]
+    assert bob["target"] == "bob"
+    assert bob["queued"] is False
+    assert payload["delivered"] == 2
+    assert payload["queued"] == 0
 
 
 def test_parser_serve_http_options():

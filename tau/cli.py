@@ -2136,10 +2136,26 @@ def cmd_send(args: argparse.Namespace) -> int:
                     # the error reaches main() and exits non-zero.
                     raise
                 # One recipient failing must not stop the rest; the
-                # failure is reported per recipient below.
+                # failure is reported per recipient below. This also
+                # covers a full outbox: enqueue raises MailboxFull
+                # inside send_message, and that must not abort the
+                # remaining recipients.
                 results.append({"target": target, "ok": False, "error": str(exc)})
                 continue
-            results.append({"target": target, **response})
+            # The peer response is untrusted JSON: keep the local
+            # recipient label and queue state authoritative, so a peer
+            # cannot relabel this result, and a "queued" reply without
+            # an id cannot KeyError the flush check below (only this
+            # node's own queue path produces a queued reply, and it
+            # always carries an id).
+            result = dict(response)
+            result["target"] = target
+            result["queued"] = bool(response.get("queued")) and isinstance(
+                response.get("id"), str
+            )
+            if result["queued"] and "to" not in response:
+                result["to"] = target
+            results.append(result)
         if any(result.get("queued") for result in results):
             # One-shot send: give reachable peers a brief chance to take a
             # sealed copy (or the message itself) before this process exits.
