@@ -655,28 +655,33 @@ class Mailbox:
                 (e for e in self._held.values() if e.depositor == depositor_hex),
                 key=lambda e: e.stored_at,
             )
+            # A blob that cannot fit even in an empty sender bucket is
+            # refused before anything is shed.
+            if 1 > quota_count or len(blob) > quota_bytes:
+                raise MailboxFull("mailbox is full for this sender")
             own_count = len(own)
             own_bytes = sum(len(e.blob) for e in own)
-            shed = 0
+            victims: List[HeldEnvelope] = []
             while own and (
                 own_count + 1 > quota_count
                 or own_bytes + len(blob) > quota_bytes
             ):
                 victim = own.pop(0)
-                del self._held[victim.id]
+                victims.append(victim)
                 own_count -= 1
                 own_bytes -= len(victim.blob)
-                shed += 1
-            if shed:
+            # Plan first, then apply: every refusal happens before any
+            # envelope is deleted, so a rejected deposit hides no mail.
+            if len(self._held) - len(victims) >= MAX_HELD_TOTAL:
+                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
+            for victim in victims:
+                del self._held[victim.id]
+            if victims:
                 log.info(
                     "Shed %d held envelope(s) from %s to stay within quota",
-                    shed,
+                    len(victims),
                     depositor_hex or "unknown sender",
                 )
-            if own_count + 1 > quota_count or own_bytes + len(blob) > quota_bytes:
-                raise MailboxFull("mailbox is full for this sender")
-            if len(self._held) >= MAX_HELD_TOTAL:
-                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
             self._held[message_id] = HeldEnvelope(
                 id=message_id,
                 to=bytes(to),

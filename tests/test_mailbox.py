@@ -279,6 +279,22 @@ def test_hold_single_blob_over_bytes_quota_is_refused(tmp_path, monkeypatch):
     assert box.held_list() == []
 
 
+def test_refused_oversized_deposit_keeps_existing_held_mail(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_BYTES", 4)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    assert box.hold(
+        to=BOB, blob=b"abc", message_id="keep", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    with pytest.raises(MailboxFull):
+        box.hold(
+            to=BOB, blob=b"123456", message_id="too-big", expires_at=5000.0,
+            now=101.0, depositor=sender,
+        )
+    assert [e.id for e in box.held_list()] == ["keep"]
+
+
 def test_held_depositor_and_usage_persist(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)
