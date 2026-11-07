@@ -6,6 +6,7 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  MarkReadResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
@@ -14,12 +15,15 @@ import type {
   SendResponse,
   Snapshot,
   TauMessage,
+  UnreadCounts,
 } from "./types";
 
 export type ConnectionState =
   | "connecting"
   | "live"
   | "reconnecting";
+
+export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 
 export interface PingState {
   pending?: boolean;
@@ -43,6 +47,7 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [messages, setMessages] = useState<TauMessage[]>([]);
+  const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
@@ -70,14 +75,19 @@ export function useTau() {
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
       setMessages(snapshot.messages);
+      setUnread(snapshot.unread ?? EMPTY_UNREAD);
       setBridge(snapshot.bridge);
       setConnection("live");
     };
 
     const onMessage = (event: Event) => {
-      const payload = readEventData<{ message: TauMessage }>(event);
+      const payload = readEventData<{
+        message: TauMessage;
+        unread?: UnreadCounts;
+      }>(event);
       if (!payload?.message) return;
       const message = payload.message;
+      if (payload.unread) setUnread(payload.unread);
       if (message.id <= snapshotMax.current) return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
@@ -111,6 +121,12 @@ export function useTau() {
       });
     };
 
+    const onUnread = (event: Event) => {
+      const payload = readEventData<{ unread: UnreadCounts }>(event);
+      if (!payload?.unread) return;
+      setUnread(payload.unread);
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -120,6 +136,7 @@ export function useTau() {
     source.addEventListener("message", onMessage);
     source.addEventListener("message_updated", onMessageUpdated);
     source.addEventListener("peer", onPeer);
+    source.addEventListener("unread", onUnread);
     source.addEventListener("error", onError);
 
     return () => {
@@ -129,10 +146,19 @@ export function useTau() {
       source.removeEventListener("message", onMessage);
       source.removeEventListener("message_updated", onMessageUpdated);
       source.removeEventListener("peer", onPeer);
+      source.removeEventListener("unread", onUnread);
       source.removeEventListener("error", onError);
       source.close();
     };
   }, []);
+
+  // The unread total rides on the tab title, like a mail client.
+  useEffect(() => {
+    document.title =
+      unread.total > 0
+        ? `(${unread.total}) tau · mesh console`
+        : "tau · mesh console";
+  }, [unread.total]);
 
   const refreshSeq = useRef(0);
 
@@ -242,10 +268,23 @@ export function useTau() {
     }
   }, []);
 
+  const markRead = useCallback(async (peer?: string) => {
+    // Opening a conversation advances its read cursor on the node, so
+    // the badge clears. A failed call leaves the badge in place; the
+    // next snapshot reconciles.
+    const result = await apiPost<MarkReadResponse>(
+      "/api/messages/read",
+      peer ? { peer } : {},
+    );
+    setUnread(result.unread);
+    return result.unread;
+  }, []);
+
   return {
     node,
     peers,
     messages,
+    unread,
     outbox,
     heldForOthers,
     bridge,
@@ -255,6 +294,7 @@ export function useTau() {
     send,
     ping,
     announce,
+    markRead,
     refreshOutbox,
     cancelOutbox,
   };

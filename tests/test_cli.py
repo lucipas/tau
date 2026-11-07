@@ -639,6 +639,124 @@ def test_messages_out_of_range_timestamp(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "from the far future" in out
     assert "unknown time" in out
+
+
+def test_parser_messages_unread_and_count_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "--unread", "--count"])
+    assert args.unread is True
+    assert args.count is True
+
+    defaults = parser.parse_args(["messages"])
+    assert defaults.unread is False
+    assert defaults.count is False
+
+
+def test_messages_listing_marks_entries_read(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    # Both entries were unread when first listed.
+    assert out.count("● ") == 2
+
+    # A second listing shows the same messages, now read.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "● " not in out
+    assert "second hello" in out
+
+    # --unread finds nothing once the conversation has been read.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--unread"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+
+def test_messages_unread_filter_and_json_flags(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert all(item["unread"] for item in payload["messages"])
+
+    # The --unread listing itself advances the cursor.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+
+    # A --peer listing only marks that conversation read.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "third hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "alice", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 3
+    assert [item["unread"] for item in payload["messages"]] == [True, False, False]
+
+
+def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "2 unread" in out
+    assert "Total: 2 unread" in out
+
+    # Counting is read-only: the count is unchanged afterwards.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {sender_hash.hex(): 2}, "total": 2}
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--peer", "alice"]
+    )
+    assert code == 0
+    assert "Total: 2 unread" in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--peer", "nobody"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_messages_count_empty(tmp_path, capsys):
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--count"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(tmp_path / "node"), "--count", "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"unread": {}, "total": 0}
+
+
 # -- outbox held / drop-held ---------------------------------------------------
 
 

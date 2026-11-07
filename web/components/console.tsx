@@ -36,6 +36,9 @@ export function Console() {
     customPicked.current = false;
     setMode("peer");
     setTarget(destination);
+    // Opening the conversation advances its read cursor on the node,
+    // so the badge clears. A failed call leaves the badge in place.
+    void tau.markRead(destination).catch(() => undefined);
     const textarea = document.getElementById(
       "message-text",
     ) as HTMLTextAreaElement | null;
@@ -76,6 +79,7 @@ export function Console() {
             peers={tau.peers}
             bridge={tau.bridge}
             pings={tau.pings}
+            unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);

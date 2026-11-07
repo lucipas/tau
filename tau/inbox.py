@@ -7,6 +7,14 @@ here, so ``tau messages`` can read back what arrived even after a
 restart.  The web console keeps its own history (``messages.json``);
 this store is the node's own, and it exists whether or not ``--http``
 is in use.
+
+Read state lives here too, as a per-conversation cursor: for each
+sender destination, the ``received_at`` (and id) of the newest message
+the owner has read.  A message is unread when it arrived after the
+cursor for its sender.  Read state is strictly local — it never leaves
+the node — and files written before cursors existed migrate with every
+stored message marked read, so an upgrade does not surface a wall of
+"unread" for mail the owner already saw.
 """
 
 from __future__ import annotations
@@ -71,6 +79,50 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _valid_cursors(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Normalize stored read cursors, or ``None`` when the file predates them.
+
+    A cursor is ``{"last_read_at": float, "last_read_id": str | None}``
+    per sender destination.  Malformed entries are skipped; a missing
+    or non-object ``read_cursors`` section means the file was written
+    before read state existed, and the caller migrates instead.
+    """
+    if raw is None or not isinstance(raw, dict):
+        return None
+    cursors: Dict[str, Dict[str, Any]] = {}
+    for destination, value in raw.items():
+        if not isinstance(destination, str) or not isinstance(value, dict):
+            continue
+        try:
+            last_read_at = float(value.get("last_read_at"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(last_read_at):
+            continue
+        last_read_id = value.get("last_read_id")
+        if last_read_id is not None and not isinstance(last_read_id, str):
+            continue
+        cursors[destination] = {
+            "last_read_at": last_read_at,
+            "last_read_id": last_read_id,
+        }
+    return cursors
+
+
+def _is_unread(entry: Dict[str, Any], cursor: Optional[Dict[str, Any]]) -> bool:
+    """Whether *entry* arrived after its sender's read cursor.
+
+    No cursor means nothing from that sender has been read yet.  The
+    comparison is on ``received_at`` alone: the cursor always lands on
+    the newest message read, so anything at or before it was shown
+    alongside it.  The cursor still records the message id, so the
+    read position is identifiable.
+    """
+    if cursor is None:
+        return True
+    return entry["received_at"] > cursor["last_read_at"]
+
+
 class Inbox:
     """Received direct messages, persisted in the node data directory.
 
@@ -83,6 +135,7 @@ class Inbox:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.Lock()
         self._messages: List[Dict[str, Any]] = []
+        self._read_cursors: Dict[str, Dict[str, Any]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -100,14 +153,34 @@ class Inbox:
             if record is not None:
                 loaded.append(record)
         self._messages = loaded[-MAX_INBOX:]
+        cursors = _valid_cursors(raw.get("read_cursors"))
+        if cursors is None:
+            # No read state on disk: every stored message starts as
+            # read, so an upgrade never surfaces old mail as unread.
+            cursors = {}
+            for entry in self._messages:
+                destination = entry.get("destination") or ""
+                cursors[destination] = {
+                    "last_read_at": entry["received_at"],
+                    "last_read_id": entry.get("id"),
+                }
+        self._read_cursors = cursors
 
     def _save(self) -> None:
         if self.path is None:
             return
         try:
-            atomic_write_json(self.path, {"messages": self._messages}, mode=0o600)
+            atomic_write_json(
+                self.path,
+                {"messages": self._messages, "read_cursors": self._read_cursors},
+                mode=0o600,
+            )
         except OSError as exc:
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
+
+    def transaction(self) -> Iterator[None]:
+        """Public handle on the cross-process inbox lock (see ``_transaction``)."""
+        return self._transaction()
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -153,16 +226,88 @@ class Inbox:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        how many are returned (``None`` means all of them).  Each entry
+        carries ``unread``: whether it arrived after its sender's read
+        cursor.
         """
         with self._lock:
             entries = list(self._messages)
+            cursors = {
+                destination: dict(cursor)
+                for destination, cursor in self._read_cursors.items()
+            }
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
-        return [dict(item) for item in entries]
+        return [
+            dict(
+                item,
+                unread=_is_unread(
+                    item, cursors.get(item.get("destination") or "")
+                ),
+            )
+            for item in entries
+        ]
+
+    def _unread_counts_locked(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the in-memory state."""
+        per_peer: Dict[str, int] = {}
+        for entry in self._messages:
+            if _is_unread(
+                entry, self._read_cursors.get(entry.get("destination") or "")
+            ):
+                destination = entry.get("destination") or ""
+                per_peer[destination] = per_peer.get(destination, 0) + 1
+        return {"per_peer": per_peer, "total": sum(per_peer.values())}
+
+    def unread_counts(self) -> Dict[str, Any]:
+        """Per-conversation unread counts, reloaded from disk first.
+
+        The reload under the cross-process lock is what lets a serving
+        node see a read cursor a one-shot ``tau messages`` just
+        advanced (and vice versa).
+        """
+        with self._transaction():
+            return self._unread_counts_locked()
+
+    def mark_read(
+        self, peer: Optional[str] = None, *, up_to: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Advance the read cursor for one conversation, or all of them.
+
+        The cursor lands on the newest message for the peer at or
+        before ``up_to`` (every message for the peer when ``up_to`` is
+        ``None``), so listing what was just shown marks exactly that
+        much read.  A peer with no messages is left alone.  Returns the
+        unread counts after the mark.
+        """
+        with self._transaction():
+            if peer is not None:
+                targets = [peer]
+            else:
+                targets = sorted(
+                    {entry.get("destination") or "" for entry in self._messages}
+                )
+            for destination in targets:
+                candidates = [
+                    entry
+                    for entry in self._messages
+                    if (entry.get("destination") or "") == destination
+                    and (up_to is None or entry["received_at"] <= up_to)
+                ]
+                if not candidates:
+                    continue
+                newest = max(
+                    candidates, key=lambda entry: entry["received_at"]
+                )
+                self._read_cursors[destination] = {
+                    "last_read_at": newest["received_at"],
+                    "last_read_id": newest.get("id"),
+                }
+            self._save()
+            return self._unread_counts_locked()
 
     def __len__(self) -> int:
         with self._lock:

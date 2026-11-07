@@ -512,7 +512,11 @@ class WebBridge:
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
         )
-        self.bus.publish({"type": "message", "message": message})
+        # The node appends to its inbox before this callback runs, so
+        # the unread total already includes the new message.
+        self.bus.publish(
+            {"type": "message", "message": message, "unread": self.unread()}
+        )
         return message
 
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
@@ -861,12 +865,42 @@ class WebBridge:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
 
+    def unread(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the node inbox.
+
+        A node without an inbox (tests, embeds) simply has nothing
+        unread; read state is local to this node either way.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return {"per_peer": {}, "total": 0}
+        try:
+            return inbox.unread_counts()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read inbox unread counts", exc_info=True)
+            return {"per_peer": {}, "total": 0}
+
+    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Advance the inbox read cursor for one conversation, or all.
+
+        The console calls this when a conversation is opened, so its
+        unread badge clears; other tabs learn from the ``unread`` SSE
+        event.  Read state never leaves this node.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return {"per_peer": {}, "total": 0}
+        counts = inbox.mark_read(peer=peer)
+        self.bus.publish({"type": "unread", "unread": counts})
+        return counts
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
+            "unread": self.unread(),
             "bridge": {
                 "version": __version__,
                 "web": self.web_dir is not None,
@@ -1072,6 +1106,22 @@ class _WebHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/messages/read":
+                peer = body.get("peer")
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                counts = self.bridge.mark_read(
+                    peer.strip() if isinstance(peer, str) else None
+                )
+                self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
