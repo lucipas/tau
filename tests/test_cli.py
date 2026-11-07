@@ -161,6 +161,119 @@ def test_id_without_identity_returns_error(tmp_path, capsys):
     assert "run `tau init` first" in captured.err
 
 
+def test_parser_status_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["status"])
+    assert args.command == "status"
+
+
+def test_status_reports_empty_node(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    code = cli.main(["status", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "bob"
+    assert payload["destination"] == _id_destination(data_dir, capsys)
+    assert payload["data_dir"] == str(data_dir)
+    assert payload["lxmf"]
+    assert payload["serving"] is False
+    assert payload["serving_pid"] is None
+    assert payload["peers"] == 0
+    assert payload["outbox"] == {"queued": 0, "due": 0, "held": 0}
+    assert payload["inbox"] == {"messages": 0}
+    assert payload["tan"] == {"posts": 0, "following": 0}
+    assert payload["allowlist"] == {"enabled": False, "entries": 0}
+    # Status is read-only: it must not create a Tan database to count it.
+    assert not (data_dir / "tan.sqlite3").exists()
+
+
+def test_status_text_output(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    code = cli.main(["status", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "serving:     no" in out
+    assert "peers:       0" in out
+    assert "outbox:      0 queued (0 due), 0 held" in out
+    assert "inbox:       0 messages" in out
+    assert "tan:         0 posts, following 0 authors" in out
+    assert "allowlist:   disabled (0 entries)" in out
+
+
+def test_status_counts_seeded_state(tmp_path, capsys):
+    from tau.allowlist import AllowList, save_allowlist
+    from tau.tangents.tan import create_post, follow, init_db
+
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    peer_identity = RNS.Identity()
+    peer_hash = destination_hash(peer_identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(peer_hash, peer_identity.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    box = Mailbox(config.mailbox_path)
+    first = box.enqueue(to=b"\xbb" * 16, text="due now", message_id="aa" + "11" * 15)
+    box.enqueue(to=b"\xbb" * 16, text="backing off", message_id="bb" + "22" * 15)
+    box.record_attempt(first.id)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash.hex(),
+            "text": "hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    conn = init_db(config.social_db_path)
+    try:
+        create_post(conn, peer_identity, "first post", name="alice", now=1000)
+        create_post(conn, peer_identity, "second post", name="alice", now=1001)
+        follow(conn, peer_hash.hex(), name="alice")
+    finally:
+        conn.close()
+    save_allowlist(
+        config.allowlist_path,
+        AllowList(enabled=True, allow=frozenset({peer_hash.hex()})),
+    )
+
+    code = cli.main(["status", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["peers"] == 1
+    # One entry is due; the attempted one backs off for 60s.
+    assert payload["outbox"] == {"queued": 2, "due": 1, "held": 0}
+    assert payload["inbox"] == {"messages": 1}
+    assert payload["tan"] == {"posts": 2, "following": 1}
+    assert payload["allowlist"] == {"enabled": True, "entries": 1}
+
+
+def test_status_reports_serving_node(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        code = cli.main(["status", "--data-dir", str(data_dir), "--json"])
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["serving"] is True
+        assert payload["serving_pid"] == os.getpid()
+    finally:
+        lock.release()
+
+
+def test_status_without_identity_returns_error(tmp_path, capsys):
+    code = cli.main(["status", "--data-dir", str(tmp_path / "missing")])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "run `tau init` first" in captured.err
+
+
 def _init_node(tmp_path, dirname, name):
     data_dir = tmp_path / dirname
     assert (

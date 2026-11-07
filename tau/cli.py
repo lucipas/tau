@@ -20,6 +20,7 @@ from .allowlist import (
     AllowListError,
     clean_destination,
     load_allowlist,
+    load_allowlist_or_deny_all,
     save_allowlist,
 )
 from .config import TauConfig, write_node_metadata, write_rns_config
@@ -40,6 +41,7 @@ from .node import (
     NodeError,
     TauNode,
     check_tcp_listen_ports,
+    instance_lock_holder,
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
@@ -330,6 +332,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --exchange, ask only this peer instead of all known peers",
     )
     peers.set_defaults(func=cmd_peers)
+
+    status = subparsers.add_parser(
+        "status",
+        parents=[common],
+        help="show a read-only summary of this node's state",
+    )
+    status.set_defaults(func=cmd_status)
 
     identity = subparsers.add_parser(
         "id",
@@ -2012,6 +2021,90 @@ def cmd_id(args: argparse.Namespace) -> int:
         print(f"identity:    {identity.hexhash}")
         print(f"lxmf:        {payload['lxmf']}")
         print(f"data dir:    {config.data_dir}")
+    return _EXIT_OK
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Summarise the local node's state without starting it.
+
+    Read-only: no RNS, no network, and the data-directory lock is only
+    probed, never taken, so this keeps working while a node is serving.
+    A missing Tan database reports zero posts instead of creating one.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    mailbox = Mailbox(config.mailbox_path)
+    counts = mailbox.counts()
+    due = sum(1 for entry in mailbox.outbox_list() if entry.is_due())
+    registry = PeerRegistry(config.peers_path)
+    inbox = Inbox(config.inbox_path)
+    # Fail closed like the running node: an unreadable allow-list file
+    # reports as enabled-but-empty rather than silently open.
+    allowlist = load_allowlist_or_deny_all(config.allowlist_path)
+    tan_posts = 0
+    tan_following = 0
+    if config.social_db_path.exists():
+        conn = init_db(config.social_db_path)
+        try:
+            tan_posts = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM posts WHERE kind = 'post'"
+                ).fetchone()["n"]
+            )
+            tan_following = len(following(conn))
+        finally:
+            conn.close()
+    serving_pid = instance_lock_holder(config.instance_lock_path)
+    payload = {
+        "name": config.name,
+        "destination": destination_hash(identity).hex(),
+        "lxmf": lxmf_delivery_hash(identity).hex(),
+        "data_dir": str(config.data_dir),
+        "serving": serving_pid is not None,
+        "serving_pid": serving_pid,
+        "peers": len(registry),
+        "outbox": {
+            "queued": counts["outbox"],
+            "due": due,
+            "held": counts["held"],
+        },
+        "inbox": {"messages": len(inbox)},
+        "tan": {"posts": tan_posts, "following": tan_following},
+        "allowlist": {
+            "enabled": allowlist.enabled,
+            "entries": len(allowlist.allow),
+        },
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"name:        {payload['name']}")
+        print(f"destination: {payload['destination']}")
+        print(f"lxmf:        {payload['lxmf']}")
+        print(f"data dir:    {payload['data_dir']}")
+        if serving_pid is None:
+            print("serving:     no")
+        elif serving_pid < 0:
+            print("serving:     yes (pid unknown)")
+        else:
+            print(f"serving:     yes (pid {serving_pid})")
+        print(f"peers:       {payload['peers']}")
+        print(
+            f"outbox:      {payload['outbox']['queued']} queued "
+            f"({payload['outbox']['due']} due), "
+            f"{payload['outbox']['held']} held"
+        )
+        print(f"inbox:       {payload['inbox']['messages']} messages")
+        print(
+            f"tan:         {payload['tan']['posts']} posts, "
+            f"following {payload['tan']['following']} authors"
+        )
+        print(
+            f"allowlist:   {'enabled' if payload['allowlist']['enabled'] else 'disabled'} "
+            f"({payload['allowlist']['entries']} entries)"
+        )
     return _EXIT_OK
 
 

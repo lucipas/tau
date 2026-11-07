@@ -176,6 +176,34 @@ class InstanceLock:
         handle.close()
 
 
+def instance_lock_holder(path: Path) -> Optional[int]:
+    """PID of the process holding the data-directory lock, or ``None``.
+
+    A read-only probe for commands like ``tau status``: it never writes
+    to the lock file, never blocks, and never takes the lock itself.
+    Returns ``None`` when the lock is free, the file does not exist yet,
+    or advisory locking is unavailable (non-POSIX).  A held lock whose
+    holder PID cannot be read reports ``-1`` so callers can still tell
+    a node is serving.
+    """
+    if fcntl is None:
+        return None
+    try:
+        handle = open(path, "r", encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = InstanceLock._read_holder_pid(handle)
+            return holder if holder is not None else -1
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return None
+    finally:
+        handle.close()
+
+
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
