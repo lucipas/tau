@@ -432,7 +432,11 @@ and acks them so holders can drop their copies. Every message carries a
 unique id, and each node remembers ids it has already shown, so direct,
 retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
-recipient) and everything expires. Failed delivery attempts back off
+recipient) and everything expires. A holder also caps each depositing
+peer — 16 envelopes / 128 KiB from an unknown peer, 128 / 1 MiB from a
+long-standing known peer — shedding that sender's oldest envelopes
+first, so one sender can crowd out only its own mail; `tau outbox held`
+shows the per-sender usage. Failed delivery attempts back off
 exponentially (60s, doubling, capped at an hour), so an unreachable peer
 does not cost a link attempt on every sweep; a peer announcing itself
 retries immediately. `tau outbox` shows what is waiting, including the
@@ -466,6 +470,7 @@ buggy peer cannot force unbounded buffering:
 | Mail store/fetch request | 24 KiB |
 | Sealed message blob | 12 KiB |
 | Outbox / held envelopes | 256 / 512 (64 per recipient) |
+| Held envelopes per sender | 16 envelopes / 128 KiB unknown, 128 / 1 MiB known |
 | Queued message lifetime | 7 days |
 
 Names and messages are stripped of control characters (including terminal

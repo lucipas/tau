@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import RNS
 import pytest
 
+import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import open_message, seal_message
@@ -239,6 +240,106 @@ def test_store_rejects_invalid_expiry(tmp_path, expires_at):
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "invalid_mail"
+    assert holder.mailbox.counts()["held"] == 0
+
+
+_UNSET = object()
+
+
+def _store(holder, sender, recipient, message_id, *, remote_identity=_UNSET):
+    """Deposit one sealed envelope, from *sender* unless told otherwise."""
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id=message_id,
+        text=f"held {message_id}",
+        sent_at=55.0,
+    )
+    return call_handler(
+        holder._handle_mail_store,
+        build_mail_store(
+            to=destination_hash(recipient).hex(),
+            message_id=message_id,
+            blob=blob,
+            expires_at=time.time() + 3600,
+        ),
+        remote_identity=sender if remote_identity is _UNSET else remote_identity,
+    )
+
+
+def test_store_enforces_per_sender_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 2)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    for message_id in ("q1", "q2", "q3"):
+        response = _store(holder, sender, recipient, message_id)
+        assert response["ok"] is True and response["stored"] is True
+    # The third deposit shed the sender's oldest envelope.
+    assert [e.id for e in holder.mailbox.held_list()] == ["q2", "q3"]
+
+
+def test_store_trusted_peer_gets_higher_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_KNOWN_COUNT", 2)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    # Long-standing peer: in the registry for two days, heard directly.
+    holder.registry.upsert(
+        destination_hash(sender),
+        sender.get_public_key(),
+        name="alice",
+        now=time.time() - 2 * 24 * 3600,
+    )
+    for message_id in ("t1", "t2"):
+        response = _store(holder, sender, recipient, message_id)
+        assert response["ok"] is True and response["stored"] is True
+    assert [e.id for e in holder.mailbox.held_list()] == ["t1", "t2"]
+    # A third deposit sheds the oldest instead of being refused.
+    response = _store(holder, sender, recipient, "t3")
+    assert response["ok"] is True and response["stored"] is True
+    assert [e.id for e in holder.mailbox.held_list()] == ["t2", "t3"]
+
+
+def test_store_recent_peer_uses_unknown_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    holder.registry.upsert(
+        destination_hash(sender), sender.get_public_key(), name="alice"
+    )
+    assert _store(holder, sender, recipient, "r1")["stored"] is True
+    assert _store(holder, sender, recipient, "r2")["stored"] is True
+    assert [e.id for e in holder.mailbox.held_list()] == ["r2"]
+
+
+def test_store_anonymous_senders_share_unknown_bucket(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    for message_id in ("a1", "a2"):
+        response = _store(
+            holder, sender, recipient, message_id, remote_identity=None
+        )
+        assert response["ok"] is True and response["stored"] is True
+    assert [e.id for e in holder.mailbox.held_list()] == ["a2"]
+    assert holder.mailbox.held_usage()[0]["sender"] == ""
+
+
+def test_store_refuses_single_blob_over_sender_bytes_quota(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_BYTES", 4)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    response = _store(holder, sender, recipient, "big-1")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "mailbox_full"
     assert holder.mailbox.counts()["held"] == 0
 
 

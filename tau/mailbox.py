@@ -15,6 +15,10 @@ the node's data directory holding three collections:
     peer.  An envelope is encrypted to the recipient and signed by the
     sender, so a holder can neither read nor forge what it carries; it
     only knows the recipient hash, the message id and the expiry.
+    Held mail is also capped per depositing peer (see the
+    ``HELD_QUOTA_*`` constants): one sender cannot fill a relay's
+    storage, and when a deposit would push a sender over quota the
+    relay sheds that sender's oldest envelopes first.
 ``seen``
     Ids of messages already delivered to the user, so a message that
     arrives twice — once directly, once via a holder — is shown once.
@@ -28,6 +32,7 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -69,6 +74,38 @@ MAX_HELD_PER_RECIPIENT = 64
 MAX_SEEN = 1024
 MAX_HOLDERS_PER_MESSAGE = 3
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer quota override from the environment, or *default*."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+# Held-mail fairness quotas (issue #89): one sender may not fill a
+# relay's storage with envelopes for many recipients.  A holder can only
+# see the peer that asked it to hold an envelope — the sealed blob hides
+# the inner sender — so quotas are keyed by that depositing peer, and
+# deposits over an unidentified link share one "unknown" bucket.  When a
+# deposit would push a sender over quota, the relay sheds that sender's
+# oldest envelopes first; only a single envelope that cannot fit even on
+# its own is refused.  Long-standing known peers get the higher tier.
+HELD_QUOTA_UNKNOWN_COUNT = _env_int("TAU_HELD_QUOTA_UNKNOWN_COUNT", 16)
+HELD_QUOTA_KNOWN_COUNT = _env_int("TAU_HELD_QUOTA_KNOWN_COUNT", 128)
+HELD_QUOTA_UNKNOWN_BYTES = _env_int(
+    "TAU_HELD_QUOTA_UNKNOWN_BYTES", 128 * 1024
+)
+HELD_QUOTA_KNOWN_BYTES = _env_int("TAU_HELD_QUOTA_KNOWN_BYTES", 1024 * 1024)
+# A peer counts as long-standing once it has been in the local registry
+# this long (and was heard directly, not via exchange).
+TRUSTED_PEER_MIN_AGE_SECONDS = _env_int(
+    "TAU_TRUSTED_PEER_MIN_AGE_SECONDS", 24 * 3600
+)
+
 # Direct-delivery retry pacing: after a failed attempt, wait 60s, then
 # double after each further failure, up to an hour.  An announce from the
 # recipient bypasses the wait (see TauNode._mail_round_for_peer).
@@ -77,6 +114,14 @@ DELIVERY_BACKOFF_MAX_SECONDS = 3600.0
 
 _DESTINATION_BYTES = 16
 _PUBLIC_KEY_BYTES = 64
+
+
+def _is_hex(value: str) -> bool:
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
 
 
 class MailboxError(RuntimeError):
@@ -204,6 +249,11 @@ class HeldEnvelope:
     blob: bytes
     stored_at: float
     expires_at: float
+    # Hex destination hash of the peer that asked this node to hold the
+    # envelope ("" when the deposit arrived over an unidentified link).
+    # The sealed blob hides the inner sender, so this is the only
+    # attribution a holder has — and the key for per-sender quotas.
+    depositor: str = ""
 
     @property
     def to_hex(self) -> str:
@@ -216,6 +266,7 @@ class HeldEnvelope:
             "blob": base64.b64encode(self.blob).decode("ascii"),
             "stored_at": self.stored_at,
             "expires_at": self.expires_at,
+            "depositor": self.depositor,
         }
 
     @classmethod
@@ -244,12 +295,22 @@ class HeldEnvelope:
             expires_at, (int, float)
         ):
             raise ValueError("invalid held timestamps")
+        depositor = raw.get("depositor")
+        if (
+            not isinstance(depositor, str)
+            or (depositor and len(depositor) != 32)
+            or (depositor and not _is_hex(depositor))
+        ):
+            # Envelopes stored before per-sender quotas carry no
+            # attribution; they join the unknown bucket.
+            depositor = ""
         return cls(
             id=message_id,
             to=destination,
             blob=blob,
             stored_at=float(stored_at),
             expires_at=float(expires_at),
+            depositor=depositor,
         )
 
 
@@ -542,19 +603,32 @@ class Mailbox:
         message_id: str,
         expires_at: float,
         now: Optional[float] = None,
+        depositor: Optional[bytes] = None,
+        trusted: bool = False,
     ) -> bool:
         """Store a sealed envelope for *to*.
 
         Returns ``True`` when the envelope was newly stored, ``False``
         when an envelope with the same id was already held.
+
+        *depositor* is the destination hash of the peer that asked this
+        node to hold the envelope (``None`` for an unidentified link);
+        it is recorded on the envelope and keys the per-sender fairness
+        quota.  A *trusted* depositor — a long-standing known peer —
+        gets the higher quota tier.  When a deposit would push its
+        sender over quota, that sender's oldest envelopes are shed
+        first, so one sender can crowd out only its own mail.
         """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
+        if depositor is not None and len(depositor) != _DESTINATION_BYTES:
+            raise MailboxError("depositor hash must be 16 bytes")
         if len(blob) > MAX_MAIL_BLOB_BYTES:
             raise MailboxError("sealed message is too large to hold")
         if not math.isfinite(expires_at):
             raise MailboxError("expiry must be a finite time")
         timestamp = now if now is not None else time.time()
+        depositor_hex = depositor.hex() if depositor is not None else ""
         with self._transaction():
             if message_id in self._held:
                 return False
@@ -566,19 +640,50 @@ class Mailbox:
                     # have expired anyway.
                     return False
                 del self._dropped_held[message_id]
-            if len(self._held) >= MAX_HELD_TOTAL:
-                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
             per_recipient = sum(1 for e in self._held.values() if e.to == to)
             if per_recipient >= MAX_HELD_PER_RECIPIENT:
                 raise MailboxFull(
                     f"mailbox is full for this recipient ({MAX_HELD_PER_RECIPIENT})"
                 )
+            quota_count = (
+                HELD_QUOTA_KNOWN_COUNT if trusted else HELD_QUOTA_UNKNOWN_COUNT
+            )
+            quota_bytes = (
+                HELD_QUOTA_KNOWN_BYTES if trusted else HELD_QUOTA_UNKNOWN_BYTES
+            )
+            own = sorted(
+                (e for e in self._held.values() if e.depositor == depositor_hex),
+                key=lambda e: e.stored_at,
+            )
+            own_count = len(own)
+            own_bytes = sum(len(e.blob) for e in own)
+            shed = 0
+            while own and (
+                own_count + 1 > quota_count
+                or own_bytes + len(blob) > quota_bytes
+            ):
+                victim = own.pop(0)
+                del self._held[victim.id]
+                own_count -= 1
+                own_bytes -= len(victim.blob)
+                shed += 1
+            if shed:
+                log.info(
+                    "Shed %d held envelope(s) from %s to stay within quota",
+                    shed,
+                    depositor_hex or "unknown sender",
+                )
+            if own_count + 1 > quota_count or own_bytes + len(blob) > quota_bytes:
+                raise MailboxFull("mailbox is full for this sender")
+            if len(self._held) >= MAX_HELD_TOTAL:
+                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
             self._held[message_id] = HeldEnvelope(
                 id=message_id,
                 to=bytes(to),
                 blob=bytes(blob),
                 stored_at=timestamp,
                 expires_at=min(float(expires_at), timestamp + MAX_MAIL_TTL),
+                depositor=depositor_hex,
             )
             self.save()
             return True
@@ -595,6 +700,29 @@ class Mailbox:
             envelopes = list(self._held.values())
         envelopes.sort(key=lambda e: e.stored_at)
         return envelopes
+
+    def held_usage(self) -> List[Dict[str, Any]]:
+        """Held-mail usage per depositing peer, busiest first.
+
+        Each entry is ``{"sender": <hex hash or "">, "count": n,
+        "bytes": b}``; ``sender == ""`` is the shared bucket for
+        deposits that arrived over an unidentified link.  Operators use
+        it to see quota pressure (``tau outbox held``).
+        """
+        with self._lock:
+            usage: Dict[str, Dict[str, Any]] = {}
+            for envelope in self._held.values():
+                entry = usage.setdefault(
+                    envelope.depositor,
+                    {"sender": envelope.depositor, "count": 0, "bytes": 0},
+                )
+                entry["count"] += 1
+                entry["bytes"] += len(envelope.blob)
+        return sorted(
+            usage.values(),
+            key=lambda row: (row["count"], row["bytes"]),
+            reverse=True,
+        )
 
     def resolve_held(self, ref: str) -> HeldEnvelope:
         """Resolve a full message id or a unique prefix to its held envelope.

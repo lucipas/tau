@@ -32,6 +32,7 @@ from .identity import (
 from .inbox import Inbox
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
+    TRUSTED_PEER_MIN_AGE_SECONDS,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -872,12 +873,34 @@ class TauNode:
             return response_error("invalid_mail", str(exc))
         if store["expires_at"] <= time.time():
             return response_error("mail_expired", "envelope has already expired")
+        # Quotas are keyed by the peer that asked us to hold the
+        # envelope: the sealed blob hides the inner sender, so the
+        # depositing peer is the only attribution a holder has.  A
+        # long-standing known peer gets the higher quota tier; the
+        # registry has no per-peer delivery history, so "long-standing"
+        # is first-seen age plus a direct (not exchanged) hearing.
+        depositor = (
+            tau_destination_hash(remote_identity)
+            if remote_identity is not None
+            else None
+        )
+        trusted = False
+        if depositor is not None:
+            peer = self.registry.get(depositor)
+            if (
+                peer is not None
+                and not peer.via_exchange
+                and time.time() - peer.first_seen >= TRUSTED_PEER_MIN_AGE_SECONDS
+            ):
+                trusted = True
         try:
             stored = self.mailbox.hold(
                 to=bytes.fromhex(store["to"]),
                 blob=store["blob"],
                 message_id=store["id"],
                 expires_at=store["expires_at"],
+                depositor=depositor,
+                trusted=trusted,
             )
         except MailboxFull as exc:
             return response_error("mailbox_full", str(exc))
