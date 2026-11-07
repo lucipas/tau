@@ -2128,12 +2128,18 @@ def cmd_send(args: argparse.Namespace) -> int:
     try:
         reply_to = None
         if getattr(args, "reply_to", None):
-            peer = node.resolve_peer(
-                args.to,
-                timeout=float(getattr(args, "discover_timeout", 10.0)),
-            )
+            # Derive the conversation hash without network discovery, so a
+            # reply to a queued message still reaches the outbox when the
+            # recipient is offline; discovery is only a fallback.
+            target_hash = node._target_hash(args.to)
+            if target_hash is None:
+                peer = node.resolve_peer(
+                    args.to,
+                    timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+                target_hash = peer.destination_hash
             reply_to = _resolve_reply_target(
-                Inbox(config.inbox_path), node.mailbox, args.reply_to, peer.hexhash
+                Inbox(config.inbox_path), node.mailbox, args.reply_to, target_hash.hex()
             )
         response = node.send_message(
             args.to,
@@ -2317,25 +2323,29 @@ def _resolve_reply_target(
     ref = ref.strip()
     if not ref:
         raise NodeError("--reply-to must not be empty")
-    matches = inbox.find_prefix(ref, peer=peer_hash)
-    if len(matches) > 1:
+    # Gather candidates from both stores before choosing, so a prefix that
+    # matches distinct messages across the inbox and the outbox is rejected
+    # rather than silently quoting whichever store is searched first.
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for item in inbox.find_prefix(ref, peer=peer_hash):
+        candidates.setdefault(str(item["id"]), item)
+    value = ref.lower()
+    for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        if entry.id.lower().startswith(value):
+            candidates.setdefault(
+                entry.id, {"id": entry.id, "text": entry.text}
+            )
+    if len(candidates) > 1:
         raise NodeError(
-            f"{len(matches)} messages in this conversation match {ref!r};"
+            f"{len(candidates)} messages in this conversation match {ref!r};"
             " use a longer prefix"
         )
-    quoted = matches[0] if matches else None
-    if quoted is None:
-        try:
-            entry = mailbox.resolve_outbox(ref)
-        except MailboxError:
-            entry = None
-        if entry is not None and entry.to.hex() == peer_hash:
-            quoted = {"id": entry.id, "text": entry.text}
-    if quoted is None:
+    if not candidates:
         raise NodeError(
             f"no message {ref!r} in this conversation to reply to;"
             " replies quote a message from this peer's history"
         )
+    quoted = next(iter(candidates.values()))
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 

@@ -771,9 +771,28 @@ class _FakeSendNode:
     def resolve_peer(self, target, timeout=10.0):
         return self.peer
 
+    def _target_hash(self, target):
+        return bytes.fromhex(self.peer.hexhash)
+
     def send_message(self, target, text, **kwargs):
         self.sent.append((target, text, kwargs.get("in_reply_to")))
         return {"ok": True, "echo": text, "id": "f" * 32}
+
+
+def test_resolve_reply_target_rejects_prefix_shared_across_stores(tmp_path):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    # A queued message to the same peer shares the "aaaa" prefix with the
+    # received one, so the reference is ambiguous and must be refused.
+    mailbox.enqueue(
+        to=bytes.fromhex(peer_hash),
+        text="queued",
+        message_id="aaaa" + "c" * 28,
+    )
+    with pytest.raises(cli.NodeError, match="2 messages"):
+        cli._resolve_reply_target(inbox, mailbox, "aaaa", peer_hash)
 
 
 def test_send_reply_to_resolves_prefix_and_sends_reference(
@@ -801,6 +820,35 @@ def test_send_reply_to_resolves_prefix_and_sends_reference(
     assert in_reply_to["id"] == "a" * 32
     assert in_reply_to["excerpt"] == cli.excerpt_hash("original thought")
     assert "in reply to aaaaaaaa" in capsys.readouterr().out
+
+
+def test_send_reply_to_offline_unregistered_hash_does_not_discover(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+
+    def _no_discovery(self, target, timeout=10.0):
+        raise cli.NodeError("unknown peer")
+
+    monkeypatch.setattr(_FakeSendNode, "resolve_peer", _no_discovery)
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            peer_hash,
+            "--reply-to",
+            "aaaa",
+            "seconded offline",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    assert node.sent[0][2]["id"] == "a" * 32
 
 
 def test_send_reply_to_unknown_reference_is_an_error(
