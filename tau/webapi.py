@@ -905,7 +905,9 @@ class WebBridge:
             ]
             removed = len(kept) != len(self._messages)
             if removed:
-                self._messages[:] = kept
+                # _messages is a deque (no slice assignment): rebuild it.
+                self._messages.clear()
+                self._messages.extend(kept)
             items = list(self._messages)
         if removed:
             self._save_messages()
@@ -1538,29 +1540,6 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 
 def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
-    values = query.get(name) or []
-    if not values:
-        return False
-    return values[0].strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int_param(
-    query: Dict[str, List[str]],
-    name: str,
-    *,
-    default: int,
-    minimum: int,
-    maximum: int,
-) -> int:
-    values = query.get(name)
-    if not values:
-        return default
-    try:
-        value = int(values[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-tr) -> bool:
     values = query.get(name) or []
     if not values:
         return False

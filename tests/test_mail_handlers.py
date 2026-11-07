@@ -18,6 +18,7 @@ from tau.protocol import (
     build_mail_store,
     decode,
     encode_message,
+    parse_message,
 )
 
 
@@ -257,6 +258,27 @@ def test_direct_message_records_expiry(tmp_path):
     assert node.inbox.list_messages()[0]["expires_at"] == 1893456000.0
 
 
+def test_direct_message_drops_expired_arrival(tmp_path):
+    import time as _time
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    payload = encode_message(
+        "too late", message_id="exp-past", expires_at=_time.time() - 10
+    )
+    response = call_handler(node._handle_message, payload)
+    assert response["ok"] is True
+    assert response["expired"] is True
+    # Dropped unrecorded (and not marked seen): never shown, and a
+    # re-delivery is not treated as a duplicate.
+    assert received == []
+    assert len(node.inbox) == 0
+    assert node.mailbox.is_seen("exp-past") is False
+
+
 def test_direct_message_without_expiry_has_none(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -307,6 +329,28 @@ def test_collected_message_records_expiry(tmp_path):
     assert node._deliver_collected(message) is True
     assert received[0]["expires_at"] == 1893456000.0
     assert node.inbox.list_messages()[0]["expires_at"] == 1893456000.0
+
+
+def test_collected_message_drops_expired_arrival(tmp_path):
+    import time as _time
+
+    received = []
+    node = make_node(tmp_path, name="bob", on_message=received.append)
+    sender = RNS.Identity()
+    message = {
+        "id": "collect-past",
+        "from": destination_hash(sender).hex(),
+        "from_name": "alice",
+        "text": "too late",
+        "sent_at": 12.0,
+        "expires_at": _time.time() - 10,
+    }
+    assert node._deliver_collected(message) is False
+    assert received == []
+    assert len(node.inbox) == 0
+    # Not marked seen: another holder's copy may still be attempted,
+    # and it will be dropped again the same way.
+    assert node.mailbox.is_seen("collect-past") is False
 
 
 def test_inbox_failure_does_not_break_delivery(tmp_path, monkeypatch):
@@ -610,6 +654,70 @@ def test_deposit_entry_skips_cancelled_message(tmp_path):
     assert node._deposit_entry(holder, entry, timeout=5) is True
     assert len(calls) == 1
     assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_deliver_entry_carries_queued_expiry(tmp_path):
+    import time as _time
+
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    deadline = _time.time() + 3600
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16),
+        text="vanish soon",
+        message_id="queued-exp",
+        expires_at=deadline,
+    )
+    assert node._deliver_entry(peer, entry, timeout=5) is True
+    assert len(calls) == 1
+    payload = parse_message(calls[0][2])
+    assert payload["expires_at"] == deadline
+
+
+def test_deliver_entry_skips_expired_message(tmp_path):
+    import time as _time
+
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16),
+        text="too late",
+        message_id="queued-past",
+        expires_at=_time.time() - 10,
+    )
+    # Past its deadline since the sweep listed it: no send is attempted.
+    assert node._deliver_entry(peer, entry, timeout=5) is False
+    assert calls == []
+    # The entry itself is left for the next prune to remove.
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_deposit_entry_skips_expired_message(tmp_path):
+    import time as _time
+
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    holder = node.registry.upsert(bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder")
+    node.registry.upsert(recipient_hash, recipient.get_public_key(), name="bob")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    entry = node.mailbox.enqueue(
+        to=recipient_hash,
+        text="too late",
+        message_id="deposit-past",
+        expires_at=_time.time() - 10,
+    )
+    assert node._deposit_entry(holder, entry, timeout=5) is False
+    assert calls == []
 def test_deliver_entry_reports_delivery_via_callback(tmp_path):
     delivered = []
     node = make_node(tmp_path, on_delivered=delivered.append)

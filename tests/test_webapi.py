@@ -196,7 +196,7 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
 
 def test_send_rejects_bad_expires_in(bridge):
-    for bad in (0, -5, "soon", True, 31 * 86400):
+    for bad in (0, -5, "soon", True, 31 * 86400, 10**400):
         status, _, payload = _json(
             bridge,
             "/api/messages",
@@ -205,6 +205,33 @@ def test_send_rejects_bad_expires_in(bridge):
         )
         assert status == 400
         assert "expires_in" in payload["error"]["message"]
+
+
+def test_messages_filters_expired_at_read_time(bridge):
+    now = time.time()
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="gone",
+        sent_at=now - 100,
+        received_at=now - 100,
+        status="received",
+        expires_at=now - 10,
+    )
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="staying",
+        sent_at=now,
+        received_at=now,
+        status="received",
+        expires_at=now + 3600,
+    )
+    # The deadline passed while the bridge was running: the read path
+    # drops it without waiting for a restart.
+    assert [m["text"] for m in bridge.messages(limit=0)] == ["staying"]
 
 
 def test_inbound_message_keeps_expiry(bridge):

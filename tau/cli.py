@@ -2203,6 +2203,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         if isinstance(rtt, (int, float)):
             print(f"round trip: {rtt * 1000:.0f} ms")
+        if response.get("expired"):
+            print("  the receiver dropped it — past its expiry")
         if expires_at is not None:
             print(f"  disappears in {_ago(expires_at - time.time())}")
     return _EXIT_OK

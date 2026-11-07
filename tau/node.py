@@ -1165,7 +1165,19 @@ class TauNode:
         # in this pass's snapshot. Re-check the queue under the mailbox
         # lock — which reloads the on-disk state — before sending.
         with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
+            fresh = self.mailbox.get_outbox(entry.id)
+            if fresh is None:
+                return False
+            if fresh.expires_at <= time.time():
+                # Past its deadline (sender-set expiry or queue TTL) since
+                # the sweep listed it: the receiver would drop the message
+                # anyway, so do not spend a send on it.  The next prune
+                # removes the entry.
+                log.info(
+                    "Skipping expired queued message %s to %s",
+                    entry.id,
+                    peer.hexhash,
+                )
                 return False
         payload = encode_message(
             entry.text,
@@ -1193,7 +1205,19 @@ class TauNode:
         # Same re-check as _deliver_entry: do not leave a sealed copy
         # with a holder for a message cancelled since the sweep listed it.
         with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
+            fresh = self.mailbox.get_outbox(entry.id)
+            if fresh is None:
+                return False
+            if fresh.expires_at <= time.time():
+                # Past its deadline since the sweep listed it: a holder
+                # would only ever hand the recipient a copy the receiver
+                # drops, so do not deposit it.  The next prune removes
+                # the entry.
+                log.info(
+                    "Skipping expired queued message %s for deposit with %s",
+                    entry.id,
+                    peer.hexhash,
+                )
                 return False
         if self.identity is None:
             return False
