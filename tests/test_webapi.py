@@ -1234,6 +1234,7 @@ def test_tan_reply_via_api(tmp_path):
             "name": "tester",
             "text": "api thread starter",
             "deleted": False,
+            "edited": False,
         }
 
         # Replying to an unknown post fails.

@@ -632,12 +632,15 @@ unlinked, and stall sync at the gap.
   holder will ever meet the recipient.
 - Request/response messaging, not streaming or group chat.
 - Tan is a public timeline: no private posts or media yet.
-  Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
+  Authors can reply to posts, edit their own posts, and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
 - Replies are a new entry kind: a peer running a version that predates
   replies rejects them, and — because entries are hash-chained — a
   rejected reply also leaves that author's later entries (including
   deletes) unlinked on the old peer until it upgrades and resyncs.
+  Edits are a new entry kind with the same caveat: an old peer rejects
+  an edit and leaves the author's later entries unlinked until it
+  upgrades, so it keeps showing the pre-edit text meanwhile.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
   Back up your own chain with `tau tan export` and restore it with
