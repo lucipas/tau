@@ -32,6 +32,18 @@ export function Console() {
     setMode(next);
   }
 
+  const { markRead } = tau;
+  const openUnread =
+    mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
+
+  // The open conversation reads as read: the auto-selected one on load,
+  // and one that gets new mail while it stays open. A failed call leaves
+  // the badge in place until the count next changes.
+  useEffect(() => {
+    if (!target || openUnread === 0) return;
+    void markRead(target).catch(() => undefined);
+  }, [target, openUnread, markRead]);
+
   function selectPeer(destination: string) {
     customPicked.current = false;
     setMode("peer");
