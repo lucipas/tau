@@ -496,13 +496,13 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        from .blocklist import blocked_destinations
-
         payload = peer.public_dict()
         # Annotate like the snapshot does, so a live update does not
         # erase the frontend's blocked badge for this peer.
-        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
-        payload["blocked"] = payload.get("destination") in blocked
+        blocklist = getattr(self.node, "blocklist", None)
+        payload["blocked"] = bool(
+            blocklist is not None and blocklist.is_blocked(payload.get("destination"))
+        )
         self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -592,7 +592,6 @@ class WebBridge:
         include_all: bool = False,
         author: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        from .blocklist import blocked_destinations, load_blocked_set
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
@@ -605,9 +604,13 @@ class WebBridge:
             timeline,
         )
 
-        blocked = load_blocked_set(
-            getattr(self.node.config, "blocklist_path", None)
-        )
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.  A list that
+        # failed closed (block_all) hides every post here, matching
+        # the gate, which drops every DM on the same condition.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -628,6 +631,7 @@ class WebBridge:
                             limit=limit,
                             posts_only=True,
                             exclude_authors=blocked,
+                            exclude_all=exclude_all,
                         )
                     )
                 )
@@ -643,6 +647,7 @@ class WebBridge:
                     limit=limit,
                     viewer=viewer,
                     exclude_authors=blocked,
+                    exclude_all=exclude_all,
                 )
             else:
                 authors = [record["author"] for record in following(conn)]
@@ -654,6 +659,7 @@ class WebBridge:
                     limit=limit,
                     viewer=viewer,
                     exclude_authors=blocked,
+                    exclude_all=exclude_all,
                 )
             if app is not None:
                 ruleset = app.ruleset
@@ -873,22 +879,24 @@ class WebBridge:
     # -- snapshots ---------------------------------------------------------
 
     def peers(self) -> List[Dict[str, Any]]:
-        from .blocklist import blocked_destinations
-
         now = time.time()
         try:
             items = [peer.public_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
-        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
+        blocklist = getattr(self.node, "blocklist", None)
         for item in items:
-            item["blocked"] = item.get("destination") in blocked
+            # is_blocked covers the fail-closed case too: with a
+            # corrupt list every peer reads as blocked, matching the
+            # DM gate, which drops every message then.
+            item["blocked"] = bool(
+                blocklist is not None
+                and blocklist.is_blocked(item.get("destination"))
+            )
         return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
-        from .blocklist import blocked_destinations
-
         with self._lock:
             items = list(self._messages)
         if limit >= 0:
@@ -897,14 +905,16 @@ class WebBridge:
         # unblocking restores the view.  Inbound records carry the
         # sender hash as "destination" (node inbox) or "peer" (console
         # log); outbound records carry the recipient, which blocking
-        # never hides.
-        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
-        if blocked:
+        # never hides.  is_blocked covers the fail-closed case too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None:
             items = [
                 item
                 for item in items
                 if item.get("direction") != "in"
-                or (item.get("destination") or item.get("peer")) not in blocked
+                or not blocklist.is_blocked(
+                    item.get("destination") or item.get("peer")
+                )
             ]
         return items
 
@@ -1515,8 +1525,5 @@ def _int_param(
     try:
         value = int(values[0])
     except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-rror, ValueError):
         return default
     return max(minimum, min(value, maximum))

@@ -1934,6 +1934,8 @@ def test_reply_snippet_blanks_blocked_parent(identities, tmp_path):
     parent = items[0]["reply_to"]
     assert parent["hash"] == post["hash"]
     assert parent["text"] == ""
+    assert parent["author"] == ""
+    assert parent["name"] == ""
     assert parent["blocked"] is True
     assert "secret words" not in json.dumps(items)
 
@@ -1955,3 +1957,16 @@ def test_thread_hides_blocked_subtree(identities, tmp_path):
         thread(conn, reply["hash"], exclude_authors=blocked)
     with pytest.raises(TanError, match="blocked author"):
         thread(conn, nested["hash"], exclude_authors=blocked)
+
+
+def test_exclude_all_hides_everything(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "from alice", name="alice", now=1000)
+    create_post(conn, bob, "from bob", name="bob", now=1001)
+
+    assert timeline(conn, include_all=True, exclude_all=True) == []
+    assert feed(conn, posts_only=True, exclude_all=True) == []
+    assert search_posts(conn, "from", exclude_all=True) == []
+    with pytest.raises(TanError, match="block-list is unusable"):
+        thread(conn, post["hash"], exclude_all=True)

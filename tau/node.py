@@ -829,19 +829,19 @@ class TauNode:
         if self.blocklist.is_blocked(caller_hash):
             # The block check runs before the allow-list: blocking an
             # allow-listed peer wins.  The drop is silent — the sender
-            # gets the same success reply as a delivered message, so
-            # blocking leaves no error oracle.  The message is never
-            # stored, never marked seen, and never passed to on_message.
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  A fake
+            # success reply was considered and rejected: the ticket
+            # says blocked messages "simply never confirm", and a
+            # success reply would falsely confirm delivery and stop
+            # the sender's retries.  The message is never stored,
+            # never marked seen, and never passed to on_message.
             log.info(
                 "Message from %s denied by the block-list",
                 caller_hash or "anonymous",
             )
-            return response_ok(
-                echo=message["text"],
-                received_at=received_at,
-                server=self.name,
-                node=self.destination_hexhash,
-                duplicate=False,
+            return response_error(
+                "unavailable", "message could not be delivered"
             )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(

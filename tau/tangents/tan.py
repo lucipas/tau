@@ -948,8 +948,9 @@ def annotate_replies(
     parent is reported as deleted with its text blanked, so the thread
     stays readable without resurfacing removed content.  A parent from
     an excluded (blocked) author is reported the same way, with its
-    text blanked and ``blocked`` set, so blocking an author never leaks
-    their words through a reply snippet.  Top-level posts get no
+    text blanked, its author and name redacted, and ``blocked`` set, so
+    blocking an author never leaks their words — or their name —
+    through a reply snippet.  Top-level posts get no
     ``reply_to`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -1158,6 +1159,7 @@ def feed(
     before: Optional[float] = None,
     posts_only: bool = False,
     exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
 
@@ -1167,8 +1169,11 @@ def feed(
     timeline items, so ``posts_only`` keeps them alongside top-level
     posts.  ``exclude_authors`` hides entries from blocked authors
     from display surfaces; the entries stay in the store, so chain
-    integrity and sync are unaffected.
+    integrity and sync are unaffected.  ``exclude_all`` hides every
+    entry — the display side of a block-list that failed closed.
     """
+    if exclude_all:
+        return []
     count = max(1, min(int(limit), MAX_FEED_POSTS))
     excluded = _clean_excluded(exclude_authors)
     if author is not None:
@@ -1191,9 +1196,11 @@ def feed(
     if posts_only:
         where += f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if excluded:
-        placeholders = ", ".join("?" for _ in excluded)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(excluded)
+        # One JSON parameter instead of one placeholder per author, so a
+        # large block-list cannot exceed SQLite's bound-variable limit
+        # (the same shape search_posts uses).
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(excluded))
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -1324,6 +1331,7 @@ def timeline(
     before: Optional[float] = None,
     viewer: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return followed posts (and local posts) newest first.
 
@@ -1335,7 +1343,11 @@ def timeline(
     author deleted never appear either.  ``exclude_authors`` hides
     posts from blocked authors — and blanks their words from reply
     snippets — while the entries stay stored, so chains stay intact.
+    ``exclude_all`` hides every post — the display side of a block-list
+    that failed closed.
     """
+    if exclude_all:
+        return []
     if include_all:
         posts = feed(
             conn,
@@ -1395,6 +1407,7 @@ def thread(
     *,
     viewer: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return the thread rooted at the post *ref* names, oldest first.
 
@@ -1414,9 +1427,12 @@ def thread(
     deleted entry, since showing it would present a partial thread.
     Entries from excluded (blocked) authors are treated like deleted
     ones: naming one raises, and a reply beneath one stays hidden with
-    its parent's subtree.
+    its parent's subtree.  ``exclude_all`` refuses any thread — the
+    display side of a block-list that failed closed.
     """
     excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show thread: the block-list is unusable")
     start = resolve_post(conn, ref)
     if not start.get("linked"):
         # A cached entry still awaiting its chain predecessor is not shown.
@@ -1513,6 +1529,7 @@ def search_posts(
     limit: int = DEFAULT_FEED_LIMIT,
     viewer: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Search stored posts by keyword, newest first.
 
@@ -1531,6 +1548,8 @@ def search_posts(
     """
     if not isinstance(query, str) or not query.strip():
         raise TanError("search text must not be empty")
+    if exclude_all:
+        return []
     count = max(1, min(int(limit), MAX_SEARCH_POSTS))
     needle = query.strip().casefold()
     params: List[Any] = []
@@ -1814,6 +1833,7 @@ class TanApp:
         authors: Optional[Sequence[str]] = None,
         limit: int = 30,
         exclude_authors: Optional[Sequence[str]] = None,
+        exclude_all: bool = False,
     ) -> List[Dict[str, Any]]:
         conn = self.connect()
         try:
@@ -1827,6 +1847,7 @@ class TanApp:
                 include_all=include_all,
                 viewer=self.author,
                 exclude_authors=exclude_authors,
+                exclude_all=exclude_all,
             )
             return apply_display_rules(posts, self.ruleset)
         finally:

@@ -1282,6 +1282,14 @@ def test_peers_marks_blocked_peers(bridge, node):
     assert payload["peers"][0]["blocked"] is False
 
 
+def test_peers_marks_everyone_blocked_when_list_failed_closed(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(block_all=True)
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is True
+
+
 def test_messages_hides_blocked_senders(bridge, node):
     from tau.blocklist import BlockList
 
@@ -1312,12 +1320,18 @@ def test_messages_hides_blocked_senders(bridge, node):
     _, _, feed = _json(bridge, "/api/messages")
     assert [m["text"] for m in feed["messages"]] == ["from alice", "from mallory"]
 
+    # A list that failed closed hides every inbound message.
+    node.blocklist = BlockList(block_all=True)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
 
 def test_tan_timeline_hides_blocked_authors(tmp_path):
     import RNS
 
-    from tau.blocklist import BlockList, save_blocklist
+    from tau.blocklist import BlockList
     from tau.config import TauConfig
+    from tau.identity import destination_hash
     from tau.tangents.tan import create_post, init_db
 
     node = FakeNode()
@@ -1329,12 +1343,9 @@ def test_tan_timeline_hides_blocked_authors(tmp_path):
         create_post(conn, bob, "from bob", name="bob", now=1001)
     finally:
         conn.close()
-    from tau.identity import destination_hash
-
-    save_blocklist(
-        node.config.blocklist_path,
-        BlockList(blocked=frozenset({destination_hash(alice).hex()})),
-    )
+    # The console uses the node's cached block-list, the same snapshot
+    # the DM gate enforces.
+    node.blocklist = BlockList(blocked=frozenset({destination_hash(alice).hex()}))
 
     bridge = WebBridge(node, host="127.0.0.1", port=0)
     bridge.start()
@@ -1342,5 +1353,10 @@ def test_tan_timeline_hides_blocked_authors(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
         assert status == 200
         assert [item["text"] for item in payload["posts"]] == ["from bob"]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert payload["posts"] == []
     finally:
         bridge.stop()

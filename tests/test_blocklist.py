@@ -66,8 +66,11 @@ def test_blocked_set_admits_only_unblocked():
     assert blocklist.is_blocked(ALICE) is True
     assert blocklist.is_blocked(ALICE.upper()) is True
     assert blocklist.is_blocked(BOB) is False
-    assert blocklist.is_blocked(None) is False
     assert blocklist.is_blocked("not-a-hash") is False
+    # An unidentified sender cannot prove they are not blocked, so
+    # with an active list they are blocked too.
+    assert blocklist.is_blocked(None) is True
+    assert BlockList().is_blocked(None) is False
 
 
 def test_save_load_roundtrip_and_mode(tmp_path):
@@ -96,6 +99,10 @@ def test_from_dict_rejects_bad_values():
         BlockList.from_dict({"blocked": ["zz" * 16]})
     with pytest.raises(BlockListError):
         BlockList.from_dict({"blocked": "aa" * 16})
+    with pytest.raises(BlockListError):
+        # null is not an empty list: it must fail closed, not
+        # silently admit everyone.
+        BlockList.from_dict({"blocked": None})
 
 
 def test_from_dict_requires_blocked_field():
@@ -134,12 +141,13 @@ def test_fail_closed_logs_the_bad_file(tmp_path, caplog):
     assert str(path) in caplog.text
 
 
-def test_load_blocked_set_never_raises(tmp_path):
+def test_load_blocked_set_returns_none_when_unusable(tmp_path):
     path = tmp_path / "blocklist.json"
     path.write_text("{not json", encoding="utf-8")
-    assert load_blocked_set(path) == frozenset()
+    assert load_blocked_set(path) is None
     save_blocklist(path, BlockList(blocked=frozenset({ALICE})))
     assert load_blocked_set(path) == frozenset({ALICE})
+    assert load_blocked_set(tmp_path / "missing.json") == frozenset()
 
 
 # -- node enforcement ------------------------------------------------------
@@ -172,10 +180,10 @@ def test_message_from_blocked_sender_is_dropped_silently(tmp_path):
     result = call_handler(
         node._handle_message, encode_message("hello", message_id="block-1"), sender
     )
-    # No oracle: the reply is the same success shape a delivered
-    # message gets, never a blocked signal.
-    assert result["ok"] is True
-    assert result["duplicate"] is False
+    assert result["ok"] is False
+    # No oracle: a generic delivery failure, never a blocked signal.
+    assert result["error"]["code"] == "unavailable"
+    assert "block" not in result["error"]["message"]
     assert received == []
     # Dropped messages are not marked seen: unblocking the sender and
     # retrying the same id delivers it as a fresh message.
@@ -217,6 +225,22 @@ def test_message_from_unblocked_sender_passes(tmp_path):
     result = call_handler(node._handle_message, encode_message("hi"), sender)
     assert result["ok"] is True
     assert len(received) == 1
+
+
+def test_anonymous_sender_blocked_when_list_active(tmp_path):
+    # A client that never identifies cannot prove it is not the peer
+    # the owner silenced, so with an active list it is blocked; with
+    # an empty list DMs stay open, as before.
+    node = make_node(tmp_path, on_message=lambda record: None)
+    save_blocklist(node.config.blocklist_path, BlockList(blocked=frozenset({ALICE})))
+    result = call_handler(node._handle_message, encode_message("hi"))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "unavailable"
+
+    # With an empty list DMs stay open, as before.
+    open_node = make_node(tmp_path / "open", on_message=lambda record: None)
+    result = call_handler(open_node._handle_message, encode_message("hi"))
+    assert result["ok"] is True
 
 
 # -- relayed (store-and-forward) enforcement ------------------------------
@@ -284,7 +308,7 @@ def _seed_peer(tmp_path, name="alice"):
 
 def test_block_cli_add_list_remove(tmp_path, capsys):
     data_dir, sender_hash = _seed_peer(tmp_path)
-    code = cli.main(["block", "add", "alice", "--data-dir", str(data_dir)])
+    code = cli.main(["block", "alice", "--data-dir", str(data_dir)])
     assert code == 0
     out = capsys.readouterr().out
     assert sender_hash.hex() in out
@@ -296,9 +320,10 @@ def test_block_cli_add_list_remove(tmp_path, capsys):
     assert payload["blocked"] == [sender_hash.hex()]
     assert payload["entries"][0]["name"] == "alice"
 
-    code = cli.main(["block", "add", "alice", "--data-dir", str(data_dir)])
+    code = cli.main(["block", "alice", "--data-dir", str(data_dir)])
     assert code == 0  # idempotent
 
+    # The allow-list-shaped aliases keep working.
     code = cli.main(["block", "remove", "alice", "--data-dir", str(data_dir)])
     assert code == 0
     capsys.readouterr()  # drain the text listing before the JSON one
@@ -306,10 +331,26 @@ def test_block_cli_add_list_remove(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["blocked"] == []
 
+    code = cli.main(["block", "add", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    code = cli.main(["unblock", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+    code = cli.main(["block", "--data-dir", str(data_dir), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["blocked"] == []
+
+
+def test_block_cli_add_needs_a_peer(tmp_path, capsys):
+    data_dir, _ = _seed_peer(tmp_path)
+    code = cli.main(["block", "add", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "needs a peer" in capsys.readouterr().err
+
 
 def test_block_cli_unknown_peer(tmp_path, capsys):
     data_dir, _ = _seed_peer(tmp_path)
-    code = cli.main(["block", "add", "nobody", "--data-dir", str(data_dir)])
+    code = cli.main(["block", "nobody", "--data-dir", str(data_dir)])
     assert code == 1
     assert "unknown peer" in capsys.readouterr().err
 
@@ -356,3 +397,63 @@ def test_messages_hides_blocked_senders(tmp_path, capsys):
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 2
+
+
+def test_messages_hides_everything_when_list_unusable(tmp_path, capsys):
+    # A corrupt block-list fails closed at the node, so the view must
+    # fail closed too instead of resurfacing hidden history.
+    data_dir, _ = _seed_peer(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "aa" * 16,
+            "text": "from alice",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    config.blocklist_path.write_text("{not json", encoding="utf-8")
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+
+
+
+def test_cli_timeline_names_blocked_parent(tmp_path, capsys):
+    from tau.tangents.tan import create_post, init_db
+
+    data_dir = tmp_path / "alice"
+    assert cli.main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    # A post from another author (bob), stored directly, that the
+    # local node then replies to.
+    bob = RNS.Identity()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = create_post(conn, bob, "bob thread starter", name="bob", now=1000)
+    finally:
+        conn.close()
+    assert (
+        cli.main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json",
+                "--reply-to", post["hash"][:16], "cli reply",
+            ]
+        )
+        == 0
+    )
+    # Block bob and the reply line must name the block instead of
+    # printing a blank snippet — and bob's words must not leak.
+    assert cli.main(["block", post["author"], "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(["tan", "timeline", "--data-dir", str(data_dir), "--all"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "in reply to a blocked author's post" in out
+    assert "bob thread starter" not in out
+    assert "cli reply" in out

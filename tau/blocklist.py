@@ -14,7 +14,11 @@ The list lives next to the allow-list, persisted as JSON in the data
 directory (``blocklist.json``), with the same fail-closed loading
 care: a missing file means nobody is blocked; a file that cannot be
 parsed is treated as blocking *everyone*, so a corrupt list can never
-silently admit a sender the owner meant to silence.  Blocking an
+silently admit a sender the owner meant to silence.  The same
+fail-closed logic applies to senders who never identify on the link:
+with an active list, an unidentified sender is blocked, because they
+cannot prove they are not the peer the owner silenced; an empty list
+keeps DMs open, as before.  Blocking an
 allow-listed peer is allowed and wins — the block check runs before
 the allow-list check.
 
@@ -68,11 +72,19 @@ class BlockList:
     block_all: bool = False
 
     def is_blocked(self, destination: Optional[str]) -> bool:
-        """True when *destination* is silenced by this list."""
+        """True when *destination* is silenced by this list.
+
+        An unidentified sender (``None``) cannot prove they are not
+        blocked, so with an active list — any entries, or ``block_all``
+        — they are blocked too; an empty list keeps DMs open, as
+        before.  Honest tau nodes always identify on the link, so
+        this only bites a client that deliberately skips identifying
+        to dodge the list.
+        """
         if self.block_all:
             return True
         if destination is None:
-            return False
+            return bool(self.blocked)
         try:
             return clean_destination(destination) in self.blocked
         except AllowListError:
@@ -151,23 +163,16 @@ def load_blocklist_or_block_all(
         return BlockList(block_all=True)
 
 
-def blocked_destinations(blocklist: Optional[BlockList]) -> FrozenSet[str]:
-    """The hashes *blocklist* silences, for timeline/feed filtering."""
-    if blocklist is None or blocklist.block_all:
-        return frozenset()
-    return blocklist.blocked
-
-
-def load_blocked_set(path: Optional[Union[str, Path]]) -> FrozenSet[str]:
+def load_blocked_set(path: Optional[Union[str, Path]]) -> Optional[FrozenSet[str]]:
     """Load the blocked hashes at *path* for display filtering.
 
-    Display callers (timeline, ``tau messages``) never fail a view
-    because the list is unreadable: a corrupt file still blocks
-    everyone at the node, but a read-only view cannot know the set,
-    so it filters nothing and logs the problem instead.
+    Returns ``None`` when the list cannot be read or parsed: display
+    callers must then hide everything (fail closed), matching the
+    node, which blocks all senders on the same condition — a corrupt
+    file must not unhide content the owner had hidden.
     """
     try:
-        return blocked_destinations(load_blocklist(path))
+        return load_blocklist(path).blocked
     except BlockListError as exc:
-        log.warning("Block-list at %s is unusable (%s); not filtering", path, exc)
-        return frozenset()
+        log.warning("Block-list at %s is unusable (%s); hiding everything", path, exc)
+        return None

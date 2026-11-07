@@ -493,31 +493,26 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="silence a peer: drop their DMs and hide their Tan posts",
     )
-    block_sub = block.add_subparsers(dest="block_command", metavar="BLOCK_COMMAND")
-    block_sub.required = True
-
-    block_list = block_sub.add_parser(
-        "list", parents=[common], help="show the block-list"
+    block.add_argument(
+        "target",
+        nargs="?",
+        help="peer to block (name, hash or prefix); 'list' shows the list, "
+        "'add'/'remove' take the peer as a second word",
     )
-    block_list.set_defaults(func=cmd_block)
+    block.add_argument(
+        "peer",
+        nargs="?",
+        help="peer for 'add'/'remove'",
+    )
+    block.set_defaults(func=cmd_block)
 
-    block_add = block_sub.add_parser(
-        "add",
+    unblock = subparsers.add_parser(
+        "unblock",
         parents=[common],
-        help="block a peer (name, hash or prefix)",
+        help="unblock a peer (name, hash or prefix)",
     )
-    block_add.add_argument("peer", help="peer name, destination hash or hash prefix")
-    block_add.set_defaults(func=cmd_block)
-
-    block_remove = block_sub.add_parser(
-        "remove",
-        parents=[common],
-        help="unblock a peer",
-    )
-    block_remove.add_argument(
-        "peer", help="peer name, destination hash or hash prefix"
-    )
-    block_remove.set_defaults(func=cmd_block)
+    unblock.add_argument("peer", help="peer name, destination hash or hash prefix")
+    unblock.set_defaults(func=cmd_block, block_command="remove")
 
     messages = subparsers.add_parser(
         "messages",
@@ -1088,7 +1083,7 @@ def _print_tan_posts(
             parent = post.get("reply_to")
             if isinstance(parent, dict):
                 if parent.get("blocked"):
-                    print("  in reply to a post by a blocked author")
+                    print("  in reply to a blocked author's post")
                 elif parent.get("deleted"):
                     print("  in reply to a deleted post")
                 else:
@@ -1363,6 +1358,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                         limit=args.limit,
                         posts_only=True,
                         exclude_authors=blocked,
+                        exclude_all=blocked is None,
                     )
                 )
             )
@@ -1378,6 +1374,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 limit=args.limit,
                 viewer=viewer,
                 exclude_authors=blocked,
+                exclude_all=blocked is None,
             )
         else:
             authors = [record["author"] for record in following(conn)]
@@ -1386,6 +1383,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             posts = timeline(
                 conn, authors, limit=args.limit, viewer=viewer,
                 exclude_authors=blocked,
+                exclude_all=blocked is None,
             )
     finally:
         conn.close()
@@ -1401,6 +1399,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
 def cmd_tan_search(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1416,7 +1415,8 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
             author=author,
             limit=args.limit,
             viewer=viewer,
-            exclude_authors=load_blocked_set(config.blocklist_path),
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
         )
     finally:
         conn.close()
@@ -1440,11 +1440,13 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
+        blocked = load_blocked_set(config.blocklist_path)
         posts = thread(
             conn,
             args.ref,
             viewer=viewer,
-            exclude_authors=load_blocked_set(config.blocklist_path),
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
         )
     finally:
         conn.close()
@@ -2350,10 +2352,14 @@ def cmd_messages(args: argparse.Namespace) -> int:
         raise NodeError("--limit must not be negative")
     # Blocked senders' history stays stored but is hidden locally;
     # unblocking restores the view.  Filter before applying the limit so
-    # hidden messages do not use up the requested count.
+    # hidden messages do not use up the requested count.  A block-list
+    # that cannot be read hides everything, matching the node, which
+    # blocks all senders on the same condition.
     entries = inbox.list_messages(limit=None, peer=peer_hash)
     blocked = load_blocked_set(config.blocklist_path)
-    if blocked:
+    if blocked is None:
+        entries = []
+    elif blocked:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
@@ -2767,19 +2773,43 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return _EXIT_ERROR
 
+    # Forms: `tau block <peer>` blocks, `tau unblock <peer>` unblocks,
+    # `tau block list` lists, and `tau block add/remove <peer>` keep
+    # working as the allow-list-shaped aliases.  A peer literally
+    # named "list", "add" or "remove" is blocked via `block add <name>`.
     command = getattr(args, "block_command", None)
+    target = getattr(args, "target", None)
+    peer_arg = getattr(args, "peer", None)
     registry = PeerRegistry(config.peers_path)
     changed = False
 
-    if command == "add":
-        destination = _resolve_allowlist_peer(registry, args.peer)
+    if command == "remove":
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination in blocklist.blocked:
+            blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif target in (None, "list") and peer_arg is None:
+        pass  # list
+    elif target == "add":
+        if peer_arg is None:
+            raise NodeError("`tau block add` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
         if destination not in blocklist.blocked:
             blocklist = blocklist.with_added(destination)
             changed = True
-    elif command == "remove":
-        destination = _resolve_allowlist_peer(registry, args.peer)
+    elif target == "remove":
+        if peer_arg is None:
+            raise NodeError("`tau block remove` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
         if destination in blocklist.blocked:
             blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif peer_arg is not None:
+        raise NodeError(f"unexpected argument: {peer_arg!r}")
+    else:
+        destination = _resolve_allowlist_peer(registry, target)
+        if destination not in blocklist.blocked:
+            blocklist = blocklist.with_added(destination)
             changed = True
 
     if changed:
