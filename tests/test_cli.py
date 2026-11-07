@@ -17,7 +17,7 @@ from tau.inbox import Inbox
 from tau.lxmf import lxmf_delivery_hash
 from tau.mailbox import Mailbox
 from tau.node import InstanceLock
-from tau.peers import PeerRegistry
+from tau.peers import PeerRegistry, safety_number
 
 
 def test_parser_accepts_global_options_before_and_after_command():
@@ -125,7 +125,7 @@ def test_id_text_output_includes_lxmf_address(tmp_path, capsys):
     code = cli.main(["id", "--data-dir", str(data_dir)])
     assert code == 0
     lines = capsys.readouterr().out.splitlines()
-    expected = f"lxmf:        {lxmf_delivery_hash(identity).hex()}"
+    expected = f"lxmf:          {lxmf_delivery_hash(identity).hex()}"
     assert expected in lines
 
 
@@ -401,6 +401,153 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
+
+
+def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
+    """Init a node and register one peer built from a real identity."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "owner",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    if capsys is not None:
+        capsys.readouterr()  # drain the init payload so later reads are clean
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name=peer_name,
+        now=100.0,
+    )
+    registry.save()
+    return data_dir, config, peer_identity
+
+
+def test_id_includes_safety_number(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "alice",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    identity = load_identity(data_dir / "identity")
+    assert identity is not None
+
+    code = cli.main(["id", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safety_number"] == safety_number(identity.get_public_key())
+
+    code = cli.main(["id", "--data-dir", str(data_dir)])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        f"safety number: {safety_number(identity.get_public_key())}" in lines
+    )
+
+
+def test_peers_verify_marks_peer_verified(tmp_path, capsys):
+    data_dir, config, peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+    owner = load_identity(data_dir / "identity")
+    assert owner is not None
+    expected = safety_number(
+        owner.get_public_key(), peer_identity.get_public_key()
+    )
+
+    code = cli.main(["peers", "verify", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Verified alice" in out
+    assert expected in out
+
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.get("alice")
+    assert peer is not None
+    assert peer.is_verified
+    assert peer.verified_fingerprint == expected
+
+    # The table now shows the verified marker.
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "✓" in capsys.readouterr().out
+
+
+def test_peers_verify_json_reports_reverification(tmp_path, capsys):
+    data_dir, config, _peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+
+    code = cli.main(
+        ["peers", "verify", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["reverified"] is False
+    assert first["fingerprint_changed"] is False
+
+    code = cli.main(
+        ["peers", "verify", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["reverified"] is True
+    assert second["safety_number"] == first["safety_number"]
+
+
+def test_peers_verify_unknown_peer_returns_error(tmp_path, capsys):
+    data_dir, _config, _peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+
+    code = cli.main(["peers", "verify", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_safety_number_lists_pairwise_numbers(tmp_path, capsys):
+    data_dir, _config, peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+    owner = load_identity(data_dir / "identity")
+    assert owner is not None
+    expected = safety_number(
+        owner.get_public_key(), peer_identity.get_public_key()
+    )
+
+    code = cli.main(["peers", "--safety-number", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert expected in capsys.readouterr().out
+
+    code = cli.main(
+        ["peers", "--safety-number", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["peers"][0]["safety_number"] == expected
+
+
+def test_peers_safety_number_without_identity_returns_error(tmp_path, capsys):
+    code = cli.main(
+        ["peers", "--safety-number", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
 
 
 def test_parser_messages_arguments():

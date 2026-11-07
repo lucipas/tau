@@ -41,7 +41,7 @@ from .node import (
     TauNode,
     check_tcp_listen_ports,
 )
-from .peers import Peer, PeerError, PeerRegistry
+from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
 from .util import atomic_write_text
@@ -329,7 +329,26 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|HASH",
         help="with --exchange, ask only this peer instead of all known peers",
     )
+    peers.add_argument(
+        "--safety-number",
+        action="store_true",
+        help="show each peer's pairwise safety number (compare it with the "
+        "peer over another channel to confirm the key is theirs)",
+    )
     peers.set_defaults(func=cmd_peers)
+    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_verify = peers_sub.add_parser(
+        "verify",
+        parents=[common],
+        help="record that the safety number was compared with a peer "
+        "out of band and matched",
+    )
+    peers_verify.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to mark verified",
+    )
+    peers_verify.set_defaults(func=cmd_peers_verify)
 
     identity = subparsers.add_parser(
         "id",
@@ -893,19 +912,25 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> None:
+def _print_peer_table(
+    peers: Iterable[Peer],
+    *,
+    now: Optional[float] = None,
+    safety_numbers: Optional[Dict[str, str]] = None,
+) -> None:
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
         return
     timestamp = now if now is not None else time.time()
-    header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN", "LXMF")
+    header = ("DESTINATION", "NAME", "VERIFIED", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
         table.append(
             (
                 peer.hexhash,
                 peer.display_name,
+                "✓" if peer.is_verified else "",
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
                 peer.lxmf_hash or "—",
@@ -914,6 +939,22 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     for row in table:
         print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    changed = [p for p in rows if p.key_change_at is not None]
+    for peer in changed:
+        print(
+            f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+            "presented a different public key under the same destination "
+            "hash; the recorded key was kept. Re-verify this peer out of "
+            "band before trusting it.",
+            file=sys.stderr,
+        )
+    if safety_numbers:
+        print("\nSafety numbers — compare each with the peer over another "
+              "channel; a match confirms the key is theirs:")
+        for peer in rows:
+            number = safety_numbers.get(peer.hexhash)
+            if number:
+                print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
 
 
 def _make_config(
@@ -1922,13 +1963,74 @@ def cmd_peers(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = registry.all(max_age=max_age)
+    safety_numbers: Optional[Dict[str, str]] = None
+    if getattr(args, "safety_number", False):
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise NodeError(
+                f"no identity at {config.identity_path}; run `tau init` first"
+            )
+        local_key = identity.get_public_key()
+        safety_numbers = {
+            peer.hexhash: safety_number(local_key, peer.public_key)
+            for peer in peers
+        }
+    if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        if safety_numbers is not None:
+            for entry in payload:
+                entry["safety_number"] = safety_numbers[entry["destination"]]
+        _emit({"peers": payload, "count": len(peers)}, True)
+    else:
+        _print_peer_table(peers, safety_numbers=safety_numbers)
+    return _EXIT_OK
+
+
+def cmd_peers_verify(args: argparse.Namespace) -> int:
+    """Mark a peer verified after comparing safety numbers out of band."""
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    number = safety_number(identity.get_public_key(), peer.public_key)
+    previously_verified = peer.is_verified
+    previous_fingerprint = peer.verified_fingerprint
+    registry.mark_verified(peer.destination_hash, number)
+    registry.save()
     if _json_mode(args):
         _emit(
-            {"peers": [peer.to_dict() for peer in peers], "count": len(peers)},
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "safety_number": number,
+                "verified_at": peer.verified_at,
+                "reverified": previously_verified,
+                "fingerprint_changed": previously_verified
+                and previous_fingerprint != number,
+            },
             True,
         )
     else:
-        _print_peer_table(peers)
+        print(f"Verified {peer.display_name} ({short_hash(peer.hexhash)}).")
+        print(f"  safety number: {number}")
+        if previously_verified and previous_fingerprint != number:
+            print(
+                "  note: the recorded safety number changed since the last "
+                "verification (the local identity changed); updated."
+            )
+        print(
+            "  Compare this number with the peer over another channel; "
+            "if it matches, the key is theirs."
+        )
     return _EXIT_OK
 
 
@@ -2001,17 +2103,22 @@ def cmd_id(args: argparse.Namespace) -> int:
         "destination": destination,
         "identity": identity.hexhash,
         "lxmf": lxmf_delivery_hash(identity).hex(),
+        # Fingerprint of this identity alone — the pairwise safety number
+        # for a peer (shown by `tau peers --safety-number`) folds the
+        # peer's key in too, so the two numbers are different by design.
+        "safety_number": safety_number(identity.get_public_key()),
         "data_dir": str(config.data_dir),
         "rns_config": str(config.rns_config_file),
     }
     if _json_mode(args):
         _emit(payload, True)
     else:
-        print(f"name:        {config.name}")
-        print(f"destination: {destination}")
-        print(f"identity:    {identity.hexhash}")
-        print(f"lxmf:        {payload['lxmf']}")
-        print(f"data dir:    {config.data_dir}")
+        print(f"name:          {config.name}")
+        print(f"destination:   {destination}")
+        print(f"identity:      {identity.hexhash}")
+        print(f"lxmf:          {payload['lxmf']}")
+        print(f"safety number: {payload['safety_number']}")
+        print(f"data dir:      {config.data_dir}")
     return _EXIT_OK
 
 

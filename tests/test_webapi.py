@@ -134,6 +134,22 @@ def test_status_snapshot(bridge):
     assert payload["messages"] == []
 
 
+def test_peers_endpoint_includes_verification_state(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["count"] == 1
+    entry = payload["peers"][0]
+    assert entry["verified"] is True
+    assert entry["verified_at"] == 1500.0
+    assert entry["key_change_at"] is None
+    # Verification state is local-only: the public description stays clean.
+    assert "verified" not in peer.public_dict()
+
+
 def test_send_message_is_recorded_and_published(bridge, node):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}

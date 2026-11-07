@@ -844,7 +844,9 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            # local_dict: verification is this node's own trust state, so
+            # it is shown to the console owner but never sent to peers.
+            return [peer.local_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
