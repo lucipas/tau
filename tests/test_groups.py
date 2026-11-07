@@ -373,7 +373,7 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert node.inbox.list_messages(group=group_id)[0]["text"] == "hi all"
     assert node.inbox.list_messages(group=generate_group_id()) == []
     pinned = node.groups.get(group_id)
-    assert pinned is not None and pinned["members"] == members
+    assert pinned is not None and pinned["members"] == sorted(members)
     assert pinned["name"] == "weekend"
     assert pinned["creator"] == sender_hash
 
