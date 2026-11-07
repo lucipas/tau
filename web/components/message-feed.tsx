@@ -162,6 +162,26 @@ function MessageBubble({ message }: { message: TauMessage }) {
           {message.text}
         </div>
 
+        {message.reactions && message.reactions.length > 0 ? (
+          <div
+            className={`flex flex-wrap gap-1.5 px-1 pt-1.5 ${
+              outbound ? "justify-end" : ""
+            }`}
+            aria-label="Reactions"
+          >
+            {message.reactions.map((reaction) => (
+              <span
+                key={reaction.reactor}
+                title={reaction.name}
+                className="inline-flex items-center gap-1 rounded-full border border-line/80 bg-void/60 px-2 py-0.5 font-mono text-[11px] text-zinc-300"
+              >
+                <span aria-hidden="true">{reaction.reaction}</span>
+                <span>{reaction.name}</span>
+              </span>
+            ))}
+          </div>
+        ) : null}
+
         <div
           className={`flex items-center gap-2 px-1 pt-1 font-mono text-[10px] ${
             outbound ? "text-signal/70" : "text-mist/60"

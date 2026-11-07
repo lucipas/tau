@@ -43,7 +43,7 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import PROTOCOL_VERSION, ProtocolError, clean_reaction, short_hash
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -291,6 +291,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail instead of queueing the message when the peer is offline",
     )
     send.set_defaults(func=cmd_send)
+
+    react = subparsers.add_parser(
+        "react",
+        parents=[common],
+        help="react to a received message",
+    )
+    react.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    react.add_argument(
+        "reaction",
+        nargs="?",
+        help="emoji or short text token, e.g. 👍 or +1 (omit with --clear)",
+    )
+    react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    react.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    react.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    react.set_defaults(func=cmd_react)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -2300,6 +2330,76 @@ def cmd_messages(args: argparse.Namespace) -> int:
         print(f"[{when}] {name} ({sender})")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        for reaction in entry.get("reactions") or []:
+            reactor = registry.get(str(reaction.get("destination") or ""))
+            reactor_name = (
+                reactor.display_name
+                if reactor is not None
+                else str(reaction.get("from") or "unknown")
+            )
+            print(f"  {reaction.get('reaction')} {reactor_name}")
+    return _EXIT_OK
+
+
+def cmd_react(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "clear", False)) == bool(getattr(args, "reaction", None)):
+        raise NodeError("give a reaction, or --clear to retract it (not both)")
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to react to")
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known sender to react to")
+    token = "" if getattr(args, "clear", False) else str(args.reaction)
+    # Validate the token before starting the node: a bad token is a
+    # usage error, not a delivery failure.
+    clean_reaction(token)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        try:
+            response = node.send_reaction(
+                author,
+                str(target["id"]),
+                token,
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        except NodeError as exc:
+            # Reactions ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver reaction: {exc} "
+                "(reactions need the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "reaction": token,
+                "cleared": not token,
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif not token:
+        print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    else:
+        print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
     return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.

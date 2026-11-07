@@ -127,6 +127,7 @@ The same bridge is the local integration point for scripts:
 | `/api/peers` | GET | peer registry |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
@@ -248,6 +249,7 @@ Global options may appear before or after the command:
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
@@ -311,6 +313,11 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# React to a received message (id or unique prefix from `tau messages`)
+tau react a1b2c3d4 👍
+tau react a1b2c3d4 +1
+tau react a1b2c3d4 --clear
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
@@ -474,6 +481,25 @@ node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
 direct and relayed alike — and can be read back with `tau messages`;
 a message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
+
+### DM reactions
+
+A DM reaction is its own message kind (`/tau/react`), not a text message:
+`tau react <message-id> <emoji>` sends one emoji or short text token
+(`👍`, `+1`, `lol` — at most 32 characters, never an image) naming the
+message it answers, and `tau react <message-id> --clear` retracts it. The
+sender is authenticated by the encrypted link, exactly as a DM is, and the
+receiver resolves state per (message, reactor) with the latest reaction
+winning — the same derivation Tan likes use, so re-sending a reaction never
+double-counts. Reactions render under the message in `tau messages` and in
+the web console, and `POST /api/react` sends one from the console's API.
+
+Reactions are delivered live in v1: the peer must be online, because the
+sealed-mail path is text-shaped throughout and cannot carry a reaction
+envelope yet. Queueing reactions for offline peers is a follow-up. A
+reaction whose target this node has never seen is still stored (the target
+may arrive later over a relay), but it is only rendered under a message the
+inbox actually holds.
 
 ### Tan posts
 

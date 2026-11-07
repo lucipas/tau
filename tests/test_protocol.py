@@ -138,3 +138,64 @@ def test_response_helpers():
 def test_short_hash():
     assert short_hash("abcdef1234", 4) == "abcd"
     assert short_hash("", 4) == ""
+
+
+def test_reaction_roundtrip():
+    from tau.protocol import clean_reaction, encode_reaction, parse_reaction
+
+    data = encode_reaction("msg-123", "👍", message_id="react-1")
+    parsed = parse_reaction(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["reaction"] == "👍"
+    assert parsed["id"] == "react-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_reaction_clear_roundtrip():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    parsed = parse_reaction(encode_reaction("msg-123", ""))
+    assert parsed["reaction"] == ""
+
+
+def test_clean_reaction_accepts_emoji_and_short_tokens():
+    from tau.protocol import MAX_REACTION_CHARS, clean_reaction
+
+    assert clean_reaction("👍") == "👍"
+    assert clean_reaction("+1") == "+1"
+    assert clean_reaction("  lol  ") == "lol"
+    assert clean_reaction("") == ""
+    assert clean_reaction("   ") == ""
+    assert clean_reaction(None) == ""
+
+
+def test_clean_reaction_rejects_long_or_non_string_tokens():
+    from tau.protocol import MAX_REACTION_CHARS, clean_reaction
+
+    with pytest.raises(ProtocolError):
+        clean_reaction("x" * (MAX_REACTION_CHARS + 1))
+    with pytest.raises(ProtocolError):
+        clean_reaction(42)
+    with pytest.raises(ProtocolError):
+        clean_reaction(b"bytes")
+
+
+def test_parse_reaction_rejects_wrong_shape():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "message", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "reaction", "target": "msg-1"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "reaction", "target": "", "reaction": "👍"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode(
+                {
+                    "type": "reaction",
+                    "target": "msg-1",
+                    "reaction": "x" * 33,
+                }
+            )
+        )

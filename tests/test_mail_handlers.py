@@ -14,6 +14,8 @@ from tau.mailbox import open_message, seal_message
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
+    ProtocolError,
+    encode_reaction,
     build_mail_fetch,
     build_mail_store,
     decode,
@@ -21,13 +23,14 @@ from tau.protocol import (
 )
 
 
-def make_node(tmp_path, name="holder", on_message=None, on_delivered=None):
+def make_node(tmp_path, name="holder", on_message=None, on_delivered=None, on_reaction=None):
     config = TauConfig.resolve(data_dir=tmp_path, name=name)
     node = TauNode(
         config,
         registry=PeerRegistry(config.peers_path),
         on_message=on_message,
         on_delivered=on_delivered,
+        on_reaction=on_reaction,
     )
     return node
 
@@ -604,3 +607,109 @@ def test_deliver_entry_reports_nothing_when_delivery_fails(tmp_path):
     assert node._deliver_entry(peer, entry, timeout=5.0) is False
     assert node.mailbox.get_outbox(entry.id) is not None
     assert delivered == []
+
+
+def test_reaction_is_recorded_and_fanned_out(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_reaction=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+
+    payload = encode_reaction("msg-1", "👍", message_id="react-1")
+    response = call_handler(node._handle_reaction, payload, remote_identity=sender)
+
+    assert response["ok"] is True
+    assert response["reaction"] == "👍"
+    assert response["target"] == "msg-1"
+    assert response["duplicate"] is False
+    assert len(received) == 1
+    assert received[0]["target"] == "msg-1"
+    assert received[0]["reaction"] == "👍"
+    assert received[0]["destination"] == destination_hash(sender).hex()
+    reactions = node.inbox.reactions_for("msg-1")
+    assert len(reactions) == 1
+    assert reactions[0]["reaction"] == "👍"
+
+
+def test_reaction_dedupes_by_id(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    payload = encode_reaction("msg-1", "👍", message_id="react-dup")
+    first = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    second = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+
+
+def test_reaction_clear_removes_the_reaction(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    call_handler(
+        node._handle_reaction,
+        encode_reaction("msg-1", "👍", message_id="react-1"),
+        remote_identity=sender,
+    )
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+    response = call_handler(
+        node._handle_reaction,
+        encode_reaction("msg-1", "", message_id="react-2"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_rejects_invalid_payload(tmp_path):
+    node = make_node(tmp_path)
+    response = call_handler(node._handle_reaction, b"not json")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+
+
+def test_reaction_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    response = call_handler(
+        node._handle_reaction, encode_reaction("msg-1", "👍")
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    save_allowlist(
+        config.allowlist_path, AllowList(enabled=True, allow=frozenset())
+    )
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        encode_reaction("msg-1", "👍"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_send_reaction_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(ProtocolError):
+        node.send_reaction("alice", "msg-1", "x" * 33)
+    with pytest.raises(NodeError):
+        node.send_reaction("alice", "", "👍")
