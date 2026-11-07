@@ -1848,8 +1848,3 @@ class TauNode:
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
         return decoded
-  raise NotAllowedError(f"peer rejected the request: {message}")
-            raise NodeError(f"peer rejected the request: {message}")
-        if isinstance(state.get("rtt"), (int, float)):
-            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
-        return decoded

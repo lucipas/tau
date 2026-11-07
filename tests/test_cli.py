@@ -251,6 +251,25 @@ def test_status_counts_seeded_state(tmp_path, capsys):
     assert payload["allowlist"] == {"enabled": True, "entries": 1}
 
 
+def test_status_expired_mail_is_queued_not_due(tmp_path, capsys):
+    # Expired outbox entries linger until a prune runs, but they will
+    # never be delivered, so status counts them as queued, not due.
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(
+        to=b"\xbb" * 16,
+        text="stale",
+        message_id="cc" + "33" * 15,
+        now=time.time() - 8 * 24 * 60 * 60,
+    )
+    code = cli.main(["status", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outbox"] == {"queued": 1, "due": 0, "held": 0}
+
+
 def test_status_reports_serving_node(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     capsys.readouterr()  # drain the --json output of `tau init`
