@@ -565,6 +565,28 @@ def test_peers_forget_removes_peer(tmp_path, capsys):
     assert "no peer matches" in capsys.readouterr().err
 
 
+def test_peers_forget_refuses_queued_mail_without_force(tmp_path, capsys):
+    data_dir, config, peer_identity = _init_and_seed_peer(
+        tmp_path, capsys=capsys
+    )
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.enqueue(
+        to=destination_hash(peer_identity), text="hello", to_name="alice"
+    )
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "queued message" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("alice") is not None
+
+    code = cli.main(
+        ["peers", "forget", "alice", "--force", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "will not be attempted" in capsys.readouterr().out
+    assert PeerRegistry(config.peers_path).get("alice") is None
+
+
 def test_id_import_different_identity_clears_verifications(tmp_path, capsys):
     node_a = _init_node(tmp_path, "a", "alice")
     capsys.readouterr()
@@ -657,6 +679,59 @@ def test_id_import_same_identity_keeps_verifications(tmp_path, capsys):
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["verifications_cleared"] == 0
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
+def test_id_import_registry_save_failure_aborts_replacement(
+    tmp_path, capsys, monkeypatch
+):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # The registry write fails: the import must abort with the old
+    # identity still in place, not commit the new key alongside stale
+    # verified markers.
+    monkeypatch.setattr(cli.PeerRegistry, "save", lambda self: False)
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "identity not replaced" in capsys.readouterr().err
+    assert _id_destination(node_a, capsys) == destination_a
     assert PeerRegistry(config_a.peers_path).get("bob").is_verified
 
 

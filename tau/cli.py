@@ -360,6 +360,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|HASH",
         help="peer to remove",
     )
+    peers_forget.add_argument(
+        "--force",
+        action="store_true",
+        help="forget even while messages are still queued for the peer "
+        "(they will not be attempted until the peer is rediscovered)",
+    )
     peers_forget.set_defaults(func=cmd_peers_forget)
 
     identity = subparsers.add_parser(
@@ -2051,17 +2057,42 @@ def cmd_peers_forget(args: argparse.Namespace) -> int:
     config = _make_config(args)
     registry = PeerRegistry(config.peers_path)
     try:
-        peer = registry.forget(args.target)
+        peer = registry.resolve(args.target)
     except PeerError as exc:
         raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    # Mail sweeps iterate registered peers: forgetting a peer with
+    # queued mail would strand those messages until it is rediscovered
+    # (or they expire).  Refuse unless the owner explicitly forces it.
+    mailbox = Mailbox(config.mailbox_path)
+    queued = mailbox.outbox_list(to=peer.destination_hash)
+    if queued and not getattr(args, "force", False):
+        raise NodeError(
+            f"{peer.display_name} still has {len(queued)} queued "
+            "message(s); forgetting this peer would strand them until "
+            "it is rediscovered. Deliver or cancel the mail first, or "
+            "pass --force to forget anyway."
+        )
+    registry.forget(peer.destination_hash)
     registry.save()
     if _json_mode(args):
         _emit(
-            {"peer": peer.hexhash, "name": peer.display_name, "forgotten": True},
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "forgotten": True,
+                "queued_messages": len(queued),
+            },
             True,
         )
     else:
         print(f"Forgot {peer.display_name} ({short_hash(peer.hexhash)}).")
+        if queued:
+            print(
+                f"  warning: {len(queued)} queued message(s) for this peer "
+                "will not be attempted until it is rediscovered."
+            )
         print("  The next genuine announce from this peer re-adds it.")
     return _EXIT_OK
 
@@ -2244,13 +2275,28 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                 )
             except Exception:
                 old_key = None
-            save_identity(identity, config.identity_path)
             verifications_cleared = 0
             if old_key != identity.get_public_key():
+                # Persist the invalidation BEFORE replacing the identity:
+                # if the registry write fails, abort with the old
+                # identity still in place rather than leaving the new
+                # identity alongside stale verified markers.
                 registry = PeerRegistry(config.peers_path)
                 verifications_cleared = registry.clear_verifications()
                 if verifications_cleared:
-                    registry.save()
+                    try:
+                        saved = registry.save()
+                    except OSError as exc:
+                        raise NodeError(
+                            "could not save peer registry "
+                            f"({exc}); identity not replaced"
+                        ) from exc
+                    if not saved:
+                        raise NodeError(
+                            "could not save peer registry; "
+                            "identity not replaced"
+                        )
+            save_identity(identity, config.identity_path)
     finally:
         lock.release()
     payload = {
