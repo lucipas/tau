@@ -276,6 +276,8 @@ Global options may appear before or after the command:
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
 | `tau tan rules` | Show or change which remote entries get committed |
+| `tau bundle export FILE [--tan]` | Write sealed mail (and optionally Tan posts) to a signed bundle file for offline carrying |
+| `tau bundle import FILE` | Merge a bundle file into this node's mailbox and Tan store |
 
 Useful flags:
 
@@ -474,6 +476,25 @@ node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
 direct and relayed alike — and can be read back with `tau messages`;
 a message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
+
+### Sneakernet bundles
+
+When two nodes share no network at all, mail can still travel on a
+file. `tau bundle export FILE` writes a signed bundle containing the
+sealed envelopes this node is holding for other peers, plus its queued
+outbox messages sealed fresh to each recipient (an outbox message whose
+recipient's key is not in the peer registry is skipped and reported,
+never written in the clear). With `--tan` it also includes recent Tan
+posts from every stored author. `tau bundle import FILE` on another
+node verifies the exporter's signature, then merges the contents
+through the normal checks: sealed envelopes become held mail under the
+same caps and dedupe rules, and Tan posts go through the usual
+admission/verify path. A tampered bundle fails signature verification
+and nothing inside it is applied; bundles over the size cap (8 MiB by
+default, `--max-bytes N` on either command) are refused. The import
+reports what was accepted, already present and skipped. No identity or
+private material is ever included, and there is no auto-import — a
+bundle only moves when someone carries the file and runs the command.
 
 ### Tan posts
 

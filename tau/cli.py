@@ -22,6 +22,13 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
+from .bundle import (
+    DEFAULT_MAX_BUNDLE_BYTES,
+    apply_bundle,
+    build_bundle,
+    parse_bundle,
+    serialize_bundle,
+)
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
@@ -44,7 +51,7 @@ from .node import (
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
-from .util import atomic_write_text
+from .util import atomic_write_bytes, atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
@@ -791,6 +798,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="display every entry kind (clears --kinds)",
     )
     tan_rules.set_defaults(func=cmd_tan_rules)
+
+    bundle = subparsers.add_parser(
+        "bundle",
+        parents=[common],
+        help="carry mail and Tan posts on a file (sneakernet)",
+    )
+    bundle_sub = bundle.add_subparsers(
+        dest="bundle_command", metavar="BUNDLE_COMMAND"
+    )
+    bundle_sub.required = True
+
+    bundle_export = bundle_sub.add_parser(
+        "export",
+        parents=[common],
+        help="write sealed mail (and optionally Tan posts) to a signed bundle file",
+    )
+    bundle_export.add_argument(
+        "file", metavar="FILE", type=Path, help="bundle file to write"
+    )
+    bundle_export.add_argument(
+        "--tan",
+        action="store_true",
+        help="also include Tan posts from every stored author",
+    )
+    bundle_export.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to write a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_export.set_defaults(func=cmd_bundle_export)
+
+    bundle_import = bundle_sub.add_parser(
+        "import",
+        parents=[common],
+        help="merge a bundle file into this node's mailbox and Tan store",
+    )
+    bundle_import.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='bundle file to read ("-" reads stdin)',
+    )
+    bundle_import.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to read a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_import.set_defaults(func=cmd_bundle_import)
 
     return parser
 
@@ -1667,6 +1726,97 @@ def cmd_tan_import(args: argparse.Namespace) -> int:
             ref = short_hash(error["hash"]) if error["hash"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
+
+
+def cmd_bundle_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    include_tan = bool(getattr(args, "tan", False))
+    tan_conn = None
+    try:
+        if include_tan:
+            tan_conn = init_db(config.social_db_path)
+        document, summary = build_bundle(
+            identity=identity,
+            sender_name=config.name,
+            mailbox=mailbox,
+            registry=registry,
+            tan_conn=tan_conn,
+            include_tan=include_tan,
+            max_bytes=int(
+                getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES)
+            ),
+        )
+    finally:
+        if tan_conn is not None:
+            tan_conn.close()
+    atomic_write_bytes(args.file, serialize_bundle(document))
+    if _json_mode(args):
+        _emit(summary, True)
+    else:
+        tan_text = (
+            f" and {summary['tan']} Tan post(s)" if include_tan else ""
+        )
+        print(
+            f"Exported bundle with {summary['mail']} sealed message(s)"
+            f"{tan_text} ({summary['bytes']} bytes) to {args.file}"
+        )
+        for skipped in summary["skipped"]:
+            print(f"  skipped {short_hash(skipped['id'])}: {skipped['reason']}")
+    return _EXIT_OK
+
+
+def cmd_bundle_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    if str(args.file) == "-":
+        raw = sys.stdin.buffer.read()
+    else:
+        try:
+            raw = Path(args.file).expanduser().read_bytes()
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    document = parse_bundle(
+        raw,
+        max_bytes=int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES)),
+    )
+    mailbox = Mailbox(config.mailbox_path)
+    tan_conn = None
+    try:
+        if document.get("tan") is not None:
+            tan_conn = init_db(config.social_db_path)
+        result = apply_bundle(
+            mailbox=mailbox, tan_conn=tan_conn, document=document
+        )
+    finally:
+        if tan_conn is not None:
+            tan_conn.close()
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        tan = result["tan"]
+        tan_text = ""
+        if tan is not None:
+            tan_text = (
+                f"; Tan: {tan['imported']} imported, "
+                f"{tan['present']} already present, "
+                f"{tan['skipped']} skipped"
+            )
+        print(
+            f"Imported {result['imported']} sealed message(s) "
+            f"({result['present']} already held, "
+            f"{result['skipped']} skipped){tan_text}"
+        )
+        for error in result["errors"]:
+            ref = short_hash(error["id"]) if error["id"] else "?"
+            print(f"  skipped {ref}: {error['error']}")
+    tan_clean = result["tan"] is None or result["tan"]["skipped"] == 0
+    return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
