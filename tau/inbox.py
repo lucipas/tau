@@ -283,8 +283,11 @@ class Inbox:
         The web bridge reconciles its history against this in one pass
         when serving messages, so reactions made from another process
         (e.g. ``tau react`` from the CLI) show up on the next read.
+        Read through the transaction path, so a serving process sees
+        what another process wrote to ``inbox.json`` instead of its
+        own stale in-memory cache.
         """
-        with self._lock:
+        with self._transaction():
             return [dict(item) for item in self._reactions]
 
     def resolve(self, ref: str) -> Dict[str, Any]:

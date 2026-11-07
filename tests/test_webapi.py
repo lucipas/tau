@@ -1462,15 +1462,21 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
 
 def test_messages_reconciles_cli_made_reactions(node, tmp_path):
     """A reaction written to the shared inbox by another process (the
-    CLI) shows up on the next read of the console history."""
+    CLI) shows up on the next read of the console history.
+
+    The write goes through a *second* Inbox object on the same path —
+    the way a separate ``tau react`` process writes — so the bridge's
+    own inbox must reload from disk to see it; reading its in-memory
+    cache would stay stale.
+    """
     from tau.config import TauConfig
     from tau.inbox import Inbox
 
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
-        node.inbox = Inbox(
-            TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
-        )
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        cli_inbox = Inbox(inbox_path)
         bridge.record_inbound(
             {
                 "from": "alice",
@@ -1483,7 +1489,7 @@ def test_messages_reconciles_cli_made_reactions(node, tmp_path):
         )
         # The CLI process writes only the inbox; the bridge never sees
         # a live callback for it.
-        node.inbox.record_reaction(
+        cli_inbox.record_reaction(
             {
                 "target": "wire-1",
                 "destination": PEER_HASH,
@@ -1499,7 +1505,7 @@ def test_messages_reconciles_cli_made_reactions(node, tmp_path):
             {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
         ]
         # ...and a CLI retraction clears it on the next read too.
-        node.inbox.record_reaction(
+        cli_inbox.record_reaction(
             {
                 "target": "wire-1",
                 "destination": PEER_HASH,

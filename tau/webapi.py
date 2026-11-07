@@ -1015,9 +1015,35 @@ class WebBridge:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
-        return [self._with_inbox_reactions(dict(item)) for item in items]
+        by_target = self._inbox_reactions_by_target()
+        return [
+            self._with_inbox_reactions(dict(item), by_target) for item in items
+        ]
 
-    def _with_inbox_reactions(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Node inbox reactions grouped by target, reloaded once per read.
+
+        One reload serves the whole listing: reloading per message
+        would take the cross-process lock and re-read ``inbox.json``
+        once per history entry.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return {}
+        try:
+            reactions = inbox.all_reactions()
+        except Exception:  # pragma: no cover - defensive
+            return {}
+        by_target: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in reactions:
+            target = entry.get("target")
+            if isinstance(target, str) and target:
+                by_target.setdefault(target, []).append(entry)
+        return by_target
+
+    def _with_inbox_reactions(
+        self, message: Dict[str, Any], by_target: Dict[str, List[Dict[str, Any]]]
+    ) -> Dict[str, Any]:
         """Overlay the node inbox's reaction state on one history entry.
 
         The bridge learns reactions live through its own node's callback,
@@ -1031,17 +1057,9 @@ class WebBridge:
         this reconciles reads, not the SSE stream.
         """
         wire_id = message.get("wire_id")
-        inbox = getattr(self.node, "inbox", None)
-        if not wire_id or inbox is None:
+        if not wire_id:
             return message
-        try:
-            stored = [
-                entry
-                for entry in inbox.all_reactions()
-                if entry.get("target") == wire_id
-            ]
-        except Exception:  # pragma: no cover - defensive
-            return message
+        stored = by_target.get(wire_id)
         if not stored:
             return message
         merged: Dict[str, Dict[str, Any]] = {
