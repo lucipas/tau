@@ -50,6 +50,7 @@ from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
+    clean_in_reply_to,
     decode,
     encode,
     generate_message_id,
@@ -101,6 +102,7 @@ class OutboxEntry:
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
     held_by: Dict[str, float] = field(default_factory=dict)
+    in_reply_to: Optional[Dict[str, Any]] = None
 
     @property
     def to_hex(self) -> str:
@@ -136,7 +138,7 @@ class OutboxEntry:
         return (now if now is not None else time.time()) >= target
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "id": self.id,
             "to": self.to_hex,
             "to_name": self.to_name,
@@ -149,6 +151,9 @@ class OutboxEntry:
             "next_attempt_at": self.next_attempt_at,
             "held_by": dict(self.held_by),
         }
+        if self.in_reply_to is not None:
+            payload["in_reply_to"] = dict(self.in_reply_to)
+        return payload
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OutboxEntry":
@@ -171,6 +176,13 @@ class OutboxEntry:
         if not isinstance(held_by, dict):
             held_by = {}
         attempts = raw.get("attempts")
+        try:
+            in_reply_to = clean_in_reply_to(raw.get("in_reply_to"))
+        except ValueError:
+            # A corrupt reference on an already-queued entry must not
+            # make the outbox unreadable; the message still delivers,
+            # just without its quote.
+            in_reply_to = None
         return cls(
             id=message_id,
             to=destination,
@@ -192,6 +204,7 @@ class OutboxEntry:
                 for k, v in held_by.items()
                 if isinstance(v, (int, float))
             },
+            in_reply_to=in_reply_to,
         )
 
 
@@ -428,6 +441,7 @@ class Mailbox:
         ttl: float = DEFAULT_TTL,
         message_id: Optional[str] = None,
         now: Optional[float] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*."""
         if len(to) != _DESTINATION_BYTES:
@@ -435,6 +449,7 @@ class Mailbox:
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
         entry_id = message_id or generate_message_id()
+        reply_to = clean_in_reply_to(in_reply_to)
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -450,6 +465,7 @@ class Mailbox:
                 to_name=sanitize_name(to_name, fallback="")
                 if to_name
                 else "",
+                in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry
             self.save()
@@ -742,6 +758,7 @@ def seal_message(
     message_id: str,
     text: str,
     sent_at: float,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -762,6 +779,9 @@ def seal_message(
         "text": normalize_message(text),
         "sent_at": float(sent_at),
     }
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        inner["in_reply_to"] = reply_to
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -839,10 +859,15 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
+    try:
+        in_reply_to = clean_in_reply_to(payload.get("in_reply_to"))
+    except ProtocolError as exc:
+        raise MailboxError(f"sealed message reply is invalid: {exc}") from exc
     return {
         "id": message_id,
         "from": claimed_from.lower(),
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+        "in_reply_to": in_reply_to,
     }

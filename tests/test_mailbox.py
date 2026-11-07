@@ -23,6 +23,7 @@ from tau.protocol import (
     build_mail_fetch,
     build_mail_store,
     encode_message,
+    excerpt_hash,
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
@@ -347,6 +348,62 @@ def test_seal_and_open_roundtrip():
     assert message["from_name"] == "alice"
     assert message["from"] == destination_hash(sender).hex()
     assert message["sent_at"] == 4242.0
+
+
+def test_seal_and_open_roundtrip_with_reply():
+    sender, recipient = make_identity_pair()
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-9",
+        text="seconded",
+        sent_at=4242.0,
+        in_reply_to=reply_to,
+    )
+    message = open_message(recipient, blob)
+    assert message["id"] == "msg-9"
+    assert message["in_reply_to"] == reply_to
+
+
+def test_seal_and_open_without_reply_has_no_reference():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-10",
+        text="standalone",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, blob)["in_reply_to"] is None
+
+
+def test_enqueue_keeps_reply_through_reload(tmp_path):
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    entry = mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16),
+        text="seconded",
+        message_id="msg-11",
+        in_reply_to=reply_to,
+    )
+    assert entry.in_reply_to == reply_to
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.get_outbox("msg-11").in_reply_to == reply_to
+
+
+def test_outbox_entry_drops_corrupt_reply_instead_of_failing(tmp_path):
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16), text="seconded", message_id="msg-12"
+    )
+    raw = json.loads((tmp_path / "mailbox.json").read_text())
+    raw["outbox"][0]["in_reply_to"] = {"id": ""}
+    (tmp_path / "mailbox.json").write_text(json.dumps(raw))
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.get_outbox("msg-12").in_reply_to is None
 
 
 def test_seal_and_open_roundtrip_with_none_returning_load(

@@ -151,4 +151,75 @@ def test_append_rejects_record_without_text(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
-    assert len(inbox) == 0
+
+
+def test_sent_messages_are_stored_but_not_listed_by_default(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in", text="from alice"))
+    inbox.append(_record(id="out-1", direction="out", text="from me"))
+
+    # The received view is unchanged: sent messages do not surface in
+    # `tau messages` or unread counts.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["in-1"]
+    assert [entry["id"] for entry in inbox.list_messages(direction="out")] == [
+        "out-1"
+    ]
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "out-1",
+        "in-1",
+    ]
+    assert len(inbox) == 2
+
+
+def test_find_resolves_quotes_in_both_directions(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in", text="from alice"))
+    inbox.append(_record(id="out-1", direction="out", text="from me"))
+
+    assert inbox.find("in-1")["text"] == "from alice"
+    assert inbox.find("out-1")["text"] == "from me"
+    assert inbox.find("missing") is None
+
+
+def test_find_is_scoped_to_the_conversation(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", destination="ab" * 16, text="alice's"))
+    inbox.append(_record(id="msg-1", destination="cd" * 16, text="carol's"))
+
+    # Same id, different peer: the lookup must not cross conversations.
+    assert inbox.find("msg-1", peer="cd" * 16)["text"] == "carol's"
+    assert inbox.find("msg-1", peer="ee" * 16) is None
+
+
+def test_find_prefix_needs_a_unique_match_in_the_conversation(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abc111", destination="ab" * 16, text="one"))
+    inbox.append(_record(id="abc222", destination="ab" * 16, text="two"))
+    inbox.append(_record(id="abc333", destination="cd" * 16, text="other peer"))
+
+    assert [entry["id"] for entry in inbox.find_prefix("abc1", peer="ab" * 16)] == [
+        "abc111"
+    ]
+    assert len(inbox.find_prefix("abc", peer="ab" * 16)) == 2
+    assert inbox.find_prefix("abc", peer="cd" * 16)[0]["id"] == "abc333"
+    assert inbox.find_prefix("zzz", peer="ab" * 16) == []
+
+
+def test_record_keeps_reply_reference_and_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    inbox.append(_record(id="msg-9", in_reply_to=reply_to, direction="in"))
+
+    reloaded = Inbox(tmp_path / "inbox.json")
+    entry = reloaded.list_messages()[0]
+    assert entry["in_reply_to"] == reply_to
+    assert entry["direction"] == "in"
+
+
+def test_record_drops_corrupt_reply_reference(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-9", in_reply_to={"id": ""}))
+
+    entry = inbox.list_messages()[0]
+    assert "in_reply_to" not in entry
+    assert len(inbox) == 1

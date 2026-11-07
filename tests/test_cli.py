@@ -639,6 +639,191 @@ def test_messages_out_of_range_timestamp(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "from the far future" in out
     assert "unknown time" in out
+
+
+# -- replies -------------------------------------------------------------------
+
+
+def _seed_reply_conversation(tmp_path):
+    """One received message and one sent message from the same peer."""
+    from tau.protocol import excerpt_hash
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    peer_hash = "ab" * 16
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "direction": "in",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "seconded",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "b" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    return data_dir, peer_hash
+
+
+def test_messages_renders_quote_from_local_history(tmp_path, capsys):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "↩ alice: original thought" in out
+    assert "seconded" in out
+
+
+def test_messages_reports_unavailable_original(tmp_path, capsys):
+    from tau.protocol import excerpt_hash
+
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "reply to a ghost",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "c" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": excerpt_hash("never arrived"),
+            },
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
+def test_messages_quote_with_wrong_excerpt_is_unavailable(tmp_path, capsys):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "quoting something else",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "e" * 32,
+            "direction": "in",
+            "in_reply_to": {"id": "a" * 32, "excerpt": "0" * 16},
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
+def test_resolve_reply_target_scopes_to_the_conversation(tmp_path):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+
+    ref = cli._resolve_reply_target(inbox, mailbox, "aaaa", peer_hash)
+    assert ref["id"] == "a" * 32
+    # Another peer's message with the same id shape must not resolve.
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "aaaa", "cd" * 16)
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "zzzz", peer_hash)
+
+
+class _FakeSendNode:
+    instances = []
+
+    def __init__(self, config, name=None):
+        self.config = config
+        self.mailbox = Mailbox(config.mailbox_path)
+        self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
+        self.sent = []
+        type(self).instances.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def resolve_peer(self, target, timeout=10.0):
+        return self.peer
+
+    def send_message(self, target, text, **kwargs):
+        self.sent.append((target, text, kwargs.get("in_reply_to")))
+        return {"ok": True, "echo": text, "id": "f" * 32}
+
+
+def test_send_reply_to_resolves_prefix_and_sends_reference(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "--reply-to",
+            "aaaa",
+            "seconded, again",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    _, _, in_reply_to = node.sent[0]
+    assert in_reply_to["id"] == "a" * 32
+    assert in_reply_to["excerpt"] == cli.excerpt_hash("original thought")
+    assert "in reply to aaaaaaaa" in capsys.readouterr().out
+
+
+def test_send_reply_to_unknown_reference_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "--reply-to",
+            "zzzz",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+    assert _FakeSendNode.instances[0].sent == []
 # -- outbox held / drop-held ---------------------------------------------------
 
 

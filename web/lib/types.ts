@@ -12,6 +12,12 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Reticulum wire id: how replies name this message.
+  wire_id?: string;
+  // Quoted message reference: wire id + short excerpt hash of the text
+  // the sender quoted. The quote is rendered from local history only;
+  // see resolveQuote in message-feed.tsx.
+  in_reply_to?: { id: string; excerpt: string | null } | null;
 }
 
 export interface Peer {

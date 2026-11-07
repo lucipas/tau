@@ -43,7 +43,13 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import (
+    PROTOCOL_VERSION,
+    ProtocolError,
+    clean_in_reply_to,
+    excerpt_hash,
+    short_hash,
+)
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -289,6 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
+    )
+    send.add_argument(
+        "--reply-to",
+        metavar="ID|PREFIX",
+        help="quote an earlier message in this conversation (message id or unique prefix)",
     )
     send.set_defaults(func=cmd_send)
 
@@ -2115,12 +2126,22 @@ def cmd_send(args: argparse.Namespace) -> int:
     node = TauNode(config, name=config.name)
     node.start()
     try:
+        reply_to = None
+        if getattr(args, "reply_to", None):
+            peer = node.resolve_peer(
+                args.to,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            reply_to = _resolve_reply_target(
+                Inbox(config.inbox_path), node.mailbox, args.reply_to, peer.hexhash
+            )
         response = node.send_message(
             args.to,
             text,
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            in_reply_to=reply_to,
         )
         if response.get("queued"):
             # One-shot send: give reachable peers a brief chance to take a
@@ -2141,12 +2162,18 @@ def cmd_send(args: argparse.Namespace) -> int:
     elif response.get("queued"):
         print(f"queued for {args.to} — they are unreachable right now")
         print(f"  id:      {response['id']}")
+        if reply_to is not None:
+            print(f"  in reply to {short_hash(reply_to['id'])}")
         print("  it will be delivered automatically when they are heard from;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
     elif response.get("delivered"):
         print(f"delivered to {args.to}")
+        if reply_to is not None:
+            print(f"  in reply to {short_hash(reply_to['id'])}")
     else:
         print(f"delivered to {args.to}")
+        if reply_to is not None:
+            print(f"  in reply to {short_hash(reply_to['id'])}")
         echo = response.get("echo")
         if echo is not None:
             print(f"echo: {echo}")
@@ -2275,6 +2302,75 @@ def _resolve_inbox_peer(
     raise NodeError(f"unknown peer: {target!r}")
 
 
+def _resolve_reply_target(
+    inbox: Inbox, mailbox: Mailbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``--reply-to`` to an ``in_reply_to`` wire reference.
+
+    The quoted message must be in the same conversation: the inbox is
+    searched first (received messages and the node's own sent ones),
+    then the outbox for a still-queued message.  A reference to
+    another peer's message, or to a message this node has never seen,
+    is refused instead of sent dangling — the receiver could only
+    render it as "original not available" anyway.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("--reply-to must not be empty")
+    matches = inbox.find_prefix(ref, peer=peer_hash)
+    if len(matches) > 1:
+        raise NodeError(
+            f"{len(matches)} messages in this conversation match {ref!r};"
+            " use a longer prefix"
+        )
+    quoted = matches[0] if matches else None
+    if quoted is None:
+        try:
+            entry = mailbox.resolve_outbox(ref)
+        except MailboxError:
+            entry = None
+        if entry is not None and entry.to.hex() == peer_hash:
+            quoted = {"id": entry.id, "text": entry.text}
+    if quoted is None:
+        raise NodeError(
+            f"no message {ref!r} in this conversation to reply to;"
+            " replies quote a message from this peer's history"
+        )
+    return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
+
+
+def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> Optional[str]:
+    """Render one message's quote, or ``None`` when it has none.
+
+    The quoted text is pulled from the local inbox, in the same
+    conversation only; when the original is not there — or its text
+    no longer matches the excerpt hash the sender quoted — the line
+    says so instead of trusting anything on the wire.
+    """
+    reply_to = entry.get("in_reply_to")
+    if not isinstance(reply_to, dict):
+        return None
+    ref_id = reply_to.get("id")
+    if not isinstance(ref_id, str) or not ref_id:
+        return None
+    quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+    excerpt = reply_to.get("excerpt")
+    if quoted is None or (
+        isinstance(excerpt, str)
+        and excerpt
+        and excerpt_hash(str(quoted.get("text") or "")) != excerpt.lower()
+    ):
+        return "↩ original not available"
+    if quoted.get("direction") == "out":
+        name = "you"
+    else:
+        peer = registry.get(str(quoted.get("destination") or ""))
+        name = peer.display_name if peer is not None else quoted.get("from") or "unknown"
+    quoted_text = str(quoted.get("text") or "")
+    first_line = quoted_text.splitlines()[0][:80] if quoted_text else ""
+    return f"↩ {name}: {first_line}"
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -2298,6 +2394,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
         print(f"[{when}] {name} ({sender})")
+        quote = _quote_line(inbox, registry, entry)
+        if quote is not None:
+            print(f"  {quote}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

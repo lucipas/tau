@@ -14,6 +14,7 @@ from tau.protocol import (
     decode,
     encode,
     encode_message,
+    excerpt_hash,
     normalize_message,
     parse_announce,
     parse_message,
@@ -116,6 +117,41 @@ def test_message_roundtrip():
     parsed = parse_message(data)
     assert parsed["text"] == "hello there"
     assert isinstance(parsed["sent_at"], float)
+    assert parsed["in_reply_to"] is None
+
+
+def test_message_roundtrip_with_reply():
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    data = encode_message("seconded", message_id="b" * 32, in_reply_to=reply_to)
+    parsed = parse_message(data)
+    assert parsed["text"] == "seconded"
+    assert parsed["id"] == "b" * 32
+    assert parsed["in_reply_to"] == reply_to
+
+
+def test_message_rejects_malformed_reply():
+    with pytest.raises(ProtocolError):
+        encode_message("hi", in_reply_to={"id": ""})
+    with pytest.raises(ProtocolError):
+        encode_message("hi", in_reply_to={"id": "x" * 65})
+    with pytest.raises(ProtocolError):
+        encode_message("hi", in_reply_to={"id": "a" * 32, "excerpt": "not-hex!"})
+    with pytest.raises(ProtocolError):
+        parse_message(
+            encode(
+                {
+                    "type": "message",
+                    "text": "hi",
+                    "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
+def test_excerpt_hash_is_stable_short_hex():
+    assert excerpt_hash("original thought") == excerpt_hash("original thought")
+    assert len(excerpt_hash("original thought")) == 16
+    assert excerpt_hash("different") != excerpt_hash("original thought")
 
 
 def test_message_rejects_wrong_shape():

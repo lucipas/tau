@@ -24,6 +24,7 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+from .protocol import clean_in_reply_to
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,16 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
-    return {
+    direction = raw.get("direction")
+    if direction not in ("in", "out"):
+        direction = "in"
+    try:
+        in_reply_to = clean_in_reply_to(raw.get("in_reply_to"))
+    except ValueError:
+        # A corrupt or hand-edited reference never blocks the inbox;
+        # the message itself is still readable, just unquoted.
+        in_reply_to = None
+    record = {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
         "text": text,
@@ -68,7 +78,11 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
+        "direction": direction,
     }
+    if in_reply_to is not None:
+        record["in_reply_to"] = in_reply_to
+    return record
 
 
 class Inbox:
@@ -148,21 +162,76 @@ class Inbox:
         return entry
 
     def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        peer: Optional[str] = None,
+        direction: str = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        how many are returned (``None`` means all of them).  Sent
+        messages are recorded here too — a reply quotes the sender's
+        own earlier message as often as the peer's — but they stay out
+        of the default listing, which is the received-message view
+        ``tau messages`` has always shown; pass ``direction="out"``
+        or ``direction=None`` to see them.
         """
         with self._lock:
             entries = list(self._messages)
+        if direction is not None:
+            entries = [item for item in entries if item.get("direction") == direction]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
         return [dict(item) for item in entries]
+
+    def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Newest record with this wire id, optionally in one conversation.
+
+        Quote resolution is scoped to the conversation: a reply
+        reference only resolves against a message with the same peer,
+        so a reference to another peer's message never renders.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        with self._lock:
+            entries = list(self._messages)
+        for item in reversed(entries):
+            if item.get("id") != message_id:
+                continue
+            if peer is not None and item.get("destination") != peer:
+                continue
+            return dict(item)
+        return None
+
+    def find_prefix(
+        self, prefix: str, *, peer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Records whose wire id starts with *prefix*, newest first.
+
+        Used to resolve ``tau send --reply-to``: the prefix must match
+        exactly one message in the conversation.
+        """
+        if not isinstance(prefix, str) or not prefix:
+            return []
+        value = prefix.strip().lower()
+        with self._lock:
+            entries = list(self._messages)
+        matches = []
+        for item in reversed(entries):
+            message_id = item.get("id")
+            if not isinstance(message_id, str):
+                continue
+            if not message_id.lower().startswith(value):
+                continue
+            if peer is not None and item.get("destination") != peer:
+                continue
+            matches.append(dict(item))
+        return matches
 
     def __len__(self) -> int:
         with self._lock:

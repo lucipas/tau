@@ -248,6 +248,7 @@ Global options may appear before or after the command:
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
@@ -311,6 +312,9 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# Reply to an earlier message in the conversation (message id or prefix)
+tau send --to alice --reply-to a1b2c3d4 "seconded"
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
@@ -474,6 +478,20 @@ node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
 direct and relayed alike — and can be read back with `tau messages`;
 a message waiting in the outbox is stored in `mailbox.json` (mode
 `0600`) until it is delivered or expires.
+
+### Reply quoting
+
+`tau send --reply-to <id-prefix>` quotes an earlier message in the same
+conversation: the DM carries an `in_reply_to` reference (the quoted
+message's id plus a short hash of the text the sender quoted), and the
+reference travels the direct and the store-and-forward paths alike. The
+web console has the same action — a ↩ reply button on each message.
+The quoted text is never trusted from the wire: the renderer pulls it
+from the local history (the node's inbox, which records sent messages
+too, or the console's `messages.json`) and shows "original not
+available" when the original is not there — it arrived before this
+node's history began, or was already pruned — and a reference to
+another peer's message never resolves.
 
 ### Tan posts
 

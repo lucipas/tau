@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useTau } from "@/lib/use-tau";
+import type { TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
 import { Header } from "./header";
@@ -14,6 +15,7 @@ export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
   const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
 
   useEffect(() => {
@@ -36,6 +38,7 @@ export function Console() {
     customPicked.current = false;
     setMode("peer");
     setTarget(destination);
+    setReplyTo(null);
     const textarea = document.getElementById(
       "message-text",
     ) as HTMLTextAreaElement | null;
@@ -88,6 +91,13 @@ export function Console() {
               messages={tau.messages}
               node={tau.node}
               live={tau.connection === "live"}
+              onReply={(message) => {
+                setReplyTo(message);
+                if (message.peer) {
+                  setTarget(message.peer);
+                  setMode("peer");
+                }
+              }}
             />
             {tau.outbox.length > 0 ? (
               <div className="mt-4">
@@ -105,6 +115,8 @@ export function Console() {
               onTargetChange={setTarget}
               onModeChange={changeMode}
               onSend={tau.send}
+              replyTo={replyTo}
+              onCancelReply={() => setReplyTo(null)}
             />
           </div>
         </main>
