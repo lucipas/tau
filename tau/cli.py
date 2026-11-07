@@ -1087,7 +1087,9 @@ def _print_tan_posts(
         if post.get("kind") == "reply":
             parent = post.get("reply_to")
             if isinstance(parent, dict):
-                if parent.get("deleted"):
+                if parent.get("blocked"):
+                    print("  in reply to a post by a blocked author")
+                elif parent.get("deleted"):
                     print("  in reply to a deleted post")
                 else:
                     parent_text = str(parent.get("text") or "")
@@ -2346,14 +2348,17 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
     # Blocked senders' history stays stored but is hidden locally;
-    # unblocking restores the view.
+    # unblocking restores the view.  Filter before applying the limit so
+    # hidden messages do not use up the requested count.
+    entries = inbox.list_messages(limit=None, peer=peer_hash)
     blocked = load_blocked_set(config.blocklist_path)
     if blocked:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
+    if limit is not None:
+        entries = entries[: max(0, limit)]
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
         return _EXIT_OK

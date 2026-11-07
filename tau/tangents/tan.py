@@ -993,15 +993,25 @@ def annotate_replies(
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
         is_blocked = parent["author"] in excluded
-        summary = {
-            "hash": parent["hash"],
-            "author": parent["author"],
-            "name": parent["name"],
-            "text": "" if (is_deleted or is_blocked) else parent["text"],
-            "deleted": is_deleted,
-        }
         if is_blocked:
-            summary["blocked"] = True
+            # Redact identity too: a blocked author's name and hash must
+            # not leak through a reply's parent summary.
+            summary = {
+                "hash": parent["hash"],
+                "author": "",
+                "name": "",
+                "text": "",
+                "deleted": is_deleted,
+                "blocked": True,
+            }
+        else:
+            summary = {
+                "hash": parent["hash"],
+                "author": parent["author"],
+                "name": parent["name"],
+                "text": "" if is_deleted else parent["text"],
+                "deleted": is_deleted,
+            }
         post["reply_to"] = summary
     return posts
 
@@ -1527,9 +1537,10 @@ def search_posts(
     where = f"linked = 1 AND kind = 'post' AND {_NOT_DELETED}"
     excluded = _clean_excluded(exclude_authors)
     if excluded:
-        placeholders = ", ".join("?" for _ in excluded)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(excluded)
+        # One JSON parameter instead of one placeholder per author, so a
+        # large block-list cannot exceed SQLite's bound-variable limit.
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(excluded))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         if author in excluded:

@@ -496,7 +496,14 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        from .blocklist import blocked_destinations
+
+        payload = peer.public_dict()
+        # Annotate like the snapshot does, so a live update does not
+        # erase the frontend's blocked badge for this peer.
+        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
+        payload["blocked"] = payload.get("destination") in blocked
+        self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
@@ -1508,5 +1515,8 @@ def _int_param(
     try:
         value = int(values[0])
     except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+rror, ValueError):
         return default
     return max(minimum, min(value, maximum))

@@ -406,7 +406,9 @@ export function PostCard({
               in reply to{" "}
               {post.reply_to ? (
                 <>
-                  {post.reply_to.name || "anonymous"} ·{" "}
+                  {post.reply_to.blocked ? null : (
+                    <>{post.reply_to.name || "anonymous"} · </>
+                  )}
                   {post.reply_to.blocked
                     ? "a blocked author's post"
                     : post.reply_to.deleted
