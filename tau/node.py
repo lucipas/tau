@@ -826,7 +826,13 @@ class TauNode:
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
-        if not duplicate:
+        # A delayed direct request past the sender's deadline is dropped
+        # unrecorded (and not marked seen), so it is never shown.
+        expires_at = message.get("expires_at")
+        expired = expires_at is not None and expires_at <= received_at
+        if expired:
+            log.info("Dropping expired message %s from %s", message_id, caller_hash)
+        if not duplicate and not expired:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -857,6 +863,7 @@ class TauNode:
             server=self.name,
             node=self.destination_hexhash,
             duplicate=duplicate,
+            expired=expired,
         )
 
     def _handle_mail_store(
@@ -1161,7 +1168,10 @@ class TauNode:
             if self.mailbox.get_outbox(entry.id) is None:
                 return False
         payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+            entry.text,
+            message_id=entry.id,
+            sent_at=entry.created_at,
+            expires_at=entry.message_expires_at,
         )
         if not self._still_queued(entry.id):
             return False
@@ -1312,6 +1322,11 @@ class TauNode:
             )
             return False
         if self.mailbox.is_seen(message["id"]):
+            return False
+        expires_at = message.get("expires_at")
+        if expires_at is not None and expires_at <= time.time():
+            # Past the sender's deadline: do not record or show it.
+            log.info("Dropping expired relayed message %s", message["id"])
             return False
         self.mailbox.mark_seen(message["id"])
         record = {
