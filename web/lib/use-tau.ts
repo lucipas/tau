@@ -139,6 +139,7 @@ export function useTau() {
   }, []);
 
   const refreshSeq = useRef(0);
+  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -154,9 +155,9 @@ export function useTau() {
   const refreshGroups = useCallback(async () => {
     // Same polling shape as the outbox: a group learned from an
     // incoming message shows up here without waiting for a reload.
-    const requestId = ++refreshSeq.current;
+    const requestId = ++groupsSeq.current;
     const result = await apiGet<GroupsResponse>("/api/groups");
-    if (requestId !== refreshSeq.current) return;
+    if (requestId !== groupsSeq.current) return;
     setGroups(result.groups);
   }, []);
 
