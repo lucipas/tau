@@ -585,6 +585,7 @@ class WebBridge:
         include_all: bool = False,
         author: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        from .blocklist import blocked_destinations, load_blocked_set
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
@@ -597,6 +598,9 @@ class WebBridge:
             timeline,
         )
 
+        blocked = load_blocked_set(
+            getattr(self.node.config, "blocklist_path", None)
+        )
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -611,19 +615,39 @@ class WebBridge:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
                 posts = list(
                     reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
+                        feed(
+                            conn,
+                            author=target,
+                            limit=limit,
+                            posts_only=True,
+                            exclude_authors=blocked,
+                        )
                     )
                 )
                 posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                    conn,
+                    annotate_reactions(conn, posts, viewer=viewer),
+                    exclude_authors=blocked,
                 )
             elif include_all:
-                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    include_all=True,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                )
             else:
                 authors = [record["author"] for record in following(conn)]
                 if viewer is not None:
                     authors.append(viewer)
-                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    authors,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -842,18 +866,39 @@ class WebBridge:
     # -- snapshots ---------------------------------------------------------
 
     def peers(self) -> List[Dict[str, Any]]:
+        from .blocklist import blocked_destinations
+
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            items = [peer.public_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
+        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
+        for item in items:
+            item["blocked"] = item.get("destination") in blocked
+        return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        from .blocklist import blocked_destinations
+
         with self._lock:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
+        # Blocked senders' history stays stored but is hidden locally;
+        # unblocking restores the view.  Inbound records carry the
+        # sender hash as "destination" (node inbox) or "peer" (console
+        # log); outbound records carry the recipient, which blocking
+        # never hides.
+        blocked = blocked_destinations(getattr(self.node, "blocklist", None))
+        if blocked:
+            items = [
+                item
+                for item in items
+                if item.get("direction") != "in"
+                or (item.get("destination") or item.get("peer")) not in blocked
+            ]
         return items
 
     def counts(self) -> Dict[str, int]:

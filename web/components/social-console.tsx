@@ -407,11 +407,13 @@ export function PostCard({
               {post.reply_to ? (
                 <>
                   {post.reply_to.name || "anonymous"} ·{" "}
-                  {post.reply_to.deleted
-                    ? "a deleted post"
-                    : post.reply_to.text.length > 80
-                      ? `${post.reply_to.text.slice(0, 80)}…`
-                      : post.reply_to.text}
+                  {post.reply_to.blocked
+                    ? "a blocked author's post"
+                    : post.reply_to.deleted
+                      ? "a deleted post"
+                      : post.reply_to.text.length > 80
+                        ? `${post.reply_to.text.slice(0, 80)}…`
+                        : post.reply_to.text}
                 </>
               ) : (
                 shortHash(post.target ?? "", 16)

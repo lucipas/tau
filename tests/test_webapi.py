@@ -1267,3 +1267,80 @@ def test_tan_reply_via_api(tmp_path):
         assert payload["post"]["kind"] == "post"
     finally:
         bridge.stop()
+
+
+def test_peers_marks_blocked_peers(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["destination"] == PEER_HASH
+    assert payload["peers"][0]["blocked"] is True
+
+    node.blocklist = BlockList()
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is False
+
+
+def test_messages_hides_blocked_senders(bridge, node):
+    from tau.blocklist import BlockList
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "from alice",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "mallory",
+            "destination": OTHER_HASH,
+            "text": "from mallory",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice"]
+
+    # Unblocking restores the view: nothing was deleted.
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice", "from mallory"]
+
+
+def test_tan_timeline_hides_blocked_authors(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList, save_blocklist
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "from alice", name="alice", now=1000)
+        create_post(conn, bob, "from bob", name="bob", now=1001)
+    finally:
+        conn.close()
+    from tau.identity import destination_hash
+
+    save_blocklist(
+        node.config.blocklist_path,
+        BlockList(blocked=frozenset({destination_hash(alice).hex()})),
+    )
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["from bob"]
+    finally:
+        bridge.stop()
