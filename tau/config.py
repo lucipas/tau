@@ -5,12 +5,18 @@ from __future__ import annotations
 import logging
 import os
 import socket
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from .protocol import APP_NAME, DEFAULT_TCP_PORT, sanitize_name
 from .util import atomic_write_text, ensure_dir, read_json
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 
@@ -122,20 +128,36 @@ def load_node_name(data_dir: Path) -> Optional[str]:
     return None
 
 
+@contextmanager
+def _node_file_lock(path: Path) -> Iterator[None]:
+    """Serialize read-modify-write updates of ``node.json`` across processes."""
+    if fcntl is None:  # pragma: no cover - non-POSIX
+        yield
+        return
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
     path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
-    # Preserve settings written since init (e.g. the file-acceptance
-    # policy): re-running `tau init` must not silently reset them.
-    raw = read_json(path, default=None)
-    metadata = dict(raw) if isinstance(raw, dict) else {}
-    metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
-    atomic_write_json(
-        path,
-        metadata,
-        mode=0o600,
-    )
+    with _node_file_lock(path):
+        # Preserve settings written since init (e.g. the file-acceptance
+        # policy): re-running `tau init` must not silently reset them.
+        raw = read_json(path, default=None)
+        metadata = dict(raw) if isinstance(raw, dict) else {}
+        metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
+        atomic_write_json(
+            path,
+            metadata,
+            mode=0o600,
+        )
     return path
 
 
@@ -172,10 +194,11 @@ def set_node_setting(data_dir: Path, key: str, value: object) -> Dict[str, objec
     from .util import atomic_write_json
 
     path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
-    raw = read_json(path, default=None)
-    settings = dict(raw) if isinstance(raw, dict) else {}
-    settings[key] = value
-    atomic_write_json(path, settings, mode=0o600)
+    with _node_file_lock(path):
+        raw = read_json(path, default=None)
+        settings = dict(raw) if isinstance(raw, dict) else {}
+        settings[key] = value
+        atomic_write_json(path, settings, mode=0o600)
     return settings
 
 
