@@ -119,6 +119,13 @@ their latency in real time over server-sent events. Message history is kept
 in `messages.json` in the data directory, so earlier conversations are still
 there after the node restarts.
 
+Read state is per conversation and strictly local: the node inbox keeps a
+read cursor per sender, `tau messages` marks entries unread with `●` and
+advances the cursor when you read a conversation, and the console shows an
+unread badge next to each peer and the unread total in the tab title.
+Opening a peer in the console clears its badge; read receipts to the sender
+are a separate feature and do not exist yet.
+
 The same bridge is the local integration point for scripts:
 
 | Endpoint | Method | Purpose |
@@ -127,6 +134,7 @@ The same bridge is the local integration point for scripts:
 | `/api/peers` | GET | peer registry |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
@@ -251,7 +259,7 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
-| `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages` | List received direct messages kept in the node inbox (`--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -312,6 +320,10 @@ tau outbox
 tau messages
 tau messages --peer alice --limit 10 --json
 
+# Only what arrived since you last read, and per-peer unread counts
+tau messages --unread
+tau messages --count            # read-only, for scripts; does not mark read
+
 # Only show peers heard from in the last day
 tau peers --max-age 1
 
@@ -335,7 +347,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
 ├── mailbox.json          # store-and-forward queues, chmod 600
-├── inbox.json            # received direct messages, chmod 600, capped at 500
+├── inbox.json            # received direct messages + per-peer read cursors, chmod 600, capped at 500
 ├── messages.json         # console message history, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration

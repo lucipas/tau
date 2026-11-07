@@ -500,6 +500,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="show the newest N messages (default 30)",
     )
+    messages.add_argument(
+        "--unread",
+        action="store_true",
+        help="only show messages not yet read",
+    )
+    messages.add_argument(
+        "--count",
+        action="store_true",
+        help="print per-peer unread counts instead of listing messages",
+    )
     messages.set_defaults(func=cmd_messages)
 
     tan = subparsers.add_parser(
@@ -2282,25 +2292,105 @@ def cmd_messages(args: argparse.Namespace) -> int:
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    if getattr(args, "count", False):
+        # A count is for scripting: it never advances the read cursor.
+        counts = inbox.unread_counts()
+        per_peer = counts["per_peer"]
+        if peer_hash is not None:
+            per_peer = {
+                destination: count
+                for destination, count in per_peer.items()
+                if destination == peer_hash
+            }
+        total = sum(per_peer.values())
+        if _json_mode(args):
+            _emit({"unread": per_peer, "total": total}, True)
+            return _EXIT_OK
+        if not per_peer:
+            print("No unread messages.")
+            return _EXIT_OK
+        for destination, count in sorted(per_peer.items()):
+            peer = registry.get(destination)
+            name = peer.display_name if peer is not None else "unknown"
+            print(f"{name} ({short_hash(destination)}): {count} unread")
+        print(f"Total: {total} unread")
+        return _EXIT_OK
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    # Filter before limiting, so --unread finds older unread mail even
+    # when newer messages from the same listing are already read.
+    entries = inbox.list_messages(peer=peer_hash)
+    unread_only = getattr(args, "unread", False)
+    if unread_only:
+        entries = [entry for entry in entries if entry.get("unread")]
+    shown = entries if limit is None else entries[:limit]
+    omitted = entries[len(shown):]
+    # Unread mail the window omitted: reported, never silently cleared.
+    more_unread: Dict[str, int] = {}
+    for entry in omitted:
+        if entry.get("unread"):
+            destination = str(entry.get("destination") or "")
+            more_unread[destination] = more_unread.get(destination, 0) + 1
     if _json_mode(args):
-        _emit({"messages": entries, "count": len(entries)}, True)
-        return _EXIT_OK
-    if not entries:
-        print("No messages received yet.")
-        return _EXIT_OK
-    for entry in entries:
-        peer = registry.get(entry.get("destination") or "")
-        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
-        sender = short_hash(str(entry.get("destination") or ""))
-        when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
-        for line in str(entry.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
+        _emit(
+            {"messages": shown, "count": len(shown), "more_unread": more_unread},
+            True,
+        )
+    elif not shown:
+        if more_unread:
+            _print_more_unread(registry, more_unread)
+        else:
+            print(
+                "No unread messages." if unread_only else "No messages received yet."
+            )
+    else:
+        for entry in shown:
+            peer = registry.get(entry.get("destination") or "")
+            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+            sender = short_hash(str(entry.get("destination") or ""))
+            when = _format_message_time(float(entry.get("received_at", 0)))
+            marker = "● " if entry.get("unread") else ""
+            print(f"{marker}[{when}] {name} ({sender})")
+            for line in str(entry.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
+        if more_unread:
+            _print_more_unread(registry, more_unread)
+    # Reading a conversation advances its cursor to the newest message
+    # just shown, so the next listing only flags what arrived since.  A
+    # conversation with unread mail omitted by --limit is left alone:
+    # a cursor past the newest shown message would silently clear it.
+    partially_listed = {
+        str(entry.get("destination") or "")
+        for entry in omitted
+        if entry.get("unread")
+    }
+    newest_shown: Dict[str, int] = {}
+    for entry in shown:
+        destination = str(entry.get("destination") or "")
+        if destination in partially_listed:
+            continue
+        newest_shown[destination] = max(
+            newest_shown.get(destination, 0), int(entry["seq"])
+        )
+    for destination, up_to_seq in newest_shown.items():
+        inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
     return _EXIT_OK
+
+
+def _print_more_unread(
+    registry: PeerRegistry, more_unread: Dict[str, int]
+) -> None:
+    """Hint lines for unread mail a limited listing did not show."""
+    for destination, count in sorted(more_unread.items()):
+        peer = registry.get(destination)
+        name = peer.display_name if peer is not None else "unknown"
+        print(
+            f"{count} more unread from {name} ({short_hash(destination)})"
+            " — raise --limit to see them."
+        )
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 

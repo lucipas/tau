@@ -11,6 +11,7 @@ import urllib.request
 
 import pytest
 
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
 from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
@@ -37,6 +38,7 @@ class FakeNode:
     def __init__(self, mailbox_path=None):
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
+        self.inbox = Inbox()
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -165,6 +167,102 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["direction"] == "in"
     assert feed["messages"][0]["peer_name"] == "bob"
     assert feed["messages"][0]["text"] == "from the mesh"
+
+
+def _inbound_record(node, **overrides):
+    """A received DM, appended to the node inbox first — the order the
+    node itself uses before it hands the record to the bridge."""
+    record = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "m-1",
+    }
+    record.update(overrides)
+    node.inbox.append(record)
+    return record
+
+
+def _counts(unread):
+    """Unread counts without the revision stamp, for shape checks."""
+    return {key: value for key, value in unread.items() if key != "revision"}
+
+
+def test_snapshot_carries_unread_counts(bridge, node):
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "total": 2}
+
+
+def test_unread_revisions_only_increase(bridge, node):
+    first = bridge.unread()["revision"]
+    second = bridge.unread()["revision"]
+    assert second > first
+
+
+def test_inbound_message_event_carries_unread_total(bridge, node):
+    record = _inbound_record(node)
+    bridge.record_inbound(record)
+
+    events = bridge.bus.replay(0)
+    message_events = [event for event in events if event["type"] == "message"]
+    assert _counts(message_events[-1]["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
+
+
+def test_mark_read_endpoint_clears_a_conversation(bridge, node):
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+    _inbound_record(
+        node,
+        destination=OTHER_HASH,
+        **{"from": "carol", "id": "m-3", "received_at": 103.0},
+    )
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+
+    # Other tabs learn from the published unread event.
+    events = bridge.bus.replay(0)
+    unread_events = [event for event in events if event["type"] == "unread"]
+    assert _counts(unread_events[-1]["unread"]) == {
+        "per_peer": {OTHER_HASH: 1},
+        "total": 1,
+    }
+
+    # Marking everything read clears the rest.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+
+def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": "  "}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": 42}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
 
 
 def test_send_validation(bridge):
