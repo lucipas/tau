@@ -286,13 +286,15 @@ def test_store_trusted_peer_gets_higher_quota(tmp_path, monkeypatch):
     holder = make_node(tmp_path)
     sender = RNS.Identity()
     recipient = RNS.Identity()
-    # Long-standing peer: in the registry for two days, heard directly.
+    # Long-standing peer: in the registry for two days, heard directly,
+    # with a delivered history.
     holder.registry.upsert(
         destination_hash(sender),
         sender.get_public_key(),
         name="alice",
         now=time.time() - 2 * 24 * 3600,
     )
+    assert holder.registry.record_delivered(destination_hash(sender)) is True
     for message_id in ("t1", "t2"):
         response = _store(holder, sender, recipient, message_id)
         assert response["ok"] is True and response["stored"] is True
@@ -301,6 +303,26 @@ def test_store_trusted_peer_gets_higher_quota(tmp_path, monkeypatch):
     response = _store(holder, sender, recipient, "t3")
     assert response["ok"] is True and response["stored"] is True
     assert [e.id for e in holder.mailbox.held_list()] == ["t2", "t3"]
+
+
+def test_store_long_standing_peer_without_delivery_uses_unknown_quota(
+    tmp_path, monkeypatch
+):
+    # Age and a direct hearing alone are not enough: the higher tier
+    # requires a delivered history (Qodo warning on PR #92).
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    holder = make_node(tmp_path)
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    holder.registry.upsert(
+        destination_hash(sender),
+        sender.get_public_key(),
+        name="alice",
+        now=time.time() - 2 * 24 * 3600,
+    )
+    assert _store(holder, sender, recipient, "n1")["stored"] is True
+    assert _store(holder, sender, recipient, "n2")["stored"] is True
+    assert [e.id for e in holder.mailbox.held_list()] == ["n2"]
 
 
 def test_store_recent_peer_uses_unknown_quota(tmp_path, monkeypatch):
@@ -341,6 +363,35 @@ def test_store_refuses_single_blob_over_sender_bytes_quota(
     assert response["ok"] is False
     assert response["error"]["code"] == "mailbox_full"
     assert holder.mailbox.counts()["held"] == 0
+
+
+def test_deliver_entry_records_delivered_history(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(
+        b"\xaa" * 16, RNS.Identity().get_public_key(), name="alice"
+    )
+    entry = node.mailbox.enqueue(to=peer.destination_hash, text="hi", now=100.0)
+    monkeypatch.setattr(node, "_request", lambda *args, **kwargs: {"ok": True})
+    assert node._deliver_entry(peer, entry, timeout=5.0) is True
+    stored = node.registry.get(peer.destination_hash)
+    assert stored.delivered_count == 1
+    assert stored.last_delivered_at is not None
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_send_message_records_delivered_history(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(
+        b"\xaa" * 16, RNS.Identity().get_public_key(), name="alice"
+    )
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: {"ok": True, "echo": "hi"}
+    )
+    response = node.send_message(peer, "hello")
+    assert response["ok"] is True
+    stored = node.registry.get(peer.destination_hash)
+    assert stored.delivered_count == 1
+    assert stored.last_delivered_at is not None
 
 
 def test_collected_message_is_delivered_once(tmp_path):

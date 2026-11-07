@@ -93,7 +93,8 @@ def _env_int(name: str, default: int) -> int:
 # deposits over an unidentified link share one "unknown" bucket.  When a
 # deposit would push a sender over quota, the relay sheds that sender's
 # oldest envelopes first; only a single envelope that cannot fit even on
-# its own is refused.  Long-standing known peers get the higher tier.
+# its own is refused.  Long-standing known peers with a delivered
+# history get the higher tier.
 HELD_QUOTA_UNKNOWN_COUNT = _env_int("TAU_HELD_QUOTA_UNKNOWN_COUNT", 16)
 HELD_QUOTA_KNOWN_COUNT = _env_int("TAU_HELD_QUOTA_KNOWN_COUNT", 128)
 HELD_QUOTA_UNKNOWN_BYTES = _env_int(
@@ -614,10 +615,12 @@ class Mailbox:
         *depositor* is the destination hash of the peer that asked this
         node to hold the envelope (``None`` for an unidentified link);
         it is recorded on the envelope and keys the per-sender fairness
-        quota.  A *trusted* depositor — a long-standing known peer —
-        gets the higher quota tier.  When a deposit would push its
-        sender over quota, that sender's oldest envelopes are shed
-        first, so one sender can crowd out only its own mail.
+        quota.  A *trusted* depositor — a long-standing known peer with
+        a delivered history — gets the higher quota tier.  When a
+        deposit would push its sender over quota, that sender's oldest
+        envelopes are shed first, so one sender can crowd out only its
+        own mail.  A deposit that cannot fit even on its own is refused
+        before anything is shed.
         """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
@@ -651,14 +654,16 @@ class Mailbox:
             quota_bytes = (
                 HELD_QUOTA_KNOWN_BYTES if trusted else HELD_QUOTA_UNKNOWN_BYTES
             )
+            if 1 > quota_count or len(blob) > quota_bytes:
+                # A single envelope that cannot fit even on its own is
+                # refused before anything is shed: shedding first would
+                # destroy the sender's existing mail for a deposit that
+                # is rejected anyway.
+                raise MailboxFull("mailbox is full for this sender")
             own = sorted(
                 (e for e in self._held.values() if e.depositor == depositor_hex),
                 key=lambda e: e.stored_at,
             )
-            # A blob that cannot fit even in an empty sender bucket is
-            # refused before anything is shed.
-            if 1 > quota_count or len(blob) > quota_bytes:
-                raise MailboxFull("mailbox is full for this sender")
             own_count = len(own)
             own_bytes = sum(len(e.blob) for e in own)
             victims: List[HeldEnvelope] = []

@@ -62,6 +62,31 @@ def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     assert peer.first_seen == 100.0
 
 
+def test_record_delivered_tracks_history_and_persists(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    assert peer.delivered_count == 0
+    assert peer.last_delivered_at is None
+    assert registry.record_delivered(b"\x09" * 16) is False
+
+    assert registry.record_delivered(peer.destination_hash, now=150.0) is True
+    assert registry.record_delivered(peer.destination_hash, now=160.0) is True
+    assert peer.delivered_count == 2
+    assert peer.last_delivered_at == 160.0
+    registry.save()
+
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    stored = reloaded.get(peer.destination_hash)
+    assert stored.delivered_count == 2
+    assert stored.last_delivered_at == 160.0
+    # An upsert for the same peer keeps its delivered history.
+    reloaded.upsert(
+        peer.destination_hash, peer.public_key, name="carol", now=200.0
+    )
+    assert stored.delivered_count == 2
+    assert stored.last_delivered_at == 160.0
+
+
 def test_ambiguous_names_and_prefixes(tmp_path):
     registry = PeerRegistry()
     make_peer(registry, 3, "duplicate", now=1.0)

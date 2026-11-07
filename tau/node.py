@@ -880,9 +880,9 @@ class TauNode:
         # Quotas are keyed by the peer that asked us to hold the
         # envelope: the sealed blob hides the inner sender, so the
         # depositing peer is the only attribution a holder has.  A
-        # long-standing known peer gets the higher quota tier; the
-        # registry has no per-peer delivery history, so "long-standing"
-        # is first-seen age plus a direct (not exchanged) hearing.
+        # long-standing known peer gets the higher quota tier: in the
+        # registry 24h+, heard directly rather than via exchange, and
+        # with at least one message this node has delivered to it.
         depositor = (
             tau_destination_hash(remote_identity)
             if remote_identity is not None
@@ -895,6 +895,7 @@ class TauNode:
                 peer is not None
                 and not peer.via_exchange
                 and time.time() - peer.first_seen >= TRUSTED_PEER_MIN_AGE_SECONDS
+                and peer.delivered_count > 0
             ):
                 trusted = True
         try:
@@ -1202,6 +1203,7 @@ class TauNode:
             return False
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
                 self.on_delivered(entry.id)
@@ -1511,7 +1513,9 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self.registry.record_delivered(peer.destination_hash)
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.

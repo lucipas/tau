@@ -434,8 +434,10 @@ retried and relayed copies of the same message are delivered to the user
 exactly once. Holders cap what they keep (512 envelopes total, 64 per
 recipient) and everything expires. A holder also caps each depositing
 peer — 16 envelopes / 128 KiB from an unknown peer, 128 / 1 MiB from a
-long-standing known peer — shedding that sender's oldest envelopes
-first, so one sender can crowd out only its own mail; `tau outbox held`
+long-standing known peer with a delivered history (in the registry 24h+,
+heard directly, and at least one message this node has delivered to
+them) — shedding that sender's oldest envelopes first, so one sender
+can crowd out only its own mail; `tau outbox held`
 shows the per-sender usage. Failed delivery attempts back off
 exponentially (60s, doubling, capped at an hour), so an unreachable peer
 does not cost a link attempt on every sweep; a peer announcing itself
