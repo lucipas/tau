@@ -261,3 +261,47 @@ def test_import_respects_the_cap(tmp_path, monkeypatch):
         "msg-3",
         "msg-2",
     ]
+
+
+def test_import_skips_huge_timestamp_without_aborting(tmp_path):
+    """A JSON integer too large for float() is skipped, not fatal.
+
+    float() on a huge int raises OverflowError; an import must record
+    the entry as skipped and keep merging the entries around it.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="before"),
+            _record(id="huge-sent", sent_at=10**400),
+            _record(id="huge-received", received_at=10**400),
+            _record(id="after"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 2
+    assert result["skipped"] == 2
+    assert [error["error"] for error in result["errors"]] == [
+        "invalid sent_at",
+        "invalid received_at",
+    ]
+    assert [entry["id"] for entry in inbox.list_messages()] == ["after", "before"]
+
+
+def test_load_skips_huge_timestamp_without_crashing(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="huge", sent_at=10**400),
+                    _record(id="good"),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entries = Inbox(path).list_messages()
+    assert [entry["id"] for entry in entries] == ["good"]

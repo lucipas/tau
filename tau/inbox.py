@@ -51,12 +51,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     received_at = raw.get("received_at")
     try:
         received_at = float(received_at) if received_at is not None else time.time()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(sent_at):
         sent_at = 0.0
