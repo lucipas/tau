@@ -474,3 +474,58 @@ def test_deposit_entry_skips_message_cancelled_by_another_process(
     )
     assert node._deposit_entry(make_peer("carol"), entry, timeout=1.0) is False
     assert calls == []
+
+
+def _seed_wait_entry(node, message_id="dd" + "66" * 15):
+    return node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="wait for me", message_id=message_id
+    )
+
+
+def test_wait_for_delivery_returns_at_once_when_not_queued(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    calls = []
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: calls.append(kwargs))
+    assert node.wait_for_delivery("dd" + "66" * 15, timeout=5.0) is True
+    assert calls == []
+
+
+def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+
+    calls = []
+
+    def fake_flush(**kwargs):
+        calls.append(kwargs)
+        node.mailbox.remove_outbox(entry.id)
+        return {"delivered": 1, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert node.wait_for_delivery(entry.id, timeout=5.0, poll_interval=0.01) is True
+    assert len(calls) == 1
+    # The wait drives a targeted flush that ignores the entry's backoff:
+    # the caller explicitly asked to wait for this message.
+    assert calls[0]["message_id"] == entry.id
+    assert calls[0]["respect_backoff"] is False
+
+
+def test_wait_for_delivery_times_out_when_entry_stays_queued(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    calls = []
+    monkeypatch.setattr(
+        node, "flush_outbox", lambda **kwargs: calls.append(kwargs) or {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
+    )
+    started = time.monotonic()
+    assert (
+        node.wait_for_delivery(entry.id, timeout=0.2, poll_interval=0.01) is False
+    )
+    assert time.monotonic() - started >= 0.2
+    assert calls, "the wait must keep retrying the flush until the deadline"
+    assert node.mailbox.get_outbox(entry.id) is not None

@@ -305,6 +305,10 @@ echo "piped message" | tau send --to alice
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
 
+# Wait up to 30 seconds for a queued message to be delivered
+# (exits non-zero if it is still queued when the wait expires)
+tau send --to alice "hi" --wait 30
+
 # See what is waiting on offline peers
 tau outbox
 

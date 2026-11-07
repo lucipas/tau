@@ -290,6 +290,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
     )
+    send.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
     send.set_defaults(func=cmd_send)
 
     ping = subparsers.add_parser(
@@ -2111,9 +2118,17 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
+    wait = float(getattr(args, "wait", 0.0) or 0.0)
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if wait > 0 and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
     config = _make_config(args)
     node = TauNode(config, name=config.name)
     node.start()
+    exit_code = _EXIT_OK
     try:
         response = node.send_message(
             args.to,
@@ -2123,28 +2138,61 @@ def cmd_send(args: argparse.Namespace) -> int:
             queue=not getattr(args, "no_queue", False),
         )
         if response.get("queued"):
-            # One-shot send: give reachable peers a brief chance to take a
-            # sealed copy (or the message itself) before this process exits.
-            node.flush_outbox(timeout=3.0, max_peers=5)
-            if node.mailbox.get_outbox(response["id"]) is None:
-                response = {
-                    "ok": True,
-                    "delivered": True,
-                    "id": response["id"],
-                    "to": response["to"],
-                }
+            if wait > 0:
+                started = time.monotonic()
+                delivered = node.wait_for_delivery(response["id"], timeout=wait)
+                waited = time.monotonic() - started
+                if delivered:
+                    response = {
+                        "ok": True,
+                        "delivered": True,
+                        "id": response["id"],
+                        "to": response["to"],
+                        "waited": round(waited, 1),
+                    }
+                else:
+                    response = {
+                        **response,
+                        "delivered": False,
+                        "waited": round(waited, 1),
+                    }
+                    exit_code = _EXIT_ERROR
+            else:
+                # One-shot send: give reachable peers a brief chance to take a
+                # sealed copy (or the message itself) before this process exits.
+                node.flush_outbox(timeout=3.0, max_peers=5)
+                if node.mailbox.get_outbox(response["id"]) is None:
+                    response = {
+                        "ok": True,
+                        "delivered": True,
+                        "id": response["id"],
+                        "to": response["to"],
+                    }
+        elif wait > 0:
+            # Direct delivery: nothing was queued, so nothing was waited
+            # for — record the outcome so --json callers always see
+            # `delivered` and `waited` when they passed --wait.
+            response = {**response, "delivered": True, "waited": 0.0}
     finally:
         node.stop()
 
     if _json_mode(args):
         _emit(response, True)
     elif response.get("queued"):
-        print(f"queued for {args.to} — they are unreachable right now")
+        waited = response.get("waited")
+        if waited is not None:
+            print(f"still queued for {args.to} after {waited:.1f}s")
+        else:
+            print(f"queued for {args.to} — they are unreachable right now")
         print(f"  id:      {response['id']}")
         print("  it will be delivered automatically when they are heard from;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
     elif response.get("delivered"):
-        print(f"delivered to {args.to}")
+        waited = response.get("waited")
+        if waited is not None:
+            print(f"delivered to {args.to} after {waited:.1f}s")
+        else:
+            print(f"delivered to {args.to}")
     else:
         print(f"delivered to {args.to}")
         echo = response.get("echo")
@@ -2153,7 +2201,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         if isinstance(rtt, (int, float)):
             print(f"round trip: {rtt * 1000:.0f} ms")
-    return _EXIT_OK
+    return exit_code
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:

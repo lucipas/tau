@@ -687,6 +687,44 @@ class TauNode:
                 if deadline - time.time() <= 0:
                     break
 
+    def wait_for_delivery(
+        self,
+        message_id: str,
+        *,
+        timeout: float,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """Block until a queued message leaves the outbox, or time out.
+
+        Returns True when the entry is gone — delivered, or removed by
+        another process — and False when it is still queued when the
+        deadline passes.  Each pass runs a targeted flush that ignores
+        the entry's delivery backoff: the caller explicitly asked to
+        wait for this message, so a backoff from an earlier failed
+        attempt must not swallow the whole wait.  The wait never
+        removes the entry itself; a message still queued at the
+        deadline is left for the background mail loop.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if not self._still_queued(message_id):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.flush_outbox(
+                timeout=min(remaining, _MAIL_REQUEST_TIMEOUT),
+                message_id=message_id,
+                respect_backoff=False,
+                wait_for_lock=min(remaining, 5.0),
+            )
+            if not self._still_queued(message_id):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.
 
