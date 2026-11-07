@@ -203,7 +203,7 @@ def test_mail_round_exchanges_peers(tmp_path):
     peer = make_peer("bob")
     calls = []
     node._flush_peer = lambda p, timeout, **_kwargs: calls.append(("flush", p.hexhash))
-    node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
+    node._collect_mail = lambda p, timeout, **_kwargs: calls.append(("collect", p.hexhash))
 
     def exchange(p, **kwargs):
         # The exchange runs after the mail lock is released, so a slow
@@ -227,7 +227,7 @@ def test_mail_round_survives_failed_exchange(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("bob")
     node._flush_peer = lambda p, timeout, **_kwargs: {"delivered": 0, "deposited": 0}
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     def failing_exchange(p, **kwargs):
         raise RuntimeError("link broke")
@@ -289,7 +289,7 @@ def test_flush_outbox_prefers_direct_peers(tmp_path):
         order.append(p.hexhash),
         {"delivered": 0, "deposited": 0},
     )[1]
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     node.flush_outbox()
 
@@ -316,7 +316,7 @@ def test_flush_outbox_to_filter_contacts_only_that_peer(tmp_path):
         return {"delivered": 0, "deposited": 0}
 
     node._flush_peer = _flush_peer
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     # A retry aimed at bob must not spend its budget on alice.
     node.flush_outbox(to=bob.destination_hash, respect_backoff=False)
@@ -346,7 +346,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
         calls.append(p.hexhash),
         {"delivered": 0, "deposited": 0},
     )[1]
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     # A background round holding the lock makes a plain flush skip,
     # and the summary says so instead of looking like a quiet sweep.
@@ -482,11 +482,18 @@ def _seed_wait_entry(node, message_id="dd" + "66" * 15):
     )
 
 
-def test_wait_for_delivery_returns_at_once_when_not_queued(tmp_path, monkeypatch):
+def test_wait_for_delivery_returns_at_once_when_already_delivered(
+    tmp_path, monkeypatch
+):
+    # A delivery that landed before the wait started is still
+    # recognised through the confirmation record — no flush needed.
     node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    node.mailbox.remove_outbox(entry.id)
+    node._delivered_ids.append(entry.id)
     calls = []
     monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: calls.append(kwargs))
-    assert node.wait_for_delivery("dd" + "66" * 15, timeout=5.0) is True
+    assert node.wait_for_delivery(entry.id, timeout=5.0) is True
     assert calls == []
 
 
@@ -499,6 +506,8 @@ def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
     def fake_flush(**kwargs):
         calls.append(kwargs)
         node.mailbox.remove_outbox(entry.id)
+        # A real delivery records the id, as _deliver_entry does.
+        node._delivered_ids.append(entry.id)
         return {"delivered": 1, "deposited": 0, "received": 0, "lock_busy": False}
 
     monkeypatch.setattr(node, "flush_outbox", fake_flush)
@@ -508,6 +517,26 @@ def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
     # the caller explicitly asked to wait for this message.
     assert calls[0]["message_id"] == entry.id
     assert calls[0]["respect_backoff"] is False
+    # The flush shares the wait's deadline, so no peer or request
+    # starts once it has passed.
+    assert calls[0]["deadline"] is not None
+
+
+def test_wait_for_delivery_rejects_unconfirmed_removal(tmp_path, monkeypatch):
+    # The entry leaves the outbox without a delivery confirmation —
+    # cancelled by another process, or delivered by one — and the wait
+    # must not report it as delivered.
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+
+    def fake_flush(**kwargs):
+        # Removal without a delivery record, as a cancel would do.
+        node.mailbox.remove_outbox(entry.id)
+        return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert node.wait_for_delivery(entry.id, timeout=5.0, poll_interval=0.01) is False
+    assert node.mailbox.get_outbox(entry.id) is None
 
 
 def test_wait_for_delivery_times_out_when_entry_stays_queued(tmp_path, monkeypatch):

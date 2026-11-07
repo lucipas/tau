@@ -2157,6 +2157,18 @@ def cmd_send(args: argparse.Namespace) -> int:
                         "to": response["to"],
                         "waited": round(waited, 1),
                     }
+                elif node.mailbox.get_outbox(response["id"]) is None:
+                    # The entry left the queue without a delivery
+                    # confirmation from this node: cancelled by another
+                    # process, or delivered by one.  Either way it must
+                    # not be reported as delivered.
+                    response = {
+                        **response,
+                        "delivered": False,
+                        "queued": False,
+                        "waited": round(waited, 1),
+                    }
+                    exit_code = _EXIT_ERROR
                 else:
                     response = {
                         **response,
@@ -2194,6 +2206,13 @@ def cmd_send(args: argparse.Namespace) -> int:
         print(f"  id:      {response['id']}")
         print("  it will be delivered automatically when they are heard from;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
+    elif response.get("waited") is not None and not response.get("delivered"):
+        # The entry left the queue while waiting without a delivery
+        # confirmation from this node: cancelled, or delivered by
+        # another process.  Say so instead of claiming delivery.
+        print(f"no longer queued for {args.to} after {response['waited']:.1f}s")
+        print("  delivery was not confirmed — it may have been cancelled,")
+        print("  or delivered by another process sharing this data directory")
     elif (
         response.get("delivered")
         and "_rtt" not in response

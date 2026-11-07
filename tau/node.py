@@ -11,8 +11,9 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Union
 
 try:  # POSIX only; the instance lock is a no-op without it.
     import fcntl
@@ -348,10 +349,12 @@ class TauNode:
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
-        # Ids whose delivery this node confirmed by a successful send.
-        # An outbox entry that disappears without an id here was
-        # cancelled, expired, or removed elsewhere — not delivered.
-        self._delivered_ids: Set[str] = set()
+        # Ids whose delivery this node confirmed by a successful send,
+        # newest last, capped so a long-lived node does not grow the
+        # record without bound.  An outbox entry that disappears without
+        # an id here was cancelled, expired, or removed elsewhere — not
+        # delivered.
+        self._delivered_ids: Deque[str] = deque(maxlen=512)
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -1260,7 +1263,7 @@ class TauNode:
             return False
         # Record the confirmed delivery before the entry leaves the outbox,
         # so a waiter that sees the entry gone can tell it was delivered.
-        self._delivered_ids.add(entry.id)
+        self._delivered_ids.append(entry.id)
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
         if self.on_delivered is not None:
@@ -1270,7 +1273,14 @@ class TauNode:
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
 
-    def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+    def _deposit_entry(
+        self,
+        peer: Peer,
+        entry: Any,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         # Same re-check as _deliver_entry: do not leave a sealed copy
         # with a holder for a message cancelled since the sweep listed it.
         with self.mailbox.transaction():

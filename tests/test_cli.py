@@ -44,7 +44,7 @@ def test_parser_send_arguments():
 def test_parser_send_wait_argument():
     parser = cli.build_parser()
     default = parser.parse_args(["send", "--to", "alice", "hello"])
-    assert default.wait == 0.0
+    assert default.wait is None
     waited = parser.parse_args(["send", "--to", "alice", "--wait", "30", "hello"])
     assert waited.wait == 30.0
 
@@ -53,19 +53,25 @@ class _FakeWaitNode:
     """Stub TauNode for `tau send --wait`: queues into the real mailbox
     and drives the real `TauNode.wait_for_delivery` loop, so the CLI
     wiring and the wait loop are both exercised.  When ``deliver`` is
-    set, the first targeted flush removes the entry, as a real
-    delivery would."""
+    set, the first targeted flush removes the entry and records the
+    delivery, as a real delivery would.  When ``vanish`` is set, the
+    entry disappears without a delivery record, as a concurrent
+    cancel would remove it."""
 
     instances: list = []
     deliver = False
+    vanish = False
 
     def __init__(self, config, **kwargs):
+        from collections import deque
+
         from tau.mailbox import Mailbox
 
         self.config = config
         self.mailbox = Mailbox(config.mailbox_path)
         self.started = False
         self.flush_calls: list = []
+        self._delivered_ids = deque(maxlen=512)
         _FakeWaitNode.instances.append(self)
 
     def start(self, **kwargs):
@@ -89,9 +95,19 @@ class _FakeWaitNode:
 
     def flush_outbox(self, **kwargs):
         self.flush_calls.append(kwargs)
-        if _FakeWaitNode.deliver and kwargs.get("message_id") is not None:
-            self.mailbox.remove_outbox(kwargs["message_id"])
+        target = kwargs.get("message_id")
+        if target is not None:
+            if _FakeWaitNode.deliver:
+                self.mailbox.remove_outbox(target)
+                self._delivered_ids.append(target)
+            elif _FakeWaitNode.vanish:
+                self.mailbox.remove_outbox(target)
         return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
+
+    def _still_queued(self, message_id):
+        from tau.node import TauNode as _RealNode
+
+        return _RealNode._still_queued(self, message_id)
 
     def _still_queued(self, message_id):
         from tau.node import TauNode as _RealNode
@@ -110,6 +126,7 @@ def test_send_wait_delivers_while_waiting(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
     _FakeWaitNode.instances.clear()
     _FakeWaitNode.deliver = True
+    _FakeWaitNode.vanish = False
     code = cli.main(
         ["send", "--to", "bob", "--wait", "5", "hello",
          "--data-dir", str(tmp_path / "node")]
@@ -125,6 +142,7 @@ def test_send_wait_json_reports_waited_seconds(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
     _FakeWaitNode.instances.clear()
     _FakeWaitNode.deliver = True
+    _FakeWaitNode.vanish = False
     code = cli.main(
         ["send", "--to", "bob", "--wait", "5", "hello",
          "--data-dir", str(tmp_path / "node"), "--json"]
@@ -143,6 +161,7 @@ def test_send_wait_times_out_with_nonzero_exit(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
     _FakeWaitNode.instances.clear()
     _FakeWaitNode.deliver = False
+    _FakeWaitNode.vanish = False
     code = cli.main(
         ["send", "--to", "bob", "--wait", "0.3", "hello",
          "--data-dir", str(data_dir)]
@@ -151,6 +170,64 @@ def test_send_wait_times_out_with_nonzero_exit(tmp_path, capsys, monkeypatch):
     assert "still queued for bob after" in capsys.readouterr().out
     # The entry is left for the background mail loop, not dropped.
     assert len(Mailbox(TauConfig.resolve(data_dir=data_dir).mailbox_path).outbox_list()) == 1
+
+
+def test_send_wait_reports_unconfirmed_removal_not_delivery(
+    tmp_path, capsys, monkeypatch
+):
+    # The entry vanishes mid-wait without a delivery confirmation
+    # (a concurrent cancel): the command must not claim delivery.
+    monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
+    _FakeWaitNode.instances.clear()
+    _FakeWaitNode.deliver = False
+    _FakeWaitNode.vanish = True
+    code = cli.main(
+        ["send", "--to", "bob", "--wait", "5", "hello",
+         "--data-dir", str(tmp_path / "node"), "--json"]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] is False
+    assert payload["queued"] is False
+    code = cli.main(
+        ["send", "--to", "bob", "--wait", "5", "hello",
+         "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "no longer queued for bob after" in out
+    assert "not confirmed" in out
+
+
+def test_send_wait_rejects_nonfinite_and_explicit_zero_with_no_queue(
+    tmp_path, capsys, monkeypatch
+):
+    # Non-finite waits and an explicit --wait (even 0) with --no-queue
+    # fail at once, before the message is read.
+    for bad in ("nan", "inf"):
+        code = cli.main(
+            ["send", "--to", "bob", "--wait", bad, "hi",
+             "--data-dir", str(tmp_path / "node")]
+        )
+        assert code == 2
+        assert "finite" in capsys.readouterr().err
+    code = cli.main(
+        ["send", "--to", "bob", "--wait", "0", "--no-queue", "hi",
+         "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 2
+    assert "--no-queue" in capsys.readouterr().err
+    # ...while --wait 0 on its own is accepted and behaves like no wait.
+    monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
+    _FakeWaitNode.instances.clear()
+    _FakeWaitNode.deliver = False
+    _FakeWaitNode.vanish = False
+    code = cli.main(
+        ["send", "--to", "bob", "--wait", "0", "hello",
+         "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "queued for bob" in capsys.readouterr().out
 
 
 def test_send_wait_rejects_negative_and_no_queue(tmp_path, capsys):
