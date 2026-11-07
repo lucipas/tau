@@ -102,7 +102,26 @@ class Inbox:
             record = _valid_record(entry)
             if record is not None:
                 loaded.append(record)
-        self._messages = loaded[-MAX_INBOX:]
+        self._messages = self._cap(loaded)
+
+    @staticmethod
+    def _cap(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the newest ``MAX_INBOX`` entries per direction.
+
+        Sent and received messages share one file but not one budget:
+        a burst of sends must not evict received history (and vice
+        versa).  Order is preserved.
+        """
+        counts = {"in": 0, "out": 0}
+        kept: List[Dict[str, Any]] = []
+        for entry in reversed(entries):
+            direction = entry.get("direction", "in")
+            if counts[direction] >= MAX_INBOX:
+                continue
+            counts[direction] += 1
+            kept.append(entry)
+        kept.reverse()
+        return kept
 
     def _save(self) -> None:
         if self.path is None:
@@ -146,7 +165,7 @@ class Inbox:
             raise ValueError("inbox record needs text")
         with self._transaction():
             self._messages.append(entry)
-            self._messages = self._messages[-MAX_INBOX:]
+            self._messages = self._cap(self._messages)
             self._save()
         return entry
 

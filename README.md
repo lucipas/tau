@@ -474,7 +474,7 @@ buggy peer cannot force unbounded buffering:
 
 Names and messages are stripped of control characters (including terminal
 escape sequences) before display. Received messages are recorded in the
-node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
+node inbox (`inbox.json`, mode `0600`, capped at 500 received and 500 sent) as they arrive —
 direct and relayed alike — and messages this node sends are recorded
 there too (marked `direction: "out"`, one record per send, whether
 delivered directly or queued); both can be read back with `tau messages`.

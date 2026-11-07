@@ -790,23 +790,24 @@ class TauNode:
             log.warning("Could not record received message", exc_info=True)
 
     def _record_sent(
-        self, destination_hash: bytes, text: str, message_id: str
+        self, destination_hash: bytes, text: str, message_id: str, sent_at: float
     ) -> None:
         """Persist a sent DM to the inbox; never break sending.
 
         One record per send, written when the message leaves the node
         (delivered directly or queued to the outbox) — not one per
-        delivery retry.  ``received_at`` is when the node recorded it.
+        delivery retry.  ``sent_at`` is the timestamp encoded in the
+        outgoing message, so the record agrees with the peer's copy;
+        ``received_at`` is when the node recorded it.
         """
-        now = time.time()
         try:
             self.inbox.append(
                 {
                     "from": self.name,
                     "destination": destination_hash.hex(),
                     "text": text,
-                    "sent_at": now,
-                    "received_at": now,
+                    "sent_at": sent_at,
+                    "received_at": time.time(),
                     "id": message_id,
                     "direction": "out",
                 }
@@ -1496,7 +1497,10 @@ class TauNode:
         """
         normalized = normalize_message(text)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        sent_at = time.time()
+        payload = encode_message(
+            normalized, message_id=message_id, sent_at=sent_at
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1506,7 +1510,7 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
-            self._record_sent(peer.destination_hash, normalized, message_id)
+            self._record_sent(peer.destination_hash, normalized, message_id, sent_at)
             return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
@@ -1528,7 +1532,7 @@ class TauNode:
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
             )
-            self._record_sent(dest_hash, normalized, message_id)
+            self._record_sent(dest_hash, normalized, message_id, sent_at)
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",
                 dest_hash.hex(),

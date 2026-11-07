@@ -150,6 +150,54 @@ def test_send_message_records_nothing_when_peer_refuses(tmp_path, monkeypatch):
     assert len(node.inbox) == 0
 
 
+def test_send_message_records_payload_send_time(tmp_path, monkeypatch):
+    from tau.protocol import parse_message
+
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    seen = {}
+
+    def _capture(peer_arg, path, payload, timeout):
+        seen["message"] = parse_message(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", _capture)
+    node.send_message("alice", "hello")
+
+    entry = node.inbox.list_messages()[0]
+    assert entry["sent_at"] == seen["message"]["sent_at"]
+
+
+def test_send_message_records_payload_send_time_when_queued(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_message
+
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    seen = {}
+
+    def _fail(peer_arg, path, payload, timeout):
+        seen["message"] = parse_message(payload)
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", _fail)
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    node.reticulum = object()  # started, without a live Reticulum
+
+    response = node.send_message("alice", "queued hello")
+
+    assert response["queued"] is True
+    entry = node.inbox.list_messages()[0]
+    assert entry["sent_at"] == seen["message"]["sent_at"]
+
+
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):
     node = make_node(tmp_path)
     node._shutdown = True

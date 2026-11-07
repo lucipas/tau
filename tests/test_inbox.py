@@ -189,3 +189,57 @@ def test_sent_record_persists_direction(tmp_path):
     reloaded = Inbox(path)
     assert [e["id"] for e in reloaded.list_messages(direction="out")] == ["sent-1"]
     assert reloaded.list_messages(direction="in") == []
+
+
+def test_cap_applies_per_direction(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 3)
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(4):
+        inbox.append(
+            _record(id=f"in-{index}", direction="in", received_at=float(index))
+        )
+    for index in range(2):
+        inbox.append(
+            _record(
+                id=f"out-{index}", direction="out", received_at=10.0 + index
+            )
+        )
+    inbox.append(_record(id="in-4", direction="in", received_at=20.0))
+
+    # Sends did not evict received history: each direction kept its own
+    # newest three.
+    entries = inbox.list_messages()
+    assert [e["id"] for e in entries] == [
+        "in-4",
+        "out-1",
+        "out-0",
+        "in-3",
+        "in-2",
+    ]
+
+
+def test_reload_caps_each_direction(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 2)
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id=f"in-{index}", direction="in")
+                    for index in range(4)
+                ]
+                + [
+                    _record(id=f"out-{index}", direction="out")
+                    for index in range(3)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = Inbox(path).list_messages()
+    assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]
