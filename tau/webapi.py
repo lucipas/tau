@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
+from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
@@ -410,6 +411,10 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Latest reaction per (target, reactor), kept even when the target
+        # is not in history yet: a reaction can beat the console append of
+        # its target, and the append seeds the message from this state.
+        self._reaction_state: List[Dict[str, Any]] = []
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -629,25 +634,25 @@ class WebBridge:
             or not isinstance(token, str)
         ):
             return None
+        entry = {
+            "target": target,
+            "destination": reactor,
+            "reaction": token,
+            "from": name if isinstance(name, str) else "unknown",
+            "sent_at": _as_float(record.get("sent_at")),
+            "id": record.get("id") if isinstance(record.get("id"), str) else None,
+        }
         updated: Optional[Dict[str, Any]] = None
         with self._lock:
+            if not merge_reaction(self._reaction_state, entry):
+                return None
+            self._reaction_state = self._reaction_state[-MAX_REACTIONS:]
             for message in self._messages:
                 if message.get("wire_id") != target:
                     continue
-                reactions = [
-                    item
-                    for item in message.get("reactions") or []
-                    if item.get("reactor") != reactor
-                ]
-                if token:
-                    reactions.append(
-                        {
-                            "reactor": reactor,
-                            "name": name if isinstance(name, str) else "unknown",
-                            "reaction": token,
-                        }
-                    )
-                message["reactions"] = reactions
+                message["reactions"] = _with_reaction(
+                    message.get("reactions") or [], reactor, entry
+                )
                 updated = dict(message)
                 break
         if updated is None:
@@ -1066,6 +1071,13 @@ class WebBridge:
                 message["mail_id"] = mail_id
             if wire_id is not None:
                 message["wire_id"] = wire_id
+                # A reaction may have arrived before this entry was
+                # appended; apply the latest known state for it now.
+                for entry in self._reaction_state:
+                    if entry["target"] == wire_id and entry["reaction"]:
+                        message["reactions"] = _with_reaction(
+                            message["reactions"], entry["destination"], entry
+                        )
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1105,6 +1117,22 @@ def _has_hidden_part(path: Path, base: Path) -> bool:
     except ValueError:
         return True
     return any(part.startswith(".") for part in parts)
+
+
+def _with_reaction(
+    reactions: List[Dict[str, Any]], reactor: str, entry: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Return a message's reaction list with the reactor's choice set.
+
+    Drops the reactor's previous entry; a retraction (empty token) leaves
+    none, while a reaction appends one carrying the reactor's name.
+    """
+    kept = [item for item in reactions if item.get("reactor") != reactor]
+    if entry["reaction"]:
+        kept.append(
+            {"reactor": reactor, "name": entry["from"], "reaction": entry["reaction"]}
+        )
+    return kept
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:

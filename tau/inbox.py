@@ -17,7 +17,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 try:  # POSIX only; the cross-process lock is a no-op without it.
     import fcntl
@@ -121,6 +121,34 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def reaction_order(entry: Dict[str, Any]) -> Tuple[float, str]:
+    """Ordering key for competing reactions from one reactor on one target."""
+    return (float(entry.get("sent_at") or 0.0), str(entry.get("id") or ""))
+
+
+def merge_reaction(items: List[Dict[str, Any]], entry: Dict[str, Any]) -> bool:
+    """Apply ``entry`` to a reaction list in place, latest per reactor wins.
+
+    One entry is kept per (target, destination).  The newer entry, ordered
+    by ``(sent_at, id)``, replaces the stored one; an equal order replaces
+    too, so a replayed reaction is idempotent.  A strictly older entry is
+    ignored and ``False`` is returned.  Empty-token tombstones are kept
+    like any other entry.  Shared by the inbox and the web console so both
+    resolve reactions the same way.
+    """
+    for index, item in enumerate(items):
+        if (
+            item["target"] == entry["target"]
+            and item["destination"] == entry["destination"]
+        ):
+            if reaction_order(entry) < reaction_order(item):
+                return False
+            del items[index]
+            break
+    items.append(entry)
+    return True
+
+
 class Inbox:
     """Received direct messages, persisted in the node data directory.
 
@@ -212,67 +240,37 @@ class Inbox:
     def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply one reaction, or retract when its token is empty.
 
-        State resolution mirrors Tan's: per (target message, reactor)
-        the latest reaction wins, so a re-sent or replayed reaction
-        cannot double-count and a newer token replaces an older one.
-        An empty token removes the reactor's entry.  Returns the stored
-        record, or ``None`` when a retraction removed one (or there was
-        nothing to remove).
+        Per (target message, reactor) the newest reaction wins, ordered
+        by the reactor's ``sent_at`` with ``id`` as tiebreak (see
+        :func:`merge_reaction`).  A replayed reaction cannot double-count,
+        and a late older reaction or retraction cannot override a newer
+        one.  Returns the stored record when it became the reactor's
+        current reaction, or ``None`` for a retraction, a stale update,
+        or a malformed record.
         """
-        if not isinstance(record, dict):
-            return None
-        target = record.get("target")
-        destination = record.get("destination")
-        token = record.get("reaction")
-        if (
-            isinstance(target, str)
-            and target
-            and isinstance(destination, str)
-            and destination
-            and isinstance(token, str)
-            and not token
-        ):
-            # A well-formed retraction: drop the reactor's entry if one
-            # is stored.  Retracting a reaction this node never stored
-            # is a no-op, not an error.
-            with self._transaction():
-                self._reactions = [
-                    item
-                    for item in self._reactions
-                    if not (
-                        item["target"] == target
-                        and item["destination"] == destination
-                    )
-                ]
-                self._save()
-            return None
         entry = _valid_reaction(record)
         if entry is None:
             return None
         with self._transaction():
-            self._reactions = [
-                item
-                for item in self._reactions
-                if not (
-                    item["target"] == entry["target"]
-                    and item["destination"] == entry["destination"]
-                )
-            ]
-            self._reactions.append(entry)
+            if not merge_reaction(self._reactions, entry):
+                return None
             self._reactions = self._reactions[-MAX_REACTIONS:]
             self._save()
-        return entry
+        return entry if entry["reaction"] else None
 
     def reactions_for(self, target: str) -> List[Dict[str, Any]]:
         """Reactions on one message, oldest first.
 
         Each entry carries the reactor's destination hash, display name
         and token.  Only the reactor's latest reaction per message is
-        ever stored, so these are already de-duplicated.
+        ever stored, so these are already de-duplicated; tombstones for
+        retractions are not returned.
         """
         with self._lock:
             entries = [
-                dict(item) for item in self._reactions if item["target"] == target
+                dict(item)
+                for item in self._reactions
+                if item["target"] == target and item["reaction"]
             ]
         entries.sort(key=lambda item: item["received_at"])
         return entries
@@ -319,7 +317,62 @@ class Inbox:
             entries = list(self._messages)
             by_target: Dict[str, List[Dict[str, Any]]] = {}
             for item in self._reactions:
-                by_target.setdefault(item["target"], []).append(dict(item))
+                if item["reaction"]:
+                    by_target.setdefault(item["target"], []).append(dict(item))
+        if peer is not None:
+            entries = [item for item in entries if item.get("destination") == peer]
+        entries.reverse()
+        if limit is not None:
+            entries = entries[: max(0, limit)]
+        annotated = []
+        for item in entries:
+            copy = dict(item)
+            reactions = by_target.get(str(item.get("id") or ""))
+            if reactions:
+                reactions.sort(key=lambda entry: entry["received_at"])
+                copy["reactions"] = reactions
+            annotated.append(copy)
+        return annotated
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._messages)
+t not be empty")
+        value = ref.strip()
+        with self._lock:
+            if len(value) == 32:
+                for entry in self._messages:
+                    if entry.get("id") == value:
+                        return dict(entry)
+                raise ValueError(f"unknown message: {ref!r}")
+            matches = [
+                entry
+                for entry in self._messages
+                if isinstance(entry.get("id"), str)
+                and entry["id"].startswith(value)
+            ]
+        if not matches:
+            raise ValueError(f"unknown message: {ref!r}")
+        if len(matches) > 1:
+            raise ValueError(f"{len(matches)} messages match prefix {ref!r}")
+        return dict(matches[0])
+
+    def list_messages(
+        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Received messages, newest first.
+
+        ``peer`` filters to one sender destination hash; ``limit`` caps
+        how many are returned (``None`` means all of them).  Each entry
+        carries a ``reactions`` list when the message has any — derived
+        from the reaction store, never stored counters.
+        """
+        with self._lock:
+            entries = list(self._messages)
+            by_target: Dict[str, List[Dict[str, Any]]] = {}
+            for item in self._reactions:
+                if item["reaction"]:
+                    by_target.setdefault(item["target"], []).append(dict(item))
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
         entries.reverse()
