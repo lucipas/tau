@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -293,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument(
         "--wait",
         type=float,
-        default=0.0,
+        default=None,
         metavar="SECONDS",
         help="after queueing, wait up to SECONDS for the message to be delivered",
     )
@@ -2117,14 +2118,20 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
-    text = _read_message(args)
-    wait = float(getattr(args, "wait", 0.0) or 0.0)
+    # Validate flags before reading the message, so an invalid command
+    # fails at once instead of blocking on stdin.
+    wait_given = getattr(args, "wait", None) is not None
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
     if wait < 0:
         print("error: --wait must not be negative", file=sys.stderr)
         return 2
-    if wait > 0 and getattr(args, "no_queue", False):
+    if wait_given and getattr(args, "no_queue", False):
         print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
         return 2
+    text = _read_message(args)
     config = _make_config(args)
     node = TauNode(config, name=config.name)
     node.start()
@@ -2187,7 +2194,13 @@ def cmd_send(args: argparse.Namespace) -> int:
         print(f"  id:      {response['id']}")
         print("  it will be delivered automatically when they are heard from;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
-    elif response.get("delivered"):
+    elif (
+        response.get("delivered")
+        and "_rtt" not in response
+        and "echo" not in response
+    ):
+        # Queued delivery (built above). A direct reply carries the peer's
+        # echo and round trip, so it takes the branch below to print them.
         waited = response.get("waited")
         if waited is not None:
             print(f"delivered to {args.to} after {waited:.1f}s")
