@@ -198,6 +198,74 @@ def test_exchange_peers_rejects_malformed_response(tmp_path):
         node.exchange_peers(source)
 
 
+def test_send_message_ignores_spoofed_queued_claim(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=time.time()
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "queued": True,
+        "id": "spoofed-id",
+        "to": peer.hexhash,
+        "expires_at": "2099-01-01T00:00:00Z",
+        "echo": "hi",
+        "duplicate": False,
+    }
+
+    response = node.send_message("alice", "hi")
+
+    # Only the node's own enqueue path may report queued; a peer's claim
+    # must not misreport a delivered message or link it to a foreign id.
+    assert response["queued"] is False
+    assert "id" not in response
+    assert "expires_at" not in response
+    assert "to" not in response
+    assert response["echo"] == "hi"
+    assert response["duplicate"] is False
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_message_ignores_queued_claim_without_id(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=time.time()
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "queued": True,
+    }
+
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    assert "id" not in response
+
+
+def test_send_message_marks_honest_direct_delivery_not_queued(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=time.time()
+    )
+    node._request = lambda p, path, payload, timeout: {
+        "ok": True,
+        "echo": "hi",
+        "received_at": 1234.5,
+        "server": "alice-node",
+        "node": peer.hexhash,
+        "duplicate": False,
+    }
+
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    assert response["echo"] == "hi"
+    assert response["server"] == "alice-node"
+
+
 def test_mail_round_exchanges_peers(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("bob")
