@@ -610,3 +610,36 @@ def test_wait_for_delivery_times_out_when_entry_stays_queued(tmp_path, monkeypat
     assert time.monotonic() - started >= 0.2
     assert calls, "the wait must keep retrying the flush until the deadline"
     assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_wait_for_delivery_returns_when_mailbox_lock_stalls(tmp_path, monkeypatch):
+    # A stalled mailbox-lock holder must not keep the wait from
+    # reporting expiry: the queue check is bounded by the time left,
+    # so the wait returns False at the deadline instead of blocking.
+    fcntl = pytest.importorskip("fcntl")
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    monkeypatch.setattr(
+        node, "flush_outbox", lambda **kwargs: {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
+    )
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert (
+            node.wait_for_delivery(entry.id, timeout=0.3, poll_interval=0.05)
+            is False
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed >= 0.3
+        assert elapsed < 2.0, "the wait must not block past its deadline"
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    assert node.mailbox.get_outbox(entry.id) is not None

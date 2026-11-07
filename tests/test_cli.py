@@ -104,15 +104,10 @@ class _FakeWaitNode:
                 self.mailbox.remove_outbox(target)
         return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
 
-    def _still_queued(self, message_id):
+    def _still_queued(self, message_id, timeout=None):
         from tau.node import TauNode as _RealNode
 
-        return _RealNode._still_queued(self, message_id)
-
-    def _still_queued(self, message_id):
-        from tau.node import TauNode as _RealNode
-
-        return _RealNode._still_queued(self, message_id)
+        return _RealNode._still_queued(self, message_id, timeout=timeout)
 
     def wait_for_delivery(self, message_id, *, timeout, poll_interval=1.0):
         from tau.node import TauNode as _RealNode

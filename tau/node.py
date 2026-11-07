@@ -723,8 +723,10 @@ class TauNode:
         ignores the entry's delivery backoff: the caller explicitly asked
         to wait for this message, so a backoff from an earlier failed
         attempt must not swallow the whole wait.  The flush shares the
-        same deadline, so no peer or request starts after it.  Retries
-        stay at `poll_interval`: growing the pause would let the last
+        same deadline, so no peer or request starts after it.  The
+        queue check is bounded by the time left as well, so a stalled
+        mailbox-lock holder cannot keep the wait from reporting expiry.
+        Retries stay at `poll_interval`: growing the pause would let the last
         attempt land long before the deadline, so a peer that becomes
         reachable late in the wait would be missed.  The wait never
         removes the entry itself; a message still queued at the deadline
@@ -732,7 +734,12 @@ class TauNode:
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
-            if not self._still_queued(message_id):
+            remaining = deadline - time.monotonic()
+            # The queue check itself is bounded by the time left: a
+            # stalled mailbox-lock holder must not keep the wait from
+            # reporting expiry, so the check treats an unacquirable lock
+            # as "still queued" and the deadline check below ends it.
+            if not self._still_queued(message_id, timeout=max(0.0, remaining)):
                 return message_id in self._delivered_ids
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -744,7 +751,8 @@ class TauNode:
                 wait_for_lock=min(remaining, 5.0),
                 deadline=deadline,
             )
-            if not self._still_queued(message_id):
+            remaining = deadline - time.monotonic()
+            if not self._still_queued(message_id, timeout=max(0.0, remaining)):
                 return message_id in self._delivered_ids
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1222,16 +1230,23 @@ class TauNode:
                 moved["deposited"] += 1
         return moved
 
-    def _still_queued(self, message_id: str) -> bool:
+    def _still_queued(self, message_id: str, timeout: Optional[float] = None) -> bool:
         """True if the outbox still holds this entry, reloaded from disk.
 
         The sweep works from a snapshot, so a cancel can land after the
         snapshot was taken; each delivery attempt re-checks instead of
         trusting the snapshot.  A send already in flight cannot be
-        recalled — cancelling only stops future attempts.
+        recalled — cancelling only stops future attempts.  With
+        ``timeout`` set, the wait for the mailbox lock is bounded by
+        it: when the lock cannot be acquired in time the entry is
+        treated as still queued, so a caller with its own deadline
+        reports expiry instead of blocking past it.
         """
-        with self.mailbox.transaction():
-            return self.mailbox.get_outbox(message_id) is not None
+        try:
+            with self.mailbox.transaction(timeout=timeout):
+                return self.mailbox.get_outbox(message_id) is not None
+        except TimeoutError:
+            return True
 
     def _deliver_entry(
         self,

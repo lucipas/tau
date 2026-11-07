@@ -541,3 +541,27 @@ def test_transaction_is_reentrant(tmp_path):
     with box._transaction():
         entry = box.enqueue(to=BOB, text="nested write", now=time.time())
     assert box.get_outbox(entry.id) is not None
+
+
+def test_transaction_timeout_when_lock_held(tmp_path):
+    # A stalled lock holder (another process holding the flock) must
+    # not block a bounded transaction past its budget.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with box.transaction(timeout=0.1):
+                raise AssertionError("must not acquire a held lock")
+        assert time.monotonic() - started < 2.0
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    # Once the holder releases, the same bounded transaction succeeds.
+    with box.transaction(timeout=1.0):
+        assert box.get_outbox(box.outbox_list()[0].id) is not None
