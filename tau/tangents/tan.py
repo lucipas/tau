@@ -1079,9 +1079,6 @@ def annotate_replies(
     return posts
 
 
-_SQL_BATCH = 500
-
-
 def edit_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, Any]]:
@@ -1522,9 +1519,9 @@ def timeline(
     )
 
 
-# Upper bound on bound parameters per thread query.  SQLite builds often cap
-# host parameters at 999, so wide generations and long threads are processed
-# in batches of this size.
+# Upper bound on bound parameters per batched query.  SQLite builds often cap
+# host parameters at 999, so wide generations, long threads and large edit
+# lookups are processed in batches of this size.
 _SQL_BATCH = 500
 
 

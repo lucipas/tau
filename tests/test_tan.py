@@ -1163,6 +1163,43 @@ def test_edit_search_matches_edited_text_not_original(identities, tmp_path):
     assert search_posts(conn, "apples")[0]["edited"] is True
 
 
+def test_edit_fork_keeps_retained_chain_text(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "v1", name="alice", now=1000)
+    first = create_edit(
+        conn, alice, post["hash"], "head branch", name="alice", now=1001
+    )
+    # A second edit branched from the same parent (e.g. written on
+    # another device before it saw the first edit) shares the sequence
+    # number; only the edit on the retained head chain counts.
+    create_edit(
+        conn, alice, post["hash"], "forked branch", name="alice", now=1002,
+        previous=post["hash"],
+    )
+    assert head(conn, post["author"]) == first["hash"]
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["head branch"]
+    # An edit chained onto the retained head supersedes both.
+    create_edit(
+        conn, alice, post["hash"], "head branch, again", name="alice", now=1003
+    )
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["head branch, again"]
+
+
+def test_search_batches_edit_lookups_over_large_feeds(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for n in range(1100):
+        create_post(conn, alice, f"bulk post {n}", name="alice", now=1000 + n)
+    # 1100 candidates exceeds SQLite's 999 host-variable limit; the
+    # edit lookup must batch instead of failing the whole search.
+    results = search_posts(conn, "bulk", limit=200)
+    assert len(results) == 200
+    assert all(item["edited"] is False for item in results)
+
+
 def test_edit_rejects_foreign_unknown_deleted_and_unlinked(
     identities, tmp_path
 ):
