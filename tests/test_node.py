@@ -505,6 +505,26 @@ def test_send_message_records_sent_message_for_quote_lookup(
     assert node.inbox.find(response["id"], peer=peer.hexhash) is not None
 
 
+def test_send_message_ignores_peer_supplied_id(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "resolve_peer", lambda *args, **kwargs: peer)
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "id": "ff" * 16},
+    )
+
+    response = node.send_message(peer, "hello")
+
+    assert response["id"] != "ff" * 16
+    sent = node.inbox.list_messages(direction="out")
+    assert sent[0]["id"] == response["id"]
+
+
 def test_send_message_queues_reply_when_peer_is_offline(
     tmp_path, monkeypatch
 ):

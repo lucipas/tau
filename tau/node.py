@@ -1517,10 +1517,10 @@ class TauNode:
             )
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
             if isinstance(response, dict):
-                # The peer's reply carries no id; attach this message's
-                # so callers (console history, JSON output) can name it
-                # the same way the queued path does.
-                response.setdefault("id", message_id)
+                # Always name the outbound wire message, never an id
+                # the peer supplied, so callers (console history, JSON
+                # output) match what was actually sent and recorded.
+                response["id"] = message_id
             self._record_sent(
                 {
                     "from": self.name,
