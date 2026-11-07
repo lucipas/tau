@@ -1178,15 +1178,18 @@ class TauNode:
                 summary["deposited"] += moved["deposited"]
                 summary["receipts"] += moved.get("receipts", 0)
                 summary["received"] += self._collect_mail(peer, timeout)
-            # Receipts for messages a reader displayed but could not
-            # receipt itself (a one-shot `tau messages` shares this
-            # data directory with the serving node and cannot start a
-            # second Reticulum instance on its listen port).  A targeted
-            # retry touches only its own entry, so it skips this sweep.
-            if to is None and message_id is None:
-                summary["receipts"] += self._flush_read_receipts()
         finally:
             self._mail_lock.release()
+        # Receipts for messages a reader displayed but could not
+        # receipt itself (a one-shot `tau messages` shares this
+        # data directory with the serving node and cannot start a
+        # second Reticulum instance on its listen port).  A targeted
+        # retry touches only its own entry, so it skips this sweep.
+        # Flushed after the mail lock is released: resolving an
+        # unknown sender can wait seconds for discovery, and that
+        # wait must not stall other mail rounds.
+        if to is None and message_id is None:
+            summary["receipts"] += self._flush_read_receipts()
         return summary
 
     def _flush_peer(
@@ -1330,7 +1333,10 @@ class TauNode:
         A one-shot reader stamps ``read_at`` when it displays a DM;
         this sweep — run by the serving node's mail loop and by any
         one-shot flush — is what actually delivers those receipts.
-        Returns how many receipts were sent or queued.
+        A sender that cannot be discovered gets its receipt queued by
+        hash (see ``send_read_receipts``), so the ids are stamped and
+        later sweeps do not repeat the discovery wait.  Returns how
+        many receipts were sent or queued.
         """
         if not self.read_receipts_enabled:
             return 0
@@ -1744,6 +1750,26 @@ class TauNode:
             f"{timeout:.1f}s; check the interface and announce interval"
         )
 
+    def _queue_read_receipts(
+        self, dest_hash: bytes, message_ids: List[str], read_at: float
+    ) -> List[Any]:
+        """Queue receipts for *dest_hash*, at most MAX_READ_IDS per entry.
+
+        ``Mailbox.queue_receipt`` (and the wire payload) reject batches
+        over 100 ids, so a longer list is split here rather than left
+        unreceipted.
+        """
+        entries = []
+        for start in range(0, len(message_ids), MAX_READ_IDS):
+            entries.append(
+                self.mailbox.queue_receipt(
+                    to=dest_hash,
+                    message_ids=message_ids[start : start + MAX_READ_IDS],
+                    read_at=read_at,
+                )
+            )
+        return entries
+
     def send_read_receipts(
         self,
         target: Union[str, bytes, Peer],
@@ -1755,12 +1781,17 @@ class TauNode:
     ) -> Dict[str, Any]:
         """Tell *target* that its messages were read.
 
-        One signed receipt covers all *message_ids*.  When the sender
-        is reachable the receipt goes direct over the link; otherwise
-        it is queued in the receipts outbox and rides store-and-forward
-        like a message.  A node that opted out never sends receipts
-        (returns ``{"ok": False, "disabled": True}``).  Receipts are
-        never receipted themselves.
+        One signed receipt covers up to ``MAX_READ_IDS`` message ids;
+        a longer list is split into one receipt per batch, sent direct
+        or queued per batch.  When the sender is reachable the receipt
+        goes direct over the link; otherwise it is queued in the
+        receipts outbox and rides store-and-forward like a message —
+        including when the sender cannot even be discovered: a known
+        destination hash is enough to queue by, so a failed discovery
+        neither drops the receipt nor repeats on every sweep.  A node
+        that opted out never sends receipts (returns
+        ``{"ok": False, "disabled": True}``).  Receipts are never
+        receipted themselves.
         """
         if not self.started:
             raise NodeError("node has not been started")
@@ -1774,12 +1805,30 @@ class TauNode:
                 ids.append(message_id)
         if not ids:
             return {"ok": True, "ids": [], "recorded": []}
-        peer = self.resolve_peer(
-            target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
-        )
+        try:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+        except (NodeError, PeerError):
+            # Discovery failed: queue by destination hash so
+            # store-and-forward can deliver the receipt when the
+            # sender is reachable, instead of dropping it and waiting
+            # out discovery again on the next sweep.
+            dest_hash = self._target_hash(target)
+            if dest_hash is None:
+                raise
+            stamp = read_at if isinstance(read_at, (int, float)) else time.time()
+            entries = self._queue_read_receipts(dest_hash, ids, stamp)
+            return {
+                "ok": True,
+                "queued": True,
+                "receipt_id": entries[0].id,
+                "receipt_ids": [entry.id for entry in entries],
+                "ids": ids,
+            }
         stamp = read_at if isinstance(read_at, (int, float)) else time.time()
         if len(ids) > MAX_READ_IDS:
             # One receipt names at most MAX_READ_IDS messages; send the

@@ -424,7 +424,9 @@ def test_send_read_receipts_respects_opt_out(tmp_path):
     set_node_setting(node.config.data_dir, "send_read_receipts", False)
     assert node.read_receipts_enabled is False
     result = node.send_read_receipts(b"\xaa" * 16, ["msg-1"])
-    assert result == {"ok": False, "disabled": True, "ids": ["msg-1"]}
+    # Disabled: no ids are reported handled, so no caller stamps them
+    # as receipted.
+    assert result == {"ok": False, "disabled": True, "ids": []}
     assert node.mailbox.counts()["receipts"] == 0
     assert send_read_receipts_enabled(node.config.data_dir) is False
 
@@ -545,6 +547,200 @@ def test_flush_read_receipts_sends_stamped(tmp_path):
     # Second sweep sends nothing.
     assert node._flush_read_receipts() == 0
     assert sent == [(reader_hash.hex(), ["msg-1"], 10.0)]
+
+
+def test_send_message_records_sent_before_request_returns(tmp_path):
+    # PR #99 (Codex P2): a live console receipts on display, so the
+    # reader's receipt can arrive while the /tau/message request is
+    # still in flight.  The send must already be recorded then, or
+    # the receipt is discarded as an unknown id and never retried.
+    node = make_node(tmp_path, name="bob")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    node.destination = SimpleNamespace(hexhash="ab" * 16, hash=b"\xab" * 16)
+    reader, reader_hash = make_peer_identity()
+    peer = Peer(
+        destination_hash=reader_hash,
+        name="alice",
+        public_key=reader.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+        caps=("message", "ping", "peers", "mail", "read"),
+    )
+    node.registry._peers[reader_hash] = peer
+
+    def _request(peer, path, payload, timeout):
+        message = decode(payload)
+        receipt = build_read_receipt(
+            reader, message_ids=[message["id"]], read_at=150.0
+        )
+        response = call_handler(node._handle_read, receipt, remote_identity=reader)
+        assert response["recorded"] == [message["id"]]
+        return {"ok": True}
+
+    node._request = _request
+    response = node.send_message(peer, "hello")
+    assert response["ok"] is True
+    assert node.mailbox.read_at(response["id"]) == 150.0
+
+
+def test_send_read_receipts_chunks_over_100_ids(tmp_path):
+    # PR #99 (Codex P2): a per-peer list over 100 ids used to fail
+    # build_read_receipt and then the queue fallback, leaving the
+    # messages unreceipted.  It is now split into ≤100-id receipts.
+    node = make_node(tmp_path, name="alice")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    reader, reader_hash = make_peer_identity()
+    peer = Peer(
+        destination_hash=reader_hash,
+        name="bob",
+        public_key=reader.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+        caps=("message", "ping", "peers", "mail", "read"),
+    )
+    node.registry._peers[reader_hash] = peer
+    ids = [f"msg-{i}" for i in range(250)]
+    batch_sizes = []
+
+    def _request(peer, path, payload, timeout):
+        batch = decode(payload)["ids"]
+        batch_sizes.append(len(batch))
+        return {"ok": True, "recorded": batch}
+
+    node._request = _request
+    result = node.send_read_receipts(peer, ids, read_at=42.0)
+    assert result["ok"] is True
+    assert result.get("queued") is None
+    assert result["recorded"] == ids
+    assert batch_sizes == [100, 100, 50]
+    assert node.mailbox.counts()["receipts"] == 0
+
+
+def test_send_read_receipts_queues_oversized_batches(tmp_path):
+    # Same chunking on the queue fallback: an unreachable sender gets
+    # three queued receipts, each within the 100-id limit.
+    node = make_node(tmp_path, name="alice")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    reader, reader_hash = make_peer_identity()
+    peer = Peer(
+        destination_hash=reader_hash,
+        name="bob",
+        public_key=reader.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+        caps=("message", "ping", "peers", "mail", "read"),
+    )
+    node.registry._peers[reader_hash] = peer
+
+    def _fail(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    node._request = _fail
+    ids = [f"msg-{i}" for i in range(250)]
+    result = node.send_read_receipts(peer, ids, read_at=42.0)
+    assert result["ok"] is True
+    assert result["ids"] == ids
+    queued = node.mailbox.receipt_outbox_list(to=reader_hash)
+    assert len(queued) == 3
+    assert [len(entry.message_ids) for entry in queued] == [100, 100, 50]
+    assert [mid for entry in queued for mid in entry.message_ids] == ids
+
+
+def test_send_read_receipts_queues_by_hash_when_discovery_fails(
+    tmp_path, monkeypatch
+):
+    # PR #99 (CodeRabbit Major): a sender that cannot be discovered
+    # gets its receipt queued by destination hash instead of dropped.
+    node = make_node(tmp_path, name="alice")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    node.destination = SimpleNamespace(hexhash="ab" * 16, hash=b"\xab" * 16)
+    sender_hash = b"\xaa" * 16
+
+    def _no_peer(dest_hash, *, timeout=10.0):
+        raise NodeError("peer did not announce within 10.0s")
+
+    monkeypatch.setattr(node, "wait_for_peer", _no_peer)
+    result = node.send_read_receipts(sender_hash.hex(), ["msg-1", "msg-2"])
+    assert result["ok"] is True
+    assert result["queued"] is True
+    queued = node.mailbox.receipt_outbox_list(to=sender_hash)
+    assert len(queued) == 1
+    assert queued[0].message_ids == ["msg-1", "msg-2"]
+
+    # A target with no recoverable hash still raises.
+    with pytest.raises(NodeError):
+        node.send_read_receipts("nobody-here", ["msg-1"])
+
+
+def test_flush_read_receipts_queues_unknown_sender_once(tmp_path, monkeypatch):
+    # PR #99 (CodeRabbit Major): once the receipt is queued the ids
+    # are stamped, so later sweeps do not repeat the discovery wait.
+    node = make_node(tmp_path, name="alice")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    node.destination = SimpleNamespace(hexhash="ab" * 16, hash=b"\xab" * 16)
+    sender_hash = b"\xaa" * 16
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "hello",
+            "sent_at": 1.0,
+            "received_at": 2.0,
+            "id": "msg-1",
+        }
+    )
+    node.inbox.mark_read(["msg-1"], at=10.0)
+    attempts = []
+
+    def _no_peer(dest_hash, *, timeout=10.0):
+        attempts.append(dest_hash)
+        raise NodeError("peer did not announce within 10.0s")
+
+    monkeypatch.setattr(node, "wait_for_peer", _no_peer)
+    assert node._flush_read_receipts() == 1
+    assert attempts == [sender_hash]
+    assert node.inbox.read_unreceipted() == []
+    assert len(node.mailbox.receipt_outbox_list(to=sender_hash)) == 1
+    # Second sweep owes nothing: no repeat discovery wait.
+    assert node._flush_read_receipts() == 0
+    assert attempts == [sender_hash]
+
+
+def test_flush_outbox_releases_mail_lock_before_receipts(tmp_path, monkeypatch):
+    # PR #99 (CodeRabbit Major): the receipt flush runs after the
+    # mail lock is released, so a discovery wait cannot stall other
+    # mail rounds.
+    node = make_node(tmp_path, name="alice")
+    node.reticulum = object()
+    node.identity = RNS.Identity()
+    node.inbox.append(
+        {
+            "from": "bob",
+            "destination": "aa" * 16,
+            "text": "hello",
+            "sent_at": 1.0,
+            "received_at": 2.0,
+            "id": "msg-1",
+        }
+    )
+    node.inbox.mark_read(["msg-1"], at=10.0)
+    lock_states = []
+    real_flush = node._flush_read_receipts
+
+    def _recording_flush():
+        lock_states.append(node._mail_lock.locked())
+        return real_flush()
+
+    monkeypatch.setattr(node, "_flush_read_receipts", _recording_flush)
+    summary = node.flush_outbox()
+    assert lock_states == [False]
+    assert summary["receipts"] == 1
+    assert node.inbox.read_unreceipted() == []
 
 
 def test_config_roundtrip(tmp_path):
