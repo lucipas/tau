@@ -18,6 +18,16 @@ the node's data directory holding three collections:
 ``seen``
     Ids of messages already delivered to the user, so a message that
     arrives twice — once directly, once via a holder — is shown once.
+``sent``
+    Messages this node sent, keyed by message id, with the recipient
+    and the time they were read (``read_at``).  A read receipt is only
+    believed when it names an id here *and* its reader is the recorded
+    recipient — that is what stops a forged receipt.
+``receipts``
+    Signed read receipts this node owes a sender that was unreachable
+    when the message was read.  They ride the same store-and-forward
+    machinery as the outbox: direct delivery when the sender is
+    reachable, sealed deposits with holders when it is not.
 
 The file format and locking mirror the peer registry: one JSON document,
 atomic writes, thread-safe access.
@@ -33,7 +43,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 try:  # POSIX only; mailbox cross-process locking is a no-op without it.
     import fcntl
@@ -68,6 +78,13 @@ MAX_HELD_TOTAL = 512
 MAX_HELD_PER_RECIPIENT = 64
 MAX_SEEN = 1024
 MAX_HOLDERS_PER_MESSAGE = 3
+# Sent-message history (for read receipts) and queued receipts waiting
+# on an unreachable sender.  Both are small metadata records, capped
+# like the seen set; sent entries also keep the text so `tau messages
+# --sent` can show what was read.
+MAX_SENT = 256
+MAX_RECEIPTS = 256
+SENT_RETENTION = 30 * 24 * 60 * 60
 
 # Direct-delivery retry pacing: after a failed attempt, wait 60s, then
 # double after each further failure, up to an hour.  An announce from the
@@ -196,6 +213,111 @@ class OutboxEntry:
 
 
 @dataclass
+class ReceiptEntry:
+    """A read receipt this node owes a sender that was unreachable.
+
+    Mirrors :class:`OutboxEntry` (same backoff, same holder deposits),
+    but the payload is a signed list of message ids the reader has
+    seen rather than a text message.  A receipt entry is removed once
+    the sender acknowledges it; receipts are never receipted.
+    """
+
+    id: str
+    to: bytes
+    message_ids: List[str]
+    read_at: float
+    created_at: float
+    expires_at: float
+    attempts: int = 0
+    last_attempt_at: Optional[float] = None
+    held_by: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def to_hex(self) -> str:
+        return self.to.hex()
+
+    @property
+    def next_attempt_at(self) -> Optional[float]:
+        if self.attempts <= 0 or self.last_attempt_at is None:
+            return None
+        exponent = min(self.attempts - 1, 6)
+        delay = min(
+            DELIVERY_BACKOFF_BASE_SECONDS * (2 ** exponent),
+            DELIVERY_BACKOFF_MAX_SECONDS,
+        )
+        return self.last_attempt_at + delay
+
+    def is_due(self, now: Optional[float] = None) -> bool:
+        target = self.next_attempt_at
+        if target is None:
+            return True
+        return (now if now is not None else time.time()) >= target
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "to": self.to_hex,
+            "message_ids": list(self.message_ids),
+            "read_at": self.read_at,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "attempts": self.attempts,
+            "last_attempt_at": self.last_attempt_at,
+            "next_attempt_at": self.next_attempt_at,
+            "held_by": dict(self.held_by),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "ReceiptEntry":
+        to_hex = raw.get("to")
+        if not isinstance(to_hex, str) or len(to_hex) != 32:
+            raise ValueError("invalid receipt destination")
+        destination = bytes.fromhex(to_hex)
+        if len(destination) != _DESTINATION_BYTES:
+            raise ValueError("invalid receipt destination length")
+        receipt_id = raw.get("id")
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise ValueError("invalid receipt id")
+        message_ids = raw.get("message_ids")
+        if not isinstance(message_ids, list) or not message_ids:
+            raise ValueError("invalid receipt message ids")
+        cleaned_ids = []
+        for message_id in message_ids:
+            if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+                raise ValueError("invalid receipt message id")
+            if message_id not in cleaned_ids:
+                cleaned_ids.append(message_id)
+        created_at = raw.get("created_at")
+        expires_at = raw.get("expires_at")
+        read_at = raw.get("read_at")
+        if not isinstance(created_at, (int, float)) or not isinstance(
+            expires_at, (int, float)
+        ) or not isinstance(read_at, (int, float)):
+            raise ValueError("invalid receipt timestamps")
+        held_by = raw.get("held_by")
+        if not isinstance(held_by, dict):
+            held_by = {}
+        attempts = raw.get("attempts")
+        return cls(
+            id=receipt_id,
+            to=destination,
+            message_ids=cleaned_ids,
+            read_at=float(read_at),
+            created_at=float(created_at),
+            expires_at=float(expires_at),
+            attempts=int(attempts) if isinstance(attempts, int) else 0,
+            last_attempt_at=raw.get("last_attempt_at")
+            if isinstance(raw.get("last_attempt_at"), (int, float))
+            else None,
+            held_by={
+                str(k): float(v)
+                for k, v in held_by.items()
+                if isinstance(v, (int, float))
+            },
+        )
+
+
+@dataclass
 class HeldEnvelope:
     """A sealed message this node is holding for another peer."""
 
@@ -263,6 +385,8 @@ class Mailbox:
         self._outbox: Dict[str, OutboxEntry] = {}
         self._held: Dict[str, HeldEnvelope] = {}
         self._seen: Dict[str, float] = {}
+        self._sent: Dict[str, Dict[str, Any]] = {}
+        self._receipts: Dict[str, ReceiptEntry] = {}
         self._pending_acks: Dict[str, List[str]] = {}
         # Ids the owner dropped with `tau outbox drop-held`, with the
         # expiry of the envelope that was dropped: a sender retrying its
@@ -376,10 +500,58 @@ class Mailbox:
                 if isinstance(v, (int, float))
             }
 
+        sent: Dict[str, Dict[str, Any]] = {}
+        raw_sent = raw.get("sent")
+        if isinstance(raw_sent, dict):
+            for message_id, record in raw_sent.items():
+                if not isinstance(record, dict):
+                    continue
+                to_hex = record.get("to")
+                sent_at = record.get("sent_at")
+                read_at = record.get("read_at")
+                text = record.get("text")
+                if (
+                    not isinstance(message_id, str)
+                    or not isinstance(to_hex, str)
+                    or len(to_hex) != 32
+                    or not isinstance(sent_at, (int, float))
+                    or (
+                        read_at is not None
+                        and not isinstance(read_at, (int, float))
+                    )
+                    or not isinstance(text, str)
+                ):
+                    continue
+                try:
+                    bytes.fromhex(to_hex)
+                except ValueError:
+                    continue
+                sent[message_id] = {
+                    "to": to_hex.lower(),
+                    "sent_at": float(sent_at),
+                    "read_at": float(read_at) if read_at is not None else None,
+                    "text": text,
+                }
+
+        receipts: Dict[str, ReceiptEntry] = {}
+        raw_receipts = raw.get("receipts")
+        if isinstance(raw_receipts, list):
+            for entry in raw_receipts:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    parsed_receipt = ReceiptEntry.from_dict(entry)
+                except (TypeError, ValueError) as exc:
+                    log.debug("Skipping invalid receipt entry: %s", exc)
+                    continue
+                receipts[parsed_receipt.id] = parsed_receipt
+
         with self._lock:
             self._outbox = outbox
             self._held = held
             self._seen = seen
+            self._sent = sent
+            self._receipts = receipts
             self._pending_acks = acks
             self._dropped_held = dropped_held
         log.debug(
@@ -399,6 +571,13 @@ class Mailbox:
                 "outbox": [entry.to_dict() for entry in self._outbox.values()],
                 "held": [env.to_dict() for env in self._held.values()],
                 "seen": dict(self._seen),
+                "sent": {
+                    message_id: dict(record)
+                    for message_id, record in self._sent.items()
+                },
+                "receipts": [
+                    entry.to_dict() for entry in self._receipts.values()
+                ],
                 "dropped_held": dict(self._dropped_held),
                 "pending_acks": {
                     holder: list(ids)
@@ -415,6 +594,8 @@ class Mailbox:
                 "outbox": len(self._outbox),
                 "held": len(self._held),
                 "seen": len(self._seen),
+                "sent": len(self._sent),
+                "receipts": len(self._receipts),
             }
 
     # -- outbox ------------------------------------------------------------
@@ -525,6 +706,218 @@ class Mailbox:
     ) -> None:
         with self._transaction():
             entry = self._outbox.get(message_id)
+            if entry is None:
+                return
+            entry.held_by[holder_hexhash] = (
+                now if now is not None else time.time()
+            )
+            self.save()
+
+    # -- sent messages and read receipts ------------------------------------
+
+    def record_sent(
+        self,
+        message_id: str,
+        *,
+        to: bytes,
+        text: str,
+        sent_at: Optional[float] = None,
+    ) -> None:
+        """Remember a message this node sent, for read receipts.
+
+        The record is what authorises a later receipt: only a reader
+        matching ``to`` can mark this id read.  Re-recording an id
+        (a retry) keeps the first send time and any read already
+        recorded.
+        """
+        if len(to) != _DESTINATION_BYTES:
+            raise MailboxError("destination hash must be 16 bytes")
+        timestamp = sent_at if sent_at is not None else time.time()
+        with self._transaction():
+            existing = self._sent.get(message_id)
+            if existing is not None:
+                return
+            if len(self._sent) >= MAX_SENT:
+                # Messages still queued for delivery keep their record: a
+                # receipt for them may arrive long after newer sends.
+                evictable = sorted(
+                    (
+                        kv
+                        for kv in self._sent.items()
+                        if kv[0] not in self._outbox
+                    ),
+                    key=lambda kv: kv[1]["sent_at"],
+                )
+                for key, _ in evictable[: len(self._sent) - MAX_SENT + 1]:
+                    del self._sent[key]
+            self._sent[message_id] = {
+                "to": to.hex(),
+                "sent_at": float(timestamp),
+                "read_at": None,
+                "delivered_at": None,
+                "text": normalize_message(text),
+            }
+            self.save()
+
+    def record_delivered(
+        self, message_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Mark a sent message as having reached its recipient."""
+        with self._transaction():
+            record = self._sent.get(message_id)
+            if record is None or record.get("delivered_at") is not None:
+                return
+            record["delivered_at"] = now if now is not None else time.time()
+            self.save()
+
+    def discard_sent(self, message_id: str) -> None:
+        """Forget a sent record whose send was refused or never went out."""
+        with self._transaction():
+            if self._sent.pop(message_id, None) is not None:
+                self.save()
+
+    def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """A copy of one sent record, or ``None`` when unknown."""
+        with self._lock:
+            record = self._sent.get(message_id)
+            return dict(record) if record is not None else None
+
+    def read_at(self, message_id: str) -> Optional[float]:
+        """When *message_id* was read, or ``None`` (unknown, not unread)."""
+        with self._lock:
+            record = self._sent.get(message_id)
+            return record["read_at"] if record is not None else None
+
+    def record_read(
+        self, message_id: str, read_at: float, *, reader_hash: str
+    ) -> bool:
+        """Mark *message_id* read at *read_at*, if *reader_hash* may.
+
+        Returns ``True`` when the record changed.  ``False`` when the
+        id was never sent by this node, or the reader is not the
+        recorded recipient — a forged receipt for a message the sender
+        never sent, or from a peer who is not the recipient, is
+        rejected here.  Absence of a receipt stays unknown: a first
+        read keeps the earliest time, never a later re-read.
+        """
+        if not math.isfinite(read_at):
+            return False
+        with self._transaction():
+            record = self._sent.get(message_id)
+            if record is None:
+                return False
+            if record["to"] != reader_hash.lower():
+                return False
+            previous = record["read_at"]
+            if previous is None or read_at < previous:
+                record["read_at"] = float(read_at)
+                self.save()
+                return True
+            return False
+
+    def sent_list(self) -> List[Dict[str, Any]]:
+        """Sent messages, oldest first, with their read state."""
+        with self._lock:
+            entries = [
+                {"id": message_id, **dict(record)}
+                for message_id, record in self._sent.items()
+            ]
+        entries.sort(key=lambda entry: entry["sent_at"])
+        return entries
+
+    def queue_receipt(
+        self,
+        *,
+        to: bytes,
+        message_ids: List[str],
+        read_at: float,
+        now: Optional[float] = None,
+    ) -> ReceiptEntry:
+        """Queue a signed read receipt for a sender we cannot reach.
+
+        The receipt rides the same store-and-forward machinery as the
+        outbox: a direct ``/tau/read`` when the sender is reachable,
+        sealed deposits with holders when it is not.
+        """
+        if len(to) != _DESTINATION_BYTES:
+            raise MailboxError("destination hash must be 16 bytes")
+        cleaned_ids = []
+        for message_id in message_ids:
+            if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+                raise MailboxError("invalid receipt message id")
+            if message_id not in cleaned_ids:
+                cleaned_ids.append(message_id)
+        if not cleaned_ids:
+            raise MailboxError("read receipt must name at least one message")
+        if len(cleaned_ids) > 100:
+            raise MailboxError("read receipt names too many messages")
+        if not math.isfinite(read_at):
+            raise MailboxError("read_at must be a finite number")
+        timestamp = now if now is not None else time.time()
+        with self._transaction():
+            if len(self._receipts) >= MAX_RECEIPTS:
+                raise MailboxFull(f"receipt queue is full ({MAX_RECEIPTS} receipts)")
+            entry = ReceiptEntry(
+                id=generate_message_id(),
+                to=bytes(to),
+                message_ids=cleaned_ids,
+                read_at=float(read_at),
+                created_at=timestamp,
+                expires_at=timestamp + max(60.0, min(float(DEFAULT_TTL), MAX_MAIL_TTL)),
+            )
+            self._receipts[entry.id] = entry
+            self.save()
+            return entry
+
+    def get_receipt_outbox(self, receipt_id: str) -> Optional[ReceiptEntry]:
+        with self._lock:
+            return self._receipts.get(receipt_id)
+
+    def receipt_outbox_list(
+        self, to: Optional[bytes] = None
+    ) -> List[ReceiptEntry]:
+        with self._lock:
+            entries = list(self._receipts.values())
+        if to is not None:
+            entries = [e for e in entries if e.to == to]
+        entries.sort(key=lambda e: e.created_at)
+        return entries
+
+    def due_receipts(
+        self, to: Optional[bytes] = None, *, now: Optional[float] = None
+    ) -> List[ReceiptEntry]:
+        """Queued receipts whose delivery backoff has elapsed."""
+        timestamp = now if now is not None else time.time()
+        return [
+            entry
+            for entry in self.receipt_outbox_list(to=to)
+            if entry.is_due(timestamp)
+        ]
+
+    def remove_receipt_outbox(self, receipt_id: str) -> bool:
+        with self._transaction():
+            if receipt_id not in self._receipts:
+                return False
+            del self._receipts[receipt_id]
+            self.save()
+            return True
+
+    def record_receipt_attempt(
+        self, receipt_id: str, *, error: Optional[str] = None, now: Optional[float] = None
+    ) -> None:
+        with self._transaction():
+            entry = self._receipts.get(receipt_id)
+            if entry is None:
+                return
+            entry.attempts += 1
+            entry.last_attempt_at = now if now is not None else time.time()
+            self.save()
+
+    def record_receipt_deposit(
+        self, receipt_id: str, holder_hexhash: str, *, now: Optional[float] = None
+    ) -> None:
+        with self._transaction():
+            entry = self._receipts.get(receipt_id)
             if entry is None:
                 return
             entry.held_by[holder_hexhash] = (
@@ -714,6 +1107,20 @@ class Mailbox:
             ]
             for key in dead_seen:
                 del self._seen[key]
+            dead_sent = [
+                key
+                for key, record in self._sent.items()
+                if timestamp - record["sent_at"] > SENT_RETENTION
+            ]
+            for key in dead_sent:
+                del self._sent[key]
+            dead_receipts = [
+                key
+                for key, entry in self._receipts.items()
+                if entry.expires_at <= timestamp
+            ]
+            for key in dead_receipts:
+                del self._receipts[key]
             dead_dropped = [
                 key
                 for key, until in self._dropped_held.items()
@@ -721,12 +1128,21 @@ class Mailbox:
             ]
             for key in dead_dropped:
                 del self._dropped_held[key]
-            if dead_outbox or dead_held or dead_seen or dead_dropped:
+            if (
+                dead_outbox
+                or dead_held
+                or dead_seen
+                or dead_sent
+                or dead_receipts
+                or dead_dropped
+            ):
                 self.save()
             return {
                 "outbox": len(dead_outbox),
                 "held": len(dead_held),
                 "seen": len(dead_seen),
+                "sent": len(dead_sent),
+                "receipts": len(dead_receipts),
                 "dropped_held": len(dead_dropped),
             }
 
@@ -782,6 +1198,106 @@ def seal_message(
 
 def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any]:
     """Decrypt and authenticate a sealed message addressed to this node."""
+    kind, message = open_sealed_envelope(recipient_identity, blob)
+    if kind != "sealed_message":
+        raise MailboxError("unexpected sealed payload type")
+    return message
+
+
+def seal_receipt(
+    sender_identity: RNS.Identity,
+    *,
+    sender_name: str,
+    recipient_public_key: bytes,
+    receipt_id: str,
+    message_ids: List[str],
+    read_at: float,
+) -> bytes:
+    """Encrypt a signed read receipt to the original sender.
+
+    Same envelope shape as :func:`seal_message` — the plaintext
+    carries the reader's public key and a signature over every other
+    field — but the payload names message ids instead of carrying
+    text.  A holder can neither read nor forge what it carries; the
+    recipient verifies the signature and then checks each id against
+    the messages it actually sent (see ``Mailbox.record_read``).
+    """
+    if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
+        raise MailboxError("recipient public key must be 64 bytes")
+    cleaned_ids = []
+    for message_id in message_ids:
+        if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+            raise MailboxError("sealed receipt has an invalid message id")
+        if message_id not in cleaned_ids:
+            cleaned_ids.append(message_id)
+    if not cleaned_ids:
+        raise MailboxError("sealed receipt must name at least one message")
+    if not math.isfinite(read_at):
+        raise MailboxError("sealed receipt read_at must be a finite number")
+    sender_hash = tau_destination_hash(sender_identity)
+    inner: Dict[str, Any] = {
+        "type": "sealed_receipt",
+        "v": 1,
+        "id": receipt_id,
+        "from": sender_hash.hex(),
+        "from_name": sanitize_name(sender_name),
+        "from_key": sender_identity.get_public_key().hex(),
+        "ids": cleaned_ids,
+        "read_at": float(read_at),
+    }
+    canonical = encode(inner)
+    signature = sender_identity.sign(canonical)
+    if signature is None:  # pragma: no cover - identity without private keys
+        raise MailboxError("sender identity cannot sign")
+    inner["sig"] = base64.b64encode(signature).decode("ascii")
+    plaintext = encode(inner, max_bytes=MAX_MAIL_BLOB_BYTES)
+
+    recipient = RNS.Identity(create_keys=False)
+    if not load_public_key(recipient, recipient_public_key):
+        raise MailboxError("could not load recipient public key")
+    blob = recipient.encrypt(plaintext)
+    if not blob:
+        raise MailboxError("could not encrypt sealed receipt")
+    if len(blob) > MAX_MAIL_BLOB_BYTES:
+        raise MailboxError("sealed receipt is too large to store or forward")
+    return blob
+
+
+def open_receipt(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any]:
+    """Decrypt and authenticate a sealed read receipt addressed to this node."""
+    kind, receipt = open_sealed_envelope(recipient_identity, blob)
+    if kind != "sealed_receipt":
+        raise MailboxError("unexpected sealed payload type")
+    return receipt
+
+
+def open_sealed_envelope(
+    recipient_identity: RNS.Identity, blob: bytes
+) -> Tuple[str, Dict[str, Any]]:
+    """Decrypt and authenticate any sealed envelope addressed to this node.
+
+    Returns ``(kind, payload)`` where kind is ``"sealed_message"`` or
+    ``"sealed_receipt"`` and the payload is the validated dict that
+    :func:`open_message` / :func:`open_receipt` return.  An envelope
+    of any other type raises :class:`MailboxError`.
+    """
+    payload = _open_sealed(recipient_identity, blob)
+    kind = payload.get("type")
+    if kind == "sealed_message":
+        return kind, _validated_sealed_message(payload)
+    if kind == "sealed_receipt":
+        return kind, _validated_sealed_receipt(payload)
+    raise MailboxError("unexpected sealed payload type")
+
+
+def _open_sealed(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any]:
+    """Decrypt a sealed envelope and verify its signature.
+
+    Shared by sealed messages and sealed receipts: the plaintext
+    carries the sender's public key and a signature over every other
+    field, so the recipient can authenticate the payload without
+    trusting whichever peer happened to hold it.
+    """
     try:
         plaintext = recipient_identity.decrypt(bytes(blob))
     except Exception as exc:
@@ -792,8 +1308,6 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         payload = decode(plaintext, max_bytes=MAX_MAIL_BLOB_BYTES)
     except ProtocolError as exc:
         raise MailboxError(f"invalid sealed message: {exc}") from exc
-    if payload.get("type") != "sealed_message":
-        raise MailboxError("unexpected sealed payload type")
 
     signature_text = payload.get("sig")
     if not isinstance(signature_text, str):
@@ -830,7 +1344,11 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         raise MailboxError(f"could not verify sealed message: {exc}") from exc
     if not verified:
         raise MailboxError("sealed message signature does not verify")
+    return payload
 
+
+def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Field checks for a verified sealed-message payload."""
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         raise MailboxError("sealed message has an invalid id")
@@ -841,8 +1359,34 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
     sent_at = payload.get("sent_at")
     return {
         "id": message_id,
-        "from": claimed_from.lower(),
+        "from": payload["from"].lower(),
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+    }
+
+
+def _validated_sealed_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Field checks for a verified sealed-receipt payload."""
+    receipt_id = payload.get("id")
+    if not isinstance(receipt_id, str) or not receipt_id or len(receipt_id) > 64:
+        raise MailboxError("sealed receipt has an invalid id")
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise MailboxError("sealed receipt must name at least one message")
+    cleaned_ids = []
+    for message_id in ids:
+        if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+            raise MailboxError("sealed receipt has an invalid message id")
+        if message_id not in cleaned_ids:
+            cleaned_ids.append(message_id)
+    read_at = payload.get("read_at")
+    if not isinstance(read_at, (int, float)) or not math.isfinite(float(read_at)):
+        raise MailboxError("sealed receipt has an invalid read_at")
+    return {
+        "id": receipt_id,
+        "from": payload["from"].lower(),
+        "from_name": sanitize_name(payload.get("from_name")),
+        "ids": cleaned_ids,
+        "read_at": float(read_at),
     }

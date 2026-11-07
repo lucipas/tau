@@ -60,7 +60,23 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
-    return {
+    receipt_sent_at = raw.get("receipt_sent_at")
+    if receipt_sent_at is not None:
+        try:
+            receipt_sent_at = float(receipt_sent_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(receipt_sent_at):
+            return None
+    read_at = raw.get("read_at")
+    if read_at is not None:
+        try:
+            read_at = float(read_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(read_at):
+            return None
+    record = {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
         "text": text,
@@ -69,6 +85,11 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
     }
+    if receipt_sent_at is not None:
+        record["receipt_sent_at"] = receipt_sent_at
+    if read_at is not None:
+        record["read_at"] = read_at
+    return record
 
 
 class Inbox:
@@ -146,6 +167,102 @@ class Inbox:
             self._messages = self._messages[-MAX_INBOX:]
             self._save()
         return entry
+
+    def reload(self) -> None:
+        """Reload the on-disk inbox, discarding the in-memory copy.
+
+        One-shot commands (``tau messages``) stamp read/receipt state
+        on disk while a serving node holds its own copy in memory; the
+        serving sweep reloads before deciding what is owed.  Safe to
+        call any time: every append persists immediately, so the file
+        is never behind the cache.
+        """
+        with self._lock:
+            self._load()
+
+    def mark_read(
+        self, message_ids: List[str], *, at: Optional[float] = None
+    ) -> List[str]:
+        """Stamp *message_ids* as displayed by a human (read, not receipted).
+
+        A one-shot reader (``tau messages``) cannot always start a node
+        to send the receipt itself — a serving node already holds the
+        TCP listen port, and Reticulum exits the process when a second
+        node tries to bind it — so the stamp is the durable handoff:
+        the serving node's mail sweep sends receipts for stamped
+        messages it has not receipted yet.  Returns the ids stamped.
+        """
+        stamp = at if at is not None else time.time()
+        wanted = set(message_ids)
+        stamped: List[str] = []
+        with self._transaction():
+            for entry in self._messages:
+                message_id = entry.get("id")
+                if (
+                    isinstance(message_id, str)
+                    and message_id in wanted
+                    and entry.get("read_at") is None
+                ):
+                    entry["read_at"] = stamp
+                    stamped.append(message_id)
+            if stamped:
+                self._save()
+        return stamped
+
+    def read_unreceipted(self) -> List[Dict[str, Any]]:
+        """Messages displayed (``read_at`` set) with no receipt sent yet."""
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._messages
+                if isinstance(item.get("id"), str)
+                and item.get("id")
+                and item.get("read_at") is not None
+                and item.get("receipt_sent_at") is None
+            ]
+
+    def mark_receipt_sent(
+        self, message_ids: List[str], *, at: Optional[float] = None
+    ) -> List[str]:
+        """Stamp *message_ids* as receipted (sent live, or queued).
+
+        A receipt is sent once per message: listing the same inbox
+        twice must not re-send it.  Returns the ids that were actually
+        stamped — only messages this inbox holds, and only ones not
+        already stamped.
+        """
+        stamp = at if at is not None else time.time()
+        wanted = set(message_ids)
+        stamped: List[str] = []
+        with self._transaction():
+            for entry in self._messages:
+                message_id = entry.get("id")
+                if (
+                    isinstance(message_id, str)
+                    and message_id in wanted
+                    and entry.get("receipt_sent_at") is None
+                ):
+                    entry["receipt_sent_at"] = stamp
+                    stamped.append(message_id)
+            if stamped:
+                self._save()
+        return stamped
+
+    def unreceipted(
+        self, *, peer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Received messages with an id that never had a receipt sent."""
+        with self._lock:
+            entries = [
+                dict(item)
+                for item in self._messages
+                if isinstance(item.get("id"), str)
+                and item.get("id")
+                and item.get("receipt_sent_at") is None
+            ]
+        if peer is not None:
+            entries = [item for item in entries if item.get("destination") == peer]
+        return entries
 
     def list_messages(
         self, *, limit: Optional[int] = None, peer: Optional[str] = None
