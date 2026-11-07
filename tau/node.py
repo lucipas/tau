@@ -826,7 +826,13 @@ class TauNode:
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
-        if not duplicate:
+        # A delayed direct request past the sender's deadline is dropped
+        # unrecorded (and not marked seen), so it is never shown.
+        expires_at = message.get("expires_at")
+        expired = expires_at is not None and expires_at <= received_at
+        if expired:
+            log.info("Dropping expired message %s from %s", message_id, caller_hash)
+        if not duplicate and not expired:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -836,6 +842,7 @@ class TauNode:
                 "sent_at": message["sent_at"],
                 "received_at": received_at,
                 "id": message_id,
+                "expires_at": message.get("expires_at"),
             }
             log.info(
                 "Message from %s (%s): %s",
@@ -856,6 +863,7 @@ class TauNode:
             server=self.name,
             node=self.destination_hexhash,
             duplicate=duplicate,
+            expired=expired,
         )
 
     def _handle_mail_store(
@@ -1157,10 +1165,25 @@ class TauNode:
         # in this pass's snapshot. Re-check the queue under the mailbox
         # lock — which reloads the on-disk state — before sending.
         with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
+            fresh = self.mailbox.get_outbox(entry.id)
+            if fresh is None:
+                return False
+            if fresh.expires_at <= time.time():
+                # Past its deadline (sender-set expiry or queue TTL) since
+                # the sweep listed it: the receiver would drop the message
+                # anyway, so do not spend a send on it.  The next prune
+                # removes the entry.
+                log.info(
+                    "Skipping expired queued message %s to %s",
+                    entry.id,
+                    peer.hexhash,
+                )
                 return False
         payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+            entry.text,
+            message_id=entry.id,
+            sent_at=entry.created_at,
+            expires_at=entry.message_expires_at,
         )
         if not self._still_queued(entry.id):
             return False
@@ -1182,7 +1205,19 @@ class TauNode:
         # Same re-check as _deliver_entry: do not leave a sealed copy
         # with a holder for a message cancelled since the sweep listed it.
         with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
+            fresh = self.mailbox.get_outbox(entry.id)
+            if fresh is None:
+                return False
+            if fresh.expires_at <= time.time():
+                # Past its deadline since the sweep listed it: a holder
+                # would only ever hand the recipient a copy the receiver
+                # drops, so do not deposit it.  The next prune removes
+                # the entry.
+                log.info(
+                    "Skipping expired queued message %s for deposit with %s",
+                    entry.id,
+                    peer.hexhash,
+                )
                 return False
         if self.identity is None:
             return False
@@ -1199,6 +1234,7 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                expires_at=entry.message_expires_at,
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1311,6 +1347,11 @@ class TauNode:
             return False
         if self.mailbox.is_seen(message["id"]):
             return False
+        expires_at = message.get("expires_at")
+        if expires_at is not None and expires_at <= time.time():
+            # Past the sender's deadline: do not record or show it.
+            log.info("Dropping expired relayed message %s", message["id"])
+            return False
         self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
@@ -1320,6 +1361,7 @@ class TauNode:
             "received_at": time.time(),
             "id": message["id"],
             "relayed": True,
+            "expires_at": message.get("expires_at"),
         }
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
@@ -1460,6 +1502,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -1468,10 +1511,19 @@ class TauNode:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds):
+        it travels in the message payload and inside sealed relay
+        envelopes, the receiver purges the message once it passes, and
+        a queued copy expires at the same deadline.  Expiry is
+        cooperative — a modified client can keep copies — so this is
+        hygiene, not a guarantee.
         """
         normalized = normalize_message(text)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        payload = encode_message(
+            normalized, message_id=message_id, expires_at=expires_at
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1500,6 +1552,7 @@ class TauNode:
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
+                expires_at=expires_at,
             )
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",

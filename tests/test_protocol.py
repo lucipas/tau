@@ -116,6 +116,25 @@ def test_message_roundtrip():
     parsed = parse_message(data)
     assert parsed["text"] == "hello there"
     assert isinstance(parsed["sent_at"], float)
+    assert parsed["expires_at"] is None
+
+
+def test_message_roundtrip_with_expiry():
+    data = encode_message("vanish soon", expires_at=1893456000.0)
+    parsed = parse_message(data)
+    assert parsed["text"] == "vanish soon"
+    assert parsed["expires_at"] == 1893456000.0
+
+
+def test_message_rejects_invalid_expiry():
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at="soon")
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at=float("inf"))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": "soon"}))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": True}))
 
 
 def test_message_rejects_wrong_shape():

@@ -451,6 +451,17 @@ whole queue — and reports what was delivered, deposited and received.
 sent from the web console shows as `queued` while it waits, and flips
 to `delivered` in the feed as soon as the sweep delivers it.
 
+Disappearing messages: `tau send --to PEER --expire 1h TEXT` marks a DM
+ephemeral (durations like `30s`, `5m`, `2h`, `7d`; at most 30d). The
+expiry travels inside the encrypted payload — and inside the signed
+sealed envelope for relayed mail, so a holder cannot extend it — the
+receiver shows the deadline and purges the message once it passes, and
+a queued copy (and any sealed copy deposited from it) expires on the
+same schedule. The web console composer has the same picker. Honest
+caveat: expiry is cooperative — a modified client can keep copies, so
+this is hygiene, not a guarantee. Tan posts are public signed chains
+and never expire; tombstones already cover their removal.
+
 Payloads are compact UTF-8 JSON. Everything is size limited so a malicious or
 buggy peer cannot force unbounded buffering:
 

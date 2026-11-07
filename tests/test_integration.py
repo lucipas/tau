@@ -862,3 +862,128 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "ready" not in result.stdout
     finally:
         stop_process(alice)
+
+def test_disappearing_message_carries_expiry_to_receiver(tmp_path: Path) -> None:
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(bob_dir),
+            "--name",
+            "bob",
+            "--tcp-connect",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+
+    log_path = tmp_path / "alice.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tau",
+                "serve",
+                "--data-dir",
+                str(alice_dir),
+                "--announce-interval",
+                "1",
+                "--json",
+            ],
+            cwd=str(ROOT),
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            text=True,
+        )
+
+    try:
+        time.sleep(2.0)
+        assert server.poll() is None, log_path.read_text()
+
+        discovered = {}
+        for _ in range(3):
+            result = run_tau(
+                "discover",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "6",
+                "--json",
+                timeout=40.0,
+            )
+            payload = json.loads(require_ok(result))
+            discovered = {
+                peer["destination"]: peer for peer in payload.get("peers", [])
+            }
+            if alice_hash in discovered:
+                break
+        assert alice_hash in discovered, (
+            f"alice was not discovered; alice log:\n{log_path.read_text()}"
+        )
+
+        before = time.time()
+        sent = run_tau(
+            "send",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            "--expire",
+            "1h",
+            "read fast",
+            "--timeout",
+            "20",
+            "--discover-timeout",
+            "10",
+            "--json",
+            timeout=60.0,
+        )
+        response = json.loads(require_ok(sent))
+        assert response["ok"] is True
+        assert response["echo"] == "read fast"
+
+        # The receiver's durable inbox carries the sender-set deadline…
+        inbox = json.loads((alice_dir / "inbox.json").read_text(encoding="utf-8"))
+        messages = inbox["messages"]
+        assert len(messages) == 1
+        assert messages[0]["text"] == "read fast"
+        expires_at = messages[0]["expires_at"]
+        assert before + 3500 <= expires_at <= time.time() + 3700
+
+        # …and `tau messages` shows it.
+        listing = require_ok(
+            run_tau("messages", "--data-dir", str(alice_dir), timeout=30.0)
+        )
+        assert "read fast" in listing
+        assert "disappears in" in listing
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)

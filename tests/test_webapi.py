@@ -69,8 +69,11 @@ class FakeNode:
             return self.registry.all()[0]
         raise ValueError(f"unknown peer: {target}")
 
-    def send_message(self, peer, text, *, timeout=20.0, discover_timeout=None):
+    def send_message(
+        self, peer, text, *, timeout=20.0, discover_timeout=None, expires_at=None
+    ):
         self.sent.append((peer.name, text))
+        self.last_expires_at = expires_at
         return {"ok": True, "echo": text, "server": self.name, "_rtt": 0.012}
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
@@ -174,6 +177,108 @@ def test_send_validation(bridge):
     assert status == 400
     assert "text" in payload["error"]["message"]
 
+
+def test_send_with_expires_in_records_deadline(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "vanish soon", "expires_in": 3600},
+    )
+    assert status == 200
+    expires_at = payload["message"]["expires_at"]
+    assert before + 3590 <= expires_at <= time.time() + 3610
+    assert node.last_expires_at == expires_at
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["expires_at"] == expires_at
+
+
+def test_send_rejects_bad_expires_in(bridge):
+    for bad in (0, -5, "soon", True, 31 * 86400, 10**400):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "hi", "expires_in": bad},
+        )
+        assert status == 400
+        assert "expires_in" in payload["error"]["message"]
+
+
+def test_messages_filters_expired_at_read_time(bridge):
+    now = time.time()
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="gone",
+        sent_at=now - 100,
+        received_at=now - 100,
+        status="received",
+        expires_at=now - 10,
+    )
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="staying",
+        sent_at=now,
+        received_at=now,
+        status="received",
+        expires_at=now + 3600,
+    )
+    # The deadline passed while the bridge was running: the read path
+    # drops it without waiting for a restart.
+    assert [m["text"] for m in bridge.messages(limit=0)] == ["staying"]
+
+
+def test_inbound_message_keeps_expiry(bridge):
+    record = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "read fast",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "expires_at": 1893456000.0,
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["expires_at"] == 1893456000.0
+
+
+def test_expired_history_is_purged_on_load(node, tmp_path):
+    now = time.time()
+    gone = _stored_message(1, "gone")
+    gone["expires_at"] = now - 10
+    staying = _stored_message(2, "staying")
+    staying["expires_at"] = now + 3600
+    (tmp_path / "messages.json").write_text(
+        json.dumps(
+            {
+                "messages": [gone, staying, _stored_message(3, "plain")],
+                "next_message_id": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages(limit=0)] == [
+            "staying",
+            "plain",
+        ]
+        # The purge is persisted: the expired entry is gone from disk.
+        stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+        assert [m["text"] for m in stored["messages"]] == ["staying", "plain"]
+    finally:
+        bridge.stop()
+
+
+def test_send_requires_a_target(bridge):
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"text": "hi"}
     )
