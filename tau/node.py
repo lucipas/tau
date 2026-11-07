@@ -923,10 +923,13 @@ class TauNode:
         # latest-per-reactor state makes a replay harmless anyway, but
         # dedupe here keeps the inbox from churning on every retry.
         reaction_id = reaction.get("id")
-        duplicate = bool(reaction_id and self.mailbox.is_seen(reaction_id))
+        # Reactions get their own namespace, keyed by the reactor too, so a
+        # reaction id can never mark a direct message id as seen.
+        seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
+        duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
-            if reaction_id:
-                self.mailbox.mark_seen(reaction_id)
+            if seen_key:
+                self.mailbox.mark_seen(seen_key)
             record = {
                 "target": reaction["target"],
                 "reaction": reaction["reaction"],
