@@ -643,11 +643,6 @@ class Mailbox:
                     # have expired anyway.
                     return False
                 del self._dropped_held[message_id]
-            per_recipient = sum(1 for e in self._held.values() if e.to == to)
-            if per_recipient >= MAX_HELD_PER_RECIPIENT:
-                raise MailboxFull(
-                    f"mailbox is full for this recipient ({MAX_HELD_PER_RECIPIENT})"
-                )
             quota_count = (
                 HELD_QUOTA_KNOWN_COUNT if trusted else HELD_QUOTA_UNKNOWN_COUNT
             )
@@ -677,6 +672,15 @@ class Mailbox:
                 own_bytes -= len(victim.blob)
             # Plan first, then apply: every refusal happens before any
             # envelope is deleted, so a rejected deposit hides no mail.
+            # Both caps net the planned victims: a sender whose own
+            # oldest envelopes are shed frees those slots, including
+            # slots for this recipient.
+            per_recipient = sum(1 for e in self._held.values() if e.to == to)
+            freed_for_recipient = sum(1 for v in victims if v.to == to)
+            if per_recipient - freed_for_recipient >= MAX_HELD_PER_RECIPIENT:
+                raise MailboxFull(
+                    f"mailbox is full for this recipient ({MAX_HELD_PER_RECIPIENT})"
+                )
             if len(self._held) - len(victims) >= MAX_HELD_TOTAL:
                 raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
             for victim in victims:

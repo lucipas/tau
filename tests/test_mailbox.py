@@ -295,6 +295,52 @@ def test_refused_oversized_deposit_keeps_existing_held_mail(tmp_path, monkeypatc
     assert [e.id for e in box.held_list()] == ["keep"]
 
 
+def test_hold_recipient_cap_counts_shed_victims(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_HELD_PER_RECIPIENT", 2)
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    box.hold(
+        to=BOB, blob=b"a", message_id="r1", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    box.hold(
+        to=BOB, blob=b"b", message_id="r2", expires_at=5000.0, now=101.0,
+        depositor=sender,
+    )
+    # The recipient is full, but the sender's own oldest envelope is shed
+    # to make room — refusing here would waste the sender's own slot.
+    assert box.hold(
+        to=BOB, blob=b"c", message_id="r3", expires_at=5000.0, now=102.0,
+        depositor=sender,
+    )
+    assert [e.id for e in box.held_for(BOB)] == ["r2", "r3"]
+
+
+def test_hold_recipient_cap_still_refuses_other_senders_mail(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mailbox_module, "MAX_HELD_PER_RECIPIENT", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    other = b"\xdd" * 16
+    box.hold(
+        to=BOB, blob=b"a", message_id="o1", expires_at=5000.0, now=100.0,
+        depositor=other,
+    )
+    box.hold(
+        to=BOB, blob=b"b", message_id="o2", expires_at=5000.0, now=101.0,
+        depositor=other,
+    )
+    sender = b"\xcc" * 16
+    with pytest.raises(MailboxFull):
+        box.hold(
+            to=BOB, blob=b"c", message_id="s1", expires_at=5000.0, now=102.0,
+            depositor=sender,
+        )
+    # Nothing of the sender's was shed for a refused deposit.
+    assert [e.id for e in box.held_for(BOB)] == ["o1", "o2"]
+
+
 def test_held_depositor_and_usage_persist(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)
