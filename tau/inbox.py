@@ -92,7 +92,10 @@ class Inbox:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.Lock()
         self._messages: List[Dict[str, Any]] = []
-        self._load()
+        # Load (and purge) under the cross-process lock: a purge saves the
+        # file, which must not overwrite an append made by another process.
+        with self._transaction():
+            pass
 
     def _load(self) -> None:
         if self.path is None:
