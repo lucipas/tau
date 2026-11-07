@@ -95,7 +95,13 @@ _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
 # A holder record older than this no longer counts toward the holder cap:
 # the holder may have shed the copy under its sender quota, so the message
-# can be deposited with another relay.
+# can be deposited with another relay.  This can let a message end up held
+# by more than MAX_HOLDERS_PER_MESSAGE relays when the original holders
+# still have their copies — accepted deliberately: extra sealed copies are
+# deduped on delivery, while a strict cap could strand mail whose holders
+# all shed it.  There is no shed signal from holder to sender, so record
+# age is the only evidence available.  The window matches the deposit
+# retry interval.
 _HOLDER_RECORD_TTL = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
@@ -1514,6 +1520,15 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            if self.registry.get(peer.destination_hash) is None:
+                # A caller can hand send_message a Peer that never entered
+                # the registry (resolve_peer returns Peer objects as-is);
+                # a peer we just reached is a known peer, so record it
+                # before stamping the delivery — otherwise the history
+                # is silently lost and the peer never earns its quota tier.
+                self.registry.upsert(
+                    peer.destination_hash, peer.public_key, name=peer.name
+                )
             self.registry.record_delivered(peer.destination_hash)
             return response
         except NotAllowedError:

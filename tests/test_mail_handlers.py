@@ -394,6 +394,34 @@ def test_send_message_records_delivered_history(tmp_path, monkeypatch):
     assert stored.last_delivered_at is not None
 
 
+def test_send_message_registers_unregistered_peer_for_delivery_history(
+    tmp_path, monkeypatch
+):
+    # A Peer handed to send_message directly never entered the registry
+    # (resolve_peer returns Peer objects as-is); a successful delivery
+    # must still leave a record, or the peer never earns its quota tier
+    # (Qodo warning on PR #92).
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    peer = Peer(
+        destination_hash=destination_hash(identity),
+        name="stranger",
+        public_key=identity.get_public_key(),
+        first_seen=100.0,
+        last_seen=100.0,
+    )
+    assert node.registry.get(peer.destination_hash) is None
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: {"ok": True, "echo": "hi"}
+    )
+    response = node.send_message(peer, "hello")
+    assert response["ok"] is True
+    stored = node.registry.get(peer.destination_hash)
+    assert stored is not None
+    assert stored.delivered_count == 1
+    assert stored.last_delivered_at is not None
+
+
 def test_collected_message_is_delivered_once(tmp_path):
     received = []
     node = make_node(tmp_path, name="bob", on_message=received.append)
