@@ -409,6 +409,27 @@ def test_send_file_rejects_oversized_files(tmp_path, monkeypatch):
         node.send_file("alice", big)
 
 
+def test_send_file_checks_size_before_reading(tmp_path, monkeypatch):
+    """An oversized file is refused from its stat size, never loaded."""
+    from pathlib import Path as _Path
+
+    monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)
+    reads = []
+    real_read_bytes = _Path.read_bytes
+
+    def tracking_read_bytes(self):
+        reads.append(str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(_Path, "read_bytes", tracking_read_bytes)
+    node = make_node(tmp_path)
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    with pytest.raises(NodeError, match="outside the"):
+        node.send_file("alice", big)
+    assert reads == []
+
+
 # -- inbox file records ----------------------------------------------------
 
 

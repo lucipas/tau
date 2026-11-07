@@ -1660,6 +1660,19 @@ class TauNode:
         source = Path(path).expanduser()
         if not source.is_file():
             raise NodeError(f"no such file: {source}")
+        # Check the size before reading: a multi-gigabyte file must
+        # be rejected without ever being loaded into memory.  The
+        # length is re-checked after the read, in case the file
+        # changed under us between the two.
+        try:
+            stated_size = source.stat().st_size
+        except OSError as exc:
+            raise NodeError(f"could not read {source}: {exc}") from exc
+        if stated_size < 1 or stated_size > MAX_FILE_BYTES:
+            raise NodeError(
+                f"file of {stated_size} bytes is outside the 1..{MAX_FILE_BYTES} "
+                "byte limit"
+            )
         try:
             data = source.read_bytes()
         except OSError as exc:
@@ -1912,13 +1925,18 @@ class TauNode:
         """Accept plain Resources on *link* only as file transfers.
 
         Request and response payloads travel as Reticulum request
-        resources and never reach this callback — it only ever sees
-        an advertisement for a standalone Resource, which in tau
-        means a file transfer.  An advertisement is accepted only
-        when a signed ``/tau/file`` offer for exactly that many
-        bytes is pending; anything else is refused before a single
-        part is requested, so a stranger cannot make this node
-        buffer arbitrary data.
+        resources and never reach this callback — RNS dispatches
+        them on the advertisement's request/response flags before
+        consulting the app callback (verified against RNS 1.5.7:
+        ``Link.request`` sets a request id, so ``is_request`` is
+        true for over-MDU protocol requests).  It only ever sees an
+        advertisement for a standalone Resource, which in tau means
+        a file transfer.  An advertisement is accepted only when a
+        signed ``/tau/file`` offer for (nearly) that many bytes is
+        pending — the advertised size includes the transfer-id
+        metadata, see ``_FILE_METADATA_OVERHEAD`` — and anything
+        else is refused before a single part is requested, so a
+        stranger cannot make this node buffer arbitrary data.
         """
         try:
             link.set_resource_strategy(RNS.Link.ACCEPT_APP)
