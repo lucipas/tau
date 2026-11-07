@@ -748,6 +748,43 @@ def test_send_group_message_treats_not_a_member_as_final(tmp_path):
     assert node.mailbox.outbox_list() == []
 
 
+def test_send_group_message_keeps_results_when_outbox_full(tmp_path):
+    from tau.mailbox import MailboxFull
+
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+
+    def unreachable(peer, path, payload, timeout):
+        raise NodeError("unreachable")
+
+    node._request = unreachable  # type: ignore[method-assign]
+    node.resolve_peer = lambda target, timeout=10.0: _stub_peer(  # type: ignore[method-assign]
+        target, "peer"
+    )
+    real_enqueue = node.mailbox.enqueue
+    calls = {"n": 0}
+
+    def flaky_enqueue(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise MailboxFull("outbox is full")
+        return real_enqueue(*args, **kwargs)
+
+    node.mailbox.enqueue = flaky_enqueue  # type: ignore[method-assign]
+    result = node.send_group_message(group, "hello")
+    # The first leg queued; the second leg's full outbox is a per-leg
+    # failure, not a lost fan-out.
+    assert result["ok"] is False
+    assert len(result["results"]) == 2
+    assert result["results"][0].get("queued") is True
+    assert result["results"][1].get("ok") is False
+    assert result["results"][1]["error"].startswith("could not queue")
+    assert len(node.mailbox.outbox_list()) == 1
+
+
 def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()

@@ -1818,13 +1818,28 @@ class TauNode:
                         }
                     )
                     continue
-                entry = self.mailbox.enqueue(
-                    to=bytes.fromhex(member),
-                    text=normalized,
-                    to_name=peer.display_name if peer is not None else "",
-                    message_id=message_id,
-                    group=context,
-                )
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name=peer.display_name if peer is not None else "",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    # The outbox is full (or the write failed): record the
+                    # leg as failed and keep going, so the legs already
+                    # delivered or queued are not lost with the exception.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "
