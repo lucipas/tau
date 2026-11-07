@@ -93,6 +93,10 @@ _EXCHANGE_INTERVAL = 900.0
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
+# A holder record older than this no longer counts toward the holder cap:
+# the holder may have shed the copy under its sender quota, so the message
+# can be deposited with another relay.
+_HOLDER_RECORD_TTL = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
 
@@ -1150,7 +1154,11 @@ class TauNode:
                 continue
             if message_id is not None and entry.id != message_id:
                 continue
-            holders = entry.held_by
+            holders = {
+                holder: deposited_at
+                for holder, deposited_at in entry.held_by.items()
+                if now - deposited_at < _HOLDER_RECORD_TTL
+            }
             if (
                 len(holders) >= MAX_HOLDERS_PER_MESSAGE
                 and peer.hexhash not in holders
