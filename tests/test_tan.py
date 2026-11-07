@@ -1882,3 +1882,91 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     reply = next(item for item in payload["posts"] if item["kind"] == "reply")
     assert reply["reply_to"]["hash"] == post["hash"]
     assert reply["reply_to"]["text"] == "cli thread starter"
+
+
+# -- blocked authors are hidden from display surfaces ----------------------
+
+def test_timeline_excludes_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "from alice", name="alice", now=1000)
+    other = create_post(conn, bob, "from bob", name="bob", now=1001)
+    blocked = [post["author"]]
+
+    assert [item["hash"] for item in timeline(conn, [post["author"], other["author"]], exclude_authors=blocked)] == [other["hash"]]
+    assert [item["hash"] for item in timeline(conn, include_all=True, exclude_authors=blocked)] == [other["hash"]]
+    # The blocked entries stay stored: the exclusion is display-only.
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [other["hash"], post["hash"]]
+
+
+def test_feed_excludes_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "from alice", name="alice", now=1000)
+    other = create_post(conn, bob, "from bob", name="bob", now=1001)
+    blocked = [post["author"]]
+
+    assert [item["hash"] for item in feed(conn, posts_only=True, exclude_authors=blocked)] == [other["hash"]]
+    assert feed(conn, author=post["author"], posts_only=True, exclude_authors=blocked) == []
+    assert [item["hash"] for item in feed(conn, author=other["author"], posts_only=True, exclude_authors=blocked)] == [other["hash"]]
+
+
+def test_search_excludes_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "shared word", name="alice", now=1000)
+    other = create_post(conn, bob, "shared word", name="bob", now=1001)
+    blocked = [author_of(alice)]
+
+    assert [item["hash"] for item in search_posts(conn, "shared", exclude_authors=blocked)] == [other["hash"]]
+    assert search_posts(conn, "shared", author=author_of(alice), exclude_authors=blocked) == []
+
+
+def test_reply_snippet_blanks_blocked_parent(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "secret words", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "answering", name="bob", now=1001)
+    blocked = [post["author"]]
+
+    items = timeline(conn, [reply["author"]], exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [reply["hash"]]
+    parent = items[0]["reply_to"]
+    assert parent["hash"] == post["hash"]
+    assert parent["text"] == ""
+    assert parent["author"] == ""
+    assert parent["name"] == ""
+    assert parent["blocked"] is True
+    assert "secret words" not in json.dumps(items)
+
+
+def test_thread_hides_blocked_subtree(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    root = create_post(conn, bob, "root", name="bob", now=1000)
+    reply = create_reply(conn, alice, root["hash"], "from alice", name="alice", now=1001)
+    nested = create_reply(conn, bob, reply["hash"], "under alice", name="bob", now=1002)
+    blocked = [reply["author"]]
+
+    # The blocked reply and everything beneath it stays hidden.
+    items = thread(conn, root["hash"], exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [root["hash"]]
+
+    # Naming a blocked post, or a reply beneath one, refuses outright.
+    with pytest.raises(TanError, match="blocked author"):
+        thread(conn, reply["hash"], exclude_authors=blocked)
+    with pytest.raises(TanError, match="blocked author"):
+        thread(conn, nested["hash"], exclude_authors=blocked)
+
+
+def test_exclude_all_hides_everything(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "from alice", name="alice", now=1000)
+    create_post(conn, bob, "from bob", name="bob", now=1001)
+
+    assert timeline(conn, include_all=True, exclude_all=True) == []
+    assert feed(conn, posts_only=True, exclude_all=True) == []
+    assert search_posts(conn, "from", exclude_all=True) == []
+    with pytest.raises(TanError, match="block-list is unusable"):
+        thread(conn, post["hash"], exclude_all=True)

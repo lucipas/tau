@@ -22,6 +22,12 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
+from .blocklist import (
+    BlockListError,
+    load_blocked_set,
+    load_blocklist,
+    save_blocklist,
+)
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
@@ -481,6 +487,32 @@ def build_parser() -> argparse.ArgumentParser:
         "off", parents=[common], help="stop enforcing the DM allow-list"
     )
     allowlist_off.set_defaults(func=cmd_allowlist)
+
+    block = subparsers.add_parser(
+        "block",
+        parents=[common],
+        help="silence a peer: drop their DMs and hide their Tan posts",
+    )
+    block.add_argument(
+        "target",
+        nargs="?",
+        help="peer to block (name, hash or prefix); 'list' shows the list, "
+        "'add'/'remove' take the peer as a second word",
+    )
+    block.add_argument(
+        "peer",
+        nargs="?",
+        help="peer for 'add'/'remove'",
+    )
+    block.set_defaults(func=cmd_block)
+
+    unblock = subparsers.add_parser(
+        "unblock",
+        parents=[common],
+        help="unblock a peer (name, hash or prefix)",
+    )
+    unblock.add_argument("peer", help="peer name, destination hash or hash prefix")
+    unblock.set_defaults(func=cmd_block, block_command="remove")
 
     messages = subparsers.add_parser(
         "messages",
@@ -1050,7 +1082,9 @@ def _print_tan_posts(
         if post.get("kind") == "reply":
             parent = post.get("reply_to")
             if isinstance(parent, dict):
-                if parent.get("deleted"):
+                if parent.get("blocked"):
+                    print("  in reply to a blocked author's post")
+                elif parent.get("deleted"):
                     print("  in reply to a deleted post")
                 else:
                     parent_text = str(parent.get("text") or "")
@@ -1307,6 +1341,7 @@ def cmd_tan_delete(args: argparse.Namespace) -> int:
 def cmd_tan_timeline(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1317,19 +1352,39 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             )
             posts = list(
                 reversed(
-                    feed(conn, author=author, limit=args.limit, posts_only=True)
+                    feed(
+                        conn,
+                        author=author,
+                        limit=args.limit,
+                        posts_only=True,
+                        exclude_authors=blocked,
+                        exclude_all=blocked is None,
+                    )
                 )
             )
             posts = annotate_replies(
-                conn, annotate_reactions(conn, posts, viewer=viewer)
+                conn,
+                annotate_reactions(conn, posts, viewer=viewer),
+                exclude_authors=blocked,
             )
         elif getattr(args, "all", False):
-            posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
+            posts = timeline(
+                conn,
+                include_all=True,
+                limit=args.limit,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+            )
         else:
             authors = [record["author"] for record in following(conn)]
             if viewer is not None:
                 authors.append(viewer)
-            posts = timeline(conn, authors, limit=args.limit, viewer=viewer)
+            posts = timeline(
+                conn, authors, limit=args.limit, viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+            )
     finally:
         conn.close()
     try:
@@ -1344,6 +1399,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
 def cmd_tan_search(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1359,6 +1415,8 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
             author=author,
             limit=args.limit,
             viewer=viewer,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
         )
     finally:
         conn.close()
@@ -1382,7 +1440,14 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
-        posts = thread(conn, args.ref, viewer=viewer)
+        blocked = load_blocked_set(config.blocklist_path)
+        posts = thread(
+            conn,
+            args.ref,
+            viewer=viewer,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
     finally:
         conn.close()
     try:
@@ -2285,7 +2350,21 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    # Blocked senders' history stays stored but is hidden locally;
+    # unblocking restores the view.  Filter before applying the limit so
+    # hidden messages do not use up the requested count.  A block-list
+    # that cannot be read hides everything, matching the node, which
+    # blocks all senders on the same condition.
+    entries = inbox.list_messages(limit=None, peer=peer_hash)
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        entries = []
+    elif blocked:
+        entries = [
+            entry for entry in entries if entry.get("destination") not in blocked
+        ]
+    if limit is not None:
+        entries = entries[: max(0, limit)]
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
         return _EXIT_OK
@@ -2677,6 +2756,82 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
         if not allowlist.allow:
             print("  no senders listed — when enforced, nobody may message this node")
         for entry in sorted(allowlist.allow):
+            peer = registry.get(entry)
+            name = f" ({peer.display_name})" if peer is not None else ""
+            print(f"  {entry}{name}")
+        if changed:
+            print("  (a running serve applies saved changes when it restarts)")
+    return _EXIT_OK
+
+
+def cmd_block(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        blocklist = load_blocklist(config.blocklist_path)
+    except BlockListError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+    # Forms: `tau block <peer>` blocks, `tau unblock <peer>` unblocks,
+    # `tau block list` lists, and `tau block add/remove <peer>` keep
+    # working as the allow-list-shaped aliases.  A peer literally
+    # named "list", "add" or "remove" is blocked via `block add <name>`.
+    command = getattr(args, "block_command", None)
+    target = getattr(args, "target", None)
+    peer_arg = getattr(args, "peer", None)
+    registry = PeerRegistry(config.peers_path)
+    changed = False
+
+    if command == "remove":
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination in blocklist.blocked:
+            blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif target in (None, "list") and peer_arg is None:
+        pass  # list
+    elif target == "add":
+        if peer_arg is None:
+            raise NodeError("`tau block add` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination not in blocklist.blocked:
+            blocklist = blocklist.with_added(destination)
+            changed = True
+    elif target == "remove":
+        if peer_arg is None:
+            raise NodeError("`tau block remove` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination in blocklist.blocked:
+            blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif peer_arg is not None:
+        raise NodeError(f"unexpected argument: {peer_arg!r}")
+    else:
+        destination = _resolve_allowlist_peer(registry, target)
+        if destination not in blocklist.blocked:
+            blocklist = blocklist.with_added(destination)
+            changed = True
+
+    if changed:
+        save_blocklist(config.blocklist_path, blocklist)
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    if json_output:
+        payload = blocklist.to_dict()
+        payload["entries"] = [describe(value) for value in sorted(blocklist.blocked)]
+        payload["path"] = str(config.blocklist_path)
+        _emit(payload, True)
+    else:
+        print(f"Block-list ({config.blocklist_path}):")
+        if not blocklist.blocked:
+            print("  nobody blocked")
+        for entry in sorted(blocklist.blocked):
             peer = registry.get(entry)
             name = f" ({peer.display_name})" if peer is not None else ""
             print(f"  {entry}{name}")

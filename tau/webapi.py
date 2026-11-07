@@ -496,7 +496,14 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        payload = peer.public_dict()
+        # Annotate like the snapshot does, so a live update does not
+        # erase the frontend's blocked badge for this peer.
+        blocklist = getattr(self.node, "blocklist", None)
+        payload["blocked"] = bool(
+            blocklist is not None and blocklist.is_blocked(payload.get("destination"))
+        )
+        self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
@@ -597,6 +604,13 @@ class WebBridge:
             timeline,
         )
 
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.  A list that
+        # failed closed (block_all) hides every post here, matching
+        # the gate, which drops every DM on the same condition.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -611,19 +625,42 @@ class WebBridge:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
                 posts = list(
                     reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
+                        feed(
+                            conn,
+                            author=target,
+                            limit=limit,
+                            posts_only=True,
+                            exclude_authors=blocked,
+                            exclude_all=exclude_all,
+                        )
                     )
                 )
                 posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                    conn,
+                    annotate_reactions(conn, posts, viewer=viewer),
+                    exclude_authors=blocked,
                 )
             elif include_all:
-                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    include_all=True,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             else:
                 authors = [record["author"] for record in following(conn)]
                 if viewer is not None:
                     authors.append(viewer)
-                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    authors,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -844,16 +881,41 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            items = [peer.public_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
+        blocklist = getattr(self.node, "blocklist", None)
+        for item in items:
+            # is_blocked covers the fail-closed case too: with a
+            # corrupt list every peer reads as blocked, matching the
+            # DM gate, which drops every message then.
+            item["blocked"] = bool(
+                blocklist is not None
+                and blocklist.is_blocked(item.get("destination"))
+            )
+        return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
+        # Blocked senders' history stays stored but is hidden locally;
+        # unblocking restores the view.  Inbound records carry the
+        # sender hash as "destination" (node inbox) or "peer" (console
+        # log); outbound records carry the recipient, which blocking
+        # never hides.  is_blocked covers the fail-closed case too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None:
+            items = [
+                item
+                for item in items
+                if item.get("direction") != "in"
+                or not blocklist.is_blocked(
+                    item.get("destination") or item.get("peer")
+                )
+            ]
         return items
 
     def counts(self) -> Dict[str, int]:

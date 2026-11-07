@@ -257,6 +257,7 @@ Global options may appear before or after the command:
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
+| `tau block` | Silence a peer: drop their DMs and hide their Tan posts |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
 | `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
@@ -586,6 +587,45 @@ destination hash from the request, so it cannot be spoofed. A list
 file that cannot be parsed fails closed (nobody admitted) rather than
 silently opening the node up. A running `serve` applies saved changes
 when it restarts.
+
+### DM block-list
+
+The allow-list is all-or-nothing; a node running open still needs a
+way to silence one abusive or mistaken peer. The block-list is a
+deny-list, stored as `blocklist.json` in the data directory (mode
+`0600`) and managed via the CLI:
+
+```bash
+tau block list               # show who is blocked
+tau block alice              # block alice (name, hash or hash prefix)
+tau unblock alice            # unblock alice
+```
+
+(`tau block add alice` and `tau block remove alice` work too, matching
+the `tau allowlist` shape; a peer literally named `list`, `add` or
+`remove` is blocked via `block add <name>`.)
+
+The block check runs before the allow-list check, so blocking an
+allow-listed peer wins. A blocked sender's direct messages are
+dropped silently — never stored, never marked seen, never passed to
+the message callback — and the sender gets only a generic delivery
+failure, never a signal that they are blocked. The same silent drop
+applies to their messages arriving through store-and-forward. A
+sender who never identifies on the link is blocked too while the
+list has entries — they cannot prove they are not the peer the owner
+silenced (honest tau nodes always identify); with an empty list,
+DMs stay open as before. Their
+Tan posts stay in the chain store (chain integrity for other peers is
+unaffected) but are hidden from the local timeline, feed, search and
+thread views, and a reply to one of their posts shows only "a blocked
+author's post". `tau messages` and the console hide blocked senders'
+history locally without deleting it, so unblocking restores the view;
+the console peers view marks blocked peers. A list file that cannot
+be parsed fails closed (everybody blocked) rather than silently
+admitting a sender the owner meant to silence — and while it stays
+unusable, the local views hide everything too, instead of resurfacing
+history the owner had hidden. A running `serve`
+applies saved changes when it restarts.
 
 `--kinds` is display-only, on purpose: it selects which entry kinds
 your timeline views present (hiding reactions also hides their like
