@@ -307,15 +307,11 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message.
         message["wire_id"] = wire_id
-    excerpt = entry.get("excerpt_hash")
-    if (
-        isinstance(excerpt, str)
-        and len(excerpt) == 16
-        and all(char in "0123456789abcdef" for char in excerpt.lower())
-    ):
-        # Short hash of this message's text, so the console can check
-        # a reply's quoted excerpt against it like the CLI does.
-        message["excerpt_hash"] = excerpt.lower()
+    # The hash is always derived from the validated text, never trusted
+    # from the file: a hand-edited messages.json that changes the text
+    # but keeps the old hash must not make a changed quote look
+    # verified. Records written before hashes existed get one here.
+    message["excerpt_hash"] = excerpt_hash(text)
     try:
         in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
     except ValueError:

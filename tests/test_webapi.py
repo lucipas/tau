@@ -1161,6 +1161,28 @@ def test_message_history_load_caps_and_drops_invalid_entries(node, tmp_path):
         bridge.stop()
 
 
+def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
+    """A stored excerpt hash is never trusted on load: the hash is
+    derived from the stored text, so a hand-edited history that
+    changed the text but kept the old hash cannot make a changed
+    quote look verified."""
+    from tau.protocol import excerpt_hash
+    from tau.webapi import _clean_stored_message
+
+    entry = _stored_message(1, "changed text")
+    entry["excerpt_hash"] = excerpt_hash("original thought")
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["excerpt_hash"] == excerpt_hash("changed text")
+    assert cleaned["excerpt_hash"] != excerpt_hash("original thought")
+
+    # Records written before hashes existed gain one on load.
+    legacy = _stored_message(2, "legacy text")
+    assert _clean_stored_message(legacy)["excerpt_hash"] == excerpt_hash(
+        "legacy text"
+    )
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)
