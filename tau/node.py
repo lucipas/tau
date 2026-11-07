@@ -72,6 +72,18 @@ from .protocol import (
 
 log = logging.getLogger(__name__)
 
+
+def _budget(timeout: float, deadline: Optional[float]) -> float:
+    """Clip a network timeout to what is left before a monotonic deadline."""
+    if deadline is None:
+        return timeout
+    return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _past(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 # Reticulum adds framing and resource overhead on top of request payloads.
 _REQUEST_WIRE_LIMIT = MAX_REQUEST_BYTES + 2 * 1024
 _MAIL_WIRE_LIMIT = MAX_MAIL_REQUEST_BYTES + 2 * 1024
@@ -81,6 +93,8 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
+# Longest pause between targeted delivery retries in wait_for_delivery.
+_WAIT_RETRY_CAP = 5.0
 _EXCHANGE_TIMEOUT = 5.0
 # Background peer exchange: a few known peers per sweep, each asked at most
 # once per _EXCHANGE_INTERVAL, so quiet neighbours still share their peers.
@@ -334,6 +348,10 @@ class TauNode:
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
+        # Ids whose delivery this node confirmed by a successful send.
+        # An outbox entry that disappears without an id here was
+        # cancelled, expired, or removed elsewhere — not delivered.
+        self._delivered_ids: Set[str] = set()
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -696,19 +714,25 @@ class TauNode:
     ) -> bool:
         """Block until a queued message leaves the outbox, or time out.
 
-        Returns True when the entry is gone — delivered, or removed by
-        another process — and False when it is still queued when the
-        deadline passes.  Each pass runs a targeted flush that ignores
-        the entry's delivery backoff: the caller explicitly asked to
-        wait for this message, so a backoff from an earlier failed
-        attempt must not swallow the whole wait.  The wait never
-        removes the entry itself; a message still queued at the
-        deadline is left for the background mail loop.
+        Returns True only when this node confirmed the delivery of the
+        entry.  An entry that vanishes without that confirmation was
+        cancelled, expired, or removed elsewhere, so the result is False
+        at once.  False is also returned when the entry is still queued
+        when the deadline passes.  Each pass runs a targeted flush that
+        ignores the entry's delivery backoff: the caller explicitly asked
+        to wait for this message, so a backoff from an earlier failed
+        attempt must not swallow the whole wait.  The flush shares the
+        same deadline, so no peer or request starts after it.  Retry
+        pauses grow up to a cap.  The wait never removes the entry
+        itself; a message still queued at the deadline is left for the
+        background mail loop.
         """
         deadline = time.monotonic() + max(0.0, timeout)
+        pause = poll_interval
+        cap = max(poll_interval, _WAIT_RETRY_CAP)
         while True:
             if not self._still_queued(message_id):
-                return True
+                return message_id in self._delivered_ids
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
@@ -717,13 +741,15 @@ class TauNode:
                 message_id=message_id,
                 respect_backoff=False,
                 wait_for_lock=min(remaining, 5.0),
+                deadline=deadline,
             )
             if not self._still_queued(message_id):
-                return True
+                return message_id in self._delivered_ids
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(min(poll_interval, remaining))
+            time.sleep(min(pause, remaining))
+            pause = min(pause * 2, cap)
 
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.
@@ -1059,6 +1085,7 @@ class TauNode:
         to: Optional[bytes] = None,
         message_id: Optional[str] = None,
         wait_for_lock: float = 0.0,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Try to move queued mail: direct delivery, deposits, collection.
 
@@ -1077,7 +1104,10 @@ class TauNode:
         concurrent mail round to finish instead of skipping the sweep;
         0 (the default) keeps the skip-when-busy behaviour, which is
         what the background loop wants.  A one-shot caller that must
-        know the outcome waits; a background round never does.
+        know the outcome waits; a background round never does.  With
+        ``deadline`` (a ``time.monotonic()`` value) set, no new peer or
+        request starts once it has passed, and each request is bounded
+        by the time left before it.
         """
         summary = {
             "delivered": 0,
@@ -1119,15 +1149,22 @@ class TauNode:
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
+                if _past(deadline):
+                    break
                 moved = self._flush_peer(
                     peer,
                     timeout,
                     respect_backoff=respect_backoff,
                     message_id=message_id,
+                    deadline=deadline,
                 )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
-                summary["received"] += self._collect_mail(peer, timeout)
+                if _past(deadline):
+                    break
+                summary["received"] += self._collect_mail(
+                    peer, timeout, deadline=deadline
+                )
         finally:
             self._mail_lock.release()
         return summary
@@ -1139,6 +1176,7 @@ class TauNode:
         *,
         respect_backoff: bool = True,
         message_id: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, int]:
         moved = {"delivered": 0, "deposited": 0}
         if respect_backoff:
@@ -1151,16 +1189,22 @@ class TauNode:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
             for entry in due:
-                if self._deliver_entry(peer, entry, timeout):
+                if _past(deadline):
+                    return moved
+                if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                     moved["delivered"] += 1
             return moved
 
         for entry in due:
-            if self._deliver_entry(peer, entry, timeout):
+            if _past(deadline):
+                return moved
+            if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                 moved["delivered"] += 1
 
         now = time.time()
         for entry in self.mailbox.outbox_list():
+            if _past(deadline):
+                return moved
             if entry.to == peer.destination_hash:
                 continue
             if message_id is not None and entry.id != message_id:
@@ -1174,7 +1218,7 @@ class TauNode:
             last_deposit = holders.get(peer.hexhash)
             if last_deposit is not None and now - last_deposit < _DEPOSIT_RETRY_AFTER:
                 continue
-            if self._deposit_entry(peer, entry, timeout):
+            if self._deposit_entry(peer, entry, timeout, deadline=deadline):
                 moved["deposited"] += 1
         return moved
 
@@ -1189,7 +1233,14 @@ class TauNode:
         with self.mailbox.transaction():
             return self.mailbox.get_outbox(message_id) is not None
 
-    def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+    def _deliver_entry(
+        self,
+        peer: Peer,
+        entry: Any,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         # The sweep lists the outbox before acting, so a message cancelled
         # by another process (``tau outbox cancel``) can still be sitting
         # in this pass's snapshot. Re-check the queue under the mailbox
@@ -1203,10 +1254,13 @@ class TauNode:
         if not self._still_queued(entry.id):
             return False
         try:
-            self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self._request(peer, REQUEST_MESSAGE, payload, timeout, deadline=deadline)
         except NodeError as exc:
             self.mailbox.record_attempt(entry.id, error=str(exc))
             return False
+        # Record the confirmed delivery before the entry leaves the outbox,
+        # so a waiter that sees the entry gone can tell it was delivered.
+        self._delivered_ids.add(entry.id)
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
         if self.on_delivered is not None:
@@ -1250,7 +1304,9 @@ class TauNode:
         if not self._still_queued(entry.id):
             return False
         try:
-            self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
+            self._request(
+                peer, REQUEST_MAIL_STORE, payload, timeout, deadline=deadline
+            )
         except NodeError:
             return False
         self.mailbox.record_deposit(entry.id, peer.hexhash)
@@ -1262,7 +1318,9 @@ class TauNode:
         )
         return True
 
-    def _collect_mail(self, peer: Peer, timeout: float) -> int:
+    def _collect_mail(
+        self, peer: Peer, timeout: float, *, deadline: Optional[float] = None
+    ) -> int:
         # Without a consumer, fetched mail would be marked seen and acked
         # while never shown to anyone, so leave it held for a live node.
         if self.on_message is None:
@@ -1274,7 +1332,11 @@ class TauNode:
         acks = self.mailbox.take_pending_acks(peer.hexhash)
         try:
             response = self._request(
-                peer, REQUEST_MAIL_FETCH, build_mail_fetch(acks), timeout
+                peer,
+                REQUEST_MAIL_FETCH,
+                build_mail_fetch(acks),
+                timeout,
+                deadline=deadline,
             )
         except NodeError:
             if acks:
@@ -1784,10 +1846,15 @@ class TauNode:
         path: str,
         payload: bytes,
         timeout: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
+        timeout = _budget(timeout, deadline)
         link = self._open_link(peer, timeout)
         try:
-            return self._request_on_link(link, path, payload, timeout)
+            return self._request_on_link(
+                link, path, payload, timeout, deadline=deadline
+            )
         finally:
             try:
                 link.teardown()
@@ -1795,7 +1862,13 @@ class TauNode:
                 pass
 
     def _request_on_link(
-        self, link: RNS.Link, path: str, payload: bytes, timeout: float
+        self,
+        link: RNS.Link,
+        path: str,
+        payload: bytes,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         concluded = threading.Event()
         state: Dict[str, Any] = {}
@@ -1821,8 +1894,10 @@ class TauNode:
         if receipt is False:
             raise NodeError("could not send request; link is not ready")
 
-        if not concluded.wait(timeout + 5.0):
-            raise NodeError(f"no response to {path} within {timeout + 5.0:.1f}s")
+        # The response grace is capped by the caller's deadline, if any.
+        wait_for = _budget(timeout + 5.0, deadline)
+        if not concluded.wait(wait_for):
+            raise NodeError(f"no response to {path} within {wait_for:.1f}s")
         if "error" in state:
             raise NodeError(f"{state['error']} (status={state.get('status')})")
 
