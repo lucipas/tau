@@ -203,7 +203,7 @@ def test_mail_round_exchanges_peers(tmp_path):
     peer = make_peer("bob")
     calls = []
     node._flush_peer = lambda p, timeout, **_kwargs: calls.append(("flush", p.hexhash))
-    node._collect_mail = lambda p, timeout: calls.append(("collect", p.hexhash))
+    node._collect_mail = lambda p, timeout, **_kwargs: calls.append(("collect", p.hexhash))
 
     def exchange(p, **kwargs):
         # The exchange runs after the mail lock is released, so a slow
@@ -227,7 +227,7 @@ def test_mail_round_survives_failed_exchange(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("bob")
     node._flush_peer = lambda p, timeout, **_kwargs: {"delivered": 0, "deposited": 0}
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     def failing_exchange(p, **kwargs):
         raise RuntimeError("link broke")
@@ -289,7 +289,7 @@ def test_flush_outbox_prefers_direct_peers(tmp_path):
         order.append(p.hexhash),
         {"delivered": 0, "deposited": 0},
     )[1]
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     node.flush_outbox()
 
@@ -316,7 +316,7 @@ def test_flush_outbox_to_filter_contacts_only_that_peer(tmp_path):
         return {"delivered": 0, "deposited": 0}
 
     node._flush_peer = _flush_peer
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     # A retry aimed at bob must not spend its budget on alice.
     node.flush_outbox(to=bob.destination_hash, respect_backoff=False)
@@ -346,7 +346,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
         calls.append(p.hexhash),
         {"delivered": 0, "deposited": 0},
     )[1]
-    node._collect_mail = lambda p, timeout: 0
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
 
     # A background round holding the lock makes a plain flush skip,
     # and the summary says so instead of looking like a quiet sweep.
@@ -474,3 +474,172 @@ def test_deposit_entry_skips_message_cancelled_by_another_process(
     )
     assert node._deposit_entry(make_peer("carol"), entry, timeout=1.0) is False
     assert calls == []
+
+
+def _seed_wait_entry(node, message_id="dd" + "66" * 15):
+    return node.mailbox.enqueue(
+        to=b"\xbb" * 16, text="wait for me", message_id=message_id
+    )
+
+
+def test_wait_for_delivery_returns_at_once_when_already_delivered(
+    tmp_path, monkeypatch
+):
+    # A delivery that landed before the wait started is still
+    # recognised through the confirmation record — no flush needed.
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    node.mailbox.remove_outbox(entry.id)
+    node._delivered_ids.append(entry.id)
+    calls = []
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: calls.append(kwargs))
+    assert node.wait_for_delivery(entry.id, timeout=5.0) is True
+    assert calls == []
+
+
+def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+
+    calls = []
+
+    def fake_flush(**kwargs):
+        calls.append(kwargs)
+        node.mailbox.remove_outbox(entry.id)
+        # A real delivery records the id, as _deliver_entry does.
+        node._delivered_ids.append(entry.id)
+        return {"delivered": 1, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert node.wait_for_delivery(entry.id, timeout=5.0, poll_interval=0.01) is True
+    assert len(calls) == 1
+    # The wait drives a targeted flush that ignores the entry's backoff:
+    # the caller explicitly asked to wait for this message.
+    assert calls[0]["message_id"] == entry.id
+    assert calls[0]["respect_backoff"] is False
+    # The flush shares the wait's deadline, so no peer or request
+    # starts once it has passed.
+    assert calls[0]["deadline"] is not None
+
+
+def test_open_link_checks_deadline_after_path_discovery(tmp_path, monkeypatch):
+    # Path discovery must not hand the full timeout to link
+    # establishment as well: once the deadline has passed, opening the
+    # link fails at once instead of waiting again.
+    node = make_node(tmp_path)
+    peer = make_peer("bob")
+
+    def slow_path(dest_hash, timeout):
+        time.sleep(0.25)
+
+    monkeypatch.setattr(node, "_wait_for_path", slow_path)
+    deadline = time.monotonic() + 0.1
+    with pytest.raises(NodeError):
+        node._open_link(peer, 5.0, deadline=deadline)
+
+
+def test_request_on_link_refuses_after_deadline(tmp_path):
+    # A request must not be sent when the link stages already consumed
+    # the deadline.
+    node = make_node(tmp_path)
+
+    class _DeadLink:
+        def request(self, *args, **kwargs):
+            raise AssertionError("must not send after the deadline")
+
+    deadline = time.monotonic() - 1.0
+    with pytest.raises(NodeError):
+        node._request_on_link(_DeadLink(), "/tau/ping", b"{}", 5.0, deadline=deadline)
+
+
+def test_wait_for_delivery_keeps_retries_at_poll_interval(tmp_path, monkeypatch):
+    # Retries stay at poll_interval: growing the pause would let the
+    # last attempt land long before the deadline, so a peer that
+    # becomes reachable late in the wait would be missed.
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    stamps = []
+
+    def fake_flush(**kwargs):
+        stamps.append(time.monotonic())
+        return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert (
+        node.wait_for_delivery(entry.id, timeout=0.5, poll_interval=0.05) is False
+    )
+    assert len(stamps) >= 8
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert gaps, "the wait must retry the flush more than once"
+    assert max(gaps) < 0.15
+
+
+def test_wait_for_delivery_rejects_unconfirmed_removal(tmp_path, monkeypatch):
+    # The entry leaves the outbox without a delivery confirmation —
+    # cancelled by another process, or delivered by one — and the wait
+    # must not report it as delivered.
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+
+    def fake_flush(**kwargs):
+        # Removal without a delivery record, as a cancel would do.
+        node.mailbox.remove_outbox(entry.id)
+        return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert node.wait_for_delivery(entry.id, timeout=5.0, poll_interval=0.01) is False
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_wait_for_delivery_times_out_when_entry_stays_queued(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    calls = []
+    monkeypatch.setattr(
+        node, "flush_outbox", lambda **kwargs: calls.append(kwargs) or {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
+    )
+    started = time.monotonic()
+    assert (
+        node.wait_for_delivery(entry.id, timeout=0.2, poll_interval=0.01) is False
+    )
+    assert time.monotonic() - started >= 0.2
+    assert calls, "the wait must keep retrying the flush until the deadline"
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_wait_for_delivery_returns_when_mailbox_lock_stalls(tmp_path, monkeypatch):
+    # A stalled mailbox-lock holder must not keep the wait from
+    # reporting expiry: the queue check is bounded by the time left,
+    # so the wait returns False at the deadline instead of blocking.
+    fcntl = pytest.importorskip("fcntl")
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    monkeypatch.setattr(
+        node, "flush_outbox", lambda **kwargs: {
+            "delivered": 0,
+            "deposited": 0,
+            "received": 0,
+            "lock_busy": False,
+        }
+    )
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert (
+            node.wait_for_delivery(entry.id, timeout=0.3, poll_interval=0.05)
+            is False
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed >= 0.3
+        assert elapsed < 2.0, "the wait must not block past its deadline"
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    assert node.mailbox.get_outbox(entry.id) is not None

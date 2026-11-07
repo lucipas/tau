@@ -253,6 +253,28 @@ class HeldEnvelope:
         )
 
 
+def _lock_file(handle: Any, timeout: Optional[float]) -> None:
+    """Take the exclusive flock on a mailbox lock file.
+
+    With no timeout this blocks, as before.  With a timeout the wait
+    is bounded by it: the lock is tried non-blocking in a short loop
+    and a ``TimeoutError`` is raised once the budget is spent, so a
+    stalled holder cannot block a caller that has its own deadline.
+    """
+    if timeout is None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("mailbox lock is held by another process")
+            time.sleep(0.005)
+
+
 class Mailbox:
     """Thread-safe store-and-forward storage, optionally JSON backed."""
 
@@ -273,15 +295,25 @@ class Mailbox:
             self.load()
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def _transaction(self, timeout: Optional[float] = None) -> Iterator[None]:
         """Serialise a read-modify-write of the mailbox across processes.
 
         ``tau serve`` and one-shot commands such as ``tau send`` share the
         same ``mailbox.json``.  Each mutation takes an exclusive ``flock`` on
         a sidecar lock file, reloads the latest on-disk state, and then
         applies its change, so a process never overwrites another's writes.
+
+        With ``timeout`` set, the wait for both the in-process lock and
+        the flock is bounded by it (a ``TimeoutError`` is raised once
+        the budget is spent), so a stalled holder cannot block a caller
+        that has its own deadline.  With no timeout the wait is
+        unbounded, as before.
         """
-        with self._lock:
+        if timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=max(0.0, timeout)):
+            raise TimeoutError("mailbox lock is held by another thread")
+        try:
             if self._txn_depth:
                 # Nested transaction: the outer one already holds the
                 # flock and reloaded state, so just join it.  (A second
@@ -298,7 +330,7 @@ class Mailbox:
                 lock_path = self.path.with_name(self.path.name + ".lock")
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(lock_path, "a") as handle:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    _lock_file(handle, timeout)
                     try:
                         self.load()
                         yield
@@ -306,10 +338,12 @@ class Mailbox:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self._txn_depth = 0
+        finally:
+            self._lock.release()
 
-    def transaction(self) -> Iterator[None]:
+    def transaction(self, timeout: Optional[float] = None) -> Iterator[None]:
         """Public handle on the cross-process mailbox lock (see ``_transaction``)."""
-        return self._transaction()
+        return self._transaction(timeout=timeout)
 
     # -- persistence -------------------------------------------------------
 
