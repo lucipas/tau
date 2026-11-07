@@ -12,6 +12,26 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Group DM context, present on inbound group messages.
+  group?: string;
+  group_name?: string;
+}
+
+export interface TauGroupMember {
+  hash: string;
+  name: string;
+}
+
+export interface TauGroup {
+  id: string;
+  name: string;
+  members: TauGroupMember[];
+  created_at: number;
+}
+
+export interface GroupsResponse {
+  groups: TauGroup[];
+  count: number;
 }
 
 export interface Peer {
@@ -55,6 +75,7 @@ export interface BridgeInfo {
 export interface Snapshot {
   node: NodeInfo;
   peers: Peer[];
+  groups: TauGroup[];
   messages: TauMessage[];
   counts: Counts;
   bridge: BridgeInfo;

@@ -60,7 +60,7 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
-    return {
+    record: Dict[str, Any] = {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
         "text": text,
@@ -69,6 +69,15 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
     }
+    kind = raw.get("kind")
+    if kind == "group":
+        group_id = raw.get("group")
+        if not isinstance(group_id, str) or len(group_id) != 32:
+            return None
+        record["kind"] = "group"
+        record["group"] = group_id.lower()
+        record["group_name"] = str(raw.get("group_name") or "group")
+    return record
 
 
 class Inbox:
@@ -148,17 +157,28 @@ class Inbox:
         return entry
 
     def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        ``peer`` filters to one sender destination hash; ``group``
+        filters to one group id; ``limit`` caps how many are returned
+        (``None`` means all of them).
         """
         with self._lock:
             entries = list(self._messages)
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if group is not None:
+            entries = [
+                item
+                for item in entries
+                if item.get("kind") == "group" and item.get("group") == group
+            ]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

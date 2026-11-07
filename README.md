@@ -125,6 +125,7 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
@@ -251,7 +252,11 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
-| `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group) |
+| `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
+| `tau group list` | List known groups |
+| `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
+| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -311,6 +316,12 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# Group DMs: fixed membership, no rekeying — a changed roster is a new group
+tau group create weekend --peer bob --peer carol
+tau group send weekend "who is driving?"
+tau messages --group weekend
+tau group list
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
@@ -630,7 +641,15 @@ unlinked, and stall sync at the gap.
   sender next hears from the recipient or from a peer holding a sealed
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
-- Request/response messaging, not streaming or group chat.
+- Request/response messaging, not streaming. Group DMs fan one message out
+  per member over the existing encrypted links (no MLS or group ratcheting);
+  membership is fixed at creation, a changed roster is a new group, and a
+  peer running a version that predates groups rejects `/tau/group` requests.
+  The group id is derived from the creator, name and roster, so a roster
+  cannot be forked under an existing id; a peer can still invent a fresh
+  group that includes you, gated by the DM allow-list like a direct message.
+  Members learn a group from the first message sent to it, and the console
+  is read-only for groups — composing from the console comes later.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
@@ -645,7 +664,7 @@ unlinked, and stall sync at the gap.
 - Peer information is self-asserted and can be stale; prune with
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
-- Natural extensions: group destinations, file transfer using Reticulum
+- Natural extensions: file transfer using Reticulum
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
   (media, moderation, follow recommendations).
