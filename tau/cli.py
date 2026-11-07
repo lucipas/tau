@@ -2366,9 +2366,11 @@ def _send_displayed_receipts(
             by_peer.setdefault(peer_hash, []).append(str(entry["id"]))
     if not by_peer:
         return {"sent": 0, "queued": 0}
+    # No mail loop or announce: this node only sends the explicit receipts
+    # below, so a background sweep cannot send the same ids concurrently.
     node = TauNode(config, name=config.name)
     try:
-        node.start()
+        node.start(mail_loop=False, announce=False)
     except Exception:
         return {"sent": 0, "queued": 0}
     sent = queued = 0
@@ -2379,13 +2381,14 @@ def _send_displayed_receipts(
                 result = node.send_read_receipts(peer_hash, ids)
             except Exception:
                 continue
+            handled = result.get("ids") or []
+            if not handled:
+                continue
             if result.get("queued"):
                 queued += 1
             elif result.get("ok"):
                 sent += 1
-            else:
-                continue
-            stamped.extend(ids)
+            stamped.extend(handled)
     finally:
         node.stop()
     if stamped:
@@ -2479,12 +2482,18 @@ def _cmd_messages_sent(
     def describe(entry: Dict[str, Any]) -> Dict[str, Any]:
         peer = registry.get(entry.get("to") or "")
         read_at = entry.get("read_at")
+        # ``delivered_at`` is set only once a delivery was confirmed.  Records
+        # from before it was tracked have no such key and count as delivered.
+        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
         if entry["id"] in queued_ids:
             state = "queued"
         elif read_at is not None:
             state = "read"
-        else:
+        elif delivered_at is not None:
             state = "delivered"
+        else:
+            # Cancelled or expired before any delivery was confirmed.
+            state = "unknown"
         return {
             "id": entry["id"],
             "to": entry.get("to"),

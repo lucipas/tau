@@ -51,6 +51,7 @@ from .protocol import (
     ASPECT_FILTER,
     MAX_MAIL_REQUEST_BYTES,
     MAX_MAIL_TTL,
+    MAX_READ_IDS,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
@@ -1155,6 +1156,9 @@ class TauNode:
                 targets = {entry.to for entry in self.mailbox.due_outbox()}
             else:
                 targets = {entry.to for entry in self.mailbox.outbox_list()}
+            # Peers owed queued read receipts are delivered to in the same
+            # visit, so they are prioritised alongside message recipients.
+            targets |= {entry.to for entry in self.mailbox.receipt_outbox_list()}
             # Peers heard only through exchange come after directly heard
             # ones inside each group, so second-hand entries cannot crowd
             # out reachable peers.
@@ -1177,8 +1181,10 @@ class TauNode:
             # Receipts for messages a reader displayed but could not
             # receipt itself (a one-shot `tau messages` shares this
             # data directory with the serving node and cannot start a
-            # second Reticulum instance on its listen port).
-            summary["receipts"] += self._flush_read_receipts()
+            # second Reticulum instance on its listen port).  A targeted
+            # retry touches only its own entry, so it skips this sweep.
+            if to is None and message_id is None:
+                summary["receipts"] += self._flush_read_receipts()
         finally:
             self._mail_lock.release()
         return summary
@@ -1204,7 +1210,8 @@ class TauNode:
             for entry in due:
                 if self._deliver_entry(peer, entry, timeout):
                     moved["delivered"] += 1
-            moved["receipts"] = self._flush_receipts(peer, timeout)
+            if message_id is None:
+                moved["receipts"] = self._flush_receipts(peer, timeout)
             return moved
 
         for entry in due:
@@ -1228,7 +1235,8 @@ class TauNode:
                 continue
             if self._deposit_entry(peer, entry, timeout):
                 moved["deposited"] += 1
-        moved["receipts"] = self._flush_receipts(peer, timeout)
+        if message_id is None:
+            moved["receipts"] = self._flush_receipts(peer, timeout)
         return moved
 
     def _still_queued(self, message_id: str) -> bool:
@@ -1260,6 +1268,7 @@ class TauNode:
         except NodeError as exc:
             self.mailbox.record_attempt(entry.id, error=str(exc))
             return False
+        self.mailbox.record_delivered(entry.id)
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
         if self.on_delivered is not None:
@@ -1364,10 +1373,11 @@ class TauNode:
                     "Could not send read receipt to %s", peer_hash, exc_info=True
                 )
                 continue
-            if result.get("ok"):
+            handled = result.get("ids") or []
+            if handled:
                 dispatched += 1
                 try:
-                    self.inbox.mark_receipt_sent(ids)
+                    self.inbox.mark_receipt_sent(handled)
                 except Exception:  # pragma: no cover - defensive
                     log.debug("Could not stamp read receipts", exc_info=True)
         return dispatched
@@ -1383,6 +1393,10 @@ class TauNode:
         ``read``: an old node would only drop the sealed receipt.
         """
         moved = 0
+        # Queued receipts pause while the reader has opted out; they are
+        # kept (not discarded) and resume if the setting is turned back on.
+        if not self.read_receipts_enabled:
+            return 0
         if peer.caps and "read" not in peer.caps:
             return 0
         for entry in self.mailbox.due_receipts(to=peer.destination_hash):
@@ -1753,7 +1767,7 @@ class TauNode:
         if self.identity is None:
             raise NodeError("node has not been started")
         if not self.read_receipts_enabled:
-            return {"ok": False, "disabled": True, "ids": list(message_ids)}
+            return {"ok": False, "disabled": True, "ids": []}
         ids = []
         for message_id in message_ids:
             if isinstance(message_id, str) and message_id and message_id not in ids:
@@ -1767,14 +1781,35 @@ class TauNode:
             else min(timeout, 10.0),
         )
         stamp = read_at if isinstance(read_at, (int, float)) else time.time()
+        if len(ids) > MAX_READ_IDS:
+            # One receipt names at most MAX_READ_IDS messages; send the
+            # rest as further receipts.  A failed chunk is left out of
+            # "ids" so the caller retries only that chunk later.
+            handled: List[str] = []
+            recorded: List[Any] = []
+            ok = True
+            for start in range(0, len(ids), MAX_READ_IDS):
+                chunk = ids[start : start + MAX_READ_IDS]
+                try:
+                    result = self.send_read_receipts(
+                        peer,
+                        chunk,
+                        timeout=timeout,
+                        read_at=stamp,
+                    )
+                except Exception:
+                    log.debug("Could not send a read receipt chunk", exc_info=True)
+                    ok = False
+                    continue
+                handled.extend(result.get("ids") or [])
+                recorded.extend(result.get("recorded") or [])
+                ok = ok and bool(result.get("ok"))
+            return {"ok": ok, "ids": handled, "recorded": recorded}
         if peer.caps and "read" not in peer.caps:
-            # An old peer cannot consume a receipt; queue it anyway so
-            # an upgrade inside the TTL still learns the messages were
-            # read, instead of failing a request it cannot answer.
-            entry = self.mailbox.queue_receipt(
-                to=peer.destination_hash, message_ids=ids, read_at=stamp
-            )
-            return {"ok": True, "queued": True, "receipt_id": entry.id, "ids": ids}
+            # An old peer cannot consume a receipt, and a receipt it can
+            # never read would only occupy a queue slot for its whole TTL.
+            # Nothing is queued; the messages are treated as handled.
+            return {"ok": True, "skipped": True, "ids": ids, "recorded": []}
         try:
             payload = build_read_receipt(
                 self.identity, message_ids=ids, read_at=stamp
@@ -1819,25 +1854,30 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
-            # Remember the send (and its recipient) so a later read
-            # receipt can be verified against it — and so the sender's
-            # history can show the read state.  The wire id is also
-            # returned, so the console can link its record to receipts.
+            # Remember the send (and its recipient) before the request: the
+            # recipient's message callback can send a read receipt back
+            # before this request returns, and that receipt must already
+            # verify.  A refused or failed send is forgotten below.
             self.mailbox.record_sent(
                 message_id,
                 to=peer.destination_hash,
                 text=normalized,
             )
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self.mailbox.record_delivered(message_id)
             response = dict(response)
             response.setdefault("id", message_id)
             return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
+            if peer is not None:
+                self.mailbox.discard_sent(message_id)
             raise
         except NodeError:
             if not queue or not self.started:
+                if peer is not None:
+                    self.mailbox.discard_sent(message_id)
                 raise
             dest_hash = (
                 peer.destination_hash
@@ -1845,6 +1885,8 @@ class TauNode:
                 else self._target_hash(target)
             )
             if dest_hash is None:
+                if peer is not None:
+                    self.mailbox.discard_sent(message_id)
                 raise
             entry = self.mailbox.enqueue(
                 to=dest_hash,

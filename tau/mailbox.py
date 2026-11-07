@@ -738,18 +738,43 @@ class Mailbox:
             if existing is not None:
                 return
             if len(self._sent) >= MAX_SENT:
-                oldest = sorted(
-                    self._sent.items(), key=lambda kv: kv[1]["sent_at"]
+                # Messages still queued for delivery keep their record: a
+                # receipt for them may arrive long after newer sends.
+                evictable = sorted(
+                    (
+                        kv
+                        for kv in self._sent.items()
+                        if kv[0] not in self._outbox
+                    ),
+                    key=lambda kv: kv[1]["sent_at"],
                 )
-                for key, _ in oldest[: len(self._sent) - MAX_SENT + 1]:
+                for key, _ in evictable[: len(self._sent) - MAX_SENT + 1]:
                     del self._sent[key]
             self._sent[message_id] = {
                 "to": to.hex(),
                 "sent_at": float(timestamp),
                 "read_at": None,
+                "delivered_at": None,
                 "text": normalize_message(text),
             }
             self.save()
+
+    def record_delivered(
+        self, message_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Mark a sent message as having reached its recipient."""
+        with self._transaction():
+            record = self._sent.get(message_id)
+            if record is None or record.get("delivered_at") is not None:
+                return
+            record["delivered_at"] = now if now is not None else time.time()
+            self.save()
+
+    def discard_sent(self, message_id: str) -> None:
+        """Forget a sent record whose send was refused or never went out."""
+        with self._transaction():
+            if self._sent.pop(message_id, None) is not None:
+                self.save()
 
     def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
         """A copy of one sent record, or ``None`` when unknown."""

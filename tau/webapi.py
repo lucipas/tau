@@ -393,6 +393,12 @@ class WebBridge:
         # OrderedDict used as a bounded set (its popitem(last=False)
         # evicts the oldest report; a plain dict has no such call).
         self._early_deliveries: OrderedDict[str, None] = OrderedDict()
+        # Verified read receipts whose console record was not appended yet,
+        # keyed by (reader, wire id); send_message reconciles them on append.
+        self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
+        # Receipt ids currently being dispatched, so overlapping triggers
+        # (SSE reconnects, re-lists) do not send the same receipt twice.
+        self._receipts_in_flight: Set[str] = set()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -601,6 +607,7 @@ class WebBridge:
         the earliest read time.  Returns the updated records.
         """
         wanted = set(message_ids)
+        matched: Set[str] = set()
         updated: List[Dict[str, Any]] = []
         with self._send_lock:
             with self._lock:
@@ -611,11 +618,19 @@ class WebBridge:
                         or message.get("mail_id") not in wanted
                     ):
                         continue
+                    matched.add(message["mail_id"])
                     if message.get("status") == "read":
                         continue
                     message["status"] = "read"
                     message["read_at"] = float(read_at)
                     updated.append(dict(message))
+                # A receipt can beat the console record: send_message
+                # registers the send before the record is appended.  Keep
+                # the read so the record picks it up when it is appended.
+                for mail_id in wanted - matched:
+                    self._early_reads[(reader_hash, mail_id)] = float(read_at)
+                    while len(self._early_reads) > MAX_EARLY_DELIVERIES:
+                        self._early_reads.popitem(last=False)
         if not updated:
             return updated
         self._save_messages()
@@ -666,24 +681,46 @@ class WebBridge:
                 ids.append(mail_id)
         if not by_peer:
             return
+        # Stamp the displayed messages read before dispatch: a send that
+        # fails then stays owed, so the serving node's sweep retries it.
+        try:
+            inbox.mark_read([mid for ids in by_peer.values() for mid in ids])
+        except Exception:
+            log.debug("Could not stamp displayed messages read", exc_info=True)
+        # Claim the ids before the thread starts, so a second trigger that
+        # runs while this one is still sending does not dispatch them again.
+        claimed: Dict[str, List[str]] = {}
+        with self._lock:
+            for peer_hash, ids in by_peer.items():
+                fresh = [mid for mid in ids if mid not in self._receipts_in_flight]
+                if fresh:
+                    self._receipts_in_flight.update(fresh)
+                    claimed[peer_hash] = fresh
+        if not claimed:
+            return
+        claimed_ids = [mid for ids in claimed.values() for mid in ids]
 
         def _send() -> None:
-            sent_ids: List[str] = []
-            for peer_hash, ids in by_peer.items():
-                try:
-                    node.send_read_receipts(peer_hash, ids)
-                    sent_ids.extend(ids)
-                except Exception:
-                    log.debug(
-                        "Could not send read receipt to %s",
-                        peer_hash,
-                        exc_info=True,
-                    )
-            if sent_ids:
-                try:
-                    inbox.mark_receipt_sent(sent_ids)
-                except Exception:
-                    log.debug("Could not stamp read receipts", exc_info=True)
+            try:
+                for peer_hash, ids in claimed.items():
+                    try:
+                        result = node.send_read_receipts(peer_hash, ids)
+                    except Exception:
+                        log.debug(
+                            "Could not send read receipt to %s",
+                            peer_hash,
+                            exc_info=True,
+                        )
+                        continue
+                    handled = result.get("ids") or []
+                    if handled:
+                        try:
+                            inbox.mark_receipt_sent(handled)
+                        except Exception:
+                            log.debug("Could not stamp read receipts", exc_info=True)
+            finally:
+                with self._lock:
+                    self._receipts_in_flight.difference_update(claimed_ids)
 
         threading.Thread(
             target=_send, name="tau-read-receipts", daemon=True
@@ -888,6 +925,7 @@ class WebBridge:
         # sent message can still be marked read.
         mail_id = response.get("id")
         flipped = False
+        early_read: Optional[float] = None
         with self._send_lock:
             message = self._append_message(
                 direction="out",
@@ -906,6 +944,12 @@ class WebBridge:
                         del self._early_deliveries[mail_id]
                         message["status"] = "delivered"
                         flipped = True
+                    early_read = self._early_reads.pop((peer.hexhash, mail_id), None)
+                if early_read is not None:
+                    # A read receipt beat the record; it is the later state.
+                    message["status"] = "read"
+                    message["read_at"] = early_read
+                    flipped = True
                 if flipped:
                     self._save_messages()
         self.bus.publish({"type": "message", "message": message})
