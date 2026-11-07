@@ -271,7 +271,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="send a message to a peer",
     )
     send.add_argument(
-        "--to", required=True, metavar="NAME|HASH", help="peer name or destination hash"
+        "--to",
+        action="append",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: send to several peers)",
     )
     send.add_argument(
         "message", nargs="?", help="message text (reads stdin when omitted)"
@@ -2114,46 +2118,89 @@ def cmd_send(args: argparse.Namespace) -> int:
     config = _make_config(args)
     node = TauNode(config, name=config.name)
     node.start()
+    targets = args.to if isinstance(args.to, list) else [args.to]
+    results: List[Dict[str, Any]] = []
     try:
-        response = node.send_message(
-            args.to,
-            text,
-            timeout=float(getattr(args, "timeout", 20.0)),
-            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
-            queue=not getattr(args, "no_queue", False),
-        )
-        if response.get("queued"):
+        for target in targets:
+            try:
+                response = node.send_message(
+                    target,
+                    text,
+                    timeout=float(getattr(args, "timeout", 20.0)),
+                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    queue=not getattr(args, "no_queue", False),
+                )
+            except (NodeError, PeerError) as exc:
+                if len(targets) == 1:
+                    # Single recipient keeps the historical behaviour:
+                    # the error reaches main() and exits non-zero.
+                    raise
+                # One recipient failing must not stop the rest; the
+                # failure is reported per recipient below.
+                results.append({"target": target, "ok": False, "error": str(exc)})
+                continue
+            results.append({"target": target, **response})
+        if any(result.get("queued") for result in results):
             # One-shot send: give reachable peers a brief chance to take a
             # sealed copy (or the message itself) before this process exits.
             node.flush_outbox(timeout=3.0, max_peers=5)
-            if node.mailbox.get_outbox(response["id"]) is None:
-                response = {
-                    "ok": True,
-                    "delivered": True,
-                    "id": response["id"],
-                    "to": response["to"],
-                }
+            for result in results:
+                if result.get("queued") and node.mailbox.get_outbox(result["id"]) is None:
+                    message_id = result["id"]
+                    to_hex = result["to"]
+                    target = result["target"]
+                    result.clear()
+                    result.update(
+                        {
+                            "target": target,
+                            "ok": True,
+                            "delivered": True,
+                            "id": message_id,
+                            "to": to_hex,
+                        }
+                    )
     finally:
         node.stop()
 
+    failed = [result for result in results if not result.get("ok", True)]
     if _json_mode(args):
-        _emit(response, True)
-    elif response.get("queued"):
-        print(f"queued for {args.to} — they are unreachable right now")
-        print(f"  id:      {response['id']}")
-        print("  it will be delivered automatically when they are heard from;")
-        print("  check `tau outbox` for the queue, or just leave a node serving")
-    elif response.get("delivered"):
-        print(f"delivered to {args.to}")
+        if len(results) == 1 and not failed:
+            # Single recipient keeps the historical bare-response shape.
+            _emit({k: v for k, v in results[0].items() if k != "target"}, True)
+        else:
+            _emit(
+                {
+                    "results": results,
+                    "delivered": sum(
+                        1 for r in results if r.get("ok", True) and not r.get("queued")
+                    ),
+                    "queued": sum(1 for r in results if r.get("queued")),
+                    "failed": len(failed),
+                },
+                True,
+            )
     else:
-        print(f"delivered to {args.to}")
-        echo = response.get("echo")
-        if echo is not None:
-            print(f"echo: {echo}")
-        rtt = response.get("_rtt")
-        if isinstance(rtt, (int, float)):
-            print(f"round trip: {rtt * 1000:.0f} ms")
-    return _EXIT_OK
+        for result in results:
+            target = result["target"]
+            if not result.get("ok", True):
+                print(f"failed to send to {target}: {result['error']}", file=sys.stderr)
+            elif result.get("queued"):
+                print(f"queued for {target} — they are unreachable right now")
+                print(f"  id:      {result['id']}")
+            elif result.get("delivered"):
+                print(f"delivered to {target}")
+            else:
+                print(f"delivered to {target}")
+                echo = result.get("echo")
+                if echo is not None:
+                    print(f"echo: {echo}")
+                rtt = result.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    print(f"round trip: {rtt * 1000:.0f} ms")
+        if any(result.get("queued") for result in results):
+            print("  it will be delivered automatically when they are heard from;")
+            print("  check `tau outbox` for the queue, or just leave a node serving")
+    return _EXIT_ERROR if failed else _EXIT_OK
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:

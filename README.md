@@ -247,7 +247,7 @@ Global options may appear before or after the command:
 | `tau init` | Create the data directory, identity and Reticulum config |
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
-| `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
@@ -304,6 +304,9 @@ echo "piped message" | tau send --to alice
 
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
+
+# Send the same message to several peers (one message id per recipient)
+tau send --to alice --to bob "hi"
 
 # See what is waiting on offline peers
 tau outbox

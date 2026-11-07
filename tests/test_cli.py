@@ -36,9 +36,183 @@ def test_parser_send_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["send", "--to", "alice", "hello world"])
     assert args.command == "send"
-    assert args.to == "alice"
+    assert args.to == ["alice"]
     assert args.message == "hello world"
     assert args.timeout == 20.0
+
+
+def test_parser_send_to_is_repeatable():
+    parser = cli.build_parser()
+    args = parser.parse_args(["send", "--to", "alice", "--to", "bob", "hello"])
+    assert args.to == ["alice", "bob"]
+
+
+class _FakeSendNode:
+    """Stub TauNode for `tau send`: per-target behaviour drives whether
+    a recipient is delivered, queued (a real outbox entry is written,
+    so the post-send flush can flip it), or fails."""
+
+    instances: list = []
+    behaviour: dict = {}
+    deliver_on_flush = False
+
+    def __init__(self, config, **kwargs):
+        from tau.mailbox import Mailbox
+
+        self.config = config
+        self.mailbox = Mailbox(config.mailbox_path)
+        self.started = False
+        self.calls: list = []
+        self.flush_calls: list = []
+        _FakeSendNode.instances.append(self)
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def send_message(self, target, text, **kwargs):
+        from tau.node import NodeError
+
+        self.calls.append((target, text))
+        mode = _FakeSendNode.behaviour.get(target, "delivered")
+        if mode == "error":
+            raise NodeError(f"no path to {target}")
+        if mode == "queued":
+            entry = self.mailbox.enqueue(
+                to=b"\xbb" * 16,
+                text=text,
+                message_id=f"{len(self.calls):032x}",
+            )
+            return {
+                "ok": True,
+                "queued": True,
+                "id": entry.id,
+                "to": entry.to_hex,
+            }
+        return {"ok": True, "echo": text, "_rtt": 0.05}
+
+    def flush_outbox(self, **kwargs):
+        self.flush_calls.append(kwargs)
+        if _FakeSendNode.deliver_on_flush:
+            for entry in self.mailbox.outbox_list():
+                self.mailbox.remove_outbox(entry.id)
+
+
+def _run_send(tmp_path, monkeypatch, argv, behaviour=None, deliver_on_flush=False):
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = dict(behaviour or {})
+    _FakeSendNode.deliver_on_flush = deliver_on_flush
+    return cli.main(["send", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_send_to_several_peers_delivers_each(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "bob": "delivered"},
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "delivered to bob" in out
+    node = _FakeSendNode.instances[0]
+    assert node.calls == [("alice", "hi"), ("bob", "hi")]
+    assert node.started is False
+    assert node.flush_calls == []
+
+
+def test_send_mixed_delivered_and_queued(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "bob": "queued"},
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "queued for bob" in out
+    # The queued hint is printed once, after every recipient's line.
+    assert out.count("it will be delivered automatically") == 1
+    node = _FakeSendNode.instances[0]
+    assert len(node.flush_calls) == 1
+    assert node.flush_calls[0]["timeout"] == 3.0
+    assert node.flush_calls[0]["max_peers"] == 5
+
+
+def test_send_queued_entry_flips_when_flush_delivers(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "hi"],
+        behaviour={"bob": "queued"},
+        deliver_on_flush=True,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to bob" in out
+    assert "queued for bob" not in out
+
+
+def test_send_one_failure_does_not_stop_the_rest(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "carol", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "carol": "error", "bob": "delivered"},
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "delivered to alice" in captured.out
+    assert "delivered to bob" in captured.out
+    assert "failed to send to carol: no path to carol" in captured.err
+    node = _FakeSendNode.instances[0]
+    assert [call[0] for call in node.calls] == ["alice", "carol", "bob"]
+
+
+def test_send_json_multi_uses_results_list(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "--json", "hi"],
+        behaviour={"alice": "delivered", "bob": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["target"] for r in payload["results"]] == ["alice", "bob"]
+    assert payload["delivered"] == 1
+    assert payload["queued"] == 1
+    assert payload["failed"] == 0
+
+
+def test_send_json_single_keeps_bare_shape(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--json", "hi"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "results" not in payload
+    assert payload["echo"] == "hi"
+
+
+def test_send_json_single_queued_keeps_bare_shape(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "--json", "hi"],
+        behaviour={"bob": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued"] is True
+    assert "id" in payload
 
 
 def test_parser_serve_http_options():
