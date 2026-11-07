@@ -34,6 +34,16 @@ export function Console() {
     setMode(next);
   }
 
+  function handleTargetChange(value: string) {
+    // Retargeting the composer invalidates the pending reply: the
+    // quoted message belongs to the old conversation, and sending it
+    // to the new peer would only be rejected by the bridge.
+    if (replyTo && value !== (replyTo.peer ?? "")) {
+      setReplyTo(null);
+    }
+    setTarget(value);
+  }
+
   function selectPeer(destination: string) {
     customPicked.current = false;
     setMode("peer");
@@ -112,7 +122,7 @@ export function Console() {
               peers={tau.peers}
               target={target}
               mode={mode}
-              onTargetChange={setTarget}
+              onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
               replyTo={replyTo}

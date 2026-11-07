@@ -307,6 +307,15 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message.
         message["wire_id"] = wire_id
+    excerpt = entry.get("excerpt_hash")
+    if (
+        isinstance(excerpt, str)
+        and len(excerpt) == 16
+        and all(char in "0123456789abcdef" for char in excerpt.lower())
+    ):
+        # Short hash of this message's text, so the console can check
+        # a reply's quoted excerpt against it like the CLI does.
+        message["excerpt_hash"] = excerpt.lower()
     try:
         in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
     except ValueError:
@@ -969,6 +978,7 @@ class WebBridge:
                 message["mail_id"] = mail_id
             if wire_id is not None:
                 message["wire_id"] = wire_id
+            message["excerpt_hash"] = excerpt_hash(text)
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
                 message["in_reply_to"] = reply_to

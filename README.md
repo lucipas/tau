@@ -339,7 +339,7 @@ By default everything lives in `~/.tau` (override with `TAU_HOME` or
 ├── node.json             # local display name
 ├── peers.json            # discovered peers, chmod 600
 ├── mailbox.json          # store-and-forward queues, chmod 600
-├── inbox.json            # received direct messages, chmod 600, capped at 500
+├── inbox.json            # direct messages, chmod 600, capped at 500 received + 500 sent
 ├── messages.json         # console message history, chmod 600
 └── reticulum/
     ├── config            # generated Reticulum configuration
@@ -474,10 +474,11 @@ buggy peer cannot force unbounded buffering:
 
 Names and messages are stripped of control characters (including terminal
 escape sequences) before display. Received messages are recorded in the
-node inbox (`inbox.json`, mode `0600`, capped at 500) as they arrive —
-direct and relayed alike — and can be read back with `tau messages`;
-a message waiting in the outbox is stored in `mailbox.json` (mode
-`0600`) until it is delivered or expires.
+node inbox (`inbox.json`, mode `0600`, capped at 500 received plus 500
+sent — sent messages keep their own allowance, so they never evict
+received history) as they arrive — direct and relayed alike — and can
+be read back with `tau messages`; a message waiting in the outbox is
+stored in `mailbox.json` (mode `0600`) until it is delivered or expires.
 
 ### Reply quoting
 

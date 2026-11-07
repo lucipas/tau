@@ -145,6 +145,8 @@ def test_status_snapshot(bridge):
 
 
 def test_send_message_is_recorded_and_published(bridge, node):
+    from tau.protocol import excerpt_hash
+
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
     )
@@ -153,6 +155,7 @@ def test_send_message_is_recorded_and_published(bridge, node):
     assert payload["message"]["peer_name"] == "alice"
     assert payload["message"]["rtt_ms"] == 12.0
     assert payload["message"]["wire_id"] == "0" * 31 + "1"
+    assert payload["message"]["excerpt_hash"] == excerpt_hash("hi")
     assert node.sent == [("alice", "hi", None)]
 
     _, _, feed = _json(bridge, "/api/messages")
@@ -246,6 +249,7 @@ def test_inbound_message_keeps_reply_and_wire_id(bridge):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["wire_id"] == "b" * 32
+    assert feed["messages"][0]["excerpt_hash"] == excerpt_hash("seconded")
     assert feed["messages"][0]["in_reply_to"] == {
         "id": "a" * 32,
         "excerpt": excerpt_hash("original thought"),

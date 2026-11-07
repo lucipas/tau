@@ -14,6 +14,9 @@ export interface TauMessage {
   mail_id?: string;
   // Reticulum wire id: how replies name this message.
   wire_id?: string;
+  // Short hash of this message's text, for checking a reply's quoted
+  // excerpt against it; see resolveQuote in message-feed.tsx.
+  excerpt_hash?: string;
   // Quoted message reference: wire id + short excerpt hash of the text
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.

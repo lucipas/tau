@@ -28,7 +28,71 @@ function makeMessage(overrides: Partial<TauMessage> = {}): TauMessage {
 
 describe("resolveQuote", () => {
   it("resolves the quoted text from the same conversation", () => {
-    const original = makeMessage({ id: 1, text: "original thought", wire_id: "a".repeat(32) });
+    const original = makeMessage({
+      id: 1,
+      text: "original thought",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    expect(resolveQuote([original, reply], reply)).toEqual({
+      name: "alice",
+      text: "original thought",
+    });
+  });
+
+  it("is unavailable when the excerpt hash does not match", () => {
+    const original = makeMessage({
+      id: 1,
+      text: "edited after the fact",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "fedcba9876543210",
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    expect(resolveQuote([original, reply], reply)).toBe("unavailable");
+  });
+
+  it("picks the hash-matching entry when a wire id is shared", () => {
+    const stale = makeMessage({
+      id: 1,
+      text: "stale copy",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "fedcba9876543210",
+    });
+    const current = makeMessage({
+      id: 2,
+      text: "current copy",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 3,
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    expect(resolveQuote([stale, current, reply], reply)).toEqual({
+      name: "alice",
+      text: "current copy",
+    });
+  });
+
+  it("still renders history written before excerpt hashes existed", () => {
+    const original = makeMessage({
+      id: 1,
+      text: "original thought",
+      wire_id: "a".repeat(32),
+    });
     const reply = makeMessage({
       id: 2,
       text: "seconded",

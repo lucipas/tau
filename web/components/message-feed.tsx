@@ -132,13 +132,30 @@ export function resolveQuote(
   // the quoted text is pulled from this console's own history, never
   // from the wire, so a reference to a message that never arrived —
   // or to another peer's message — renders as unavailable instead of
-  // trusting the sender's claim about what was said.
+  // trusting the sender's claim about what was said. When the reply
+  // carries an excerpt hash, the rendered text must match it: if
+  // several history entries share the wire id, the hash-matching one
+  // wins, and a hash present on every candidate but matching none
+  // means the local copy changed, so the original is unavailable.
+  // Entries written before excerpt hashes existed carry no hash and
+  // cannot be checked; they still render.
   const ref = message.in_reply_to;
   if (!ref || !ref.id) return null;
-  const quoted = messages.find(
+  const candidates = messages.filter(
     (entry) => entry.peer === message.peer && entry.wire_id === ref.id,
   );
-  if (!quoted) return "unavailable";
+  if (candidates.length === 0) return "unavailable";
+  let quoted = candidates[0];
+  if (ref.excerpt) {
+    const verified = candidates.find(
+      (entry) => entry.excerpt_hash === ref.excerpt,
+    );
+    if (verified) {
+      quoted = verified;
+    } else if (candidates.some((entry) => entry.excerpt_hash !== undefined)) {
+      return "unavailable";
+    }
+  }
   return {
     name: quoted.direction === "out" ? "you" : quoted.peer_name,
     text: quoted.text.split("\n")[0].slice(0, 80),
