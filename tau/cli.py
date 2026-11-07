@@ -2466,7 +2466,8 @@ def cmd_group_list(args: argparse.Namespace) -> int:
 def cmd_group_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
-    node = TauNode(config, name=config.name)
+    delivered_ids: Set[str] = set()
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start()
     try:
         group = node.groups.find(args.group)
@@ -2482,18 +2483,31 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         if any(result.get("queued") for result in response["results"]):
             node.flush_outbox(timeout=3.0, max_peers=5)
             for result in response["results"]:
-                if result.get("queued") and node.mailbox.get_outbox(result["id"]) is None:
+                if not result.get("queued"):
+                    continue
+                # Only a delivery acknowledgement counts as delivered; an
+                # entry that merely vanished was cancelled, expired, or
+                # taken by another process.
+                if result["id"] in delivered_ids:
                     result["queued"] = False
                     result["delivered"] = True
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = "left the outbox without a delivery confirmation"
     finally:
         node.stop()
 
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered") and not r.get("queued")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
     if _json_mode(args):
         _emit(response, True)
-        return _EXIT_OK
+        return exit_code
     delivered = [r for r in response["results"] if r.get("delivered")]
     queued = [r for r in response["results"] if r.get("queued")]
-    failed = [r for r in response["results"] if not r.get("delivered") and not r.get("queued")]
+    failed = failed_legs
     for result in delivered:
         print(f"delivered to {result.get('to_name') or result['to'][:8]}")
     for result in queued:
@@ -2506,7 +2520,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             f"failed for {result.get('to_name') or result['to'][:8]}:"
             f" {result.get('error') or 'unknown error'}"
         )
-    return _EXIT_OK
+    return exit_code
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 

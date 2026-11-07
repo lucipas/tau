@@ -112,6 +112,14 @@ class NotAllowedError(NodeError):
     """
 
 
+class NotAMemberError(NodeError):
+    """Raised when a peer rejects a group message as not a group member.
+
+    A changed roster or a non-member sender is a permanent refusal, so
+    the group leg is not queued for retry.
+    """
+
+
 class InstanceAlreadyRunning(NodeError):
     """The data directory belongs to another running node."""
 
@@ -1300,6 +1308,12 @@ class TauNode:
                 payload,
                 timeout,
             )
+        except NotAMemberError as exc:
+            # Permanent refusal: the recipient will not accept this roster,
+            # so stop retrying rather than holding the leg until its TTL.
+            log.warning("Dropping queued group message %s: %s", entry.id, exc)
+            self.mailbox.remove_outbox(entry.id)
+            return False
         except NodeError as exc:
             self.mailbox.record_attempt(entry.id, error=str(exc))
             return False
@@ -1712,6 +1726,22 @@ class TauNode:
         }
         results: List[Dict[str, Any]] = []
         any_queued = False
+        # Check the full group request size once, before any leg is sent
+        # or queued, so an oversized message fails cleanly up front rather
+        # than aborting the fan-out partway through.
+        try:
+            encode_group_message(
+                normalized,
+                message_id=generate_message_id(),
+                group_id=group["id"],
+                group_name=group["name"],
+                members=list(group["members"]),
+            )
+        except ProtocolError as exc:
+            raise NodeError(
+                f"group message is too large to send with its roster ({exc}); "
+                "shorten the message"
+            ) from exc
         for member in members:
             message_id = generate_message_id()
             payload = encode_group_message(
@@ -1741,7 +1771,7 @@ class TauNode:
                         "rtt": response.get("_rtt"),
                     }
                 )
-            except NotAllowedError:
+            except (NotAllowedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; queueing
                 # would retry a refusal until its TTL expires.
                 results.append(
@@ -1749,7 +1779,9 @@ class TauNode:
                         "to": member,
                         "to_name": peer.display_name if peer is not None else "",
                         "ok": False,
-                        "error": "not_allowed",
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
                         "id": message_id,
                     }
                 )
@@ -1795,8 +1827,11 @@ class TauNode:
                 name="tau-mail-flush",
                 daemon=True,
             ).start()
+        # Aggregate success only when every leg was delivered or queued;
+        # an explicit refusal or unqueued failure is a failed fan-out.
+        all_ok = all(r.get("delivered") or r.get("queued") for r in results)
         return {
-            "ok": True,
+            "ok": all_ok,
             "v": PROTOCOL_VERSION,
             "group": group["id"],
             "name": group["name"],
@@ -2082,6 +2117,8 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
