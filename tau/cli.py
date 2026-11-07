@@ -2143,18 +2143,20 @@ def cmd_send(args: argparse.Namespace) -> int:
                 results.append({"target": target, "ok": False, "error": str(exc)})
                 continue
             # The peer response is untrusted JSON: keep the local
-            # recipient label and queue state authoritative, so a peer
-            # cannot relabel this result, and a "queued" reply without
-            # an id cannot KeyError the flush check below (only this
-            # node's own queue path produces a queued reply, and it
-            # always carries an id).
+            # recipient label authoritative, so a peer cannot relabel
+            # this result. A "queued" claim is only trusted with a
+            # string id (only this node's own queue path produces a
+            # queued reply, and it always carries an id); a peer
+            # claiming queued without one is treated as delivered, so
+            # the flush check below cannot KeyError. A direct delivery
+            # keeps no "queued" key at all, preserving the established
+            # single-recipient JSON shape.
             result = dict(response)
             result["target"] = target
-            result["queued"] = bool(response.get("queued")) and isinstance(
-                response.get("id"), str
-            )
-            if result["queued"] and "to" not in response:
-                result["to"] = target
+            if response.get("queued"):
+                result["queued"] = isinstance(response.get("id"), str)
+                if result["queued"] and "to" not in response:
+                    result["to"] = target
             results.append(result)
         if any(result.get("queued") for result in results):
             # One-shot send: give reachable peers a brief chance to take a

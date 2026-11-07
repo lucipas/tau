@@ -220,8 +220,9 @@ def test_send_json_single_keeps_bare_shape(tmp_path, capsys, monkeypatch):
     )
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert "results" not in payload
-    assert payload["echo"] == "hi"
+    # The complete payload is the bare peer response: no "results"
+    # wrapper and no "queued" key added for a direct delivery.
+    assert payload == {"ok": True, "echo": "hi", "_rtt": 0.05}
 
 
 def test_send_json_single_queued_keeps_bare_shape(tmp_path, capsys, monkeypatch):
