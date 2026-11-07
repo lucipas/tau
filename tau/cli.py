@@ -2315,13 +2315,31 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
     mailbox = Mailbox(config.mailbox_path)
     registry = PeerRegistry(config.peers_path)
     envelopes = mailbox.held_list()
+    usage = mailbox.held_usage()
+
+    def describe_sender(row: Dict[str, Any]) -> Dict[str, Any]:
+        sender = row["sender"]
+        peer = registry.get(bytes.fromhex(sender)) if sender else None
+        return {
+            "sender": sender,
+            "name": peer.display_name if peer is not None else "",
+            "count": row["count"],
+            "bytes": row["bytes"],
+        }
 
     def describe(envelope: Any) -> Dict[str, Any]:
         peer = registry.get(envelope.to)
+        sender_peer = (
+            registry.get(bytes.fromhex(envelope.depositor))
+            if envelope.depositor
+            else None
+        )
         return {
             "id": envelope.id,
             "to": envelope.to_hex,
             "to_name": peer.display_name if peer is not None else "",
+            "from": envelope.depositor,
+            "from_name": sender_peer.display_name if sender_peer is not None else "",
             "stored_at": envelope.stored_at,
             "expires_at": envelope.expires_at,
             "blob_bytes": len(envelope.blob),
@@ -2329,7 +2347,11 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
 
     if _json_mode(args):
         _emit(
-            {"held": [describe(e) for e in envelopes], "count": len(envelopes)},
+            {
+                "held": [describe(e) for e in envelopes],
+                "count": len(envelopes),
+                "senders": [describe_sender(row) for row in usage],
+            },
             True,
         )
     else:
@@ -2355,6 +2377,35 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
             for row in rows:
                 print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
             print(f"\n{len(envelopes)} sealed message(s) held for other peers.")
+        if usage:
+            print("\nHeld per sender:")
+            sender_header = ("SENDER", "NAME", "COUNT", "BYTES")
+            sender_rows: List[tuple] = [sender_header]
+            for row in usage:
+                peer = (
+                    registry.get(bytes.fromhex(row["sender"]))
+                    if row["sender"]
+                    else None
+                )
+                sender_rows.append(
+                    (
+                        row["sender"] if row["sender"] else "unknown",
+                        peer.display_name if peer is not None else "-",
+                        str(row["count"]),
+                        str(row["bytes"]),
+                    )
+                )
+            sender_widths = [
+                max(len(row[i]) for row in sender_rows)
+                for i in range(len(sender_header))
+            ]
+            for row in sender_rows:
+                print(
+                    "  ".join(
+                        value.ljust(sender_widths[i])
+                        for i, value in enumerate(row)
+                    )
+                )
     return _EXIT_OK
 
 

@@ -800,6 +800,59 @@ def test_outbox_held_lists_envelopes(tmp_path, capsys):
     assert "sealed-bytes" not in json.dumps(payload)
 
 
+def test_outbox_held_shows_per_sender_usage(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    box = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    box.hold(
+        to=b"\xbb" * 16,
+        blob=b"sealed-bytes",
+        message_id="a" * 32,
+        expires_at=time.time() + 3600,
+        depositor=sender_hash,
+    )
+    box.hold(
+        to=b"\xbb" * 16,
+        blob=b"sealed-bytes",
+        message_id="b" * 32,
+        expires_at=time.time() + 3600,
+        depositor=sender_hash,
+    )
+    box.hold(
+        to=b"\xaa" * 16,
+        blob=b"sealed-bytes",
+        message_id="c" * 32,
+        expires_at=time.time() + 3600,
+    )
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice")
+    registry.save()
+
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Held per sender:" in out
+    assert "alice" in out
+    assert "unknown" in out
+
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["held"][0]["from"] == sender_hash.hex()
+    assert payload["held"][0]["from_name"] == "alice"
+    assert payload["senders"] == [
+        {
+            "sender": sender_hash.hex(),
+            "name": "alice",
+            "count": 2,
+            "bytes": 2 * len(b"sealed-bytes"),
+        },
+        {"sender": "", "name": "", "count": 1, "bytes": len(b"sealed-bytes")},
+    ]
+
+
 def test_outbox_drop_held_by_prefix(tmp_path, capsys):
     data_dir = _hold_for_cli(tmp_path, [("a" * 32, b"\xbb" * 16, "bob")])
     code = cli.main(

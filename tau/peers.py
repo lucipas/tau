@@ -53,6 +53,12 @@ class Peer:
     # never heard directly.  Its reported liveness is second-hand, so mail
     # sweeps rank directly heard peers ahead of it.
     via_exchange: bool = False
+    # Outbound delivery history: how many messages this node has
+    # successfully delivered directly to this peer, and when the last
+    # one landed.  A peer with a delivered history is a proven peer —
+    # the higher held-mail quota tier requires it.
+    delivered_count: int = 0
+    last_delivered_at: Optional[float] = None
 
     @property
     def hexhash(self) -> str:
@@ -91,6 +97,8 @@ class Peer:
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
             "lxmf": self.lxmf_hash,
+            "delivered_count": self.delivered_count,
+            "last_delivered_at": self.last_delivered_at,
         }
 
     @classmethod
@@ -124,6 +132,12 @@ class Peer:
         caps = raw.get("caps")
         if not isinstance(caps, list):
             caps = []
+        delivered_count = raw.get("delivered_count")
+        if not isinstance(delivered_count, int) or delivered_count < 0:
+            delivered_count = 0
+        last_delivered_at = raw.get("last_delivered_at")
+        if not isinstance(last_delivered_at, (int, float)):
+            last_delivered_at = None
         return cls(
             destination_hash=destination_bytes,
             name=sanitize_name(raw.get("name"), fallback="unknown"),
@@ -134,6 +148,12 @@ class Peer:
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
+            delivered_count=delivered_count,
+            last_delivered_at=(
+                float(last_delivered_at)
+                if last_delivered_at is not None
+                else None
+            ),
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -284,6 +304,26 @@ class PeerRegistry:
                 peer = existing
             self._enforce_limit()
             return peer
+
+    def record_delivered(
+        self, destination_hash: bytes, *, now: Optional[float] = None
+    ) -> bool:
+        """Record a successful direct delivery to a peer.
+
+        Bumps the peer's delivered count and stamps the time, so the
+        registry carries the delivered history the held-mail quota tier
+        (and any future trust decision) needs.  Returns ``False`` when
+        the peer is not in the registry.  The caller owns persistence:
+        the serving node saves peers on its usual cadence and on stop.
+        """
+        timestamp = now if now is not None else time.time()
+        with self._lock:
+            peer = self._peers.get(destination_hash)
+            if peer is None:
+                return False
+            peer.delivered_count += 1
+            peer.last_delivered_at = timestamp
+            return True
 
     def all(
         self,

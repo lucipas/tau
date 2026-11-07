@@ -32,6 +32,7 @@ from .identity import (
 from .inbox import Inbox
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
+    TRUSTED_PEER_MIN_AGE_SECONDS,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -92,6 +93,16 @@ _EXCHANGE_INTERVAL = 900.0
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
+# A holder record older than this no longer counts toward the holder cap:
+# the holder may have shed the copy under its sender quota, so the message
+# can be deposited with another relay.  This can let a message end up held
+# by more than MAX_HOLDERS_PER_MESSAGE relays when the original holders
+# still have their copies — accepted deliberately: extra sealed copies are
+# deduped on delivery, while a strict cap could strand mail whose holders
+# all shed it.  There is no shed signal from holder to sender, so record
+# age is the only evidence available.  The window matches the deposit
+# retry interval.
+_HOLDER_RECORD_TTL = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
 
@@ -872,12 +883,35 @@ class TauNode:
             return response_error("invalid_mail", str(exc))
         if store["expires_at"] <= time.time():
             return response_error("mail_expired", "envelope has already expired")
+        # Quotas are keyed by the peer that asked us to hold the
+        # envelope: the sealed blob hides the inner sender, so the
+        # depositing peer is the only attribution a holder has.  A
+        # long-standing known peer gets the higher quota tier: in the
+        # registry 24h+, heard directly rather than via exchange, and
+        # with at least one message this node has delivered to it.
+        depositor = (
+            tau_destination_hash(remote_identity)
+            if remote_identity is not None
+            else None
+        )
+        trusted = False
+        if depositor is not None:
+            peer = self.registry.get(depositor)
+            if (
+                peer is not None
+                and not peer.via_exchange
+                and time.time() - peer.first_seen >= TRUSTED_PEER_MIN_AGE_SECONDS
+                and peer.delivered_count > 0
+            ):
+                trusted = True
         try:
             stored = self.mailbox.hold(
                 to=bytes.fromhex(store["to"]),
                 blob=store["blob"],
                 message_id=store["id"],
                 expires_at=store["expires_at"],
+                depositor=depositor,
+                trusted=trusted,
             )
         except MailboxFull as exc:
             return response_error("mailbox_full", str(exc))
@@ -1127,7 +1161,11 @@ class TauNode:
                 continue
             if message_id is not None and entry.id != message_id:
                 continue
-            holders = entry.held_by
+            holders = {
+                holder: deposited_at
+                for holder, deposited_at in entry.held_by.items()
+                if now - deposited_at < _HOLDER_RECORD_TTL
+            }
             if (
                 len(holders) >= MAX_HOLDERS_PER_MESSAGE
                 and peer.hexhash not in holders
@@ -1171,6 +1209,7 @@ class TauNode:
             return False
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
                 self.on_delivered(entry.id)
@@ -1480,7 +1519,18 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            if self.registry.get(peer.destination_hash) is None:
+                # A caller can hand send_message a Peer that never entered
+                # the registry (resolve_peer returns Peer objects as-is);
+                # a peer we just reached is a known peer, so record it
+                # before stamping the delivery — otherwise the history
+                # is silently lost and the peer never earns its quota tier.
+                self.registry.upsert(
+                    peer.destination_hash, peer.public_key, name=peer.name
+                )
+            self.registry.record_delivered(peer.destination_hash)
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
