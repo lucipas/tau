@@ -745,6 +745,94 @@ def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     assert "unknown peer" in capsys.readouterr().err
 
 
+def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
+    """An older unread message is not crowded out by newer read ones."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    alice = RNS.Identity()
+    alice_hash = destination_hash(alice)
+    carol = RNS.Identity()
+    carol_hash = destination_hash(carol)
+    registry.upsert(alice_hash, alice.get_public_key(), name="alice", now=100.0)
+    registry.upsert(carol_hash, carol.get_public_key(), name="carol", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": alice_hash.hex(),
+            "text": "old unread",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "a-1",
+        }
+    )
+    for index, received_at in enumerate((11.0, 12.0, 13.0)):
+        inbox.append(
+            {
+                "from": "carol",
+                "destination": carol_hash.hex(),
+                "text": f"read {index}",
+                "sent_at": 11.0,
+                "received_at": received_at,
+                "id": f"c-{index}",
+            }
+        )
+    inbox.mark_read(peer=carol_hash.hex())
+
+    # The three newest messages are all read; --unread must still find
+    # Alice's older one instead of reporting nothing.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--limit", "3", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["a-1"]
+    assert payload["more_unread"] == {}
+
+
+def test_messages_limit_truncation_reports_unshown_unread(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "third hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+
+    # Two of three unread fit in the window; the third stays unread and
+    # is reported, not silently marked read.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--limit", "2", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-3", "m-2"]
+    assert payload["more_unread"] == {sender_hash.hex(): 1}
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {sender_hash.hex(): 3}, "total": 3}
+
+    # The text listing prints the same hint, and the plain listing
+    # truncates the same way.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--limit", "2"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "1 more unread from alice" in out
+    assert "raise --limit to see them" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert json.loads(capsys.readouterr().out)["total"] == 3
+
+
 def test_messages_count_empty(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--count"])
     assert code == 0

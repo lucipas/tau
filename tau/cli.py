@@ -2326,10 +2326,24 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [entry for entry in entries if entry.get("unread")]
     shown = entries if limit is None else entries[:limit]
     omitted = entries[len(shown):]
+    # Unread mail the window omitted: reported, never silently cleared.
+    more_unread: Dict[str, int] = {}
+    for entry in omitted:
+        if entry.get("unread"):
+            destination = str(entry.get("destination") or "")
+            more_unread[destination] = more_unread.get(destination, 0) + 1
     if _json_mode(args):
-        _emit({"messages": shown, "count": len(shown)}, True)
+        _emit(
+            {"messages": shown, "count": len(shown), "more_unread": more_unread},
+            True,
+        )
     elif not shown:
-        print("No unread messages." if unread_only else "No messages received yet.")
+        if more_unread:
+            _print_more_unread(registry, more_unread)
+        else:
+            print(
+                "No unread messages." if unread_only else "No messages received yet."
+            )
     else:
         for entry in shown:
             peer = registry.get(entry.get("destination") or "")
@@ -2340,6 +2354,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             print(f"{marker}[{when}] {name} ({sender})")
             for line in str(entry.get("text", "")).splitlines() or [""]:
                 print(f"  {line}")
+        if more_unread:
+            _print_more_unread(registry, more_unread)
     # Reading a conversation advances its cursor to the newest message
     # just shown, so the next listing only flags what arrived since.  A
     # conversation with unread mail omitted by --limit is left alone:
@@ -2360,6 +2376,21 @@ def cmd_messages(args: argparse.Namespace) -> int:
     for destination, up_to_seq in newest_shown.items():
         inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
     return _EXIT_OK
+
+
+def _print_more_unread(
+    registry: PeerRegistry, more_unread: Dict[str, int]
+) -> None:
+    """Hint lines for unread mail a limited listing did not show."""
+    for destination, count in sorted(more_unread.items()):
+        peer = registry.get(destination)
+        name = peer.display_name if peer is not None else "unknown"
+        print(
+            f"{count} more unread from {name} ({short_hash(destination)})"
+            " — raise --limit to see them."
+        )
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 

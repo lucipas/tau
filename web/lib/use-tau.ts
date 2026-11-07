@@ -89,7 +89,10 @@ export function useTau() {
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
       setMessages(snapshot.messages);
-      setUnread(snapshot.unread ?? EMPTY_UNREAD);
+      // A snapshot is authoritative for its connection: reset the
+      // revision baseline so a delayed event from the old connection
+      // cannot overwrite it.
+      applyUnread(snapshot.unread ?? EMPTY_UNREAD, true);
       setBridge(snapshot.bridge);
       setConnection("live");
     };
@@ -101,7 +104,7 @@ export function useTau() {
       }>(event);
       if (!payload?.message) return;
       const message = payload.message;
-      if (payload.unread) setUnread(payload.unread);
+      if (payload.unread) applyUnread(payload.unread);
       if (message.id <= snapshotMax.current) return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
