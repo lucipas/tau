@@ -2273,7 +2273,15 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     if old_identity is not None
                     else None
                 )
-            except Exception:
+            except Exception as exc:
+                # The identity is about to be replaced either way, so the
+                # comparisons are cleared — but say why, so a transient
+                # read failure (e.g. permissions) is not silent.
+                log.warning(
+                    "Could not read the existing identity (%s); clearing "
+                    "peer verifications",
+                    exc,
+                )
                 old_key = None
             verifications_cleared = 0
             if old_key != identity.get_public_key():
