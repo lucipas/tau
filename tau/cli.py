@@ -2318,16 +2318,20 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    # Filter before limiting, so --unread finds older unread mail even
+    # when newer messages from the same listing are already read.
+    entries = inbox.list_messages(peer=peer_hash)
     unread_only = getattr(args, "unread", False)
     if unread_only:
         entries = [entry for entry in entries if entry.get("unread")]
+    shown = entries if limit is None else entries[:limit]
+    omitted = entries[len(shown):]
     if _json_mode(args):
-        _emit({"messages": entries, "count": len(entries)}, True)
-    elif not entries:
+        _emit({"messages": shown, "count": len(shown)}, True)
+    elif not shown:
         print("No unread messages." if unread_only else "No messages received yet.")
     else:
-        for entry in entries:
+        for entry in shown:
             peer = registry.get(entry.get("destination") or "")
             name = peer.display_name if peer is not None else entry.get("from") or "unknown"
             sender = short_hash(str(entry.get("destination") or ""))
@@ -2337,17 +2341,24 @@ def cmd_messages(args: argparse.Namespace) -> int:
             for line in str(entry.get("text", "")).splitlines() or [""]:
                 print(f"  {line}")
     # Reading a conversation advances its cursor to the newest message
-    # just shown, so the next listing only flags what arrived since.
-    if entries:
-        newest_shown: Dict[str, float] = {}
-        for entry in entries:
-            destination = str(entry.get("destination") or "")
-            received_at = float(entry.get("received_at", 0))
-            newest_shown[destination] = max(
-                newest_shown.get(destination, received_at), received_at
-            )
-        for destination, up_to in newest_shown.items():
-            inbox.mark_read(peer=destination, up_to=up_to)
+    # just shown, so the next listing only flags what arrived since.  A
+    # conversation with unread mail omitted by --limit is left alone:
+    # a cursor past the newest shown message would silently clear it.
+    partially_listed = {
+        str(entry.get("destination") or "")
+        for entry in omitted
+        if entry.get("unread")
+    }
+    newest_shown: Dict[str, int] = {}
+    for entry in shown:
+        destination = str(entry.get("destination") or "")
+        if destination in partially_listed:
+            continue
+        newest_shown[destination] = max(
+            newest_shown.get(destination, 0), int(entry["seq"])
+        )
+    for destination, up_to_seq in newest_shown.items():
+        inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
     return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.

@@ -9,9 +9,10 @@ this store is the node's own, and it exists whether or not ``--http``
 is in use.
 
 Read state lives here too, as a per-conversation cursor: for each
-sender destination, the ``received_at`` (and id) of the newest message
+sender destination, the arrival sequence (and id) of the newest message
 the owner has read.  A message is unread when it arrived after the
-cursor for its sender.  Read state is strictly local — it never leaves
+cursor for its sender.  Arrival order comes from the append sequence,
+not the wall clock, so a clock change cannot hide new mail.  Read state is strictly local — it never leaves
 the node — and files written before cursors existed migrate with every
 stored message marked read, so an upgrade does not surface a wall of
 "unread" for mail the owner already saw.
@@ -68,6 +69,9 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
+    seq = raw.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+        seq = None
     return {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
@@ -76,15 +80,36 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
+        "seq": seq,
     }
 
 
-def _valid_cursors(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+def _number_sequence(messages: List[Dict[str, Any]]) -> None:
+    """Give every message a strictly increasing arrival sequence, in place.
+
+    The list is already in arrival order.  Records written before
+    sequence numbers existed (or with a bad one) are numbered after the
+    last valid one, so the order never depends on wall-clock time.
+    """
+    last = 0
+    for entry in messages:
+        seq = entry.get("seq")
+        if seq is None or seq <= last:
+            seq = last + 1
+        entry["seq"] = seq
+        last = seq
+
+
+def _valid_cursors(
+    raw: Any, messages: List[Dict[str, Any]]
+) -> Optional[Dict[str, Dict[str, Any]]]:
     """Normalize stored read cursors, or ``None`` when the file predates them.
 
-    A cursor is ``{"last_read_at": float, "last_read_id": str | None}``
-    per sender destination.  Malformed entries are skipped; a missing
-    or non-object ``read_cursors`` section means the file was written
+    A cursor is ``{"last_read_seq": int, "last_read_id": str | None}``
+    per sender destination.  A cursor saved before sequence numbers
+    carries only ``last_read_at``; it is resolved to the newest stored
+    message it covered.  Malformed entries are skipped; a missing or
+    non-object ``read_cursors`` section means the file was written
     before read state existed, and the caller migrates instead.
     """
     if raw is None or not isinstance(raw, dict):
@@ -93,19 +118,25 @@ def _valid_cursors(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
     for destination, value in raw.items():
         if not isinstance(destination, str) or not isinstance(value, dict):
             continue
-        try:
-            last_read_at = float(value.get("last_read_at"))
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(last_read_at):
-            continue
         last_read_id = value.get("last_read_id")
         if last_read_id is not None and not isinstance(last_read_id, str):
             continue
-        cursors[destination] = {
-            "last_read_at": last_read_at,
-            "last_read_id": last_read_id,
-        }
+        seq = value.get("last_read_seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            try:
+                last_read_at = float(value.get("last_read_at"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(last_read_at):
+                continue
+            covered = [
+                entry["seq"]
+                for entry in messages
+                if (entry.get("destination") or "") == destination
+                and entry["received_at"] <= last_read_at
+            ]
+            seq = max(covered, default=0)
+        cursors[destination] = {"last_read_seq": seq, "last_read_id": last_read_id}
     return cursors
 
 
@@ -113,14 +144,12 @@ def _is_unread(entry: Dict[str, Any], cursor: Optional[Dict[str, Any]]) -> bool:
     """Whether *entry* arrived after its sender's read cursor.
 
     No cursor means nothing from that sender has been read yet.  The
-    comparison is on ``received_at`` alone: the cursor always lands on
-    the newest message read, so anything at or before it was shown
-    alongside it.  The cursor still records the message id, so the
-    read position is identifiable.
+    comparison is on the arrival sequence, not the wall clock, so a
+    clock that moves backward cannot hide newly arrived mail.
     """
     if cursor is None:
         return True
-    return entry["received_at"] > cursor["last_read_at"]
+    return entry["seq"] > cursor["last_read_seq"]
 
 
 class Inbox:
@@ -153,18 +182,29 @@ class Inbox:
             if record is not None:
                 loaded.append(record)
         self._messages = loaded[-MAX_INBOX:]
-        cursors = _valid_cursors(raw.get("read_cursors"))
+        _number_sequence(self._messages)
+        cursors = _valid_cursors(raw.get("read_cursors"), self._messages)
         if cursors is None:
             # No read state on disk: every stored message starts as
             # read, so an upgrade never surfaces old mail as unread.
+            # The arrival sequence is ordered, so the newest message
+            # per sender is the greatest sequence, whatever its time.
             cursors = {}
             for entry in self._messages:
                 destination = entry.get("destination") or ""
-                cursors[destination] = {
-                    "last_read_at": entry["received_at"],
-                    "last_read_id": entry.get("id"),
-                }
+                current = cursors.get(destination)
+                if current is None or entry["seq"] > current["last_read_seq"]:
+                    cursors[destination] = {
+                        "last_read_seq": entry["seq"],
+                        "last_read_id": entry.get("id"),
+                    }
         self._read_cursors = cursors
+
+    def _next_seq(self) -> int:
+        """The sequence number for the next arrival (caller holds the lock)."""
+        highest = [entry["seq"] for entry in self._messages]
+        highest += [cursor["last_read_seq"] for cursor in self._read_cursors.values()]
+        return max(highest, default=0) + 1
 
     def _save(self) -> None:
         if self.path is None:
@@ -215,6 +255,7 @@ class Inbox:
         if entry is None:
             raise ValueError("inbox record needs text")
         with self._transaction():
+            entry["seq"] = self._next_seq()
             self._messages.append(entry)
             self._messages = self._messages[-MAX_INBOX:]
             self._save()
@@ -273,15 +314,17 @@ class Inbox:
             return self._unread_counts_locked()
 
     def mark_read(
-        self, peer: Optional[str] = None, *, up_to: Optional[float] = None
+        self, peer: Optional[str] = None, *, up_to_seq: Optional[int] = None
     ) -> Dict[str, Any]:
         """Advance the read cursor for one conversation, or all of them.
 
-        The cursor lands on the newest message for the peer at or
-        before ``up_to`` (every message for the peer when ``up_to`` is
-        ``None``), so listing what was just shown marks exactly that
-        much read.  A peer with no messages is left alone.  Returns the
-        unread counts after the mark.
+        The cursor lands on the newest message for the peer with an
+        arrival sequence at or before ``up_to_seq`` (every message for
+        the peer when ``up_to_seq`` is ``None``), so listing what was
+        just shown marks exactly that much read.  A cursor never moves
+        backward, so a delayed mark cannot restore read mail as unread.
+        A peer with no messages is left alone.  Returns the unread
+        counts after the mark.
         """
         with self._transaction():
             if peer is not None:
@@ -295,15 +338,16 @@ class Inbox:
                     entry
                     for entry in self._messages
                     if (entry.get("destination") or "") == destination
-                    and (up_to is None or entry["received_at"] <= up_to)
+                    and (up_to_seq is None or entry["seq"] <= up_to_seq)
                 ]
                 if not candidates:
                     continue
-                newest = max(
-                    candidates, key=lambda entry: entry["received_at"]
-                )
+                newest = max(candidates, key=lambda entry: entry["seq"])
+                current = self._read_cursors.get(destination)
+                if current is not None and current["last_read_seq"] >= newest["seq"]:
+                    continue
                 self._read_cursors[destination] = {
-                    "last_read_at": newest["received_at"],
+                    "last_read_seq": newest["seq"],
                     "last_read_id": newest.get("id"),
                 }
             self._save()

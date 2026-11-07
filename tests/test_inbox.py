@@ -185,10 +185,50 @@ def test_mark_read_advances_only_to_up_to(tmp_path):
 
     # A listing capped at the older two marks those read; the newest,
     # never shown, stays unread.
-    inbox.mark_read(up_to=2.0)
+    inbox.mark_read(up_to_seq=2)
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a3", "a2", "a1"]
     assert [entry["unread"] for entry in listed] == [True, False, False]
+
+
+def test_mark_read_never_moves_a_cursor_backward(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    # A delayed mark covering only the older message must not restore
+    # the newer one to unread.
+    inbox.mark_read(up_to_seq=1)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_clock_going_backward_does_not_hide_new_mail(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=100.0))
+    inbox.mark_read()
+
+    # Arrives later, but the wall clock says it is earlier.
+    inbox.append(_record(id="a2", received_at=50.0))
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_legacy_file_with_descending_timestamps_starts_read(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="first", received_at=9.0),
+                    _record(id="second", received_at=3.0),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inbox = Inbox(path)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
 
 
 def test_read_cursors_persist_across_instances(tmp_path):
