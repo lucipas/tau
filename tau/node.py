@@ -94,8 +94,6 @@ _PEER_SAVE_INTERVAL = 5.0
 _PATHFINDER_MAX_HOPS = 128
 _MAIL_INTERVAL = 45.0
 _MAIL_REQUEST_TIMEOUT = 6.0
-# Longest pause between targeted delivery retries in wait_for_delivery.
-_WAIT_RETRY_CAP = 5.0
 _EXCHANGE_TIMEOUT = 5.0
 # Background peer exchange: a few known peers per sweep, each asked at most
 # once per _EXCHANGE_INTERVAL, so quiet neighbours still share their peers.
@@ -725,14 +723,14 @@ class TauNode:
         ignores the entry's delivery backoff: the caller explicitly asked
         to wait for this message, so a backoff from an earlier failed
         attempt must not swallow the whole wait.  The flush shares the
-        same deadline, so no peer or request starts after it.  Retry
-        pauses grow up to a cap.  The wait never removes the entry
-        itself; a message still queued at the deadline is left for the
-        background mail loop.
+        same deadline, so no peer or request starts after it.  Retries
+        stay at `poll_interval`: growing the pause would let the last
+        attempt land long before the deadline, so a peer that becomes
+        reachable late in the wait would be missed.  The wait never
+        removes the entry itself; a message still queued at the deadline
+        is left for the background mail loop.
         """
         deadline = time.monotonic() + max(0.0, timeout)
-        pause = poll_interval
-        cap = max(poll_interval, _WAIT_RETRY_CAP)
         while True:
             if not self._still_queued(message_id):
                 return message_id in self._delivered_ids
@@ -751,8 +749,7 @@ class TauNode:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(min(pause, remaining))
-            pause = min(pause * 2, cap)
+            time.sleep(min(poll_interval, remaining))
 
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.

@@ -522,6 +522,28 @@ def test_wait_for_delivery_returns_when_flush_delivers(tmp_path, monkeypatch):
     assert calls[0]["deadline"] is not None
 
 
+def test_wait_for_delivery_keeps_retries_at_poll_interval(tmp_path, monkeypatch):
+    # Retries stay at poll_interval: growing the pause would let the
+    # last attempt land long before the deadline, so a peer that
+    # becomes reachable late in the wait would be missed.
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    stamps = []
+
+    def fake_flush(**kwargs):
+        stamps.append(time.monotonic())
+        return {"delivered": 0, "deposited": 0, "received": 0, "lock_busy": False}
+
+    monkeypatch.setattr(node, "flush_outbox", fake_flush)
+    assert (
+        node.wait_for_delivery(entry.id, timeout=0.5, poll_interval=0.05) is False
+    )
+    assert len(stamps) >= 8
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert gaps, "the wait must retry the flush more than once"
+    assert max(gaps) < 0.15
+
+
 def test_wait_for_delivery_rejects_unconfirmed_removal(tmp_path, monkeypatch):
     # The entry leaves the outbox without a delivery confirmation —
     # cancelled by another process, or delivered by one — and the wait
