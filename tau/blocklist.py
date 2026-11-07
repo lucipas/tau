@@ -45,8 +45,8 @@ class BlockListError(ValueError):
 
 
 def _clean_destinations(values: Any) -> FrozenSet[str]:
-    if values is None:
-        return frozenset()
+    # A present ``null`` is malformed, not an empty list: treating it as
+    # empty would switch enforcement off instead of failing closed.
     if not isinstance(values, (list, tuple, set, frozenset)):
         raise BlockListError("blocked must be a list of destination hashes")
     try:

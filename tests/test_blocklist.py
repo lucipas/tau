@@ -105,6 +105,13 @@ def test_from_dict_requires_blocked_field():
         BlockList.from_dict({})
 
 
+def test_from_dict_rejects_null_blocked():
+    # A present null is malformed, not an empty list: it must fail
+    # closed rather than switch enforcement off.
+    with pytest.raises(BlockListError):
+        BlockList.from_dict({"blocked": None})
+
+
 def test_corrupt_file_raises_and_fails_closed(tmp_path):
     path = tmp_path / "blocklist.json"
     path.write_text("{not json", encoding="utf-8")
@@ -165,10 +172,10 @@ def test_message_from_blocked_sender_is_dropped_silently(tmp_path):
     result = call_handler(
         node._handle_message, encode_message("hello", message_id="block-1"), sender
     )
-    assert result["ok"] is False
-    # No oracle: a generic delivery failure, never a blocked signal.
-    assert result["error"]["code"] == "unavailable"
-    assert "block" not in result["error"]["message"]
+    # No oracle: the reply is the same success shape a delivered
+    # message gets, never a blocked signal.
+    assert result["ok"] is True
+    assert result["duplicate"] is False
     assert received == []
     # Dropped messages are not marked seen: unblocking the sender and
     # retrying the same id delivers it as a fresh message.
