@@ -13,8 +13,14 @@ The bundle is just the existing wire formats in a container:
 * outbox entries are sealed fresh at export time, to the recipient's
   public key from the peer registry (an entry whose recipient key is
   unknown is skipped and reported, never exported in the clear);
-* Tan posts travel as a ``tan export`` document and are re-verified on
-  import by the normal ``import_entries`` path.
+* Tan posts travel as a ``tan export`` document (at most the 256 most
+  recent, so a long history cannot crowd the bundle past its size cap)
+  and are re-verified on import by the normal ``import_entries`` path —
+  after this node's admission rules have had their say: each verified
+  post's author passes the same ruleset decision the sync path uses,
+  so a post from a blocked author is reported as skipped and never
+  stored, while a post that fails verification is still reported with
+  its usual error.
 
 The manifest carries the exporter's identity hash and public key, and
 the exporter signs the canonical JSON of everything else in the bundle.

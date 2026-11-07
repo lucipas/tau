@@ -484,12 +484,14 @@ file. `tau bundle export FILE` writes a signed bundle containing the
 sealed envelopes this node is holding for other peers, plus its queued
 outbox messages sealed fresh to each recipient (an outbox message whose
 recipient's key is not in the peer registry is skipped and reported,
-never written in the clear). With `--tan` it also includes recent Tan
-posts from every stored author. `tau bundle import FILE` on another
+never written in the clear). With `--tan` it also includes the 256 most
+recent Tan posts from every stored author, so a long history cannot
+crowd the bundle past its size cap. `tau bundle import FILE` on another
 node verifies the exporter's signature, then merges the contents
 through the normal checks: sealed envelopes become held mail under the
-same caps and dedupe rules, and Tan posts go through the usual
-admission/verify path. A tampered bundle fails signature verification
+same caps and dedupe rules, and Tan posts first pass the importer's
+admission rules — a post from a blocked author is reported as skipped
+and never stored — then go through the usual verify path. A tampered bundle fails signature verification
 and nothing inside it is applied; bundles over the size cap (8 MiB by
 default, `--max-bytes N` on either command) are refused. The import
 reports what was accepted, already present and skipped. No identity or

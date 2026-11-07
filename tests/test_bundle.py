@@ -18,7 +18,8 @@ from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.mailbox import Mailbox, open_message, seal_message
 from tau.peers import PeerRegistry
-from tau.tangents.tan import create_post, get_post, init_db
+from tau.tangents.rules import Ruleset
+from tau.tangents.tan import create_post, export_entries, follow, get_post, init_db
 
 
 def _identities():
@@ -185,6 +186,146 @@ def test_bundle_without_tan_flag_carries_no_posts(tmp_path):
     assert document["tan"] is None
 
 
+def test_bundle_import_applies_tan_admission_rules(tmp_path):
+    alice, bob, _ = _identities()
+    alice_author = destination_hash(alice).hex()
+    bob_author = destination_hash(bob).hex()
+    sender_conn = init_db(tmp_path / "sender.sqlite3")
+    try:
+        alice_post = create_post(
+            sender_conn, alice, "admitted", name="alice", now=1000
+        )
+        bob_post = create_post(
+            sender_conn, bob, "blocked author", name="bob", now=1001
+        )
+    finally:
+        sender_conn.close()
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    tan_conn = init_db(tmp_path / "sender.sqlite3")
+    try:
+        document, _ = build_bundle(
+            identity=alice,
+            sender_name="alice",
+            mailbox=mailbox,
+            registry=PeerRegistry(),
+            tan_conn=tan_conn,
+            include_tan=True,
+            now=1000.0,
+        )
+    finally:
+        tan_conn.close()
+
+    parsed = parse_bundle(serialize_bundle(document))
+    receiver_box = Mailbox(tmp_path / "receiver.json")
+    receiver_conn = init_db(tmp_path / "receiver.sqlite3")
+    try:
+        # A refused author is reported as skipped and never stored.
+        deny_bob = Ruleset(block_authors=frozenset({bob_author}))
+        result = apply_bundle(
+            mailbox=receiver_box,
+            tan_conn=receiver_conn,
+            document=parsed,
+            admit=lambda author: deny_bob.decide(
+                author, own_author=alice_author
+            ),
+            now=1000.0,
+        )
+        assert result["tan"]["imported"] == 1
+        assert result["tan"]["skipped"] == 1
+        assert "denied by this node's Tan ruleset" in result["tan"]["errors"][0]["error"]
+        assert get_post(receiver_conn, alice_post["hash"]) is not None
+        assert get_post(receiver_conn, bob_post["hash"]) is None
+
+        # Under a default-deny ruleset the local author is still admitted.
+        deny_all = Ruleset(default_allow=False)
+        receiver_conn2 = init_db(tmp_path / "receiver2.sqlite3")
+        try:
+            result = apply_bundle(
+                mailbox=Mailbox(tmp_path / "receiver2.json"),
+                tan_conn=receiver_conn2,
+                document=parsed,
+                admit=lambda author: deny_all.decide(
+                    author, own_author=alice_author
+                ),
+                now=1000.0,
+            )
+        finally:
+            receiver_conn2.close()
+        assert result["tan"]["imported"] == 1
+        assert result["tan"]["skipped"] == 1
+    finally:
+        receiver_conn.close()
+
+
+def test_bundle_import_admit_uses_ruleset_and_follow_list(tmp_path):
+    """The CLI's admission check: followed authors pass a deny default."""
+    from tau.cli import _bundle_tan_admit
+
+    alice, bob, carol = _identities()
+    alice_author = destination_hash(alice).hex()
+    bob_author = destination_hash(bob).hex()
+    carol_author = destination_hash(carol).hex()
+
+    node_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=node_dir)
+    config.tan_rules_path.parent.mkdir(parents=True, exist_ok=True)
+    config.tan_rules_path.write_text(
+        '{"default": "deny", "allow_followed": true}', encoding="utf-8"
+    )
+    receiver_conn = init_db(tmp_path / "receiver.sqlite3")
+    try:
+        follow(receiver_conn, bob_author)
+        admit = _bundle_tan_admit(config, alice, receiver_conn)
+    finally:
+        receiver_conn.close()
+    assert admit(alice_author) is True  # own author always admitted
+    assert admit(bob_author) is True  # followed author admitted
+    assert admit(carol_author) is False  # stranger denied
+
+
+def test_bundle_export_caps_tan_posts(tmp_path):
+    sender, _, _ = _identities()
+    sender_conn = init_db(tmp_path / "sender.sqlite3")
+    try:
+        oldest = create_post(
+            sender_conn, sender, "oldest post", name="alice", now=1000
+        )
+        middle = create_post(
+            sender_conn, sender, "middle post", name="alice", now=1001
+        )
+        newest = create_post(
+            sender_conn, sender, "newest post", name="alice", now=1002
+        )
+        # The export limit keeps the most recent entries; the oldest
+        # post is left out (chain order within the kept set is kept).
+        limited = export_entries(sender_conn, all_authors=True, limit=2)
+    finally:
+        sender_conn.close()
+    assert {e["hash"] for e in limited["entries"]} == {
+        middle["hash"],
+        newest["hash"],
+    }
+    assert oldest["hash"] not in {e["hash"] for e in limited["entries"]}
+
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    tan_conn = init_db(tmp_path / "sender.sqlite3")
+    try:
+        document, summary = build_bundle(
+            identity=sender,
+            sender_name="alice",
+            mailbox=mailbox,
+            registry=PeerRegistry(),
+            tan_conn=tan_conn,
+            include_tan=True,
+            now=1000.0,
+        )
+    finally:
+        tan_conn.close()
+    # Three posts is far under the 256-post bundle cap: all travel.
+    assert summary["tan"] == 3
+    assert len(document["tan"]["entries"]) == 3
+
+
 # -- skipping --------------------------------------------------------------
 
 
@@ -238,6 +379,37 @@ def test_bundle_apply_skips_malformed_entries(tmp_path):
     assert result["imported"] == 2
     assert result["skipped"] == 2
     assert len(result["errors"]) == 2
+
+
+def test_bundle_apply_validates_mail_entries_like_the_network_path(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build(tmp_path, sender, recipient)
+    good_blob = document["mail"][0]["blob"]
+    to_hex = destination_hash(recipient).hex()
+    document["mail"].extend(
+        [
+            # Over the 64-character id limit the fetch protocol enforces.
+            {"id": "x" * 65, "to": to_hex, "blob": good_blob,
+             "expires_at": 9999999.0},
+            # An empty envelope the recipient could never open.
+            {"id": "empty-blob", "to": to_hex, "blob": "",
+             "expires_at": 9999999.0},
+            # An expiry too large for a float, and a non-finite one.
+            {"id": "huge-expiry", "to": to_hex, "blob": good_blob,
+             "expires_at": 10**400},
+            {"id": "inf-expiry", "to": to_hex, "blob": good_blob,
+             "expires_at": float("inf")},
+            {"id": "bool-expiry", "to": to_hex, "blob": good_blob,
+             "expires_at": True},
+        ]
+    )
+    receiver_box = Mailbox(tmp_path / "receiver.json")
+    result = apply_bundle(
+        mailbox=receiver_box, tan_conn=None, document=document, now=1000.0
+    )
+    assert result["imported"] == 2
+    assert result["skipped"] == 5
+    assert len(result["errors"]) == 5
 
 
 def test_bundle_apply_without_tan_store_skips_posts(tmp_path):
@@ -375,3 +547,23 @@ def test_cli_export_missing_identity_errors(tmp_path):
     code = main(["bundle", "export", str(bundle_file), "--data-dir", str(data_dir)])
     assert code == 1
     assert not bundle_file.exists()
+
+
+def test_cli_export_preserves_target_directory_permissions(tmp_path):
+    import os
+    import stat
+
+    sender_dir = tmp_path / "sender"
+    assert main(["init", "--data-dir", str(sender_dir), "--json"]) == 0
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    bundle_file = shared / "bundle.json"
+    assert (
+        main(
+            ["bundle", "export", str(bundle_file), "--data-dir", str(sender_dir)]
+        )
+        == 0
+    )
+    assert bundle_file.exists()
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755

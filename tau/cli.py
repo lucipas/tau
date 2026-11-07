@@ -1757,7 +1757,9 @@ def cmd_bundle_export(args: argparse.Namespace) -> int:
     finally:
         if tan_conn is not None:
             tan_conn.close()
-    atomic_write_bytes(args.file, serialize_bundle(document))
+    atomic_write_bytes(
+        args.file, serialize_bundle(document), restrict_parent=False
+    )
     if _json_mode(args):
         _emit(summary, True)
     else:
