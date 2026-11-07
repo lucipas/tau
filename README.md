@@ -248,6 +248,8 @@ Global options may appear before or after the command:
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
+| `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
@@ -304,6 +306,15 @@ echo "piped message" | tau send --to alice
 
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
+
+# Send a small file (at most 10 MiB) over a direct link. The receiver
+# first gets a signed offer (name, size, SHA-256) and may refuse it;
+# files are never queued and never stored-and-forwarded. A node only
+# accepts files when its owner opted in — or when the sender is on
+# its DM allow-list — and received files land in
+# <data-dir>/files/<sender>/, verified against the offered hash.
+tau config accept-files on
+tau send-file --to alice photo.png
 
 # See what is waiting on offline peers
 tau outbox
@@ -645,8 +656,12 @@ unlinked, and stall sync at the gap.
 - Peer information is self-asserted and can be stale; prune with
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
-- Natural extensions: group destinations, file transfer using Reticulum
-  resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
+- File transfer is direct links only: a file goes over an RNS Resource
+  after a signed offer, at most 10 MiB, and only to a node that opted
+  in (or allow-listed the sender). There is no store-and-forward for
+  files yet — the recipient must be online — and no resume: a failed
+  transfer restarts from the beginning.
+- Natural extensions: group destinations, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
   (media, moderation, follow recommendations).
 - LXMF addressing is in place: every peer's LXMF delivery address is
