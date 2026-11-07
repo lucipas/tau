@@ -43,7 +43,7 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import MAX_MAIL_TTL, PROTOCOL_VERSION, ProtocolError, short_hash
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -289,6 +289,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
+    )
+    send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
     send.set_defaults(func=cmd_send)
 
@@ -891,6 +897,38 @@ def _ago(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}h"
     return f"{seconds // 86400}d"
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _parse_duration(value: str) -> float:
+    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+
+    A bare number means seconds.  Returns the duration in seconds;
+    raises ``ValueError`` for anything unparseable, non-positive, or
+    longer than the mail TTL (a disappearing message cannot outlive
+    the store-and-forward envelope that might carry it).
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+    unit = 1.0
+    if text[-1] in _DURATION_UNITS:
+        unit = float(_DURATION_UNITS[text[-1]])
+        text = text[:-1]
+    try:
+        amount = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+        ) from exc
+    seconds = amount * unit
+    if not seconds > 0:
+        raise ValueError("--expire duration must be positive")
+    if seconds > MAX_MAIL_TTL:
+        raise ValueError("--expire duration must be at most 30d")
+    return seconds
 
 
 def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> None:
@@ -2112,6 +2150,10 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        expires_at = time.time() + _parse_duration(expire_text)
     node = TauNode(config, name=config.name)
     node.start()
     try:
@@ -2121,6 +2163,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            expires_at=expires_at,
         )
         if response.get("queued"):
             # One-shot send: give reachable peers a brief chance to take a
@@ -2132,19 +2175,26 @@ def cmd_send(args: argparse.Namespace) -> int:
                     "delivered": True,
                     "id": response["id"],
                     "to": response["to"],
+                    "expires_at": expires_at,
                 }
     finally:
         node.stop()
 
     if _json_mode(args):
+        if expires_at is not None:
+            response = dict(response, expires_at=expires_at)
         _emit(response, True)
     elif response.get("queued"):
         print(f"queued for {args.to} — they are unreachable right now")
         print(f"  id:      {response['id']}")
         print("  it will be delivered automatically when they are heard from;")
         print("  check `tau outbox` for the queue, or just leave a node serving")
+        if expires_at is not None:
+            print(f"  disappears in {_ago(expires_at - time.time())}")
     elif response.get("delivered"):
         print(f"delivered to {args.to}")
+        if expires_at is not None:
+            print(f"  disappears in {_ago(expires_at - time.time())}")
     else:
         print(f"delivered to {args.to}")
         echo = response.get("echo")
@@ -2153,6 +2203,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         rtt = response.get("_rtt")
         if isinstance(rtt, (int, float)):
             print(f"round trip: {rtt * 1000:.0f} ms")
+        if expires_at is not None:
+            print(f"  disappears in {_ago(expires_at - time.time())}")
     return _EXIT_OK
 
 
@@ -2300,6 +2352,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
         print(f"[{when}] {name} ({sender})")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        expires_at = entry.get("expires_at")
+        if isinstance(expires_at, (int, float)) and float(expires_at) > time.time():
+            print(f"  disappears in {_ago(float(expires_at) - time.time())}")
     return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.

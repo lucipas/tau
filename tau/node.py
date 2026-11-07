@@ -836,6 +836,7 @@ class TauNode:
                 "sent_at": message["sent_at"],
                 "received_at": received_at,
                 "id": message_id,
+                "expires_at": message.get("expires_at"),
             }
             log.info(
                 "Message from %s (%s): %s",
@@ -1199,6 +1200,7 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                expires_at=entry.message_expires_at,
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1320,6 +1322,7 @@ class TauNode:
             "received_at": time.time(),
             "id": message["id"],
             "relayed": True,
+            "expires_at": message.get("expires_at"),
         }
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
@@ -1460,6 +1463,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -1468,10 +1472,19 @@ class TauNode:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds):
+        it travels in the message payload and inside sealed relay
+        envelopes, the receiver purges the message once it passes, and
+        a queued copy expires at the same deadline.  Expiry is
+        cooperative — a modified client can keep copies — so this is
+        hygiene, not a guarantee.
         """
         normalized = normalize_message(text)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        payload = encode_message(
+            normalized, message_id=message_id, expires_at=expires_at
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1500,6 +1513,7 @@ class TauNode:
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
+                expires_at=expires_at,
             )
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",

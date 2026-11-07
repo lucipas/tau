@@ -6,7 +6,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
-    POST /api/messages     send ``{"to": "...", "text": "..."}``
+    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional
+                           ``"expires_in"`` seconds for a disappearing message)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
@@ -31,6 +32,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import mimetypes
 import queue
 import socket
@@ -50,6 +52,7 @@ from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
+    MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
     normalize_message,
@@ -293,6 +296,17 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "status": status,
     }
+    expires_at = entry.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return None
+        try:
+            expires_at = float(expires_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(expires_at):
+            return None
+        message["expires_at"] = expires_at
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
@@ -446,6 +460,18 @@ class WebBridge:
             if message is not None:
                 loaded.append(message)
         loaded = loaded[-MAX_MESSAGE_LOG:]
+        # Disappearing messages whose deadline passed are gone for good:
+        # drop them here (and persist the purge below) so a restarted
+        # console never resurrects them.
+        now = time.time()
+        kept = [
+            message
+            for message in loaded
+            if message.get("expires_at") is None
+            or float(message["expires_at"]) > now
+        ]
+        purged = len(loaded) - len(kept)
+        loaded = kept
         self._messages.extend(loaded)
         saved_next = raw.get("next_message_id")
         max_id = max((message["id"] for message in loaded), default=0)
@@ -453,6 +479,8 @@ class WebBridge:
             self._next_message_id = max(saved_next, max_id + 1, 1)
         else:
             self._next_message_id = max(max_id + 1, 1)
+        if purged:
+            self._save_messages()
 
     def _save_messages(self) -> None:
         """Persist the current message log to ``messages.json``.
@@ -503,6 +531,9 @@ class WebBridge:
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        expires_at = record.get("expires_at")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+            expires_at = None
         message = self._append_message(
             direction="in",
             peer=peer_hash or None,
@@ -511,6 +542,7 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            expires_at=float(expires_at) if expires_at is not None else None,
         )
         self.bus.publish({"type": "message", "message": message})
         return message
@@ -726,6 +758,7 @@ class WebBridge:
         text: str,
         *,
         timeout: float = 20.0,
+        expires_at: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -733,6 +766,12 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                raise ValueError("expires_at must be a number")
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite number")
         # Normalise up front so the recorded text is exactly what gets sent
         # (and is always UTF-8 encodable for the history file): the node
         # normalises again before sending, so this cannot change delivery.
@@ -746,7 +785,9 @@ class WebBridge:
         # delivery report behind this send. Instead, record_delivery
         # buffers a report that beats the record, and the append below
         # reconciles it.
-        response = self.node.send_message(peer, text, timeout=timeout)
+        response = self.node.send_message(
+            peer, text, timeout=timeout, expires_at=expires_at
+        )
         queued = bool(response.get("queued"))
         # The outbox id links this record to a later delivery; only
         # present while the message is queued.
@@ -763,6 +804,7 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
+                expires_at=expires_at,
             )
             if mail_id is not None:
                 with self._lock:
@@ -890,6 +932,7 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -906,6 +949,8 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if expires_at is not None:
+                message["expires_at"] = expires_at
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1193,6 +1238,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         target = body.get("to")
         text = body.get("text")
         timeout = body.get("timeout", 20.0)
+        expires_in = body.get("expires_in")
         if not isinstance(target, str) or not target.strip():
             self._send_json(
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
@@ -1206,8 +1252,31 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        expires_at = None
+        if expires_in is not None:
+            if (
+                not isinstance(expires_in, (int, float))
+                or isinstance(expires_in, bool)
+                or not math.isfinite(float(expires_in))
+                or float(expires_in) <= 0
+                or float(expires_in) > MAX_MAIL_TTL
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'expires_in' must be a number of "
+                            "seconds between 0 and 30 days"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            expires_at = time.time() + float(expires_in)
         try:
-            message, response = self.bridge.send_message(target, text, timeout=timeout)
+            message, response = self.bridge.send_message(
+                target, text, timeout=timeout, expires_at=expires_at
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return

@@ -60,6 +60,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
+    expires_at = raw.get("expires_at")
+    if expires_at is not None:
+        try:
+            expires_at = float(expires_at)
+        except (TypeError, ValueError):
+            expires_at = None
+        if expires_at is not None and not math.isfinite(expires_at):
+            expires_at = None
     return {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
@@ -68,6 +76,7 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
+        "expires_at": expires_at,
     }
 
 
@@ -99,7 +108,20 @@ class Inbox:
             record = _valid_record(entry)
             if record is not None:
                 loaded.append(record)
-        self._messages = loaded[-MAX_INBOX:]
+        now = time.time()
+        kept = [
+            record
+            for record in loaded
+            if record.get("expires_at") is None or record["expires_at"] > now
+        ]
+        purged = len(loaded) - len(kept)
+        self._messages = kept[-MAX_INBOX:]
+        if purged:
+            # Disappearing messages whose deadline passed are gone for
+            # good: persist the purge so a later load does not resurrect
+            # them, and so `tau messages` never shows an expired entry.
+            log.info("Purged %d expired message(s) from the inbox", purged)
+            self._save()
 
     def _save(self) -> None:
         if self.path is None:
