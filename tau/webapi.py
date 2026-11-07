@@ -361,6 +361,11 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Unread counts are stamped with an ever-increasing revision so
+        # the console can drop a queued or delayed count older than one
+        # it already applied.
+        self._unread_lock = threading.Lock()
+        self._unread_revision = 0
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -865,6 +870,11 @@ class WebBridge:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
 
+    def _stamp_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the next revision to *counts* (caller holds ``_unread_lock``)."""
+        self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
+        return dict(counts, revision=self._unread_revision)
+
     def unread(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the node inbox.
 
@@ -872,13 +882,14 @@ class WebBridge:
         unread; read state is local to this node either way.
         """
         inbox = getattr(self.node, "inbox", None)
-        if inbox is None:
-            return {"per_peer": {}, "total": 0}
-        try:
-            return inbox.unread_counts()
-        except Exception:  # pragma: no cover - defensive
-            log.debug("Could not read inbox unread counts", exc_info=True)
-            return {"per_peer": {}, "total": 0}
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                try:
+                    counts = inbox.unread_counts()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not read inbox unread counts", exc_info=True)
+            return self._stamp_unread(counts)
 
     def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
         """Advance the inbox read cursor for one conversation, or all.
@@ -888,11 +899,14 @@ class WebBridge:
         event.  Read state never leaves this node.
         """
         inbox = getattr(self.node, "inbox", None)
-        if inbox is None:
-            return {"per_peer": {}, "total": 0}
-        counts = inbox.mark_read(peer=peer)
-        self.bus.publish({"type": "unread", "unread": counts})
-        return counts
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                counts = inbox.mark_read(peer=peer)
+            stamped = self._stamp_unread(counts)
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
 
     def snapshot(self) -> Dict[str, Any]:
         return {

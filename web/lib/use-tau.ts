@@ -55,6 +55,20 @@ export function useTau() {
   const [pings, setPings] = useState<Record<string, PingState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
+  const unreadRevision = useRef(-1);
+
+  // Unread counts can arrive out of order: an SSE event queued before a
+  // snapshot, or an HTTP response delayed past a newer event. Only a
+  // count at least as new as the last one applied may replace state.
+  const applyUnread = useCallback(
+    (counts: UnreadCounts, reset = false) => {
+      const revision = counts.revision ?? 0;
+      if (!reset && revision < unreadRevision.current) return;
+      unreadRevision.current = revision;
+      setUnread(counts);
+    },
+    [],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -124,7 +138,7 @@ export function useTau() {
     const onUnread = (event: Event) => {
       const payload = readEventData<{ unread: UnreadCounts }>(event);
       if (!payload?.unread) return;
-      setUnread(payload.unread);
+      applyUnread(payload.unread);
     };
 
     const onError = () => {
@@ -150,7 +164,7 @@ export function useTau() {
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, []);
+  }, [applyUnread]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -276,9 +290,9 @@ export function useTau() {
       "/api/messages/read",
       peer ? { peer } : {},
     );
-    setUnread(result.unread);
+    applyUnread(result.unread);
     return result.unread;
-  }, []);
+  }, [applyUnread]);
 
   return {
     node,

@@ -52,6 +52,9 @@ export interface Counts {
 export interface UnreadCounts {
   per_peer: Record<string, number>;
   total: number;
+  // Stamped by the node; a count with an older revision than one
+  // already applied is stale and is ignored.
+  revision?: number;
 }
 
 export interface MarkReadResponse {

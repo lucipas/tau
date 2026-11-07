@@ -185,15 +185,26 @@ def _inbound_record(node, **overrides):
     return record
 
 
+def _counts(unread):
+    """Unread counts without the revision stamp, for shape checks."""
+    return {key: value for key, value in unread.items() if key != "revision"}
+
+
 def test_snapshot_carries_unread_counts(bridge, node):
     _, _, payload = _json(bridge, "/api/status")
-    assert payload["unread"] == {"per_peer": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
 
     _inbound_record(node)
     _inbound_record(node, id="m-2", received_at=102.0)
 
     _, _, payload = _json(bridge, "/api/status")
-    assert payload["unread"] == {"per_peer": {PEER_HASH: 2}, "total": 2}
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "total": 2}
+
+
+def test_unread_revisions_only_increase(bridge, node):
+    first = bridge.unread()["revision"]
+    second = bridge.unread()["revision"]
+    assert second > first
 
 
 def test_inbound_message_event_carries_unread_total(bridge, node):
@@ -202,7 +213,7 @@ def test_inbound_message_event_carries_unread_total(bridge, node):
 
     events = bridge.bus.replay(0)
     message_events = [event for event in events if event["type"] == "message"]
-    assert message_events[-1]["unread"] == {
+    assert _counts(message_events[-1]["unread"]) == {
         "per_peer": {PEER_HASH: 1},
         "total": 1,
     }
@@ -222,12 +233,12 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
     )
     assert status == 200
     assert payload["ok"] is True
-    assert payload["unread"] == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
 
     # Other tabs learn from the published unread event.
     events = bridge.bus.replay(0)
     unread_events = [event for event in events if event["type"] == "unread"]
-    assert unread_events[-1]["unread"] == {
+    assert _counts(unread_events[-1]["unread"]) == {
         "per_peer": {OTHER_HASH: 1},
         "total": 1,
     }
@@ -237,7 +248,7 @@ def test_mark_read_endpoint_clears_a_conversation(bridge, node):
         bridge, "/api/messages/read", method="POST", body={}
     )
     assert status == 200
-    assert payload["unread"] == {"per_peer": {}, "total": 0}
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
 
 
 def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
