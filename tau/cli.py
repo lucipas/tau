@@ -31,7 +31,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
-from .inbox import Inbox
+from .inbox import Inbox, InboxError
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
 from .node import (
@@ -501,6 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N messages (default 30)",
     )
     messages.set_defaults(func=cmd_messages)
+
+    messages_sub = messages.add_subparsers(metavar="COMMAND")
+    messages_delete = messages_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete one stored direct message from the local inbox",
+    )
+    messages_delete.add_argument(
+        "target", metavar="ID", help="message id or unique id prefix"
+    )
+    messages_delete.set_defaults(func=cmd_messages_delete)
 
     tan = subparsers.add_parser(
         "tan",
@@ -2297,9 +2308,36 @@ def cmd_messages(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+        header = f"[{when}] {name} ({sender})"
+        if entry.get("id"):
+            header += f" [{_safe_id_prefix(str(entry.get('id')))}]"
+        print(header)
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+    return _EXIT_OK
+
+
+def cmd_messages_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        removed = inbox.delete(args.target)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    peer = registry.get(removed.get("destination") or "")
+    name = peer.display_name if peer is not None else removed.get("from") or "unknown"
+    if _json_mode(args):
+        _emit({"deleted": removed}, True)
+    else:
+        short = _safe_id_prefix(str(removed.get("id") or ""))
+        when = _format_message_time(float(removed.get("received_at", 0)))
+        print(f"deleted [{short}] from {name} ({when})")
+        print(
+            "note: only this node's copy was deleted; the sender keeps"
+            " theirs, and sealed copies already held by relays are"
+            " unaffected."
+        )
     return _EXIT_OK
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.

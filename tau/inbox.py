@@ -32,6 +32,10 @@ INBOX_FILE_NAME = "inbox.json"
 MAX_INBOX = 500
 
 
+class InboxError(ValueError):
+    """Raised when an inbox lookup or delete fails."""
+
+
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored record, or ``None`` when it is unusable.
 
@@ -146,6 +150,46 @@ class Inbox:
             self._messages = self._messages[-MAX_INBOX:]
             self._save()
         return entry
+
+    def delete(self, ref: str) -> Dict[str, Any]:
+        """Remove one stored message by full id or unique prefix.
+
+        Same convention as :meth:`Mailbox.resolve_outbox`: a full
+        32-character id matches exactly, a shorter prefix must match
+        exactly one stored message.  The removal runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this delete runs.  Only this
+        node's copy is removed — the sender keeps theirs, and sealed
+        copies already held by relays are unaffected.  Records with no
+        id (older stores predate ids) cannot be addressed this way.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise InboxError("message reference must not be empty")
+        value = ref.strip().lower()
+        with self._transaction():
+            entries = list(self._messages)
+            if len(value) == 32:
+                matches = [
+                    entry
+                    for entry in entries
+                    if str(entry.get("id") or "").lower() == value
+                ]
+            else:
+                matches = [
+                    entry
+                    for entry in entries
+                    if str(entry.get("id") or "").lower().startswith(value)
+                ]
+            if not matches:
+                raise InboxError(f"unknown message: {ref!r}")
+            if len(matches) > 1:
+                raise InboxError(
+                    f"{len(matches)} messages match prefix {ref!r}"
+                )
+            removed = matches[0]
+            self._messages = [entry for entry in entries if entry is not removed]
+            self._save()
+        return dict(removed)
 
     def list_messages(
         self, *, limit: Optional[int] = None, peer: Optional[str] = None

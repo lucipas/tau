@@ -639,6 +639,65 @@ def test_messages_out_of_range_timestamp(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "from the far future" in out
     assert "unknown time" in out
+
+
+def test_parser_messages_delete_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "delete", "abcd1234"])
+    assert args.command == "messages"
+    assert args.target == "abcd1234"
+    assert args.func is cli.cmd_messages_delete
+
+    # Plain `tau messages` still lists.
+    args = parser.parse_args(["messages"])
+    assert args.func is cli.cmd_messages
+
+
+def test_messages_list_shows_short_id(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[m-2]" in out
+    assert "[m-1]" in out
+
+
+def test_messages_delete_by_id(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "delete", "m-2", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "deleted [m-2] from alice" in out
+    assert "only this node's copy was deleted" in out
+
+    # The deletion persists and the other message survives.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-1"]
+
+
+def test_messages_delete_json_and_errors(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    # Ambiguous prefix: both seeded ids start with "m-".
+    code = cli.main(["messages", "delete", "m-", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "2 messages match prefix" in capsys.readouterr().err
+
+    # Unknown id.
+    code = cli.main(["messages", "delete", "nope", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown message" in capsys.readouterr().err
+
+    code = cli.main(
+        ["messages", "delete", "m-1", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["deleted"]["id"] == "m-1"
+    assert payload["deleted"]["text"] == "first hello"
 # -- outbox held / drop-held ---------------------------------------------------
 
 

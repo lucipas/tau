@@ -252,6 +252,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -311,6 +312,9 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# Delete one stored message from the local inbox (sender keeps theirs)
+tau messages delete ab12cd34
 
 # Only show peers heard from in the last day
 tau peers --max-age 1
