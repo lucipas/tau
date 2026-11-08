@@ -1457,6 +1457,7 @@ def export_entries(
     *,
     author: Optional[str] = None,
     all_authors: bool = False,
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Return a portable backup of stored chain entries.
 
@@ -1467,6 +1468,9 @@ def export_entries(
     any entries whose parent is missing from this store (sequence 0)
     by creation time.  An entry whose parent is missing stays unlinked
     on import until that parent arrives, exactly as sync behaves.
+
+    With *limit* and ``all_authors``, only the *limit* most recent
+    entries across all authors are exported (the rest are left out).
     """
     columns = ", ".join(f"posts.{column}" for column in _POST_COLUMNS)
     order = (
@@ -1474,10 +1478,21 @@ def export_entries(
         "posts.created_at ASC, posts.hash ASC"
     )
     if all_authors:
+        source = "posts"
+        params: Tuple[Any, ...] = ()
+        if limit is not None:
+            if limit <= 0:
+                raise TanError("export limit must be positive")
+            source = (
+                "(SELECT * FROM posts ORDER BY created_at DESC, hash DESC LIMIT ?)"
+                " AS posts"
+            )
+            params = (int(limit),)
         rows = conn.execute(
-            f"SELECT {columns} FROM posts LEFT JOIN heads "
+            f"SELECT {columns} FROM {source} LEFT JOIN heads "
             "ON heads.author = posts.author AND heads.hash = posts.hash "
-            f"ORDER BY posts.author ASC, {order}"
+            f"ORDER BY posts.author ASC, {order}",
+            params,
         ).fetchall()
     else:
         if author is None:
