@@ -11,7 +11,7 @@ import pytest
 import RNS
 
 from tau import cli
-from tau.config import TauConfig
+from tau.config import TauConfig, write_node_metadata
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
 from tau.lxmf import lxmf_delivery_hash
@@ -483,6 +483,53 @@ def test_id_rename_refuses_while_serving(tmp_path, capsys):
     assert code == 1
     assert "already serving" in capsys.readouterr().err
     assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_refresh_served_name_picks_up_rename(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "bob")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="alice", announce=lambda: announced.append(True))
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=False)
+    assert node.name == "bob"
+    assert announced == [True]
+
+
+def test_refresh_served_name_sanitises_hand_edited_name(tmp_path):
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "node.json").write_text(
+        json.dumps({"name": "  bob\x01  ", "protocol": "tau"}), encoding="utf-8"
+    )
+    config = TauConfig.resolve(data_dir=node_dir)
+    node = SimpleNamespace(name="alice", announce=lambda: None)
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=True)
+    assert node.name == "bob"
+
+
+def test_refresh_served_name_respects_name_override(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "bob")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="carol", announce=lambda: announced.append(True))
+    cli._refresh_served_name(
+        config, node, SimpleNamespace(name="carol"), no_announce=False
+    )
+    assert node.name == "carol"
+    assert announced == []
+
+
+def test_refresh_served_name_noop_without_change(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "alice")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="alice", announce=lambda: announced.append(True))
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=False)
+    assert node.name == "alice"
+    assert announced == []
 
 
 def test_peers_on_empty_registry(tmp_path, capsys):
