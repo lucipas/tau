@@ -203,6 +203,29 @@ def test_verify_store_counts_unlinked_entries_without_failing(
     assert report["problems"] == []
 
 
+def test_verify_store_accepts_an_unlinked_entry_with_an_unlinked_parent(
+    identities, tmp_path
+):
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+    third = create_post(source, alice, "third", name="alice", now=1002)
+
+    conn = init_db(tmp_path / "tan.sqlite3")
+    store_post(conn, second)
+    store_post(conn, third)
+
+    # Both entries are waiting on the missing first post: the third
+    # entry's parent is stored but unlinked, which is normal partial
+    # sync — only a *linked* parent left un-promoted is an inconsistency.
+    report = verify_store(conn)
+    assert report["ok"] is True
+    assert report["entries"] == 2
+    assert report["unlinked"] == 2
+    assert report["problems"] == []
+
+
 def test_verify_store_reports_tampered_text(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
