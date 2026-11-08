@@ -151,6 +151,7 @@ export interface TanTimelineResponse {
 export interface TanSavedResponse {
   posts: TanPost[];
   count: number;
+  next_offset: number | null;
 }
 
 export interface TanFollowingResponse {

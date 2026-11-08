@@ -55,7 +55,7 @@ describe("useTan saved posts", () => {
     const saved = makePost({ hash: "e".repeat(64), text: "keep me" });
     mockedGet.mockImplementation((path: string) => {
       if (path.startsWith("/api/tan/saved")) {
-        return Promise.resolve({ posts: [saved], count: 1 });
+        return Promise.resolve({ posts: [saved], count: 1, next_offset: null });
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
@@ -100,8 +100,8 @@ describe("useTan saved posts", () => {
     const secondPage = [makePost({ hash: "f".repeat(64), text: "older" })];
     mockedGet.mockImplementation((path: string) => {
       if (path.startsWith("/api/tan/saved")) {
-        // A full page means there may be more: the first page is full,
-        // the second holds the one remaining save.
+        // A non-null next_offset means there may be more: the first
+        // page is full, the second holds the one remaining save.
         const page = path.endsWith("offset=0")
           ? Array.from({ length: 100 }, (_, index) =>
               makePost({
@@ -110,7 +110,11 @@ describe("useTan saved posts", () => {
               }),
             )
           : secondPage;
-        return Promise.resolve({ posts: page, count: page.length });
+        return Promise.resolve({
+          posts: page,
+          count: page.length,
+          next_offset: path.endsWith("offset=0") ? 100 : null,
+        });
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [], count: 0 })
@@ -145,7 +149,7 @@ describe("useTan saved posts", () => {
     mockedGet.mockImplementation((path: string) => {
       if (path.startsWith("/api/tan/saved")) {
         savedCalls += 1;
-        return Promise.resolve({ posts: [saved], count: 1 });
+        return Promise.resolve({ posts: [saved], count: 1, next_offset: null });
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })

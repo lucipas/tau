@@ -473,13 +473,17 @@ def test_tan_saved_via_api(tmp_path):
         assert all("saved_at" in item for item in payload["posts"])
 
         # The list pages through older saves instead of stopping at the
-        # first page.
+        # first page. The resume offset comes from the response: it
+        # counts raw rows, so filtering never shifts it.
         status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
         assert [item["text"] for item in payload["posts"]] == ["save me too"]
+        assert payload["next_offset"] == 1
         status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=1")
         assert [item["text"] for item in payload["posts"]] == ["save me"]
+        assert payload["next_offset"] is None
         status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
         assert payload["posts"] == []
+        assert payload["next_offset"] is None
 
         # Unsaving removes it from the list; unsaving again is a no-op.
         status, _, payload = _json(
@@ -590,6 +594,15 @@ def test_tan_saved_annotations_and_muting(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
         timeline_by_text = {item["text"]: item for item in payload["posts"]}
         assert timeline_by_text["worth sharing"]["quoted"] is None
+        # Paging fills past the muted rows: the first page still holds
+        # one visible post, and the resume offset skips the muted row
+        # instead of re-fetching it.
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["next_offset"] == 2
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["next_offset"] is None
         conn = init_db(node.config.social_db_path)
         try:
             assert unmute(conn, original["author"]) is True

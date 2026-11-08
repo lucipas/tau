@@ -734,10 +734,12 @@ class WebBridge:
         finally:
             conn.close()
 
-    def tan_saved(self, *, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
+    def tan_saved(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import annotated_saved_posts, apply_display_rules
+        from .tangents.tan import annotated_saved_posts
 
         conn = self._tan_conn()
         try:
@@ -749,9 +751,6 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            posts = annotated_saved_posts(
-                conn, limit=limit, offset=offset, viewer=viewer
-            )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -761,7 +760,10 @@ class WebBridge:
                     )
                 except RulesError:
                     ruleset = Ruleset()
-            return apply_display_rules(posts, ruleset)
+            posts, next_offset = annotated_saved_posts(
+                conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
+            )
+            return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
 
@@ -1117,7 +1119,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     query, "offset", default=0, minimum=0, maximum=100000
                 )
                 try:
-                    posts = self.bridge.tan_saved(limit=limit, offset=offset)
+                    result = self.bridge.tan_saved(limit=limit, offset=offset)
                 except ValueError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
@@ -1129,7 +1131,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         500,
                     )
                     return
-                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
+                    head_only,
+                )
                 return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)

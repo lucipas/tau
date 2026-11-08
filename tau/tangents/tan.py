@@ -2431,7 +2431,8 @@ def annotated_saved_posts(
     limit: int = DEFAULT_FEED_LIMIT,
     offset: int = 0,
     viewer: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    ruleset: Optional[Ruleset] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     """Saved posts with the timeline's annotations and muting applied.
 
     Reaction counts, reply parents, quote counts and quoted originals
@@ -2442,28 +2443,49 @@ def annotated_saved_posts(
     muting is display-only, so the saves stay stored and unmuting
     restores them.  Each returned post carries ``saved`` and
     ``saved_at``.
+
+    Returns ``(posts, next_offset)``: up to *limit* visible posts
+    starting at raw offset *offset*, and the raw offset to resume
+    paging from, or ``None`` when the saved list is exhausted.  Muted
+    entries and entries hidden by *ruleset* never shrink a page: raw
+    rows are read until *limit* visible posts are collected or the
+    list is exhausted, so a caller must page with the returned
+    ``next_offset``, not with the number of posts it received.
     """
     silenced = muted_author_set(conn)
     keywords = _muted_keyword_list(conn)
-    posts = saved_posts(conn, limit=limit, offset=offset)
-    posts = annotate_quotes(
-        conn,
-        annotate_quote_counts(
+    kept: List[Dict[str, Any]] = []
+    raw_offset = max(0, int(offset))
+    while len(kept) < limit:
+        batch = saved_posts(conn, limit=limit - len(kept), offset=raw_offset)
+        if not batch:
+            break
+        raw_offset += len(batch)
+        batch = annotate_quotes(
             conn,
-            annotate_replies(
+            annotate_quote_counts(
                 conn,
-                annotate_reactions(conn, posts, viewer=viewer),
-                muted_keywords=keywords,
-                exclude_authors=silenced,
+                annotate_replies(
+                    conn,
+                    annotate_reactions(conn, batch, viewer=viewer),
+                    muted_keywords=keywords,
+                    exclude_authors=silenced,
+                ),
             ),
-        ),
-        muted_keywords=keywords,
-        exclude_authors=silenced,
-    )
-    for post in posts:
-        post["saved"] = True
-    kept = [post for post in posts if post["author"] not in silenced]
-    return without_muted_keywords(conn, kept, keywords)
+            muted_keywords=keywords,
+            exclude_authors=silenced,
+        )
+        for post in batch:
+            post["saved"] = True
+        batch = [post for post in batch if post["author"] not in silenced]
+        batch = without_muted_keywords(conn, batch, keywords)
+        if ruleset is not None:
+            batch = apply_display_rules(batch, ruleset)
+        kept.extend(batch)
+    if len(kept) < limit:
+        return kept, None
+    total = conn.execute("SELECT COUNT(*) AS n FROM saved_posts").fetchone()["n"]
+    return kept, raw_offset if raw_offset < int(total) else None
 
 
 

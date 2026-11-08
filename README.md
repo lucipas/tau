@@ -141,7 +141,7 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
-| `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them) |
+| `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
 | `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |
 | `/api/tan/unsave` | POST | unsave `{"target": "<post hash>"}` |
 | `/api/events` | GET | SSE stream of messages, peers and posts |

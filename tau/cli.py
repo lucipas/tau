@@ -1936,16 +1936,17 @@ def cmd_tan_saved(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     conn = init_db(config.social_db_path)
     try:
-        identity = load_identity(config.identity_path)
-        viewer = destination_hash(identity).hex() if identity is not None else None
-        posts = annotated_saved_posts(conn, limit=args.limit, viewer=viewer)
-    finally:
-        conn.close()
-    try:
         display_ruleset = load_ruleset(config.tan_rules_path)
     except RulesError:
         display_ruleset = Ruleset()
-    posts = apply_display_rules(posts, display_ruleset)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        posts, _ = annotated_saved_posts(
+            conn, limit=args.limit, viewer=viewer, ruleset=display_ruleset
+        )
+    finally:
+        conn.close()
     _print_saved_posts(posts, json_output=json_output)
     return _EXIT_OK
 

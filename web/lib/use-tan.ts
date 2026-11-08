@@ -118,6 +118,11 @@ export function useTan() {
   useEffect(() => {
     savedRef.current = saved;
   }, [saved]);
+  // The raw offset to resume paging from, as returned by the API.
+  // Muted and hidden entries never shrink a page server-side, so the
+  // next offset must come from the response — the filtered list length
+  // would re-fetch rows already seen.
+  const savedNextOffsetRef = useRef<number | null>(null);
   // Monotonic generation of saved loads, mirroring the feed's: a newer
   // load supersedes an older one, so a slow response cannot restore a
   // post that was unsaved after it started.
@@ -127,9 +132,12 @@ export function useTan() {
   // a list nobody has opened.
   const savedLoadedRef = useRef(false);
 
-  const fetchSavedPage = async (offset: number) => {
+  const fetchSavedPage = async (
+    offset: number,
+    limit: number = SAVED_PAGE_SIZE,
+  ) => {
     return apiGet<TanSavedResponse>(
-      `/api/tan/saved?limit=${SAVED_PAGE_SIZE}&offset=${offset}`,
+      `/api/tan/saved?limit=${limit}&offset=${offset}`,
     );
   };
 
@@ -140,7 +148,8 @@ export function useTan() {
       const result = await fetchSavedPage(0);
       if (savedGenerationRef.current !== generation) return;
       setSaved(result.posts);
-      setSavedHasMore(result.posts.length === SAVED_PAGE_SIZE);
+      savedNextOffsetRef.current = result.next_offset;
+      setSavedHasMore(result.next_offset !== null);
       savedLoadedRef.current = true;
     } finally {
       if (savedGenerationRef.current === generation) {
@@ -150,13 +159,16 @@ export function useTan() {
   }, []);
 
   const loadMoreSaved = useCallback(async () => {
+    const offset = savedNextOffsetRef.current;
+    if (offset === null) return;
     const generation = ++savedGenerationRef.current;
     setSavedLoading(true);
     try {
-      const result = await fetchSavedPage(savedRef.current.length);
+      const result = await fetchSavedPage(offset);
       if (savedGenerationRef.current !== generation) return;
       setSaved((previous) => [...previous, ...result.posts]);
-      setSavedHasMore(result.posts.length === SAVED_PAGE_SIZE);
+      savedNextOffsetRef.current = result.next_offset;
+      setSavedHasMore(result.next_offset !== null);
     } finally {
       if (savedGenerationRef.current === generation) {
         setSavedLoading(false);
@@ -164,26 +176,31 @@ export function useTan() {
     }
   }, []);
 
-  // Re-read every page currently shown. A save or unsave shifts the
-  // offsets behind the shown pages, so refreshing only the first page
-  // would leave the rest stale.
+  // Re-read every page currently shown, paging with the server's
+  // offsets. A save or unsave shifts the offsets behind the shown
+  // pages, so refreshing only the first page would leave the rest
+  // stale.
   const reloadSaved = useCallback(async () => {
     const shown = savedRef.current.length;
     if (shown === 0) return;
     const generation = ++savedGenerationRef.current;
     setSavedLoading(true);
     try {
-      const pages = Math.ceil(shown / SAVED_PAGE_SIZE);
       const all: TanPost[] = [];
-      for (let page = 0; page < pages; page += 1) {
-        const result = await fetchSavedPage(page * SAVED_PAGE_SIZE);
+      let offset: number | null = 0;
+      while (all.length < shown && offset !== null) {
+        const result = await fetchSavedPage(
+          offset,
+          Math.min(SAVED_PAGE_SIZE, shown - all.length),
+        );
         if (savedGenerationRef.current !== generation) return;
         all.push(...result.posts);
-        if (result.posts.length < SAVED_PAGE_SIZE) break;
+        offset = result.next_offset;
       }
       if (savedGenerationRef.current !== generation) return;
       setSaved(all);
-      setSavedHasMore(all.length === pages * SAVED_PAGE_SIZE);
+      savedNextOffsetRef.current = offset;
+      setSavedHasMore(offset !== null);
     } finally {
       if (savedGenerationRef.current === generation) {
         setSavedLoading(false);
