@@ -113,6 +113,7 @@ export interface TanReplyParent {
   deleted: boolean;
   // True when the parent is from a blocked author: its text is blanked.
   blocked?: boolean;
+  muted?: boolean;
 }
 
 export interface TanPost {
@@ -128,8 +129,10 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  quotes?: number;
   own?: boolean;
 }
 

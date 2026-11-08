@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import sys
+import threading
 import time
+import types
 
 import pytest
 import RNS
 
 from tau import lxmf
+from tau.config import TauConfig
 from tau.identity import destination_hash
-from tau.peers import Peer
+from tau.node import NodeError, TauNode
+from tau.peers import Peer, PeerRegistry
 
 
 def test_delivery_hash_matches_rns_destination_hash() -> None:
@@ -144,3 +149,131 @@ def test_peer_table_shows_lxmf_column(capsys) -> None:
     out = capsys.readouterr().out
     assert "LXMF" in out
     assert peer.lxmf_hash in out
+
+
+# -- router lifecycle ------------------------------------------------------
+
+class _FakeDeliveryDestination:
+    def __init__(self, destination_hash: bytes) -> None:
+        self.hash = destination_hash
+
+
+class _FakeLXMRouter:
+    """Stand-in for LXMF.LXMRouter: records construction and calls.
+
+    It never touches Reticulum, so the router lifecycle can be tested
+    without a live node — the real router is exercised by the serve
+    integration test instead.
+    """
+
+    created: list = []
+
+    def __init__(self, identity=None, storagepath=None, **_kwargs) -> None:
+        self.identity = identity
+        self.storagepath = storagepath
+        self.delivery_destinations = {}
+        self.display_name = None
+        self.announced: list = []
+        self.exit_handler_calls = 0
+        type(self).created.append(self)
+
+    def register_delivery_identity(self, identity, display_name=None):
+        self.display_name = display_name
+        destination = _FakeDeliveryDestination(
+            lxmf.lxmf_delivery_hash(identity)
+        )
+        self.delivery_destinations[destination.hash] = destination
+        return destination
+
+    def announce(self, destination_hash):
+        self.announced.append(destination_hash)
+
+    def exit_handler(self):
+        self.exit_handler_calls += 1
+
+
+@pytest.fixture
+def fake_lxmf(monkeypatch):
+    """Install a fake LXMF package exposing _FakeLXMRouter."""
+    _FakeLXMRouter.created.clear()
+    module = types.ModuleType("LXMF")
+    module.LXMRouter = _FakeLXMRouter
+    monkeypatch.setitem(sys.modules, "LXMF", module)
+    return _FakeLXMRouter.created
+
+
+def test_start_router_registers_delivery_and_announces(fake_lxmf, tmp_path):
+    identity = RNS.Identity()
+    router = lxmf.start_lxmf_router(
+        identity, tmp_path, display_name="tester"
+    )
+    assert fake_lxmf == [router]
+    assert router.identity is identity
+    assert router.storagepath == str(tmp_path)
+    assert router.display_name == "tester"
+    delivery = lxmf.lxmf_delivery_hash(identity)
+    assert lxmf.lxmf_router_delivery_hash(router) == delivery
+    assert router.announced == [delivery]
+
+
+def test_start_router_requires_installed_package(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "LXMF", None)
+    with pytest.raises(lxmf.LXMFError, match="not installed"):
+        lxmf.start_lxmf_router(RNS.Identity(), tmp_path)
+
+
+def test_start_router_requires_main_thread(fake_lxmf, tmp_path):
+    errors: list = []
+
+    def run():
+        try:
+            lxmf.start_lxmf_router(RNS.Identity(), tmp_path)
+        except lxmf.LXMFError as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=10)
+    assert errors and "main thread" in errors[0]
+    assert fake_lxmf == []
+
+
+def test_stop_router_calls_exit_handler_and_tolerates_none(fake_lxmf, tmp_path):
+    router = lxmf.start_lxmf_router(RNS.Identity(), tmp_path)
+    lxmf.stop_lxmf_router(router)
+    lxmf.stop_lxmf_router(router)
+    assert router.exit_handler_calls == 2
+    lxmf.stop_lxmf_router(None)
+    assert lxmf.lxmf_router_delivery_hash(None) is None
+
+
+def test_router_delivery_hash_none_without_registration(fake_lxmf, tmp_path):
+    router = _FakeLXMRouter(identity=RNS.Identity(), storagepath=str(tmp_path))
+    assert lxmf.lxmf_router_delivery_hash(router) is None
+
+
+def test_node_lxmf_router_lifecycle(fake_lxmf, tmp_path):
+    # The node wiring runs without a live Reticulum instance: the
+    # identity is set directly and the router is faked, so no signal
+    # handlers or Transport state leak into the unit suite.
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    node.identity = RNS.Identity()
+    node._start_lxmf_router()
+    assert fake_lxmf == [node.lxmf_router]
+    assert lxmf.lxmf_router_delivery_hash(node.lxmf_router) == (
+        lxmf.lxmf_delivery_hash(node.identity)
+    )
+    node.stop()
+    assert node.lxmf_router is None
+    assert fake_lxmf[0].exit_handler_calls == 1
+
+
+def test_node_lxmf_router_missing_package_is_node_error(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "LXMF", None)
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    node.identity = RNS.Identity()
+    with pytest.raises(NodeError, match="not installed"):
+        node._start_lxmf_router()
+    assert node.lxmf_router is None
