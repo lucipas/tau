@@ -62,6 +62,22 @@ def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     assert peer.first_seen == 100.0
 
 
+def test_from_dict_rejects_nonfinite_timestamps():
+    # JSON accepts NaN/Infinity literals, so a hand-edited registry file
+    # can carry them; a non-finite timestamp used to crash every reader
+    # that formats an age (e.g. `tau peers show` via _ago).
+    registry = PeerRegistry()
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    raw = peer.to_dict()
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            Peer.from_dict(dict(raw, last_seen=bad))
+        # A non-finite first_seen falls back to last_seen, like a missing one.
+        recovered = Peer.from_dict(dict(raw, first_seen=bad))
+        assert recovered.first_seen == peer.last_seen
+        assert recovered.last_seen == peer.last_seen
+
+
 def test_ambiguous_names_and_prefixes(tmp_path):
     registry = PeerRegistry()
     make_peer(registry, 3, "duplicate", now=1.0)

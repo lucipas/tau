@@ -110,10 +110,10 @@ class Peer:
             raise ValueError("invalid public key length")
 
         last_seen = raw.get("last_seen")
-        if not isinstance(last_seen, (int, float)):
+        if not isinstance(last_seen, (int, float)) or not math.isfinite(last_seen):
             raise ValueError("invalid last_seen timestamp")
         first_seen = raw.get("first_seen")
-        if not isinstance(first_seen, (int, float)):
+        if not isinstance(first_seen, (int, float)) or not math.isfinite(first_seen):
             first_seen = last_seen
         hops = raw.get("hops")
         if not isinstance(hops, int) or hops < 0:
