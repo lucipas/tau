@@ -296,20 +296,38 @@ def test_verify_store_reports_an_unlinked_entry_with_its_parent_stored(
     )
 
 
-def test_verify_store_reports_a_forked_sequence(identities, tmp_path):
+def test_verify_store_accepts_a_forked_sequence(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     first = create_post(conn, alice, "first", name="alice", now=1000)
     create_post(conn, alice, "second", name="alice", now=1001)
-    # A second entry chained to the first post reuses sequence 2.
+    # A second entry chained to the first post reuses sequence 2; store_post
+    # accepts such forks, so the audit must too.
     create_post(
         conn, alice, "forked", name="alice", now=1002, previous=first["hash"]
     )
 
     report = verify_store(conn)
+    assert report["ok"] is True
+    assert report["problems"] == []
+
+
+def test_verify_store_reports_a_wrong_previous_link(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET prev = ? WHERE hash = ?",
+        ("0" * 64, second["hash"]),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
     assert report["ok"] is False
     assert any(
-        "duplicate sequence number 2" in problem["problem"]
+        problem["hash"] == second["hash"]
+        and "does not point at the previous entry" in problem["problem"]
         for problem in report["problems"]
     )
 
