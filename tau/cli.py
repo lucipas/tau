@@ -330,6 +330,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --exchange, ask only this peer instead of all known peers",
     )
     peers.set_defaults(func=cmd_peers)
+    peers_sub = peers.add_subparsers(
+        dest="peers_command", metavar="PEERS_COMMAND"
+    )
+
+    peers_alias = peers_sub.add_parser(
+        "alias",
+        parents=[common],
+        help="give a known peer a local alias",
+    )
+    peers_alias.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, destination hash, or hash prefix",
+    )
+    peers_alias.add_argument(
+        "alias", metavar="ALIAS", help="local label for the peer"
+    )
+    peers_alias.set_defaults(func=cmd_peers_alias)
+
+    peers_unalias = peers_sub.add_parser(
+        "unalias",
+        parents=[common],
+        help="remove a peer's local alias",
+    )
+    peers_unalias.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, alias, destination hash, or hash prefix",
+    )
+    peers_unalias.set_defaults(func=cmd_peers_unalias)
 
     identity = subparsers.add_parser(
         "id",
@@ -902,10 +932,13 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
     header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
+        name = peer.display_name
+        if peer.alias and peer.alias != peer.name:
+            name = f"{peer.alias} ({peer.name})"
         table.append(
             (
                 peer.hexhash,
-                peer.display_name,
+                name,
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
                 peer.lxmf_hash or "—",
@@ -1929,6 +1962,28 @@ def cmd_peers(args: argparse.Namespace) -> int:
         )
     else:
         _print_peer_table(peers)
+    return _EXIT_OK
+
+
+def cmd_peers_alias(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.set_alias(args.peer, args.alias)
+    if _json_mode(args):
+        _emit(peer.to_dict(), True)
+    else:
+        print(f"alias {peer.alias!r} set for {peer.name} ({peer.hexhash[:8]})")
+    return _EXIT_OK
+
+
+def cmd_peers_unalias(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.clear_alias(args.peer)
+    if _json_mode(args):
+        _emit(peer.to_dict(), True)
+    else:
+        print(f"removed alias for {peer.name} ({peer.hexhash[:8]})")
     return _EXIT_OK
 
 

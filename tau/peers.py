@@ -53,6 +53,9 @@ class Peer:
     # never heard directly.  Its reported liveness is second-hand, so mail
     # sweeps rank directly heard peers ahead of it.
     via_exchange: bool = False
+    # Local-only label for this peer, set with `tau peers alias`.  Never
+    # sent in peer exchange or announces, and never overwritten by them.
+    alias: Optional[str] = None
 
     @property
     def hexhash(self) -> str:
@@ -74,6 +77,8 @@ class Peer:
 
     @property
     def display_name(self) -> str:
+        if self.alias:
+            return self.alias
         return self.name or short_hash(self.hexhash)
 
     def age(self, now: Optional[float] = None) -> float:
@@ -90,6 +95,7 @@ class Peer:
             "protocol": self.protocol,
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
+            "alias": self.alias,
             "lxmf": self.lxmf_hash,
         }
 
@@ -134,6 +140,7 @@ class Peer:
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
+            alias=sanitize_name(raw.get("alias"), fallback="") or None,
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -194,12 +201,15 @@ class PeerRegistry:
             if _HEX32.match(value):
                 return self._peers.get(bytes.fromhex(value))
             for peer in self._peers.values():
+                if peer.alias and peer.alias.casefold() == value.casefold():
+                    return peer
+            for peer in self._peers.values():
                 if peer.name.casefold() == value.casefold():
                     return peer
             return None
 
     def resolve(self, target: Union[bytes, str]) -> Optional[Peer]:
-        """Resolve a destination hash, hash prefix or peer name."""
+        """Resolve a destination hash, hash prefix, peer name or alias."""
         if isinstance(target, bytes):
             if len(target) != DESTINATION_HASH_BYTES:
                 raise PeerError("destination hash must be 16 bytes")
@@ -215,6 +225,17 @@ class PeerRegistry:
 
         with self._lock:
             peers = list(self._peers.values())
+
+        by_alias = [
+            p for p in peers if p.alias and p.alias.casefold() == value.casefold()
+        ]
+        if len(by_alias) == 1:
+            return by_alias[0]
+        if len(by_alias) > 1:
+            raise AmbiguousPeer(
+                f"{len(by_alias)} peers share the alias {value!r}; "
+                "use a destination hash"
+            )
 
         by_name = [p for p in peers if p.name.casefold() == value.casefold()]
         if len(by_name) == 1:
@@ -234,6 +255,57 @@ class PeerRegistry:
                     f"{len(by_prefix)} peers match the hash prefix {value!r}"
                 )
         return None
+
+    def set_alias(self, target: Union[bytes, str], alias: str) -> Peer:
+        """Give a known peer a local alias, stored only in this registry.
+
+        The alias is unique across the registry (case-insensitive) so it
+        always resolves to exactly one peer.  Raises :class:`PeerError`
+        for an unknown peer, an empty alias, or an alias another peer
+        already uses.  The alias survives re-announces: :meth:`upsert`
+        never touches it.
+        """
+        clean = sanitize_name(alias, fallback="")
+        if not clean:
+            raise PeerError("alias must not be empty")
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            clash = next(
+                (
+                    other
+                    for other in self._peers.values()
+                    if other.destination_hash != peer.destination_hash
+                    and other.alias
+                    and other.alias.casefold() == clean.casefold()
+                ),
+                None,
+            )
+            if clash is not None:
+                raise PeerError(
+                    f"alias {clean!r} is already used by "
+                    f"{clash.hexhash[:8]} ({clash.display_name})"
+                )
+            peer.alias = clean
+        self.save()
+        return peer
+
+    def clear_alias(self, target: Union[bytes, str]) -> Peer:
+        """Remove a peer's local alias.
+
+        Raises :class:`PeerError` when the peer is unknown or has no
+        alias set.
+        """
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            if not peer.alias:
+                raise PeerError(f"peer {peer.display_name} has no alias")
+            peer.alias = None
+        self.save()
+        return peer
 
     def upsert(
         self,

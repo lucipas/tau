@@ -427,3 +427,112 @@ def test_merge_exchanged_exceeds_cap_rather_than_evicting_all_kept(tmp_path):
     assert summary["added"] == 1
     assert len(registry) == 3
     assert registry.get(destination) is not None
+
+
+# -- local aliases ----------------------------------------------------------
+
+
+def test_alias_roundtrip_persists(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.set_alias(peer.hexhash, "my laptop")
+
+    reloaded = PeerRegistry(path)
+    stored = reloaded.get(peer.destination_hash)
+    assert stored is not None
+    assert stored.alias == "my laptop"
+    assert stored.display_name == "my laptop"
+
+
+def test_display_name_prefers_alias_over_name(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 2, "bob", now=100.0)
+    assert peer.display_name == "bob"
+    registry.set_alias(peer.hexhash, "relay-berlin")
+    assert peer.display_name == "relay-berlin"
+
+
+def test_resolve_and_get_accept_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    registry.set_alias(peer.hexhash, "carol-laptop")
+    assert registry.resolve("carol-laptop") is peer
+    assert registry.resolve("CAROL-LAPTOP") is peer
+    assert registry.get("carol-laptop") is peer
+    # The asserted name still resolves too.
+    assert registry.resolve("carol") is peer
+
+
+def test_alias_wins_over_another_peers_name(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 4, "dave", now=100.0)
+    make_peer(registry, 5, "laptop", now=200.0)
+    registry.set_alias(peer.hexhash, "laptop")
+    assert registry.resolve("laptop") is peer
+
+
+def test_set_alias_rejects_duplicates_case_insensitively(tmp_path):
+    registry = PeerRegistry()
+    first = make_peer(registry, 6, "erin", now=100.0)
+    second = make_peer(registry, 7, "frank", now=200.0)
+    registry.set_alias(first.hexhash, "spare")
+    with pytest.raises(PeerError, match="already used"):
+        registry.set_alias(second.hexhash, "SPARE")
+    # Re-setting the same alias on the same peer is fine.
+    assert registry.set_alias(first.hexhash, "spare") is first
+
+
+def test_set_alias_rejects_empty_and_unknown_peer(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 8, "grace", now=100.0)
+    with pytest.raises(PeerError, match="must not be empty"):
+        registry.set_alias(peer.hexhash, "   ")
+    with pytest.raises(PeerError, match="unknown peer"):
+        registry.set_alias("missing", "spare")
+
+
+def test_clear_alias_and_clearing_without_one(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 9, "heidi", now=100.0)
+    with pytest.raises(PeerError, match="has no alias"):
+        registry.clear_alias(peer.hexhash)
+    registry.set_alias(peer.hexhash, "home")
+    assert registry.clear_alias("home") is peer
+    assert peer.alias is None
+    assert peer.display_name == "heidi"
+    assert registry.resolve("home") is None
+
+
+def test_upsert_preserves_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 10, "ivan", now=100.0)
+    registry.set_alias(peer.hexhash, "workstation")
+    registry.upsert(
+        peer.destination_hash,
+        peer.public_key,
+        name="ivan-new",
+        hops=1,
+        now=200.0,
+    )
+    assert peer.alias == "workstation"
+    assert peer.name == "ivan-new"
+
+
+def test_alias_never_leaves_the_local_registry(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 11, "judy", now=100.0)
+    registry.set_alias(peer.hexhash, "secret-label")
+    assert "alias" not in peer.public_dict()
+    assert "alias" not in peer.exchange_dict()
+    assert peer.to_dict()["alias"] == "secret-label"
+
+
+def test_from_dict_tolerates_bad_alias_values(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 12, "ken", now=100.0)
+    raw = peer.to_dict()
+    raw["alias"] = 42
+    assert Peer.from_dict(raw).alias is None
+    raw["alias"] = "   "
+    assert Peer.from_dict(raw).alias is None

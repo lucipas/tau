@@ -251,6 +251,8 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
+| `tau peers unalias PEER` | Remove a peer's local alias |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
@@ -400,6 +402,12 @@ and the background sweep asks a few quiet known peers for their lists every 15
 minutes, so discovery does not depend on announces alone. Peers owed mail or
 pending acks are never evicted by the registry cap to make room for gossip.
 `tau peers --exchange [--to NAME|HASH]` runs the same exchange on demand.
+A peer can also be given a local alias with `tau peers alias PEER ALIAS`:
+the alias is shown by `tau peers` (with the peer's asserted name alongside
+when they differ), works as a target for `send`, `ping`, `info` and
+`--to`, and is never sent to other peers or overwritten when the peer
+re-announces. Aliases are unique across the registry, so one alias always
+resolves to exactly one peer; remove one with `tau peers unalias PEER`.
 
 ### Messaging
 
