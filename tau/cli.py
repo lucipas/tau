@@ -22,7 +22,7 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .config import TauConfig, write_node_metadata, write_rns_config
+from .config import TauConfig, load_node_name, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -43,7 +43,7 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import PROTOCOL_VERSION, ProtocolError, sanitize_name, short_hash
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -375,6 +375,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing identity",
     )
     id_import.set_defaults(func=cmd_id_import)
+    id_rename = id_sub.add_parser(
+        "rename",
+        parents=[common],
+        help="change this node's display name",
+    )
+    id_rename.add_argument(
+        "new_name",
+        metavar="NEWNAME",
+        help="new node name",
+    )
+    id_rename.set_defaults(func=cmd_id_rename)
 
     outbox = subparsers.add_parser(
         "outbox",
@@ -2106,6 +2117,44 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
+    return _EXIT_OK
+
+
+def cmd_id_rename(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    raw_name = getattr(args, "new_name", None)
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise NodeError("new name must not be empty")
+    new_name = sanitize_name(raw_name)
+    # Read the stored name, not the resolved one: a global --name flag
+    # would override the resolved name and misreport the rename.
+    old_name = load_node_name(config.data_dir) or config.name
+    payload = {
+        "name": new_name,
+        "previous_name": old_name,
+        "changed": new_name != old_name,
+        "destination": destination_hash(identity).hex(),
+    }
+    if new_name == old_name:
+        if _json_mode(args):
+            _emit(payload, True)
+        else:
+            print(f'Node is already named "{old_name}".')
+        return _EXIT_OK
+    # A running node announces with its in-memory name, so a rename under
+    # it would sit ignored on disk until restart. Probe the instance lock
+    # (same pattern as `tau serve`) and refuse while the node is serving.
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    probe.acquire()
+    probe.release()
+    write_node_metadata(config.data_dir, new_name)
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f'Renamed node "{old_name}" to "{new_name}".')
     return _EXIT_OK
 
 

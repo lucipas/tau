@@ -397,6 +397,85 @@ def test_id_import_refuses_when_node_serving(tmp_path, capsys):
     assert "already serving" in capsys.readouterr().err
 
 
+def test_parser_id_rename_subcommand():
+    parser = cli.build_parser()
+    args = parser.parse_args(["id", "rename", "bob"])
+    assert args.func is cli.cmd_id_rename
+    assert args.new_name == "bob"
+
+
+def test_id_rename_end_to_end(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    destination = _id_destination(node, capsys)
+    capsys.readouterr()
+
+    code = cli.main(["id", "rename", "bob", "--data-dir", str(node), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "name": "bob",
+        "previous_name": "alice",
+        "changed": True,
+        "destination": destination,
+    }
+
+    assert cli.main(["id", "--data-dir", str(node), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "bob"
+    assert _id_destination(node, capsys) == destination
+    assert json.loads((node / "node.json").read_text())["name"] == "bob"
+
+
+def test_id_rename_text_output_collapses_whitespace(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "  bob   smith  ", "--data-dir", str(node)])
+    assert code == 0
+    assert 'Renamed node "alice" to "bob smith".' in capsys.readouterr().out
+
+
+def test_id_rename_same_name_is_noop(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "alice", "--data-dir", str(node), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["changed"] is False
+    assert payload["name"] == "alice"
+    assert payload["previous_name"] == "alice"
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_id_rename_rejects_empty_name(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "   ", "--data-dir", str(node)])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_id_rename_refuses_without_identity(tmp_path, capsys):
+    code = cli.main(["id", "rename", "bob", "--data-dir", str(tmp_path / "fresh")])
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
+
+
+def test_id_rename_refuses_while_serving(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    holder = InstanceLock(config.instance_lock_path, config.data_dir)
+    holder.acquire()
+    try:
+        code = cli.main(["id", "rename", "bob", "--data-dir", str(node)])
+    finally:
+        holder.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
 def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
