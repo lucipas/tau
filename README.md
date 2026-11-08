@@ -206,6 +206,18 @@ tau tan search mesh --author alice
 tau tan follow 5c04c868
 tau tan following
 
+# Hide a word or phrase from your local views (whole-word match,
+# case-insensitive; entries keep syncing, so unmuting restores them)
+tau tan mute-keyword crypto
+tau tan mute-keyword "climate change"
+tau tan muted-keywords
+tau tan unmute-keyword crypto
+
+# Mute an author: their posts leave your timeline, search and threads,
+# but keep syncing and storing — unmute to see them again
+tau tan mute alice
+tau tan muted
+
 # Back up your posts (or every cached author's) and restore them later —
 # every entry's signature and hash are re-verified on import
 tau tan export --output tan-backup.json
@@ -218,14 +230,25 @@ long-running node stores only posts it created, received or synced. Tan is
 public-feed oriented: there are no private posts or media yet. Posts can be
 answered with `tau tan post --reply-to <post>` — a reply is a signed entry
 on the replier's chain pointing at its parent, so it propagates to peers
-like any other post. Read a whole conversation with
+like any other post. A post can also be shared with your own comment with
+`tau tan quote <post> "comment"` — a quote is a signed entry on the
+quoter's chain carrying the comment text and the original as its target,
+so it appears in followers' timelines as a standalone entry with the
+original embedded beneath it. Read a whole conversation with
 `tau tan thread <post>` — it prints the post and its replies nested under
 it, oldest first, and accepts a reply's hash to show the thread it belongs
 to. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
-(the entry itself stays stored, keeping chains verifiable). In the web
-console your own posts show a delete button that calls the same endpoint.
+(the entry itself stays stored, keeping chains verifiable). A word or
+phrase can be muted locally with `tau tan mute-keyword <word>` — matching
+posts disappear from your timeline and threads (a muted reply hides its
+whole subtree), while search still finds them and unmuting restores them.
+An author can also be muted with `tau tan mute <peer>` — their posts and
+replies leave your timeline, search results and threads, while their
+entries keep syncing and storing, so `tau tan unmute <peer>` brings the
+whole history back. Muting is display-only and never touches DMs.
+In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
@@ -263,15 +286,26 @@ Global options may appear before or after the command:
 | `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
+| `tau tan quote POST TEXT` | Quote a post with your own comment (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan mentions` | Show replies to your own posts |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
+| `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
+| `tau tan muted-keywords` | List muted keywords |
+| `tau tan mute PEER` | Hide an author's posts from local views |
+| `tau tan unmute PEER` | Show a muted author's posts again |
+| `tau tan muted` | List muted authors |
+| `tau tan save POST` | Save a post to read later (local only, never published) |
+| `tau tan unsave POST` | Remove a post from your saved list |
+| `tau tan saved` | List your saved posts, newest first |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
@@ -641,6 +675,11 @@ unlinked, and stall sync at the gap.
   replies rejects them, and — because entries are hash-chained — a
   rejected reply also leaves that author's later entries (including
   deletes) unlinked on the old peer until it upgrades and resyncs.
+- Quotes are a new entry kind too: a peer running a version that predates
+  quotes rejects them, and the same hash-chain effect applies — the rejected
+  quote leaves that author's later entries (including deletes) unlinked on the
+  old peer until it upgrades and resyncs. Upgrade and resync older peers before
+  exchanging quotes.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
   Back up your own chain with `tau tan export` and restore it with
@@ -654,9 +693,11 @@ unlinked, and stall sync at the gap.
   (media, moderation, follow recommendations).
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
-  console); `tau id` shows this node's own address. Nothing is sent over
-  LXMF yet — the router and the migration of store-and-forward follow
-  under #67.
+  console); `tau id` shows this node's own address. `tau serve --lxmf`
+  (requires the `lxmf` extra) also runs an LXMRouter on the node's
+  identity, registers its delivery destination and announces it.
+  Nothing is sent over LXMF yet — sending and the migration of
+  store-and-forward follow under #67.
 
 ## Development
 

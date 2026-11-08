@@ -30,6 +30,12 @@ from .identity import (
     load_public_key,
 )
 from .inbox import Inbox
+from .lxmf import (
+    LXMFError,
+    lxmf_router_delivery_hash,
+    start_lxmf_router,
+    stop_lxmf_router,
+)
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
     Mailbox,
@@ -338,6 +344,7 @@ class TauNode:
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
         self.destination: Optional[RNS.Destination] = None
+        self.lxmf_router: Optional[Any] = None
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
@@ -396,6 +403,7 @@ class TauNode:
         announce: bool = True,
         exclusive: bool = False,
         mail_loop: bool = True,
+        lxmf: bool = False,
     ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
@@ -412,6 +420,9 @@ class TauNode:
         one-shot command that flushes the outbox itself (``tau outbox
         retry``) opts out so its own flush cannot lose the mail lock
         to the loop's first round and silently report nothing moved.
+        With ``lxmf`` on, an LXMF router also runs alongside the node
+        (see :meth:`_start_lxmf_router`); it needs the ``lxmf`` extra
+        installed and must start on the main thread.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -429,7 +440,7 @@ class TauNode:
             lock.acquire()
             self._instance_lock = lock
         try:
-            self._start(announce=announce, mail_loop=mail_loop)
+            self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -441,7 +452,7 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool, mail_loop: bool = True) -> None:
+    def _start(self, *, announce: bool, mail_loop: bool = True, lxmf: bool = False) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -506,15 +517,55 @@ class TauNode:
             )
             self._mail_thread.start()
 
+        if lxmf:
+            self._start_lxmf_router()
+
         if announce:
             self.announce()
 
         log.info("tau node %r ready at %s", self.name, self.destination.hexhash)
 
+    def _start_lxmf_router(self) -> None:
+        """Run an LXMF router on this node's identity.
+
+        The router listens on the LXMF delivery destination derived from
+        the node's identity (the address ``tau id`` and ``tau peers``
+        already show) and announces it, so LXMF clients can find a path
+        to this node.  Storage lives under the data directory.  This is
+        the router lifecycle only — nothing is sent over LXMF yet; that
+        follows under the migration tracked in issue #67.  A failure here
+        is a node-start failure: the caller cleans up via :meth:`stop`.
+        """
+        assert self.identity is not None  # set above, before this runs
+        try:
+            self.lxmf_router = start_lxmf_router(
+                self.identity,
+                self.config.data_dir,
+                display_name=self.name,
+            )
+        except LXMFError as exc:
+            raise NodeError(str(exc)) from exc
+        delivery = lxmf_router_delivery_hash(self.lxmf_router)
+        log.info(
+            "LXMF router running, delivery %s",
+            delivery.hex() if delivery is not None else "unknown",
+        )
+
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
         # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
+
+        if self.lxmf_router is not None:
+            # The router's exit handler persists its state and tears its
+            # destinations down; it runs before Reticulum exits because
+            # it still needs a live Transport.  It is idempotent, so the
+            # atexit handler it registered is a harmless no-op afterwards.
+            try:
+                stop_lxmf_router(self.lxmf_router)
+            except Exception:  # pragma: no cover - defensive
+                log.debug("LXMF router shutdown failed", exc_info=True)
+            self.lxmf_router = None
 
         if self._announce_handler is not None:
             try:
@@ -1374,6 +1425,7 @@ class TauNode:
             ]
         except Exception:  # pragma: no cover - introspection only
             pass
+        lxmf_delivery = lxmf_router_delivery_hash(self.lxmf_router)
         return {
             "name": self.name,
             "destination": self.destination.hexhash,
@@ -1384,6 +1436,10 @@ class TauNode:
             "peers": len(self.registry),
             "mailbox": self.mailbox.counts(),
             "interfaces": interfaces,
+            "lxmf": {
+                "enabled": self.lxmf_router is not None,
+                "delivery": lxmf_delivery.hex() if lxmf_delivery else None,
+            },
         }
 
     def resolve_peer(
