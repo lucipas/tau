@@ -250,6 +250,7 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
+| `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
