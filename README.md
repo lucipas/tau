@@ -230,7 +230,11 @@ long-running node stores only posts it created, received or synced. Tan is
 public-feed oriented: there are no private posts or media yet. Posts can be
 answered with `tau tan post --reply-to <post>` — a reply is a signed entry
 on the replier's chain pointing at its parent, so it propagates to peers
-like any other post. Read a whole conversation with
+like any other post. A post can also be shared with your own comment with
+`tau tan quote <post> "comment"` — a quote is a signed entry on the
+quoter's chain carrying the comment text and the original as its target,
+so it appears in followers' timelines as a standalone entry with the
+original embedded beneath it. Read a whole conversation with
 `tau tan thread <post>` — it prints the post and its replies nested under
 it, oldest first, and accepts a reply's hash to show the thread it belongs
 to. An author can delete one of their own posts with
@@ -282,6 +286,7 @@ Global options may appear before or after the command:
 | `tau id import --from PATH` | Restore the node identity from a backup |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
+| `tau tan quote POST TEXT` | Quote a post with your own comment (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan delete POST` | Delete one of your own posts |
@@ -667,6 +672,11 @@ unlinked, and stall sync at the gap.
   replies rejects them, and — because entries are hash-chained — a
   rejected reply also leaves that author's later entries (including
   deletes) unlinked on the old peer until it upgrades and resyncs.
+- Quotes are a new entry kind too: a peer running a version that predates
+  quotes rejects them, and the same hash-chain effect applies — the rejected
+  quote leaves that author's later entries (including deletes) unlinked on the
+  old peer until it upgrades and resyncs. Upgrade and resync older peers before
+  exchanging quotes.
 - A node only has the posts it created, received or synced. If every peer that
   cached an author's feed disappears, the feed is gone until the author returns.
   Back up your own chain with `tau tan export` and restore it with

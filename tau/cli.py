@@ -51,6 +51,8 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
+    annotate_quote_counts,
+    annotate_quotes,
     annotate_reactions,
     annotate_replies,
     apply_display_rules,
@@ -552,6 +554,34 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
 
+    tan_quote = tan_sub.add_parser(
+        "quote",
+        parents=[common],
+        help="quote a post with your own comment (writes a signed quote entry to your chain)",
+    )
+    tan_quote.add_argument(
+        "target", metavar="POST", help="post hash or unique hash prefix"
+    )
+    tan_quote.add_argument(
+        "text", nargs="?", help="quote comment (reads stdin when omitted)"
+    )
+    tan_quote.add_argument("--file", type=Path, help="read the comment from a file")
+    tan_quote.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_quote.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_quote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_quote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_quote.set_defaults(func=cmd_tan_quote)
+
     for verb, help_text in (
         ("like", "like a post (writes a signed like entry to your chain)"),
         ("unlike", "remove your like from a post (writes an unlike entry)"),
@@ -872,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_rules.add_argument(
         "--kinds",
         default=None,
-        metavar="post,like,unlike,delete",
+        metavar="post,like,unlike,delete,reply,quote",
         help="comma-separated entry kinds to display (display-only: "
         "every kind is still stored, so chains stay complete)",
     )
@@ -1157,10 +1187,24 @@ def _print_tan_posts(
                 print(f"  in reply to {short_hash(str(post.get('target', '')))}")
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("deleted"):
+                    print("  quoting a deleted post")
+                else:
+                    print(f"  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"    {line}")
+            else:
+                print(f"  quoting {short_hash(str(post.get('target', '')))}")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")
+        quotes = int(post.get("quotes") or 0)
+        if quotes:
+            print(f"  ❝ {quotes}")
 
 
 def _print_tan_thread(
@@ -1188,10 +1232,27 @@ def _print_tan_thread(
         )
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"{indent}  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("deleted"):
+                    print(f"{indent}  quoting a deleted post")
+                else:
+                    print(f"{indent}  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"{indent}    {line}")
+            else:
+                print(
+                    f"{indent}  quoting "
+                    f"{short_hash(str(post.get('target', '')))}"
+                )
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"{indent}  ♥ {likes}{suffix}")
+        quotes = int(post.get("quotes") or 0)
+        if quotes:
+            print(f"{indent}  ❝ {quotes}")
 
 
 def _print_saved_posts(
@@ -1240,6 +1301,7 @@ def _publish_local_post(
     *,
     text: str,
     reply_to: Optional[str] = None,
+    quote_of: Optional[str] = None,
     to: Optional[List[str]] = None,
     ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
@@ -1250,7 +1312,10 @@ def _publish_local_post(
     )
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
-    post = publisher.create_post(text, reply_to=reply_to)
+    if quote_of is not None:
+        post = publisher.quote(quote_of, text)
+    else:
+        post = publisher.create_post(text, reply_to=reply_to)
     published = publisher.publish(
         post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
     )
@@ -1318,6 +1383,68 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         print(f"{verb} {short_hash(post['hash'])}")
         if reply_to is not None:
             print(f"  in reply to {short_hash(reply_to)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_quote(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        target = resolve_post(conn, args.target)["hash"]
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        post = app.quote(target, text)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir, text=text, quote_of=target,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            post, published = result["post"], result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config, node.identity, name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                result = _publish_local_post(
+                    node, text=text, quote_of=target,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                post, published = result["post"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"post": post, "published": published}, True)
+    else:
+        print(f"quoted {short_hash(post['hash'])}")
+        print(f"  quoting {short_hash(target)}")
         if published is None:
             print("  stored locally (not published)")
         else:
