@@ -1689,11 +1689,13 @@ def _normalize_keyword(keyword: Any) -> str:
     are the same mute; the display form the user typed is kept
     separately.  A keyword is one word or phrase — it may contain
     spaces, but it must not be empty and must fit in
-    ``MAX_KEYWORD_LENGTH`` characters.
+    ``MAX_KEYWORD_LENGTH`` characters.  Internal whitespace is
+    collapsed to single spaces first, so ``climate  change`` and
+    ``climate change`` are the same mute.
     """
     if not isinstance(keyword, str) or not keyword.strip():
         raise TanError("keyword must not be empty")
-    clean = keyword.strip()
+    clean = " ".join(str(keyword).split())
     if len(clean) > MAX_KEYWORD_LENGTH:
         raise TanError(f"keyword is limited to {MAX_KEYWORD_LENGTH} characters")
     return clean.casefold()
@@ -1707,13 +1709,19 @@ def _muted_keyword_pattern(keywords: Sequence[str]) -> Optional["re.Pattern[str]
     ``climate change`` matches the phrase.  The ``(?<!\\w)`` /
     ``(?!\\w)`` guards are word boundaries that also work when a
     keyword starts or ends with a non-word character, where ``\\b``
-    would not.  Returns ``None`` when there is nothing to match.
+    would not.  Inside a phrase, any run of whitespace matches — a
+    post saying ``climate\\nchange`` is hidden by a ``climate change``
+    mute.  Returns ``None`` when there is nothing to match.
     """
     clean = [keyword.casefold() for keyword in keywords if keyword.strip()]
     if not clean:
         return None
+    alternatives = [
+        r"\s+".join(re.escape(part) for part in keyword.split())
+        for keyword in clean
+    ]
     return re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(keyword) for keyword in clean) + r")(?!\w)"
+        r"(?<!\w)(?:" + "|".join(alternatives) + r")(?!\w)"
     )
 
 

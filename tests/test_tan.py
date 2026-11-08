@@ -1962,6 +1962,25 @@ def test_timeline_hides_muted_keyword_posts(identities, tmp_path):
     ]
 
 
+def test_mute_keyword_collapses_whitespace(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    record = mute_keyword(conn, "climate  change")
+    assert record["keyword"] == "climate change"
+    # Re-muting with different spacing is the same mute.
+    assert mute_keyword(conn, "Climate Change")["added_at"] == record["added_at"]
+    assert len(muted_keywords(conn)) == 1
+
+    # Any whitespace run inside the phrase matches: newline, double
+    # space, and tab alike.
+    create_post(conn, alice, "climate\nchange is real", name="alice", now=1000)
+    create_post(conn, alice, "climate  change again", name="alice", now=1001)
+    create_post(conn, alice, "climate\tchange too", name="alice", now=1002)
+    create_post(conn, alice, "climate talks", name="alice", now=1003)
+    items = timeline(conn, [author_of(alice)])
+    assert [item["text"] for item in items] == ["climate talks"]
+
+
 def test_timeline_whole_word_match_ignores_substrings(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")

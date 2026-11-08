@@ -1502,7 +1502,13 @@ def cmd_tan_unmute_keyword(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     if _json_mode(args):
-        _emit({"keyword": args.keyword.strip().casefold(), "unmuted": removed}, True)
+        _emit(
+            {
+                "keyword": " ".join(args.keyword.split()).casefold(),
+                "unmuted": removed,
+            },
+            True,
+        )
     else:
         if removed:
             print(f"unmuted keyword {args.keyword.strip()!r}")
