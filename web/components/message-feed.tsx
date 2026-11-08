@@ -3,7 +3,12 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import type { NodeInfo, TauMessage } from "@/lib/types";
-import { formatRtt, formatTime, shortHash } from "@/lib/format";
+import {
+  formatExpiresIn,
+  formatRtt,
+  formatTime,
+  shortHash,
+} from "@/lib/format";
 
 import { CopyButton, RadarIcon, SectionLabel } from "./ui";
 
@@ -174,6 +179,7 @@ function MessageBubble({
   const outbound = message.direction === "out";
   const peerHash = message.peer ?? "";
   const initial = (message.peer_name || "?").slice(0, 1).toUpperCase();
+  const expiry = formatExpiresIn(message.expires_at);
   const quote = resolveQuote(messages, message);
 
   return (
@@ -266,6 +272,7 @@ function MessageBubble({
           {message.rtt_ms !== undefined ? (
             <span>· rtt {formatRtt(message.rtt_ms)}</span>
           ) : null}
+          {expiry !== null ? <span>· {expiry}</span> : null}
           {onReply && message.wire_id ? (
             <button
               type="button"

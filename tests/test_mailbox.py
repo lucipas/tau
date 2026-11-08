@@ -912,3 +912,77 @@ def test_transaction_is_reentrant(tmp_path):
     with box._transaction():
         entry = box.enqueue(to=BOB, text="nested write", now=time.time())
     assert box.get_outbox(entry.id) is not None
+
+
+def test_enqueue_caps_entry_expiry_at_message_expiry(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB, text="vanish", now=1000.0, expires_at=1060.0, message_id="exp-1"
+    )
+    # The queue entry expires at the message deadline, not the 7-day TTL.
+    assert entry.expires_at == 1060.0
+    assert entry.message_expires_at == 1060.0
+
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.outbox_list()[0].message_expires_at == 1060.0
+
+
+def test_enqueue_rejects_invalid_message_expiry(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="bad", expires_at="soon")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="bad", expires_at=float("inf"))
+
+
+def test_enqueue_without_message_expiry_keeps_ttl(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(to=BOB, text="stays", now=1000.0, message_id="plain-1")
+    assert entry.expires_at > 1000.0 + 3600
+    assert entry.message_expires_at is None
+
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    assert reloaded.outbox_list()[0].message_expires_at is None
+
+
+def test_seal_and_open_roundtrip_with_expiry():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-exp",
+        text="read fast",
+        sent_at=4242.0,
+        expires_at=5000.0,
+    )
+    message = open_message(recipient, blob)
+    assert message["id"] == "msg-exp"
+    assert message["expires_at"] == 5000.0
+
+
+def test_seal_and_open_roundtrip_without_expiry_has_none():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-plain",
+        text="stays",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, blob)["expires_at"] is None
+
+
+def test_seal_rejects_invalid_expiry():
+    sender, recipient = make_identity_pair()
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="msg-bad",
+            text="bad",
+            sent_at=4242.0,
+            expires_at="soon",
+        )

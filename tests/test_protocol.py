@@ -296,3 +296,21 @@ def test_reaction_unsigned_bytes_exclude_the_signature():
     assert reaction_unsigned_bytes(signed) == unsigned
     assert parse_reaction(signed)["sig"] == payload["sig"]
     assert encode_reaction("msg-1", "👍", message_id="react-1", sent_at=12.0) == unsigned
+
+
+def test_message_rejects_invalid_expiry():
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at="soon")
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at=float("inf"))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": "soon"}))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": True}))
+
+
+def test_message_roundtrip_with_expiry():
+    data = encode_message("vanish soon", expires_at=1893456000.0)
+    parsed = parse_message(data)
+    assert parsed["text"] == "vanish soon"
+    assert parsed["expires_at"] == 1893456000.0

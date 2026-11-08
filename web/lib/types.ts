@@ -21,6 +21,9 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Sender-set expiry (epoch seconds). Absent when the message never
+  // expires; the console purges it once the deadline passes.
+  expires_at?: number;
   // Reticulum wire id: how replies name this message, and how
   // reactions are matched to it.
   wire_id?: string;

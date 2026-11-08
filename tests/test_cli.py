@@ -39,6 +39,31 @@ def test_parser_send_arguments():
     assert args.to == ["alice"]
     assert args.message == "hello world"
     assert args.timeout == 20.0
+    assert args.expire is None
+
+    ephemeral = parser.parse_args(
+        ["send", "--to", "alice", "--expire", "1h", "vanish soon"]
+    )
+    assert ephemeral.expire == "1h"
+
+
+def test_parse_duration():
+    assert cli._parse_duration("30s") == 30
+    assert cli._parse_duration("5m") == 300
+    assert cli._parse_duration("2h") == 7200
+    assert cli._parse_duration("7d") == 604800
+    assert cli._parse_duration("90") == 90
+    assert cli._parse_duration("  10m ") == 600
+    with pytest.raises(ValueError):
+        cli._parse_duration("soon")
+    with pytest.raises(ValueError):
+        cli._parse_duration("0s")
+    with pytest.raises(ValueError):
+        cli._parse_duration("-5m")
+    with pytest.raises(ValueError):
+        cli._parse_duration("31d")
+    with pytest.raises(ValueError):
+        cli._parse_duration("")
 
 
 def test_parser_send_to_is_repeatable():

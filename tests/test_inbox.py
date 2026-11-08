@@ -505,3 +505,41 @@ def _reaction(**overrides):
     }
     record.update(overrides)
     return record
+
+
+def test_expired_messages_are_purged_on_load(tmp_path):
+    import time as _time
+
+    now = _time.time()
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="gone", expires_at=now - 10))
+    inbox.append(_record(id="staying", expires_at=now + 3600))
+    inbox.append(_record(id="plain"))
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages()] == [
+        "plain",
+        "staying",
+    ]
+    # The purge is persisted: a later load does not resurrect the entry.
+    assert "gone" not in path.read_text(encoding="utf-8")
+
+
+def test_expiry_is_recorded(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="exp-1", expires_at=9999999999.0))
+    entry = inbox.list_messages()[0]
+    assert entry["expires_at"] == 9999999999.0
+
+
+def test_invalid_expiry_is_treated_as_no_expiry(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="bad-exp", expires_at="soon"))
+    assert inbox.list_messages()[0]["expires_at"] is None
+
+
+def test_message_without_expiry_has_none(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="plain-1"))
+    assert inbox.list_messages()[0]["expires_at"] is None

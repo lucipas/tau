@@ -6,7 +6,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
-    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id)
+    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
+                           ``"expires_in"`` seconds for a disappearing message)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -33,6 +34,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import mimetypes
 import queue
 import socket
@@ -53,6 +55,7 @@ from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
+    MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
     clean_in_reply_to,
@@ -322,6 +325,17 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "status": status,
     }
+    expires_at = entry.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return None
+        try:
+            expires_at = float(expires_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(expires_at):
+            return None
+        message["expires_at"] = expires_at
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
@@ -521,6 +535,18 @@ class WebBridge:
             if message is not None:
                 loaded.append(message)
         loaded = loaded[-MAX_MESSAGE_LOG:]
+        # Disappearing messages whose deadline passed are gone for good:
+        # drop them here (and persist the purge below) so a restarted
+        # console never resurrects them.
+        now = time.time()
+        kept = [
+            message
+            for message in loaded
+            if message.get("expires_at") is None
+            or float(message["expires_at"]) > now
+        ]
+        purged = len(loaded) - len(kept)
+        loaded = kept
         self._messages.extend(loaded)
         saved_next = raw.get("next_message_id")
         max_id = max((message["id"] for message in loaded), default=0)
@@ -528,6 +554,8 @@ class WebBridge:
             self._next_message_id = max(saved_next, max_id + 1, 1)
         else:
             self._next_message_id = max(max_id + 1, 1)
+        if purged:
+            self._save_messages()
 
     def _save_messages(self) -> None:
         """Persist the current message log to ``messages.json``.
@@ -589,6 +617,9 @@ class WebBridge:
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        expires_at = record.get("expires_at")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+            expires_at = None
         wire_id = record.get("id")
         message = self._append_message(
             direction="in",
@@ -598,6 +629,7 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            expires_at=float(expires_at) if expires_at is not None else None,
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
         )
@@ -931,6 +963,7 @@ class WebBridge:
         text: str,
         *,
         timeout: float = 20.0,
+        expires_at: Optional[float] = None,
         reply_to: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
@@ -939,6 +972,12 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                raise ValueError("expires_at must be a number")
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite number")
         # Normalise up front so the recorded text is exactly what gets sent
         # (and is always UTF-8 encodable for the history file): the node
         # normalises again before sending, so this cannot change delivery.
@@ -954,7 +993,7 @@ class WebBridge:
         # buffers a report that beats the record, and the append below
         # reconciles it.
         response = self.node.send_message(
-            peer, text, timeout=timeout, in_reply_to=in_reply_to
+            peer, text, timeout=timeout, in_reply_to=in_reply_to, expires_at=expires_at
         )
         queued = bool(response.get("queued"))
         # The outbox id links this record to a later delivery; only
@@ -973,6 +1012,7 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
+                expires_at=expires_at,
                 wire_id=wire_id,
                 in_reply_to=in_reply_to,
             )
@@ -1126,8 +1166,25 @@ class WebBridge:
         return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        # Drop disappearing messages whose deadline has passed while the
+        # bridge is running, not only at startup, so snapshots and the
+        # live feed never show an expired entry.
+        now = time.time()
         with self._lock:
+            kept = [
+                message
+                for message in self._messages
+                if message.get("expires_at") is None
+                or float(message["expires_at"]) > now
+            ]
+            removed = len(kept) != len(self._messages)
+            if removed:
+                # _messages is a deque (no slice assignment): rebuild it.
+                self._messages.clear()
+                self._messages.extend(kept)
             items = list(self._messages)
+        if removed:
+            self._save_messages()
         if limit >= 0:
             items = items[-limit:]
         # Blocked senders' history stays stored but is hidden locally;
@@ -1285,6 +1342,7 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -1304,6 +1362,8 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if expires_at is not None:
+                message["expires_at"] = expires_at
             if wire_id is not None:
                 message["wire_id"] = wire_id
                 # A reaction may have arrived before this entry was
@@ -1378,6 +1438,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def _valid_expires_in(value: Any) -> bool:
+    """True when ``value`` is a finite lifetime in (0, MAX_MAIL_TTL] seconds.
+
+    Huge JSON integers overflow ``float()``, so the conversion is guarded
+    here instead of raising past the 400 response.
+    """
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL
 
 
 class _WebServer(ThreadingHTTPServer):
@@ -1639,6 +1712,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         target = body.get("to")
         text = body.get("text")
         timeout = body.get("timeout", 20.0)
+        expires_in = body.get("expires_in")
         if not isinstance(target, str) or not target.strip():
             self._send_json(
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
@@ -1652,6 +1726,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        expires_at = None
+        if expires_in is not None:
+            if (
+                not isinstance(expires_in, (int, float))
+                or isinstance(expires_in, bool)
+                or not _valid_expires_in(expires_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'expires_in' must be a number of "
+                            "seconds between 0 and 30 days"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            expires_at = time.time() + float(expires_in)
         reply_to = body.get("reply_to")
         if reply_to is not None and (
             not isinstance(reply_to, str) or not reply_to.strip()
@@ -1664,7 +1757,11 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             message, response = self.bridge.send_message(
-                target, text, timeout=timeout, reply_to=reply_to
+                target,
+                text,
+                timeout=timeout,
+                expires_at=expires_at,
+                reply_to=reply_to,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)

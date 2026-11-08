@@ -148,6 +148,13 @@ class OutboxEntry:
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
     held_by: Dict[str, float] = field(default_factory=dict)
+    # Sender-set expiry of the message itself, if any.  Distinct from
+    # ``expires_at`` (when the queue entry itself expires): a relayed
+    # copy is sealed with this deadline so the recipient purges the
+    # message on schedule, while a message with no sender-set expiry
+    # stays in the recipient's inbox even though its queue entry still
+    # has a TTL.
+    message_expires_at: Optional[float] = None
     in_reply_to: Optional[Dict[str, Any]] = None
 
     @property
@@ -196,6 +203,7 @@ class OutboxEntry:
             "last_error": self.last_error,
             "next_attempt_at": self.next_attempt_at,
             "held_by": dict(self.held_by),
+            "message_expires_at": self.message_expires_at,
         }
         if self.in_reply_to is not None:
             payload["in_reply_to"] = dict(self.in_reply_to)
@@ -224,6 +232,20 @@ class OutboxEntry:
         if not isinstance(held_by, dict):
             held_by = {}
         attempts = raw.get("attempts")
+        message_expires_at = raw.get("message_expires_at")
+        if isinstance(message_expires_at, bool) or not isinstance(
+            message_expires_at, (int, float)
+        ):
+            message_expires_at = None
+        else:
+            try:
+                message_expires_at = float(message_expires_at)
+            except (OverflowError, ValueError):
+                message_expires_at = None
+            if message_expires_at is not None and not math.isfinite(
+                message_expires_at
+            ):
+                message_expires_at = None
         try:
             in_reply_to = clean_in_reply_to(raw.get("in_reply_to"))
         except ValueError:
@@ -252,6 +274,7 @@ class OutboxEntry:
                 for k, v in held_by.items()
                 if isinstance(v, (int, float))
             },
+            message_expires_at=message_expires_at,
             in_reply_to=in_reply_to,
         )
 
@@ -633,15 +656,34 @@ class Mailbox:
         to_name: str = "",
         ttl: float = DEFAULT_TTL,
         message_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
         now: Optional[float] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
-        """Queue *text* for delivery to destination *to*."""
+        """Queue *text* for delivery to destination *to*.
+
+        ``expires_at`` is a sender-set message expiry (epoch seconds):
+        the entry expires at the earlier of the queue TTL and the
+        message expiry, so a queued ephemeral message — and any sealed
+        copy a holder deposits from it — is dropped at its deadline
+        instead of lingering for the full TTL.
+        """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
         entry_id = message_id or generate_message_id()
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(
+                expires_at, (int, float)
+            ):
+                raise MailboxError("expires_at must be a finite number")
+            try:
+                expires_at = float(expires_at)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError("expires_at must be a finite number") from exc
+            if not math.isfinite(expires_at):
+                raise MailboxError("expires_at must be a finite number")
         reply_to = clean_in_reply_to(in_reply_to)
         with self._transaction():
             existing = self._outbox.get(entry_id)
@@ -649,15 +691,21 @@ class Mailbox:
                 return existing
             if len(self._outbox) >= MAX_OUTBOX:
                 raise MailboxFull(f"outbox is full ({MAX_OUTBOX} messages)")
+            entry_expires_at = timestamp + max(
+                60.0, min(float(ttl), MAX_MAIL_TTL)
+            )
+            if expires_at is not None:
+                entry_expires_at = min(entry_expires_at, expires_at)
             entry = OutboxEntry(
                 id=entry_id,
                 to=bytes(to),
                 text=clean_text,
                 created_at=timestamp,
-                expires_at=timestamp + max(60.0, min(float(ttl), MAX_MAIL_TTL)),
+                expires_at=entry_expires_at,
                 to_name=sanitize_name(to_name, fallback="")
                 if to_name
                 else "",
+                message_expires_at=expires_at,
                 in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry
@@ -1031,13 +1079,16 @@ def seal_message(
     message_id: str,
     text: str,
     sent_at: float,
+    expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
     The plaintext envelope carries the sender's public key and a signature
     over every other field, so the recipient can authenticate the message
-    without trusting whichever peer happened to hold it.
+    without trusting whichever peer happened to hold it.  ``expires_at``
+    (when given) travels inside that signed envelope, so a holder cannot
+    extend a disappearing message's deadline.
     """
     if len(recipient_public_key) != _PUBLIC_KEY_BYTES:
         raise MailboxError("recipient public key must be 64 bytes")
@@ -1052,6 +1103,16 @@ def seal_message(
         "text": normalize_message(text),
         "sent_at": float(sent_at),
     }
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            raise MailboxError("expires_at must be a finite number")
+        try:
+            expires_at = float(expires_at)
+        except (OverflowError, ValueError) as exc:
+            raise MailboxError("expires_at must be a finite number") from exc
+        if not math.isfinite(expires_at):
+            raise MailboxError("expires_at must be a finite number")
+        inner["expires_at"] = expires_at
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         inner["in_reply_to"] = reply_to
@@ -1132,6 +1193,16 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
+    expires_at = payload.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            raise MailboxError("sealed message expires_at is invalid")
+        try:
+            expires_at = float(expires_at)
+        except (OverflowError, ValueError) as exc:
+            raise MailboxError("sealed message expires_at is invalid") from exc
+        if not math.isfinite(expires_at):
+            raise MailboxError("sealed message expires_at is invalid")
     try:
         in_reply_to = clean_in_reply_to(payload.get("in_reply_to"))
     except ProtocolError as exc:
@@ -1142,5 +1213,6 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+        "expires_at": expires_at,
         "in_reply_to": in_reply_to,
     }

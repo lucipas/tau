@@ -50,6 +50,7 @@ from .node import (
 from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
+    MAX_MAIL_TTL,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
@@ -332,6 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--reply-to",
         metavar="ID|PREFIX",
         help="quote an earlier message in this conversation (message id or unique prefix)",
+    )
+    send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
     send.set_defaults(func=cmd_send)
 
@@ -1146,6 +1153,38 @@ def _ago(seconds: float) -> str:
         return f"{seconds // 3600}h"
     return f"{seconds // 86400}d"
 
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _parse_duration(value: str) -> float:
+    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+
+    A bare number means seconds.  Returns the duration in seconds;
+    raises ``ValueError`` for anything unparseable, non-positive, or
+    longer than the mail TTL (a disappearing message cannot outlive
+    the store-and-forward envelope that might carry it).
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+    unit = 1.0
+    if text[-1] in _DURATION_UNITS:
+        unit = float(_DURATION_UNITS[text[-1]])
+        text = text[:-1]
+    try:
+        amount = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+        ) from exc
+    seconds = amount * unit
+    if not seconds > 0:
+        raise ValueError("--expire duration must be positive")
+    if seconds > MAX_MAIL_TTL:
+        raise ValueError("--expire duration must be at most 30d")
+    return seconds
 
 def _print_peer_table(
     peers: Iterable[Peer],
@@ -2961,6 +3000,10 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        expires_at = time.time() + _parse_duration(expire_text)
     node = TauNode(config, name=config.name)
     node.start()
     targets = args.to if isinstance(args.to, list) else [args.to]
@@ -3005,6 +3048,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                     discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
                     queue=not getattr(args, "no_queue", False),
                     in_reply_to=reply_to,
+                    expires_at=expires_at,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -3025,6 +3069,8 @@ def cmd_send(args: argparse.Namespace) -> int:
             # all, preserving the established single-recipient JSON shape.
             result = dict(response)
             result["target"] = target
+            if expires_at is not None:
+                result["expires_at"] = expires_at
             if response.get("queued"):
                 result["queued"] = (
                     isinstance(response.get("id"), str)
@@ -3050,6 +3096,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                             "delivered": True,
                             "id": message_id,
                             "to": to_hex,
+                            **(
+                                {"expires_at": expires_at}
+                                if expires_at is not None
+                                else {}
+                            ),
                         }
                     )
     finally:
@@ -3082,10 +3133,14 @@ def cmd_send(args: argparse.Namespace) -> int:
                 print(f"  id:      {result['id']}")
                 if reply_ids.get(target):
                     print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
             elif result.get("delivered"):
                 print(f"delivered to {target}")
                 if reply_ids.get(target):
                     print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
             else:
                 print(f"delivered to {target}")
                 if reply_ids.get(target):
@@ -3096,6 +3151,10 @@ def cmd_send(args: argparse.Namespace) -> int:
                 rtt = result.get("_rtt")
                 if isinstance(rtt, (int, float)):
                     print(f"round trip: {rtt * 1000:.0f} ms")
+                if result.get("expired"):
+                    print("  the receiver dropped it — past its expiry")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
         if any(result.get("queued") for result in results):
             print("  it will be delivered automatically when they are heard from;")
             print("  check `tau outbox` for the queue, or just leave a node serving")
@@ -3384,6 +3443,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
                     else str(reaction.get("from") or "unknown")
                 )
                 print(f"  {reaction.get('reaction')} {reactor_name}")
+            entry_expires_at = entry.get("expires_at")
+            if isinstance(entry_expires_at, (int, float)) and float(
+                entry_expires_at
+            ) > time.time():
+                print(
+                    f"  disappears in {_ago(float(entry_expires_at) - time.time())}"
+                )
         if more_unread:
             _print_more_unread(registry, more_unread)
     # Reading a conversation advances its cursor to the newest message

@@ -233,13 +233,18 @@ export function useTau() {
     [refreshOutbox],
   );
 
-  const send = useCallback(async (to: string, text: string, replyTo?: string) => {
-    const result = await apiPost<SendResponse>("/api/messages", {
-      to,
-      text,
-      ...(replyTo ? { reply_to: replyTo } : {}),
-    });
-    setMessages((previous) => {
+  const send = useCallback(
+    async (to: string, text: string, expiresIn?: number, replyTo?: string) => {
+      const body: {
+        to: string;
+        text: string;
+        expires_in?: number;
+        reply_to?: string;
+      } = { to, text };
+      if (expiresIn !== undefined) body.expires_in = expiresIn;
+      if (replyTo) body.reply_to = replyTo;
+      const result = await apiPost<SendResponse>("/api/messages", body);
+      setMessages((previous) => {
       if (previous.some((entry) => entry.id === result.message.id)) {
         return previous;
       }

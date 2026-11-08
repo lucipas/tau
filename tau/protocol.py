@@ -194,6 +194,25 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
     }
 
 
+def _clean_expires_at(value: Any) -> Optional[float]:
+    """Validate an optional message expiry timestamp.
+
+    ``None`` (absent) means the message never expires.  A present value
+    must be a finite number; anything else is a malformed payload.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolError("expires_at must be a finite number")
+    try:
+        expires_at = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ProtocolError("expires_at must be a finite number") from exc
+    if not math.isfinite(expires_at):
+        raise ProtocolError("expires_at must be a finite number")
+    return expires_at
+
+
 def generate_message_id() -> str:
     """Return a fresh random message identifier (32 hex characters)."""
     return uuid.uuid4().hex
@@ -367,9 +386,19 @@ def encode_message(
     *,
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
+    expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
-    """Encode a chat message for the ``/tau/message`` request."""
+    """Encode a chat message for the ``/tau/message`` request.
+
+    ``expires_at`` is an optional sender-set expiry (epoch seconds):
+    the receiver shows the deadline and purges the message once it
+    passes.  It is advisory — a modified client can keep copies — but
+    it travels inside the encrypted payload (and inside the signed
+    sealed envelope for relayed mail), so a relay cannot extend it.
+    ``in_reply_to`` optionally names the earlier message this one
+    quotes.
+    """
     payload = {
         "type": "message",
         "v": PROTOCOL_VERSION,
@@ -379,6 +408,9 @@ def encode_message(
     }
     if message_id:
         payload["id"] = message_id
+    cleaned_expires_at = _clean_expires_at(expires_at)
+    if cleaned_expires_at is not None:
+        payload["expires_at"] = cleaned_expires_at
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         payload["in_reply_to"] = reply_to
@@ -401,6 +433,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "text": text,
         "sent_at": sent_at,
         "id": message_id,
+        "expires_at": _clean_expires_at(payload.get("expires_at")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
     }
 

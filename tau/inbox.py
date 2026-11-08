@@ -93,6 +93,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
+    expires_at = raw.get("expires_at")
+    if expires_at is not None:
+        try:
+            expires_at = float(expires_at)
+        except (TypeError, ValueError):
+            expires_at = None
+        if expires_at is not None and not math.isfinite(expires_at):
+            expires_at = None
     direction = raw.get("direction")
     if direction not in ("in", "out"):
         direction = "in"
@@ -113,6 +121,7 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
         "relayed": bool(raw.get("relayed", False)),
+        "expires_at": expires_at,
         "direction": direction,
         "seq": seq,
     }
@@ -277,7 +286,10 @@ class Inbox:
         self._messages: List[Dict[str, Any]] = []
         self._reactions: List[Dict[str, Any]] = []
         self._read_cursors: Dict[str, Dict[str, Any]] = {}
-        self._load()
+        # Load (and purge) under the cross-process lock: a purge saves the
+        # file, which must not overwrite an append made by another process.
+        with self._transaction():
+            pass
 
     def _load(self) -> None:
         if self.path is None:
@@ -293,7 +305,14 @@ class Inbox:
             record = _valid_record(entry)
             if record is not None:
                 loaded.append(record)
-        self._messages = _retain(loaded)
+        now = time.time()
+        kept = [
+            record
+            for record in loaded
+            if record.get("expires_at") is None or record["expires_at"] > now
+        ]
+        purged = len(loaded) - len(kept)
+        self._messages = _retain(kept)
         _number_sequence(self._messages)
         reactions = raw.get("reactions")
         if isinstance(reactions, list):
@@ -319,6 +338,14 @@ class Inbox:
                         "last_read_id": entry.get("id"),
                     }
         self._read_cursors = cursors
+        if purged:
+            # Disappearing messages whose deadline passed are gone for
+            # good: persist the purge so a later load does not resurrect
+            # them, and so `tau messages` never shows an expired entry.
+            # Saved only now, with reactions and cursors loaded, so the
+            # write cannot clobber them.
+            log.info("Purged %d expired message(s) from the inbox", purged)
+            self._save()
 
     def _next_seq(self) -> int:
         """The sequence number for the next arrival (caller holds the lock)."""
