@@ -926,6 +926,22 @@ def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     post.  Only linked reactions count, like :func:`reaction_states`.
     """
     post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        # Like thread(): an unlinked entry is not shown, so its likers are not either.
+        raise TanError(f"post has not linked yet: {ref!r}")
+    # Like thread(): a reply beneath a deleted ancestor stays hidden.
+    current_entry = post
+    seen_ancestors = {current_entry["hash"]}
+    while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
+        parent = get_post(conn, str(current_entry["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent):
+            raise TanError(f"post has been deleted: {ref!r}")
+        seen_ancestors.add(parent["hash"])
+        current_entry = parent
     target = str(post["hash"])
     states = reaction_states(conn, [target]).get(target, {})
     current = [a for a, kind in states.items() if kind == KIND_LIKE]
