@@ -152,6 +152,32 @@ describe("useTan thread view", () => {
     expect(result.current.threadError).toBe("network down");
   });
 
+  it("reports a feed failure while opening a thread", async () => {
+    const root = makePost({ text: "root post" });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/thread")) {
+        return Promise.resolve({ posts: [root], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.reject(new Error("could not load the feed"));
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // The feed load fails before the thread request runs; the thread
+    // must report the failure instead of claiming to be empty.
+    await act(async () => {
+      await result.current.openThread(root.hash);
+    });
+    expect(result.current.threadRef).toBe(root.hash);
+    expect(result.current.threadPosts).toBeNull();
+    expect(result.current.threadLoading).toBe(false);
+    expect(result.current.threadError).toBe("could not load the feed");
+  });
+
   it("reloads the open thread after an action", async () => {
     const root = makePost({ text: "root post" });
     let feed: TanPost[] = [root];

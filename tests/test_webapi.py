@@ -449,6 +449,26 @@ def test_tan_thread_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_thread_unexpected_failure_is_500(tmp_path, monkeypatch):
+    node = FakeNode()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # An unexpected failure inside tan_thread is a server error,
+        # not a bad reference: the console must not read it as a
+        # deleted anchor and close the thread.
+        monkeypatch.setattr(
+            bridge,
+            "tan_thread",
+            lambda ref: (_ for _ in ()).throw(RuntimeError("database is locked")),
+        )
+        status, _, payload = _json(bridge, "/api/tan/thread?ref=abc12345")
+        assert status == 500
+        assert payload["error"]["message"] == "internal error"
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

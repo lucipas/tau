@@ -1101,7 +1101,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 try:
                     posts = self.bridge.tan_thread(ref.strip())
-                except Exception as exc:
+                except ValueError as exc:
+                    # Only an invalid reference is a client error; an
+                    # unexpected failure (a database error, say) must
+                    # reach the server-error handler as a 500, so the
+                    # console does not mistake it for a deleted anchor
+                    # and close the thread.
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)

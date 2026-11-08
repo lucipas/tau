@@ -165,7 +165,22 @@ export function useTan() {
       setThreadPosts(null);
       setThreadLoading(true);
       setThreadError(null);
-      await load();
+      try {
+        await load();
+      } catch (caught) {
+        // The feed load failed before the thread request ran, so the
+        // thread has no entries and no error of its own yet. Report
+        // the failure instead of leaving a thread view that claims
+        // to be empty. (A thread-fetch failure is caught inside
+        // `load` and never reaches this path.)
+        if (openThreadRef.current === ref) {
+          setThreadError(
+            caught instanceof Error
+              ? caught.message
+              : "could not load the thread",
+          );
+        }
+      }
     },
     [load],
   );
