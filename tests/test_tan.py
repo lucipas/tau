@@ -9,8 +9,8 @@ import pytest
 from tau.cli import main
 from tau.config import TauConfig
 from tau.peers import Peer
-from tau.tangents.rules import Ruleset
 from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
+from tau.tangents.rules import Ruleset
 from tau.tangents.tan import (
     HASH_FIELDS,
     TAN_EXPORT_FORMAT,
@@ -2335,79 +2335,6 @@ def test_top_posts_hides_deleted_muted_and_unlinked(identities, tmp_path):
     ]
 
 
-def test_cli_top(tmp_path, capsys):
-    data_dir = tmp_path / "alice"
-    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
-    assert (
-        main(
-            [
-                "tan",
-                "post",
-                "--data-dir",
-                str(data_dir),
-                "--no-publish",
-                "--json",
-                "first post",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    assert (
-        main(
-            [
-                "tan",
-                "post",
-                "--data-dir",
-                str(data_dir),
-                "--no-publish",
-                "--json",
-                "second post",
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-
-    # With no likes anywhere the ranking falls back to recency.
-    assert main(["tan", "top", "--data-dir", str(data_dir), "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert [post["text"] for post in payload["posts"]] == [
-        "second post",
-        "first post",
-    ]
-
-    # Liking the older post promotes it to the top, and --limit trims.
-    conn = init_db(data_dir / "tan.sqlite3")
-    try:
-        older = feed(conn, all_authors=True)[-1]
-    finally:
-        conn.close()
-    assert (
-        main(
-            [
-                "tan",
-                "like",
-                "--data-dir",
-                str(data_dir),
-                "--no-publish",
-                "--json",
-                older["hash"][:16],
-            ]
-        )
-        == 0
-    )
-    capsys.readouterr()
-    assert (
-        main(["tan", "top", "--data-dir", str(data_dir), "--json", "--limit", "1"])
-        == 0
-    )
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["count"] == 1
-    assert payload["posts"][0]["text"] == "first post"
-    assert payload["posts"][0]["likes"] == 1
-yone loves this",
-    ]
 
 
 def test_cli_top(tmp_path, capsys):
@@ -2481,3 +2408,22 @@ def test_cli_top(tmp_path, capsys):
     assert payload["count"] == 1
     assert payload["posts"][0]["text"] == "first post"
     assert payload["posts"][0]["likes"] == 1
+
+
+def test_top_posts_batches_reaction_lookups(identities, tmp_path):
+    # Codex P2 on PR #149: annotating every candidate in one
+    # `reaction_states` call passes all hashes to a single IN (...)
+    # query, which raises "too many SQL variables" past 999 posts on
+    # SQLite builds with the 999-variable limit. The ranking must
+    # batch the lookup like thread() does; this pins the ranking at
+    # real scale, past the limit and past several batches.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for index in range(1005):
+        create_post(conn, alice, f"post {index}", name="alice", now=1000 + index)
+    winner = create_post(conn, bob, "the winner", name="bob", now=3000)
+    create_reaction(conn, alice, winner["hash"], liked=True, name="alice", now=3001)
+
+    ranked = top_posts(conn, limit=1)
+    assert [post["text"] for post in ranked] == ["the winner"]
+    assert ranked[0]["likes"] == 1
