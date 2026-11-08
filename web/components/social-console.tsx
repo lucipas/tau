@@ -473,14 +473,16 @@ export function PostCard({
             >
               ↻ {post.reposts ?? 0}
             </span>
-            <button
-              type="button"
-              onClick={() => onReply(post)}
-              title="Reply to this post"
-              className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
-            >
-              reply
-            </button>
+            {post.kind !== "repost" ? (
+              <button
+                type="button"
+                onClick={() => onReply(post)}
+                title="Reply to this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                reply
+              </button>
+            ) : null}
             {post.own ? (
               deleting ? (
                 <button
