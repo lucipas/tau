@@ -51,6 +51,8 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
+    annotate_reactions,
+    annotate_replies,
     apply_display_rules,
     author_stats,
     author_timeline,
@@ -69,12 +71,15 @@ from .tangents.tan import (
     resolve_delete_target,
     resolve_muted_name,
     resolve_post,
+    save_post,
+    saved_posts,
     search_posts,
     thread,
     timeline,
     unfollow,
     unmute,
     unmute_keyword,
+    unsave_post,
 )
 
 log = logging.getLogger(__name__)
@@ -388,9 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
-    outbox_sub = outbox.add_subparsers(
-        dest="outbox_command", metavar="OUTBOX_COMMAND"
-    )
+    outbox_sub = outbox.add_subparsers(dest="outbox_command", metavar="OUTBOX_COMMAND")
 
     outbox_list = outbox_sub.add_parser(
         "list",
@@ -465,7 +468,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="allow direct messages from a peer (name, hash or prefix)",
     )
-    allowlist_add.add_argument("peer", help="peer name, destination hash or hash prefix")
+    allowlist_add.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
     allowlist_add.set_defaults(func=cmd_allowlist)
 
     allowlist_remove = allowlist_sub.add_parser(
@@ -521,7 +526,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="sign and store a post, then publish it to known peers",
     )
-    tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
+    tan_post.add_argument(
+        "text", nargs="?", help="post text (reads stdin when omitted)"
+    )
     tan_post.add_argument("--file", type=Path, help="read the post text from a file")
     tan_post.add_argument(
         "--reply-to",
@@ -568,12 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
         tan_react.add_argument(
             "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
         )
-        tan_react.add_argument(
-            "--timeout", type=float, default=15.0, metavar="SECONDS"
-        )
-        tan_react.set_defaults(
-            func=cmd_tan_like if verb == "like" else cmd_tan_unlike
-        )
+        tan_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+        tan_react.set_defaults(func=cmd_tan_like if verb == "like" else cmd_tan_unlike)
 
     tan_delete = tan_sub.add_parser(
         "delete",
@@ -595,12 +598,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="store locally without contacting peers",
     )
-    tan_delete.add_argument(
-        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
-    )
-    tan_delete.add_argument(
-        "--timeout", type=float, default=15.0, metavar="SECONDS"
-    )
+    tan_delete.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_delete.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_delete.set_defaults(func=cmd_tan_delete)
 
     tan_timeline = tan_sub.add_parser(
@@ -657,7 +656,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="show a post with its replies as a nested thread",
     )
     tan_thread.add_argument(
-        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+        "ref",
+        metavar="HASH|PREFIX",
+        help="post or reply hash (full hash or unique prefix)",
     )
     tan_thread.set_defaults(func=cmd_tan_thread)
 
@@ -690,9 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_unmute.add_argument("target", metavar="NAME|HASH")
     tan_unmute.set_defaults(func=cmd_tan_unmute)
 
-    tan_muted = tan_sub.add_parser(
-        "muted", parents=[common], help="list muted authors"
-    )
+    tan_muted = tan_sub.add_parser("muted", parents=[common], help="list muted authors")
     tan_muted.set_defaults(func=cmd_tan_muted)
 
     tan_mute_keyword = tan_sub.add_parser(
@@ -721,6 +720,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="list muted keywords",
     )
     tan_muted_keywords.set_defaults(func=cmd_tan_muted_keywords)
+
+    tan_save = tan_sub.add_parser(
+        "save", parents=[common], help="save a post to read later"
+    )
+    tan_save.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_save.set_defaults(func=cmd_tan_save)
+
+    tan_unsave = tan_sub.add_parser(
+        "unsave", parents=[common], help="remove a post from your saved list"
+    )
+    tan_unsave.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_unsave.set_defaults(func=cmd_tan_unsave)
+
+    tan_saved = tan_sub.add_parser(
+        "saved", parents=[common], help="list your saved posts"
+    )
+    tan_saved.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_saved.set_defaults(func=cmd_tan_saved)
 
     tan_sync = tan_sub.add_parser(
         "sync",
@@ -1096,7 +1123,7 @@ def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
     json_output: bool,
-    empty_message: str = "No posts yet. Try `tau tan post \"hello\"` or `tau tan sync --explore`.",
+    empty_message: str = 'No posts yet. Try `tau tan post "hello"` or `tau tan sync --explore`.',
 ) -> None:
     if json_output:
         _emit({"posts": list(posts), "count": len(posts)}, True)
@@ -1167,6 +1194,40 @@ def _print_tan_thread(
             print(f"{indent}  ♥ {likes}{suffix}")
 
 
+def _print_saved_posts(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+) -> None:
+    """Print saved posts, newest save first."""
+    if json_output:
+        _emit({"saved": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No saved posts yet. Try `tau tan save <hash>`.")
+        return
+    for post in posts:
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        saved = datetime.fromtimestamp(float(post.get("saved_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        print(f"  saved {saved}")
+        if post.get("deleted"):
+            print("  (deleted post)")
+            continue
+        for line in str(post.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+        likes = int(post.get("likes") or 0)
+        if likes or post.get("liked"):
+            suffix = " (you liked this)" if post.get("liked") else ""
+            print(f"  ♥ {likes}{suffix}")
+
+
 def _tan_identity(config: TauConfig) -> Any:
     identity = load_identity(config.identity_path)
     if identity is None:
@@ -1175,19 +1236,24 @@ def _tan_identity(config: TauConfig) -> Any:
 
 
 def _publish_local_post(
-    node: TauNode, *, text: str,
+    node: TauNode,
+    *,
+    text: str,
     reply_to: Optional[str] = None,
-    to: Optional[List[str]] = None, ttl: int = MAX_GOSSIP_TTL,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
-    publisher = TanApp(node.config, node.identity, name=node.name,
-                       request_timeout=float(timeout))
+    publisher = TanApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
     post = publisher.create_post(text, reply_to=reply_to)
-    published = publisher.publish(post, targets=targets,
-                                  ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)))
+    published = publisher.publish(
+        post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
     return {"post": post, "published": published}
 
 
@@ -1216,7 +1282,9 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             from .local_publish import publish_running
 
             result = publish_running(
-                config.data_dir, text=text, reply_to=reply_to,
+                config.data_dir,
+                text=text,
+                reply_to=reply_to,
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
@@ -1225,12 +1293,16 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         else:
             try:
                 app = TanApp(
-                    config, node.identity, name=config.name,
+                    config,
+                    node.identity,
+                    name=config.name,
                     request_timeout=float(getattr(args, "timeout", 15.0)),
                 )
                 node.attach_app(app)
                 result = _publish_local_post(
-                    node, text=text, reply_to=reply_to,
+                    node,
+                    text=text,
+                    reply_to=reply_to,
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
@@ -1289,7 +1361,9 @@ def _cmd_tan_react(args: argparse.Namespace, *, liked: bool) -> int:
             published = app.publish(
                 record,
                 targets=targets,
-                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                ttl=max(
+                    0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)
+                ),
             )
         finally:
             node.stop()
@@ -1350,7 +1424,9 @@ def cmd_tan_delete(args: argparse.Namespace) -> int:
             published = app.publish(
                 record,
                 targets=targets,
-                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                ttl=max(
+                    0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)
+                ),
             )
         finally:
             node.stop()
@@ -1689,6 +1765,62 @@ def cmd_tan_muted_keywords(args: argparse.Namespace) -> int:
             )
             print(f"{record['display']} (muted {when})")
     return _EXIT_OK
+
+
+def cmd_tan_save(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = save_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record.get("already_saved"):
+            when = datetime.fromtimestamp(float(record["saved_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"already saved {short_hash(str(record['hash']))} at {when}")
+        else:
+            print(f"saved {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_unsave(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = unsave_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record["unsaved"]:
+            print(f"unsaved {short_hash(str(record['hash']))}")
+        else:
+            print(f"was not saved: {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_saved(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        posts = saved_posts(conn, limit=args.limit)
+        posts = annotate_replies(conn, annotate_reactions(conn, posts, viewer=viewer))
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_saved_posts(posts, json_output=json_output)
     return _EXIT_OK
 
 
@@ -1762,7 +1894,9 @@ def cmd_tan_rules(args: argparse.Namespace) -> int:
     else:
         print(f"Tan admission rules ({config.tan_rules_path}):")
         print(f"  default: {data['default']}")
-        print(f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}")
+        print(
+            f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}"
+        )
         kinds = data["kinds"]
         print(
             f"  kinds displayed: {', '.join(kinds) if kinds else 'all'}"
@@ -1977,12 +2111,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             check_web_console_bind(host, port)
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc
-    node.start(
-        announce=not getattr(args, "no_announce", False), exclusive=True
-    )
+    node.start(announce=not getattr(args, "no_announce", False), exclusive=True)
 
     social_app = None
     if getattr(args, "social", False):
+
         def on_tan_post(record: Dict[str, Any]) -> None:
             if _json_mode(args):
                 _emit_event(args, "post", post=record)
@@ -1999,7 +2132,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 try:
                     bridge.record_tan_post(record)
                 except Exception:  # pragma: no cover - optional web layer
-                    log.debug("Could not forward Tan post to web console", exc_info=True)
+                    log.debug(
+                        "Could not forward Tan post to web console", exc_info=True
+                    )
 
         social_app = TanApp(
             config,
@@ -2023,10 +2158,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
 
-    social_interval = max(
-        0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0)
-    )
+    social_interval = max(0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0))
     if social_app is not None and social_interval > 0:
+
         def social_sync_loop() -> None:
             while not stop.wait(social_interval):
                 try:
@@ -2034,9 +2168,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         node, limit=DEFAULT_FEED_LIMIT, explore=True
                     )
                     if summary.get("stored"):
-                        log.info(
-                            "Tan sync stored %s new post(s)", summary["stored"]
-                        )
+                        log.info("Tan sync stored %s new post(s)", summary["stored"])
                 except Exception:  # pragma: no cover - network dependent
                     log.warning("Tan background sync failed", exc_info=True)
 
@@ -2174,9 +2306,7 @@ def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
     node.start()
     try:
         target = getattr(args, "to", None)
-        targets = (
-            [node.resolve_peer(target)] if target else node.registry.all()
-        )
+        targets = [node.resolve_peer(target)] if target else node.registry.all()
         results: List[Dict[str, Any]] = []
         for peer in targets:
             try:
@@ -2191,7 +2321,9 @@ def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
                     }
                 )
                 continue
-            results.append({"peer": peer.hexhash, "name": peer.display_name, "ok": True, **summary})
+            results.append(
+                {"peer": peer.hexhash, "name": peer.display_name, "ok": True, **summary}
+            )
         totals = {
             key: sum(int(r.get(key, 0)) for r in results if r.get("ok"))
             for key in ("added", "updated", "skipped")
@@ -2307,7 +2439,9 @@ def cmd_id_import(args: argparse.Namespace) -> int:
     except Exception as exc:
         # A backup file is untrusted input: any parse failure is a bad backup.
         raise NodeError(f"not a valid identity backup: {exc}") from exc
-    if identity is None:  # pragma: no cover - load_identity returns None only when missing
+    if (
+        identity is None
+    ):  # pragma: no cover - load_identity returns None only when missing
         raise NodeError(f"no identity backup at {source}")
     config.prepare()
     # Hold the instance lock across the whole replacement: a node that
@@ -2454,9 +2588,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
 
 
 def _is_hex32(value: str) -> bool:
-    return len(value) == 32 and all(
-        char in "0123456789abcdefABCDEF" for char in value
-    )
+    return len(value) == 32 and all(char in "0123456789abcdefABCDEF" for char in value)
 
 
 def _format_message_time(timestamp: float) -> str:
@@ -2467,9 +2599,7 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
-def _resolve_inbox_peer(
-    inbox: Inbox, registry: PeerRegistry, target: str
-) -> str:
+def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
@@ -2492,22 +2622,16 @@ def _resolve_inbox_peer(
         )
     if len(target) >= 4:
         prefix = target.casefold()
-        senders = {
-            peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)
-        }
+        senders = {peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)}
         senders |= {
             str(entry.get("destination") or "").casefold()
             for entry in inbox.list_messages(limit=None)
-            if str(entry.get("destination") or "")
-            .casefold()
-            .startswith(prefix)
+            if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
         if len(senders) == 1:
             return senders.pop()
         if len(senders) > 1:
-            raise NodeError(
-                f"{len(senders)} senders match the hash prefix {target!r}"
-            )
+            raise NodeError(f"{len(senders)} senders match the hash prefix {target!r}")
     raise NodeError(f"unknown peer: {target!r}")
 
 
@@ -2537,6 +2661,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* characters of *ref* with control characters dropped.
 
@@ -2718,9 +2844,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
     # expired, or delivered by another process — never counted delivered.
     queued_before = {e.id: e for e in mailbox.outbox_list()}
     delivered_ids: Set[str] = set()
-    node = TauNode(
-        config, name=config.name, on_delivered=delivered_ids.add
-    )
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start(mail_loop=False)
     try:
         summary = node.flush_outbox(
@@ -2815,7 +2939,9 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 next_text = "now"
             else:
                 next_text = f"in {_ago(next_try - time.time())}"
-            print(f"still queued: {label} (attempt {fresh.attempts}, next try {next_text})")
+            print(
+                f"still queued: {label} (attempt {fresh.attempts}, next try {next_text})"
+            )
             if deposited:
                 print(
                     f"  left a sealed copy with {deposited} peer(s)"

@@ -298,6 +298,9 @@ Global options may appear before or after the command:
 | `tau tan mute PEER` | Hide an author's posts from local views |
 | `tau tan unmute PEER` | Show a muted author's posts again |
 | `tau tan muted` | List muted authors |
+| `tau tan save POST` | Save a post to read later (local only, never published) |
+| `tau tan unsave POST` | Remove a post from your saved list |
+| `tau tan saved` | List your saved posts, newest first |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
