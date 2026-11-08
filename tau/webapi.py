@@ -6,7 +6,10 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
-    POST /api/messages     send ``{"to": "...", "text": "..."}``
+    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
+                           ``"expires_in"`` seconds for a disappearing message)
+    POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
+                           or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
@@ -31,6 +34,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import mimetypes
 import queue
 import socket
@@ -46,12 +50,17 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
+from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
+    MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
+    clean_in_reply_to,
+    clean_reaction,
+    excerpt_hash,
     normalize_message,
     sanitize_name,
     short_hash,
@@ -242,6 +251,29 @@ class EventBus:
                 pass
 
 
+def _clean_stored_reaction(entry: Any) -> Optional[Dict[str, Any]]:
+    """Validate one reaction stored on a console history entry.
+
+    Returns a normalised copy, or ``None`` when the entry is not a
+    recognisable reaction (corrupt or hand-edited history never blocks
+    startup; the bad entry is simply dropped).
+    """
+    if not isinstance(entry, dict):
+        return None
+    reactor = entry.get("reactor")
+    name = entry.get("name")
+    reaction = entry.get("reaction")
+    if (
+        not isinstance(reactor, str)
+        or not reactor
+        or not isinstance(name, str)
+        or not isinstance(reaction, str)
+        or not reaction
+    ):
+        return None
+    return {"reactor": reactor, "name": name, "reaction": reaction}
+
+
 def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     """Validate one message record loaded from ``messages.json``.
 
@@ -298,6 +330,17 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "status": status,
     }
+    expires_at = entry.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return None
+        try:
+            expires_at = float(expires_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(expires_at):
+            return None
+        message["expires_at"] = expires_at
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
@@ -311,6 +354,22 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # Kept so a message still queued across a restart can be matched
         # when its delivery is reported.
         message["mail_id"] = mail_id
+    wire_id = entry.get("wire_id")
+    if isinstance(wire_id, str) and wire_id:
+        # The Reticulum message id: how replies name this message, and
+        # how reactions (which name their target by wire id) attach to
+        # the right history entry.
+        message["wire_id"] = wire_id
+    reactions = entry.get("reactions")
+    if isinstance(reactions, list):
+        cleaned = [_clean_stored_reaction(item) for item in reactions]
+        message["reactions"] = [item for item in cleaned if item is not None]
+    try:
+        in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
+    except ValueError:
+        in_reply_to = None
+    if in_reply_to is not None:
+        message["in_reply_to"] = in_reply_to
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -318,6 +377,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         json.dumps(message, ensure_ascii=False).encode("utf-8")
     except (UnicodeEncodeError, ValueError):
         return None
+    # The hash is derived from the validated text, never trusted from
+    # the file: a hand-edited messages.json that changes the text but
+    # keeps the old hash must not make a changed quote look verified.
+    # Records written before hashes existed get one here. It is computed
+    # after the UTF-8 check above, because hashing a lone surrogate
+    # would raise instead of dropping the entry.
+    message["excerpt_hash"] = excerpt_hash(text)
     return message
 
 
@@ -383,11 +449,33 @@ class WebBridge:
                 )
 
         node.on_read = _on_read
+        # Reactions arrive on the same node callback pattern: chain any
+        # reaction callback the node already has, then annotate the
+        # console history entry the reaction targets.
+        previous_on_reaction = getattr(node, "on_reaction", None)
+
+        def _on_reaction(record: Dict[str, Any]) -> None:
+            try:
+                if callable(previous_on_reaction):
+                    previous_on_reaction(record)
+            finally:
+                self.record_reaction(record)
+
+        node.on_reaction = _on_reaction
 
         self.bus = EventBus()
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Latest reaction per (target, reactor), kept even when the target
+        # is not in history yet: a reaction can beat the console append of
+        # its target, and the append seeds the message from this state.
+        self._reaction_state: List[Dict[str, Any]] = []
+        # Unread counts are stamped with an ever-increasing revision so
+        # the console can drop a queued or delayed count older than one
+        # it already applied.
+        self._unread_lock = threading.Lock()
+        self._unread_revision = 0
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -479,6 +567,18 @@ class WebBridge:
             if message is not None:
                 loaded.append(message)
         loaded = loaded[-MAX_MESSAGE_LOG:]
+        # Disappearing messages whose deadline passed are gone for good:
+        # drop them here (and persist the purge below) so a restarted
+        # console never resurrects them.
+        now = time.time()
+        kept = [
+            message
+            for message in loaded
+            if message.get("expires_at") is None
+            or float(message["expires_at"]) > now
+        ]
+        purged = len(loaded) - len(kept)
+        loaded = kept
         self._messages.extend(loaded)
         saved_next = raw.get("next_message_id")
         max_id = max((message["id"] for message in loaded), default=0)
@@ -486,6 +586,8 @@ class WebBridge:
             self._next_message_id = max(saved_next, max_id + 1, 1)
         else:
             self._next_message_id = max(max_id + 1, 1)
+        if purged:
+            self._save_messages()
 
     def _save_messages(self) -> None:
         """Persist the current message log to ``messages.json``.
@@ -529,13 +631,27 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        # local_dict: the console replaces its snapshot record with this
+        # event, so it must carry the same trust fields — a public_dict
+        # event would silently drop the verified badge and any key-change
+        # warning until the next snapshot load.
+        payload = peer.local_dict()
+        # Annotate like the snapshot does, so a live update does not
+        # erase the frontend's blocked badge for this peer.
+        blocklist = getattr(self.node, "blocklist", None)
+        payload["blocked"] = bool(
+            blocklist is not None and blocklist.is_blocked(payload.get("destination"))
+        )
+        self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        expires_at = record.get("expires_at")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+            expires_at = None
         wire_id = record.get("id")
         message = self._append_message(
             direction="in",
@@ -545,9 +661,15 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
-            mail_id=wire_id if isinstance(wire_id, str) else None,
+            expires_at=float(expires_at) if expires_at is not None else None,
+            wire_id=wire_id if isinstance(wire_id, str) else None,
+            in_reply_to=record.get("in_reply_to"),
         )
-        self.bus.publish({"type": "message", "message": message})
+        # The node appends to its inbox before this callback runs, so
+        # the unread total already includes the new message.
+        self.bus.publish(
+            {"type": "message", "message": message, "unread": self.unread()}
+        )
         # A live console is showing the thread view, so this message
         # counts as displayed: send its read receipt.  With nobody
         # subscribed the receipt waits for a snapshot serve instead.
@@ -612,13 +734,17 @@ class WebBridge:
         with self._send_lock:
             with self._lock:
                 for message in self._messages:
-                    if (
-                        message.get("direction") != "out"
-                        or message.get("peer") != reader_hash
-                        or message.get("mail_id") not in wanted
+                    if message.get("direction") != "out" or (
+                        message.get("peer") != reader_hash
                     ):
                         continue
-                    matched.add(message["mail_id"])
+                    # Queued records are named by their outbox id and
+                    # every record by its wire id; a receipt names the
+                    # wire id, which for queued mail is the outbox id.
+                    record_id = message.get("wire_id") or message.get("mail_id")
+                    if record_id not in wanted:
+                        continue
+                    matched.add(record_id)
                     if message.get("status") == "read":
                         continue
                     message["status"] = "read"
@@ -656,7 +782,8 @@ class WebBridge:
             pending = [
                 dict(message)
                 for message in self._messages
-                if message.get("direction") == "in" and message.get("mail_id")
+                if message.get("direction") == "in"
+                and (message.get("wire_id") or message.get("mail_id"))
             ]
         if not pending:
             return
@@ -670,7 +797,7 @@ class WebBridge:
             return
         by_peer: Dict[str, List[str]] = {}
         for message in pending:
-            mail_id = message["mail_id"]
+            mail_id = message.get("wire_id") or message["mail_id"]
             if mail_id not in wanted:
                 continue
             peer = message.get("peer")
@@ -726,6 +853,57 @@ class WebBridge:
             target=_send, name="tau-read-receipts", daemon=True
         ).start()
 
+    def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Attach a reaction to the console history entry it targets.
+
+        Reactions name their target by wire id, which history entries
+        now carry.  Per (message, reactor) the latest reaction wins —
+        the same resolution as the inbox — and an empty token retracts.
+        A reaction whose target is not in this console's history (sent
+        from the CLI, or predating wire ids) is dropped: the node inbox
+        still keeps it, so ``tau messages`` shows it.  The updated
+        entry is re-sent as ``message_updated``, which the console
+        already renders in place.
+        """
+        target = record.get("target")
+        token = record.get("reaction")
+        reactor = record.get("destination")
+        name = record.get("from")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(reactor, str)
+            or not reactor
+            or not isinstance(token, str)
+        ):
+            return None
+        entry = {
+            "target": target,
+            "destination": reactor,
+            "reaction": token,
+            "from": name if isinstance(name, str) else "unknown",
+            "sent_at": _as_float(record.get("sent_at")),
+            "id": record.get("id") if isinstance(record.get("id"), str) else None,
+        }
+        updated: Optional[Dict[str, Any]] = None
+        with self._lock:
+            if not merge_reaction(self._reaction_state, entry):
+                return None
+            self._reaction_state = self._reaction_state[-MAX_REACTIONS:]
+            for message in self._messages:
+                if message.get("wire_id") != target:
+                    continue
+                message["reactions"] = _with_reaction(
+                    message.get("reactions") or [], reactor, entry
+                )
+                updated = dict(message)
+                break
+        if updated is None:
+            return None
+        self._save_messages()
+        self.bus.publish({"type": "message_updated", "message": updated})
+        return updated
+
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
         with self._lock:
@@ -760,15 +938,24 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_quote_counts,
+            annotate_quotes,
             annotate_reactions,
             annotate_replies,
             apply_display_rules,
-            feed,
+            author_timeline,
             following,
             resolve_author,
             timeline,
         )
 
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.  A list that
+        # failed closed (block_all) hides every post here, matching
+        # the gate, which drops every DM on the same condition.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -781,21 +968,35 @@ class WebBridge:
                 )
             if author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
-                posts = list(
-                    reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
-                    )
-                )
-                posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                posts = author_timeline(
+                    conn,
+                    target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
                 )
             elif include_all:
-                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    include_all=True,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             else:
                 authors = [record["author"] for record in following(conn)]
                 if viewer is not None:
                     authors.append(viewer)
-                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    authors,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -892,12 +1093,52 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def _resolve_console_reply(
+        self, peer_hash: str, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a console ``reply_to`` wire id to an ``in_reply_to``.
+
+        The quoted message must be in this conversation — same peer in
+        the console history, matched by full id or unique prefix — so a
+        reply never dangles at a message from another peer or one the
+        console never saw.
+        """
+        if reply_to is None:
+            return None
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            raise ValueError("field 'reply_to' must be a message id")
+        ref = reply_to.strip().lower()
+        with self._lock:
+            matches = [
+                message
+                for message in self._messages
+                if message.get("peer") == peer_hash
+                and isinstance(message.get("wire_id"), str)
+                and str(message["wire_id"]).lower().startswith(ref)
+            ]
+        if not matches:
+            raise ValueError(
+                f"no message {reply_to.strip()!r} in this conversation to reply to"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} messages in this conversation match"
+                f" {reply_to.strip()!r}; use a longer id"
+            )
+        quoted = matches[0]
+        return {
+            "id": str(quoted["wire_id"]),
+            "excerpt": excerpt_hash(str(quoted.get("text") or "")),
+        }
+
     def send_message(
         self,
         target: str,
         text: str,
         *,
         timeout: float = 20.0,
+        expires_at: Optional[float] = None,
+        reply_to: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -905,12 +1146,19 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                raise ValueError("expires_at must be a number")
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite number")
         # Normalise up front so the recorded text is exactly what gets sent
         # (and is always UTF-8 encodable for the history file): the node
         # normalises again before sending, so this cannot change delivery.
         text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        in_reply_to = self._resolve_console_reply(peer.hexhash, reply_to)
         # The send lock is NOT held across the network send: queueing
         # starts a flush thread that can deliver the entry (and report
         # it via record_delivery) before the record below exists, and
@@ -918,12 +1166,14 @@ class WebBridge:
         # delivery report behind this send. Instead, record_delivery
         # buffers a report that beats the record, and the append below
         # reconciles it.
-        response = self.node.send_message(peer, text, timeout=timeout)
+        response = self.node.send_message(
+            peer, text, timeout=timeout, in_reply_to=in_reply_to, expires_at=expires_at
+        )
         queued = bool(response.get("queued"))
-        # The wire id links this record to later delivery and read
-        # reports; the direct response carries it too, so a directly
-        # sent message can still be marked read.
-        mail_id = response.get("id")
+        # The outbox id links this record to a later delivery; only
+        # present while the message is queued.
+        mail_id = response.get("id") if queued else None
+        wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         flipped = False
         early_read: Optional[float] = None
         with self._send_lock:
@@ -937,27 +1187,85 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
+                expires_at=expires_at,
+                wire_id=wire_id,
+                in_reply_to=in_reply_to,
             )
-            if mail_id is not None:
-                with self._lock:
-                    if mail_id in self._early_deliveries:
-                        del self._early_deliveries[mail_id]
-                        message["status"] = "delivered"
-                        flipped = True
-                    early_read = self._early_reads.pop((peer.hexhash, mail_id), None)
-                if early_read is not None:
-                    # A read receipt beat the record; it is the later state.
-                    message["status"] = "read"
-                    message["read_at"] = early_read
+            with self._lock:
+                if mail_id is not None and mail_id in self._early_deliveries:
+                    del self._early_deliveries[mail_id]
+                    message["status"] = "delivered"
                     flipped = True
-                if flipped:
-                    self._save_messages()
+                read_key = wire_id or mail_id
+                if read_key is not None:
+                    early_read = self._early_reads.pop(
+                        (peer.hexhash, read_key), None
+                    )
+            if early_read is not None:
+                # A read receipt beat the record; it is the later state.
+                message["status"] = "read"
+                message["read_at"] = early_read
+                flipped = True
+            if flipped:
+                self._save_messages()
         self.bus.publish({"type": "message", "message": message})
         if flipped:
             self.bus.publish(
                 {"type": "message_updated", "message": dict(message)}
             )
         return message, response
+
+    def react(
+        self,
+        target: str,
+        reaction: Optional[str] = None,
+        *,
+        clear: bool = False,
+        timeout: float = 20.0,
+    ) -> Dict[str, Any]:
+        """React to a DM from the console, by its wire id.
+
+        The target is resolved from this console's history first (it
+        covers both directions: an inbound message reacts to its author,
+        an outbound one to its recipient) and then from the node inbox,
+        which keeps received messages past the console's window.  The
+        outgoing reaction is recorded locally by the node, so the
+        console annotates the entry through the same ``message_updated``
+        event as an inbound reaction.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target message id is required")
+        if clear and reaction is not None:
+            raise ValueError("give a reaction, or clear it (not both)")
+        if not clear and (not isinstance(reaction, str) or not reaction.strip()):
+            raise ValueError("a reaction is required")
+        token = clean_reaction("" if clear else reaction)
+        target = target.strip()
+        peer: Optional[str] = None
+        with self._lock:
+            for message in self._messages:
+                if message.get("wire_id") == target:
+                    peer = message.get("peer")
+                    break
+        if peer is None:
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is None:
+                raise ValueError(f"unknown message: {target!r}")
+            try:
+                record = inbox.resolve(target)
+            except ValueError as exc:
+                raise ValueError(f"unknown message: {target!r}") from exc
+            peer = record.get("destination")
+        if not peer:
+            raise ValueError("that message has no known peer to react to")
+        response = self.node.send_reaction(peer, target, token, timeout=timeout)
+        return {
+            "ok": True,
+            "target": target,
+            "reaction": token,
+            "cleared": clear,
+            "id": response.get("id"),
+        }
 
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
@@ -1025,22 +1333,169 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            # local_dict: verification is this node's own trust state, so
+            # it is shown to the console owner but never sent to peers.
+            items = [peer.local_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
+        blocklist = getattr(self.node, "blocklist", None)
+        for item in items:
+            # is_blocked covers the fail-closed case too: with a
+            # corrupt list every peer reads as blocked, matching the
+            # DM gate, which drops every message then.
+            item["blocked"] = bool(
+                blocklist is not None
+                and blocklist.is_blocked(item.get("destination"))
+            )
+        return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        # Drop disappearing messages whose deadline has passed while the
+        # bridge is running, not only at startup, so snapshots and the
+        # live feed never show an expired entry.
+        now = time.time()
         with self._lock:
+            kept = [
+                message
+                for message in self._messages
+                if message.get("expires_at") is None
+                or float(message["expires_at"]) > now
+            ]
+            removed = len(kept) != len(self._messages)
+            if removed:
+                # _messages is a deque (no slice assignment): rebuild it.
+                self._messages.clear()
+                self._messages.extend(kept)
             items = list(self._messages)
+        if removed:
+            self._save_messages()
         if limit >= 0:
             items = items[-limit:]
-        return items
+        # Blocked senders' history stays stored but is hidden locally;
+        # unblocking restores the view.  Inbound records carry the
+        # sender hash as "destination" (node inbox) or "peer" (console
+        # log); outbound records carry the recipient, which blocking
+        # never hides.  is_blocked covers the fail-closed case too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None:
+            items = [
+                item
+                for item in items
+                if item.get("direction") != "in"
+                or not blocklist.is_blocked(
+                    item.get("destination") or item.get("peer")
+                )
+            ]
+        by_target = self._inbox_reactions_by_target()
+        return [
+            self._with_inbox_reactions(dict(item), by_target) for item in items
+        ]
+
+    def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Node inbox reactions grouped by target, reloaded once per read.
+
+        One reload serves the whole listing: reloading per message
+        would take the cross-process lock and re-read ``inbox.json``
+        once per history entry.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return {}
+        try:
+            reactions = inbox.all_reactions()
+        except Exception:  # pragma: no cover - defensive
+            return {}
+        by_target: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in reactions:
+            target = entry.get("target")
+            if isinstance(target, str) and target:
+                by_target.setdefault(target, []).append(entry)
+        return by_target
+
+    def _with_inbox_reactions(
+        self, message: Dict[str, Any], by_target: Dict[str, List[Dict[str, Any]]]
+    ) -> Dict[str, Any]:
+        """Overlay the node inbox's reaction state on one history entry.
+
+        The bridge learns reactions live through its own node's callback,
+        but a reaction made from another process (``tau react`` from the
+        CLI) only lands in the shared ``inbox.json``.  The inbox is the
+        durable authority — per reactor its entry wins over the bridge's
+        live state (the two agree for live traffic; the inbox additionally
+        holds the CLI-made ones, in ``sent_at`` order) — so every read of
+        the history shows the current state.  A live push to an already
+        open console tab for a CLI-made reaction is still a follow-up:
+        this reconciles reads, not the SSE stream.
+        """
+        wire_id = message.get("wire_id")
+        if not wire_id:
+            return message
+        stored = by_target.get(wire_id)
+        if not stored:
+            return message
+        merged: Dict[str, Dict[str, Any]] = {
+            str(item.get("reactor")): dict(item)
+            for item in message.get("reactions") or []
+            if item.get("reactor")
+        }
+        for entry in stored:
+            reactor = str(entry.get("destination") or "")
+            if not reactor:
+                continue
+            if entry.get("reaction"):
+                merged[reactor] = {
+                    "reactor": reactor,
+                    "name": str(entry.get("from") or "unknown"),
+                    "reaction": entry["reaction"],
+                }
+            else:
+                merged.pop(reactor, None)
+        message["reactions"] = list(merged.values())
+        return message
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
+
+    def _stamp_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the next revision to *counts* (caller holds ``_unread_lock``)."""
+        self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
+        return dict(counts, revision=self._unread_revision)
+
+    def unread(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the node inbox.
+
+        A node without an inbox (tests, embeds) simply has nothing
+        unread; read state is local to this node either way.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                try:
+                    counts = inbox.unread_counts()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not read inbox unread counts", exc_info=True)
+            return self._stamp_unread(counts)
+
+    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Advance the inbox read cursor for one conversation, or all.
+
+        The console calls this when a conversation is opened, so its
+        unread badge clears; other tabs learn from the ``unread`` SSE
+        event.  Read state never leaves this node.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                counts = inbox.mark_read(peer=peer)
+            stamped = self._stamp_unread(counts)
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
 
     def snapshot(self) -> Dict[str, Any]:
         return {
@@ -1048,6 +1503,7 @@ class WebBridge:
             "peers": self.peers(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
+            "unread": self.unread(),
             "bridge": {
                 "version": __version__,
                 "web": self.web_dir is not None,
@@ -1071,6 +1527,9 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        wire_id: Optional[str] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -1082,11 +1541,27 @@ class WebBridge:
                 "sent_at": sent_at,
                 "received_at": received_at,
                 "status": status,
+                "reactions": [],
             }
             if rtt is not None:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if expires_at is not None:
+                message["expires_at"] = expires_at
+            if wire_id is not None:
+                message["wire_id"] = wire_id
+                # A reaction may have arrived before this entry was
+                # appended; apply the latest known state for it now.
+                for entry in self._reaction_state:
+                    if entry["target"] == wire_id and entry["reaction"]:
+                        message["reactions"] = _with_reaction(
+                            message["reactions"], entry["destination"], entry
+                        )
+            message["excerpt_hash"] = excerpt_hash(text)
+            reply_to = clean_in_reply_to(in_reply_to)
+            if reply_to is not None:
+                message["in_reply_to"] = reply_to
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1128,10 +1603,39 @@ def _has_hidden_part(path: Path, base: Path) -> bool:
     return any(part.startswith(".") for part in parts)
 
 
+def _with_reaction(
+    reactions: List[Dict[str, Any]], reactor: str, entry: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Return a message's reaction list with the reactor's choice set.
+
+    Drops the reactor's previous entry; a retraction (empty token) leaves
+    none, while a reaction appends one carrying the reactor's name.
+    """
+    kept = [item for item in reactions if item.get("reactor") != reactor]
+    if entry["reaction"]:
+        kept.append(
+            {"reactor": reactor, "name": entry["from"], "reaction": entry["reaction"]}
+        )
+    return kept
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def _valid_expires_in(value: Any) -> bool:
+    """True when ``value`` is a finite lifetime in (0, MAX_MAIL_TTL] seconds.
+
+    Huge JSON integers overflow ``float()``, so the conversion is guarded
+    here instead of raising past the 400 response.
+    """
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL
 
 
 class _WebServer(ThreadingHTTPServer):
@@ -1254,6 +1758,25 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages":
                 self._handle_send(body, head_only)
                 return
+            if path == "/api/react":
+                self._handle_react(body, head_only)
+                return
+            if path == "/api/messages/read":
+                peer = body.get("peer")
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                counts = self.bridge.mark_read(
+                    peer.strip() if isinstance(peer, str) else None
+                )
+                self._send_json({"ok": True, "unread": counts}, head_only)
+                return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
@@ -1374,6 +1897,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         target = body.get("to")
         text = body.get("text")
         timeout = body.get("timeout", 20.0)
+        expires_in = body.get("expires_in")
         if not isinstance(target, str) or not target.strip():
             self._send_json(
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
@@ -1387,8 +1911,43 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        expires_at = None
+        if expires_in is not None:
+            if (
+                not isinstance(expires_in, (int, float))
+                or isinstance(expires_in, bool)
+                or not _valid_expires_in(expires_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'expires_in' must be a number of "
+                            "seconds between 0 and 30 days"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            expires_at = time.time() + float(expires_in)
+        reply_to = body.get("reply_to")
+        if reply_to is not None and (
+            not isinstance(reply_to, str) or not reply_to.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'reply_to' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
         try:
-            message, response = self.bridge.send_message(target, text, timeout=timeout)
+            message, response = self.bridge.send_message(
+                target,
+                text,
+                timeout=timeout,
+                expires_at=expires_at,
+                reply_to=reply_to,
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
@@ -1401,6 +1960,43 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only
         )
+
+    def _handle_react(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target")
+        reaction = body.get("reaction")
+        clear = bool(body.get("clear", False))
+        timeout = body.get("timeout", 20.0)
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if reaction is not None and not isinstance(reaction, str):
+            self._send_json(
+                {"error": {"message": "field 'reaction' must be a string"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 20.0
+        timeout = max(1.0, min(float(timeout), 120.0))
+        try:
+            result = self.bridge.react(
+                target.strip(), reaction, clear=clear, timeout=timeout
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
 
     def _handle_outbox_cancel(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("target") or body.get("id")

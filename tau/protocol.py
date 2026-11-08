@@ -19,6 +19,7 @@ or buggy peer must not be able to make us buffer large amounts of data.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import time
@@ -38,6 +39,10 @@ DEFAULT_TCP_PORT = 4343
 
 MAX_NAME_LENGTH = 48
 MAX_MESSAGE_CHARS = 2000
+# A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
+# never an image or a URL.  32 characters leaves room for a multi-codepoint
+# emoji sequence while keeping the reaction far inside the request budget.
+MAX_REACTION_CHARS = 32
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ANNOUNCE_MAX_BYTES = 256
@@ -55,6 +60,7 @@ REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
 REQUEST_READ = "/tau/read"
+REQUEST_REACT = "/tau/react"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
@@ -63,6 +69,7 @@ REQUEST_PATHS = (
     REQUEST_INFO,
     REQUEST_MESSAGE,
     REQUEST_READ,
+    REQUEST_REACT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
@@ -196,9 +203,191 @@ def parse_announce(app_data: Any) -> Dict[str, Any]:
     }
 
 
+def _clean_expires_at(value: Any) -> Optional[float]:
+    """Validate an optional message expiry timestamp.
+
+    ``None`` (absent) means the message never expires.  A present value
+    must be a finite number; anything else is a malformed payload.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolError("expires_at must be a finite number")
+    try:
+        expires_at = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ProtocolError("expires_at must be a finite number") from exc
+    if not math.isfinite(expires_at):
+        raise ProtocolError("expires_at must be a finite number")
+    return expires_at
+
+
 def generate_message_id() -> str:
     """Return a fresh random message identifier (32 hex characters)."""
     return uuid.uuid4().hex
+
+
+def clean_reaction(value: Any) -> str:
+    """Validate a reaction token, or ``""`` when it retracts one.
+
+    A reaction is a unicode emoji or a short text token: printable
+    characters only, at most :data:`MAX_REACTION_CHARS` long.  An empty
+    (or whitespace-only) value is a retraction, not an error — ``tau
+    react <id> --clear`` sends exactly that.  Anything else raises
+    :class:`ProtocolError`.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ProtocolError("reaction must be a string")
+    cleaned = _clean_text(value).strip()
+    if len(cleaned) > MAX_REACTION_CHARS:
+        raise ProtocolError(
+            f"reaction is longer than {MAX_REACTION_CHARS} characters"
+        )
+    return cleaned
+
+
+def reaction_dict(
+    target: str,
+    reaction: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/react`` payload as a dict, unsigned unless signed.
+
+    The signature — when present — covers every other field, exactly
+    like a sealed mail envelope: the sender signs the canonical
+    encoding of the payload without ``"sig"`` and attaches the base64
+    signature, so the receiver can verify attribution against the link
+    identity independently of the transport.
+    """
+    target = _clean_message_id(target)
+    payload: Dict[str, Any] = {
+        "type": "reaction",
+        "v": PROTOCOL_VERSION,
+        "target": target,
+        "reaction": clean_reaction(reaction),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if message_id:
+        payload["id"] = message_id
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_reaction(
+    target: str,
+    reaction: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM reaction for the ``/tau/react`` request.
+
+    ``target`` names the reacted-to message id; ``reaction`` is the token
+    from :func:`clean_reaction` (``""`` retracts the reactor's reaction).
+    ``signature`` is the base64 signature over the canonical unsigned
+    payload; see :func:`reaction_dict`.
+    """
+    return encode(
+        reaction_dict(
+            target,
+            reaction,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_reaction(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/react`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "reaction":
+        raise ProtocolError("expected a reaction payload")
+    target = _clean_message_id(payload.get("target"))
+    if "reaction" not in payload:
+        raise ProtocolError("reaction payload is missing 'reaction'")
+    reaction = clean_reaction(payload.get("reaction"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("reaction signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "reaction signature is not valid base64"
+            ) from exc
+    return {
+        "target": target,
+        "reaction": reaction,
+        "sent_at": sent_at,
+        "id": message_id,
+        "sig": signature,
+    }
+
+
+def reaction_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of a reaction payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+def excerpt_hash(text: str) -> str:
+    """Short hash of a quoted message's text (first 16 hex of SHA-256).
+
+    A reply carries this alongside the quoted message id so the
+    receiver can check the copy it renders against what the sender
+    quoted, without trusting any excerpt text on the wire.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate an ``in_reply_to`` reference, or ``None`` when absent.
+
+    The reference names a message id and, optionally, the excerpt hash
+    of the text the sender quoted.  A malformed reference is a protocol
+    error — the sender is either buggy or trying to smuggle junk past
+    the size budget — while a missing one simply means a standalone
+    message.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ProtocolError("in_reply_to must be an object")
+    message_id = value.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        raise ProtocolError("in_reply_to id must be a string of 1-64 characters")
+    excerpt = value.get("excerpt")
+    if excerpt is not None:
+        if (
+            not isinstance(excerpt, str)
+            or not excerpt
+            or len(excerpt) > 32
+            or any(char not in "0123456789abcdef" for char in excerpt.lower())
+        ):
+            raise ProtocolError("in_reply_to excerpt must be a short hex hash")
+        excerpt = excerpt.lower()
+    return {"id": message_id, "excerpt": excerpt}
 
 
 def encode_message(
@@ -206,8 +395,19 @@ def encode_message(
     *,
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
+    expires_at: Optional[float] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
-    """Encode a chat message for the ``/tau/message`` request."""
+    """Encode a chat message for the ``/tau/message`` request.
+
+    ``expires_at`` is an optional sender-set expiry (epoch seconds):
+    the receiver shows the deadline and purges the message once it
+    passes.  It is advisory — a modified client can keep copies — but
+    it travels inside the encrypted payload (and inside the signed
+    sealed envelope for relayed mail), so a relay cannot extend it.
+    ``in_reply_to`` optionally names the earlier message this one
+    quotes.
+    """
     payload = {
         "type": "message",
         "v": PROTOCOL_VERSION,
@@ -217,6 +417,12 @@ def encode_message(
     }
     if message_id:
         payload["id"] = message_id
+    cleaned_expires_at = _clean_expires_at(expires_at)
+    if cleaned_expires_at is not None:
+        payload["expires_at"] = cleaned_expires_at
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -232,7 +438,13 @@ def parse_message(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
-    return {"text": text, "sent_at": sent_at, "id": message_id}
+    return {
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "expires_at": _clean_expires_at(payload.get("expires_at")),
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+    }
 
 
 def build_read_receipt(
