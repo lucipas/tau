@@ -411,7 +411,10 @@ resolves to exactly one peer; an alias that looks like a destination hash
 or hash prefix (four or more hex characters) is rejected, so an alias can
 never be mistaken for a hash target. A running node picks up aliases set
 while it serves at its next registry save. Remove one with
-`tau peers unalias PEER`.
+`tau peers unalias PEER`. The DM allow-list is the exception to alias
+resolution: `tau allowlist add` matches asserted names, hashes, and hash
+prefixes only, and lists asserted names, so a local label can never
+stand in for who was actually allowed.
 
 ### Messaging
 

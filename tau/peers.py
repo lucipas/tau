@@ -227,8 +227,15 @@ class PeerRegistry:
                     return peer
             return None
 
-    def resolve(self, target: Union[bytes, str]) -> Optional[Peer]:
-        """Resolve a destination hash, hash prefix, peer name or alias."""
+    def resolve(
+        self, target: Union[bytes, str], *, include_alias: bool = True
+    ) -> Optional[Peer]:
+        """Resolve a destination hash, hash prefix, peer name or alias.
+
+        Pass ``include_alias=False`` for security boundaries such as the
+        allow-list, where a local label must never stand in for the
+        peer's asserted name.
+        """
         if isinstance(target, bytes):
             if len(target) != DESTINATION_HASH_BYTES:
                 raise PeerError("destination hash must be 16 bytes")
@@ -245,16 +252,19 @@ class PeerRegistry:
         with self._lock:
             peers = list(self._peers.values())
 
-        by_alias = [
-            p for p in peers if p.alias and p.alias.casefold() == value.casefold()
-        ]
-        if len(by_alias) == 1:
-            return by_alias[0]
-        if len(by_alias) > 1:
-            raise AmbiguousPeer(
-                f"{len(by_alias)} peers share the alias {value!r}; "
-                "use a destination hash"
-            )
+        if include_alias:
+            by_alias = [
+                p
+                for p in peers
+                if p.alias and p.alias.casefold() == value.casefold()
+            ]
+            if len(by_alias) == 1:
+                return by_alias[0]
+            if len(by_alias) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_alias)} peers share the alias {value!r}; "
+                    "use a destination hash"
+                )
 
         by_name = [p for p in peers if p.name.casefold() == value.casefold()]
         if len(by_name) == 1:

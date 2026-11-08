@@ -611,3 +611,17 @@ def test_refresh_aliases_ignores_unknown_peers_and_missing_keys(tmp_path):
 
     assert registry.refresh_aliases() == 0
     assert registry.get(peer.destination_hash).alias is None
+
+
+def test_resolve_can_exclude_aliases(tmp_path):
+    registry = PeerRegistry()
+    named = make_peer(registry, 18, "laptop", now=100.0)
+    aliased = make_peer(registry, 19, "dave", now=200.0)
+    registry.set_alias(aliased.hexhash, "laptop")
+    # Aliases win by default...
+    assert registry.resolve("laptop") is aliased
+    # ...but a security boundary can ask for asserted names only.
+    assert registry.resolve("laptop", include_alias=False) is named
+    assert registry.resolve("LAPTOP", include_alias=False) is named
+    assert registry.resolve("dave", include_alias=False) is aliased
+    assert registry.resolve("laptop", include_alias=True) is aliased

@@ -1426,3 +1426,36 @@ def test_parser_peers_alias_arguments():
     plain = parser.parse_args(["peers"])
     assert plain.command == "peers"
     assert plain.peers_command is None
+
+
+def test_allowlist_add_ignores_aliases_and_lists_asserted_names(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    # A second peer aliased "alice" must not be the one allow-listed when
+    # the operator names "alice".
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = RNS.Identity()
+    other_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(other_hash, identity.get_public_key(), name="carol", now=200.0)
+    registry.set_alias(other_hash, "alice")
+    registry.save()
+
+    code = cli.main(["allowlist", "add", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        ["allowlist", "list", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        peer_hash.hex()
+    ]
+    assert [entry["name"] for entry in payload["entries"]] == ["alice"]
+
+    code = cli.main(["allowlist", "list", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"{peer_hash.hex()} (alice)" in out
+    assert "carol" not in out

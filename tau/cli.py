@@ -2669,8 +2669,13 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
 
 
 def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
-    """Resolve a peer name, hash or prefix to a destination hash."""
-    peer = registry.resolve(value)
+    """Resolve a peer name, hash or prefix to a destination hash.
+
+    Aliases are excluded on purpose: the allow-list is a security
+    boundary, so a local label must never stand in for the peer's
+    asserted name.
+    """
+    peer = registry.resolve(value, include_alias=False)
     if peer is not None:
         return peer.hexhash
     try:
@@ -2718,7 +2723,9 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
         peer = registry.get(destination)
         return {
             "destination": destination,
-            "name": peer.display_name if peer is not None else "",
+            # The asserted name, not the local alias: the operator must
+            # see who was actually allowed, and an alias could mask that.
+            "name": peer.name if peer is not None else "",
         }
 
     if json_output:
@@ -2733,7 +2740,7 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
             print("  no senders listed — when enforced, nobody may message this node")
         for entry in sorted(allowlist.allow):
             peer = registry.get(entry)
-            name = f" ({peer.display_name})" if peer is not None else ""
+            name = f" ({peer.name})" if peer is not None else ""
             print(f"  {entry}{name}")
         if changed:
             print("  (a running serve applies saved changes when it restarts)")
