@@ -41,6 +41,7 @@ from tau.tangents.tan import (
     search_posts,
     store,
     store_post,
+    suggest_authors,
     thread,
     timeline,
     unfollow,
@@ -171,6 +172,140 @@ def test_follow_and_timeline(identities, tmp_path):
     assert unfollow(conn, bob_post["author"]) is True
     assert following(conn) == []
     assert timeline(conn, []) == []
+
+
+def test_suggest_authors_ranks_followed_engagement(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    carol_post = create_post(conn, carol, "carol here", name="carol", now=1000)
+    create_post(conn, dave, "dave here", name="dave", now=1001)
+    create_post(conn, alice, "alice here", name="alice", now=1002)
+    follow(conn, author_of(bob), name="bob")
+    create_reaction(conn, bob, carol_post["hash"], liked=True, name="bob", now=1003)
+
+    suggestions = suggest_authors(conn, viewer=author_of(alice))
+    assert [item["author"] for item in suggestions] == [
+        author_of(carol),
+        author_of(dave),
+    ]
+    assert suggestions[0]["name"] == "carol"
+    assert suggestions[0]["posts"] == 1
+    assert suggestions[0]["likes"] == 1
+    assert suggestions[0]["engagers"] == ["bob"]
+    assert "liked by bob" in suggestions[0]["reason"]
+    # Dave has posts but no engagement, so he still ranks — last, at zero.
+    assert suggestions[1]["score"] == 0
+    assert "1 post(s)" in suggestions[1]["reason"]
+
+
+def test_suggest_authors_counts_replies_and_unlikes(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    carol_post = create_post(conn, carol, "carol here", name="carol", now=1000)
+    follow(conn, author_of(bob), name="bob")
+    create_reply(conn, bob, carol_post["hash"], "nice one", name="bob", now=1001)
+    # An unlike from the same followed author still counts as engagement
+    # via the reply, but the withdrawn like no longer counts as a like.
+    create_reaction(conn, bob, carol_post["hash"], liked=True, name="bob", now=1002)
+    create_reaction(conn, bob, carol_post["hash"], liked=False, name="bob", now=1003)
+
+    suggestions = suggest_authors(conn, viewer=author_of(alice))
+    assert len(suggestions) == 1
+    assert suggestions[0]["author"] == author_of(carol)
+    assert suggestions[0]["likes"] == 0
+    assert suggestions[0]["engagers"] == ["bob"]
+    assert "replied to by bob" in suggestions[0]["reason"]
+
+
+def test_suggest_authors_skips_followed_self_deleted_and_unlinked(
+    identities, tmp_path
+):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "mine", name="alice", now=1000)
+    followed_post = create_post(conn, bob, "followed", name="bob", now=1001)
+    follow(conn, followed_post["author"], name="bob")
+    deleted_post = create_post(conn, carol, "gone", name="carol", now=1002)
+    create_delete(conn, carol, deleted_post["hash"], name="carol", now=1003)
+
+    # Carol's only remaining entry is the delete, so she has no candidate
+    # posts — and neither the viewer nor a followed author is suggested.
+    assert suggest_authors(conn, viewer=author_of(alice)) == []
+
+    # An unlinked post (chain head missing) does not make its author a
+    # candidate either.
+    source = init_db(tmp_path / "source.sqlite3")
+    eve = RNS.Identity()
+    create_post(source, eve, "first", name="eve", now=1000)
+    second = create_post(source, eve, "second", name="eve", now=1001)
+    store_post(conn, second)
+    assert suggest_authors(conn, viewer=author_of(alice)) == []
+
+
+def test_suggest_authors_limit_and_no_follow_fallback(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    carol_post = create_post(conn, carol, "popular", name="carol", now=1000)
+    dave_post = create_post(conn, dave, "quieter", name="dave", now=1001)
+    create_reaction(conn, alice, carol_post["hash"], liked=True, name="alice", now=1002)
+    create_reaction(conn, bob, carol_post["hash"], liked=True, name="bob", now=1003)
+    create_reaction(conn, alice, dave_post["hash"], liked=True, name="alice", now=1004)
+
+    # No follows: the most-liked cached authors come first.
+    suggestions = suggest_authors(conn, viewer=author_of(alice))
+    assert [item["author"] for item in suggestions] == [
+        author_of(carol),
+        author_of(dave),
+    ]
+    assert suggestions[0]["likes"] == 2
+    assert "2 like(s)" in suggestions[0]["reason"]
+    assert [item["author"] for item in suggest_authors(conn, limit=1)] == [
+        author_of(carol)
+    ]
+    assert suggest_authors(conn, limit=0) == []
+
+
+def test_cli_tan_suggest(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        carol = RNS.Identity()
+        bob = RNS.Identity()
+        carol_post = create_post(conn, carol, "carol here", name="carol", now=1000)
+        create_post(conn, bob, "bob here", name="bob", now=1001)
+        follow(conn, author_of(bob), name="bob")
+        create_reaction(conn, bob, carol_post["hash"], liked=True, name="bob", now=1002)
+    finally:
+        conn.close()
+
+    assert (
+        main(["tan", "suggest", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["suggestions"][0]["name"] == "carol"
+    assert payload["suggestions"][0]["engagers"] == ["bob"]
+
+    # Text output names the suggestion and its reason.
+    assert main(["tan", "suggest", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "carol" in out
+    assert "liked by bob" in out
+
+    # A fresh node with nothing cached gets a clean empty result.
+    empty_dir = tmp_path / "empty"
+    assert main(["init", "--data-dir", str(empty_dir), "--name", "nobody"]) == 0
+    capsys.readouterr()
+    assert main(["tan", "suggest", "--data-dir", str(empty_dir)]) == 0
+    assert "No suggestions yet" in capsys.readouterr().out
 
 
 def test_feed_paginates_by_sequence(identities, tmp_path):

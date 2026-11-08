@@ -111,6 +111,10 @@ SIG_HEX_LENGTH = 128
 MAX_POST_CHARS = MAX_MESSAGE_CHARS
 MAX_FEED_POSTS = 20
 DEFAULT_FEED_LIMIT = 20
+DEFAULT_SUGGEST_LIMIT = 5
+# Weight of one distinct followed author engaging with a candidate, in
+# suggestion score points; one like on the candidate's posts is worth 1.
+SUGGEST_FOLLOWED_WEIGHT = 2
 MAX_FOLLOWS = 512
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
@@ -1523,6 +1527,119 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def suggest_authors(
+    conn: sqlite3.Connection,
+    *,
+    viewer: Optional[str] = None,
+    limit: int = DEFAULT_SUGGEST_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Rank cached authors the viewer does not follow yet.
+
+    Candidates are authors with at least one linked, non-deleted post or
+    reply in the local store, excluding followed authors and the viewer.
+    Each candidate scores ``SUGGEST_FOLLOWED_WEIGHT`` per distinct author
+    the viewer follows who liked or replied to one of the candidate's
+    posts, plus one per like on the candidate's posts (so a like from a
+    followed author counts in both terms). With no follows the ranking
+    degrades to the most-liked cached authors. Ties break by most recent
+    post, then author hash, so the order is stable.
+    """
+    followed = {record["author"]: record["name"] for record in following(conn)}
+    excluded = set(followed)
+    if viewer is not None:
+        excluded.add(_require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer"))
+    limit = max(0, int(limit))
+    if limit == 0:
+        return []
+
+    candidates: Dict[str, Dict[str, Any]] = {}
+    rows = conn.execute(
+        "SELECT author, name, created_at FROM posts "
+        "WHERE linked = 1 AND kind IN ('post', 'reply') "
+        f"AND {_NOT_DELETED} ORDER BY created_at DESC"
+    ).fetchall()
+    for row in rows:
+        # Rows arrive newest-first, so the first row per author carries
+        # the name on their latest post.
+        author = str(row["author"])
+        if author in excluded or author in candidates:
+            continue
+        candidates[author] = {
+            "author": author,
+            "name": str(row["name"] or ""),
+            "last_post": float(row["created_at"]),
+        }
+
+    for author, candidate in candidates.items():
+        hashes = [
+            str(row["hash"])
+            for row in conn.execute(
+                "SELECT hash FROM posts WHERE author = ? AND linked = 1 "
+                f"AND kind = 'post' AND {_NOT_DELETED}",
+                (author,),
+            ).fetchall()
+        ]
+        states = reaction_states(conn, hashes)
+        likers: Set[str] = set()
+        for reactors in states.values():
+            likers.update(
+                reactor for reactor, kind in reactors.items() if kind == KIND_LIKE
+            )
+        followed_likers = sorted(a for a in likers if a in followed)
+        followed_repliers: List[str] = []
+        if hashes:
+            placeholders = ", ".join("?" for _ in hashes)
+            repliers = {
+                str(row["author"])
+                for row in conn.execute(
+                    "SELECT DISTINCT author FROM posts WHERE kind = 'reply' "
+                    f"AND linked = 1 AND {_NOT_DELETED} "
+                    f"AND target IN ({placeholders})",
+                    hashes,
+                ).fetchall()
+            }
+            followed_repliers = sorted(a for a in repliers if a in followed)
+        engagers = sorted(set(followed_likers) | set(followed_repliers))
+        candidate["posts"] = len(hashes)
+        candidate["likes"] = len(likers)
+        candidate["score"] = SUGGEST_FOLLOWED_WEIGHT * len(engagers) + len(likers)
+        candidate["engagers"] = [_engager_name(a, followed) for a in engagers]
+        reasons: List[str] = []
+        if followed_likers:
+            reasons.append("liked by " + _format_engagers(followed_likers, followed))
+        if followed_repliers:
+            reasons.append(
+                "replied to by " + _format_engagers(followed_repliers, followed)
+            )
+        if likers:
+            reasons.append(f"{len(likers)} like(s)")
+        if not reasons:
+            reasons.append(f"{len(hashes)} post(s)")
+        candidate["reason"] = "; ".join(reasons)
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (-item["score"], -item["last_post"], item["author"]),
+    )
+    return ranked[:limit]
+
+
+def _engager_name(author: str, followed: Dict[str, str]) -> str:
+    """Display name for a followed engager, falling back to a short hash."""
+    name = followed.get(author) or ""
+    if name:
+        return name
+    return author[:8]
+
+
+def _format_engagers(authors: List[str], followed: Dict[str, str]) -> str:
+    """Comma-joined engager names, capped so the reason stays one line."""
+    names = [_engager_name(author, followed) for author in authors]
+    if len(names) > 2:
+        return ", ".join(names[:2]) + f", and {len(names) - 2} more"
+    return ", ".join(names)
 
 
 def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:

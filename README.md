@@ -272,6 +272,7 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan suggest` | Suggest authors to follow, from who the authors you follow engage with |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
@@ -648,7 +649,7 @@ unlinked, and stall sync at the gap.
 - Natural extensions: group destinations, file transfer using Reticulum
   resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (media, moderation, follow recommendations).
+  (media, moderation).
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
   console); `tau id` shows this node's own address. Nothing is sent over

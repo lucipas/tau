@@ -48,6 +48,7 @@ from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
+    DEFAULT_SUGGEST_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
@@ -66,6 +67,7 @@ from .tangents.tan import (
     resolve_delete_target,
     resolve_post,
     search_posts,
+    suggest_authors,
     thread,
     timeline,
     unfollow,
@@ -657,6 +659,20 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_suggest = tan_sub.add_parser(
+        "suggest",
+        parents=[common],
+        help="suggest authors to follow, from who the authors you follow engage with",
+    )
+    tan_suggest.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_SUGGEST_LIMIT,
+        metavar="N",
+        help="maximum suggestions (default: %(default)s)",
+    )
+    tan_suggest.set_defaults(func=cmd_tan_suggest)
 
     tan_sync = tan_sub.add_parser(
         "sync",
@@ -1452,6 +1468,32 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
             print(
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
+            )
+    return _EXIT_OK
+
+
+def cmd_tan_suggest(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        suggestions = suggest_authors(conn, viewer=viewer, limit=args.limit)
+    finally:
+        conn.close()
+
+    if json_output:
+        _emit({"suggestions": suggestions, "count": len(suggestions)}, True)
+    else:
+        if not suggestions:
+            print("No suggestions yet. Follow an author or sync more posts first.")
+        for item in suggestions:
+            name = item.get("name") or "unknown"
+            print(
+                f"{name:<20} {short_hash(item['author']):<10} "
+                f"{item.get('posts', 0)} post(s), {item.get('likes', 0)} like(s) "
+                f"— {item.get('reason', '')}"
             )
     return _EXIT_OK
 
