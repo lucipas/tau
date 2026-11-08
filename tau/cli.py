@@ -53,6 +53,7 @@ from .protocol import (
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
+    clean_reaction,
     excerpt_hash,
     short_hash,
 )
@@ -333,6 +334,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="quote an earlier message in this conversation (message id or unique prefix)",
     )
     send.set_defaults(func=cmd_send)
+
+    react = subparsers.add_parser(
+        "react",
+        parents=[common],
+        help="react to a received message",
+    )
+    react.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    react.add_argument(
+        "reaction",
+        nargs="?",
+        help="emoji or short text token, e.g. 👍 or +1 (omit with --clear)",
+    )
+    react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    react.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    react.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    react.set_defaults(func=cmd_react)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -3331,12 +3362,28 @@ def cmd_messages(args: argparse.Namespace) -> int:
             sender = short_hash(str(entry.get("destination") or ""))
             when = _format_message_time(float(entry.get("received_at", 0)))
             marker = "● " if entry.get("unread") else ""
-            print(f"{marker}[{when}] {name} ({sender})")
+            # The short id is what `tau react` takes: without it the
+            # listing gives the user no way to name a message to react to.
+            message_id = entry.get("id")
+            id_suffix = (
+                f" #{_safe_id_prefix(str(message_id))}"
+                if isinstance(message_id, str) and message_id
+                else ""
+            )
+            print(f"{marker}[{when}] {name} ({sender}){id_suffix}")
             quote = _quote_line(inbox, registry, entry)
             if quote is not None:
                 print(f"  {quote}")
             for line in str(entry.get("text", "")).splitlines() or [""]:
                 print(f"  {line}")
+            for reaction in entry.get("reactions") or []:
+                reactor = registry.get(str(reaction.get("destination") or ""))
+                reactor_name = (
+                    reactor.display_name
+                    if reactor is not None
+                    else str(reaction.get("from") or "unknown")
+                )
+                print(f"  {reaction.get('reaction')} {reactor_name}")
         if more_unread:
             _print_more_unread(registry, more_unread)
     # Reading a conversation advances its cursor to the newest message
@@ -3361,6 +3408,73 @@ def cmd_messages(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_react(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "clear", False)) == bool(getattr(args, "reaction", None)):
+        raise NodeError("give a reaction, or --clear to retract it (not both)")
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to react to")
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known sender to react to")
+    if getattr(args, "clear", False):
+        token = ""
+    else:
+        # Validate the token before starting the node: a bad token is a
+        # usage error, not a delivery failure.  A blank argument cleans to
+        # the retraction token, so reject it unless --clear was given.
+        token = clean_reaction(str(args.reaction))
+        if not token:
+            raise NodeError("reaction is empty; use --clear to retract it")
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        try:
+            response = node.send_reaction(
+                author,
+                str(target["id"]),
+                token,
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        except NodeError as exc:
+            # Reactions ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver reaction: {exc} "
+                "(reactions need the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "reaction": token,
+                "cleared": not token,
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif not token:
+        print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    else:
+        print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
 def _print_more_unread(
     registry: PeerRegistry, more_unread: Dict[str, int]
 ) -> None:
@@ -3376,12 +3490,16 @@ def _print_more_unread(
 
 
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
-    """First *length* characters of *ref* with control characters dropped.
+    """First *length* printable characters of *ref*.
 
     Held ids arrive from remote senders and may contain terminal escapes
     or newlines; never print them verbatim. JSON output keeps the raw id.
+    Non-printable characters are dropped from the full id first, then
+    the result is truncated — so the tag is always a true prefix of the
+    stored id that ``Inbox.resolve`` can match.
     """
-    return "".join(char for char in ref[:length] if char.isprintable())
+    cleaned = "".join(char for char in ref if char.isprintable())
+    return cleaned[:length]
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:

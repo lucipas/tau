@@ -26,7 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 try:  # POSIX only; the cross-process lock is a no-op without it.
     import fcntl
@@ -40,6 +40,12 @@ log = logging.getLogger(__name__)
 
 INBOX_FILE_NAME = "inbox.json"
 MAX_INBOX = 500
+# Reactions are keyed by (target message, reactor): the latest entry per
+# pair wins, so the store stays small, but a hostile peer could still
+# spray reactions at made-up targets.  Cap the total and drop the
+# oldest first; a reaction whose target is not in the inbox is stored
+# but never rendered, so spraying buys the sender nothing visible.
+MAX_REACTIONS = 1000
 # Sent records have their own cap so outgoing DMs never evict received ones.
 MAX_INBOX_SENT = 500
 
@@ -183,6 +189,80 @@ def _is_unread(entry: Dict[str, Any], cursor: Optional[Dict[str, Any]]) -> bool:
     return entry["seq"] > cursor["last_read_seq"]
 
 
+def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
+    """Normalize one stored reaction, or ``None`` when it is unusable.
+
+    A reaction names the target message id, the reactor's destination
+    hash, and the token.  An empty token is a retraction tombstone: it
+    IS stored (see :func:`merge_reaction`), so a late older reaction
+    cannot resurrect a reaction the reactor already retracted.
+    Non-finite timestamps are normalized the same way message records
+    are: a bad ``sent_at`` becomes 0.0, a bad ``received_at`` drops the
+    entry.
+    """
+    if not isinstance(raw, dict):
+        return None
+    target = raw.get("target")
+    if not isinstance(target, str) or not target or len(target) > 64:
+        return None
+    destination = raw.get("destination")
+    if not isinstance(destination, str) or not destination:
+        return None
+    reaction = raw.get("reaction")
+    if not isinstance(reaction, str):
+        return None
+    try:
+        sent_at = float(raw.get("sent_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    received_at = raw.get("received_at")
+    try:
+        received_at = float(received_at) if received_at is not None else time.time()
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sent_at):
+        sent_at = 0.0
+    if not math.isfinite(received_at):
+        return None
+    return {
+        "target": target,
+        "destination": destination,
+        "from": str(raw.get("from") or "unknown"),
+        "reaction": reaction,
+        "sent_at": sent_at,
+        "received_at": received_at,
+        "id": raw.get("id"),
+    }
+
+
+def reaction_order(entry: Dict[str, Any]) -> Tuple[float, str]:
+    """Ordering key for competing reactions from one reactor on one target."""
+    return (float(entry.get("sent_at") or 0.0), str(entry.get("id") or ""))
+
+
+def merge_reaction(items: List[Dict[str, Any]], entry: Dict[str, Any]) -> bool:
+    """Apply ``entry`` to a reaction list in place, latest per reactor wins.
+
+    One entry is kept per (target, destination).  The newer entry, ordered
+    by ``(sent_at, id)``, replaces the stored one; an equal order replaces
+    too, so a replayed reaction is idempotent.  A strictly older entry is
+    ignored and ``False`` is returned.  Empty-token tombstones are kept
+    like any other entry.  Shared by the inbox and the web console so both
+    resolve reactions the same way.
+    """
+    for index, item in enumerate(items):
+        if (
+            item["target"] == entry["target"]
+            and item["destination"] == entry["destination"]
+        ):
+            if reaction_order(entry) < reaction_order(item):
+                return False
+            del items[index]
+            break
+    items.append(entry)
+    return True
+
+
 class Inbox:
     """Received direct messages, persisted in the node data directory.
 
@@ -195,6 +275,7 @@ class Inbox:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.Lock()
         self._messages: List[Dict[str, Any]] = []
+        self._reactions: List[Dict[str, Any]] = []
         self._read_cursors: Dict[str, Dict[str, Any]] = {}
         self._load()
 
@@ -214,6 +295,14 @@ class Inbox:
                 loaded.append(record)
         self._messages = _retain(loaded)
         _number_sequence(self._messages)
+        reactions = raw.get("reactions")
+        if isinstance(reactions, list):
+            stored = []
+            for entry in reactions:
+                record = _valid_reaction(entry)
+                if record is not None:
+                    stored.append(record)
+            self._reactions = stored[-MAX_REACTIONS:]
         cursors = _valid_cursors(raw.get("read_cursors"), self._messages)
         if cursors is None:
             # No read state on disk: every stored message starts as
@@ -237,17 +326,31 @@ class Inbox:
         highest += [cursor["last_read_seq"] for cursor in self._read_cursors.values()]
         return max(highest, default=0) + 1
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
+        """Persist the inbox; ``True`` when the write landed.
+
+        A path-less (in-memory) inbox has nothing to write and reports
+        success.  A failed write is logged and reported — callers that
+        must not acknowledge unstored state (reaction handling) raise
+        on ``False``; callers that must never break delivery (DM
+        appends) ignore the return value.
+        """
         if self.path is None:
-            return
+            return True
         try:
             atomic_write_json(
                 self.path,
-                {"messages": self._messages, "read_cursors": self._read_cursors},
+                {
+                    "messages": self._messages,
+                    "reactions": self._reactions,
+                    "read_cursors": self._read_cursors,
+                },
                 mode=0o600,
             )
         except OSError as exc:
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
+            return False
+        return True
 
     def transaction(self) -> Iterator[None]:
         """Public handle on the cross-process inbox lock (see ``_transaction``)."""
@@ -292,6 +395,97 @@ class Inbox:
             self._save()
         return entry
 
+    def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply one reaction, or retract when its token is empty.
+
+        Per (target message, reactor) the newest reaction wins, ordered
+        by the reactor's ``sent_at`` with ``id`` as tiebreak (see
+        :func:`merge_reaction`).  A replayed reaction cannot double-count,
+        and a late older reaction or retraction cannot override a newer
+        one.  Returns the stored record when it became the reactor's
+        current reaction, or ``None`` for a retraction, a stale update,
+        or a malformed record.  Raises :class:`OSError` when the merged
+        state cannot be persisted — a caller that acknowledges receipt
+        must know the reaction was not stored, instead of marking it
+        seen and losing it on a replay.
+        """
+        entry = _valid_reaction(record)
+        if entry is None:
+            return None
+        with self._transaction():
+            previous = list(self._reactions)
+            if not merge_reaction(self._reactions, entry):
+                return None
+            self._reactions = self._reactions[-MAX_REACTIONS:]
+            if not self._save():
+                # The merge lives in memory only; restore the pre-merge
+                # state so a later read does not show a reaction that
+                # was never stored.  Reloading from disk is not enough:
+                # a file that was never written (or has no reactions
+                # key) would leave the merged entry in place.
+                self._reactions = previous
+                raise OSError(f"could not persist inbox to {self.path}")
+        return entry if entry["reaction"] else None
+
+    def reactions_for(self, target: str) -> List[Dict[str, Any]]:
+        """Reactions on one message, oldest first.
+
+        Each entry carries the reactor's destination hash, display name
+        and token.  Only the reactor's latest reaction per message is
+        ever stored, so these are already de-duplicated; tombstones for
+        retractions are not returned.
+        """
+        with self._lock:
+            entries = [
+                dict(item)
+                for item in self._reactions
+                if item["target"] == target and item["reaction"]
+            ]
+        entries.sort(key=lambda item: item["received_at"])
+        return entries
+
+    def all_reactions(self) -> List[Dict[str, Any]]:
+        """Every stored reaction, including retraction tombstones.
+
+        The web bridge reconciles its history against this in one pass
+        when serving messages, so reactions made from another process
+        (e.g. ``tau react`` from the CLI) show up on the next read.
+        Read through the transaction path, so a serving process sees
+        what another process wrote to ``inbox.json`` instead of its
+        own stale in-memory cache.
+        """
+        with self._transaction():
+            return [dict(item) for item in self._reactions]
+
+    def resolve(self, ref: str) -> Dict[str, Any]:
+        """Resolve a full message id or a unique prefix to its record.
+
+        ``tau messages`` shows only the first 8 characters of each id,
+        so a short prefix is the usual way to name a message — the same
+        convention as ``tau outbox``.  An exact id always wins over a
+        prefix match first, whatever its length: two ids can share a
+        prefix where one is the whole of the other, and the full id must
+        still resolve to its own message.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("message reference must not be empty")
+        value = ref.strip()
+        with self._lock:
+            for entry in self._messages:
+                if entry.get("id") == value:
+                    return dict(entry)
+            matches = [
+                entry
+                for entry in self._messages
+                if isinstance(entry.get("id"), str)
+                and entry["id"].startswith(value)
+            ]
+        if not matches:
+            raise ValueError(f"unknown message: {ref!r}")
+        if len(matches) > 1:
+            raise ValueError(f"{len(matches)} messages match prefix {ref!r}")
+        return dict(matches[0])
+
     def list_messages(
         self,
         *,
@@ -308,7 +502,9 @@ class Inbox:
         of the default listing, which is the received-message view
         ``tau messages`` has always shown; pass ``direction="out"``
         or ``direction=None`` to see them.  Each entry carries
-        ``unread``: whether it arrived after its sender's read cursor.
+        ``unread``: whether it arrived after its sender's read cursor,
+        and a ``reactions`` list when the message has any — derived
+        from the reaction store, never stored counters.
         """
         with self._lock:
             entries = list(self._messages)
@@ -316,6 +512,10 @@ class Inbox:
                 destination: dict(cursor)
                 for destination, cursor in self._read_cursors.items()
             }
+            by_target: Dict[str, List[Dict[str, Any]]] = {}
+            for item in self._reactions:
+                if item["reaction"]:
+                    by_target.setdefault(item["target"], []).append(dict(item))
         if direction is not None:
             entries = [item for item in entries if item.get("direction") == direction]
         if peer is not None:
@@ -323,15 +523,20 @@ class Inbox:
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
-        return [
-            dict(
+        annotated = []
+        for item in entries:
+            copy = dict(
                 item,
                 unread=_is_unread(
                     item, cursors.get(item.get("destination") or "")
                 ),
             )
-            for item in entries
-        ]
+            reactions = by_target.get(str(item.get("id") or ""))
+            if reactions:
+                reactions.sort(key=lambda entry: entry["received_at"])
+                copy["reactions"] = reactions
+            annotated.append(copy)
+        return annotated
 
     def _unread_counts_locked(self) -> Dict[str, Any]:
         """Per-conversation unread counts from the in-memory state."""

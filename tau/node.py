@@ -62,12 +62,15 @@ from .protocol import (
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
+    REQUEST_REACT,
     ProtocolError,
     build_announce,
     build_mail_fetch,
     build_mail_store,
     clean_in_reply_to,
+    clean_reaction,
     decode,
+    encode,
     encode_message,
     generate_message_id,
     normalize_message,
@@ -75,6 +78,9 @@ from .protocol import (
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
+    parse_reaction,
+    reaction_dict,
+    reaction_unsigned_bytes,
     response_error,
     response_ok,
 )
@@ -342,6 +348,7 @@ class TauNode:
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
+        on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -353,6 +360,7 @@ class TauNode:
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
+        self.on_reaction = on_reaction
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
@@ -515,6 +523,7 @@ class TauNode:
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
+            REQUEST_REACT: self._handle_reaction,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -869,6 +878,34 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
+        """Persist a reaction and fan it out.
+
+        A reaction whose target this node has never seen is still
+        stored — the target may arrive later (a relayed copy can land
+        after the reaction) — but it is only rendered under a message
+        the inbox actually holds, so spraying unknown targets buys a
+        peer nothing visible.
+
+        With ``strict=True`` (the receive handler) a storage failure
+        raises, so the handler can answer with an error instead of
+        acknowledging a reaction it did not store.  Otherwise a failed
+        local record is logged and delivery still succeeds — the
+        sender's own copy is best-effort; the peer already accepted
+        the reaction.
+        """
+        try:
+            self.inbox.record_reaction(record)
+        except Exception:  # pragma: no cover - storage failure
+            log.warning("Could not record reaction", exc_info=True)
+            if strict:
+                raise
+        if self.on_reaction is not None:
+            try:
+                self.on_reaction(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_reaction callback failed", exc_info=True)
+
     def _record_sent(self, record: Dict[str, Any]) -> None:
         """Persist an outgoing DM to the inbox; never break sending.
 
@@ -969,6 +1006,110 @@ class TauNode:
             received_at=received_at,
             server=self.name,
             node=self.destination_hexhash,
+            duplicate=duplicate,
+        )
+
+    def _handle_reaction(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            reaction = parse_reaction(data)
+        except ProtocolError as exc:
+            return response_error("invalid_reaction", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # A reaction is state keyed by its reactor: without an
+            # authenticated link identity there is no reactor to key on,
+            # and an anonymous reaction could overwrite anyone's.
+            return response_error(
+                "unidentified", "identify on the link to react"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Reactions are signed entries, like Tan likes: the signature
+        # covers the whole payload and is verified against the link
+        # identity, so attribution does not depend on trusting the
+        # transport — a relayed or replayed reaction still has to prove
+        # its reactor.  (parse_reaction already checked the base64.)
+        signature_text = reaction.get("sig")
+        if not signature_text:
+            return response_error(
+                "invalid_reaction", "reaction is missing its signature"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = reaction_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_reaction", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_reaction", f"could not verify reaction: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_reaction", "reaction signature does not verify"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Reaction from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        # A retried or relayed reaction replays with the same id; the
+        # latest-per-reactor state makes a replay harmless anyway, but
+        # dedupe here keeps the inbox from churning on every retry.
+        reaction_id = reaction.get("id")
+        # Reactions get their own namespace, keyed by the reactor too, so a
+        # reaction id can never mark a direct message id as seen.
+        seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
+        duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
+        if not duplicate:
+            record = {
+                "target": reaction["target"],
+                "reaction": reaction["reaction"],
+                "from": caller_name,
+                "destination": caller_hash,
+                "sent_at": reaction["sent_at"],
+                "received_at": received_at,
+                "id": reaction_id,
+            }
+            try:
+                self._record_reaction(record, strict=True)
+            except OSError as exc:
+                # Do not acknowledge a reaction that was not stored, and
+                # do not mark its id seen — the sender can retry with the
+                # same id and it will be recorded then.
+                return response_error(
+                    "storage_failed", f"could not store reaction: {exc}"
+                )
+            if seen_key:
+                self.mailbox.mark_seen(seen_key)
+            log.info(
+                "Reaction from %s (%s) on %s: %s",
+                caller_name,
+                caller_hash or "anonymous",
+                reaction["target"][:8],
+                reaction["reaction"] or "(retracted)",
+            )
+
+        return response_ok(
+            reaction=reaction["reaction"],
+            target=reaction["target"],
+            received_at=received_at,
             duplicate=duplicate,
         )
 
@@ -1659,7 +1800,8 @@ class TauNode:
             if isinstance(response, dict):
                 # Always name the outbound wire message, never an id
                 # the peer supplied, so callers (console history, JSON
-                # output) match what was actually sent and recorded.
+                # output) match what was actually sent and recorded —
+                # delivery reports and reactions key off this id.
                 response["id"] = message_id
             self._record_sent(
                 {
@@ -1736,6 +1878,68 @@ class TauNode:
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
             }
+
+    def send_reaction(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        reaction: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send a reaction to a peer's DM and return the decoded response.
+
+        ``message_id`` names the reacted-to message, ``reaction`` is one
+        emoji or short text token (``""`` retracts the sender's reaction
+        to that message).  Reactions are their own signed message kind:
+        the payload is signed with this node's Reticulum identity and
+        verified by the receiver against the link identity, exactly like
+        a sealed mail envelope — and the receiver resolves state per
+        (message, reactor) with the latest reaction winning.
+
+        Reactions are delivered live in v1: unlike ``send_message``
+        there is no outbox queue, because the sealed-mail path is
+        text-shaped throughout.  An unreachable peer raises
+        :class:`NodeError`; queueing reactions for offline peers is a
+        follow-up once the mailbox can carry non-text kinds.
+        """
+        token = clean_reaction(reaction)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("reaction target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        reaction_id = generate_message_id()
+        payload = reaction_dict(target_id, token, message_id=reaction_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign reaction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
+        # Record the outgoing reaction locally, so the reactor sees it
+        # under the message in their own inbox and console.
+        record = {
+            "target": target_id,
+            "reaction": token,
+            "from": self.name,
+            "destination": self.destination_hexhash
+            if self.destination is not None
+            else "",
+            "sent_at": time.time(),
+            "received_at": time.time(),
+            "id": reaction_id,
+        }
+        self._record_reaction(record)
+        return dict(response, id=reaction_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""

@@ -1,5 +1,14 @@
 export type Direction = "in" | "out";
 
+export interface MessageReaction {
+  // Reactor's destination hash.
+  reactor: string;
+  // Reactor's display name at reaction time.
+  name: string;
+  // One emoji or short text token; never an image.
+  reaction: string;
+}
+
 export interface TauMessage {
   id: number;
   direction: Direction;
@@ -12,8 +21,11 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
-  // Reticulum wire id: how replies name this message.
+  // Reticulum wire id: how replies name this message, and how
+  // reactions are matched to it.
   wire_id?: string;
+  // Latest reaction per reactor, oldest first.
+  reactions?: MessageReaction[];
   // Short hash of this message's text, for checking a reply's quoted
   // excerpt against it; see resolveQuote in message-feed.tsx.
   excerpt_hash?: string;

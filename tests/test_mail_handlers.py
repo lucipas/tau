@@ -15,21 +15,26 @@ from tau.mailbox import open_message, seal_message
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
+    ProtocolError,
     build_mail_fetch,
     build_mail_store,
     decode,
+    encode,
     encode_message,
+    encode_reaction,
     excerpt_hash,
+    reaction_dict,
 )
 
 
-def make_node(tmp_path, name="holder", on_message=None, on_delivered=None):
+def make_node(tmp_path, name="holder", on_message=None, on_delivered=None, on_reaction=None):
     config = TauConfig.resolve(data_dir=tmp_path, name=name)
     node = TauNode(
         config,
         registry=PeerRegistry(config.peers_path),
         on_message=on_message,
         on_delivered=on_delivered,
+        on_reaction=on_reaction,
     )
     return node
 
@@ -832,3 +837,224 @@ def test_collected_reply_keeps_reply_reference(tmp_path):
     assert node._deliver_collected(message) is True
     assert received[0]["in_reply_to"] == reply_to
     assert node.inbox.list_messages()[0]["in_reply_to"] == reply_to
+
+
+def signed_reaction(sender, target, token, message_id, *, sent_at=None):
+    """A reaction payload signed by *sender*, as send_reaction builds it."""
+    import base64
+
+    payload = reaction_dict(target, token, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def test_reaction_clear_removes_the_reaction(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    call_handler(
+        node._handle_reaction,
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
+        remote_identity=sender,
+    )
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(sender, "msg-1", "", "react-2"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_dedupes_by_id(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    payload = signed_reaction(sender, "msg-1", "👍", "react-dup")
+    first = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    second = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+
+
+def test_reaction_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    save_allowlist(
+        config.allowlist_path, AllowList(enabled=True, allow=frozenset())
+    )
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_is_recorded_and_fanned_out(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_reaction=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+
+    payload = signed_reaction(sender, "msg-1", "👍", "react-1")
+    response = call_handler(node._handle_reaction, payload, remote_identity=sender)
+
+    assert response["ok"] is True
+    assert response["reaction"] == "👍"
+    assert response["target"] == "msg-1"
+    assert response["duplicate"] is False
+    assert len(received) == 1
+    assert received[0]["target"] == "msg-1"
+    assert received[0]["reaction"] == "👍"
+    assert received[0]["destination"] == destination_hash(sender).hex()
+    reactions = node.inbox.reactions_for("msg-1")
+    assert len(reactions) == 1
+    assert reactions[0]["reaction"] == "👍"
+
+
+def test_reaction_rejects_a_signature_from_another_identity(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    signer = RNS.Identity()
+    presenter = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(signer, "msg-1", "👍", "react-1"),
+        remote_identity=presenter,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_rejects_a_tampered_payload(tmp_path):
+    import base64
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    payload = reaction_dict("msg-1", "👍", message_id="react-1")
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    payload["reaction"] = "❤️"  # tampered after signing
+    response = call_handler(
+        node._handle_reaction, encode(payload), remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_rejects_invalid_payload(tmp_path):
+    node = make_node(tmp_path)
+    response = call_handler(node._handle_reaction, b"not json")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+
+
+def test_reaction_requires_a_signature(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        encode_reaction("msg-1", "👍", message_id="react-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_reaction"
+    assert "signature" in response["error"]["message"]
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(sender, "msg-1", "👍", "react-1"),
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_reaction_storage_failure_is_reported_and_retryable(tmp_path, monkeypatch):
+    """A reaction the receiver cannot store is an error, not an ack —
+    and because its id was never marked seen, the same reaction can be
+    retried with the same id."""
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    payload = signed_reaction(sender, "msg-1", "👍", "react-1")
+
+    monkeypatch.setattr(node.inbox, "_save", lambda: False)
+    response = call_handler(node._handle_reaction, payload, remote_identity=sender)
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert "could not store" in response["error"]["message"]
+    assert node.inbox.reactions_for("msg-1") == []
+    assert not node.mailbox.is_seen(
+        f"reaction:{destination_hash(sender).hex()}:react-1"
+    )
+
+    # The write heals; the same id retries cleanly.
+    monkeypatch.setattr(node.inbox, "_save", lambda: True)
+    retry = call_handler(node._handle_reaction, payload, remote_identity=sender)
+    assert retry["ok"] is True
+    assert retry["duplicate"] is False
+    assert len(node.inbox.reactions_for("msg-1")) == 1
+
+
+def test_record_reaction_strict_raises_on_storage_failure(tmp_path, monkeypatch):
+    """The sender's own best-effort record swallows a failed write,
+    but the strict (receive-handler) record raises so the handler can
+    report it."""
+    node = make_node(tmp_path)
+    monkeypatch.setattr(node.inbox, "_save", lambda: False)
+    record = {
+        "target": "msg-1",
+        "reaction": "👍",
+        "from": "alice",
+        "destination": "ab" * 16,
+        "sent_at": 1.0,
+        "received_at": 2.0,
+        "id": "react-1",
+    }
+    node._record_reaction(record)  # non-strict: logged, not raised
+    with pytest.raises(OSError):
+        node._record_reaction(record, strict=True)
+    # The failed merge was rolled back: nothing phantom is served.
+    assert node.inbox.reactions_for("msg-1") == []
+
+
+def test_send_reaction_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(ProtocolError):
+        node.send_reaction("alice", "msg-1", "x" * 33)
+    with pytest.raises(NodeError):
+        node.send_reaction("alice", "", "👍")

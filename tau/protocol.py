@@ -37,6 +37,10 @@ DEFAULT_TCP_PORT = 4343
 
 MAX_NAME_LENGTH = 48
 MAX_MESSAGE_CHARS = 2000
+# A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
+# never an image or a URL.  32 characters leaves room for a multi-codepoint
+# emoji sequence while keeping the reaction far inside the request budget.
+MAX_REACTION_CHARS = 32
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ANNOUNCE_MAX_BYTES = 256
@@ -53,6 +57,7 @@ MAX_MAIL_TTL = 30 * 24 * 60 * 60
 REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
+REQUEST_REACT = "/tau/react"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
@@ -60,6 +65,7 @@ REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
     REQUEST_MESSAGE,
+    REQUEST_REACT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
@@ -193,6 +199,130 @@ def generate_message_id() -> str:
     return uuid.uuid4().hex
 
 
+def clean_reaction(value: Any) -> str:
+    """Validate a reaction token, or ``""`` when it retracts one.
+
+    A reaction is a unicode emoji or a short text token: printable
+    characters only, at most :data:`MAX_REACTION_CHARS` long.  An empty
+    (or whitespace-only) value is a retraction, not an error — ``tau
+    react <id> --clear`` sends exactly that.  Anything else raises
+    :class:`ProtocolError`.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ProtocolError("reaction must be a string")
+    cleaned = _clean_text(value).strip()
+    if len(cleaned) > MAX_REACTION_CHARS:
+        raise ProtocolError(
+            f"reaction is longer than {MAX_REACTION_CHARS} characters"
+        )
+    return cleaned
+
+
+def reaction_dict(
+    target: str,
+    reaction: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/react`` payload as a dict, unsigned unless signed.
+
+    The signature — when present — covers every other field, exactly
+    like a sealed mail envelope: the sender signs the canonical
+    encoding of the payload without ``"sig"`` and attaches the base64
+    signature, so the receiver can verify attribution against the link
+    identity independently of the transport.
+    """
+    target = _clean_message_id(target)
+    payload: Dict[str, Any] = {
+        "type": "reaction",
+        "v": PROTOCOL_VERSION,
+        "target": target,
+        "reaction": clean_reaction(reaction),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if message_id:
+        payload["id"] = message_id
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_reaction(
+    target: str,
+    reaction: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM reaction for the ``/tau/react`` request.
+
+    ``target`` names the reacted-to message id; ``reaction`` is the token
+    from :func:`clean_reaction` (``""`` retracts the reactor's reaction).
+    ``signature`` is the base64 signature over the canonical unsigned
+    payload; see :func:`reaction_dict`.
+    """
+    return encode(
+        reaction_dict(
+            target,
+            reaction,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_reaction(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/react`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "reaction":
+        raise ProtocolError("expected a reaction payload")
+    target = _clean_message_id(payload.get("target"))
+    if "reaction" not in payload:
+        raise ProtocolError("reaction payload is missing 'reaction'")
+    reaction = clean_reaction(payload.get("reaction"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("reaction signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "reaction signature is not valid base64"
+            ) from exc
+    return {
+        "target": target,
+        "reaction": reaction,
+        "sent_at": sent_at,
+        "id": message_id,
+        "sig": signature,
+    }
+
+
+def reaction_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of a reaction payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
 def excerpt_hash(text: str) -> str:
     """Short hash of a quoted message's text (first 16 hex of SHA-256).
 
