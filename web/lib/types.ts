@@ -23,6 +23,9 @@ export interface Peer {
   protocol: number;
   // LXMF delivery destination hash, derived from the peer's public key.
   lxmf?: string | null;
+  // True when the peer is on this node's block-list: their DMs are
+  // dropped and their Tan posts hidden.
+  blocked?: boolean;
 }
 
 export interface InterfaceInfo {
@@ -108,6 +111,8 @@ export interface TanReplyParent {
   name: string;
   text: string;
   deleted: boolean;
+  // True when the parent is from a blocked author: its text is blanked.
+  blocked?: boolean;
   muted?: boolean;
 }
 

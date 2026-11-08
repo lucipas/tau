@@ -23,6 +23,7 @@ import RNS
 
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
+from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -364,6 +365,7 @@ class TauNode:
         self._shutdown = False
         self.app: Optional[Any] = None
         self._allowlist: Optional[AllowList] = None
+        self._blocklist: Optional[BlockList] = None
 
     @property
     def allowlist(self) -> AllowList:
@@ -377,6 +379,21 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    @property
+    def blocklist(self) -> BlockList:
+        """The DM/Tan block-list, loaded lazily from the data directory.
+
+        Checked before the allow-list: blocking an allow-listed peer
+        wins.  A list that cannot be parsed fails closed — every
+        sender is blocked — so a corrupt list can never silently
+        admit a sender the owner meant to silence.
+        """
+        if self._blocklist is None:
+            self._blocklist = load_blocklist_or_block_all(
+                getattr(self.config, "blocklist_path", None)
+            )
+        return self._blocklist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -860,6 +877,23 @@ class TauNode:
             # outside the registry; the inbox keys on Tau destination
             # hashes, so derive that here instead.
             caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins.  The drop is silent — the sender
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  A fake
+            # success reply was considered and rejected: the ticket
+            # says blocked messages "simply never confirm", and a
+            # success reply would falsely confirm delivery and stop
+            # the sender's retries.  The message is never stored,
+            # never marked seen, and never passed to on_message.
+            log.info(
+                "Message from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -1347,6 +1381,17 @@ class TauNode:
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
         sender = message.get("from")
+        if self.blocklist.is_blocked(
+            sender if isinstance(sender, str) else None
+        ):
+            # Same silent drop as a direct message, checked before the
+            # allow-list.  Do not mark it seen: another holder's copy
+            # may still be delivered if the sender is unblocked later.
+            log.info(
+                "Relayed message from %s denied by the block-list",
+                sender or "unknown",
+            )
+            return False
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):
