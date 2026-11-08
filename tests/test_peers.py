@@ -548,3 +548,66 @@ def test_from_dict_tolerates_bad_alias_values(tmp_path):
     assert Peer.from_dict(raw).alias is None
     raw["alias"] = "   "
     assert Peer.from_dict(raw).alias is None
+
+
+def test_set_alias_rejects_hash_like_aliases(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 13, "mia", now=100.0)
+    other = make_peer(registry, 14, "nick", now=200.0)
+    # Another peer's full destination hash, its hash prefix, and any
+    # hex-only string long enough to be read as a prefix are all refused.
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash)
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash[:8])
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, "deadbeef")
+    # A short hex string cannot be a prefix, so it is a fine alias.
+    assert registry.set_alias(peer.hexhash, "abc").alias == "abc"
+
+
+def test_from_dict_drops_hash_like_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 15, "olive", now=100.0)
+    raw = peer.to_dict()
+    raw["alias"] = peer.hexhash[:8]
+    assert Peer.from_dict(raw).alias is None
+
+
+def test_refresh_aliases_picks_up_another_process(tmp_path):
+    path = tmp_path / "peers.json"
+    cli = PeerRegistry(path)
+    peer = make_peer(cli, 16, "pam", now=100.0)
+    cli.save()
+    # A second registry loaded earlier, as a running node's snapshot.
+    node_view = PeerRegistry(path)
+    assert node_view.get(peer.destination_hash).alias is None
+
+    cli.set_alias(peer.hexhash, "field-kit")
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).alias == "field-kit"
+    # The node's next save keeps the alias instead of erasing it.
+    node_view.save()
+    assert PeerRegistry(path).get(peer.destination_hash).alias == "field-kit"
+
+    cli.clear_alias(peer.hexhash)
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).alias is None
+    assert node_view.refresh_aliases() == 0
+
+
+def test_refresh_aliases_ignores_unknown_peers_and_missing_keys(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 17, "quinn", now=100.0)
+    registry.save()
+
+    raw = json.loads(path.read_text())
+    raw["peers"].append(
+        {"destination": "00" * 16, "alias": "ghost", "name": "ghost"}
+    )
+    raw["peers"][0].pop("alias")
+    path.write_text(json.dumps(raw))
+
+    assert registry.refresh_aliases() == 0
+    assert registry.get(peer.destination_hash).alias is None

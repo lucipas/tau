@@ -27,8 +27,25 @@ MAX_PEERS = 256
 DEFAULT_MAX_AGE = 7 * 24 * 60 * 60
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
-# Hex strings that resolve() may read as a hash or hash prefix (>= 4 chars).
+# Hex strings that resolve() may read as a hash or hash prefix (>= 4
+# chars): a 32-char target is read as a full hash before aliases, and a
+# 4-or-more-char target as a prefix after them, so such an alias could
+# never reliably select its owner and could misdirect a hash target.
 _HEX_LIKE = re.compile(r"^[0-9a-fA-F]{4,}$")
+
+
+def _clean_stored_alias(value: Any) -> Optional[str]:
+    """Normalise a stored alias, dropping values that are unusable.
+
+    Non-strings and blank strings become ``None``; a hash-like alias
+    (one that would be read as a destination hash or prefix) is also
+    dropped, so an alias saved by an older version or edited by hand
+    cannot misdirect a hash target.
+    """
+    alias = sanitize_name(value, fallback="") or None
+    if alias is not None and _HEX_LIKE.match(alias):
+        return None
+    return alias
 
 
 class PeerError(RuntimeError):
@@ -142,7 +159,7 @@ class Peer:
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
-            alias=sanitize_name(raw.get("alias"), fallback="") or None,
+            alias=_clean_stored_alias(raw.get("alias")),
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -270,12 +287,13 @@ class PeerRegistry:
         clean = sanitize_name(alias, fallback="")
         if not clean:
             raise PeerError("alias must not be empty")
-        # resolve() treats hex strings of 4+ characters as hashes or hash
-        # prefixes before it looks at aliases, so such an alias could never
-        # reliably select its owner.  Reject them up front.
+        # A hex-like alias could never reliably select its owner (full
+        # hashes resolve before aliases, prefixes after them), so reject
+        # it up front instead of letting it misdirect a hash target.
         if _HEX_LIKE.match(clean):
             raise PeerError(
-                f"alias {clean!r} looks like a destination hash; choose another"
+                f"alias {clean!r} looks like a destination hash or hash "
+                "prefix; pick a label with a non-hex character"
             )
         with self._lock:
             peer = self.resolve(target)
@@ -315,6 +333,41 @@ class PeerRegistry:
             peer.alias = None
         self.save()
         return peer
+
+    def refresh_aliases(self) -> int:
+        """Pick up alias changes another process made to the registry file.
+
+        A running node holds its registry in memory and rewrites the
+        whole file on every save, so an alias set by a one-shot command
+        (``tau peers alias``) while the node serves would be lost at the
+        next save.  Only aliases are refreshed — peer records themselves
+        are this process's observations — and a peer absent from the file
+        keeps its alias.  Returns the number of peers whose alias changed.
+        """
+        if self.path is None:
+            return 0
+        raw = read_json(self.path)
+        entries = raw.get("peers", []) if isinstance(raw, dict) else []
+        if not isinstance(entries, list):
+            return 0
+        changed = 0
+        with self._lock:
+            for entry in entries:
+                if not isinstance(entry, dict) or "alias" not in entry:
+                    continue
+                destination = entry.get("destination", "")
+                if not isinstance(destination, str) or not _HEX32.match(
+                    destination
+                ):
+                    continue
+                peer = self._peers.get(bytes.fromhex(destination))
+                if peer is None:
+                    continue
+                alias = _clean_stored_alias(entry.get("alias"))
+                if peer.alias != alias:
+                    peer.alias = alias
+                    changed += 1
+        return changed
 
     def upsert(
         self,

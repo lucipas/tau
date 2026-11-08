@@ -474,3 +474,25 @@ def test_deposit_entry_skips_message_cancelled_by_another_process(
     )
     assert node._deposit_entry(make_peer("carol"), entry, timeout=1.0) is False
     assert calls == []
+
+
+def test_save_peers_preserves_cli_set_alias(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("aliased")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="aliased", now=time.time()
+    )
+    node.registry.save()
+
+    # A one-shot `tau peers alias` while the node serves: a separate
+    # registry instance edits the same file.
+    cli_registry = PeerRegistry(node.registry.path)
+    cli_registry.set_alias(peer.hexhash, "field-kit")
+
+    node._save_peers(force=True)
+
+    assert node.registry.get(peer.destination_hash).alias == "field-kit"
+    assert (
+        PeerRegistry(node.registry.path).get(peer.destination_hash).alias
+        == "field-kit"
+    )

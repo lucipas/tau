@@ -407,7 +407,11 @@ the alias is shown by `tau peers` (with the peer's asserted name alongside
 when they differ), works as a target for `send`, `ping`, `info` and
 `--to`, and is never sent to other peers or overwritten when the peer
 re-announces. Aliases are unique across the registry, so one alias always
-resolves to exactly one peer; remove one with `tau peers unalias PEER`.
+resolves to exactly one peer; an alias that looks like a destination hash
+or hash prefix (four or more hex characters) is rejected, so an alias can
+never be mistaken for a hash target. A running node picks up aliases set
+while it serves at its next registry save. Remove one with
+`tau peers unalias PEER`.
 
 ### Messaging
 
