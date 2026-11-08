@@ -1008,7 +1008,10 @@ def repost_counts(
 
     Only linked reposts count, and only while they stand: a repost its
     author deleted stops counting, the same way an unlike retires a
-    like.  ``reposted`` is true when the viewer's own repost of the
+    like.  The count is distinct reposters, not entries: one author
+    counts once even if their chain somehow carries two reposts of the
+    same target (a fork, or a repost stored past the duplicate guard).
+    ``reposted`` is true when the viewer's own repost of the
     target still stands.
     """
     clean = []
@@ -1028,14 +1031,19 @@ def repost_counts(
         f"WHERE kind = 'repost' AND linked = 1 AND target IN ({placeholders})",
         clean,
     ).fetchall()
+    seen: Dict[str, Set[str]] = {target: set() for target in clean}
     for row in rows:
         target = str(row["target"])
+        author = str(row["author"])
+        if author in seen[target]:
+            continue
         if _is_deleted(
-            conn, {"hash": str(row["hash"]), "author": str(row["author"])}
+            conn, {"hash": str(row["hash"]), "author": author}
         ):
             continue
+        seen[target].add(author)
         result[target]["reposts"] += 1
-        if viewer is not None and str(row["author"]) == viewer:
+        if viewer is not None and author == viewer:
             result[target]["reposted"] = True
     return result
 
@@ -2388,18 +2396,6 @@ class TanApp:
             try:
                 if self.node is not None and not self._closed:
                     self.publish(
-                        post,
-                        ttl=ttl,
-                        exclude=exclude,
-                        fanout=self.gossip_fanout,
-                    )
-            except Exception:  # pragma: no cover - network dependent
-                log.debug("Tan gossip failed", exc_info=True)
-            finally:
-                self._gossip_slots.release()
-
-        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-lf.publish(
                         post,
                         ttl=ttl,
                         exclude=exclude,

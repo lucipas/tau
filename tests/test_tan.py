@@ -1692,6 +1692,40 @@ def test_repost_can_be_deleted_and_reposted_again(identities, tmp_path):
     assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
 
 
+def test_repost_counts_distinct_reposters(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    first = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+    # A second repost of the same target from the same author — stored
+    # past create_repost's duplicate guard, as a forked chain could
+    # deliver — still counts as one reposter, not two.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "",
+        "created_at": 1002.0,
+        "prev": first["hash"],
+        "kind": "repost",
+        "target": post["hash"],
+    }
+    digest = hash(body, previous=first["hash"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_post(conn, mesg)
+    assert is_new is True
+    assert repost_counts(conn, [post["hash"]])[post["hash"]] == {
+        "reposts": 1,
+        "reposted": False,
+    }
+    assert repost_counts(conn, [post["hash"]], viewer=author_of(bob))[
+        post["hash"]
+    ]["reposted"] is True
+
+
 def test_thread_resolves_a_repost_to_its_original(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")

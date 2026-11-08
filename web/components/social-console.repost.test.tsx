@@ -90,4 +90,23 @@ describe("PostCard repost display", () => {
 
     expect(screen.queryByText(/reposted/)).toBeNull();
   });
+
+  it("hides the reply button on a repost card", () => {
+    const repost = makePost({
+      kind: "repost",
+      target: "f".repeat(64),
+      repost_of: {
+        hash: "f".repeat(64),
+        author: "a".repeat(64),
+        name: "alice",
+        text: "original thought",
+        deleted: false,
+      },
+    });
+    render(card(repost));
+
+    // Replying targets a post or reply; a repost has no text of its
+    // own, so the button is hidden rather than offered and failing.
+    expect(screen.queryByTitle("Reply to this post")).toBeNull();
+  });
 });
