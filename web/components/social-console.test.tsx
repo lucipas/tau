@@ -97,3 +97,91 @@ describe("PostCard delete control", () => {
     expect(onDelete).not.toHaveBeenCalled();
   });
 });
+
+describe("PostCard quote rendering", () => {
+  function renderCard(post: TanPost) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+  }
+
+  it("shows a quote's comment with the quoted original beneath it", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "worth sharing",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "f".repeat(32),
+          name: "alice",
+          text: "original thought",
+          deleted: false,
+        },
+      }),
+    );
+
+    expect(screen.getByText("worth sharing")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting alice · original thought",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("reports a deleted original without resurfacing its text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "still worth it",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "f".repeat(32),
+          name: "alice",
+          text: "",
+          deleted: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("still worth it")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting alice · a deleted post",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("shows the quote count on the quoted post and hides it at zero", () => {
+    const { rerender } = render(
+      <PostCard
+        post={makePost({ quotes: 2 })}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+    expect(screen.getByText("❝ 2")).toBeTruthy();
+
+    rerender(
+      <PostCard
+        post={makePost({ quotes: 0 })}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+    expect(screen.queryByText(/❝/)).toBeNull();
+  });
+});
