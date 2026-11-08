@@ -76,7 +76,9 @@ describe("useTan saved posts", () => {
     await act(async () => {
       await result.current.loadSaved();
     });
-    expect(mockedGet).toHaveBeenCalledWith("/api/tan/saved?limit=100");
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/saved?limit=100&offset=0",
+    );
     expect(result.current.saved).toEqual([saved]);
 
     await act(async () => {
@@ -92,6 +94,84 @@ describe("useTan saved posts", () => {
     expect(mockedPost).toHaveBeenCalledWith("/api/tan/unsave", {
       target: mine.hash,
     });
+  });
+
+  it("pages through older saves with load more", async () => {
+    const secondPage = [makePost({ hash: "f".repeat(64), text: "older" })];
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        // A full page means there may be more: the first page is full,
+        // the second holds the one remaining save.
+        const page = path.endsWith("offset=0")
+          ? Array.from({ length: 100 }, (_, index) =>
+              makePost({
+                hash: `${index}`.padStart(64, "0"),
+                text: `saved ${index}`,
+              }),
+            )
+          : secondPage;
+        return Promise.resolve({ posts: page, count: page.length });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [], count: 0 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(result.current.saved).toHaveLength(100);
+    expect(result.current.savedHasMore).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMoreSaved();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/saved?limit=100&offset=100",
+    );
+    expect(result.current.saved).toHaveLength(101);
+    expect(result.current.saved[100]).toEqual(secondPage[0]);
+    expect(result.current.savedHasMore).toBe(false);
+  });
+
+  it("refreshes the saved list after liking from the saved view", async () => {
+    const mine = makePost();
+    const saved = makePost({ hash: "e".repeat(64), text: "keep me" });
+    let savedCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        savedCalls += 1;
+        return Promise.resolve({ posts: [saved], count: 1 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+
+    // Liking before the saved list was ever opened does not fetch it.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(savedCalls).toBe(0);
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(savedCalls).toBe(1);
+
+    // Once opened, a like refreshes the saved cards too.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(savedCalls).toBe(2);
   });
 });
 

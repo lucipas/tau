@@ -14,12 +14,14 @@ import type {
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
+const SAVED_PAGE_SIZE = 100;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
+  const [savedHasMore, setSavedHasMore] = useState(false);
   const [all, setAll] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -110,32 +112,105 @@ export function useTan() {
 
   // Saved posts change only through this client's save/unsave actions
   // (or the CLI), so they load on demand instead of on every poll tick.
+  // The store holds up to 512 saves, so the view pages through them
+  // 100 at a time instead of fetching only the newest page.
+  const savedRef = useRef(saved);
+  useEffect(() => {
+    savedRef.current = saved;
+  }, [saved]);
+  // Monotonic generation of saved loads, mirroring the feed's: a newer
+  // load supersedes an older one, so a slow response cannot restore a
+  // post that was unsaved after it started.
+  const savedGenerationRef = useRef(0);
+  // Whether the saved list has been loaded at least once. Actions
+  // refresh it only then, so a like from the timeline does not pay for
+  // a list nobody has opened.
+  const savedLoadedRef = useRef(false);
+
+  const fetchSavedPage = async (offset: number) => {
+    return apiGet<TanSavedResponse>(
+      `/api/tan/saved?limit=${SAVED_PAGE_SIZE}&offset=${offset}`,
+    );
+  };
+
   const loadSaved = useCallback(async () => {
+    const generation = ++savedGenerationRef.current;
     setSavedLoading(true);
     try {
-      const result = await apiGet<TanSavedResponse>(
-        "/api/tan/saved?limit=100",
-      );
+      const result = await fetchSavedPage(0);
+      if (savedGenerationRef.current !== generation) return;
       setSaved(result.posts);
+      setSavedHasMore(result.posts.length === SAVED_PAGE_SIZE);
+      savedLoadedRef.current = true;
     } finally {
-      setSavedLoading(false);
+      if (savedGenerationRef.current === generation) {
+        setSavedLoading(false);
+      }
     }
   }, []);
+
+  const loadMoreSaved = useCallback(async () => {
+    const generation = ++savedGenerationRef.current;
+    setSavedLoading(true);
+    try {
+      const result = await fetchSavedPage(savedRef.current.length);
+      if (savedGenerationRef.current !== generation) return;
+      setSaved((previous) => [...previous, ...result.posts]);
+      setSavedHasMore(result.posts.length === SAVED_PAGE_SIZE);
+    } finally {
+      if (savedGenerationRef.current === generation) {
+        setSavedLoading(false);
+      }
+    }
+  }, []);
+
+  // Re-read every page currently shown. A save or unsave shifts the
+  // offsets behind the shown pages, so refreshing only the first page
+  // would leave the rest stale.
+  const reloadSaved = useCallback(async () => {
+    const shown = savedRef.current.length;
+    if (shown === 0) return;
+    const generation = ++savedGenerationRef.current;
+    setSavedLoading(true);
+    try {
+      const pages = Math.ceil(shown / SAVED_PAGE_SIZE);
+      const all: TanPost[] = [];
+      for (let page = 0; page < pages; page += 1) {
+        const result = await fetchSavedPage(page * SAVED_PAGE_SIZE);
+        if (savedGenerationRef.current !== generation) return;
+        all.push(...result.posts);
+        if (result.posts.length < SAVED_PAGE_SIZE) break;
+      }
+      if (savedGenerationRef.current !== generation) return;
+      setSaved(all);
+      setSavedHasMore(all.length === pages * SAVED_PAGE_SIZE);
+    } finally {
+      if (savedGenerationRef.current === generation) {
+        setSavedLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshSavedIfLoaded = useCallback(async () => {
+    if (savedLoadedRef.current) {
+      await reloadSaved();
+    }
+  }, [reloadSaved]);
 
   const save = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/save", { target });
-      await Promise.all([load(), loadSaved()]);
+      await Promise.all([load(), reloadSaved()]);
     },
-    [load, loadSaved],
+    [load, reloadSaved],
   );
 
   const unsave = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unsave", { target });
-      await Promise.all([load(), loadSaved()]);
+      await Promise.all([load(), reloadSaved()]);
     },
-    [load, loadSaved],
+    [load, reloadSaved],
   );
 
   const publish = useCallback(
@@ -180,25 +255,25 @@ export function useTan() {
   const like = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/like", { target });
-      await load();
+      await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load],
+    [load, refreshSavedIfLoaded],
   );
 
   const unlike = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unlike", { target });
-      await load();
+      await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load],
+    [load, refreshSavedIfLoaded],
   );
 
   const deletePost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/delete", { target });
-      await load();
+      await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load],
+    [load, refreshSavedIfLoaded],
   );
 
   const sync = useCallback(async () => {
@@ -219,7 +294,9 @@ export function useTan() {
     following,
     saved,
     savedLoading,
+    savedHasMore,
     loadSaved,
+    loadMoreSaved,
     save,
     unsave,
     all,

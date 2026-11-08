@@ -2363,19 +2363,25 @@ def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
 
 
 def saved_posts(
-    conn: sqlite3.Connection, *, limit: int = DEFAULT_FEED_LIMIT
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """Saved posts, newest save first.
 
     A post deleted after being saved stays in the list with its text
     blanked and ``deleted`` set, so the save is not silently lost.
+    *offset* pages through the list in save order, so a caller can
+    reach saves older than one page.
     """
     count = max(1, min(int(limit), MAX_SAVED_POSTS))
+    start = max(0, int(offset))
     rows = conn.execute(
         "SELECT p.*, s.saved_at FROM saved_posts s "
         "JOIN posts p ON p.hash = s.hash "
-        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ?",
-        (count,),
+        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ? OFFSET ?",
+        (count, start),
     ).fetchall()
     deleted = deleted_targets(conn)
     records: List[Dict[str, Any]] = []
@@ -2387,6 +2393,45 @@ def saved_posts(
             post["text"] = ""
         records.append(post)
     return records
+
+
+def annotated_saved_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Saved posts with the timeline's annotations and muting applied.
+
+    Reaction counts, reply parents, quote counts and quoted originals
+    are attached exactly as :func:`timeline` does: a reply parent or
+    quoted original from a muted author is redacted, and a parent
+    matching a muted keyword has its text blanked.  Posts by muted
+    authors or matching a muted keyword are dropped from the view —
+    muting is display-only, so the saves stay stored and unmuting
+    restores them.  Each returned post carries ``saved`` and
+    ``saved_at``.
+    """
+    silenced = muted_author_set(conn)
+    keywords = _muted_keyword_list(conn)
+    posts = saved_posts(conn, limit=limit, offset=offset)
+    posts = annotate_quotes(
+        conn,
+        annotate_quote_counts(
+            conn,
+            annotate_replies(
+                conn,
+                annotate_reactions(conn, posts, viewer=viewer),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
+            ),
+        ),
+    )
+    for post in posts:
+        post["saved"] = True
+    kept = [post for post in posts if post["author"] not in silenced]
+    return without_muted_keywords(conn, kept, keywords)
 
 
 

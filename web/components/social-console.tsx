@@ -320,17 +320,31 @@ export function SocialConsole() {
                       <SavedEmptyState />
                     )
                   ) : (
-                    tan.saved.map((post) => (
-                      <PostCard
-                        key={post.hash}
-                        post={post}
-                        onToggleLike={toggleLike}
-                        onToggleSave={toggleSave}
-                        onReply={(target) => setReplyTarget(target)}
-                        onDelete={submitDelete}
-                        deleting={deleting.has(post.hash)}
-                      />
-                    ))
+                    <>
+                      {tan.saved.map((post) => (
+                        <PostCard
+                          key={post.hash}
+                          post={post}
+                          onToggleLike={toggleLike}
+                          onToggleSave={toggleSave}
+                          onReply={(target) => setReplyTarget(target)}
+                          onDelete={submitDelete}
+                          deleting={deleting.has(post.hash)}
+                        />
+                      ))}
+                      {tan.savedHasMore ? (
+                        <button
+                          type="button"
+                          onClick={() => void tan.loadMoreSaved()}
+                          disabled={tan.savedLoading}
+                          className="w-full rounded-xl border border-line/70 bg-void/40 px-3 py-2.5 text-xs text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          {tan.savedLoading
+                            ? "loading…"
+                            : "load more saved posts"}
+                        </button>
+                      ) : null}
+                    </>
                   )
                 ) : tan.posts.length === 0 ? (
                   <EmptyState />

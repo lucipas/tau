@@ -734,15 +734,10 @@ class WebBridge:
         finally:
             conn.close()
 
-    def tan_saved(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+    def tan_saved(self, *, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import (
-            annotate_reactions,
-            annotate_replies,
-            apply_display_rules,
-            saved_posts,
-        )
+        from .tangents.tan import annotated_saved_posts, apply_display_rules
 
         conn = self._tan_conn()
         try:
@@ -754,12 +749,9 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            posts = saved_posts(conn, limit=limit)
-            posts = annotate_replies(
-                conn, annotate_reactions(conn, posts, viewer=viewer)
+            posts = annotated_saved_posts(
+                conn, limit=limit, offset=offset, viewer=viewer
             )
-            for post in posts:
-                post["saved"] = True
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1121,10 +1113,21 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/tan/saved":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
                 try:
-                    posts = self.bridge.tan_saved(limit=limit)
-                except Exception as exc:
+                    posts = self.bridge.tan_saved(limit=limit, offset=offset)
+                except ValueError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load saved Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load saved posts"}},
+                        head_only,
+                        500,
+                    )
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
                 return
@@ -1253,8 +1256,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                         result = self.bridge.tan_unsave(target.strip())
                     else:
                         result = self.bridge.tan_save(target.strip())
-                except Exception as exc:
+                except ValueError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a saved Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update saved posts"}},
+                        head_only,
+                        500,
+                    )
                     return
                 self._send_json({"ok": True, "save": result}, head_only)
                 return

@@ -55,6 +55,7 @@ from .tangents.tan import (
     annotate_quotes,
     annotate_reactions,
     annotate_replies,
+    annotated_saved_posts,
     apply_display_rules,
     author_stats,
     author_timeline,
@@ -74,7 +75,6 @@ from .tangents.tan import (
     resolve_muted_name,
     resolve_post,
     save_post,
-    saved_posts,
     search_posts,
     thread,
     timeline,
@@ -1938,8 +1938,7 @@ def cmd_tan_saved(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
-        posts = saved_posts(conn, limit=args.limit)
-        posts = annotate_replies(conn, annotate_reactions(conn, posts, viewer=viewer))
+        posts = annotated_saved_posts(conn, limit=args.limit, viewer=viewer)
     finally:
         conn.close()
     try:
