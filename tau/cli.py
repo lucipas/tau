@@ -1419,6 +1419,10 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
 def cmd_tan_top(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1428,13 +1432,15 @@ def cmd_tan_top(args: argparse.Namespace) -> int:
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
-        posts = top_posts(conn, author=author, limit=args.limit, viewer=viewer)
+        posts = top_posts(
+            conn,
+            author=author,
+            limit=args.limit,
+            viewer=viewer,
+            ruleset=display_ruleset,
+        )
     finally:
         conn.close()
-    try:
-        display_ruleset = load_ruleset(config.tan_rules_path)
-    except RulesError:
-        display_ruleset = Ruleset()
     posts = apply_display_rules(posts, display_ruleset)
     _print_tan_posts(
         posts,

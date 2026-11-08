@@ -1429,8 +1429,14 @@ def top_posts(
     author: Optional[str] = None,
     limit: int = 10,
     viewer: Optional[str] = None,
+    ruleset: Optional[Ruleset] = None,
 ) -> List[Dict[str, Any]]:
     """Return the most-liked posts in the local store, best first.
+
+    When *ruleset* is given, kinds it hides are dropped before the limit
+    is applied, so hidden entries never take up result slots.  If it
+    hides both reaction kinds, hidden likes do not influence the order
+    and posts rank by recency.
 
     Ranking is by derived like count, then newest first (the same
     ``created_at DESC, hash DESC`` order as the timeline).  Posts with
@@ -1462,16 +1468,31 @@ def top_posts(
         params,
     ).fetchall()
     candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
-    ranked = annotate_reactions(conn, candidates, viewer=viewer)
-    ranked.sort(
-        key=lambda post: (
-            int(post.get("likes") or 0),
-            float(post.get("created_at") or 0),
-            str(post.get("hash") or ""),
-        ),
-        reverse=True,
-    )
-    return annotate_replies(conn, ranked[:count], muted_keywords=keywords)
+    if ruleset is not None:
+        candidates = [
+            post
+            for post in candidates
+            if ruleset.displays(str(post.get("kind") or KIND_POST))
+        ]
+    if ruleset is None or ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE):
+        # Batch the reaction lookup so large stores stay under the
+        # SQLite bound-parameter limit.
+        for batch in _thread_batches(candidates, _SQL_BATCH):
+            annotate_reactions(conn, batch, viewer=viewer)
+        candidates.sort(
+            key=lambda post: (
+                int(post.get("likes") or 0),
+                float(post.get("created_at") or 0),
+                str(post.get("hash") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        # Hidden reactions must not shape the order; the scan is already
+        # newest first, so keep that order and only attach ownership.
+        for post in candidates:
+            post["own"] = viewer is not None and post["author"] == viewer
+    return annotate_replies(conn, candidates[:count], muted_keywords=keywords)
 
 
 def _fill_unmuted(
