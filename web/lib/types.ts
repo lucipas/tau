@@ -108,6 +108,7 @@ export interface TanReplyParent {
   name: string;
   text: string;
   deleted: boolean;
+  muted?: boolean;
 }
 
 export interface TanPost {
