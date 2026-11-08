@@ -296,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
     )
-    ping.add_argument("--to", required=True, metavar="NAME|HANAME|HASH")
+    ping.add_argument("--to", required=True, metavar="NAME|HASH")
     ping.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     ping.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     ping.set_defaults(func=cmd_ping)

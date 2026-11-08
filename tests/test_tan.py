@@ -20,6 +20,7 @@ from tau.tangents.tan import (
     TanError,
     annotate_replies,
     author_stats,
+    author_timeline,
     create_delete,
     create_post,
     create_reaction,
@@ -2174,11 +2175,6 @@ def test_cli_mute_keyword(tmp_path, capsys):
         main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert [post["text"] for post in payload["posts"]] == [
-        "mesh notes",
-        "crypto to the moon",
-    ]
-)
     assert [post["text"] for post in payload["posts"]] == [
         "mesh notes",
         "crypto to the moon",

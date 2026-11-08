@@ -1387,22 +1387,31 @@ def author_timeline(
 
     Pages through the author's chain until *limit* unmuted posts are
     collected, so muted posts never shrink the result.  Reply previews
-    are redacted for muted parents, as in :func:`timeline`.
+    are redacted for muted parents, as in :func:`timeline`.  The page
+    reads rows with their sequence numbers attached — :func:`feed`
+    strips ``seq`` from its results, so paging on it would fail as
+    soon as a second page was needed.
     """
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
     keywords = _muted_keyword_list(conn)
+
+    def page(cursor: int) -> List[Dict[str, Any]]:
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            "WHERE author = ? AND linked = 1 AND seq > ? "
+            f"AND kind IN ('post', 'reply') AND {_NOT_DELETED} "
+            "ORDER BY seq ASC LIMIT ?",
+            (author, max(0, int(cursor)), MAX_FEED_POSTS),
+        ).fetchall()
+        return [_row_to_post_with_meta(row) for row in rows]
+
     posts = _fill_unmuted(
         conn,
         keywords,
         limit,
-        lambda cursor: feed(
-            conn,
-            author=author,
-            after_seq=int(cursor),
-            limit=MAX_FEED_POSTS,
-            posts_only=True,
-        ),
+        page,
         0,
-        lambda post: post["seq"],
+        lambda post: int(post["seq"]),
     )
     return annotate_replies(
         conn,
