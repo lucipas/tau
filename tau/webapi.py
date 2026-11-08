@@ -380,6 +380,11 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Unread counts are stamped with an ever-increasing revision so
+        # the console can drop a queued or delayed count older than one
+        # it already applied.
+        self._unread_lock = threading.Lock()
+        self._unread_revision = 0
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -515,7 +520,18 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        # local_dict: the console replaces its snapshot record with this
+        # event, so it must carry the same trust fields — a public_dict
+        # event would silently drop the verified badge and any key-change
+        # warning until the next snapshot load.
+        payload = peer.local_dict()
+        # Annotate like the snapshot does, so a live update does not
+        # erase the frontend's blocked badge for this peer.
+        blocklist = getattr(self.node, "blocklist", None)
+        payload["blocked"] = bool(
+            blocklist is not None and blocklist.is_blocked(payload.get("destination"))
+        )
+        self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
@@ -533,7 +549,11 @@ class WebBridge:
             wire_id=str(record["id"]) if isinstance(record.get("id"), str) else None,
             in_reply_to=record.get("in_reply_to"),
         )
-        self.bus.publish({"type": "message", "message": message})
+        # The node appends to its inbox before this callback runs, so
+        # the unread total already includes the new message.
+        self.bus.publish(
+            {"type": "message", "message": message, "unread": self.unread()}
+        )
         return message
 
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
@@ -609,15 +629,24 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_quote_counts,
+            annotate_quotes,
             annotate_reactions,
             annotate_replies,
             apply_display_rules,
-            feed,
+            author_timeline,
             following,
             resolve_author,
             timeline,
         )
 
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.  A list that
+        # failed closed (block_all) hides every post here, matching
+        # the gate, which drops every DM on the same condition.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -630,21 +659,35 @@ class WebBridge:
                 )
             if author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
-                posts = list(
-                    reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
-                    )
-                )
-                posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                posts = author_timeline(
+                    conn,
+                    target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
                 )
             elif include_all:
-                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    include_all=True,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             else:
                 authors = [record["author"] for record in following(conn)]
                 if viewer is not None:
                     authors.append(viewer)
-                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    authors,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -910,16 +953,43 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            # local_dict: verification is this node's own trust state, so
+            # it is shown to the console owner but never sent to peers.
+            items = [peer.local_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
+        blocklist = getattr(self.node, "blocklist", None)
+        for item in items:
+            # is_blocked covers the fail-closed case too: with a
+            # corrupt list every peer reads as blocked, matching the
+            # DM gate, which drops every message then.
+            item["blocked"] = bool(
+                blocklist is not None
+                and blocklist.is_blocked(item.get("destination"))
+            )
+        return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
+        # Blocked senders' history stays stored but is hidden locally;
+        # unblocking restores the view.  Inbound records carry the
+        # sender hash as "destination" (node inbox) or "peer" (console
+        # log); outbound records carry the recipient, which blocking
+        # never hides.  is_blocked covers the fail-closed case too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None:
+            items = [
+                item
+                for item in items
+                if item.get("direction") != "in"
+                or not blocklist.is_blocked(
+                    item.get("destination") or item.get("peer")
+                )
+            ]
         return items
 
     def counts(self) -> Dict[str, int]:
@@ -927,12 +997,51 @@ class WebBridge:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
 
+    def _stamp_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the next revision to *counts* (caller holds ``_unread_lock``)."""
+        self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
+        return dict(counts, revision=self._unread_revision)
+
+    def unread(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the node inbox.
+
+        A node without an inbox (tests, embeds) simply has nothing
+        unread; read state is local to this node either way.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                try:
+                    counts = inbox.unread_counts()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not read inbox unread counts", exc_info=True)
+            return self._stamp_unread(counts)
+
+    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Advance the inbox read cursor for one conversation, or all.
+
+        The console calls this when a conversation is opened, so its
+        unread badge clears; other tabs learn from the ``unread`` SSE
+        event.  Read state never leaves this node.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                counts = inbox.mark_read(peer=peer)
+            stamped = self._stamp_unread(counts)
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
+            "unread": self.unread(),
             "bridge": {
                 "version": __version__,
                 "web": self.web_dir is not None,
@@ -1146,6 +1255,22 @@ class _WebHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/messages/read":
+                peer = body.get("peer")
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                counts = self.bridge.mark_read(
+                    peer.strip() if isinstance(peer, str) else None
+                )
+                self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)

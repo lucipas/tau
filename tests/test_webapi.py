@@ -11,6 +11,7 @@ import urllib.request
 
 import pytest
 
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
 from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
@@ -37,6 +38,7 @@ class FakeNode:
     def __init__(self, mailbox_path=None):
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
+        self.inbox = Inbox()
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -142,6 +144,38 @@ def test_status_snapshot(bridge):
     assert payload["node"]["name"] == "tester"
     assert payload["peers"][0]["name"] == "alice"
     assert payload["messages"] == []
+
+
+def test_peers_endpoint_includes_verification_state(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["count"] == 1
+    entry = payload["peers"][0]
+    assert entry["verified"] is True
+    assert entry["verified_at"] == 1500.0
+    assert entry["key_change_at"] is None
+    # Verification state is local-only: the public description stays clean.
+    assert "verified" not in peer.public_dict()
+
+
+def test_record_peer_event_carries_trust_fields(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+    peer.key_change_at = 1600.0
+
+    bridge.record_peer(peer)
+    events = bridge.bus.replay(0)
+    peer_events = [event for event in events if event.get("type") == "peer"]
+    assert peer_events
+    # A live announce must not replace the snapshot record with a
+    # trust-free one: the badge and warning survive the event.
+    assert peer_events[-1]["peer"]["verified"] is True
+    assert peer_events[-1]["peer"]["key_change_at"] == 1600.0
 
 
 def test_send_message_is_recorded_and_published(bridge, node):
@@ -270,6 +304,102 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["direction"] == "in"
     assert feed["messages"][0]["peer_name"] == "bob"
     assert feed["messages"][0]["text"] == "from the mesh"
+
+
+def _inbound_record(node, **overrides):
+    """A received DM, appended to the node inbox first — the order the
+    node itself uses before it hands the record to the bridge."""
+    record = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "m-1",
+    }
+    record.update(overrides)
+    node.inbox.append(record)
+    return record
+
+
+def _counts(unread):
+    """Unread counts without the revision stamp, for shape checks."""
+    return {key: value for key, value in unread.items() if key != "revision"}
+
+
+def test_snapshot_carries_unread_counts(bridge, node):
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "total": 2}
+
+
+def test_unread_revisions_only_increase(bridge, node):
+    first = bridge.unread()["revision"]
+    second = bridge.unread()["revision"]
+    assert second > first
+
+
+def test_inbound_message_event_carries_unread_total(bridge, node):
+    record = _inbound_record(node)
+    bridge.record_inbound(record)
+
+    events = bridge.bus.replay(0)
+    message_events = [event for event in events if event["type"] == "message"]
+    assert _counts(message_events[-1]["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
+
+
+def test_mark_read_endpoint_clears_a_conversation(bridge, node):
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+    _inbound_record(
+        node,
+        destination=OTHER_HASH,
+        **{"from": "carol", "id": "m-3", "received_at": 103.0},
+    )
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+
+    # Other tabs learn from the published unread event.
+    events = bridge.bus.replay(0)
+    unread_events = [event for event in events if event["type"] == "unread"]
+    assert _counts(unread_events[-1]["unread"]) == {
+        "per_peer": {OTHER_HASH: 1},
+        "total": 1,
+    }
+
+    # Marking everything read clears the rest.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+
+def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": "  "}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": 42}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
 
 
 def test_send_validation(bridge):
@@ -1413,5 +1543,98 @@ def test_tan_reply_via_api(tmp_path):
         )
         assert status == 200
         assert payload["post"]["kind"] == "post"
+    finally:
+        bridge.stop()
+
+
+def test_peers_marks_blocked_peers(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["destination"] == PEER_HASH
+    assert payload["peers"][0]["blocked"] is True
+
+    node.blocklist = BlockList()
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is False
+
+
+def test_peers_marks_everyone_blocked_when_list_failed_closed(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(block_all=True)
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is True
+
+
+def test_messages_hides_blocked_senders(bridge, node):
+    from tau.blocklist import BlockList
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "from alice",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "mallory",
+            "destination": OTHER_HASH,
+            "text": "from mallory",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice"]
+
+    # Unblocking restores the view: nothing was deleted.
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice", "from mallory"]
+
+    # A list that failed closed hides every inbound message.
+    node.blocklist = BlockList(block_all=True)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
+def test_tan_timeline_hides_blocked_authors(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "from alice", name="alice", now=1000)
+        create_post(conn, bob, "from bob", name="bob", now=1001)
+    finally:
+        conn.close()
+    # The console uses the node's cached block-list, the same snapshot
+    # the DM gate enforces.
+    node.blocklist = BlockList(blocked=frozenset({destination_hash(alice).hex()}))
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["from bob"]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert payload["posts"] == []
     finally:
         bridge.stop()

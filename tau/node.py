@@ -23,6 +23,7 @@ import RNS
 
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
+from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import TauConfig, tcp_listen_endpoints, write_rns_config
 from .identity import (
     destination_hash as tau_destination_hash,
@@ -30,8 +31,15 @@ from .identity import (
     load_public_key,
 )
 from .inbox import Inbox
+from .lxmf import (
+    LXMFError,
+    lxmf_router_delivery_hash,
+    start_lxmf_router,
+    stop_lxmf_router,
+)
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
+    TRUSTED_PEER_MIN_AGE_SECONDS,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -93,6 +101,16 @@ _EXCHANGE_INTERVAL = 900.0
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
+# A holder record older than this no longer counts toward the holder cap:
+# the holder may have shed the copy under its sender quota, so the message
+# can be deposited with another relay.  This can let a message end up held
+# by more than MAX_HOLDERS_PER_MESSAGE relays when the original holders
+# still have their copies — accepted deliberately: extra sealed copies are
+# deduped on delivery, while a strict cap could strand mail whose holders
+# all shed it.  There is no shed signal from holder to sender, so record
+# age is the only evidence available.  The window matches the deposit
+# retry interval.
+_HOLDER_RECORD_TTL = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
 
 
@@ -339,6 +357,7 @@ class TauNode:
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
         self.destination: Optional[RNS.Destination] = None
+        self.lxmf_router: Optional[Any] = None
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
@@ -358,6 +377,7 @@ class TauNode:
         self._shutdown = False
         self.app: Optional[Any] = None
         self._allowlist: Optional[AllowList] = None
+        self._blocklist: Optional[BlockList] = None
 
     @property
     def allowlist(self) -> AllowList:
@@ -371,6 +391,21 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    @property
+    def blocklist(self) -> BlockList:
+        """The DM/Tan block-list, loaded lazily from the data directory.
+
+        Checked before the allow-list: blocking an allow-listed peer
+        wins.  A list that cannot be parsed fails closed — every
+        sender is blocked — so a corrupt list can never silently
+        admit a sender the owner meant to silence.
+        """
+        if self._blocklist is None:
+            self._blocklist = load_blocklist_or_block_all(
+                getattr(self.config, "blocklist_path", None)
+            )
+        return self._blocklist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -397,6 +432,7 @@ class TauNode:
         announce: bool = True,
         exclusive: bool = False,
         mail_loop: bool = True,
+        lxmf: bool = False,
     ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
@@ -413,6 +449,9 @@ class TauNode:
         one-shot command that flushes the outbox itself (``tau outbox
         retry``) opts out so its own flush cannot lose the mail lock
         to the loop's first round and silently report nothing moved.
+        With ``lxmf`` on, an LXMF router also runs alongside the node
+        (see :meth:`_start_lxmf_router`); it needs the ``lxmf`` extra
+        installed and must start on the main thread.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -430,7 +469,7 @@ class TauNode:
             lock.acquire()
             self._instance_lock = lock
         try:
-            self._start(announce=announce, mail_loop=mail_loop)
+            self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -442,7 +481,7 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool, mail_loop: bool = True) -> None:
+    def _start(self, *, announce: bool, mail_loop: bool = True, lxmf: bool = False) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -507,15 +546,55 @@ class TauNode:
             )
             self._mail_thread.start()
 
+        if lxmf:
+            self._start_lxmf_router()
+
         if announce:
             self.announce()
 
         log.info("tau node %r ready at %s", self.name, self.destination.hexhash)
 
+    def _start_lxmf_router(self) -> None:
+        """Run an LXMF router on this node's identity.
+
+        The router listens on the LXMF delivery destination derived from
+        the node's identity (the address ``tau id`` and ``tau peers``
+        already show) and announces it, so LXMF clients can find a path
+        to this node.  Storage lives under the data directory.  This is
+        the router lifecycle only — nothing is sent over LXMF yet; that
+        follows under the migration tracked in issue #67.  A failure here
+        is a node-start failure: the caller cleans up via :meth:`stop`.
+        """
+        assert self.identity is not None  # set above, before this runs
+        try:
+            self.lxmf_router = start_lxmf_router(
+                self.identity,
+                self.config.data_dir,
+                display_name=self.name,
+            )
+        except LXMFError as exc:
+            raise NodeError(str(exc)) from exc
+        delivery = lxmf_router_delivery_hash(self.lxmf_router)
+        log.info(
+            "LXMF router running, delivery %s",
+            delivery.hex() if delivery is not None else "unknown",
+        )
+
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
         # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
+
+        if self.lxmf_router is not None:
+            # The router's exit handler persists its state and tears its
+            # destinations down; it runs before Reticulum exits because
+            # it still needs a live Transport.  It is idempotent, so the
+            # atexit handler it registered is a harmless no-op afterwards.
+            try:
+                stop_lxmf_router(self.lxmf_router)
+            except Exception:  # pragma: no cover - defensive
+                log.debug("LXMF router shutdown failed", exc_info=True)
+            self.lxmf_router = None
 
         if self._announce_handler is not None:
             try:
@@ -824,6 +903,23 @@ class TauNode:
             # outside the registry; the inbox keys on Tau destination
             # hashes, so derive that here instead.
             caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins.  The drop is silent — the sender
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  A fake
+            # success reply was considered and rejected: the ticket
+            # says blocked messages "simply never confirm", and a
+            # success reply would falsely confirm delivery and stop
+            # the sender's retries.  The message is never stored,
+            # never marked seen, and never passed to on_message.
+            log.info(
+                "Message from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -890,12 +986,35 @@ class TauNode:
             return response_error("invalid_mail", str(exc))
         if store["expires_at"] <= time.time():
             return response_error("mail_expired", "envelope has already expired")
+        # Quotas are keyed by the peer that asked us to hold the
+        # envelope: the sealed blob hides the inner sender, so the
+        # depositing peer is the only attribution a holder has.  A
+        # long-standing known peer gets the higher quota tier: in the
+        # registry 24h+, heard directly rather than via exchange, and
+        # with at least one message this node has delivered to it.
+        depositor = (
+            tau_destination_hash(remote_identity)
+            if remote_identity is not None
+            else None
+        )
+        trusted = False
+        if depositor is not None:
+            peer = self.registry.get(depositor)
+            if (
+                peer is not None
+                and not peer.via_exchange
+                and time.time() - peer.first_seen >= TRUSTED_PEER_MIN_AGE_SECONDS
+                and peer.delivered_count > 0
+            ):
+                trusted = True
         try:
             stored = self.mailbox.hold(
                 to=bytes.fromhex(store["to"]),
                 blob=store["blob"],
                 message_id=store["id"],
                 expires_at=store["expires_at"],
+                depositor=depositor,
+                trusted=trusted,
             )
         except MailboxFull as exc:
             return response_error("mailbox_full", str(exc))
@@ -1145,7 +1264,11 @@ class TauNode:
                 continue
             if message_id is not None and entry.id != message_id:
                 continue
-            holders = entry.held_by
+            holders = {
+                holder: deposited_at
+                for holder, deposited_at in entry.held_by.items()
+                if now - deposited_at < _HOLDER_RECORD_TTL
+            }
             if (
                 len(holders) >= MAX_HOLDERS_PER_MESSAGE
                 and peer.hexhash not in holders
@@ -1192,6 +1315,7 @@ class TauNode:
             return False
         self.mailbox.remove_outbox(entry.id)
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
                 self.on_delivered(entry.id)
@@ -1318,6 +1442,17 @@ class TauNode:
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
         sender = message.get("from")
+        if self.blocklist.is_blocked(
+            sender if isinstance(sender, str) else None
+        ):
+            # Same silent drop as a direct message, checked before the
+            # allow-list.  Do not mark it seen: another holder's copy
+            # may still be delivered if the sender is unblocked later.
+            log.info(
+                "Relayed message from %s denied by the block-list",
+                sender or "unknown",
+            )
+            return False
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):
@@ -1399,6 +1534,7 @@ class TauNode:
             ]
         except Exception:  # pragma: no cover - introspection only
             pass
+        lxmf_delivery = lxmf_router_delivery_hash(self.lxmf_router)
         return {
             "name": self.name,
             "destination": self.destination.hexhash,
@@ -1409,6 +1545,10 @@ class TauNode:
             "peers": len(self.registry),
             "mailbox": self.mailbox.counts(),
             "interfaces": interfaces,
+            "lxmf": {
+                "enabled": self.lxmf_router is not None,
+                "delivery": lxmf_delivery.hex() if lxmf_delivery else None,
+            },
         }
 
     def resolve_peer(
@@ -1533,6 +1673,16 @@ class TauNode:
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
                 }
             )
+            if self.registry.get(peer.destination_hash) is None:
+                # A caller can hand send_message a Peer that never entered
+                # the registry (resolve_peer returns Peer objects as-is);
+                # a peer we just reached is a known peer, so record it
+                # before stamping the delivery — otherwise the history
+                # is silently lost and the peer never earns its quota tier.
+                self.registry.upsert(
+                    peer.destination_hash, peer.public_key, name=peer.name
+                )
+            self.registry.record_delivered(peer.destination_hash)
             return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;

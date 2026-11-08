@@ -23,23 +23,6 @@ def _record(**overrides):
     return record
 
 
-def test_sent_records_do_not_evict_received_history(tmp_path, monkeypatch):
-    from tau import inbox as inbox_module
-
-    monkeypatch.setattr(inbox_module, "MAX_INBOX", 2)
-    monkeypatch.setattr(inbox_module, "MAX_INBOX_SENT", 1)
-    inbox = Inbox(tmp_path / "inbox.json")
-    inbox.append(_record(id="in-1", direction="in"))
-    inbox.append(_record(id="in-2", direction="in"))
-    for index in range(3):
-        inbox.append(_record(id=f"out-{index}", direction="out"))
-
-    received = inbox.list_messages()
-    assert [item["id"] for item in received] == ["in-2", "in-1"]
-    sent = inbox.list_messages(direction="out")
-    assert [item["id"] for item in sent] == ["out-2"]
-
-
 def test_append_lists_newest_first(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="first", received_at=20.0, text="one"))
@@ -168,6 +151,161 @@ def test_append_rejects_record_without_text(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
+    assert len(inbox) == 0
+
+
+def test_new_messages_are_unread_until_marked_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, received_at=2.0))
+    inbox.append(_record(id="a2", destination="aa" * 16, received_at=3.0))
+
+    assert inbox.unread_counts() == {
+        "per_peer": {"aa" * 16: 2, "bb" * 16: 1},
+        "total": 3,
+    }
+    assert all(entry["unread"] for entry in inbox.list_messages())
+
+    counts = inbox.mark_read(peer="aa" * 16)
+    assert counts == {"per_peer": {"bb" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "b1", "a1"]
+    assert [entry["unread"] for entry in listed] == [False, True, False]
+
+    # Marking one peer leaves the other's cursor alone.
+    inbox.mark_read(peer="bb" * 16)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_read_advances_only_to_up_to(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="a3", received_at=3.0))
+
+    # A listing capped at the older two marks those read; the newest,
+    # never shown, stays unread.
+    inbox.mark_read(up_to_seq=2)
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a3", "a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False, False]
+
+
+def test_mark_read_never_moves_a_cursor_backward(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    # A delayed mark covering only the older message must not restore
+    # the newer one to unread.
+    inbox.mark_read(up_to_seq=1)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_clock_going_backward_does_not_hide_new_mail(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=100.0))
+    inbox.mark_read()
+
+    # Arrives later, but the wall clock says it is earlier.
+    inbox.append(_record(id="a2", received_at=50.0))
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_legacy_file_with_descending_timestamps_starts_read(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="first", received_at=9.0),
+                    _record(id="second", received_at=3.0),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inbox = Inbox(path)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_read_cursors_persist_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.mark_read()
+    inbox.append(_record(id="a2", received_at=2.0))
+
+    reloaded = Inbox(path)
+    assert reloaded.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert [entry["unread"] for entry in reloaded.list_messages()] == [True, False]
+
+
+def test_old_file_without_cursors_starts_read(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps({"messages": [_record(id="old", received_at=5.0)]}),
+        encoding="utf-8",
+    )
+
+    inbox = Inbox(path)
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert inbox.list_messages()[0]["unread"] is False
+
+    # But mail that arrives after the upgrade is unread.
+    inbox.append(_record(id="new", received_at=6.0))
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_same_timestamp_messages_are_all_read_after_marking(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="first", received_at=1.0))
+    inbox.append(_record(id="second", received_at=1.0))
+
+    # The cursor lands on the shared timestamp, so both tied messages
+    # count as read — they were shown together.
+    inbox.mark_read()
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["second", "first"]
+    assert [entry["unread"] for entry in listed] == [False, False]
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_unread_counts_see_another_handles_mark(tmp_path):
+    """A serving node sees a one-shot CLI's mark via the reload."""
+    path = tmp_path / "inbox.json"
+    server = Inbox(path)
+    cli = Inbox(path)
+    server.append(_record(id="a1", received_at=1.0))
+    assert server.unread_counts()["total"] == 1
+
+    cli.mark_read()
+    assert server.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_read_on_empty_inbox_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    assert inbox.mark_read(peer="aa" * 16) == {"per_peer": {}, "total": 0}
+    assert inbox.mark_read() == {"per_peer": {}, "total": 0}
+
+
+def test_sent_records_do_not_evict_received_history(tmp_path, monkeypatch):
+    from tau import inbox as inbox_module
+
+    monkeypatch.setattr(inbox_module, "MAX_INBOX", 2)
+    monkeypatch.setattr(inbox_module, "MAX_INBOX_SENT", 1)
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in"))
+    inbox.append(_record(id="in-2", direction="in"))
+    for index in range(3):
+        inbox.append(_record(id=f"out-{index}", direction="out"))
+
+    received = inbox.list_messages()
+    assert [item["id"] for item in received] == ["in-2", "in-1"]
+    sent = inbox.list_messages(direction="out")
+    assert [item["id"] for item in sent] == ["out-2"]
 
 
 def test_sent_messages_are_stored_but_not_listed_by_default(tmp_path):

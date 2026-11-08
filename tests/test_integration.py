@@ -194,178 +194,9 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
             server.wait(timeout=5)
 
 
-def test_reply_quoting_round_trip(tmp_path: Path) -> None:
-    """A reply sent with --reply-to arrives with its reference intact,
-    and the receiver's CLI renders the quote from local history."""
-    port = free_port()
-    alice_dir = tmp_path / "alice"
-    bob_dir = tmp_path / "bob"
-
-    alice_init = json.loads(
-        require_ok(
-            run_tau(
-                "init",
-                "--data-dir",
-                str(alice_dir),
-                "--name",
-                "alice",
-                "--tcp-listen",
-                f"127.0.0.1:{port}",
-                "--no-auto-interface",
-                "--json",
-            )
-        )
-    )
-    alice_hash = alice_init["destination"]
-
-    require_ok(
-        run_tau(
-            "init",
-            "--data-dir",
-            str(bob_dir),
-            "--name",
-            "bob",
-            "--tcp-connect",
-            f"127.0.0.1:{port}",
-            "--no-auto-interface",
-            "--json",
-        )
-    )
-
-    log_path = tmp_path / "alice.log"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        server = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "tau",
-                "serve",
-                "--data-dir",
-                str(alice_dir),
-                "--announce-interval",
-                "1",
-                "--json",
-            ],
-            cwd=str(ROOT),
-            env={**os.environ, "PYTHONPATH": str(ROOT)},
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            text=True,
-        )
-
-    try:
-        time.sleep(2.0)
-        assert server.poll() is None, log_path.read_text()
-
-        discovered = {}
-        for _ in range(3):
-            result = run_tau(
-                "discover",
-                "--data-dir",
-                str(bob_dir),
-                "--duration",
-                "6",
-                "--json",
-                timeout=40.0,
-            )
-            payload = json.loads(require_ok(result))
-            discovered = {
-                peer["destination"]: peer for peer in payload.get("peers", [])
-            }
-            if alice_hash in discovered:
-                break
-        assert alice_hash in discovered, (
-            f"alice was not discovered; alice log:\n{log_path.read_text()}"
-        )
-
-        sent = json.loads(
-            require_ok(
-                run_tau(
-                    "send",
-                    "--data-dir",
-                    str(bob_dir),
-                    "--to",
-                    alice_hash,
-                    "original thought",
-                    "--timeout",
-                    "20",
-                    "--discover-timeout",
-                    "10",
-                    "--json",
-                    timeout=60.0,
-                )
-            )
-        )
-        assert sent["ok"] is True
-        original_id = sent["id"]
-        assert original_id
-
-        reply = json.loads(
-            require_ok(
-                run_tau(
-                    "send",
-                    "--data-dir",
-                    str(bob_dir),
-                    "--to",
-                    alice_hash,
-                    "--reply-to",
-                    original_id[:8],
-                    "seconded",
-                    "--timeout",
-                    "20",
-                    "--discover-timeout",
-                    "10",
-                    "--json",
-                    timeout=60.0,
-                )
-            )
-        )
-        assert reply["ok"] is True
-        assert reply["echo"] == "seconded"
-
-        # Alice's inbox carries the reference; her CLI renders the
-        # quote from the original she received.
-        messages = json.loads(
-            require_ok(
-                run_tau(
-                    "messages",
-                    "--data-dir",
-                    str(alice_dir),
-                    "--json",
-                    timeout=30.0,
-                )
-            )
-        )
-        by_id = {item["id"]: item for item in messages["messages"]}
-        assert by_id[reply["id"]]["in_reply_to"]["id"] == original_id
-        assert by_id[reply["id"]]["in_reply_to"]["excerpt"]
-
-        text = require_ok(
-            run_tau(
-                "messages",
-                "--data-dir",
-                str(alice_dir),
-                timeout=30.0,
-            )
-        )
-        quote_lines = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip().startswith("↩ ")
-        ]
-        assert len(quote_lines) == 1
-        assert quote_lines[0].endswith(": original thought")
-        assert "seconded" in text
-    finally:
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait(timeout=5)
-
-
-def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path):
+def start_serve(
+    data_dir: Path, stdout_path: Path, stderr_path: Path, *extra: str
+):
     env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}
     stdout_file = stdout_path.open("w", encoding="utf-8")
     stderr_file = stderr_path.open("w", encoding="utf-8")
@@ -380,6 +211,7 @@ def start_serve(data_dir: Path, stdout_path: Path, stderr_path: Path):
             "--announce-interval",
             "1",
             "--json",
+            *extra,
         ],
         cwd=str(ROOT),
         env=env,
@@ -1033,3 +865,232 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "ready" not in result.stdout
     finally:
         stop_process(alice)
+
+
+def test_serve_with_lxmf_runs_router(tmp_path: Path) -> None:
+    """`tau serve --lxmf` runs a real LXMRouter and exits cleanly.
+
+    The router's delivery destination is registered (its ratchet store
+    appears under the data dir), the ready event reports the LXMF
+    delivery address, and SIGTERM shuts the serve down with exit code 0
+    and no traceback — the router's exit handler runs before Reticulum
+    exits.
+    """
+    pytest.importorskip("LXMF")
+    port = free_port()
+    data_dir = tmp_path / "lxmf-node"
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(data_dir),
+            "--name",
+            "lxmf-node",
+            "--tcp-listen",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+    stdout_path = tmp_path / "serve.out"
+    stderr_path = tmp_path / "serve.err"
+    process = start_serve(
+        data_dir, stdout_path, stderr_path, "--lxmf", "--duration", "60"
+    )
+    try:
+        assert wait_for_text(stdout_path, '"ready"', timeout=60), (
+            stderr_path.read_text(encoding="utf-8")
+            if stderr_path.exists()
+            else "serve produced no output"
+        )
+        assert process.poll() is None, stderr_path.read_text(encoding="utf-8")
+        deadline = time.time() + 60
+        ratchets = data_dir / "lxmf" / "ratchets"
+        while not ratchets.is_dir():
+            if time.time() > deadline:
+                pytest.fail(
+                    "LXMF router storage never appeared; "
+                    f"stderr:\n{stderr_path.read_text(encoding='utf-8')}"
+                )
+            time.sleep(0.5)
+        ready = json.loads(stdout_path.read_text(encoding="utf-8").splitlines()[0])
+        lxmf_info = ready["node"]["lxmf"]
+        assert lxmf_info["enabled"] is True
+        # A 16-byte destination hash, hex-encoded.
+        assert isinstance(lxmf_info["delivery"], str)
+        assert len(lxmf_info["delivery"]) == 32
+    finally:
+        stop_process(process)
+    assert process.returncode == 0, stderr_path.read_text(encoding="utf-8")
+    assert "Traceback" not in stderr_path.read_text(encoding="utf-8")
+
+
+def test_reply_quoting_round_trip(tmp_path: Path) -> None:
+    """A reply sent with --reply-to arrives with its reference intact,
+    and the receiver's CLI renders the quote from local history."""
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_init = json.loads(
+        require_ok(
+            run_tau(
+                "init",
+                "--data-dir",
+                str(alice_dir),
+                "--name",
+                "alice",
+                "--tcp-listen",
+                f"127.0.0.1:{port}",
+                "--no-auto-interface",
+                "--json",
+            )
+        )
+    )
+    alice_hash = alice_init["destination"]
+
+    require_ok(
+        run_tau(
+            "init",
+            "--data-dir",
+            str(bob_dir),
+            "--name",
+            "bob",
+            "--tcp-connect",
+            f"127.0.0.1:{port}",
+            "--no-auto-interface",
+            "--json",
+        )
+    )
+
+    log_path = tmp_path / "alice.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tau",
+                "serve",
+                "--data-dir",
+                str(alice_dir),
+                "--announce-interval",
+                "1",
+                "--json",
+            ],
+            cwd=str(ROOT),
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            text=True,
+        )
+
+    try:
+        time.sleep(2.0)
+        assert server.poll() is None, log_path.read_text()
+
+        discovered = {}
+        for _ in range(3):
+            result = run_tau(
+                "discover",
+                "--data-dir",
+                str(bob_dir),
+                "--duration",
+                "6",
+                "--json",
+                timeout=40.0,
+            )
+            payload = json.loads(require_ok(result))
+            discovered = {
+                peer["destination"]: peer for peer in payload.get("peers", [])
+            }
+            if alice_hash in discovered:
+                break
+        assert alice_hash in discovered, (
+            f"alice was not discovered; alice log:\n{log_path.read_text()}"
+        )
+
+        sent = json.loads(
+            require_ok(
+                run_tau(
+                    "send",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--to",
+                    alice_hash,
+                    "original thought",
+                    "--timeout",
+                    "20",
+                    "--discover-timeout",
+                    "10",
+                    "--json",
+                    timeout=60.0,
+                )
+            )
+        )
+        assert sent["ok"] is True
+        original_id = sent["id"]
+        assert original_id
+
+        reply = json.loads(
+            require_ok(
+                run_tau(
+                    "send",
+                    "--data-dir",
+                    str(bob_dir),
+                    "--to",
+                    alice_hash,
+                    "--reply-to",
+                    original_id[:8],
+                    "seconded",
+                    "--timeout",
+                    "20",
+                    "--discover-timeout",
+                    "10",
+                    "--json",
+                    timeout=60.0,
+                )
+            )
+        )
+        assert reply["ok"] is True
+        assert reply["echo"] == "seconded"
+
+        # Alice's inbox carries the reference; her CLI renders the
+        # quote from the original she received.
+        messages = json.loads(
+            require_ok(
+                run_tau(
+                    "messages",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--json",
+                    timeout=30.0,
+                )
+            )
+        )
+        by_id = {item["id"]: item for item in messages["messages"]}
+        assert by_id[reply["id"]]["in_reply_to"]["id"] == original_id
+        assert by_id[reply["id"]]["in_reply_to"]["excerpt"]
+
+        text = require_ok(
+            run_tau(
+                "messages",
+                "--data-dir",
+                str(alice_dir),
+                timeout=30.0,
+            )
+        )
+        quote_lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip().startswith("↩ ")
+        ]
+        assert len(quote_lines) == 1
+        assert quote_lines[0].endswith(": original thought")
+        assert "seconded" in text
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
