@@ -116,6 +116,7 @@ MAX_FOLLOWS = 512
 MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_KEYWORD_LENGTH = 100
+MAX_SAVED_POSTS = 512
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
@@ -451,6 +452,11 @@ CREATE TABLE IF NOT EXISTS muted_authors (
     author TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT '',
     muted_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS saved_posts (
+    hash TEXT PRIMARY KEY,
+    saved_at REAL NOT NULL
 );
 """
 
@@ -2005,6 +2011,133 @@ def muted_author_set(conn: sqlite3.Connection) -> Set[str]:
     """Authors currently muted, as a set of destination hashes."""
     rows = conn.execute("SELECT author FROM muted_authors").fetchall()
     return {str(row["author"]) for row in rows}
+
+
+def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
+    """Resolve a saved-post reference to a cached post hash.
+
+    Unlike :func:`resolve_post`, a post its author deleted still
+    resolves: unsaving must keep working after the save's target is
+    deleted.  A reference to nothing cached fails as unknown.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise TanError("post reference must not be empty")
+    value = ref.strip().lower()
+    if len(value) == HASH_HEX_LENGTH:
+        post = get_post(conn, _require_hex(value, HASH_HEX_LENGTH, "post"))
+        if post is not None and post.get("kind", KIND_POST) in TIMELINE_KINDS:
+            return str(post["hash"])
+        raise TanError(f"unknown post: {ref!r}")
+    if len(value) >= 8:
+        try:
+            bytes.fromhex(value)
+        except ValueError:
+            raise TanError(f"unknown post: {ref!r}") from None
+        rows = conn.execute(
+            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "AND hash LIKE ? LIMIT 8",
+            (value + "%",),
+        ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["hash"])
+        if len(rows) > 1:
+            raise TanError(f"{len(rows)} posts match prefix {value!r}")
+    raise TanError(f"unknown post: {ref!r}")
+
+
+def save_post(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Save a cached post to the local read-later list.
+
+    Saves are private to this node — no signed entry, nothing gossiped.
+    The target must be a cached, linked post or reply that has not been
+    deleted; saving the same post twice is a no-op that reports the
+    original save time.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        raise TanError("post has not linked yet; sync its chain before saving")
+    digest = str(post["hash"])
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing save and the
+    # capacity, so a competing save cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT saved_at FROM saved_posts WHERE hash = ?", (digest,)
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "hash": digest,
+                "author": str(post["author"]),
+                "name": str(post.get("name") or ""),
+                "saved_at": float(existing["saved_at"]),
+                "already_saved": True,
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM saved_posts").fetchone()["n"]
+        if int(count) >= MAX_SAVED_POSTS:
+            raise TanError(f"saved posts are limited to {MAX_SAVED_POSTS} entries")
+        conn.execute(
+            "INSERT INTO saved_posts(hash, saved_at) VALUES(?, ?)",
+            (digest, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {
+        "hash": digest,
+        "author": str(post["author"]),
+        "name": str(post.get("name") or ""),
+        "saved_at": timestamp,
+        "already_saved": False,
+    }
+
+
+def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Remove a post from the local read-later list.
+
+    Returns the resolved post hash with whether a save was removed, so
+    callers — including ``--json`` output — can identify the post even
+    when *ref* was a short prefix.
+    """
+    digest = _resolve_saved_ref(conn, ref)
+    with conn:
+        cursor = conn.execute("DELETE FROM saved_posts WHERE hash = ?", (digest,))
+    return {"hash": digest, "unsaved": cursor.rowcount > 0}
+
+
+def saved_posts(
+    conn: sqlite3.Connection, *, limit: int = DEFAULT_FEED_LIMIT
+) -> List[Dict[str, Any]]:
+    """Saved posts, newest save first.
+
+    A post deleted after being saved stays in the list with its text
+    blanked and ``deleted`` set, so the save is not silently lost.
+    """
+    count = max(1, min(int(limit), MAX_SAVED_POSTS))
+    rows = conn.execute(
+        "SELECT p.*, s.saved_at FROM saved_posts s "
+        "JOIN posts p ON p.hash = s.hash "
+        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ?",
+        (count,),
+    ).fetchall()
+    deleted = deleted_targets(conn)
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        post = _row_to_post(row)
+        post["saved_at"] = float(row["saved_at"])
+        if str(post["hash"]) in deleted:
+            post["deleted"] = True
+            post["text"] = ""
+        records.append(post)
+    return records
+
 
 
 def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:

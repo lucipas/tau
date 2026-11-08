@@ -49,6 +49,8 @@ from tau.tangents.tan import (
     mute,
     muted,
     muted_author_set,
+    save_post,
+    saved_posts,
     search_posts,
     store,
     store_post,
@@ -57,6 +59,7 @@ from tau.tangents.tan import (
     unfollow,
     unmute,
     unmute_keyword,
+    unsave_post,
     verify_post,
     without_muted_keywords,
 )
@@ -1672,14 +1675,14 @@ def test_mentions_lists_replies_to_own_posts_and_replies(identities, tmp_path):
     own_reply = create_reply(
         conn, alice, post["hash"], "talking to myself", name="alice", now=1001
     )
-    reply = create_reply(
-        conn, bob, post["hash"], "seconded", name="bob", now=1002
-    )
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1002)
     reply_to_reply = create_reply(
         conn, bob, own_reply["hash"], "even this", name="bob", now=1003
     )
     other = create_post(conn, bob, "bob's own post", name="bob", now=1004)
-    to_bob = create_reply(conn, alice, other["hash"], "not a mention", name="alice", now=1005)
+    to_bob = create_reply(
+        conn, alice, other["hash"], "not a mention", name="alice", now=1005
+    )
 
     found = mentions(conn, author_of(alice))
     assert [item["hash"] for item in found] == [
@@ -1692,9 +1695,7 @@ def test_mentions_lists_replies_to_own_posts_and_replies(identities, tmp_path):
     assert found[1]["reply_to"]["hash"] == post["hash"]
     assert found[1]["reply_to"]["text"] == "original thought"
     # A reply to someone else's post is a mention of them, not of you.
-    assert [item["hash"] for item in mentions(conn, author_of(bob))] == [
-        to_bob["hash"]
-    ]
+    assert [item["hash"] for item in mentions(conn, author_of(bob))] == [to_bob["hash"]]
     assert [item["hash"] for item in mentions(conn, author_of(alice), limit=1)] == [
         reply_to_reply["hash"]
     ]
@@ -1704,9 +1705,7 @@ def test_mentions_hides_deleted_and_unlinked(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "original thought", name="alice", now=1000)
-    reply = create_reply(
-        conn, bob, post["hash"], "seconded", name="bob", now=1001
-    )
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1001)
     assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
         reply["hash"]
     ]
@@ -1733,9 +1732,7 @@ def test_mentions_hides_deleted_and_unlinked(identities, tmp_path):
     store_post(conn, late)
     assert mentions(conn, author_of(alice)) == []
     store_post(conn, bob_first)
-    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
-        late["hash"]
-    ]
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [late["hash"]]
 
 
 def test_mentions_hides_replies_beneath_deleted_ancestor(identities, tmp_path):
@@ -1779,9 +1776,7 @@ def test_cli_mentions(tmp_path, capsys):
     post = json.loads(capsys.readouterr().out)["post"]
 
     # No replies yet is a clean empty result, not an error.
-    assert (
-        main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
-    )
+    assert main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 0
 
     # A reply from another author, stored as if it had synced in.
@@ -1792,9 +1787,7 @@ def test_cli_mentions(tmp_path, capsys):
         )
     finally:
         conn.close()
-    assert (
-        main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
-    )
+    assert main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
     assert payload["posts"][0]["text"] == "seconded"
@@ -2671,3 +2664,195 @@ def test_cli_mute_keyword(tmp_path, capsys):
         "mesh notes",
         "crypto to the moon",
     ]
+
+
+def test_save_post_round_trip(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, bob, "worth keeping", name="bob", now=1000)
+    second = create_post(conn, alice, "mine too", name="alice", now=1001)
+
+    record = save_post(conn, first["hash"][:16], now=2000)
+    assert record["hash"] == first["hash"]
+    assert record["already_saved"] is False
+    assert record["saved_at"] == 2000
+
+    # Saving again is a no-op that reports the original save time.
+    again = save_post(conn, first["hash"], now=3000)
+    assert again["already_saved"] is True
+    assert again["saved_at"] == 2000
+
+    save_post(conn, second["hash"], now=2001)
+    saved = saved_posts(conn)
+    assert [post["hash"] for post in saved] == [second["hash"], first["hash"]]
+    assert saved[0]["saved_at"] == 2001
+
+    removed = unsave_post(conn, first["hash"][:16])
+    assert removed == {"hash": first["hash"], "unsaved": True}
+    assert unsave_post(conn, first["hash"]) == {
+        "hash": first["hash"],
+        "unsaved": False,
+    }
+    assert [post["hash"] for post in saved_posts(conn)] == [second["hash"]]
+
+
+def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        save_post(source, "ab" * 32)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # saving it would file a post with no verified chain behind it.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        save_post(destination, second["hash"])
+
+    # A post its author deleted cannot be saved.
+    create_delete(source, alice, first["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        save_post(source, first["hash"])
+    # ... but a post deleted after being saved stays listed, blanked.
+    keep = create_post(source, bob, "keep me", name="bob", now=1003)
+    save_post(source, keep["hash"], now=2000)
+    create_delete(source, bob, keep["hash"], name="bob", now=1004)
+    saved = saved_posts(source)
+    assert len(saved) == 1
+    assert saved[0]["hash"] == keep["hash"]
+    assert saved[0]["deleted"] is True
+    assert saved[0]["text"] == ""
+
+
+def test_cli_tan_save(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "save this for later",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert main(["tan", "save", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert f"saved {post['hash'][:8]}" in capsys.readouterr().out
+
+    # JSON output lists the saved post with its save time.
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["saved"][0]["text"] == "save this for later"
+    assert payload["saved"][0]["saved_at"] > 0
+
+    # Text output shows the post and when it was saved.
+    assert main(["tan", "saved", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "save this for later" in out
+    assert "saved " in out
+
+    # Unsaving by prefix reports the full hash in JSON output, so
+    # machine-readable callers can identify the affected post.
+    assert (
+        main(
+            [
+                "tan",
+                "unsave",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"hash": post["hash"], "unsaved": True}
+
+    # Unsaving twice: the second time reports it was not saved.
+    assert main(["tan", "unsave", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "was not saved" in capsys.readouterr().out
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    # An unknown reference is a clean CLI error, not a traceback.
+    assert main(["tan", "save", "--data-dir", str(data_dir), "cd" * 32]) != 0
+    assert "tau: error: unknown post" in capsys.readouterr().err
+
+
+def test_cli_tan_saved_deleted_post(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "soon to be deleted",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert main(["tan", "save", "--data-dir", str(data_dir), post["hash"]]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                post["hash"],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # Text output keeps the save but marks the post as deleted.
+    assert main(["tan", "saved", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "(deleted post)" in out
+    assert "soon to be deleted" not in out
+
+    # JSON output lists it as deleted with blank text.
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["saved"][0]["deleted"] is True
+    assert payload["saved"][0]["text"] == ""
+
+    # Unsaving the deleted post succeeds and empties the list.
+    assert main(["tan", "unsave", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "unsaved" in capsys.readouterr().out
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
