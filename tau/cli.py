@@ -1945,25 +1945,51 @@ def cmd_peers(args: argparse.Namespace) -> int:
 
 
 def cmd_peers_forget(args: argparse.Namespace) -> int:
-    """Remove one peer from the local registry."""
+    """Remove one peer from the local registry.
+
+    A serving node keeps its own in-memory registry and rewrites the file
+    on its next save, so forgetting refuses while one is running on this
+    data directory.  The mailbox transaction is held across the fresh
+    safety checks and the registry removal, mirroring ``_save_peers``:
+    a one-shot send cannot queue mail for the peer between the check
+    and the removal.
+    """
     config = _make_config(args)
-    registry = PeerRegistry(config.peers_path)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
     try:
-        peer = registry.resolve(args.target)
-    except PeerError as exc:
-        raise NodeError(str(exc)) from exc
-    if peer is None:
-        raise NodeError(f"unknown peer: {args.target!r}")
-    mailbox = Mailbox(config.mailbox_path)
-    queued = mailbox.outbox_list(to=peer.destination_hash)
-    if queued:
-        noun = "message" if len(queued) == 1 else "messages"
+        lock.acquire()
+    except InstanceAlreadyRunning as exc:
         raise NodeError(
-            f"{peer.display_name} still has {len(queued)} queued {noun}; "
-            "cancel them with `tau outbox cancel` first"
-        )
-    registry.remove(peer.destination_hash)
-    registry.save()
+            "a tau node is already serving on this data directory; "
+            "stop it before forgetting a peer"
+        ) from exc
+    try:
+        mailbox = Mailbox(config.mailbox_path)
+        with mailbox.transaction():
+            registry = PeerRegistry(config.peers_path)
+            try:
+                peer = registry.resolve(args.target)
+            except PeerError as exc:
+                raise NodeError(str(exc)) from exc
+            if peer is None:
+                raise NodeError(f"unknown peer: {args.target!r}")
+            queued = mailbox.outbox_list(to=peer.destination_hash)
+            if queued:
+                noun = "message" if len(queued) == 1 else "messages"
+                raise NodeError(
+                    f"{peer.display_name} still has {len(queued)} queued {noun}; "
+                    "cancel them with `tau outbox cancel` first"
+                )
+            if peer.hexhash in mailbox.pending_ack_holders():
+                raise NodeError(
+                    f"{peer.display_name} still has mail acknowledgements owed; "
+                    "wait for the next mail sweep to send them, then try again"
+                )
+            registry.remove(peer.destination_hash)
+            registry.save()
+    finally:
+        lock.release()
     if _json_mode(args):
         _emit({"forgotten": peer.to_dict()}, True)
     else:

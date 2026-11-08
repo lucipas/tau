@@ -1102,6 +1102,68 @@ def test_peers_forget_refuses_queued_mail(tmp_path, capsys):
     assert PeerRegistry(config.peers_path).get("bob") is not None
 
 
+def test_peers_forget_refuses_pending_acks(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.add_pending_acks("bb" * 16, ["aa" + "11" * 15])
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "acknowledgements" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_refuses_while_serving(tmp_path, capsys):
+    from tau.node import InstanceLock
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    finally:
+        lock.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_holds_mailbox_transaction(tmp_path, capsys, monkeypatch):
+    import fcntl
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock_path = config.mailbox_path.with_name(config.mailbox_path.name + ".lock")
+    blocked = {}
+
+    real_save = PeerRegistry.save
+
+    def save_and_probe(self):
+        # A non-blocking flock on the mailbox lock file must fail while
+        # forget holds the mailbox transaction across the registry save:
+        # a concurrent send could not enqueue between the safety check
+        # and the removal.
+        with open(lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked["held"] = True
+            else:
+                blocked["held"] = False
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return real_save(self)
+
+    monkeypatch.setattr(PeerRegistry, "save", save_and_probe)
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert blocked.get("held") is True
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
 def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
     from tau.mailbox import Mailbox
 
