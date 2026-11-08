@@ -455,6 +455,15 @@ def test_id_rename_rejects_empty_name(tmp_path, capsys):
     assert json.loads((node / "node.json").read_text())["name"] == "alice"
 
 
+def test_id_rename_rejects_control_only_name(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "\x01\x02", "--data-dir", str(node)])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
 def test_id_rename_refuses_without_identity(tmp_path, capsys):
     code = cli.main(["id", "rename", "bob", "--data-dir", str(tmp_path / "fresh")])
     assert code == 1

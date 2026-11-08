@@ -24,7 +24,6 @@ from .allowlist import (
 )
 from .config import (
     TauConfig,
-    default_node_name,
     load_node_name,
     write_node_metadata,
     write_rns_config,
@@ -2141,9 +2140,13 @@ def cmd_id_rename(args: argparse.Namespace) -> int:
     if identity is None:
         raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
     raw_name = getattr(args, "new_name", None)
-    if not isinstance(raw_name, str) or not raw_name.strip():
+    if not isinstance(raw_name, str):
         raise NodeError("new name must not be empty")
-    new_name = sanitize_name(raw_name)
+    # Empty fallback: a name that sanitises to nothing (blank, or control
+    # characters only) is rejected instead of silently becoming "anonymous".
+    new_name = sanitize_name(raw_name, fallback="")
+    if not new_name:
+        raise NodeError("new name must not be empty")
     # Read the stored name, not the resolved one: a global --name flag
     # would override the resolved name and misreport the rename.
     old_name = load_node_name(config.data_dir) or config.name
