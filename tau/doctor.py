@@ -23,13 +23,14 @@ from urllib.request import pathname2url
 import RNS
 
 from .allowlist import AllowListError, load_allowlist
-from .config import TauConfig
+from .config import MESSAGES_FILE_NAME, TauConfig
 from .identity import IdentityError, destination_hash
 from .inbox import MAX_INBOX, _valid_record
 from .mailbox import HeldEnvelope, OutboxEntry
 from .peers import MAX_PEERS, Peer
 from .protocol import short_hash
 from .tangents.rules import RulesError, load_ruleset
+from .webapi import MAX_MESSAGE_LOG, _clean_stored_message
 
 STATUS_OK = "ok"
 STATUS_WARN = "warn"
@@ -81,6 +82,7 @@ def run_checks(config: TauConfig) -> List[Check]:
         _check_peers(config),
         _check_mailbox(config),
         _check_inbox(config),
+        _check_messages(config),
         _check_tan(config),
         _check_tan_rules(config),
         _check_allowlist(config),
@@ -302,6 +304,42 @@ def _check_inbox(config: TauConfig) -> Check:
     if problems:
         return Check("inbox", STATUS_WARN, f"{retained} message(s); {'; '.join(problems)}")
     return Check("inbox", STATUS_OK, f"{retained} message(s)")
+
+
+def _check_messages(config: TauConfig) -> Check:
+    """Check the web console's persisted message history (messages.json)."""
+    path = config.data_dir / MESSAGES_FILE_NAME
+    raw, error = _read_json(path)
+    if error == "missing":
+        return Check("messages", STATUS_OK, "no web history yet")
+    if error is not None:
+        return Check("messages", STATUS_FAIL, f"messages.json {error}")
+    if not isinstance(raw, dict):
+        return Check("messages", STATUS_FAIL, "messages.json is not a JSON object")
+    entries = raw.get("messages")
+    if entries is None:
+        return Check("messages", STATUS_OK, "0 message(s)")
+    if not isinstance(entries, list):
+        return Check("messages", STATUS_FAIL, "messages.json has an invalid messages list")
+    invalid = sum(1 for entry in entries if _clean_stored_message(entry) is None)
+    valid = len(entries) - invalid
+    problems = []
+    if invalid:
+        problems.append(f"{invalid} invalid record(s) skipped on load")
+    if valid > MAX_MESSAGE_LOG:
+        # WebBridge._load_messages keeps only the newest MAX_MESSAGE_LOG.
+        problems.append(
+            f"{valid - MAX_MESSAGE_LOG} older message(s) dropped on load "
+            f"(limit {MAX_MESSAGE_LOG})"
+        )
+        valid = MAX_MESSAGE_LOG
+    if problems:
+        return Check(
+            "messages",
+            STATUS_WARN,
+            f"{valid} message(s); {'; '.join(problems)}",
+        )
+    return Check("messages", STATUS_OK, f"{valid} message(s)")
 
 
 def _check_tan(config: TauConfig) -> Check:
