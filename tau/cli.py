@@ -62,6 +62,7 @@ from .tangents.tan import (
     import_entries,
     init_db,
     list_authors,
+    open_readonly_db,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -1480,7 +1481,7 @@ def cmd_tan_authors(args: argparse.Namespace) -> int:
     if not config.social_db_path.exists():
         records: List[Dict[str, Any]] = []
     else:
-        conn = init_db(config.social_db_path)
+        conn = open_readonly_db(config.social_db_path)
         try:
             records = list_authors(conn, sort=args.sort, limit=limit)
         finally:

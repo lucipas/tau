@@ -1004,14 +1004,11 @@ def test_list_authors(identities, tmp_path):
     assert alice_record["last_post"] == 1000
 
     # An author known only from a delete entry (target not cached yet)
-    # still shows up, with zero visible posts.
+    # has no visible posts, so they are not listed.
     create_delete(conn, carol, "ab" * 32, name="carol", now=1004)
     records = list_authors(conn)
-    assert [record["name"] for record in records] == ["bob", "alice", "carol"]
-    carol_record = records[-1]
-    assert carol_record["posts"] == 0
-    assert carol_record["last_post"] == 0
-    assert carol_record["followed"] is False
+    assert [record["name"] for record in records] == ["bob", "alice"]
+    assert all(record["posts"] > 0 for record in records)
 
     with pytest.raises(TanError):
         list_authors(conn, sort="nope")

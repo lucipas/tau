@@ -487,6 +487,14 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     return conn
 
 
+def open_readonly_db(path: Union[str, Path]) -> sqlite3.Connection:
+    """Open an existing Tan database read-only, without schema or metadata writes."""
+    target = Path(path).expanduser().resolve()
+    conn = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def _row_to_post(row: sqlite3.Row) -> Dict[str, Any]:
     return _canonical_post(dict(row))
 
@@ -1561,7 +1569,8 @@ def list_authors(
         raise TanError(f"unknown author sort: {sort!r}")
     if limit < 0:
         raise TanError("--limit must not be negative")
-    rows = conn.execute(
+    # Only authors with at least one visible post are listed.
+    stats = (
         "SELECT posts.author AS author, "
         "(SELECT name FROM posts AS latest WHERE latest.author = posts.author "
         "AND latest.linked = 1 "
@@ -1570,8 +1579,22 @@ def list_authors(
         f"MAX(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN posts.created_at ELSE 0 END) AS last_post, "
         "CASE WHEN follows.author IS NULL THEN 0 ELSE 1 END AS followed "
         "FROM posts LEFT JOIN follows ON follows.author = posts.author "
-        "WHERE posts.linked = 1 GROUP BY posts.author"
-    ).fetchall()
+        "WHERE posts.linked = 1 GROUP BY posts.author "
+        f"HAVING SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) > 0"
+    )
+    order_by = {
+        "recent": "last_post DESC, author ASC",
+        "posts": "posts DESC, last_post DESC, author ASC",
+    }.get(sort)
+    if order_by is not None:
+        # Ordering and limiting happen in SQL so only the page is materialised.
+        rows = conn.execute(
+            f"SELECT author, name, posts, last_post, followed FROM ({stats}) "
+            f"ORDER BY {order_by} LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(stats).fetchall()
     records = [
         {
             "author": str(row["author"]),
@@ -1582,15 +1605,13 @@ def list_authors(
         }
         for row in rows
     ]
-    if sort == "posts":
-        records.sort(key=lambda record: (-record["posts"], -record["last_post"], record["author"]))
-    elif sort == "name":
+    if order_by is None:
+        # Unicode casefold ordering for names is not expressible in SQLite.
         records.sort(
             key=lambda record: ((record["name"] or "").casefold(), record["author"])
         )
-    else:
-        records.sort(key=lambda record: (-record["last_post"], record["author"]))
-    return records[:limit]
+        return records[:limit]
+    return records
 
 
 def resolve_author(
