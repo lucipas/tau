@@ -41,7 +41,13 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
     box = Mailbox(path)
     entry = box.enqueue(to=BOB, text="hello bob", to_name="bob", now=1000.0)
     assert entry.to == BOB
-    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0}
+    assert box.counts() == {
+        "outbox": 1,
+        "held": 0,
+        "seen": 0,
+        "sent": 0,
+        "receipts": 0,
+    }
 
     reloaded = Mailbox(path)
     entries = reloaded.outbox_list()
@@ -115,7 +121,7 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0}
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0}
     kept = box.get_outbox("dup-id")
     assert kept is not None
     assert kept.text == "newer copy"
@@ -174,7 +180,7 @@ def test_load_skips_nonfinite_timestamps(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0}
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0}
     assert box.get_outbox("nan-created") is None
     assert box.get_outbox("good-id") is not None
 
@@ -621,8 +627,21 @@ def test_prune_expires_everything(tmp_path):
     box.hold(to=BOB, blob=b"y", message_id="dropped-old", expires_at=150.0, now=100.0)
     assert box.drop_held("dropped-old", tombstone=True) is True
     removed = box.prune(now=100.0 + 31 * 24 * 60 * 60)
-    assert removed == {"outbox": 1, "held": 1, "seen": 1, "dropped_held": 1}
-    assert box.counts() == {"outbox": 0, "held": 0, "seen": 0}
+    assert removed == {
+        "outbox": 1,
+        "held": 1,
+        "seen": 1,
+        "sent": 0,
+        "receipts": 0,
+        "dropped_held": 1,
+    }
+    assert box.counts() == {
+        "outbox": 0,
+        "held": 0,
+        "seen": 0,
+        "sent": 0,
+        "receipts": 0,
+    }
 
 
 def test_seen_and_pending_acks(tmp_path):

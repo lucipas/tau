@@ -356,6 +356,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": True,
         }
         assert calls == []
@@ -365,6 +366,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": True,
         }
         assert calls == []
@@ -388,6 +390,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
         "delivered": 0,
         "deposited": 0,
         "received": 0,
+        "receipts": 0,
         "lock_busy": False,
     }
     holder.join(timeout=5.0)

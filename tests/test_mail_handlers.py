@@ -471,6 +471,7 @@ def test_flush_outbox_is_a_noop_until_started(tmp_path):
         "delivered": 0,
         "deposited": 0,
         "received": 0,
+        "receipts": 0,
         "lock_busy": False,
     }
 

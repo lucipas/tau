@@ -1408,3 +1408,108 @@ def test_disappearing_message_carries_expiry_to_receiver(tmp_path: Path) -> None
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+
+
+def test_read_receipts_flow_end_to_end(tmp_path: Path) -> None:
+    """Bob sends alice a DM; alice reads it; bob sees it read (issue #83).
+
+    Alice reads via `tau messages`, which sends one signed receipt
+    back over the link; bob's serving node records `read_at` against
+    the message, and `tau messages --sent` shows the read state.
+    """
+    port = free_port()
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    alice_hash = init_node(
+        tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{port}"
+    )["destination"]
+    init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{port}")
+
+    alice_out, alice_err = tmp_path / "alice.out", tmp_path / "alice.err"
+    bob_out, bob_err = tmp_path / "bob.out", tmp_path / "bob.err"
+    alice = start_serve(alice_dir, alice_out, alice_err)
+    bob = None
+    try:
+        time.sleep(2.0)
+        assert alice.poll() is None, alice_err.read_text()
+        bob = start_serve(bob_dir, bob_out, bob_err)
+        time.sleep(2.0)
+        assert bob.poll() is None, bob_err.read_text()
+
+        discovered = discover_until(bob_dir, alice_hash)
+        assert alice_hash in discovered, alice_err.read_text()
+
+        sent = run_tau(
+            "send",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            "hello, please read this",
+            "--timeout",
+            "20",
+            "--discover-timeout",
+            "10",
+            "--json",
+            timeout=60.0,
+        )
+        response = json.loads(require_ok(sent))
+        assert response["ok"] is True
+        assert response["echo"] == "hello, please read this"
+        wire_id = response["id"]
+        assert isinstance(wire_id, str) and len(wire_id) == 32
+
+        assert wait_for_text(alice_out, "hello, please read this"), (
+            f"alice never received the message\n"
+            f"alice err:\n{alice_err.read_text()}"
+        )
+
+        # Alice lists her inbox: reading it stamps the message read.
+        # Her serving node already holds the TCP listen port, so the
+        # one-shot list cannot start a node of its own — the serving
+        # node's mail sweep delivers the receipt from the stamp.
+        listed = run_tau(
+            "messages", "--data-dir", str(alice_dir), "--json", timeout=60.0
+        )
+        inbox = json.loads(require_ok(listed))
+        assert inbox["count"] >= 1
+        assert any(
+            entry.get("id") == wire_id for entry in inbox["messages"]
+        ), inbox
+
+        # Bob's sent history flips to read once the receipt lands.
+        deadline = time.time() + 90.0
+        state = None
+        while time.time() < deadline:
+            result = run_tau(
+                "messages",
+                "--sent",
+                "--data-dir",
+                str(bob_dir),
+                "--json",
+                timeout=30.0,
+            )
+            payload = json.loads(require_ok(result))
+            entry = next(
+                (
+                    item
+                    for item in payload["messages"]
+                    if item["id"] == wire_id
+                ),
+                None,
+            )
+            assert entry is not None, payload
+            state = entry["state"]
+            if state == "read" and entry["read_at"]:
+                break
+            time.sleep(2.0)
+        assert state == "read", (
+            f"bob never saw the receipt (last state: {state})\n"
+            f"alice err:\n{alice_err.read_text()}\n"
+            f"bob err:\n{bob_err.read_text()}"
+        )
+    finally:
+        if bob is not None:
+            stop_process(bob)
+        stop_process(alice)

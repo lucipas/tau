@@ -26,6 +26,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import RNS
+
 from . import __version__
 
 APP_NAME = "tau"
@@ -57,6 +59,7 @@ MAX_MAIL_TTL = 30 * 24 * 60 * 60
 REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
+REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
@@ -65,11 +68,17 @@ REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
     REQUEST_MESSAGE,
+    REQUEST_READ,
     REQUEST_REACT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
 )
+
+# A read receipt names at most this many message ids; a receipt is
+# batched, but a compromised peer must not make the sender buffer an
+# unbounded list.
+MAX_READ_IDS = 100
 
 
 class ProtocolError(ValueError):
@@ -154,7 +163,7 @@ def build_announce(name: str) -> bytes:
         "v": PROTOCOL_VERSION,
         "name": sanitize_name(name),
         "proto": APP_NAME,
-        "caps": ["message", "ping", "peers", "mail"],
+        "caps": ["message", "ping", "peers", "mail", "read"],
     }
     data = encode(payload)
     # Reticulum announces have a very small payload budget.  Shorten the name
@@ -435,6 +444,141 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         "id": message_id,
         "expires_at": _clean_expires_at(payload.get("expires_at")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+    }
+
+
+def build_read_receipt(
+    reader_identity: Any,
+    *,
+    message_ids: List[str],
+    read_at: Optional[float] = None,
+) -> bytes:
+    """Encode a signed read receipt for the ``/tau/read`` request.
+
+    A receipt names the message ids its sender has *seen* — one
+    receipt can cover many ids, and receipts are never receipted
+    themselves.  The payload carries the reader's public key and a
+    signature over every other field, so the sender can authenticate
+    the receipt without trusting the link alone: the same signed
+    payload rides the link when the sender is online and, sealed,
+    the mailbox when it is not.  Mirrors the sealed-message signing
+    in :mod:`tau.mailbox`.
+    """
+    if not message_ids:
+        raise ProtocolError("read receipt must name at least one message")
+    if len(message_ids) > MAX_READ_IDS:
+        raise ProtocolError(
+            f"read receipt names more than {MAX_READ_IDS} messages"
+        )
+    ids = []
+    for message_id in message_ids:
+        cleaned = _clean_message_id(message_id)
+        if cleaned not in ids:
+            ids.append(cleaned)
+    if not ids:
+        raise ProtocolError("read receipt must name at least one message")
+    if len(ids) > MAX_READ_IDS:
+        raise ProtocolError(
+            f"read receipt names more than {MAX_READ_IDS} messages"
+        )
+    timestamp = read_at if isinstance(read_at, (int, float)) else time.time()
+    if not math.isfinite(timestamp):
+        raise ProtocolError("read_at must be a finite number")
+    reader_hash = RNS.Destination.hash(reader_identity, APP_NAME, ASPECT).hex()
+    payload: Dict[str, Any] = {
+        "type": "read_receipt",
+        "v": PROTOCOL_VERSION,
+        "ids": ids,
+        "read_at": float(timestamp),
+        "from": reader_hash,
+        "from_key": reader_identity.get_public_key().hex(),
+    }
+    signature = reader_identity.sign(encode(payload))
+    if signature is None:  # pragma: no cover - identity without private keys
+        raise ProtocolError("reader identity cannot sign")
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+
+
+def parse_read_receipt(
+    raw: Any, *, remote_identity: Optional[Any] = None
+) -> Dict[str, Any]:
+    """Validate a signed ``/tau/read`` request body.
+
+    Verifies the signature against the carried public key, checks the
+    key derives the claimed reader hash, and — when the link supplied
+    an identity — checks that identity is the claimed reader too.  A
+    receipt from anyone else, or for ids that fail validation, is
+    rejected outright; whether the ids name messages this node actually
+    sent is the caller's check (see ``Mailbox.record_read``).
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "read_receipt":
+        raise ProtocolError("expected a read_receipt payload")
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise ProtocolError("read receipt must name at least one message")
+    if len(ids) > MAX_READ_IDS:
+        raise ProtocolError(
+            f"read receipt names more than {MAX_READ_IDS} messages"
+        )
+    cleaned_ids = []
+    for message_id in ids:
+        cleaned = _clean_message_id(message_id)
+        if cleaned not in cleaned_ids:
+            cleaned_ids.append(cleaned)
+    read_at = payload.get("read_at")
+    if isinstance(read_at, bool) or not isinstance(read_at, (int, float)):
+        raise ProtocolError("read_at must be a finite number")
+    if not math.isfinite(float(read_at)):
+        raise ProtocolError("read_at must be a finite number")
+
+    signature_text = payload.get("sig")
+    if not isinstance(signature_text, str):
+        raise ProtocolError("read receipt is missing its signature")
+    try:
+        signature = base64.b64decode(signature_text, validate=True)
+    except ValueError as exc:
+        raise ProtocolError("read receipt signature is not valid base64") from exc
+    from_key = payload.get("from_key")
+    if not isinstance(from_key, str):
+        raise ProtocolError("read receipt is missing its reader key")
+    try:
+        reader_key = bytes.fromhex(from_key)
+    except ValueError as exc:
+        raise ProtocolError("read receipt reader key is not hex") from exc
+    if len(reader_key) != 64:
+        raise ProtocolError("read receipt reader key has the wrong length")
+    reader = RNS.Identity(create_keys=False)
+    if (
+        reader.load_public_key(reader_key) is False
+        or reader.hash is None
+    ):
+        raise ProtocolError("could not load the reader public key")
+    claimed_from = payload.get("from")
+    if (
+        not isinstance(claimed_from, str)
+        or RNS.Destination.hash(reader, APP_NAME, ASPECT).hex()
+        != claimed_from.lower()
+    ):
+        raise ProtocolError("reader key does not match the claimed reader")
+    if remote_identity is not None:
+        if (
+            RNS.Destination.hash(remote_identity, APP_NAME, ASPECT).hex()
+            != claimed_from.lower()
+        ):
+            raise ProtocolError("read receipt reader does not match the link")
+    unsigned = {k: v for k, v in payload.items() if k != "sig"}
+    try:
+        verified = reader.validate(signature, encode(unsigned))
+    except Exception as exc:
+        raise ProtocolError(f"could not verify read receipt: {exc}") from exc
+    if not verified:
+        raise ProtocolError("read receipt signature does not verify")
+    return {
+        "ids": cleaned_ids,
+        "read_at": float(read_at),
+        "from": claimed_from.lower(),
     }
 
 

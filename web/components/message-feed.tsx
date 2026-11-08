@@ -266,7 +266,9 @@ function MessageBubble({
             {outbound
               ? message.status === "queued"
                 ? "queued"
-                : "delivered"
+                : message.status === "read"
+                  ? "read"
+                  : "delivered"
               : "received"}
           </span>
           {message.rtt_ms !== undefined ? (

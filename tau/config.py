@@ -119,13 +119,59 @@ def load_node_name(data_dir: Path) -> Optional[str]:
     return None
 
 
+def load_node_settings(data_dir: Path) -> Dict[str, Any]:
+    """Read the node's own settings from ``node.json``.
+
+    Tolerates a missing or corrupt file: settings are best-effort and
+    every reader supplies its own default.  Only the keys this module
+    knows are returned, so a hand-edited file cannot smuggle arbitrary
+    state into a settings lookup.
+    """
+    raw = read_json(Path(data_dir) / NODE_FILE_NAME, default=None)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: raw[key]
+        for key in ("send_read_receipts",)
+        if key in raw
+    }
+
+
+def send_read_receipts_enabled(data_dir: Path) -> bool:
+    """True unless this node opted out of sending read receipts.
+
+    A node that never sends receipts simply never does; senders treat
+    the absence of a receipt as unknown, not unread-forever.  Only an
+    explicit ``false`` in ``node.json`` disables sending — any other
+    value (including a corrupt one) keeps the default on.
+    """
+    return load_node_settings(data_dir).get("send_read_receipts", True) is not False
+
+
+def set_node_setting(data_dir: Path, key: str, value: Any) -> Dict[str, Any]:
+    """Persist one node setting in ``node.json``, keeping the others."""
+    from .util import atomic_write_json
+
+    path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
+    raw = read_json(path, default=None)
+    settings = dict(raw) if isinstance(raw, dict) else {}
+    settings[key] = value
+    atomic_write_json(path, settings, mode=0o600)
+    return settings
+
+
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
     path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
+    # Preserve settings written since init (e.g. the read-receipt
+    # opt-out): re-running `tau init` must not silently reset them.
+    raw = read_json(path, default=None)
+    metadata = dict(raw) if isinstance(raw, dict) else {}
+    metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
     atomic_write_json(
         path,
-        {"name": sanitize_name(name), "protocol": APP_NAME},
+        metadata,
         mode=0o600,
     )
     return path

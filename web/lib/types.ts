@@ -19,6 +19,8 @@ export interface TauMessage {
   received_at: number;
   status: string;
   rtt_ms?: number;
+  // Unix time the recipient read this outbound message, when known.
+  read_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
   // Sender-set expiry (epoch seconds). Absent when the message never

@@ -228,6 +228,11 @@ class EventBus:
             self._subscribers.add(subscriber)
         return subscriber
 
+    def subscriber_count(self) -> int:
+        """Live SSE subscribers — whether anyone is watching the console."""
+        with self._lock:
+            return len(self._subscribers)
+
     def unsubscribe(self, subscriber: queue.Queue) -> None:
         with self._lock:
             self._subscribers.discard(subscriber)
@@ -339,6 +344,11 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
+    read_at = entry.get("read_at")
+    if read_at is not None:
+        if not isinstance(read_at, (int, float)) or isinstance(read_at, bool):
+            return None
+        message["read_at"] = float(read_at)
     mail_id = entry.get("mail_id")
     if isinstance(mail_id, str):
         # Kept so a message still queued across a restart can be matched
@@ -423,6 +433,22 @@ class WebBridge:
 
         node.on_delivered = _on_delivered
 
+        # Same chaining for read receipts: the bridge flips the console
+        # record to "read" when the sender's node reports one.
+        previous_on_read = getattr(node, "on_read", None)
+
+        def _on_read(receipt: Dict[str, Any]) -> None:
+            try:
+                if callable(previous_on_read):
+                    previous_on_read(receipt)
+            finally:
+                self.record_read(
+                    receipt.get("reader", ""),
+                    receipt.get("ids", []),
+                    receipt.get("read_at", time.time()),
+                )
+
+        node.on_read = _on_read
         # Reactions arrive on the same node callback pattern: chain any
         # reaction callback the node already has, then annotate the
         # console history entry the reaction targets.
@@ -455,6 +481,12 @@ class WebBridge:
         # OrderedDict used as a bounded set (its popitem(last=False)
         # evicts the oldest report; a plain dict has no such call).
         self._early_deliveries: OrderedDict[str, None] = OrderedDict()
+        # Verified read receipts whose console record was not appended yet,
+        # keyed by (reader, wire id); send_message reconciles them on append.
+        self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
+        # Receipt ids currently being dispatched, so overlapping triggers
+        # (SSE reconnects, re-lists) do not send the same receipt twice.
+        self._receipts_in_flight: Set[str] = set()
         self._messages: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._tan_posts: Deque[Dict[str, Any]] = deque(maxlen=MAX_MESSAGE_LOG)
         self._next_message_id = 1
@@ -638,6 +670,11 @@ class WebBridge:
         self.bus.publish(
             {"type": "message", "message": message, "unread": self.unread()}
         )
+        # A live console is showing the thread view, so this message
+        # counts as displayed: send its read receipt.  With nobody
+        # subscribed the receipt waits for a snapshot serve instead.
+        if self.bus.subscriber_count():
+            self.mark_displayed_read()
         return message
 
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
@@ -678,6 +715,143 @@ class WebBridge:
         self._save_messages()
         self.bus.publish({"type": "message_updated", "message": updated})
         return updated
+
+    def record_read(
+        self,
+        reader_hash: str,
+        message_ids: List[str],
+        read_at: float,
+    ) -> List[Dict[str, Any]]:
+        """Mark outbound messages read from a verified receipt.
+
+        Only records for this reader, still showing ``queued`` or
+        ``delivered``, flip to ``read``; a record already read keeps
+        the earliest read time.  Returns the updated records.
+        """
+        wanted = set(message_ids)
+        matched: Set[str] = set()
+        updated: List[Dict[str, Any]] = []
+        with self._send_lock:
+            with self._lock:
+                for message in self._messages:
+                    if message.get("direction") != "out" or (
+                        message.get("peer") != reader_hash
+                    ):
+                        continue
+                    # Queued records are named by their outbox id and
+                    # every record by its wire id; a receipt names the
+                    # wire id, which for queued mail is the outbox id.
+                    record_id = message.get("wire_id") or message.get("mail_id")
+                    if record_id not in wanted:
+                        continue
+                    matched.add(record_id)
+                    if message.get("status") == "read":
+                        continue
+                    message["status"] = "read"
+                    message["read_at"] = float(read_at)
+                    updated.append(dict(message))
+                # A receipt can beat the console record: send_message
+                # registers the send before the record is appended.  Keep
+                # the read so the record picks it up when it is appended.
+                for mail_id in wanted - matched:
+                    self._early_reads[(reader_hash, mail_id)] = float(read_at)
+                    while len(self._early_reads) > MAX_EARLY_DELIVERIES:
+                        self._early_reads.popitem(last=False)
+        if not updated:
+            return updated
+        self._save_messages()
+        for message in updated:
+            self.bus.publish({"type": "message_updated", "message": message})
+        return updated
+
+    def mark_displayed_read(self) -> None:
+        """Send read receipts for inbound messages shown in the thread view.
+
+        Best-effort and asynchronous: receipt delivery must never
+        block the console.  Only messages the inbox has not already
+        stamped as receipted are covered, so a reconnect or a re-list
+        never re-sends a receipt.  A node that opted out sends none.
+        """
+        node = self.node
+        if node is None or not getattr(node, "read_receipts_enabled", True):
+            return
+        inbox = getattr(node, "inbox", None)
+        if inbox is None:
+            return
+        with self._lock:
+            pending = [
+                dict(message)
+                for message in self._messages
+                if message.get("direction") == "in"
+                and (message.get("wire_id") or message.get("mail_id"))
+            ]
+        if not pending:
+            return
+        try:
+            # A one-shot `tau messages` may have stamped receipts on
+            # disk since this node's copy was loaded.
+            inbox.reload()
+            wanted = {entry["id"] for entry in inbox.unreceipted()}
+        except Exception:
+            log.debug("Could not list unreceipted messages", exc_info=True)
+            return
+        by_peer: Dict[str, List[str]] = {}
+        for message in pending:
+            mail_id = message.get("wire_id") or message["mail_id"]
+            if mail_id not in wanted:
+                continue
+            peer = message.get("peer")
+            if not isinstance(peer, str) or not peer:
+                continue
+            ids = by_peer.setdefault(peer, [])
+            if mail_id not in ids:
+                ids.append(mail_id)
+        if not by_peer:
+            return
+        # Stamp the displayed messages read before dispatch: a send that
+        # fails then stays owed, so the serving node's sweep retries it.
+        try:
+            inbox.mark_read([mid for ids in by_peer.values() for mid in ids])
+        except Exception:
+            log.debug("Could not stamp displayed messages read", exc_info=True)
+        # Claim the ids before the thread starts, so a second trigger that
+        # runs while this one is still sending does not dispatch them again.
+        claimed: Dict[str, List[str]] = {}
+        with self._lock:
+            for peer_hash, ids in by_peer.items():
+                fresh = [mid for mid in ids if mid not in self._receipts_in_flight]
+                if fresh:
+                    self._receipts_in_flight.update(fresh)
+                    claimed[peer_hash] = fresh
+        if not claimed:
+            return
+        claimed_ids = [mid for ids in claimed.values() for mid in ids]
+
+        def _send() -> None:
+            try:
+                for peer_hash, ids in claimed.items():
+                    try:
+                        result = node.send_read_receipts(peer_hash, ids)
+                    except Exception:
+                        log.debug(
+                            "Could not send read receipt to %s",
+                            peer_hash,
+                            exc_info=True,
+                        )
+                        continue
+                    handled = result.get("ids") or []
+                    if handled:
+                        try:
+                            inbox.mark_receipt_sent(handled)
+                        except Exception:
+                            log.debug("Could not stamp read receipts", exc_info=True)
+            finally:
+                with self._lock:
+                    self._receipts_in_flight.difference_update(claimed_ids)
+
+        threading.Thread(
+            target=_send, name="tau-read-receipts", daemon=True
+        ).start()
 
     def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Attach a reaction to the console history entry it targets.
@@ -1001,6 +1175,7 @@ class WebBridge:
         mail_id = response.get("id") if queued else None
         wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         flipped = False
+        early_read: Optional[float] = None
         with self._send_lock:
             message = self._append_message(
                 direction="out",
@@ -1016,14 +1191,23 @@ class WebBridge:
                 wire_id=wire_id,
                 in_reply_to=in_reply_to,
             )
-            if mail_id is not None:
-                with self._lock:
-                    if mail_id in self._early_deliveries:
-                        del self._early_deliveries[mail_id]
-                        message["status"] = "delivered"
-                        flipped = True
-                if flipped:
-                    self._save_messages()
+            with self._lock:
+                if mail_id is not None and mail_id in self._early_deliveries:
+                    del self._early_deliveries[mail_id]
+                    message["status"] = "delivered"
+                    flipped = True
+                read_key = wire_id or mail_id
+                if read_key is not None:
+                    early_read = self._early_reads.pop(
+                        (peer.hexhash, read_key), None
+                    )
+            if early_read is not None:
+                # A read receipt beat the record; it is the later state.
+                message["status"] = "read"
+                message["read_at"] = early_read
+                flipped = True
+            if flipped:
+                self._save_messages()
         self.bus.publish({"type": "message", "message": message})
         if flipped:
             self.bus.publish(
@@ -1124,6 +1308,7 @@ class WebBridge:
         peer = self.node.registry.get(entry.to)
         payload["to_name"] = peer.display_name if peer is not None else entry.to_name
         payload["held_by"] = sorted(entry.held_by)
+        payload["read_at"] = self.node.mailbox.read_at(entry.id)
         return payload
 
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
@@ -1875,6 +2060,9 @@ class _WebHandler(BaseHTTPRequestHandler):
 
         try:
             self._write_event("snapshot", {"snapshot": self.bridge.snapshot()})
+            # A client just opened the console, so the thread view is
+            # displaying these messages: send their read receipts.
+            self.bridge.mark_displayed_read()
             if replay:
                 for event in self.bridge.bus.replay(since):
                     self._write_event(
