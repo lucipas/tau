@@ -61,6 +61,7 @@ from .tangents.tan import (
     following,
     import_entries,
     init_db,
+    likers,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -641,6 +642,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_thread.set_defaults(func=cmd_tan_thread)
 
+    tan_likes = tan_sub.add_parser(
+        "likes",
+        parents=[common],
+        help="show who currently likes a post",
+    )
+    tan_likes.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+    )
+    tan_likes.set_defaults(func=cmd_tan_likes)
+
     tan_follow = tan_sub.add_parser(
         "follow", parents=[common], help="follow a peer or author"
     )
@@ -1101,6 +1112,30 @@ def _print_tan_thread(
             print(f"{indent}  ♥ {likes}{suffix}")
 
 
+def _print_tan_likes(result: Dict[str, Any], *, json_output: bool) -> None:
+    """Print a post plus its current likers, as returned by tan.likers."""
+    post = result["post"]
+    likers = result["likers"]
+    if json_output:
+        _emit({"post": post, "likers": likers, "count": len(likers)}, True)
+        return
+    name = post.get("name") or "anonymous"
+    author = short_hash(str(post.get("author", "")))
+    when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+    print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+    for line in str(post.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    if not likers:
+        print("No likes yet.")
+        return
+    print(f"♥ {len(likers)} like(s):")
+    for liker in likers:
+        liker_name = liker.get("name") or "anonymous"
+        print(f"  {liker_name} ({short_hash(str(liker.get('author', '')))})")
+
+
 def _tan_identity(config: TauConfig) -> Any:
     identity = load_identity(config.identity_path)
     if identity is None:
@@ -1391,6 +1426,18 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
         display_ruleset = Ruleset()
     posts = apply_display_rules(posts, display_ruleset)
     _print_tan_thread(posts, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_likes(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        result = likers(conn, args.ref)
+    finally:
+        conn.close()
+    _print_tan_likes(result, json_output=json_output)
     return _EXIT_OK
 
 

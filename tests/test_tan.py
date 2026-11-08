@@ -35,6 +35,7 @@ from tau.tangents.tan import (
     import_entries,
     init_db,
     like_counts,
+    likers,
     reaction_states,
     resolve_post,
     max_seq,
@@ -701,6 +702,63 @@ def test_reaction_chains_verifies_and_counts(identities, tmp_path):
     assert reaction_states(conn, [post["hash"]])[post["hash"]] == {
         bob_author: "unlike"
     }
+
+
+def test_likers_names_current_likers(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "likeable", name="alice", now=1000)
+    bob_author = author_of(bob)
+    carol_author = author_of(carol)
+
+    assert likers(conn, post["hash"])["likers"] == []
+
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+    create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1002)
+    result = likers(conn, post["hash"][:16])
+    assert result["post"]["hash"] == post["hash"]
+    assert result["likers"] == [
+        {"author": bob_author, "name": "bob"},
+        {"author": carol_author, "name": "carol"},
+    ]
+
+    # An unlike supersedes the like; a re-like restores it under the
+    # name on the latest reaction entry.
+    create_reaction(conn, bob, post["hash"], liked=False, name="bob", now=1003)
+    assert likers(conn, post["hash"])["likers"] == [
+        {"author": carol_author, "name": "carol"}
+    ]
+    create_reaction(conn, bob, post["hash"], liked=True, name="robert", now=1004)
+    assert likers(conn, post["hash"])["likers"] == [
+        {"author": carol_author, "name": "carol"},
+        {"author": bob_author, "name": "robert"},
+    ]
+
+
+def test_likers_rejects_unknown_and_deleted(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        likers(conn, "cd" * 32)
+
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        likers(conn, post["hash"])
+
+
+def test_likers_works_on_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "root", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "agreed", name="bob", now=1001)
+    create_reaction(conn, alice, reply["hash"], liked=True, name="alice", now=1002)
+    assert likers(conn, reply["hash"][:12])["likers"] == [
+        {"author": author_of(alice), "name": "alice"}
+    ]
 
 
 def test_reaction_rejects_tampering(identities, tmp_path):
@@ -1772,6 +1830,77 @@ def test_cli_tan_thread(tmp_path, capsys):
     # An unknown reference is a clean CLI error, not a traceback.
     assert (
         main(["tan", "thread", "--data-dir", str(data_dir), "cd" * 32]) != 0
+    )
+    assert "tau: error: unknown post" in capsys.readouterr().err
+
+
+def test_cli_tan_likes(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "cli likeable",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    # No likes yet is a successful empty result, not an error.
+    assert (
+        main(["tan", "likes", "--data-dir", str(data_dir), post["hash"][:16]])
+        == 0
+    )
+    assert "No likes yet." in capsys.readouterr().out
+
+    assert (
+        main(
+            [
+                "tan", "like", "--data-dir", str(data_dir),
+                "--no-publish", "--json", post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # JSON output names the liker.
+    assert (
+        main(
+            [
+                "tan", "likes", "--data-dir", str(data_dir),
+                "--json", post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["post"]["hash"] == post["hash"]
+    assert payload["likers"] == [
+        {"author": payload["post"]["author"], "name": "alice"}
+    ]
+
+    # Text output shows the post and the liker.
+    assert (
+        main(["tan", "likes", "--data-dir", str(data_dir), post["hash"][:16]])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "cli likeable" in out
+    assert "♥ 1 like(s):" in out
+    assert "alice" in out
+
+    # An unknown reference is a clean CLI error, not a traceback.
+    assert (
+        main(["tan", "likes", "--data-dir", str(data_dir), "cd" * 32]) != 0
     )
     assert "tau: error: unknown post" in capsys.readouterr().err
 

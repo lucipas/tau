@@ -913,6 +913,44 @@ def like_counts(
     return result
 
 
+def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Return the post *ref* names plus who currently likes it.
+
+    *ref* is a post or reply hash or unique prefix, resolved exactly as
+    :func:`resolve_post` does — an unknown, ambiguous or deleted
+    reference raises :class:`TanError`.  The result carries the resolved
+    post under ``"post"`` and the current likers under ``"likers"``: one
+    ``{"author": ..., "name": ...}`` record per reactor whose latest
+    reaction for the post is a like, sorted by name then author hash.
+    The name is the one on the reactor's latest reaction entry for the
+    post.  Only linked reactions count, like :func:`reaction_states`.
+    """
+    post = resolve_post(conn, ref)
+    target = str(post["hash"])
+    states = reaction_states(conn, [target]).get(target, {})
+    current = [a for a, kind in states.items() if kind == KIND_LIKE]
+    records: List[Dict[str, Any]] = []
+    if current:
+        placeholders = ", ".join("?" for _ in current)
+        rows = conn.execute(
+            "SELECT author, name FROM posts "
+            "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
+            f"AND author IN ({placeholders}) ORDER BY author, seq ASC",
+            [target, *current],
+        ).fetchall()
+        names: Dict[str, str] = {}
+        for row in rows:
+            # Rows arrive in chain order per reactor, so the last write
+            # wins — the name on the reactor's latest reaction.
+            names[str(row["author"])] = str(row["name"])
+        records = [
+            {"author": author, "name": names.get(author, "")}
+            for author in current
+        ]
+    records.sort(key=lambda record: (record["name"].lower(), record["author"]))
+    return {"post": _canonical_post(post), "likers": records}
+
+
 def annotate_reactions(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],

@@ -268,6 +268,7 @@ Global options may appear before or after the command:
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
+| `tau tan likes POST` | Show who currently likes a post |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
@@ -527,7 +528,12 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan likes 5c04c868         # names the authors whose like currently stands
 ```
+
+The timeline only shows counts. `tau tan likes` prints the post followed by
+one line per liker; an author who unliked, or whose like was superseded by a
+later unlike, does not appear.
 
 The web console shows the same counts with a ♥ toggle on every post
 (`POST /api/tan/like` / `POST /api/tan/unlike`).
