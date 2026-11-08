@@ -6,7 +6,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
     GET  /api/messages     recent inbound/outbound messages
-    POST /api/messages     send ``{"to": "...", "text": "..."}``
+    POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -55,7 +55,9 @@ from .peers import Peer, PeerError
 from .protocol import (
     MAX_MESSAGE_CHARS,
     ProtocolError,
+    clean_in_reply_to,
     clean_reaction,
+    excerpt_hash,
     normalize_message,
     sanitize_name,
     short_hash,
@@ -330,13 +332,20 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         message["mail_id"] = mail_id
     wire_id = entry.get("wire_id")
     if isinstance(wire_id, str) and wire_id:
-        # The wire message id, so reactions (which name their target by
-        # wire id) can be attached to the right history entry.
+        # The Reticulum message id: how replies name this message, and
+        # how reactions (which name their target by wire id) attach to
+        # the right history entry.
         message["wire_id"] = wire_id
     reactions = entry.get("reactions")
     if isinstance(reactions, list):
         cleaned = [_clean_stored_reaction(item) for item in reactions]
         message["reactions"] = [item for item in cleaned if item is not None]
+    try:
+        in_reply_to = clean_in_reply_to(entry.get("in_reply_to"))
+    except ValueError:
+        in_reply_to = None
+    if in_reply_to is not None:
+        message["in_reply_to"] = in_reply_to
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -344,6 +353,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         json.dumps(message, ensure_ascii=False).encode("utf-8")
     except (UnicodeEncodeError, ValueError):
         return None
+    # The hash is derived from the validated text, never trusted from
+    # the file: a hand-edited messages.json that changes the text but
+    # keeps the old hash must not make a changed quote look verified.
+    # Records written before hashes existed get one here. It is computed
+    # after the UTF-8 check above, because hashing a lone surrogate
+    # would raise instead of dropping the entry.
+    message["excerpt_hash"] = excerpt_hash(text)
     return message
 
 
@@ -415,6 +431,11 @@ class WebBridge:
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
         self._reaction_state: List[Dict[str, Any]] = []
+        # Unread counts are stamped with an ever-increasing revision so
+        # the console can drop a queued or delayed count older than one
+        # it already applied.
+        self._unread_lock = threading.Lock()
+        self._unread_revision = 0
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -550,7 +571,18 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        self.bus.publish({"type": "peer", "peer": peer.public_dict()})
+        # local_dict: the console replaces its snapshot record with this
+        # event, so it must carry the same trust fields — a public_dict
+        # event would silently drop the verified badge and any key-change
+        # warning until the next snapshot load.
+        payload = peer.local_dict()
+        # Annotate like the snapshot does, so a live update does not
+        # erase the frontend's blocked badge for this peer.
+        blocklist = getattr(self.node, "blocklist", None)
+        payload["blocked"] = bool(
+            blocklist is not None and blocklist.is_blocked(payload.get("destination"))
+        )
+        self.bus.publish({"type": "peer", "peer": payload})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
@@ -567,8 +599,13 @@ class WebBridge:
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
             wire_id=wire_id if isinstance(wire_id, str) else None,
+            in_reply_to=record.get("in_reply_to"),
         )
-        self.bus.publish({"type": "message", "message": message})
+        # The node appends to its inbox before this callback runs, so
+        # the unread total already includes the new message.
+        self.bus.publish(
+            {"type": "message", "message": message, "unread": self.unread()}
+        )
         return message
 
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
@@ -695,15 +732,24 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_quote_counts,
+            annotate_quotes,
             annotate_reactions,
             annotate_replies,
             apply_display_rules,
-            feed,
+            author_timeline,
             following,
             resolve_author,
             timeline,
         )
 
+        # One snapshot for every console surface: the node's cached
+        # block-list, the same list the DM gate enforces.  A list that
+        # failed closed (block_all) hides every post here, matching
+        # the gate, which drops every DM on the same condition.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -716,21 +762,35 @@ class WebBridge:
                 )
             if author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
-                posts = list(
-                    reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
-                    )
-                )
-                posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                posts = author_timeline(
+                    conn,
+                    target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
                 )
             elif include_all:
-                posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    include_all=True,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             else:
                 authors = [record["author"] for record in following(conn)]
                 if viewer is not None:
                     authors.append(viewer)
-                posts = timeline(conn, authors, limit=limit, viewer=viewer)
+                posts = timeline(
+                    conn,
+                    authors,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -827,12 +887,51 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def _resolve_console_reply(
+        self, peer_hash: str, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a console ``reply_to`` wire id to an ``in_reply_to``.
+
+        The quoted message must be in this conversation — same peer in
+        the console history, matched by full id or unique prefix — so a
+        reply never dangles at a message from another peer or one the
+        console never saw.
+        """
+        if reply_to is None:
+            return None
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            raise ValueError("field 'reply_to' must be a message id")
+        ref = reply_to.strip().lower()
+        with self._lock:
+            matches = [
+                message
+                for message in self._messages
+                if message.get("peer") == peer_hash
+                and isinstance(message.get("wire_id"), str)
+                and str(message["wire_id"]).lower().startswith(ref)
+            ]
+        if not matches:
+            raise ValueError(
+                f"no message {reply_to.strip()!r} in this conversation to reply to"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} messages in this conversation match"
+                f" {reply_to.strip()!r}; use a longer id"
+            )
+        quoted = matches[0]
+        return {
+            "id": str(quoted["wire_id"]),
+            "excerpt": excerpt_hash(str(quoted.get("text") or "")),
+        }
+
     def send_message(
         self,
         target: str,
         text: str,
         *,
         timeout: float = 20.0,
+        reply_to: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target peer is required")
@@ -846,6 +945,7 @@ class WebBridge:
         text = normalize_message(text)
 
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        in_reply_to = self._resolve_console_reply(peer.hexhash, reply_to)
         # The send lock is NOT held across the network send: queueing
         # starts a flush thread that can deliver the entry (and report
         # it via record_delivery) before the record below exists, and
@@ -853,12 +953,14 @@ class WebBridge:
         # delivery report behind this send. Instead, record_delivery
         # buffers a report that beats the record, and the append below
         # reconciles it.
-        response = self.node.send_message(peer, text, timeout=timeout)
+        response = self.node.send_message(
+            peer, text, timeout=timeout, in_reply_to=in_reply_to
+        )
         queued = bool(response.get("queued"))
         # The outbox id links this record to a later delivery; only
         # present while the message is queued.
         mail_id = response.get("id") if queued else None
-        wire_id = response.get("id")
+        wire_id = response.get("id") if isinstance(response.get("id"), str) else None
         flipped = False
         with self._send_lock:
             message = self._append_message(
@@ -871,7 +973,8 @@ class WebBridge:
                 status="queued" if queued else "delivered",
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
-                wire_id=wire_id if isinstance(wire_id, str) else None,
+                wire_id=wire_id,
+                in_reply_to=in_reply_to,
             )
             if mail_id is not None:
                 with self._lock:
@@ -1005,16 +1108,43 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            return [peer.public_dict(now) for peer in self.node.registry.all()]
+            # local_dict: verification is this node's own trust state, so
+            # it is shown to the console owner but never sent to peers.
+            items = [peer.local_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []
+        blocklist = getattr(self.node, "blocklist", None)
+        for item in items:
+            # is_blocked covers the fail-closed case too: with a
+            # corrupt list every peer reads as blocked, matching the
+            # DM gate, which drops every message then.
+            item["blocked"] = bool(
+                blocklist is not None
+                and blocklist.is_blocked(item.get("destination"))
+            )
+        return items
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._messages)
         if limit >= 0:
             items = items[-limit:]
+        # Blocked senders' history stays stored but is hidden locally;
+        # unblocking restores the view.  Inbound records carry the
+        # sender hash as "destination" (node inbox) or "peer" (console
+        # log); outbound records carry the recipient, which blocking
+        # never hides.  is_blocked covers the fail-closed case too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None:
+            items = [
+                item
+                for item in items
+                if item.get("direction") != "in"
+                or not blocklist.is_blocked(
+                    item.get("destination") or item.get("peer")
+                )
+            ]
         by_target = self._inbox_reactions_by_target()
         return [
             self._with_inbox_reactions(dict(item), by_target) for item in items
@@ -1087,12 +1217,51 @@ class WebBridge:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
 
+    def _stamp_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the next revision to *counts* (caller holds ``_unread_lock``)."""
+        self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
+        return dict(counts, revision=self._unread_revision)
+
+    def unread(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the node inbox.
+
+        A node without an inbox (tests, embeds) simply has nothing
+        unread; read state is local to this node either way.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                try:
+                    counts = inbox.unread_counts()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not read inbox unread counts", exc_info=True)
+            return self._stamp_unread(counts)
+
+    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Advance the inbox read cursor for one conversation, or all.
+
+        The console calls this when a conversation is opened, so its
+        unread badge clears; other tabs learn from the ``unread`` SSE
+        event.  Read state never leaves this node.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                counts = inbox.mark_read(peer=peer)
+            stamped = self._stamp_unread(counts)
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
+            "unread": self.unread(),
             "bridge": {
                 "version": __version__,
                 "web": self.web_dir is not None,
@@ -1117,6 +1286,7 @@ class WebBridge:
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
         wire_id: Optional[str] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -1143,6 +1313,10 @@ class WebBridge:
                         message["reactions"] = _with_reaction(
                             message["reactions"], entry["destination"], entry
                         )
+            message["excerpt_hash"] = excerpt_hash(text)
+            reply_to = clean_in_reply_to(in_reply_to)
+            if reply_to is not None:
+                message["in_reply_to"] = reply_to
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1329,6 +1503,22 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/react":
                 self._handle_react(body, head_only)
                 return
+            if path == "/api/messages/read":
+                peer = body.get("peer")
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                counts = self.bridge.mark_read(
+                    peer.strip() if isinstance(peer, str) else None
+                )
+                self._send_json({"ok": True, "unread": counts}, head_only)
+                return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
@@ -1462,8 +1652,20 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        reply_to = body.get("reply_to")
+        if reply_to is not None and (
+            not isinstance(reply_to, str) or not reply_to.strip()
+        ):
+            self._send_json(
+                {"error": {"message": "field 'reply_to' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
         try:
-            message, response = self.bridge.send_message(target, text, timeout=timeout)
+            message, response = self.bridge.send_message(
+                target, text, timeout=timeout, reply_to=reply_to
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
