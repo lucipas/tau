@@ -130,6 +130,35 @@ def test_send_message_queues_kind_for_offline_peer(tmp_path, monkeypatch):
     assert entry.kind == "alert"
 
 
+def test_queued_kind_survives_retry_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_message("alice", "doorbell rang", kind="alert")
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.kind == "alert"
+
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    assert parse_message(sent["payload"])["kind"] == "alert"
+    assert node.mailbox.get_outbox(response["id"]) is None
+
+
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):
     node = make_node(tmp_path)
     node._shutdown = True

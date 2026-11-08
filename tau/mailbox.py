@@ -54,6 +54,7 @@ from .protocol import (
     decode,
     encode,
     generate_message_id,
+    kind_from_wire,
     normalize_message,
     normalize_message_kind,
     sanitize_name,
@@ -855,7 +856,7 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
     try:
-        kind = normalize_message_kind(payload.get("kind"))
+        kind = kind_from_wire(payload)
     except ProtocolError as exc:
         raise MailboxError(f"sealed message kind is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")

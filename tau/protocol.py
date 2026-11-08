@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -43,6 +44,9 @@ MAX_MESSAGE_CHARS = 2000
 # peers keep working: a payload without a kind is a chat message.
 DEFAULT_MESSAGE_KIND = "chat"
 MAX_MESSAGE_KIND_LENGTH = 32
+# ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
+# would break the documented slug grammar for consumers that enforce it.
+_MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ANNOUNCE_MAX_BYTES = 256
@@ -108,26 +112,35 @@ def normalize_message(text: Any) -> str:
 def normalize_message_kind(kind: Any) -> str:
     """Validate a message kind slug, defaulting an absent one to chat.
 
-    A kind is a short lowercase slug (``[a-z0-9][a-z0-9_-]*``) so it is
-    safe to print, compare and filter on.  ``None`` — the wire case for
-    a peer that predates kinds — means plain chat.
+    A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
+    at most 32 characters) so it is safe to print, compare and filter
+    on.  ``None`` — the local default — means plain chat.
     """
     if kind is None:
         return DEFAULT_MESSAGE_KIND
     if not isinstance(kind, str):
         raise ProtocolError("message kind must be a string")
     cleaned = kind.strip().lower()
-    if not cleaned or len(cleaned) > MAX_MESSAGE_KIND_LENGTH:
+    if _MESSAGE_KIND_RE.fullmatch(cleaned) is None:
         raise ProtocolError(
-            f"message kind must be 1-{MAX_MESSAGE_KIND_LENGTH} characters"
+            "message kind must match [a-z0-9][a-z0-9_-]{0,31}"
         )
-    if not all(char.isalnum() or char in "-_" for char in cleaned):
-        raise ProtocolError(
-            "message kind may only use lowercase letters, digits, '-' and '_'"
-        )
-    if not cleaned[0].isalnum():
-        raise ProtocolError("message kind must start with a letter or digit")
     return cleaned
+
+
+def kind_from_wire(payload: Dict[str, Any]) -> str:
+    """Kind from a peer payload: absent means chat, present must be valid.
+
+    An explicit ``null`` is malformed, not chat — only a missing key
+    gets the default, so a peer cannot smuggle an invalid kind past
+    validation by sending ``null``.
+    """
+    if "kind" not in payload:
+        return DEFAULT_MESSAGE_KIND
+    kind = payload["kind"]
+    if kind is None:
+        raise ProtocolError("message kind must be a string")
+    return normalize_message_kind(kind)
 
 
 def encode(obj: Any, *, max_bytes: Optional[int] = None) -> bytes:
@@ -259,7 +272,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         message_id = None
     return {
         "text": text,
-        "kind": normalize_message_kind(payload.get("kind")),
+        "kind": kind_from_wire(payload),
         "sent_at": sent_at,
         "id": message_id,
     }

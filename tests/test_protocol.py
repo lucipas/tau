@@ -134,7 +134,21 @@ def test_message_without_kind_parses_as_chat():
 
 
 @pytest.mark.parametrize(
-    "kind", ["", " ", "has space", "has/slash", "UPPER!", "-lead", "x" * 33, 7, ["ping"]]
+    "kind",
+    [
+        "",
+        " ",
+        "has space",
+        "has/slash",
+        "UPPER!",
+        "-lead",
+        "x" * 33,
+        7,
+        ["ping"],
+        "café",
+        "１",
+        "١",
+    ],
 )
 def test_message_kind_rejects_invalid(kind):
     with pytest.raises(ProtocolError):
@@ -143,6 +157,13 @@ def test_message_kind_rejects_invalid(kind):
         parse_message(
             encode({"type": "message", "v": 1, "text": "hi", "kind": kind})
         )
+
+
+def test_message_explicit_null_kind_is_rejected_but_absent_kind_is_chat():
+    base = {"type": "message", "v": 1, "text": "hi", "sent_at": 1.0}
+    assert parse_message(encode(base))["kind"] == "chat"
+    with pytest.raises(ProtocolError):
+        parse_message(encode({**base, "kind": None}))
 
 
 def test_message_rejects_wrong_shape():
