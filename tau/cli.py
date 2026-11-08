@@ -2309,8 +2309,11 @@ def cmd_messages(args: argparse.Namespace) -> int:
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
         header = f"[{when}] {name} ({sender})"
-        if entry.get("id"):
-            header += f" [{_safe_id_prefix(str(entry.get('id')))}]"
+        raw_id = str(entry.get("id") or "")
+        # Only show an id when it is printable and so is a real prefix
+        # that `tau messages delete` can resolve; otherwise use --json.
+        if raw_id and raw_id.isprintable():
+            header += f" [{raw_id[:8]}]"
         print(header)
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
