@@ -131,15 +131,29 @@ KIND_LIKE = "like"
 KIND_UNLIKE = "unlike"
 KIND_DELETE = "delete"
 KIND_REPLY = "reply"
+KIND_QUOTE = "quote"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-# Reactions and deletes carry no text; replies carry text but are still
-# targeted entries, so their parent link is signed like a reaction's.
+# Reactions and deletes carry no text; replies and quotes carry text but
+# are still targeted entries, so their parent link is signed like a
+# reaction's.
 TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE,)
-# Targeted entries (reactions, deletes and replies) point at another post.
-TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY,)
+# Targeted entries (reactions, deletes, replies and quotes) point at
+# another post.
+TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_QUOTE)
 ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
-# Kinds that appear as timeline items: top-level posts and replies.
-TIMELINE_KINDS = (KIND_POST, KIND_REPLY)
+# Kinds that appear as timeline items: top-level posts, replies and
+# quotes.  A quote is a post-like entry: it carries its own text, can be
+# replied to and can be deleted.
+TIMELINE_KINDS = (KIND_POST, KIND_REPLY, KIND_QUOTE)
+# Kinds a quote may target.  Quoting a quote would nest embeds, so only
+# posts and replies are quotable and the embedded original stays one
+# level deep.
+QUOTABLE_KINDS = (KIND_POST, KIND_REPLY)
+# SQL fragment listing the timeline kinds, for the queries that filter
+# on kind directly.  Built from TIMELINE_KINDS so the two cannot drift.
+TIMELINE_KINDS_SQL = ", ".join(f"'{kind}'" for kind in TIMELINE_KINDS)
+# Same treatment for the kinds a quote may target.
+QUOTABLE_KINDS_SQL = ", ".join(f"'{kind}'" for kind in QUOTABLE_KINDS)
 
 # Targeted envelopes sign two extra fields on top of the post fields, so a
 # reaction's or deletion's target cannot be swapped without invalidating
@@ -797,7 +811,7 @@ def create_reply(
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
     if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
-        raise TanError("only posts and replies can be replied to")
+        raise TanError("only posts, replies and quotes can be replied to")
     if not existing.get("linked"):
         raise TanError(
             "post has not linked yet; sync its chain before replying"
@@ -821,6 +835,74 @@ def create_reply(
         "created_at": timestamp,
         "prev": prev,
         "kind": KIND_REPLY,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
+def create_quote(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    text: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a quote of the post *target*.
+
+    A quote is a targeted entry like a reply: ``kind`` is ``quote``
+    and ``target`` is the quoted post's hash, so the quoted link is
+    signed — but unlike a reply it is a standalone timeline item: it
+    carries the quoter's own comment as its text and the original is
+    shown embedded beneath it.  It is appended to the quoter's own
+    chain, exactly like a post, and is gossipped and synced through
+    the same paths.  Only posts and replies can be quoted, so embeds
+    stay one level deep; quoting your own post is allowed.  When the
+    target is not cached locally, or is cached but has not linked yet
+    (its chain is incomplete), this raises: a quote is written to a
+    post the author has seen in full.  Quotes received from peers for
+    parents that have not arrived yet are still stored through the
+    sync path (:func:`store_post`) and shown without the embedded
+    original until the parent arrives.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) not in QUOTABLE_KINDS:
+        raise TanError("only posts and replies can be quoted")
+    if not existing.get("linked"):
+        raise TanError(
+            "post has not linked yet; sync its chain before quoting"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("post has been deleted")
+    clean_text = normalize_message(text)
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": clean_text,
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_QUOTE,
         "target": target,
     }
     digest = hash(body, previous=prev)
@@ -856,7 +938,7 @@ def create_delete(
     existing = get_post(conn, target)
     if existing is not None:
         if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
-            raise TanError("only posts and replies can be deleted")
+            raise TanError("only posts, replies and quotes can be deleted")
         if existing["author"] != author:
             raise TanError("cannot delete a post you did not author")
         if _is_deleted(conn, existing):
@@ -979,7 +1061,7 @@ def annotate_replies(
 
     Parents are fetched in one query and their deletion status in a
     second, so a reply-heavy page does not issue one lookup per reply.
-    Only linked posts and replies count as parents: a reply that points
+    Only linked timeline entries count as parents: a reply that points
     at a reaction, a delete or an unlinked entry is shown without a
     parent snippet, the same as an uncached parent.
     """
@@ -994,7 +1076,7 @@ def annotate_replies(
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE hash IN ({placeholders}) "
-            "AND kind IN ('post', 'reply') AND linked = 1",
+            f"AND kind IN ({TIMELINE_KINDS_SQL}) AND linked = 1",
             targets,
         ).fetchall()
         for row in rows:
@@ -1037,6 +1119,114 @@ def annotate_replies(
     return posts
 
 
+def quote_counts(
+    conn: sqlite3.Connection,
+    targets: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return ``{target: {"quotes": n}}`` for timeline display.
+
+    Every linked, not-deleted quote of a target counts, including
+    quotes of a post that has since been deleted — the count
+    describes the quoting activity, not the target's current
+    visibility.  A quote its author deleted stops counting, the same
+    way a deleted post stops appearing.
+    """
+    clean = []
+    for target in targets:
+        try:
+            clean.append(_require_hex(target, HASH_HEX_LENGTH, "target"))
+        except PostError:
+            continue
+    result: Dict[str, Dict[str, Any]] = {target: {"quotes": 0} for target in clean}
+    if not clean:
+        return result
+    placeholders = ", ".join("?" for _ in clean)
+    rows = conn.execute(
+        "SELECT target, COUNT(*) AS n FROM posts "
+        f"WHERE kind = 'quote' AND linked = 1 AND target IN ({placeholders}) "
+        f"AND {_NOT_DELETED} GROUP BY target",
+        clean,
+    ).fetchall()
+    for row in rows:
+        result[str(row["target"])] = {"quotes": int(row["n"])}
+    return result
+
+
+def annotate_quote_counts(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``quotes`` count to post dicts, in place."""
+    counts = quote_counts(conn, [post["hash"] for post in posts])
+    for post in posts:
+        info = counts.get(post["hash"], {"quotes": 0})
+        post["quotes"] = info["quotes"]
+    return posts
+
+
+def annotate_quotes(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``quoted`` original summary to quote entries, in place.
+
+    The summary carries the original's hash, author, name and text
+    when the original is cached locally, and is ``None`` when the
+    original has not arrived yet — a quote is still shown on its own.
+    A deleted original is reported as deleted with its text blanked,
+    so the thread stays readable without resurfacing removed content.
+    Top-level posts and replies get no ``quoted`` key.
+
+    Parents are fetched in one query and their deletion status in a
+    second, so a quote-heavy page does not issue one lookup per quote.
+    Only linked posts and replies count as originals: a quote that
+    points at a reaction, a delete, a quote or an unlinked entry is
+    shown without the embedded original, the same as an uncached
+    original.
+    """
+    targets = [
+        str(post["target"])
+        for post in posts
+        if post.get("kind") == KIND_QUOTE and post.get("target")
+    ]
+    parents: Dict[str, Dict[str, Any]] = {}
+    if targets:
+        placeholders = ", ".join("?" for _ in targets)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            f"WHERE hash IN ({placeholders}) "
+            f"AND kind IN ({QUOTABLE_KINDS_SQL}) AND linked = 1",
+            targets,
+        ).fetchall()
+        for row in rows:
+            parents[str(row["hash"])] = _canonical_post(dict(row))
+    deleted: Set[Tuple[str, str]] = set()
+    if parents:
+        placeholders = ", ".join("?" for _ in parents)
+        rows = conn.execute(
+            "SELECT target, author FROM posts WHERE kind = 'delete' "
+            f"AND linked = 1 AND target IN ({placeholders})",
+            list(parents),
+        ).fetchall()
+        deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    for post in posts:
+        if post.get("kind") != KIND_QUOTE:
+            continue
+        parent = parents.get(str(post.get("target") or ""))
+        if parent is None:
+            post["quoted"] = None
+            continue
+        is_deleted = (parent["hash"], parent["author"]) in deleted
+        post["quoted"] = {
+            "hash": parent["hash"],
+            "author": parent["author"],
+            "name": parent["name"],
+            "text": "" if is_deleted else parent["text"],
+            "deleted": is_deleted,
+        }
+    return posts
+
+
 # SQL fragment excluding posts their author deleted.  The outer query must
 # read from a table named ``posts``.  Deletion is derived at read time, the
 # same way like counts are, so a delete that arrives before its post
@@ -1060,7 +1250,7 @@ def deleted_targets(conn: sqlite3.Connection) -> Set[str]:
     rows = conn.execute(
         "SELECT p.hash FROM posts p "
         "JOIN posts d ON d.target = p.hash AND d.author = p.author "
-        "WHERE p.kind IN ('post', 'reply') AND p.linked = 1 "
+        f"WHERE p.kind IN ({TIMELINE_KINDS_SQL}) AND p.linked = 1 "
         "AND d.kind = 'delete' AND d.linked = 1"
     ).fetchall()
     return {str(row["hash"]) for row in rows}
@@ -1096,6 +1286,9 @@ def apply_display_rules(
         for post in shown:
             post.pop("likes", None)
             post.pop("liked", None)
+    if not ruleset.displays(KIND_QUOTE):
+        for post in shown:
+            post.pop("quotes", None)
     return shown
 
 
@@ -1121,7 +1314,8 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         except ValueError:
             raise TanError(f"unknown post: {ref!r}") from None
         rows = conn.execute(
-            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "SELECT hash FROM posts WHERE kind IN "
+            f"({TIMELINE_KINDS_SQL}) "
             "AND hash LIKE ? LIMIT 8",
             (value + "%",),
         ).fetchall()
@@ -1170,18 +1364,20 @@ def feed(
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
 
-    Sync needs every entry (reactions, deletes and replies included) to
-    keep chains complete; display callers pass ``posts_only=True`` to
-    hide reaction entries and posts their author deleted.  Replies are
-    timeline items, so ``posts_only`` keeps them alongside top-level
-    posts.
+    Sync needs every entry (reactions, deletes, replies and quotes
+    included) to keep chains complete; display callers pass
+    ``posts_only=True`` to hide reaction entries and posts their author
+    deleted.  Replies and quotes are timeline items, so ``posts_only``
+    keeps them alongside top-level posts.
     """
     count = max(1, min(int(limit), MAX_FEED_POSTS))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         kind_filter = ""
         if posts_only:
-            kind_filter = f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+            kind_filter = (
+                f" AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}"
+            )
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
@@ -1193,7 +1389,7 @@ def feed(
     params: List[Any] = []
     where = "linked = 1"
     if posts_only:
-        where += f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+        where += f" AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}"
     if exclude_authors:
         # Display-only exclusion: the author-specific path above is an
         # explicit lookup and never excludes.  Sync callers leave this
@@ -1340,8 +1536,9 @@ def timeline(
     Reaction entries never appear as timeline items; instead each post
     is annotated with its derived ``likes`` count and, when *viewer* is
     given, whether the viewer's like currently stands and whether the
-    post is the viewer's own.  Replies appear as timeline items,
-    annotated with their parent post when it is cached.  Posts their
+    post is the viewer's own.  Replies and quotes appear as timeline
+    items, annotated with their parent post when it is cached, and
+    each post carries its derived ``quotes`` count.  Posts their
     author deleted never appear either.  Posts whose text matches a
     muted keyword (see :func:`muted_keywords`) never appear either,
     and a reply to one keeps its ``reply_to`` preview text blanked —
@@ -1368,11 +1565,17 @@ def timeline(
             before,
             lambda post: float(post["created_at"]),
         )
-        return annotate_replies(
+        return annotate_quotes(
             conn,
-            annotate_reactions(conn, posts, viewer=viewer),
-            muted_keywords=keywords,
-            exclude_authors=silenced,
+            annotate_quote_counts(
+                conn,
+                annotate_replies(
+                    conn,
+                    annotate_reactions(conn, posts, viewer=viewer),
+                    muted_keywords=keywords,
+                    exclude_authors=silenced,
+                ),
+            ),
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1385,8 +1588,8 @@ def timeline(
     def page(cursor: Optional[float]) -> List[Dict[str, Any]]:
         params: List[Any] = list(clean_authors)
         where = (
-            f"linked = 1 AND kind IN ('post', 'reply') AND author IN ({placeholders}) "
-            f"AND {_NOT_DELETED}"
+            f"linked = 1 AND kind IN ({TIMELINE_KINDS_SQL}) "
+            f"AND author IN ({placeholders}) AND {_NOT_DELETED}"
         )
         if cursor is not None:
             where += " AND created_at < ?"
@@ -1407,11 +1610,17 @@ def timeline(
         before,
         lambda post: float(post["created_at"]),
     )
-    return annotate_replies(
+    return annotate_quotes(
         conn,
-        annotate_reactions(conn, posts, viewer=viewer),
-        muted_keywords=keywords,
-        exclude_authors=silenced,
+        annotate_quote_counts(
+            conn,
+            annotate_replies(
+                conn,
+                annotate_reactions(conn, posts, viewer=viewer),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
+            ),
+        ),
     )
 
 
@@ -1438,7 +1647,7 @@ def author_timeline(
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             "WHERE author = ? AND linked = 1 AND seq > ? "
-            f"AND kind IN ('post', 'reply') AND {_NOT_DELETED} "
+            f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED} "
             "ORDER BY seq ASC LIMIT ?",
             (author, max(0, int(cursor)), MAX_FEED_POSTS),
         ).fetchall()
@@ -1452,10 +1661,16 @@ def author_timeline(
         0,
         lambda post: int(post["seq"]),
     )
-    return annotate_replies(
+    return annotate_quotes(
         conn,
-        annotate_reactions(conn, list(reversed(posts)), viewer=viewer),
-        muted_keywords=keywords,
+        annotate_quote_counts(
+            conn,
+            annotate_replies(
+                conn,
+                annotate_reactions(conn, list(reversed(posts)), viewer=viewer),
+                muted_keywords=keywords,
+            ),
+        ),
     )
 
 
@@ -1506,27 +1721,29 @@ def thread(
 
     *ref* may name any entry in the thread — a reply resolves to its
     root post, walking up through cached, linked, non-deleted parents.
-    The root is the highest such ancestor; a reply whose parent has not
-    arrived yet still anchors its own visible thread.  Every entry
-    carries a ``depth`` (the root is 0) and the derived ``likes`` /
-    ``liked`` / ``own`` annotations, like the timeline.  Replies appear
-    in depth-first order — a reply, then its own replies, then the next
-    sibling — with siblings oldest first, so the thread reads as a
-    conversation.  Deleted and unlinked entries never appear, and a
-    reply to a deleted entry is hidden with its parent's subtree rather
-    than re-parented.  Replies by muted authors are hidden the same
-    way, subtree included — except the entry the caller named, which
-    always anchors the thread even when its author is muted, and a
-    muted ancestor above it, which simply ends the climb instead of
-    being promoted to the root.  An unknown, ambiguous or deleted reference
-    raises :class:`TanError`, exactly as :func:`resolve_post` does; so
-    does a reference to an unlinked entry or to a reply beneath a
-    deleted entry, since showing it would present a partial thread.
-    A reply matching a muted keyword (see :func:`muted_keywords`) is
-    hidden with its whole subtree the same way, but the entry the
-    reference names always anchors the thread even when its own text
-    matches — an explicit lookup — and a muted ancestor above it ends
-    the climb instead of being promoted to the root.
+    The root is the highest such ancestor; a quote is its own root, so
+    naming a quote (or a reply to one) shows the quote and the replies
+    to it.  A reply whose parent has not arrived yet still anchors its
+    own visible thread.  Every entry carries a ``depth`` (the root is
+    0) and the derived ``likes`` / ``liked`` / ``own`` annotations,
+    like the timeline.  Replies appear in depth-first order — a reply,
+    then its own replies, then the next sibling — with siblings oldest
+    first, so the thread reads as a conversation.  Deleted and unlinked
+    entries never appear, and a reply to a deleted entry is hidden with
+    its parent's subtree rather than re-parented.  Replies by muted
+    authors are hidden the same way, subtree included — except the
+    entry the caller named, which always anchors the thread even when
+    its author is muted, and a muted ancestor above it, which simply
+    ends the climb instead of being promoted to the root.  An unknown,
+    ambiguous or deleted reference raises :class:`TanError`, exactly as
+    :func:`resolve_post` does; so does a reference to an unlinked entry
+    or to a reply beneath a deleted entry, since showing it would
+    present a partial thread.  A reply matching a muted keyword (see
+    :func:`muted_keywords`) is hidden with its whole subtree the same
+    way, but the entry the reference names always anchors the thread
+    even when its own text matches — an explicit lookup — and a muted
+    ancestor above it ends the climb instead of being promoted to the
+    root.
     """
     start = resolve_post(conn, ref)
     if not start.get("linked"):
@@ -1631,7 +1848,10 @@ def thread(
     # Annotation fills each entry in place, so batching keeps the reaction
     # lookup within the parameter limit for long threads.
     for batch in _thread_batches(ordered, _SQL_BATCH):
-        annotate_reactions(conn, batch, viewer=viewer)
+        annotate_quotes(
+            conn,
+            annotate_quote_counts(conn, annotate_reactions(conn, batch, viewer=viewer)),
+        )
     return ordered
 
 
@@ -1650,13 +1870,14 @@ def search_posts(
 ) -> List[Dict[str, Any]]:
     """Search stored posts by keyword, newest first.
 
-    Only linked ``post`` entries match: reaction entries never appear
-    as results, and posts their author deleted are excluded the same
-    way the timeline excludes them.  The match is a case-insensitive
-    substring search over the post text — ``casefold`` on both sides,
-    so it folds Unicode case (``Ä`` matches ``ä``) — and the search
-    reads only the local store: it makes no network requests.  Results
-    carry the same like annotations as the timeline.
+    Only linked ``post`` and ``quote`` entries match: reaction entries
+    never appear as results, and posts their author deleted are
+    excluded the same way the timeline excludes them.  The match is a
+    case-insensitive substring search over the post text — ``casefold``
+    on both sides, so it folds Unicode case (``Ä`` matches ``ä``) —
+    and the search reads only the local store: it makes no network
+    requests.  Results carry the same like and quote annotations as
+    the timeline.
 
     The match runs in Python rather than as a SQL ``LIKE``: SQLite's
     ``LIKE`` folds ASCII case only, so a ``LIKE`` query would miss
@@ -1673,7 +1894,7 @@ def search_posts(
     count = max(1, min(int(limit), MAX_SEARCH_POSTS))
     needle = query.strip().casefold()
     params: List[Any] = []
-    where = f"linked = 1 AND kind = 'post' AND {_NOT_DELETED}"
+    where = f"linked = 1 AND kind IN ('post', 'quote') AND {_NOT_DELETED}"
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
@@ -1687,7 +1908,13 @@ def search_posts(
     if author is None:
         silenced = muted_author_set(conn)
         matches = [row for row in matches if str(row["author"]) not in silenced]
-    return annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer)
+    return annotate_quotes(
+        conn,
+        annotate_quote_counts(
+            conn,
+            annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer),
+        ),
+    )
 
 
 # Mentions share search's ceiling: they are a display surface like the
@@ -2371,6 +2598,27 @@ class TanApp:
         if publish and self.node is not None:
             self.publish(post, targets=targets, ttl=ttl)
         return post
+
+    def quote(
+        self,
+        target: str,
+        text: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Create a quote of *target* carrying *text* as the comment."""
+        conn = self.connect()
+        try:
+            record = create_quote(
+                conn, self.identity, target, text, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
 
     def timeline(
         self,

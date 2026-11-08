@@ -588,6 +588,10 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_quote_counts,
+            annotate_quotes,
+            annotate_reactions,
+            annotate_replies,
             apply_display_rules,
             author_timeline,
             following,

@@ -19,12 +19,15 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    annotate_quote_counts,
+    annotate_quotes,
     annotate_reactions,
     annotate_replies,
     author_stats,
     author_timeline,
     create_delete,
     create_post,
+    create_quote,
     create_reaction,
     create_reply,
     deleted_targets,
@@ -40,6 +43,7 @@ from tau.tangents.tan import (
     like_counts,
     mute_keyword,
     muted_keywords,
+    quote_counts,
     reaction_states,
     resolve_post,
     resolve_author,
@@ -1276,8 +1280,8 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
     assert deleted_targets(conn) == set()
     assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
 
-    # Only posts and replies can be deleted, even by their own author.
-    with pytest.raises(TanError, match="only posts and replies can be deleted"):
+    # Only posts, replies and quotes can be deleted, even by their own author.
+    with pytest.raises(TanError, match="only posts, replies and quotes can be deleted"):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
@@ -1900,7 +1904,7 @@ def test_reply_to_deleted_post_or_reaction_is_rejected(identities, tmp_path):
     post = create_post(conn, alice, "doomed", name="alice", now=1000)
     like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
 
-    with pytest.raises(TanError, match="only posts and replies"):
+    with pytest.raises(TanError, match="only posts, replies and quotes"):
         create_reply(conn, bob, like["hash"], "reply to a like", name="bob", now=1002)
 
     create_delete(conn, alice, post["hash"], name="alice", now=1003)
@@ -1946,6 +1950,303 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     }
     with pytest.raises(TanError, match="has been deleted"):
         create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
+
+
+def test_quote_chains_verifies_and_annotates(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+
+    quote = create_quote(
+        conn, bob, post["hash"], "worth sharing", name="bob", now=1001
+    )
+    assert quote["kind"] == "quote"
+    assert quote["target"] == post["hash"]
+    assert quote["text"] == "worth sharing"
+    assert verify_post(quote)["hash"] == quote["hash"]
+    assert head(conn, author_of(bob)) == quote["hash"]
+
+    # The sync feed carries the quote; display surfaces show it with
+    # the original attached and the original carrying a quote count.
+    chain = feed(conn, author=author_of(bob))
+    assert [entry["kind"] for entry in chain] == ["quote"]
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [quote["hash"], post["hash"]]
+    assert items[0]["quoted"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "original thought",
+        "deleted": False,
+    }
+    assert items[0]["quotes"] == 0
+    assert items[1]["quotes"] == 1
+    assert "quoted" not in items[1]
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [
+        quote["hash"],
+        post["hash"],
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        quote["hash"],
+        post["hash"],
+    ]
+    assert resolve_post(conn, quote["hash"][:12])["hash"] == quote["hash"]
+
+
+def test_quote_rejects_tampering(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "target practice", name="alice", now=1000)
+    other = create_post(conn, alice, "decoy", name="alice", now=1001)
+    quote = create_quote(
+        conn, bob, post["hash"], "agreed", name="bob", now=1002
+    )
+
+    # The quoted link is signed: swapping it invalidates the signature.
+    with pytest.raises(PostError):
+        verify_post(dict(quote, target=other["hash"]))
+    with pytest.raises(PostError):
+        verify_post(dict(quote, text="sneaky"))
+    # A quote without an original, and an empty quote, are rejected.
+    with pytest.raises(PostError):
+        verify_post(dict(quote, target=""))
+    with pytest.raises(ProtocolError, match="must not be empty"):
+        create_quote(conn, bob, post["hash"], "   ", name="bob", now=1003)
+
+
+def test_quote_to_uncached_parent_is_rejected_when_authoring(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    with pytest.raises(TanError, match="unknown post"):
+        create_quote(conn, bob, "cd" * 32, "early quote", name="bob", now=1000)
+
+
+def test_quote_to_unlinked_parent_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # quoting it would produce a quote with no original context.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        create_quote(
+            destination, bob, second["hash"], "too early", name="bob", now=1002
+        )
+
+    # Once the chain links up, the same quote is accepted.
+    store_post(destination, first)
+    quote = create_quote(
+        destination, bob, second["hash"], "in full", name="bob", now=1003
+    )
+    assert quote["kind"] == "quote"
+
+
+def test_quote_to_parent_not_yet_synced_shows_without_embed(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "original thought", name="alice", now=1000)
+    quote = create_quote(
+        source, bob, post["hash"], "early quote", name="bob", now=1001
+    )
+
+    # The quote arrives (via gossip or sync) before its original: the
+    # store path keeps it, and the timeline shows it without the
+    # embedded original until the original is cached.
+    replica = init_db(tmp_path / "replica.sqlite3")
+    record, is_new = store_post(replica, quote)
+    assert is_new is True
+    items = timeline(replica, [author_of(bob)])
+    assert [item["hash"] for item in items] == [quote["hash"]]
+    assert items[0]["quoted"] is None
+
+    store(replica, post)
+    items = timeline(replica, [author_of(bob)])
+    assert items[0]["quoted"]["hash"] == post["hash"]
+
+
+def test_quote_to_invalid_target_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+    quote = create_quote(
+        conn, bob, post["hash"], "first quote", name="bob", now=1002
+    )
+
+    # Reactions, deletes and quotes are not quotable: embeds stay one
+    # level deep and always point at a post or a reply.
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_quote(conn, bob, like["hash"], "quote a like", name="bob", now=1003)
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_quote(
+            conn, alice, quote["hash"], "quote a quote", name="alice", now=1004
+        )
+
+    create_delete(conn, alice, post["hash"], name="alice", now=1005)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_quote(conn, bob, post["hash"], "too late", name="bob", now=1006)
+
+
+def test_quote_of_own_post_is_allowed(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "my take", name="alice", now=1000)
+    quote = create_quote(
+        conn, alice, post["hash"], "adding context", name="alice", now=1001
+    )
+    assert quote["kind"] == "quote"
+    assert quote["author"] == post["author"]
+    assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 1
+
+
+def test_quote_can_be_liked_deleted_and_replied_to(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    quote = create_quote(
+        conn, bob, post["hash"], "amplifying this", name="bob", now=1001
+    )
+    reply = create_reply(
+        conn, alice, quote["hash"], "reply to the quote", name="alice", now=1002
+    )
+
+    # Quotes are posts for liking, resolving and replying: a reply to
+    # a quote points at the quote, and the quote is its own thread
+    # root rather than a child of the original's thread.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [
+        reply["hash"],
+        quote["hash"],
+        post["hash"],
+    ]
+    assert items[0]["reply_to"]["hash"] == quote["hash"]
+    assert items[1]["quoted"]["hash"] == post["hash"]
+    assert items[2]["quotes"] == 1
+    assert resolve_post(conn, quote["hash"][:12])["hash"] == quote["hash"]
+
+    create_reaction(conn, alice, quote["hash"], liked=True, name="alice", now=1003)
+    assert like_counts(conn, [quote["hash"]])[quote["hash"]]["likes"] == 1
+
+    items = thread(conn, quote["hash"])
+    assert [item["hash"] for item in items] == [quote["hash"], reply["hash"]]
+    assert [item["depth"] for item in items] == [0, 1]
+    assert items[0]["quoted"]["hash"] == post["hash"]
+    # The quote is not a child of the original's thread either.
+    items = thread(conn, post["hash"])
+    assert [item["hash"] for item in items] == [post["hash"]]
+
+    # Deleting the quote hides it and drops the count; the reply to
+    # it stays in the timeline, with its parent annotation reporting
+    # the deletion without resurfacing the text.
+    create_delete(conn, bob, quote["hash"], name="bob", now=1004)
+    assert deleted_targets(conn) == {quote["hash"]}
+    assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 0
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [reply["hash"], post["hash"]]
+    assert items[0]["reply_to"] == {
+        "hash": quote["hash"],
+        "author": quote["author"],
+        "name": "bob",
+        "text": "",
+        "deleted": True,
+    }
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, quote["hash"])
+
+    # A reaction is not a timeline entry, so it cannot be deleted.
+    like = create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1005)
+    with pytest.raises(TanError, match="only posts, replies and quotes"):
+        create_delete(conn, alice, like["hash"], name="alice", now=1006)
+
+
+def test_quote_of_deleted_post_renders_blanked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    quote = create_quote(
+        conn, bob, post["hash"], "still worth it", name="bob", now=1001
+    )
+
+    # The quote survives its original's deletion, but the embedded
+    # original is blanked rather than resurfacing removed content.
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [quote["hash"]]
+    assert items[0]["quoted"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "",
+        "deleted": True,
+    }
+    # The deleted original's quote count still describes the quoting.
+    assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 1
+
+
+def test_search_includes_quotes(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "mesh networking", name="alice", now=1000)
+    quote = create_quote(
+        conn, bob, post["hash"], "meshtastic thoughts", name="bob", now=1001
+    )
+
+    # A quote matches on its own comment text, with the original
+    # attached like the timeline attaches it.
+    results = search_posts(conn, "meshtastic")
+    assert [item["hash"] for item in results] == [quote["hash"]]
+    assert results[0]["quoted"]["hash"] == post["hash"]
+    # The original still matches on its own text.
+    results = search_posts(conn, "networking")
+    assert [item["hash"] for item in results] == [post["hash"]]
+
+
+def test_cli_quote(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "original thought",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert (
+        main(
+            [
+                "tan", "quote", "--data-dir", str(data_dir),
+                "--no-publish", "--json", post["hash"][:16], "worth sharing",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 1
+        items = timeline(conn, [post["author"]])
+        assert [item["kind"] for item in items] == ["quote", "post"]
+        assert items[0]["quoted"]["hash"] == post["hash"]
+    finally:
+        conn.close()
+    # The timeline shows the quote with its embedded original.
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all"])
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "quoting alice:\n    original thought" in captured.out
+    assert "❝ 1" in captured.out
 
 
 def test_thread_returns_root_and_nested_replies(identities, tmp_path):
@@ -2207,6 +2508,9 @@ def test_cli_tan_thread(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "cli thread starter" in out
     assert "  cli reply" in out
+    # Each entry's text is printed exactly once in text mode.
+    assert out.count("cli thread starter") == 1
+    assert out.count("cli reply") == 1
 
     # An unknown reference is a clean CLI error, not a traceback.
     assert main(["tan", "thread", "--data-dir", str(data_dir), "cd" * 32]) != 0
