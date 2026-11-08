@@ -46,6 +46,7 @@ from tau.tangents.tan import (
     store_post,
     thread,
     timeline,
+    top_posts,
     unfollow,
     unmute_keyword,
     verify_post,
@@ -2198,3 +2199,168 @@ def test_cli_mute_keyword(tmp_path, capsys):
         "mesh notes",
         "crypto to the moon",
     ]
+
+
+def test_top_posts_ranks_by_likes_then_recency(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    old_hit = create_post(conn, alice, "old hit", name="alice", now=1000)
+    mid_hit = create_post(conn, bob, "mid hit", name="bob", now=1001)
+    newer_hit = create_post(conn, alice, "newer hit", name="alice", now=1002)
+    fresh_flop = create_post(conn, alice, "fresh flop", name="alice", now=1003)
+    create_reaction(conn, bob, old_hit["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, carol, old_hit["hash"], liked=True, name="carol", now=1005)
+    create_reaction(conn, bob, newer_hit["hash"], liked=True, name="bob", now=1006)
+    create_reaction(conn, carol, mid_hit["hash"], liked=True, name="carol", now=1007)
+
+    ranked = top_posts(conn)
+    assert [post["text"] for post in ranked] == [
+        "old hit",
+        "newer hit",
+        "mid hit",
+        "fresh flop",
+    ]
+    assert [post["likes"] for post in ranked] == [2, 1, 1, 0]
+
+    # A reactor's latest reaction wins: bob unlikes the old hit and it
+    # drops to the one-like tier, newest first among the ties.
+    create_reaction(conn, bob, old_hit["hash"], liked=False, name="bob", now=1008)
+    assert [post["text"] for post in top_posts(conn)] == [
+        "newer hit",
+        "mid hit",
+        "old hit",
+        "fresh flop",
+    ]
+
+    # Limit and author filter compose with the ranking.
+    assert [post["text"] for post in top_posts(conn, limit=2)] == [
+        "newer hit",
+        "mid hit",
+    ]
+    assert [post["text"] for post in top_posts(conn, author=author_of(alice))] == [
+        "newer hit",
+        "old hit",
+        "fresh flop",
+    ]
+
+    # Viewer annotations ride along: alice owns her posts and has not
+    # liked anything, so liked is False and own tracks authorship.
+    ranked = top_posts(conn, viewer=author_of(alice))
+    assert [(post["text"], post["liked"], post["own"]) for post in ranked] == [
+        ("newer hit", False, True),
+        ("mid hit", False, False),
+        ("old hit", False, True),
+        ("fresh flop", False, True),
+    ]
+    with pytest.raises(TanError, match="author must be"):
+        top_posts(conn, author="not-a-hash")
+
+
+def test_top_posts_hides_deleted_muted_and_unlinked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    liked = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    doomed = create_post(conn, alice, "liked then deleted", name="alice", now=1001)
+    noisy = create_post(conn, alice, "CRYPTO to the moon", name="alice", now=1002)
+    reply = create_reply(conn, bob, noisy["hash"], "to the moon", name="bob", now=1003)
+    create_reaction(conn, bob, liked["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, bob, doomed["hash"], liked=True, name="bob", now=1005)
+    create_reaction(conn, alice, noisy["hash"], liked=True, name="alice", now=1006)
+    create_reaction(conn, alice, reply["hash"], liked=True, name="alice", now=1007)
+    create_delete(conn, alice, doomed["hash"], name="alice", now=1008)
+    mute_keyword(conn, "crypto")
+
+    ranked = top_posts(conn)
+    # The deleted post never ranks, and neither does the muted post —
+    # but the liked reply to the muted post still ranks, with its
+    # parent preview blanked like the timeline blanks it.
+    assert [post["text"] for post in ranked] == [
+        "to the moon",
+        "everyone loves this",
+    ]
+    assert ranked[0]["reply_to"]["muted"] is True
+    assert ranked[0]["reply_to"]["text"] == ""
+
+    # An unlinked post never ranks even with likes on it.
+    orphan = create_post(conn, bob, "unlinked hit", name="bob", now=1009)
+    create_reaction(conn, alice, orphan["hash"], liked=True, name="alice", now=1010)
+    conn.execute("UPDATE posts SET linked = 0 WHERE hash = ?", (orphan["hash"],))
+    conn.commit()
+    assert [post["text"] for post in top_posts(conn)] == [
+        "to the moon",
+        "everyone loves this",
+    ]
+
+
+def test_cli_top(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "first post",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "second post",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # With no likes anywhere the ranking falls back to recency.
+    assert main(["tan", "top", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "second post",
+        "first post",
+    ]
+
+    # Liking the older post promotes it to the top, and --limit trims.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        older = feed(conn, all_authors=True)[-1]
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "tan",
+                "like",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                older["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(["tan", "top", "--data-dir", str(data_dir), "--json", "--limit", "1"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "first post"
+    assert payload["posts"][0]["likes"] == 1

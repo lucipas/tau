@@ -1420,6 +1420,60 @@ def author_timeline(
     )
 
 
+MAX_TOP_POSTS = 100
+
+
+def top_posts(
+    conn: sqlite3.Connection,
+    *,
+    author: Optional[str] = None,
+    limit: int = 10,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return the most-liked posts in the local store, best first.
+
+    Ranking is by derived like count, then newest first (the same
+    ``created_at DESC, hash DESC`` order as the timeline).  Posts with
+    no likes sort last by recency, so the ranking is still useful
+    before anything has been liked.  Only linked ``post`` and ``reply``
+    entries rank: reaction entries never appear as items, and posts
+    their author deleted never appear either.  Posts matching a muted
+    keyword (see :func:`muted_keywords`) are skipped, and a reply to
+    one keeps its ``reply_to`` preview text blanked, as in the
+    timeline.  Results carry the timeline's ``likes`` / ``liked`` /
+    ``own`` annotations and ``reply_to`` parent summaries.
+
+    The ranking needs every candidate's like count before any
+    ordering is possible, so the scan reads the whole visible store
+    in one query — the same scale :func:`search_posts` already scans,
+    and a personal mesh feed keeps the local post table small.
+    """
+    count = max(1, min(int(limit), MAX_TOP_POSTS))
+    keywords = _muted_keyword_list(conn)
+    params: List[Any] = []
+    where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+    if author is not None:
+        author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        where += " AND author = ?"
+        params.append(author)
+    rows = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
+        "ORDER BY created_at DESC, hash DESC",
+        params,
+    ).fetchall()
+    candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
+    ranked = annotate_reactions(conn, candidates, viewer=viewer)
+    ranked.sort(
+        key=lambda post: (
+            int(post.get("likes") or 0),
+            float(post.get("created_at") or 0),
+            str(post.get("hash") or ""),
+        ),
+        reverse=True,
+    )
+    return annotate_replies(conn, ranked[:count], muted_keywords=keywords)
+
+
 def _fill_unmuted(
     conn: sqlite3.Connection,
     keywords: List[str],

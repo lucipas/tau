@@ -68,6 +68,7 @@ from .tangents.tan import (
     search_posts,
     thread,
     timeline,
+    top_posts,
     unfollow,
     unmute_keyword,
 )
@@ -631,6 +632,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts",
     )
     tan_search.set_defaults(func=cmd_tan_search)
+
+    tan_top = tan_sub.add_parser(
+        "top",
+        parents=[common],
+        help="show the most-liked stored posts",
+    )
+    tan_top.add_argument(
+        "--author", metavar="NAME|HASH", help="rank one author's posts"
+    )
+    tan_top.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        metavar="N",
+        help="maximum posts (default 10)",
+    )
+    tan_top.set_defaults(func=cmd_tan_top)
 
     tan_thread = tan_sub.add_parser(
         "thread",
@@ -1394,6 +1412,34 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
         posts,
         json_output=json_output,
         empty_message=f"No stored posts match {args.query!r}.",
+    )
+    return _EXIT_OK
+
+
+def cmd_tan_top(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        author = None
+        if getattr(args, "author", None):
+            author, _ = resolve_author(
+                conn, args.author, registry=PeerRegistry(config.peers_path)
+            )
+        posts = top_posts(conn, author=author, limit=args.limit, viewer=viewer)
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_tan_posts(
+        posts,
+        json_output=json_output,
+        empty_message="No stored posts yet.",
     )
     return _EXIT_OK
 

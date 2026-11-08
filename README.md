@@ -202,6 +202,10 @@ tau tan timeline --author alice
 tau tan search mesh --limit 10
 tau tan search mesh --author alice
 
+# Show the most-liked stored posts (best first; unliked posts last, newest first)
+tau tan top --limit 10
+tau tan top --author alice
+
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
@@ -279,6 +283,7 @@ Global options may appear before or after the command:
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan top` | Show the most-liked stored posts, best first |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
@@ -540,6 +545,7 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan top                    # ranks stored posts by ♥ count
 ```
 
 The web console shows the same counts with a ♥ toggle on every post
