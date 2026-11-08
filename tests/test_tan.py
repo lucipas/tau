@@ -10,6 +10,7 @@ from tau.cli import main
 from tau.config import TauConfig
 from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
+from tau.tangents import tan as tan_module
 from tau.tangents.tan import (
     HASH_FIELDS,
     TAN_EXPORT_FORMAT,
@@ -41,6 +42,7 @@ from tau.tangents.tan import (
     search_posts,
     store,
     store_post,
+    SUGGEST_FOLLOWED_WEIGHT,
     suggest_authors,
     thread,
     timeline,
@@ -218,6 +220,44 @@ def test_suggest_authors_counts_replies_and_unlikes(identities, tmp_path):
     assert suggestions[0]["likes"] == 0
     assert suggestions[0]["engagers"] == ["bob"]
     assert "replied to by bob" in suggestions[0]["reason"]
+
+
+def test_suggest_authors_counts_each_like_per_post(identities, tmp_path, monkeypatch):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, carol, "one", name="carol", now=1000)
+    second = create_post(conn, carol, "two", name="carol", now=1001)
+    follow(conn, author_of(bob), name="bob")
+    create_reaction(conn, bob, first["hash"], liked=True, name="bob", now=1002)
+    create_reaction(conn, bob, second["hash"], liked=True, name="bob", now=1003)
+    # Force the bounded-batch lookup path with a tiny batch size.
+    monkeypatch.setattr(tan_module, "_SQL_BATCH", 1)
+
+    suggestions = suggest_authors(conn, viewer=author_of(alice))
+    assert len(suggestions) == 1
+    # One liker on two posts is two likes, not one.
+    assert suggestions[0]["likes"] == 2
+    assert suggestions[0]["posts"] == 2
+    assert suggestions[0]["engagers"] == ["bob"]
+    assert suggestions[0]["score"] == SUGGEST_FOLLOWED_WEIGHT + 2
+
+
+def test_suggest_authors_counts_replies_to_replies(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, carol, "starter", name="carol", now=1000)
+    reply = create_reply(conn, carol, post["hash"], "self reply", name="carol", now=1001)
+    follow(conn, author_of(bob), name="bob")
+    create_reply(conn, bob, reply["hash"], "replying to the reply", name="bob", now=1002)
+
+    suggestions = suggest_authors(conn, viewer=author_of(alice))
+    assert len(suggestions) == 1
+    assert suggestions[0]["engagers"] == ["bob"]
+    assert "replied to by bob" in suggestions[0]["reason"]
+    # The candidate's own reply is an engagement target, not a post.
+    assert suggestions[0]["posts"] == 1
 
 
 def test_suggest_authors_skips_followed_self_deleted_and_unlinked(

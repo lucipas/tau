@@ -1541,10 +1541,10 @@ def suggest_authors(
     reply in the local store, excluding followed authors and the viewer.
     Each candidate scores ``SUGGEST_FOLLOWED_WEIGHT`` per distinct author
     the viewer follows who liked or replied to one of the candidate's
-    posts, plus one per like on the candidate's posts (so a like from a
-    followed author counts in both terms). With no follows the ranking
-    degrades to the most-liked cached authors. Ties break by most recent
-    post, then author hash, so the order is stable.
+    posts or replies, plus one per like on the candidate's posts (so a
+    like from a followed author counts in both terms). With no follows
+    the ranking degrades to the most-liked cached authors. Ties break by
+    most recent post, then author hash, so the order is stable.
     """
     followed = {record["author"]: record["name"] for record in following(conn)}
     excluded = set(followed)
@@ -1573,26 +1573,41 @@ def suggest_authors(
         }
 
     for author, candidate in candidates.items():
-        hashes = [
+        # Post hashes drive the post count and the like targets; reply
+        # hashes join them as engagement targets, so a reply to one of
+        # the candidate's replies counts as engagement with the candidate
+        # too. The two lists stay separate so "posts" never counts replies.
+        post_hashes = [
             str(row["hash"])
             for row in conn.execute(
                 "SELECT hash FROM posts WHERE author = ? AND linked = 1 "
-                f"AND kind IN ('post', 'reply') AND {_NOT_DELETED}",
+                f"AND kind = 'post' AND {_NOT_DELETED}",
+                (author,),
+            ).fetchall()
+        ]
+        reply_hashes = [
+            str(row["hash"])
+            for row in conn.execute(
+                "SELECT hash FROM posts WHERE author = ? AND linked = 1 "
+                f"AND kind = 'reply' AND {_NOT_DELETED}",
                 (author,),
             ).fetchall()
         ]
         # Each active like counts once per post, so likes are summed across
         # the candidate's posts rather than deduplicated per liker.
+        # Hashes are looked up in bounded batches: a prolific author must
+        # not trip SQLite's host-parameter limit.
         like_total = 0
         likers: Set[str] = set()
-        repliers: Set[str] = set()
-        for batch in _thread_batches(hashes, _SQL_BATCH):
+        for batch in _thread_batches(post_hashes, _SQL_BATCH):
             states = reaction_states(conn, batch)
             for reactors in states.values():
                 for reactor, kind in reactors.items():
                     if kind == KIND_LIKE:
                         like_total += 1
                         likers.add(reactor)
+        repliers: Set[str] = set()
+        for batch in _thread_batches(post_hashes + reply_hashes, _SQL_BATCH):
             placeholders = ", ".join("?" for _ in batch)
             repliers.update(
                 str(row["author"])
@@ -1606,7 +1621,7 @@ def suggest_authors(
         followed_likers = sorted(a for a in likers if a in followed)
         followed_repliers = sorted(a for a in repliers if a in followed)
         engagers = sorted(set(followed_likers) | set(followed_repliers))
-        candidate["posts"] = len(hashes)
+        candidate["posts"] = len(post_hashes)
         candidate["likes"] = like_total
         candidate["score"] = SUGGEST_FOLLOWED_WEIGHT * len(engagers) + like_total
         candidate["engagers"] = [_engager_name(a, followed) for a in engagers]
@@ -1620,7 +1635,7 @@ def suggest_authors(
         if like_total:
             reasons.append(f"{like_total} like(s)")
         if not reasons:
-            reasons.append(f"{len(hashes)} post(s)")
+            reasons.append(f"{len(post_hashes)} post(s)")
         candidate["reason"] = "; ".join(reasons)
 
     ranked = sorted(
@@ -2266,12 +2281,6 @@ class TanApp:
                         fanout=self.gossip_fanout,
                     )
             except Exception:  # pragma: no cover - network dependent
-                log.debug("Tan gossip failed", exc_info=True)
-            finally:
-                self._gossip_slots.release()
-
-        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
-except Exception:  # pragma: no cover - network dependent
                 log.debug("Tan gossip failed", exc_info=True)
             finally:
                 self._gossip_slots.release()
