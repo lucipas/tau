@@ -13,18 +13,21 @@ exactly what the loaders would silently drop.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import pathname2url
 
+import RNS
+
 from .allowlist import AllowListError, load_allowlist
 from .config import TauConfig
-from .identity import IdentityError, destination_hash, load_identity
-from .inbox import _valid_record
+from .identity import IdentityError, destination_hash
+from .inbox import MAX_INBOX, _valid_record
 from .mailbox import HeldEnvelope, OutboxEntry
-from .peers import Peer
+from .peers import MAX_PEERS, Peer
 from .protocol import short_hash
 from .tangents.rules import RulesError, load_ruleset
 
@@ -33,6 +36,22 @@ STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 
 _TAN_TABLES = ("meta", "posts", "heads", "follows")
+# Base posts columns that every Tan read and write relies on.  ``v``,
+# ``kind`` and ``target`` are added by Tan's migrations, so they are not
+# required of an older file.
+_TAN_POST_COLUMNS = (
+    "hash",
+    "author",
+    "prev",
+    "key",
+    "name",
+    "text",
+    "created_at",
+    "received_at",
+    "sig",
+    "seq",
+    "linked",
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +104,8 @@ def _read_json(path: Path) -> Tuple[Optional[Any], Optional[str]]:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None, "missing"
+    except UnicodeDecodeError as exc:
+        return None, f"is not valid UTF-8: {exc}"
     except OSError as exc:
         return None, f"could not read: {exc}"
     try:
@@ -93,11 +114,19 @@ def _read_json(path: Path) -> Tuple[Optional[Any], Optional[str]]:
         return None, f"could not parse JSON: {exc}"
 
 
+def _load_identity_read_only(path: Path) -> RNS.Identity:
+    """Load an identity without ``identity.load_identity``'s chmod side effect."""
+    identity = RNS.Identity.from_file(str(path))
+    if identity is None:
+        raise IdentityError(f"could not load identity from {path}")
+    return identity
+
+
 def _check_identity(config: TauConfig) -> Check:
     if not config.identity_path.exists():
         return Check("identity", STATUS_FAIL, "no identity — run `tau init` first")
     try:
-        identity = load_identity(config.identity_path)
+        identity = _load_identity_read_only(config.identity_path)
     except IdentityError as exc:
         return Check("identity", STATUS_FAIL, f"could not load identity: {exc}")
     except Exception as exc:  # RNS raises its own errors on corrupt files
@@ -156,12 +185,17 @@ def _check_peers(config: TauConfig) -> Check:
         if peer.destination_hash in seen_hashes:
             duplicates += 1
         seen_hashes.add(peer.destination_hash)
-    detail = f"{len(seen_hashes)} peer(s)"
+    # The registry evicts the least recently seen peers beyond MAX_PEERS on load.
+    retained = min(len(seen_hashes), MAX_PEERS)
+    evicted = len(seen_hashes) - retained
+    detail = f"{retained} peer(s)"
     problems = []
     if invalid:
         problems.append(f"{invalid} invalid entr{'y' if invalid == 1 else 'ies'} skipped on load")
     if duplicates:
         problems.append(f"{duplicates} duplicate(s)")
+    if evicted:
+        problems.append(f"{evicted} peer(s) evicted on load (limit {MAX_PEERS})")
     if problems:
         return Check("peers", STATUS_WARN, f"{detail}; {'; '.join(problems)}")
     return Check("peers", STATUS_OK, detail)
@@ -176,41 +210,49 @@ def _check_mailbox(config: TauConfig) -> Check:
     if not isinstance(raw, dict):
         return Check("mailbox", STATUS_FAIL, "mailbox.json is not a JSON object")
     invalid_outbox = 0
+    duplicate_outbox = 0
+    outbox_ids: set = set()
     outbox = raw.get("outbox")
     if outbox is None:
-        outbox_count = 0
+        pass
     elif isinstance(outbox, list):
-        outbox_count = 0
         for entry in outbox:
             if not isinstance(entry, dict):
                 invalid_outbox += 1
                 continue
             try:
-                OutboxEntry.from_dict(entry)
+                parsed = OutboxEntry.from_dict(entry)
             except (TypeError, ValueError):
                 invalid_outbox += 1
                 continue
-            outbox_count += 1
+            if parsed.id in outbox_ids:
+                duplicate_outbox += 1
+            outbox_ids.add(parsed.id)
     else:
         return Check("mailbox", STATUS_FAIL, "mailbox.json has an invalid outbox list")
+    outbox_count = len(outbox_ids)
     invalid_held = 0
+    duplicate_held = 0
+    held_ids: set = set()
     held = raw.get("held")
     if held is None:
-        held_count = 0
+        pass
     elif isinstance(held, list):
-        held_count = 0
         for entry in held:
             if not isinstance(entry, dict):
                 invalid_held += 1
                 continue
             try:
-                HeldEnvelope.from_dict(entry)
+                parsed_held = HeldEnvelope.from_dict(entry)
             except (TypeError, ValueError):
                 invalid_held += 1
                 continue
-            held_count += 1
+            if parsed_held.id in held_ids:
+                duplicate_held += 1
+            held_ids.add(parsed_held.id)
     else:
         return Check("mailbox", STATUS_FAIL, "mailbox.json has an invalid held list")
+    held_count = len(held_ids)
     detail = f"{outbox_count} queued, {held_count} held"
     problems = []
     if invalid_outbox:
@@ -220,6 +262,15 @@ def _check_mailbox(config: TauConfig) -> Check:
     if invalid_held:
         problems.append(
             f"{invalid_held} invalid held envelope(s) skipped on load"
+        )
+    if duplicate_outbox:
+        problems.append(
+            f"{duplicate_outbox} duplicate outbox entr{'y' if duplicate_outbox == 1 else 'ies'} "
+            "(later copy overwrites earlier on load)"
+        )
+    if duplicate_held:
+        problems.append(
+            f"{duplicate_held} duplicate held envelope(s) (later copy overwrites earlier on load)"
         )
     if problems:
         return Check("mailbox", STATUS_WARN, f"{detail}; {'; '.join(problems)}")
@@ -241,13 +292,16 @@ def _check_inbox(config: TauConfig) -> Check:
         return Check("inbox", STATUS_FAIL, "inbox.json has an invalid messages list")
     invalid = sum(1 for entry in entries if _valid_record(entry) is None)
     valid = len(entries) - invalid
+    # The loader keeps only the newest MAX_INBOX valid records.
+    retained = min(valid, MAX_INBOX)
+    problems = []
     if invalid:
-        return Check(
-            "inbox",
-            STATUS_WARN,
-            f"{valid} message(s); {invalid} invalid record(s) skipped on load",
-        )
-    return Check("inbox", STATUS_OK, f"{valid} message(s)")
+        problems.append(f"{invalid} invalid record(s) skipped on load")
+    if valid > MAX_INBOX:
+        problems.append(f"{valid - MAX_INBOX} older message(s) dropped on load (limit {MAX_INBOX})")
+    if problems:
+        return Check("inbox", STATUS_WARN, f"{retained} message(s); {'; '.join(problems)}")
+    return Check("inbox", STATUS_OK, f"{retained} message(s)")
 
 
 def _check_tan(config: TauConfig) -> Check:
@@ -279,12 +333,40 @@ def _check_tan(config: TauConfig) -> Check:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+        # The immutable image ignores WAL frames, so a schema that looks
+        # incomplete may just be uncheckpointed.  Report that as unverified.
+        wal = path.with_name(path.name + "-wal")
+        wal_pending = wal.exists() and wal.stat().st_size > 0
         missing = [table for table in _TAN_TABLES if table not in tables]
         if missing:
+            if wal_pending:
+                return Check(
+                    "tan",
+                    STATUS_WARN,
+                    f"tan.sqlite3 main file lacks table(s) {', '.join(missing)}; "
+                    "uncheckpointed WAL changes could not be read",
+                )
             return Check(
                 "tan",
                 STATUS_FAIL,
                 f"tan.sqlite3 is missing table(s): {', '.join(missing)}",
+            )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        missing_columns = [column for column in _TAN_POST_COLUMNS if column not in columns]
+        if missing_columns:
+            if wal_pending:
+                return Check(
+                    "tan",
+                    STATUS_WARN,
+                    f"tan.sqlite3 main file lacks posts column(s) {', '.join(missing_columns)}; "
+                    "uncheckpointed WAL changes could not be read",
+                )
+            return Check(
+                "tan",
+                STATUS_FAIL,
+                f"tan.sqlite3 posts table is missing column(s): {', '.join(missing_columns)}",
             )
         count = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
         return Check("tan", STATUS_OK, f"{count} post(s)")
@@ -330,33 +412,40 @@ def _check_allowlist(config: TauConfig) -> Check:
 
 
 def _check_instance_lock(config: TauConfig) -> Check:
+    """Infer whether a node is serving from the PID it wrote to node.lock.
+
+    The lock itself is not probed: taking ``flock`` here would make a
+    concurrent ``tau serve`` fail with InstanceAlreadyRunning.  A PID
+    check cannot prove the lock state (PIDs get reused, and a node may
+    not have written its PID yet), so the verdict is an inference.
+    """
     path = config.instance_lock_path
     if not path.exists():
         return Check("instance lock", STATUS_OK, "no node serving")
     try:
-        import fcntl
-    except ImportError:  # pragma: no cover - POSIX only, like the lock itself
-        return Check(
-            "instance lock", STATUS_WARN, "cannot probe the lock (no fcntl)"
-        )
-    try:
-        handle = open(path, "r", encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as exc:
         return Check("instance lock", STATUS_WARN, f"could not read node.lock: {exc}")
+    text = raw.decode("utf-8", errors="replace").strip()
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            holder = handle.read().strip()
-            detail = f"node serving (pid {holder})" if holder else "node serving"
-            return Check("instance lock", STATUS_OK, detail)
-        finally:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:  # pragma: no cover - defensive
-                pass
-    finally:
-        handle.close()
-    # The lock file survives a stopped node (the flock, not the file, is
-    # the guard), so a free lock just means no node is serving right now.
-    return Check("instance lock", STATUS_OK, "no node serving")
+        pid = int(text)
+    except ValueError:
+        pid = 0
+    if pid <= 0:
+        return Check(
+            "instance lock", STATUS_WARN, "node.lock has no readable pid; serving state unknown"
+        )
+    if os.name == "nt":  # pragma: no cover - os.kill(pid, 0) terminates on Windows
+        return Check(
+            "instance lock", STATUS_WARN, f"node.lock records pid {pid}; cannot probe on Windows"
+        )
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # The file survives a stopped node, so a dead PID means nothing is serving.
+        return Check("instance lock", STATUS_OK, f"no node serving (stale pid {pid})")
+    except PermissionError:
+        pass  # the process exists but belongs to another user
+    except OSError as exc:
+        return Check("instance lock", STATUS_WARN, f"could not probe pid {pid}: {exc}")
+    return Check("instance lock", STATUS_OK, f"node probably serving (pid {pid})")
