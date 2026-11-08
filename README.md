@@ -261,6 +261,8 @@ Global options may appear before or after the command:
 | `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
+| `tau backup FILE` | Back up the whole data directory (identity, peers, outbox, inbox, Tan) to one archive |
+| `tau restore FILE` | Restore a backup archive into a data directory |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
@@ -355,6 +357,24 @@ unless `--force` is given, and refuses while a node is serving on the same
 data directory. It prints the imported destination hash so you can verify it
 matches the old node. Anyone who reads the backup can impersonate the node
 and decrypt its traffic, so keep it private.
+
+To back up everything at once — identity, peer registry, queued outbox
+mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
+and the Reticulum config — use `tau backup`:
+
+```bash
+tau backup ~/tau-backup.tar.gz
+tau restore ~/tau-backup.tar.gz   # into a fresh data directory
+```
+
+The archive is a gzipped tar with a manifest (format version, node name,
+tau version, file list); the runtime lock file is never included. Both
+commands refuse while a node is serving on the data directory, so a backup
+never catches the mailbox or the Tan database half-written. `restore`
+validates the archive first — unknown format, unexpected members, absolute
+paths and `..` traversal are all rejected — and refuses to overwrite
+existing node state unless `--force` is given. The archive holds the
+identity, so keep it as private as the identity file itself.
 
 ## How it works
 

@@ -22,6 +22,7 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
+from .backup import create_backup, restore_backup
 from .config import TauConfig, write_node_metadata, write_rns_config
 from .identity import (
     IdentityError,
@@ -375,6 +376,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing identity",
     )
     id_import.set_defaults(func=cmd_id_import)
+
+    backup = subparsers.add_parser(
+        "backup",
+        parents=[common],
+        help="back up the whole data directory to one archive file",
+    )
+    backup.add_argument(
+        "file",
+        type=Path,
+        metavar="FILE",
+        help="backup archive to write",
+    )
+    backup.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing backup archive",
+    )
+    backup.set_defaults(func=cmd_backup)
+
+    restore = subparsers.add_parser(
+        "restore",
+        parents=[common],
+        help="restore a backup archive into the data directory",
+    )
+    restore.add_argument(
+        "file",
+        type=Path,
+        metavar="FILE",
+        help="backup archive to read",
+    )
+    restore.add_argument(
+        "--force",
+        action="store_true",
+        help="replace existing node state in the data directory",
+    )
+    restore.set_defaults(func=cmd_restore)
 
     outbox = subparsers.add_parser(
         "outbox",
@@ -2106,6 +2143,50 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
+    return _EXIT_OK
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    target, manifest = create_backup(
+        config, args.file, force=getattr(args, "force", False)
+    )
+    identity = load_identity(config.identity_path)
+    payload = {
+        "backup": str(target),
+        "node": manifest.get("node"),
+        "destination": destination_hash(identity).hex() if identity else None,
+        "files": manifest.get("files"),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"node:        {payload['node']}")
+        print(f"destination: {payload['destination']}")
+        print(f"backup:      {payload['backup']}")
+        print(f"files:       {len(payload['files'] or [])}")
+    return _EXIT_OK
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    manifest, files = restore_backup(
+        config, args.file, force=getattr(args, "force", False)
+    )
+    identity = load_identity(config.identity_path)
+    payload = {
+        "data_dir": str(config.data_dir),
+        "node": manifest.get("node"),
+        "destination": destination_hash(identity).hex() if identity else None,
+        "files": files,
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f"node:        {payload['node']}")
+        print(f"destination: {payload['destination']}")
+        print(f"data dir:    {payload['data_dir']}")
+        print(f"files:       {len(payload['files'])}")
     return _EXIT_OK
 
 

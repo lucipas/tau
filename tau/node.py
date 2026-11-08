@@ -112,6 +112,10 @@ class InstanceAlreadyRunning(NodeError):
     """The data directory belongs to another running node."""
 
 
+class BackupError(NodeError):
+    """Raised when a backup or restore fails (bad archive, bad target)."""
+
+
 class InstanceLock:
     """Exclusive advisory lock marking a data directory as in use.
 
