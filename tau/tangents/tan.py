@@ -1684,6 +1684,75 @@ def search_posts(
     return annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer)
 
 
+# Mentions share search's ceiling: they are a display surface like the
+# timeline, not a sync page.
+MAX_MENTIONS_POSTS = MAX_SEARCH_POSTS
+
+
+def _hidden_under_deleted(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """Whether the reply *row* sits beneath a deleted ancestor.
+
+    Walks up from the reply's target the same way :func:`thread` walks
+    up to its root, stopping where the thread view stops, and reports
+    True when any entry on that chain has been deleted by its author.
+    """
+    seen = {str(row["hash"])}
+    parent_hash = str(row["target"] or "")
+    while parent_hash and parent_hash not in seen:
+        seen.add(parent_hash)
+        parent = get_post(conn, parent_hash)
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            return False
+        if _is_deleted(conn, parent):
+            return True
+        if not parent.get("linked") or parent.get("kind") != KIND_REPLY:
+            return False
+        parent_hash = str(parent.get("target") or "")
+    return False
+
+
+def mentions(
+    conn: sqlite3.Connection,
+    viewer: str,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Return stored replies to the viewer's own posts, newest first.
+
+    A mention is a linked ``reply`` entry whose target is a linked
+    ``post`` or ``reply`` authored by *viewer* — a reply to something
+    you wrote, including a reply to one of your own replies.  A reply
+    you wrote to your own post is not a mention of you.  The same
+    hiding rules as the thread view apply: a reply its author deleted
+    never appears, and neither does a reply to a post you deleted.
+    Unlinked replies never appear either.  Results carry the same like
+    annotations and ``reply_to`` parent summary as the timeline, and
+    the query reads only the local store: it makes no network requests.
+    """
+    viewer = _require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer")
+    count = max(1, min(int(limit), MAX_MENTIONS_POSTS))
+    rows = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r "
+        "WHERE r.linked = 1 AND r.kind = 'reply' AND r.author != ? "
+        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+        "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
+        "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
+        "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
+        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+        "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
+        "ORDER BY r.created_at DESC, r.hash DESC",
+        (viewer, viewer),
+    ).fetchall()
+    # A reply beneath a deleted ancestor is hidden with that subtree, as
+    # the thread view hides it, so filter on the ancestor chain before
+    # applying the limit to keep the requested count of visible mentions.
+    visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
+    rows = visible[:count]
+    return annotate_replies(
+        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    )
+
+
 def follow(
     conn: sqlite3.Connection,
     author: str,

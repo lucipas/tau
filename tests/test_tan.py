@@ -45,6 +45,7 @@ from tau.tangents.tan import (
     resolve_author,
     resolve_muted_name,
     max_seq,
+    mentions,
     mute,
     muted,
     muted_author_set,
@@ -1662,6 +1663,147 @@ def test_reply_chains_verifies_and_annotates(identities, tmp_path):
         reply["hash"],
         post["hash"],
     ]
+
+
+def test_mentions_lists_replies_to_own_posts_and_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    own_reply = create_reply(
+        conn, alice, post["hash"], "talking to myself", name="alice", now=1001
+    )
+    reply = create_reply(
+        conn, bob, post["hash"], "seconded", name="bob", now=1002
+    )
+    reply_to_reply = create_reply(
+        conn, bob, own_reply["hash"], "even this", name="bob", now=1003
+    )
+    other = create_post(conn, bob, "bob's own post", name="bob", now=1004)
+    to_bob = create_reply(conn, alice, other["hash"], "not a mention", name="alice", now=1005)
+
+    found = mentions(conn, author_of(alice))
+    assert [item["hash"] for item in found] == [
+        reply_to_reply["hash"],
+        reply["hash"],
+    ]
+    # Each mention carries its parent, so the reader sees what was answered.
+    assert found[0]["reply_to"]["hash"] == own_reply["hash"]
+    assert found[0]["reply_to"]["text"] == "talking to myself"
+    assert found[1]["reply_to"]["hash"] == post["hash"]
+    assert found[1]["reply_to"]["text"] == "original thought"
+    # A reply to someone else's post is a mention of them, not of you.
+    assert [item["hash"] for item in mentions(conn, author_of(bob))] == [
+        to_bob["hash"]
+    ]
+    assert [item["hash"] for item in mentions(conn, author_of(alice), limit=1)] == [
+        reply_to_reply["hash"]
+    ]
+
+
+def test_mentions_hides_deleted_and_unlinked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "seconded", name="bob", now=1001
+    )
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        reply["hash"]
+    ]
+
+    # A reply its author deleted never appears.
+    create_delete(conn, bob, reply["hash"], name="bob", now=1002)
+    assert mentions(conn, author_of(alice)) == []
+
+    # A reply to a post you deleted never appears either.
+    kept = create_post(conn, alice, "keeping this", name="alice", now=1003)
+    fresh = create_reply(conn, bob, kept["hash"], "still here", name="bob", now=1004)
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        fresh["hash"]
+    ]
+    create_delete(conn, alice, kept["hash"], name="alice", now=1005)
+    assert mentions(conn, author_of(alice)) == []
+
+    # An unlinked reply (its chain predecessor has not arrived yet)
+    # never appears, and shows up once the predecessor lands.
+    source = init_db(tmp_path / "source.sqlite3")
+    store_post(source, post)
+    bob_first = create_post(source, bob, "bob first", name="bob", now=1006)
+    late = create_reply(source, bob, post["hash"], "late arrival", name="bob", now=1007)
+    store_post(conn, late)
+    assert mentions(conn, author_of(alice)) == []
+    store_post(conn, bob_first)
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        late["hash"]
+    ]
+
+
+def test_mentions_hides_replies_beneath_deleted_ancestor(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    first = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
+    mine = create_reply(conn, alice, first["hash"], "my answer", name="alice", now=1002)
+    nested = create_reply(conn, bob, mine["hash"], "back at you", name="bob", now=1003)
+
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        nested["hash"],
+        first["hash"],
+    ]
+
+    # Bob deletes his reply: the thread view hides the whole subtree
+    # under it, so the reply to my reply beneath it must not leak
+    # into mentions even though its immediate parent is untouched.
+    create_delete(conn, bob, first["hash"], name="bob", now=1004)
+    assert mentions(conn, author_of(alice)) == []
+
+
+def test_cli_mentions(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "hello mesh",
+            ]
+        )
+        == 0
+    )
+    post = json.loads(capsys.readouterr().out)["post"]
+
+    # No replies yet is a clean empty result, not an error.
+    assert (
+        main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    # A reply from another author, stored as if it had synced in.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        create_reply(
+            conn, RNS.Identity(), post["hash"], "seconded", name="bob", now=1001
+        )
+    finally:
+        conn.close()
+    assert (
+        main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "seconded"
+    assert payload["posts"][0]["reply_to"]["text"] == "hello mesh"
+
+    assert main(["tan", "mentions", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "seconded" in out
+    assert "in reply to alice: hello mesh" in out
 
 
 def test_reply_rejects_tampering(identities, tmp_path):
