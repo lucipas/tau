@@ -330,6 +330,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --exchange, ask only this peer instead of all known peers",
     )
     peers.set_defaults(func=cmd_peers)
+    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_forget = peers_sub.add_parser(
+        "forget",
+        parents=[common],
+        help="remove a peer from the local registry",
+    )
+    peers_forget.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or unique hash prefix",
+    )
+    peers_forget.set_defaults(func=cmd_peers_forget)
 
     identity = subparsers.add_parser(
         "id",
@@ -1929,6 +1941,34 @@ def cmd_peers(args: argparse.Namespace) -> int:
         )
     else:
         _print_peer_table(peers)
+    return _EXIT_OK
+
+
+def cmd_peers_forget(args: argparse.Namespace) -> int:
+    """Remove one peer from the local registry."""
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"unknown peer: {args.target!r}")
+    mailbox = Mailbox(config.mailbox_path)
+    queued = mailbox.outbox_list(to=peer.destination_hash)
+    if queued:
+        noun = "message" if len(queued) == 1 else "messages"
+        raise NodeError(
+            f"{peer.display_name} still has {len(queued)} queued {noun}; "
+            "cancel them with `tau outbox cancel` first"
+        )
+    registry.remove(peer.destination_hash)
+    registry.save()
+    if _json_mode(args):
+        _emit({"forgotten": peer.to_dict()}, True)
+    else:
+        print(f"forgot {peer.display_name} ({peer.hexhash[:8]})")
+        print("they will re-appear if they announce again.")
     return _EXIT_OK
 
 

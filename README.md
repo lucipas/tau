@@ -251,6 +251,7 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers forget PEER` | Remove a peer from the local registry (refuses while mail is queued for them) |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
@@ -695,7 +696,7 @@ web/            Next.js + Tailwind console (static export served by tau)
 | `another tau node is already serving on data directory ...` | A `tau serve` already holds that data directory's `node.lock`; two serving nodes on one directory would corrupt the shared peer registry, mailbox and Tan database. Stop the running serve (the message names its pid) or use a different `--data-dir`. One-shot commands (`send`, `tan post`, …) are unaffected — they share the directory briefly by design. |
 | `no path to ...` | Reticulum has not learned a route yet. Keep the peer announcing (`tau serve --announce-interval 5`) or wait for a path request to resolve. |
 | Noisy output | Reticulum logs go to stderr. Use `-q`, `--rns-log-level 1`, or `--json` for clean stdout. |
-| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail are kept). `tau peers --max-age 1` lists only peers seen in the last day. |
+| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail are kept). `tau peers --max-age 1` lists only peers seen in the last day. Remove one now with `tau peers forget PEER` (refuses while mail is queued for them). |
 
 ## License
 
