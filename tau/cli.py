@@ -2725,7 +2725,11 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
             "destination": destination,
             # The asserted name, not the local alias: the operator must
             # see who was actually allowed, and an alias could mask that.
-            "name": peer.name if peer is not None else "",
+            "name": (
+                (peer.name or short_hash(peer.hexhash))
+                if peer is not None
+                else ""
+            ),
         }
 
     if json_output:
@@ -2740,7 +2744,11 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
             print("  no senders listed — when enforced, nobody may message this node")
         for entry in sorted(allowlist.allow):
             peer = registry.get(entry)
-            name = f" ({peer.name})" if peer is not None else ""
+            name = (
+                f" ({peer.name or short_hash(peer.hexhash)})"
+                if peer is not None
+                else ""
+            )
             print(f"  {entry}{name}")
         if changed:
             print("  (a running serve applies saved changes when it restarts)")
