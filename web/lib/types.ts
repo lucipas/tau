@@ -1,5 +1,14 @@
 export type Direction = "in" | "out";
 
+export interface MessageReaction {
+  // Reactor's destination hash.
+  reactor: string;
+  // Reactor's display name at reaction time.
+  name: string;
+  // One emoji or short text token; never an image.
+  reaction: string;
+}
+
 export interface TauMessage {
   id: number;
   direction: Direction;
@@ -12,6 +21,21 @@ export interface TauMessage {
   rtt_ms?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Sender-set expiry (epoch seconds). Absent when the message never
+  // expires; the console purges it once the deadline passes.
+  expires_at?: number;
+  // Reticulum wire id: how replies name this message, and how
+  // reactions are matched to it.
+  wire_id?: string;
+  // Latest reaction per reactor, oldest first.
+  reactions?: MessageReaction[];
+  // Short hash of this message's text, for checking a reply's quoted
+  // excerpt against it; see resolveQuote in message-feed.tsx.
+  excerpt_hash?: string;
+  // Quoted message reference: wire id + short excerpt hash of the text
+  // the sender quoted. The quote is rendered from local history only;
+  // see resolveQuote in message-feed.tsx.
+  in_reply_to?: { id: string; excerpt: string | null } | null;
 }
 
 export interface Peer {
@@ -23,6 +47,13 @@ export interface Peer {
   protocol: number;
   // LXMF delivery destination hash, derived from the peer's public key.
   lxmf?: string | null;
+  // Local trust state, shown only to this node's owner (never sent to peers).
+  verified?: boolean;
+  verified_at?: number | null;
+  key_change_at?: number | null;
+  // True when the peer is on this node's block-list: their DMs are
+  // dropped and their Tan posts hidden.
+  blocked?: boolean;
 }
 
 export interface InterfaceInfo {
@@ -46,6 +77,22 @@ export interface Counts {
   peers: number;
 }
 
+// Per-conversation unread counts from the node inbox: how many
+// received DMs sit after each sender's read cursor. Read state is
+// local to the node; the console only displays and clears it.
+export interface UnreadCounts {
+  per_peer: Record<string, number>;
+  total: number;
+  // Stamped by the node; a count with an older revision than one
+  // already applied is stale and is ignored.
+  revision?: number;
+}
+
+export interface MarkReadResponse {
+  ok: boolean;
+  unread: UnreadCounts;
+}
+
 export interface BridgeInfo {
   version: string;
   web: boolean;
@@ -57,6 +104,7 @@ export interface Snapshot {
   peers: Peer[];
   messages: TauMessage[];
   counts: Counts;
+  unread: UnreadCounts;
   bridge: BridgeInfo;
 }
 
@@ -108,6 +156,9 @@ export interface TanReplyParent {
   name: string;
   text: string;
   deleted: boolean;
+  // True when the parent is from a blocked author: its text is blanked.
+  blocked?: boolean;
+  muted?: boolean;
 }
 
 export interface TanPost {
@@ -123,8 +174,10 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  quotes?: number;
   own?: boolean;
 }
 
