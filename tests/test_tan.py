@@ -3085,3 +3085,28 @@ def test_top_posts_batches_reaction_lookups(identities, tmp_path):
     ranked = top_posts(conn, limit=1)
     assert [post["text"] for post in ranked] == ["the winner"]
     assert ranked[0]["likes"] == 1
+
+
+def test_top_posts_hides_muted_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    loved = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    noisy = create_post(conn, bob, "loud hit", name="bob", now=1001)
+    reply = create_reply(conn, alice, noisy["hash"], "agreed", name="alice", now=1002)
+    create_reaction(conn, alice, noisy["hash"], liked=True, name="alice", now=1003)
+    create_reaction(conn, bob, loved["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, bob, reply["hash"], liked=True, name="bob", now=1005)
+    mute(conn, author_of(bob), name="bob")
+
+    ranked = top_posts(conn)
+    # Bob's own liked post never ranks, but alice's reply to it still
+    # ranks — with no parent preview, so bob's name and text never
+    # surface through it.
+    assert [post["text"] for post in ranked] == ["agreed", "everyone loves this"]
+    assert ranked[0]["reply_to"] is None
+
+    # An explicit author lookup still ranks a muted author's posts,
+    # like timeline --author does.
+    assert [post["text"] for post in top_posts(conn, author=author_of(bob))] == [
+        "loud hit"
+    ]

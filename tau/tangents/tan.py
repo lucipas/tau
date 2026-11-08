@@ -1485,8 +1485,13 @@ def top_posts(
     their author deleted never appear either.  Posts matching a muted
     keyword (see :func:`muted_keywords`) are skipped, and a reply to
     one keeps its ``reply_to`` preview text blanked, as in the
-    timeline.  Results carry the timeline's ``likes`` / ``liked`` /
-    ``own`` annotations and ``reply_to`` parent summaries.
+    timeline.  Posts by muted authors never rank either, and a reply
+    to one keeps no parent preview at all, as in the timeline —
+    muting is display-only, so entries stay stored and unmuting
+    restores them.  An explicit *author* is an explicit lookup, like
+    ``timeline --author``: their posts rank even when they are muted.
+    Results carry the timeline's ``likes`` / ``liked`` / ``own``
+    annotations and ``reply_to`` parent summaries.
 
     The ranking needs every candidate's like count before any
     ordering is possible, so the scan reads the whole visible store
@@ -1495,8 +1500,13 @@ def top_posts(
     """
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
+    silenced = muted_author_set(conn) if author is None else set()
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+    if silenced:
+        placeholders = ", ".join("?" for _ in silenced)
+        where += f" AND author NOT IN ({placeholders})"
+        params.extend(sorted(silenced))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
@@ -1531,7 +1541,12 @@ def top_posts(
         # newest first, so keep that order and only attach ownership.
         for post in candidates:
             post["own"] = viewer is not None and post["author"] == viewer
-    return annotate_replies(conn, candidates[:count], muted_keywords=keywords)
+    return annotate_replies(
+        conn,
+        candidates[:count],
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+    )
 
 
 def _fill_unmuted(
