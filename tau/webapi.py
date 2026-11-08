@@ -593,8 +593,10 @@ class WebBridge:
             apply_display_rules,
             feed,
             following,
+            muted_keywords,
             resolve_author,
             timeline,
+            without_muted_keywords,
         )
 
         conn = self._tan_conn()
@@ -614,8 +616,15 @@ class WebBridge:
                         feed(conn, author=target, limit=limit, posts_only=True)
                     )
                 )
+                keywords = [record["keyword"] for record in muted_keywords(conn)]
                 posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                    conn,
+                    annotate_reactions(
+                        conn,
+                        without_muted_keywords(conn, posts, keywords),
+                        viewer=viewer,
+                    ),
+                    muted_keywords=keywords,
                 )
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)

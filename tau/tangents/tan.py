@@ -72,6 +72,7 @@ import json
 import logging
 import math
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -112,6 +113,8 @@ MAX_POST_CHARS = MAX_MESSAGE_CHARS
 MAX_FEED_POSTS = 20
 DEFAULT_FEED_LIMIT = 20
 MAX_FOLLOWS = 512
+MAX_MUTED_KEYWORDS = 256
+MAX_KEYWORD_LENGTH = 100
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
@@ -434,6 +437,12 @@ CREATE TABLE IF NOT EXISTS heads (
 CREATE TABLE IF NOT EXISTS follows (
     author TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT '',
+    added_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS muted_keywords (
+    keyword TEXT PRIMARY KEY,
+    display TEXT NOT NULL,
     added_at REAL NOT NULL
 );
 """
@@ -937,6 +946,8 @@ def annotate_reactions(
 def annotate_replies(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
+    *,
+    muted_keywords: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``reply_to`` parent summary to reply entries, in place.
 
@@ -944,7 +955,10 @@ def annotate_replies(
     the parent is cached locally, and is ``None`` when the parent has
     not arrived yet — a reply is still shown on its own.  A deleted
     parent is reported as deleted with its text blanked, so the thread
-    stays readable without resurfacing removed content.  Top-level
+    stays readable without resurfacing removed content.  A parent
+    matching a muted keyword (see :func:`muted_keywords`) is reported
+    the same way, with its text blanked and ``muted`` set, so the
+    muted content does not leak through the preview.  Top-level
     posts get no ``reply_to`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -978,6 +992,7 @@ def annotate_replies(
             list(parents),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_REPLY:
             continue
@@ -986,13 +1001,21 @@ def annotate_replies(
             post["reply_to"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
-        post["reply_to"] = {
+        is_muted = _text_matches_muted_keywords(
+            str(parent.get("text") or ""), muted_pattern
+        )
+        preview = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if is_deleted else parent["text"],
+            "text": "" if is_deleted or is_muted else parent["text"],
             "deleted": is_deleted,
         }
+        if is_muted:
+            # Only present when muted, so unmuted previews keep their
+            # established shape.
+            preview["muted"] = True
+        post["reply_to"] = preview
     return posts
 
 
@@ -1289,12 +1312,24 @@ def timeline(
     given, whether the viewer's like currently stands and whether the
     post is the viewer's own.  Replies appear as timeline items,
     annotated with their parent post when it is cached.  Posts their
-    author deleted never appear either.
+    author deleted never appear either.  Posts whose text matches a
+    muted keyword (see :func:`muted_keywords`) never appear either,
+    and a reply to one keeps its ``reply_to`` preview text blanked —
+    muting is display-only, so entries stay stored and unmuting
+    restores them.  The page ``limit`` applies before the mute filter,
+    so a heavily muted page can return fewer than ``limit`` posts.
     """
+    keywords = _muted_keyword_list(conn)
     if include_all:
         posts = feed(conn, limit=limit, before=before, posts_only=True)
         return annotate_replies(
-            conn, annotate_reactions(conn, posts, viewer=viewer)
+            conn,
+            annotate_reactions(
+                conn,
+                without_muted_keywords(conn, posts, keywords),
+                viewer=viewer,
+            ),
+            muted_keywords=keywords,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1317,7 +1352,13 @@ def timeline(
         params,
     ).fetchall()
     return annotate_replies(
-        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+        conn,
+        annotate_reactions(
+            conn,
+            without_muted_keywords(conn, _public_posts(rows), keywords),
+            viewer=viewer,
+        ),
+        muted_keywords=keywords,
     )
 
 
@@ -1354,30 +1395,46 @@ def thread(
     raises :class:`TanError`, exactly as :func:`resolve_post` does; so
     does a reference to an unlinked entry or to a reply beneath a
     deleted entry, since showing it would present a partial thread.
+    A reply matching a muted keyword (see :func:`muted_keywords`) is
+    hidden with its whole subtree the same way, but the entry the
+    reference names always anchors the thread even when its own text
+    matches — an explicit lookup — and a muted ancestor above it ends
+    the climb instead of being promoted to the root.
     """
     start = resolve_post(conn, ref)
     if not start.get("linked"):
         # A cached entry still awaiting its chain predecessor is not shown.
         raise TanError(f"post has not linked yet: {ref!r}")
+    muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
     root = start
     ancestors = {root["hash"]}
-    while root.get("kind") == KIND_REPLY and root.get("target"):
-        parent = get_post(conn, str(root["target"]))
-        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
-            break
-        if parent["hash"] in ancestors:
-            break
-        if _is_deleted(conn, parent):
-            # Replies under a deleted entry stay hidden, even when named
-            # directly, so refuse rather than showing a fragment.  The
-            # deletion check comes before the unlinked shortcut: a
-            # deleted parent whose chain never linked up hides its
-            # subtree just the same.
-            raise TanError(f"post has been deleted: {ref!r}")
-        if not parent.get("linked"):
-            break
-        ancestors.add(parent["hash"])
-        root = parent
+    if not _text_matches_muted_keywords(str(start.get("text") or ""), muted_pattern):
+        # A muted start anchors its own visible thread, so the climb
+        # is skipped entirely — mirroring the muted-author rule.
+        while root.get("kind") == KIND_REPLY and root.get("target"):
+            parent = get_post(conn, str(root["target"]))
+            if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+                break
+            if parent["hash"] in ancestors:
+                break
+            if _is_deleted(conn, parent):
+                # Replies under a deleted entry stay hidden, even when named
+                # directly, so refuse rather than showing a fragment.  The
+                # deletion check comes before the unlinked shortcut: a
+                # deleted parent whose chain never linked up hides its
+                # subtree just the same.
+                raise TanError(f"post has been deleted: {ref!r}")
+            if _text_matches_muted_keywords(
+                str(parent.get("text") or ""), muted_pattern
+            ):
+                # A muted ancestor ends the climb: the named entry anchors
+                # its own visible thread rather than promoting the muted
+                # parent to the root.
+                break
+            if not parent.get("linked"):
+                break
+            ancestors.add(parent["hash"])
+            root = parent
     root = _canonical_post(root)
     # Collect descendants level by level — one query per depth, so a
     # deep thread costs a handful of queries instead of one per entry —
@@ -1404,7 +1461,16 @@ def thread(
         generation = sorted(
             _public_posts(rows), key=lambda post: (post["created_at"], post["hash"])
         )
-        children = [child for child in generation if child["hash"] not in seen]
+        # A muted reply hides its whole subtree: it never enters the
+        # frontier, so its own replies are never collected.
+        children = [
+            child
+            for child in generation
+            if child["hash"] not in seen
+            and not _text_matches_muted_keywords(
+                str(child.get("text") or ""), muted_pattern
+            )
+        ]
         for child in children:
             seen.add(child["hash"])
         if not children:
@@ -1457,6 +1523,9 @@ def search_posts(
     ``LIKE`` folds ASCII case only, so a ``LIKE`` query would miss
     exactly the Unicode matches this promises.  The scan is over the
     local post table only, which a personal mesh feed keeps small.
+
+    Search is an explicit lookup, so it ignores muted keywords
+    entirely: searching for a word you muted still finds it.
     """
     if not isinstance(query, str) or not query.strip():
         raise TanError("search text must not be empty")
@@ -1522,6 +1591,139 @@ def following(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             "added_at": float(row["added_at"]),
         }
         for row in rows
+    ]
+
+
+def _normalize_keyword(keyword: Any) -> str:
+    """Return the casefolded form of *keyword*, or raise :class:`TanError`.
+
+    The casefolded form is the storage key, so ``Crypto`` and ``crypto``
+    are the same mute; the display form the user typed is kept
+    separately.  A keyword is one word or phrase — it may contain
+    spaces, but it must not be empty and must fit in
+    ``MAX_KEYWORD_LENGTH`` characters.
+    """
+    if not isinstance(keyword, str) or not keyword.strip():
+        raise TanError("keyword must not be empty")
+    clean = keyword.strip()
+    if len(clean) > MAX_KEYWORD_LENGTH:
+        raise TanError(f"keyword is limited to {MAX_KEYWORD_LENGTH} characters")
+    return clean.casefold()
+
+
+def _muted_keyword_pattern(keywords: Sequence[str]) -> Optional["re.Pattern[str]"]:
+    """Compile one whole-word matcher for the given casefolded keywords.
+
+    The match is a case-insensitive whole-word (or whole-phrase) match
+    over casefolded text: ``art`` never matches ``start``, while
+    ``climate change`` matches the phrase.  The ``(?<!\\w)`` /
+    ``(?!\\w)`` guards are word boundaries that also work when a
+    keyword starts or ends with a non-word character, where ``\\b``
+    would not.  Returns ``None`` when there is nothing to match.
+    """
+    clean = [keyword.casefold() for keyword in keywords if keyword.strip()]
+    if not clean:
+        return None
+    return re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(keyword) for keyword in clean) + r")(?!\w)"
+    )
+
+
+def _text_matches_muted_keywords(
+    text: str, pattern: Optional["re.Pattern[str]"]
+) -> bool:
+    return pattern is not None and pattern.search(text.casefold()) is not None
+
+
+def mute_keyword(
+    conn: sqlite3.Connection,
+    keyword: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Mute *keyword* in local views.  Re-muting is a no-op returning
+    the original record, so the first mute time is kept."""
+    folded = _normalize_keyword(keyword)
+    display = str(keyword).strip()
+    timestamp = float(now if now is not None else time.time())
+    existing = conn.execute(
+        "SELECT keyword, display, added_at FROM muted_keywords WHERE keyword = ?",
+        (folded,),
+    ).fetchone()
+    if existing is not None:
+        return {
+            "keyword": str(existing["keyword"]),
+            "display": str(existing["display"]),
+            "added_at": float(existing["added_at"]),
+        }
+    count = conn.execute("SELECT COUNT(*) AS n FROM muted_keywords").fetchone()["n"]
+    if int(count) >= MAX_MUTED_KEYWORDS:
+        raise TanError(
+            f"muted keyword list is limited to {MAX_MUTED_KEYWORDS} keywords"
+        )
+    with conn:
+        conn.execute(
+            "INSERT INTO muted_keywords(keyword, display, added_at) "
+            "VALUES(?, ?, ?)",
+            (folded, display, timestamp),
+        )
+    return {"keyword": folded, "display": display, "added_at": timestamp}
+
+
+def unmute_keyword(conn: sqlite3.Connection, keyword: str) -> bool:
+    """Remove the mute for *keyword*.  Returns whether one was removed."""
+    folded = _normalize_keyword(keyword)
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM muted_keywords WHERE keyword = ?", (folded,)
+        )
+    return cursor.rowcount > 0
+
+
+def muted_keywords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Muted keywords, newest first."""
+    rows = conn.execute(
+        "SELECT keyword, display, added_at FROM muted_keywords "
+        "ORDER BY added_at DESC"
+    ).fetchall()
+    return [
+        {
+            "keyword": str(row["keyword"]),
+            "display": str(row["display"]),
+            "added_at": float(row["added_at"]),
+        }
+        for row in rows
+    ]
+
+
+def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute("SELECT keyword FROM muted_keywords").fetchall()
+    return [str(row["keyword"]) for row in rows]
+
+
+def without_muted_keywords(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    keywords: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Drop posts whose text matches a muted keyword, keeping the rest.
+
+    Muting is display-only: entries stay stored and keep syncing, so
+    unmuting restores them.  The match runs in Python over the given
+    page — the same scale search already scans — rather than as SQL,
+    because SQLite cannot express the whole-word match.  Pass
+    *keywords* when the caller already loaded them to avoid a second
+    lookup.
+    """
+    pattern = _muted_keyword_pattern(
+        list(keywords) if keywords is not None else _muted_keyword_list(conn)
+    )
+    if pattern is None:
+        return list(posts)
+    return [
+        post
+        for post in posts
+        if not _text_matches_muted_keywords(str(post.get("text") or ""), pattern)
     ]
 
 

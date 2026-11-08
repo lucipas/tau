@@ -35,6 +35,8 @@ from tau.tangents.tan import (
     import_entries,
     init_db,
     like_counts,
+    mute_keyword,
+    muted_keywords,
     reaction_states,
     resolve_post,
     max_seq,
@@ -44,7 +46,9 @@ from tau.tangents.tan import (
     thread,
     timeline,
     unfollow,
+    unmute_keyword,
     verify_post,
+    without_muted_keywords,
 )
 
 
@@ -1882,3 +1886,231 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     reply = next(item for item in payload["posts"] if item["kind"] == "reply")
     assert reply["reply_to"]["hash"] == post["hash"]
     assert reply["reply_to"]["text"] == "cli thread starter"
+
+
+def test_mute_keyword_round_trip(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    record = mute_keyword(conn, "Crypto", now=1000)
+    assert record == {"keyword": "crypto", "display": "Crypto", "added_at": 1000.0}
+    mute_keyword(conn, "mesh", now=1001)
+
+    # Newest first; the display form the user typed is kept.
+    assert muted_keywords(conn) == [
+        {"keyword": "mesh", "display": "mesh", "added_at": 1001.0},
+        {"keyword": "crypto", "display": "Crypto", "added_at": 1000.0},
+    ]
+
+    # Re-muting is a no-op: same keyword, original time and display.
+    assert mute_keyword(conn, "CRYPTO", now=1002) == {
+        "keyword": "crypto",
+        "display": "Crypto",
+        "added_at": 1000.0,
+    }
+    assert len(muted_keywords(conn)) == 2
+
+    assert unmute_keyword(conn, "crypto") is True
+    assert unmute_keyword(conn, "crypto") is False
+    assert [record["keyword"] for record in muted_keywords(conn)] == ["mesh"]
+
+
+def test_mute_keyword_rejects_empty_or_oversized(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for bad in ("", "   "):
+        with pytest.raises(TanError, match="keyword must not be empty"):
+            mute_keyword(conn, bad)
+        with pytest.raises(TanError, match="keyword must not be empty"):
+            unmute_keyword(conn, bad)
+    with pytest.raises(TanError, match="limited to 100 characters"):
+        mute_keyword(conn, "x" * 101)
+
+
+def test_timeline_hides_muted_keyword_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    noisy = create_post(conn, alice, "CRYPTO to the moon", name="alice", now=1000)
+    kept = create_post(conn, alice, "starting the mesh node", name="alice", now=1001)
+    phrase = create_post(
+        conn, alice, "talking about climate change today", name="alice", now=1002
+    )
+    talks = create_post(conn, alice, "climate talks next week", name="alice", now=1003)
+
+    mute_keyword(conn, "crypto")
+    mute_keyword(conn, "climate change")
+    authors = [alice and author_of(alice)]
+
+    # Whole-word and case-insensitive: "crypto" hides the shouty post,
+    # "climate change" hides the phrase but not "climate talks", and
+    # "starting" is untouched — muting "art" would never hide "start".
+    assert [item["hash"] for item in timeline(conn, authors)] == [
+        talks["hash"],
+        kept["hash"],
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        talks["hash"],
+        kept["hash"],
+    ]
+
+    # Muting is display-only: unmuting restores the hidden posts.
+    unmute_keyword(conn, "crypto")
+    unmute_keyword(conn, "climate change")
+    assert [item["hash"] for item in timeline(conn, authors)] == [
+        talks["hash"],
+        phrase["hash"],
+        kept["hash"],
+        noisy["hash"],
+    ]
+
+
+def test_timeline_whole_word_match_ignores_substrings(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "start the engine", name="alice", now=1000)
+    create_post(conn, alice, "the art of mesh", name="alice", now=1001)
+
+    mute_keyword(conn, "art")
+    items = timeline(conn, [author_of(alice)])
+    assert [item["text"] for item in items] == ["start the engine"]
+
+
+def test_timeline_blanks_muted_reply_parent_preview(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = create_post(conn, alice, "crypto secrets", name="alice", now=1000)
+    reply = create_reply(conn, bob, parent["hash"], "noted", name="bob", now=1001)
+    mute_keyword(conn, "crypto")
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [reply["hash"]]
+    preview = items[0]["reply_to"]
+    assert preview["hash"] == parent["hash"]
+    assert preview["text"] == ""
+    assert preview["muted"] is True
+    assert preview["deleted"] is False
+
+
+def test_thread_hides_muted_reply_subtree(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    first = create_reply(
+        conn, bob, post["hash"], "crypto thread", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, first["hash"], "reply to the muted reply", name="alice", now=1002
+    )
+    second = create_reply(
+        conn, bob, post["hash"], "second reply", name="bob", now=1003
+    )
+    mute_keyword(conn, "crypto")
+
+    # The muted reply hides its whole subtree, like a deleted reply.
+    items = thread(conn, post["hash"])
+    assert [item["hash"] for item in items] == [post["hash"], second["hash"]]
+
+    # The entry you name always anchors the thread, even when its own
+    # text matches a muted keyword.
+    assert [item["hash"] for item in thread(conn, first["hash"])] == [
+        first["hash"],
+        nested["hash"],
+    ]
+
+
+def test_thread_stops_climb_at_muted_ancestor(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto news", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "clean reply", name="bob", now=1001)
+    nested = create_reply(
+        conn, alice, reply["hash"], "deeper reply", name="alice", now=1002
+    )
+    mute_keyword(conn, "crypto")
+
+    # The muted root is not promoted: the named reply anchors.
+    items = thread(conn, nested["hash"])
+    assert [item["hash"] for item in items] == [reply["hash"], nested["hash"]]
+    assert [item["depth"] for item in items] == [0, 1]
+
+
+def test_search_ignores_muted_keywords(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto roundup", name="alice", now=1000)
+    mute_keyword(conn, "crypto")
+
+    # Search is an explicit lookup: it still finds the muted word.
+    assert [item["hash"] for item in search_posts(conn, "crypto")] == [post["hash"]]
+
+
+def test_without_muted_keywords_keeps_unmuted_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    noisy = create_post(conn, alice, "crypto spam", name="alice", now=1000)
+    kept = create_post(conn, alice, "mesh notes", name="alice", now=1001)
+
+    posts = [noisy, kept]
+    assert without_muted_keywords(conn, posts) == posts
+    mute_keyword(conn, "crypto")
+    assert without_muted_keywords(conn, posts) == [kept]
+
+
+def test_cli_mute_keyword(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    for text in ("crypto to the moon", "mesh notes"):
+        assert (
+            main(
+                [
+                    "tan", "post", "--data-dir", str(data_dir),
+                    "--no-publish", "--json", text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "tan", "mute-keyword", "--data-dir", str(data_dir),
+                "--json", "crypto",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["keyword"] == "crypto"
+
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == ["mesh notes"]
+
+    assert (
+        main(["tan", "muted-keywords", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["muted_keywords"][0]["keyword"] == "crypto"
+
+    assert (
+        main(
+            [
+                "tan", "unmute-keyword", "--data-dir", str(data_dir),
+                "--json", "crypto",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unmuted"] is True
+
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "mesh notes",
+        "crypto to the moon",
+    ]
