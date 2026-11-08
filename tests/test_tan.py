@@ -332,6 +332,110 @@ def test_verify_store_reports_a_wrong_previous_link(identities, tmp_path):
     )
 
 
+def test_verify_store_reports_a_head_pointing_at_another_author(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    create_post(conn, alice, "second", name="alice", now=1001)
+    create_post(conn, bob, "bob one", name="bob", now=1002)
+    bob_second = create_post(conn, bob, "bob two", name="bob", now=1003)
+    # Alice's head now points at Bob's latest entry, same sequence number.
+    conn.execute(
+        "UPDATE heads SET hash = ? WHERE author = ?",
+        (bob_second["hash"], author_of(alice)),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        "different author" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_malformed_sequence_values(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET seq = 'not-a-number' WHERE hash = ?",
+        (second["hash"],),
+    )
+    conn.commit()
+
+    # A hand-edited row is a store problem, not a traceback.
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        problem["hash"] == second["hash"]
+        and "non-numeric sequence number" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_a_non_integer_sequence_value(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET seq = 2.5 WHERE hash = ?", (second["hash"],)
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        problem["hash"] == second["hash"]
+        and "non-numeric sequence number" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_a_malformed_linked_flag(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET linked = 'yes' WHERE hash = ?", (second["hash"],)
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        problem["hash"] == second["hash"]
+        and "linked flag is not 0 or 1" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_a_malformed_head_sequence(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE heads SET seq = 'bogus' WHERE author = ?",
+        (second["author"],),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        "head sequence is not an integer" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
 def test_follow_and_timeline(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -920,6 +1024,48 @@ def test_cli_tan_verify_reports_problems(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert len(payload["problems"]) == 1
+
+
+def test_cli_tan_verify_is_read_only(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    db_path = data_dir / "tan.sqlite3"
+    before = db_path.read_bytes()
+
+    assert main(["tan", "verify", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+    assert db_path.read_bytes() == before
+
+
+def test_cli_tan_verify_missing_store(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["tan", "verify", "--data-dir", str(data_dir)]) == 1
+    assert "no Tan store at" in capsys.readouterr().err
+
+
+def test_cli_tan_verify_reports_a_corrupt_store(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    (data_dir / "tan.sqlite3").write_bytes(b"not a database")
+
+    # A damaged store is exactly when this command is needed: a clean
+    # failure, not a traceback.
+    assert main(["tan", "verify", "--data-dir", str(data_dir)]) == 1
+    assert "could not audit Tan store" in capsys.readouterr().err
 
 
 def test_reaction_chains_verifies_and_counts(identities, tmp_path):

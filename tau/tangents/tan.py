@@ -1546,6 +1546,16 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
 
 
 def _int_or_none(value: Any) -> Optional[int]:
+    """Return *value* as an int, or None when it is not integer-shaped.
+
+    SQLite columns are typeless, so a hand-edited or corrupted row can
+    hold text (or a non-integral real) where the audit expects a number;
+    that is a store problem to report, not a crash.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -1600,7 +1610,11 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
     linked_by_author: Dict[str, List[Tuple[Any, int]]] = {}
     for row in rows:
         seq = _int_or_none(row["seq"])
-        if not bool(row["linked"]):
+        linked = _int_or_none(row["linked"])
+        if linked not in (0, 1):
+            _report(row, "linked flag is not 0 or 1")
+            continue
+        if not linked:
             unlinked += 1
             parent = str(row["prev"])
             if seq != 0:
@@ -1608,7 +1622,7 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
             if not parent:
                 _report(row, "unlinked entry has no parent")
             parent_row = by_hash.get(parent)
-            if parent_row is not None and bool(parent_row["linked"]):
+            if parent_row is not None and _int_or_none(parent_row["linked"]) == 1:
                 _report(row, "entry is unlinked but its parent is stored")
             continue
         if seq is None:
@@ -1661,7 +1675,7 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
                 "head points at an entry that belongs to a different author",
             )
             continue
-        if not bool(head_entry["linked"]):
+        if _int_or_none(head_entry["linked"]) != 1:
             _report(
                 head_entry,
                 "head points at an entry that is not linked",
@@ -1669,6 +1683,12 @@ def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
             continue
         head_seq = _int_or_none(head_row["seq"])
         entry_seq = _int_or_none(head_entry["seq"])
+        if entry_seq is None:
+            # Already reported when the row was classified.
+            continue
+        if head_seq is None:
+            _report(head_entry, "head sequence is not an integer")
+            continue
         if head_seq != entry_seq:
             _report(
                 head_entry,
