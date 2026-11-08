@@ -186,6 +186,14 @@ export function PeerSidebar({
                                 ✓ verified
                               </span>
                             ) : null}
+                            {peer.blocked ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-rose-400/40 bg-rose-400/10 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-rose-300"
+                                title="Blocked: their DMs are dropped and their Tan posts hidden"
+                              >
+                                blocked
+                              </span>
+                            ) : null}
                           </span>
                           <span className="block truncate font-mono text-[10px] text-mist">
                             {shortHash(peer.destination, 10)} · {peer.hops} hop

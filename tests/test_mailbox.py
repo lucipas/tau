@@ -61,6 +61,123 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     assert box.counts()["outbox"] == 1
 
 
+def test_load_dedupes_duplicate_message_ids(tmp_path):
+    """A mailbox.json with duplicate ids keeps the newest copy of each
+    and is rewritten on load, so the duplicates do not survive a
+    restart."""
+    path = tmp_path / "mailbox.json"
+    payload = {
+        "version": 1,
+        "outbox": [
+            {
+                "id": "dup-id",
+                "to": BOB.hex(),
+                "text": "newer copy",
+                "created_at": 2000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "dup-id",
+                "to": BOB.hex(),
+                "text": "older copy",
+                "created_at": 1000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "other-id",
+                "to": ALICE.hex(),
+                "text": "untouched",
+                "created_at": 1500.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "held": [
+            {
+                "id": "held-dup",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"newer envelope").decode("ascii"),
+                "stored_at": 3000.0,
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "held-dup",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"older envelope").decode("ascii"),
+                "stored_at": 2500.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "seen": {},
+        "pending_acks": {"holder-hash": ["mid-1", "mid-1", "mid-2"]},
+        "dropped_held": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    box = Mailbox(path)
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0}
+    kept = box.get_outbox("dup-id")
+    assert kept is not None
+    assert kept.text == "newer copy"
+    assert kept.created_at == 2000.0
+    held = box.held_for(ALICE)
+    assert len(held) == 1
+    assert held[0].blob == b"newer envelope"
+
+    # The file itself was rewritten without the duplicates.
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    assert len(reloaded["outbox"]) == 2
+    assert len(reloaded["held"]) == 1
+    assert reloaded["pending_acks"]["holder-hash"] == ["mid-1", "mid-2"]
+
+    # The load report counts what was dropped; a clean file drops none.
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert box.load() == {"outbox": 1, "held": 1, "pending_acks": 1}
+    assert box.load() == {"outbox": 0, "held": 0, "pending_acks": 0}
+
+
+def test_load_skips_nonfinite_timestamps(tmp_path):
+    """NaN / infinite timestamps never parse: a corrupt copy cannot
+    replace a newer valid entry in the newest-wins comparison."""
+    path = tmp_path / "mailbox.json"
+    payload = {
+        "version": 1,
+        "outbox": [
+            {
+                "id": "nan-created",
+                "to": BOB.hex(),
+                "text": "bad timestamp",
+                "created_at": float("nan"),
+                "expires_at": 9000.0,
+            },
+            {
+                "id": "good-id",
+                "to": BOB.hex(),
+                "text": "good",
+                "created_at": 1000.0,
+                "expires_at": 9000.0,
+            },
+        ],
+        "held": [
+            {
+                "id": "inf-stored",
+                "to": ALICE.hex(),
+                "blob": base64.b64encode(b"bad").decode("ascii"),
+                "stored_at": float("inf"),
+                "expires_at": 9000.0,
+            },
+        ],
+        "seen": {},
+        "pending_acks": {},
+        "dropped_held": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    box = Mailbox(path)
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0}
+    assert box.get_outbox("nan-created") is None
+    assert box.get_outbox("good-id") is not None
+
+
 def test_enqueue_rejects_bad_destination(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError):
@@ -190,6 +307,203 @@ def test_hold_dedupe_caps_and_drop(tmp_path, monkeypatch):
         box.hold(to=BOB, blob=blob, message_id="m3", expires_at=5000.0, now=103.0)
     # A different recipient still has room.
     assert box.hold(to=ALICE, blob=blob, message_id="m4", expires_at=5000.0, now=104.0)
+
+
+def test_hold_per_sender_count_quota_sheds_oldest(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    blob = b"sealed-bytes"
+    sender = b"\xcc" * 16
+    assert box.hold(
+        to=BOB, blob=blob, message_id="s1", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    assert box.hold(
+        to=ALICE, blob=blob, message_id="s2", expires_at=5000.0, now=101.0,
+        depositor=sender,
+    )
+    # A third deposit from the same sender sheds the oldest of theirs.
+    assert box.hold(
+        to=BOB, blob=blob, message_id="s3", expires_at=5000.0, now=102.0,
+        depositor=sender,
+    )
+    assert [e.id for e in box.held_list()] == ["s2", "s3"]
+    # Another sender is unaffected.
+    assert box.hold(
+        to=BOB, blob=blob, message_id="o1", expires_at=5000.0, now=103.0,
+        depositor=b"\xdd" * 16,
+    )
+    assert [e.id for e in box.held_list()] == ["s2", "s3", "o1"]
+
+
+def test_hold_per_sender_bytes_quota_sheds_oldest(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_BYTES", 10)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    box.hold(
+        to=BOB, blob=b"123456", message_id="b1", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    box.hold(
+        to=BOB, blob=b"123456", message_id="b2", expires_at=5000.0, now=101.0,
+        depositor=sender,
+    )
+    assert [e.id for e in box.held_list()] == ["b2"]
+
+
+def test_hold_known_sender_gets_higher_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_KNOWN_COUNT", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    for index in range(3):
+        assert box.hold(
+            to=BOB, blob=b"x", message_id=f"k{index}", expires_at=5000.0,
+            now=100.0 + index, depositor=sender, trusted=True,
+        )
+    assert len(box.held_list()) == 3
+    # A fourth trusted deposit sheds the oldest instead of refusing.
+    assert box.hold(
+        to=BOB, blob=b"x", message_id="k3", expires_at=5000.0, now=103.0,
+        depositor=sender, trusted=True,
+    )
+    assert [e.id for e in box.held_list()] == ["k1", "k2", "k3"]
+    # The same sender untrusted is capped at one: its earlier envelopes
+    # are shed to make room for the single allowed slot.
+    assert box.hold(
+        to=ALICE, blob=b"x", message_id="u1", expires_at=5000.0, now=104.0,
+        depositor=sender,
+    )
+    assert [e.id for e in box.held_list()] == ["u1"]
+
+
+def test_hold_unidentified_depositors_share_one_bucket(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 1)
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.hold(to=BOB, blob=b"a", message_id="anon-1", expires_at=5000.0, now=100.0)
+    box.hold(to=BOB, blob=b"b", message_id="anon-2", expires_at=5000.0, now=101.0)
+    assert [e.id for e in box.held_list()] == ["anon-2"]
+
+
+def test_hold_single_blob_over_bytes_quota_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_BYTES", 4)
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxFull):
+        box.hold(
+            to=BOB, blob=b"123456", message_id="too-big", expires_at=5000.0,
+            depositor=b"\xcc" * 16,
+        )
+    assert box.held_list() == []
+
+
+def test_refused_oversized_deposit_keeps_existing_held_mail(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_BYTES", 4)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    assert box.hold(
+        to=BOB, blob=b"abc", message_id="keep", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    with pytest.raises(MailboxFull):
+        box.hold(
+            to=BOB, blob=b"123456", message_id="too-big", expires_at=5000.0,
+            now=101.0, depositor=sender,
+        )
+    assert [e.id for e in box.held_list()] == ["keep"]
+
+
+def test_hold_recipient_cap_counts_shed_victims(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_HELD_PER_RECIPIENT", 2)
+    monkeypatch.setattr(mailbox_module, "HELD_QUOTA_UNKNOWN_COUNT", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = b"\xcc" * 16
+    box.hold(
+        to=BOB, blob=b"a", message_id="r1", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    box.hold(
+        to=BOB, blob=b"b", message_id="r2", expires_at=5000.0, now=101.0,
+        depositor=sender,
+    )
+    # The recipient is full, but the sender's own oldest envelope is shed
+    # to make room — refusing here would waste the sender's own slot.
+    assert box.hold(
+        to=BOB, blob=b"c", message_id="r3", expires_at=5000.0, now=102.0,
+        depositor=sender,
+    )
+    assert [e.id for e in box.held_for(BOB)] == ["r2", "r3"]
+
+
+def test_hold_recipient_cap_still_refuses_other_senders_mail(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mailbox_module, "MAX_HELD_PER_RECIPIENT", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    other = b"\xdd" * 16
+    box.hold(
+        to=BOB, blob=b"a", message_id="o1", expires_at=5000.0, now=100.0,
+        depositor=other,
+    )
+    box.hold(
+        to=BOB, blob=b"b", message_id="o2", expires_at=5000.0, now=101.0,
+        depositor=other,
+    )
+    sender = b"\xcc" * 16
+    with pytest.raises(MailboxFull):
+        box.hold(
+            to=BOB, blob=b"c", message_id="s1", expires_at=5000.0, now=102.0,
+            depositor=sender,
+        )
+    # Nothing of the sender's was shed for a refused deposit.
+    assert [e.id for e in box.held_for(BOB)] == ["o1", "o2"]
+
+
+def test_held_depositor_and_usage_persist(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = b"\xcc" * 16
+    box.hold(
+        to=BOB, blob=b"abc", message_id="m1", expires_at=5000.0, now=100.0,
+        depositor=sender,
+    )
+    box.hold(
+        to=ALICE, blob=b"abcd", message_id="m2", expires_at=5000.0, now=101.0,
+        depositor=sender,
+    )
+    box.hold(to=BOB, blob=b"ab", message_id="m3", expires_at=5000.0, now=102.0)
+    reloaded = Mailbox(path)
+    assert [e.id for e in reloaded.held_list()] == ["m1", "m2", "m3"]
+    assert reloaded.held_for(BOB)[0].depositor == sender.hex()
+    assert reloaded.held_usage() == [
+        {"sender": sender.hex(), "count": 2, "bytes": 7},
+        {"sender": "", "count": 1, "bytes": 2},
+    ]
+
+
+def test_held_envelope_without_depositor_loads_as_unknown(tmp_path):
+    path = tmp_path / "mailbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "outbox": [],
+                "held": [
+                    {
+                        "id": "legacy",
+                        "to": BOB.hex(),
+                        "blob": base64.b64encode(b"old").decode("ascii"),
+                        "stored_at": 100.0,
+                        "expires_at": 5000.0,
+                    }
+                ],
+                "seen": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    box = Mailbox(path)
+    assert box.held_for(BOB)[0].depositor == ""
+    assert box.held_usage() == [{"sender": "", "count": 1, "bytes": 3}]
 
 
 def test_hold_rejects_oversize_blob(tmp_path):
