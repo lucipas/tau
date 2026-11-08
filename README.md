@@ -251,6 +251,7 @@ Global options may appear before or after the command:
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers show NAME\|HASH` | Show what this node knows about one peer (offline, read-only) |
 | `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |

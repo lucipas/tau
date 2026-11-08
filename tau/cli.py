@@ -329,6 +329,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|HASH",
         help="with --exchange, ask only this peer instead of all known peers",
     )
+    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_show = peers_sub.add_parser(
+        "show",
+        parents=[common],
+        help="show what this node knows about one peer (offline, read-only)",
+    )
+    peers_show.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer name, destination hash or hash prefix",
+    )
+    peers_show.set_defaults(func=cmd_peers_show)
     peers.set_defaults(func=cmd_peers)
 
     identity = subparsers.add_parser(
@@ -1929,6 +1941,68 @@ def cmd_peers(args: argparse.Namespace) -> int:
         )
     else:
         _print_peer_table(peers)
+    return _EXIT_OK
+
+
+def cmd_peers_show(args: argparse.Namespace) -> int:
+    """Show everything the local stores know about one peer.
+
+    Read-only and offline: no node is started and nothing is sent.  The
+    registry answers identity and liveness; the mailbox and inbox answer
+    how much mail and how many messages involve this peer.
+    """
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    target = args.target
+    peer = registry.resolve(target)
+    if peer is None:
+        raise PeerError(f"unknown peer: {target!r}")
+    mailbox = Mailbox(config.mailbox_path)
+    inbox = Inbox(config.inbox_path)
+    queued = mailbox.outbox_list(to=peer.destination_hash)
+    held = mailbox.held_for(peer.destination_hash)
+    received = inbox.list_messages(peer=peer.hexhash, limit=None)
+    now = time.time()
+    payload = {
+        "name": peer.name,
+        "destination": peer.hexhash,
+        "lxmf": peer.lxmf_hash,
+        "public_key": peer.public_key.hex(),
+        "first_seen": peer.first_seen,
+        "last_seen": peer.last_seen,
+        "hops": peer.hops,
+        "protocol": peer.protocol,
+        "caps": list(peer.caps),
+        "via_exchange": peer.via_exchange,
+        "queued": len(queued),
+        "held": len(held),
+        "received": len(received),
+    }
+    if _json_mode(args):
+        _emit(payload, True)
+        return _EXIT_OK
+    print(f"name:         {peer.display_name}")
+    print(f"destination:  {peer.hexhash}")
+    print(f"lxmf:         {peer.lxmf_hash or '—'}")
+    print(f"public key:   {peer.public_key.hex()}")
+    print(
+        f"first seen:   {_format_message_time(peer.first_seen)}"
+        f" ({_ago(now - peer.first_seen)} ago)"
+    )
+    print(
+        f"last seen:    {_format_message_time(peer.last_seen)}"
+        f" ({_ago(now - peer.last_seen)} ago)"
+    )
+    print(f"hops:         {peer.hops}")
+    print(f"protocol:     {peer.protocol}")
+    print(f"caps:         {', '.join(peer.caps) if peer.caps else '—'}")
+    print(
+        "via exchange: "
+        + ("yes — never heard directly" if peer.via_exchange else "no")
+    )
+    print(f"queued mail:  {len(queued)} message(s) waiting for this peer")
+    print(f"held mail:    {len(held)} sealed message(s) held for this peer")
+    print(f"received:     {len(received)} message(s) from this peer in the inbox")
     return _EXIT_OK
 
 
