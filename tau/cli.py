@@ -51,16 +51,16 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
-    annotate_reactions,
-    annotate_replies,
     apply_display_rules,
     author_stats,
+    author_timeline,
     export_entries,
-    feed,
     follow,
     following,
     import_entries,
     init_db,
+    mute_keyword,
+    muted_keywords,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -69,6 +69,7 @@ from .tangents.tan import (
     thread,
     timeline,
     unfollow,
+    unmute_keyword,
 )
 
 log = logging.getLogger(__name__)
@@ -658,6 +659,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_following.set_defaults(func=cmd_tan_following)
 
+    tan_mute_keyword = tan_sub.add_parser(
+        "mute-keyword",
+        parents=[common],
+        help="hide posts containing a word or phrase from local views",
+    )
+    tan_mute_keyword.add_argument(
+        "keyword", metavar="WORD|PHRASE", help="word or phrase to mute"
+    )
+    tan_mute_keyword.set_defaults(func=cmd_tan_mute_keyword)
+
+    tan_unmute_keyword = tan_sub.add_parser(
+        "unmute-keyword",
+        parents=[common],
+        help="stop hiding posts containing a word or phrase",
+    )
+    tan_unmute_keyword.add_argument(
+        "keyword", metavar="WORD|PHRASE", help="word or phrase to unmute"
+    )
+    tan_unmute_keyword.set_defaults(func=cmd_tan_unmute_keyword)
+
+    tan_muted_keywords = tan_sub.add_parser(
+        "muted-keywords",
+        parents=[common],
+        help="list muted keywords",
+    )
+    tan_muted_keywords.set_defaults(func=cmd_tan_muted_keywords)
+
     tan_sync = tan_sub.add_parser(
         "sync",
         parents=[common],
@@ -1052,6 +1080,8 @@ def _print_tan_posts(
             if isinstance(parent, dict):
                 if parent.get("deleted"):
                     print("  in reply to a deleted post")
+                elif parent.get("muted"):
+                    print("  in reply to a muted post")
                 else:
                     parent_text = str(parent.get("text") or "")
                     if len(parent_text) > 80:
@@ -1315,14 +1345,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
-            posts = list(
-                reversed(
-                    feed(conn, author=author, limit=args.limit, posts_only=True)
-                )
-            )
-            posts = annotate_replies(
-                conn, annotate_reactions(conn, posts, viewer=viewer)
-            )
+            posts = author_timeline(conn, author, limit=args.limit, viewer=viewer)
         elif getattr(args, "all", False):
             posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
         else:
@@ -1453,6 +1476,65 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
             )
+    return _EXIT_OK
+
+
+def cmd_tan_mute_keyword(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        record = mute_keyword(conn, args.keyword)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"muted keyword {record['display']!r}")
+    return _EXIT_OK
+
+
+def cmd_tan_unmute_keyword(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        removed = unmute_keyword(conn, args.keyword)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(
+            {
+                "keyword": " ".join(args.keyword.split()).casefold(),
+                "unmuted": removed,
+            },
+            True,
+        )
+    else:
+        if removed:
+            print(f"unmuted keyword {args.keyword.strip()!r}")
+        else:
+            print(f"keyword {args.keyword.strip()!r} was not muted")
+    return _EXIT_OK
+
+
+def cmd_tan_muted_keywords(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = muted_keywords(conn)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"muted_keywords": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No muted keywords. Try `tau tan mute-keyword WORD`.")
+        for record in records:
+            when = datetime.fromtimestamp(float(record["added_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"{record['display']} (muted {when})")
     return _EXIT_OK
 
 

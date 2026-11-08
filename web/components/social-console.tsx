@@ -409,7 +409,9 @@ export function PostCard({
                   {post.reply_to.name || "anonymous"} ·{" "}
                   {post.reply_to.deleted
                     ? "a deleted post"
-                    : post.reply_to.text.length > 80
+                    : post.reply_to.muted
+                      ? "a muted post"
+                      : post.reply_to.text.length > 80
                       ? `${post.reply_to.text.slice(0, 80)}…`
                       : post.reply_to.text}
                 </>

@@ -588,10 +588,8 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
-            annotate_reactions,
-            annotate_replies,
             apply_display_rules,
-            feed,
+            author_timeline,
             following,
             resolve_author,
             timeline,
@@ -609,14 +607,7 @@ class WebBridge:
                 )
             if author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
-                posts = list(
-                    reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
-                    )
-                )
-                posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
-                )
+                posts = author_timeline(conn, target, limit=limit, viewer=viewer)
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
             else:

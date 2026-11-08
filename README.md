@@ -206,6 +206,13 @@ tau tan search mesh --author alice
 tau tan follow 5c04c868
 tau tan following
 
+# Hide a word or phrase from your local views (whole-word match,
+# case-insensitive; entries keep syncing, so unmuting restores them)
+tau tan mute-keyword crypto
+tau tan mute-keyword "climate change"
+tau tan muted-keywords
+tau tan unmute-keyword crypto
+
 # Back up your posts (or every cached author's) and restore them later —
 # every entry's signature and hash are re-verified on import
 tau tan export --output tan-backup.json
@@ -224,8 +231,11 @@ it, oldest first, and accepts a reply's hash to show the thread it belongs
 to. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
-(the entry itself stays stored, keeping chains verifiable). In the web
-console your own posts show a delete button that calls the same endpoint.
+(the entry itself stays stored, keeping chains verifiable). A word or
+phrase can be muted locally with `tau tan mute-keyword <word>` — matching
+posts disappear from your timeline and threads (a muted reply hides its
+whole subtree), while search still finds them and unmuting restores them.
+In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
@@ -272,6 +282,9 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
+| `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
+| `tau tan muted-keywords` | List muted keywords |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
