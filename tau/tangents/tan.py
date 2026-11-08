@@ -488,10 +488,36 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
 
 
 def open_readonly_db(path: Union[str, Path]) -> sqlite3.Connection:
-    """Open an existing Tan database read-only, without schema or metadata writes."""
+    """Open an existing Tan database read-only, without schema or metadata writes.
+
+    The store must already have the current schema: a store created by an
+    older tau (before reactions) needs one migrating open first — any other
+    ``tau tan`` command does that — so a stale schema raises TanError
+    instead of failing mid-query on a missing column.
+    """
     target = Path(path).expanduser().resolve()
     conn = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    except sqlite3.Error as exc:
+        conn.close()
+        raise TanError(f"could not read the Tan store: {exc}") from exc
+    required = {"author", "name", "created_at", "seq", "kind", "target", "linked"}
+    if not required <= columns or "follows" not in tables:
+        conn.close()
+        raise TanError(
+            "Tan store schema is outdated; run `tau tan timeline` once to migrate it"
+        )
     return conn
 
 

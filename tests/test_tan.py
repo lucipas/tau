@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import RNS
@@ -39,6 +40,7 @@ from tau.tangents.tan import (
     reaction_states,
     resolve_post,
     max_seq,
+    open_readonly_db,
     search_posts,
     store,
     store_post,
@@ -1016,6 +1018,44 @@ def test_list_authors(identities, tmp_path):
         list_authors(conn, limit=-1)
 
 
+def test_open_readonly_db_leaves_store_untouched(identities, tmp_path):
+    alice, _ = identities
+    path = tmp_path / "tan.sqlite3"
+    conn = init_db(path)
+    create_post(conn, alice, "hello", name="alice", now=1000)
+    conn.close()
+
+    before = path.read_bytes()
+    conn = open_readonly_db(path)
+    try:
+        assert len(list_authors(conn)) == 1
+    finally:
+        conn.close()
+    assert path.read_bytes() == before
+
+
+def test_open_readonly_db_rejects_outdated_schema(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(path))
+    # A pre-reactions store: no kind/target columns, so list_authors
+    # would fail mid-query on a missing column.
+    conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(TanError, match="outdated"):
+        open_readonly_db(path)
+
+
 def test_cli_tan_authors(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     # A fresh data dir has no store yet, and listing must not create one.
@@ -1057,6 +1097,28 @@ def test_cli_tan_authors(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "alice" in out
     assert "2 post(s)" in out
+
+    # A pre-reactions store fails cleanly, not with a traceback.
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy_conn = sqlite3.connect(str(legacy_dir / "tan.sqlite3"))
+    legacy_conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    legacy_conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+    assert main(["tan", "authors", "--data-dir", str(legacy_dir), "--json"]) != 0
+    captured = capsys.readouterr()
+    assert "outdated" in captured.err
+    assert "Traceback" not in captured.err
 
     assert main(["tan", "authors", "--data-dir", str(data_dir), "--limit", "-1"]) != 0
 
