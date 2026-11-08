@@ -584,6 +584,12 @@ def test_tan_saved_annotations_and_muting(tmp_path):
         ]
         by_text = {item["text"]: item for item in payload["posts"]}
         assert by_text["seconded"]["reply_to"] is None
+        # A muted author's post never surfaces through a quote preview
+        # either — in the saved list or the timeline.
+        assert by_text["worth sharing"]["quoted"] is None
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        timeline_by_text = {item["text"]: item for item in payload["posts"]}
+        assert timeline_by_text["worth sharing"]["quoted"] is None
         conn = init_db(node.config.social_db_path)
         try:
             assert unmute(conn, original["author"]) is True
@@ -606,6 +612,31 @@ def test_tan_saved_annotations_and_muting(tmp_path):
         conn = init_db(node.config.social_db_path)
         try:
             assert unmute_keyword(conn, "sharing") is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+
+        # A muted keyword blanks the quoted original (and the reply
+        # parent) instead of leaking its text through the preview.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute_keyword(conn, "thought")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded",
+            "worth sharing",
+        ]
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["quoted"]["text"] == ""
+        assert by_text["worth sharing"]["quoted"]["muted"] is True
+        assert by_text["seconded"]["reply_to"]["text"] == ""
+        assert by_text["seconded"]["reply_to"]["muted"] is True
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute_keyword(conn, "thought") is True
         finally:
             conn.close()
         status, _, payload = _json(bridge, "/api/tan/saved")

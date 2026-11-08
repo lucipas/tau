@@ -547,7 +547,11 @@ export function PostCard({
               {post.quoted ? (
                 <>
                   {post.quoted.name || "anonymous"} ·{" "}
-                  {post.quoted.deleted ? "a deleted post" : post.quoted.text}
+                  {post.quoted.deleted
+                    ? "a deleted post"
+                    : post.quoted.muted
+                      ? "a muted post"
+                      : post.quoted.text}
                 </>
               ) : (
                 shortHash(post.target ?? "", 16)

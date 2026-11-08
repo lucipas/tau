@@ -1190,6 +1190,9 @@ def annotate_quote_counts(
 def annotate_quotes(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
+    *,
+    muted_keywords: Optional[Sequence[str]] = None,
+    exclude_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1198,7 +1201,12 @@ def annotate_quotes(
     original has not arrived yet — a quote is still shown on its own.
     A deleted original is reported as deleted with its text blanked,
     so the thread stays readable without resurfacing removed content.
-    Top-level posts and replies get no ``quoted`` key.
+    An original matching a muted keyword (see :func:`muted_keywords`)
+    is reported the same way, with its text blanked and ``muted`` set,
+    so the muted content does not leak through the preview.  An
+    original whose author is in *exclude_authors* (muted) is reported
+    as ``None`` so its name and text never surface.  Top-level posts
+    and replies get no ``quoted`` key.
 
     Parents are fetched in one query and their deletion status in a
     second, so a quote-heavy page does not issue one lookup per quote.
@@ -1232,21 +1240,32 @@ def annotate_quotes(
             list(parents),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_QUOTE:
             continue
         parent = parents.get(str(post.get("target") or ""))
-        if parent is None:
+        if parent is None or (
+            exclude_authors and parent["author"] in exclude_authors
+        ):
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
-        post["quoted"] = {
+        is_muted = _text_matches_muted_keywords(
+            str(parent.get("text") or ""), muted_pattern
+        )
+        summary = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if is_deleted else parent["text"],
+            "text": "" if is_deleted or is_muted else parent["text"],
             "deleted": is_deleted,
         }
+        if is_muted:
+            # Only present when muted, so unmuted previews keep their
+            # established shape.
+            summary["muted"] = True
+        post["quoted"] = summary
     return posts
 
 
@@ -1599,6 +1618,8 @@ def timeline(
                     exclude_authors=silenced,
                 ),
             ),
+            muted_keywords=keywords,
+            exclude_authors=silenced,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1644,6 +1665,8 @@ def timeline(
                 exclude_authors=silenced,
             ),
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
     )
 
 
@@ -1665,6 +1688,7 @@ def author_timeline(
     """
     author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
     keywords = _muted_keyword_list(conn)
+    silenced = muted_author_set(conn)
 
     def page(cursor: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
@@ -1692,8 +1716,11 @@ def author_timeline(
                 conn,
                 annotate_reactions(conn, list(reversed(posts)), viewer=viewer),
                 muted_keywords=keywords,
+                exclude_authors=silenced,
             ),
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
     )
 
 
@@ -1773,7 +1800,8 @@ def thread(
         # A cached entry still awaiting its chain predecessor is not shown.
         raise TanError(f"post has not linked yet: {ref!r}")
     silenced = muted_author_set(conn)
-    muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
+    keywords = _muted_keyword_list(conn)
+    muted_pattern = _muted_keyword_pattern(keywords)
     root = start
     ancestors = {root["hash"]}
     # Once a muted entry is met (the named entry itself, or an ancestor),
@@ -1874,6 +1902,8 @@ def thread(
         annotate_quotes(
             conn,
             annotate_quote_counts(conn, annotate_reactions(conn, batch, viewer=viewer)),
+            muted_keywords=keywords,
+            exclude_authors=silenced,
         )
     return ordered
 
@@ -2427,6 +2457,8 @@ def annotated_saved_posts(
                 exclude_authors=silenced,
             ),
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
     )
     for post in posts:
         post["saved"] = True

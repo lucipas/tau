@@ -161,6 +161,32 @@ describe("PostCard quote rendering", () => {
     ).toBeTruthy();
   });
 
+  it("reports a muted original without resurfacing its text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "still worth it",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "f".repeat(32),
+          name: "alice",
+          text: "",
+          deleted: false,
+          muted: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("still worth it")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting alice · a muted post",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows the quote count on the quoted post and hides it at zero", () => {
     const { rerender } = render(
       <PostCard
