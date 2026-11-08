@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -1386,11 +1387,27 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
 def cmd_tan_verify(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
-    conn = init_db(config.social_db_path)
+    path = Path(config.social_db_path).expanduser()
+    # Audit a read-only connection to the existing file: opening through
+    # init_db would create a missing store, or migrate and rewrite an old one.
     try:
-        report = verify_store(conn)
-    finally:
-        conn.close()
+        if not path.is_file():
+            raise FileNotFoundError(f"no Tan store at {path}")
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            report = verify_store(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        message = f"could not audit Tan store at {path}: {exc}"
+        if json_output:
+            _emit({"ok": False, "error": message}, True)
+        else:
+            print(f"tau: error: {message}", file=sys.stderr)
+        return _EXIT_ERROR
     if json_output:
         _emit(report, True)
         return _EXIT_OK if report["ok"] else _EXIT_ERROR
