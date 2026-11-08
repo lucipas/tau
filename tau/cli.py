@@ -811,7 +811,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_rules.add_argument(
         "--kinds",
         default=None,
-        metavar="post,like,unlike,delete",
+        metavar="post,reply,repost,like,unlike,delete",
         help="comma-separated entry kinds to display (display-only: "
         "every kind is still stored, so chains stay complete)",
     )
