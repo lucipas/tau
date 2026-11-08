@@ -1509,8 +1509,10 @@ def thread(
     conversation.  Deleted and unlinked entries never appear, and a
     reply to a deleted entry is hidden with its parent's subtree rather
     than re-parented.  Replies by muted authors are hidden the same
-    way, subtree included — except the root itself, which was named
-    explicitly and is always shown.  An unknown, ambiguous or deleted reference
+    way, subtree included — except the entry the caller named, which
+    always anchors the thread even when its author is muted, and a
+    muted ancestor above it, which simply ends the climb instead of
+    being promoted to the root.  An unknown, ambiguous or deleted reference
     raises :class:`TanError`, exactly as :func:`resolve_post` does; so
     does a reference to an unlinked entry or to a reply beneath a
     deleted entry, since showing it would present a partial thread.
@@ -1524,13 +1526,16 @@ def thread(
     if not start.get("linked"):
         # A cached entry still awaiting its chain predecessor is not shown.
         raise TanError(f"post has not linked yet: {ref!r}")
+    silenced = muted_author_set(conn)
     muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
     root = start
     ancestors = {root["hash"]}
     # Once a muted entry is met (the named entry itself, or an ancestor),
     # the visible root stops moving, but the climb continues so that
     # deleted ancestors above it are still rejected.
-    anchored = _text_matches_muted_keywords(str(start.get("text") or ""), muted_pattern)
+    anchored = start["author"] in silenced or _text_matches_muted_keywords(
+        str(start.get("text") or ""), muted_pattern
+    )
     cursor = start
     while cursor.get("kind") == KIND_REPLY and cursor.get("target"):
         parent = get_post(conn, str(cursor["target"]))
@@ -1549,8 +1554,11 @@ def thread(
             break
         ancestors.add(parent["hash"])
         cursor = parent
-        if not anchored and _text_matches_muted_keywords(
-            str(parent.get("text") or ""), muted_pattern
+        if not anchored and (
+            parent["author"] in silenced
+            or _text_matches_muted_keywords(
+                str(parent.get("text") or ""), muted_pattern
+            )
         ):
             # A muted ancestor ends the visible climb: the named entry
             # anchors its own thread rather than promoting the muted
@@ -1568,7 +1576,6 @@ def thread(
     levels: List[List[Dict[str, Any]]] = [[root]]
     frontier = [root["hash"]]
     seen = {root["hash"]}
-    silenced = muted_author_set(conn)
     while frontier:
         rows: List[sqlite3.Row] = []
         for batch in _thread_batches(frontier, _SQL_BATCH):

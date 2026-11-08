@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
 from .allowlist import (
@@ -66,6 +66,7 @@ from .tangents.tan import (
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
+    resolve_muted_name,
     resolve_post,
     search_posts,
     thread,
@@ -1499,13 +1500,35 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _resolve_mute_target(
+    conn: sqlite3.Connection, target: str, registry: PeerRegistry
+) -> Tuple[str, str]:
+    """Resolve a mute/unmute target, falling back to stored names.
+
+    The peer registry does not know authors whose posts are only cached,
+    and a muted author may have no cached posts at all — so after the
+    registry/hash/prefix lookup fails, try the name stored with the
+    mute, then the name on the author's cached posts.
+    """
+    try:
+        return resolve_author(conn, target, registry=registry)
+    except TanError as exc:
+        match = resolve_muted_name(conn, target)
+        if match is not None:
+            return match
+        try:
+            return resolve_cached_author(conn, target)
+        except TanError:
+            raise exc from None
+
+
 def cmd_tan_mute(args: argparse.Namespace) -> int:
     config = _make_config(args)
     config.prepare()
     conn = init_db(config.social_db_path)
     try:
-        author, name = resolve_author(
-            conn, args.target, registry=PeerRegistry(config.peers_path)
+        author, name = _resolve_mute_target(
+            conn, args.target, PeerRegistry(config.peers_path)
         )
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
@@ -1525,17 +1548,9 @@ def cmd_tan_unmute(args: argparse.Namespace) -> int:
     config = _make_config(args)
     conn = init_db(config.social_db_path)
     try:
-        try:
-            author, name = resolve_author(
-                conn, args.target, registry=PeerRegistry(config.peers_path)
-            )
-        except TanError:
-            # Muted authors may be cached without a peer registry entry;
-            # `tan muted` lists them by name, so accept that name here too.
-            match = resolve_muted_name(conn, args.target)
-            if match is None:
-                raise
-            author, name = match
+        author, name = _resolve_mute_target(
+            conn, args.target, PeerRegistry(config.peers_path)
+        )
         removed = unmute(conn, author)
     finally:
         conn.close()

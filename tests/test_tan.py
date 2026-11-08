@@ -19,6 +19,7 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    annotate_reactions,
     annotate_replies,
     author_stats,
     author_timeline,
@@ -41,6 +42,8 @@ from tau.tangents.tan import (
     muted_keywords,
     reaction_states,
     resolve_post,
+    resolve_author,
+    resolve_muted_name,
     max_seq,
     mute,
     muted,
@@ -261,7 +264,7 @@ def test_thread_hides_muted_subtree(identities, tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     root = create_post(conn, alice, "root post", name="alice", now=1000)
     reply = create_reply(conn, bob, root["hash"], "bob replies", name="bob", now=1001)
-    create_reply(
+    nested = create_reply(
         conn, carol, reply["hash"], "carol replies to bob", name="carol", now=1002
     )
     create_reply(
@@ -274,13 +277,18 @@ def test_thread_hides_muted_subtree(identities, tmp_path):
         "root post",
         "carol replies to root",
     ]
-    # Naming the muted reply still opens its thread, with the muted
-    # reply (and its subtree) hidden — only the root is exempt.
+    # The named entry always anchors the thread, even when its author
+    # is muted — so the muted reply shows with its own descendants.
     assert [entry["text"] for entry in thread(conn, reply["hash"])] == [
-        "root post",
-        "carol replies to root",
+        "bob replies",
+        "carol replies to bob",
     ]
-    # ...but a muted author's own root post still shows when opened by hash.
+    # ...while a muted ancestor above the named entry simply ends the
+    # climb instead of being promoted to the root.
+    assert [entry["text"] for entry in thread(conn, nested["hash"])] == [
+        "carol replies to bob"
+    ]
+    # ...and a muted author's own root post still shows when opened by hash.
     bob_root = create_post(conn, bob, "bob root", name="bob", now=1004)
     assert [entry["text"] for entry in thread(conn, bob_root["hash"])] == ["bob root"]
 
@@ -291,6 +299,55 @@ def test_thread_hides_muted_subtree(identities, tmp_path):
         "carol replies to bob",
         "carol replies to root",
     ]
+
+
+def test_timeline_hides_muted_parent_preview(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = create_post(conn, bob, "muted parent text", name="bob", now=1000)
+    create_reply(conn, alice, parent["hash"], "alice replies", name="alice", now=1001)
+
+    mute(conn, author_of(bob), name="bob")
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(alice))
+    assert len(posts) == 1
+    # The muted parent's name and text never surface in the preview.
+    assert posts[0]["reply_to"] is None
+    assert "muted parent text" not in json.dumps(posts)
+
+    # An explicit author lookup still shows the parent preview.
+    shown = feed(conn, author=author_of(alice), posts_only=True)
+    annotated = annotate_replies(
+        conn, annotate_reactions(conn, shown, viewer=author_of(alice))
+    )
+    assert annotated[0]["reply_to"]["text"] == "muted parent text"
+
+
+def test_resolve_author_prefix_with_renamed_author(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, bob, "first as bob", name="bob", now=1000)
+    create_post(conn, bob, "now as robert", name="robert", now=1001)
+
+    # A unique hash prefix resolves even though the author posted under
+    # two names, and reports the latest name.
+    author, name = resolve_author(conn, author_of(bob)[:8])
+    assert author == author_of(bob)
+    assert name == "robert"
+
+
+def test_resolve_muted_name(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mute(conn, author_of(bob), name="bob", now=1000)
+
+    assert resolve_muted_name(conn, "bob") == (author_of(bob), "bob")
+    assert resolve_muted_name(conn, "BOB")[0] == author_of(bob)
+    assert resolve_muted_name(conn, "alice") is None
+
+    # Two muted authors sharing a name must be disambiguated by hash.
+    mute(conn, author_of(alice), name="bob", now=1001)
+    with pytest.raises(TanError, match="use a destination hash"):
+        resolve_muted_name(conn, "bob")
 
 
 def test_feed_paginates_by_sequence(identities, tmp_path):
@@ -478,6 +535,25 @@ def test_cli_mute_muted_unmute(tmp_path, capsys):
         main(["tan", "unmute", "--data-dir", str(data_dir), "--json", bob_author]) == 0
     )
     assert json.loads(capsys.readouterr().out)["unmuted"] is False
+
+    # Names work too, even though bob is not in the peer registry: the
+    # name comes from his cached posts, and from the mute record itself.
+    assert main(["tan", "mute", "--data-dir", str(data_dir), "--json", "bob"]) == 0
+    assert json.loads(capsys.readouterr().out)["author"] == bob_author
+    assert main(["tan", "unmute", "--data-dir", str(data_dir), "--json", "bob"]) == 0
+    assert json.loads(capsys.readouterr().out)["unmuted"] is True
+
+    # A unique hash prefix works as well.
+    assert (
+        main(["tan", "mute", "--data-dir", str(data_dir), "--json", bob_author[:8]])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["author"] == bob_author
+    assert (
+        main(["tan", "unmute", "--data-dir", str(data_dir), "--json", bob_author[:8]])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unmuted"] is True
 
 
 def test_export_import_roundtrip(identities, tmp_path):
