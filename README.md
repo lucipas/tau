@@ -339,6 +339,10 @@ echo "piped message" | tau send --to alice
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
 
+# Tag a message with a kind (default chat); the receiver can filter by it
+tau send --to alice --kind ping "are you there?"
+tau messages --kind ping
+
 # See what is waiting on offline peers
 tau outbox
 
@@ -685,9 +689,11 @@ unlinked, and stall sync at the gap.
   `tau peers --max-age`.
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
 - Natural extensions: group destinations, file transfer using Reticulum
-  resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
+  resources, allow-lists, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (media, moderation, follow recommendations).
+  (media, moderation, follow recommendations). Direct messages can already
+  carry a kind (`tau send --kind`, default `chat`); every kind is
+  delivered, queued and stored exactly like chat.
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
   console); `tau id` shows this node's own address. Nothing is sent over

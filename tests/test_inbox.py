@@ -93,6 +93,24 @@ def test_list_filters_by_peer_and_limit(tmp_path):
     assert inbox.list_messages(limit=0) == []
 
 
+def test_records_default_to_chat_kind(tmp_path):
+    # Records written before kinds existed carry no kind field.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old"))
+    assert inbox.list_messages()[0]["kind"] == "chat"
+
+
+def test_list_filters_by_kind(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="c1", kind="chat", received_at=1.0))
+    inbox.append(_record(id="p1", kind="ping", received_at=2.0))
+    inbox.append(_record(id="p2", kind="ping", received_at=3.0))
+
+    assert [e["id"] for e in inbox.list_messages(kind="ping")] == ["p2", "p1"]
+    assert [e["id"] for e in inbox.list_messages(kind="chat")] == ["c1"]
+    assert inbox.list_messages(kind="alert") == []
+
+
 def test_concurrent_writers_do_not_lose_entries(tmp_path):
     """Two Inbox handles on one file (serve + one-shot) keep each other's entries."""
     path = tmp_path / "inbox.json"

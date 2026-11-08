@@ -115,7 +115,34 @@ def test_message_roundtrip():
     data = encode_message("hello there")
     parsed = parse_message(data)
     assert parsed["text"] == "hello there"
+    assert parsed["kind"] == "chat"
     assert isinstance(parsed["sent_at"], float)
+
+
+@pytest.mark.parametrize("kind", ["ping", "alert", "bot-command", "sensor_1", "A1"])
+def test_message_kind_roundtrip_normalises(kind):
+    parsed = parse_message(encode_message("hello", kind=kind))
+    assert parsed["kind"] == kind.lower()
+
+
+def test_message_without_kind_parses_as_chat():
+    # A peer that predates kinds sends no kind field at all.
+    data = encode(
+        {"type": "message", "v": 1, "text": "old peer here", "sent_at": 1.0}
+    )
+    assert parse_message(data)["kind"] == "chat"
+
+
+@pytest.mark.parametrize(
+    "kind", ["", " ", "has space", "has/slash", "UPPER!", "-lead", "x" * 33, 7, ["ping"]]
+)
+def test_message_kind_rejects_invalid(kind):
+    with pytest.raises(ProtocolError):
+        encode_message("hello", kind=kind)
+    with pytest.raises(ProtocolError):
+        parse_message(
+            encode({"type": "message", "v": 1, "text": "hi", "kind": kind})
+        )
 
 
 def test_message_rejects_wrong_shape():

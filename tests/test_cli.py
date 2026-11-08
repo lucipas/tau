@@ -39,6 +39,10 @@ def test_parser_send_arguments():
     assert args.to == "alice"
     assert args.message == "hello world"
     assert args.timeout == 20.0
+    assert args.kind is None
+
+    kinded = parser.parse_args(["send", "--to", "alice", "--kind", "ping", "hi"])
+    assert kinded.kind == "ping"
 
 
 def test_parser_serve_http_options():
@@ -409,10 +413,15 @@ def test_parser_messages_arguments():
     assert args.command == "messages"
     assert args.peer == "alice"
     assert args.limit == 5
+    assert args.kind is None
+
+    kinded = parser.parse_args(["messages", "--kind", "ping"])
+    assert kinded.kind == "ping"
 
     defaults = parser.parse_args(["messages"])
     assert defaults.peer is None
     assert defaults.limit == 30
+    assert defaults.kind is None
 
 
 def _seed_messages(tmp_path):
@@ -456,6 +465,40 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "first hello" in out
     assert out.index("second hello") < out.index("first hello")
     assert "alice" in out
+
+
+def test_messages_kind_filter_and_tag(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "are you there?",
+            "kind": "ping",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "ping"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "are you there?" in out
+    assert "[ping]" in out
+    assert "second hello" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    kinds = {item["id"]: item["kind"] for item in payload["messages"]}
+    assert kinds == {"m-3": "ping", "m-2": "chat", "m-1": "chat"}
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "has space"])
+    assert code == 1
+    assert "message kind" in capsys.readouterr().err
 
 
 def test_messages_json_and_peer_filter(tmp_path, capsys):

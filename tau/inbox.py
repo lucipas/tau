@@ -24,6 +24,7 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
+from .protocol import DEFAULT_MESSAGE_KIND, ProtocolError, normalize_message_kind
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -60,10 +61,17 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
+    try:
+        kind = normalize_message_kind(raw.get("kind"))
+    except ProtocolError:
+        # A hand-edited record keeps its text; the kind falls back to
+        # plain chat rather than dropping the message.
+        kind = DEFAULT_MESSAGE_KIND
     return {
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
         "text": text,
+        "kind": kind,
         "sent_at": sent_at,
         "received_at": received_at,
         "id": raw.get("id"),
@@ -148,17 +156,24 @@ class Inbox:
         return entry
 
     def list_messages(
-        self, *, limit: Optional[int] = None, peer: Optional[str] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        peer: Optional[str] = None,
+        kind: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).
+        ``peer`` filters to one sender destination hash; ``kind`` filters
+        to one message kind; ``limit`` caps how many are returned (``None``
+        means all of them).
         """
         with self._lock:
             entries = list(self._messages)
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if kind is not None:
+            entries = [item for item in entries if item.get("kind") == kind]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

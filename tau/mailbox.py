@@ -47,6 +47,7 @@ from .identity import (
     load_public_key,
 )
 from .protocol import (
+    DEFAULT_MESSAGE_KIND,
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
@@ -54,6 +55,7 @@ from .protocol import (
     encode,
     generate_message_id,
     normalize_message,
+    normalize_message_kind,
     sanitize_name,
 )
 from .util import atomic_write_json, read_json
@@ -97,6 +99,7 @@ class OutboxEntry:
     created_at: float
     expires_at: float
     to_name: str = ""
+    kind: str = DEFAULT_MESSAGE_KIND
     attempts: int = 0
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
@@ -141,6 +144,7 @@ class OutboxEntry:
             "to": self.to_hex,
             "to_name": self.to_name,
             "text": self.text,
+            "kind": self.kind,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "attempts": self.attempts,
@@ -171,6 +175,12 @@ class OutboxEntry:
         if not isinstance(held_by, dict):
             held_by = {}
         attempts = raw.get("attempts")
+        try:
+            kind = normalize_message_kind(raw.get("kind"))
+        except ProtocolError:
+            # A hand-edited or corrupt entry keeps its text; the kind
+            # falls back to plain chat rather than dropping the message.
+            kind = DEFAULT_MESSAGE_KIND
         return cls(
             id=message_id,
             to=destination,
@@ -180,6 +190,7 @@ class OutboxEntry:
             to_name=sanitize_name(raw.get("to_name"), fallback="")
             if isinstance(raw.get("to_name"), str)
             else "",
+            kind=kind,
             attempts=int(attempts) if isinstance(attempts, int) else 0,
             last_attempt_at=raw.get("last_attempt_at")
             if isinstance(raw.get("last_attempt_at"), (int, float))
@@ -425,6 +436,7 @@ class Mailbox:
         to: bytes,
         text: str,
         to_name: str = "",
+        kind: Optional[str] = None,
         ttl: float = DEFAULT_TTL,
         message_id: Optional[str] = None,
         now: Optional[float] = None,
@@ -434,6 +446,7 @@ class Mailbox:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
+        clean_kind = normalize_message_kind(kind)
         entry_id = message_id or generate_message_id()
         with self._transaction():
             existing = self._outbox.get(entry_id)
@@ -450,6 +463,7 @@ class Mailbox:
                 to_name=sanitize_name(to_name, fallback="")
                 if to_name
                 else "",
+                kind=clean_kind,
             )
             self._outbox[entry.id] = entry
             self.save()
@@ -742,6 +756,7 @@ def seal_message(
     message_id: str,
     text: str,
     sent_at: float,
+    kind: Optional[str] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -760,6 +775,7 @@ def seal_message(
         "from_name": sanitize_name(sender_name),
         "from_key": sender_identity.get_public_key().hex(),
         "text": normalize_message(text),
+        "kind": normalize_message_kind(kind),
         "sent_at": float(sent_at),
     }
     canonical = encode(inner)
@@ -838,11 +854,16 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         text = normalize_message(payload.get("text"))
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
+    try:
+        kind = normalize_message_kind(payload.get("kind"))
+    except ProtocolError as exc:
+        raise MailboxError(f"sealed message kind is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
     return {
         "id": message_id,
         "from": claimed_from.lower(),
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
+        "kind": kind,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
     }

@@ -43,6 +43,7 @@ from .protocol import (
     APP_NAME,
     ASPECT,
     ASPECT_FILTER,
+    DEFAULT_MESSAGE_KIND,
     MAX_MAIL_REQUEST_BYTES,
     MAX_MAIL_TTL,
     MAX_REQUEST_BYTES,
@@ -62,6 +63,7 @@ from .protocol import (
     encode_message,
     generate_message_id,
     normalize_message,
+    normalize_message_kind,
     parse_announce,
     parse_mail_fetch,
     parse_mail_store,
@@ -833,6 +835,7 @@ class TauNode:
                 "from": caller_name,
                 "destination": caller_hash,
                 "text": message["text"],
+                "kind": message["kind"],
                 "sent_at": message["sent_at"],
                 "received_at": received_at,
                 "id": message_id,
@@ -852,6 +855,7 @@ class TauNode:
 
         return response_ok(
             echo=message["text"],
+            kind=message["kind"],
             received_at=received_at,
             server=self.name,
             node=self.destination_hexhash,
@@ -1160,7 +1164,10 @@ class TauNode:
             if self.mailbox.get_outbox(entry.id) is None:
                 return False
         payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+            entry.text,
+            message_id=entry.id,
+            sent_at=entry.created_at,
+            kind=getattr(entry, "kind", None),
         )
         if not self._still_queued(entry.id):
             return False
@@ -1199,6 +1206,7 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                kind=getattr(entry, "kind", None),
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1316,6 +1324,7 @@ class TauNode:
             "from": message["from_name"],
             "destination": message["from"],
             "text": message["text"],
+            "kind": message.get("kind") or DEFAULT_MESSAGE_KIND,
             "sent_at": message["sent_at"],
             "received_at": time.time(),
             "id": message["id"],
@@ -1460,6 +1469,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        kind: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -1467,11 +1477,16 @@ class TauNode:
         be reached is stored in the local outbox instead of being lost:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
-        willing to hold a sealed copy — is heard from.
+        willing to hold a sealed copy — is heard from.  ``kind`` tags the
+        message (``chat`` by default); it travels on the wire, survives
+        queueing, and is stored in the recipient's inbox.
         """
         normalized = normalize_message(text)
+        clean_kind = normalize_message_kind(kind)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        payload = encode_message(
+            normalized, message_id=message_id, kind=clean_kind
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1499,6 +1514,7 @@ class TauNode:
                 to=dest_hash,
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
+                kind=clean_kind,
                 message_id=message_id,
             )
             log.info(

@@ -43,7 +43,13 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import (
+    DEFAULT_MESSAGE_KIND,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    normalize_message_kind,
+    short_hash,
+)
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -303,6 +309,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
     )
+    send.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="tag the message with a kind (default chat); receivers can"
+        " filter their inbox by kind",
+    )
     send.set_defaults(func=cmd_send)
 
     ping = subparsers.add_parser(
@@ -512,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         metavar="N",
         help="show the newest N messages (default 30)",
+    )
+    messages.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="only show messages of this kind (default: all kinds)",
     )
     messages.set_defaults(func=cmd_messages)
 
@@ -2609,6 +2628,10 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
+    try:
+        kind = normalize_message_kind(getattr(args, "kind", None))
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
     node = TauNode(config, name=config.name)
     node.start()
     try:
@@ -2618,6 +2641,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            kind=kind,
         )
         if response.get("queued"):
             # One-shot send: give reachable peers a brief chance to take a
@@ -2681,7 +2705,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print("Outbox is empty — nothing waiting on offline peers.")
         else:
             now = time.time()
-            header = ("ID", "TO", "NAME", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
+            header = ("ID", "TO", "NAME", "KIND", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
             rows: List[tuple] = [header]
             for entry in entries:
                 peer = registry.get(entry.to)
@@ -2696,6 +2720,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                         entry.id[:8],
                         entry.to_hex,
                         name or "-",
+                        getattr(entry, "kind", None) or DEFAULT_MESSAGE_KIND,
                         _ago(now - entry.created_at),
                         str(entry.attempts),
                         next_try_text,
@@ -2772,7 +2797,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    kind = getattr(args, "kind", None)
+    if kind is not None:
+        try:
+            kind = normalize_message_kind(kind)
+        except ProtocolError as exc:
+            raise NodeError(str(exc)) from exc
+    entries = inbox.list_messages(limit=limit, peer=peer_hash, kind=kind)
     if _json_mode(args):
         _emit({"messages": entries, "count": len(entries)}, True)
         return _EXIT_OK
@@ -2784,7 +2815,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         sender = short_hash(str(entry.get("destination") or ""))
         when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
+        kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
+        tag = f" [{kind}]" if kind != DEFAULT_MESSAGE_KIND else ""
+        print(f"[{when}] {name} ({sender}){tag}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

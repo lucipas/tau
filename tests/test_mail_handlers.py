@@ -60,6 +60,67 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert node.inbox.path.exists()
 
 
+def test_direct_message_keeps_kind(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    payload = encode_message("are you there?", message_id="kind-1", kind="ping")
+    response = call_handler(node._handle_message, payload)
+
+    assert response["ok"] is True
+    assert response["kind"] == "ping"
+    assert received[0]["kind"] == "ping"
+    assert node.inbox.list_messages()[0]["kind"] == "ping"
+
+
+def test_direct_message_without_kind_is_chat(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    # A peer that predates kinds sends no kind field at all: build the
+    # payload by hand instead of through encode_message, which always
+    # stamps the kind now.
+    from tau.protocol import encode as encode_payload
+
+    payload = encode_payload(
+        {"type": "message", "v": 1, "text": "old peer here", "sent_at": 1.0,
+         "id": "kind-2"}
+    )
+    response = call_handler(node._handle_message, payload)
+
+    assert response["ok"] is True
+    assert response["kind"] == "chat"
+    assert node.inbox.list_messages()[0]["kind"] == "chat"
+
+
+def test_relayed_message_keeps_kind(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+
+    message = {
+        "id": "relay-kind-1",
+        "from": destination_hash(sender).hex(),
+        "from_name": "alice",
+        "text": "doorbell rang",
+        "kind": "alert",
+        "sent_at": 42.0,
+    }
+    assert node._deliver_collected(message) is True
+    assert received[0]["kind"] == "alert"
+    assert received[0]["relayed"] is True
+    assert node.inbox.list_messages()[0]["kind"] == "alert"
+
+
 def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

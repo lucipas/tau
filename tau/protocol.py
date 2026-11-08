@@ -7,7 +7,8 @@ encrypted Reticulum ``Link``:
 
     /tau/ping     -> liveness and clock information
     /tau/info     -> static node information
-    /tau/message  -> deliver a text message, echo it back
+    /tau/message  -> deliver a text message (optionally tagged with a
+                     kind, default ``chat``), echo it back
     /tau/peers    -> ask a peer which peers it has heard from; the answer
                     carries each peer's public key, so the receiver can verify
                     the key derives the reported destination hash (peer exchange)
@@ -36,6 +37,12 @@ DEFAULT_TCP_PORT = 4343
 
 MAX_NAME_LENGTH = 48
 MAX_MESSAGE_CHARS = 2000
+# Message kinds (``tau send --kind``): a short lowercase slug tagging what
+# a DM is for — ``chat`` is plain conversation, anything else is a typed
+# message a receiver can filter on.  The wire field is optional so old
+# peers keep working: a payload without a kind is a chat message.
+DEFAULT_MESSAGE_KIND = "chat"
+MAX_MESSAGE_KIND_LENGTH = 32
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ANNOUNCE_MAX_BYTES = 256
@@ -95,6 +102,31 @@ def normalize_message(text: Any) -> str:
         raise ProtocolError("message text must not be empty")
     if len(cleaned) > MAX_MESSAGE_CHARS:
         raise ProtocolError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+    return cleaned
+
+
+def normalize_message_kind(kind: Any) -> str:
+    """Validate a message kind slug, defaulting an absent one to chat.
+
+    A kind is a short lowercase slug (``[a-z0-9][a-z0-9_-]*``) so it is
+    safe to print, compare and filter on.  ``None`` — the wire case for
+    a peer that predates kinds — means plain chat.
+    """
+    if kind is None:
+        return DEFAULT_MESSAGE_KIND
+    if not isinstance(kind, str):
+        raise ProtocolError("message kind must be a string")
+    cleaned = kind.strip().lower()
+    if not cleaned or len(cleaned) > MAX_MESSAGE_KIND_LENGTH:
+        raise ProtocolError(
+            f"message kind must be 1-{MAX_MESSAGE_KIND_LENGTH} characters"
+        )
+    if not all(char.isalnum() or char in "-_" for char in cleaned):
+        raise ProtocolError(
+            "message kind may only use lowercase letters, digits, '-' and '_'"
+        )
+    if not cleaned[0].isalnum():
+        raise ProtocolError("message kind must start with a letter or digit")
     return cleaned
 
 
@@ -197,12 +229,14 @@ def encode_message(
     *,
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
+    kind: Optional[str] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request."""
     payload = {
         "type": "message",
         "v": PROTOCOL_VERSION,
         "text": normalize_message(text),
+        "kind": normalize_message_kind(kind),
         "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
         "client": f"tau/{__version__}",
     }
@@ -223,7 +257,12 @@ def parse_message(raw: Any) -> Dict[str, Any]:
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
-    return {"text": text, "sent_at": sent_at, "id": message_id}
+    return {
+        "text": text,
+        "kind": normalize_message_kind(payload.get("kind")),
+        "sent_at": sent_at,
+        "id": message_id,
+    }
 
 
 def _clean_hexhash(value: Any, field: str) -> str:
