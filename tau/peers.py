@@ -27,6 +27,8 @@ MAX_PEERS = 256
 DEFAULT_MAX_AGE = 7 * 24 * 60 * 60
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+# Hex strings that resolve() may read as a hash or hash prefix (>= 4 chars).
+_HEX_LIKE = re.compile(r"^[0-9a-fA-F]{4,}$")
 
 
 class PeerError(RuntimeError):
@@ -268,6 +270,13 @@ class PeerRegistry:
         clean = sanitize_name(alias, fallback="")
         if not clean:
             raise PeerError("alias must not be empty")
+        # resolve() treats hex strings of 4+ characters as hashes or hash
+        # prefixes before it looks at aliases, so such an alias could never
+        # reliably select its owner.  Reject them up front.
+        if _HEX_LIKE.match(clean):
+            raise PeerError(
+                f"alias {clean!r} looks like a destination hash; choose another"
+            )
         with self._lock:
             peer = self.resolve(target)
             if peer is None:

@@ -492,6 +492,18 @@ def test_set_alias_rejects_empty_and_unknown_peer(tmp_path):
         registry.set_alias("missing", "spare")
 
 
+def test_set_alias_rejects_hash_like_values(tmp_path):
+    registry = PeerRegistry()
+    other = make_peer(registry, 10, "ivan", now=100.0)
+    peer = make_peer(registry, 11, "judy", now=200.0)
+    # A full hash and a hash prefix of another peer must not become aliases.
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash)
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash[:8])
+    assert peer.alias is None
+
+
 def test_clear_alias_and_clearing_without_one(tmp_path):
     registry = PeerRegistry()
     peer = make_peer(registry, 9, "heidi", now=100.0)
