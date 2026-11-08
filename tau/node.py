@@ -1480,7 +1480,17 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            # Only this node's own outbox may report a message as queued,
+            # with a real local entry id. A peer that claims queued (with
+            # an arbitrary id, or none at all) must not be trusted: both
+            # consumers read response["queued"]/response["id"] verbatim,
+            # so a spoofed claim misreports delivery in the console and
+            # can make the CLI raise KeyError on the missing id.
+            for key in ("id", "expires_at", "to"):
+                response.pop(key, None)
+            response["queued"] = False
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.

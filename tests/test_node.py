@@ -451,6 +451,102 @@ def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
     assert node.mailbox.get_outbox(entry.id) is None
 
 
+def test_send_message_distrusts_peer_queued_claim(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "queued": True,
+            "id": "spoofed-id",
+            "to": "00" * 16,
+            "expires_at": 9999999999.0,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    # The peer claimed the message was queued with an id it invented;
+    # the node reports a plain delivery and drops the queue keys.
+    assert response["queued"] is False
+    assert "id" not in response
+    assert "to" not in response
+    assert "expires_at" not in response
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
+def test_send_message_distrusts_peer_queued_claim_without_id(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "queued": True, "echo": "hi"},
+    )
+
+    # A queued claim with no id used to make the CLI raise KeyError
+    # on response["id"] after the flush; the normalized response
+    # must not raise anywhere downstream.
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    assert "id" not in response
+    assert response["echo"] == "hi"
+
+
+def test_send_message_keeps_well_behaved_delivery_response(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["node"] == peer.hexhash
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
 def test_deposit_entry_skips_message_cancelled_by_another_process(
     tmp_path, monkeypatch
 ):
