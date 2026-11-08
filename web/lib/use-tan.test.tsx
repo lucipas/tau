@@ -49,6 +49,52 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
+describe("useTan saved posts", () => {
+  it("loads saved posts on demand and posts save/unsave to the API", async () => {
+    const mine = makePost();
+    const saved = makePost({ hash: "e".repeat(64), text: "keep me" });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        return Promise.resolve({ posts: [saved], count: 1 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Saved posts are not part of the feed's poll: nothing loaded yet.
+    expect(result.current.saved).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/saved"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/tan/saved?limit=100");
+    expect(result.current.saved).toEqual([saved]);
+
+    await act(async () => {
+      await result.current.save(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/save", {
+      target: mine.hash,
+    });
+
+    await act(async () => {
+      await result.current.unsave(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unsave", {
+      target: mine.hash,
+    });
+  });
+});
+
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
     const mine = makePost();

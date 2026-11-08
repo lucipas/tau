@@ -390,6 +390,129 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_saved_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "save me", name="tester", now=1000)
+        theirs = create_post(conn, other, "save me too", name="other", now=1001)
+        create_post(conn, other, "not saved", name="other", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline flags saved posts so the console can show save
+        # state on each card.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is False
+
+        # Saving requires a target, and an unknown hash cannot be saved.
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": "ff" * 32}
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["hash"] == mine["hash"]
+        assert payload["save"]["already_saved"] is False
+
+        # Saving again is a no-op that reports the original save.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["already_saved"] is True
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is True
+        assert by_text["save me too"]["saved"] is True
+        assert by_text["not saved"]["saved"] is False
+
+        # Saved posts come back newest save first, flagged as saved.
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "save me too",
+            "save me",
+        ]
+        assert all(item["saved"] is True for item in payload["posts"])
+        assert all("saved_at" in item for item in payload["posts"])
+
+        # Unsaving removes it from the list; unsaving again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is False
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == ["save me"]
+
+        # A post deleted after being saved stays in the list with its
+        # text blanked, so the save is not silently lost.
+        node.app = TanApp(node.config, identity, name="tester", gossip=False)
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert len(payload["posts"]) == 1
+        assert payload["posts"][0]["text"] == ""
+        assert payload["posts"][0]["deleted"] is True
+        assert payload["posts"][0]["saved"] is True
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

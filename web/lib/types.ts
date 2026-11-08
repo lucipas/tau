@@ -129,6 +129,9 @@ export interface TanPost {
   liked?: boolean;
   quotes?: number;
   own?: boolean;
+  saved?: boolean;
+  saved_at?: number;
+  deleted?: boolean;
 }
 
 export interface TanFollow {
@@ -141,6 +144,11 @@ export interface TanFollow {
 }
 
 export interface TanTimelineResponse {
+  posts: TanPost[];
+  count: number;
+}
+
+export interface TanSavedResponse {
   posts: TanPost[];
   count: number;
 }

@@ -1038,6 +1038,29 @@ def annotate_reactions(
     return posts
 
 
+def annotate_saved(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``saved`` flag to post dicts, in place.
+
+    A display surface uses it to show save state on each card without
+    a second request: the saved list itself is fetched separately.
+    """
+    hashes = [str(post["hash"]) for post in posts if post.get("hash")]
+    saved: Set[str] = set()
+    if hashes:
+        placeholders = ", ".join("?" for _ in hashes)
+        rows = conn.execute(
+            f"SELECT hash FROM saved_posts WHERE hash IN ({placeholders})",
+            hashes,
+        ).fetchall()
+        saved = {str(row["hash"]) for row in rows}
+    for post in posts:
+        post["saved"] = str(post.get("hash")) in saved
+    return posts
+
+
 def annotate_replies(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],

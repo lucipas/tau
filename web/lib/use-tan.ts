@@ -8,6 +8,7 @@ import type {
   TanFollowingResponse,
   TanPost,
   TanPostResponse,
+  TanSavedResponse,
   TanSyncResponse,
   TanTimelineResponse,
 } from "./types";
@@ -17,6 +18,8 @@ const POLL_INTERVAL_MS = 5000;
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  const [saved, setSaved] = useState<TanPost[]>([]);
+  const [savedLoading, setSavedLoading] = useState(false);
   const [all, setAll] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -105,6 +108,36 @@ export function useTan() {
     await load();
   }, [load]);
 
+  // Saved posts change only through this client's save/unsave actions
+  // (or the CLI), so they load on demand instead of on every poll tick.
+  const loadSaved = useCallback(async () => {
+    setSavedLoading(true);
+    try {
+      const result = await apiGet<TanSavedResponse>(
+        "/api/tan/saved?limit=100",
+      );
+      setSaved(result.posts);
+    } finally {
+      setSavedLoading(false);
+    }
+  }, []);
+
+  const save = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/save", { target });
+      await Promise.all([load(), loadSaved()]);
+    },
+    [load, loadSaved],
+  );
+
+  const unsave = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unsave", { target });
+      await Promise.all([load(), loadSaved()]);
+    },
+    [load, loadSaved],
+  );
+
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
       setPosting(true);
@@ -184,6 +217,11 @@ export function useTan() {
   return {
     posts,
     following,
+    saved,
+    savedLoading,
+    loadSaved,
+    save,
+    unsave,
     all,
     setAll,
     loading,

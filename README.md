@@ -141,6 +141,9 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/saved` | GET | saved posts, newest save first |
+| `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |
+| `/api/tan/unsave` | POST | unsave `{"target": "<post hash>"}` |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
@@ -564,7 +567,10 @@ tau tan timeline               # shows ♥ counts under each post
 ```
 
 The web console shows the same counts with a ♥ toggle on every post
-(`POST /api/tan/like` / `POST /api/tan/unlike`).
+(`POST /api/tan/like` / `POST /api/tan/unlike`). Saved posts work the
+same way: `tau tan save` keeps a post to read later (local only, never
+published), and the console has a Saved view with a save toggle on every
+post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
 
 ### Admission rules
 
