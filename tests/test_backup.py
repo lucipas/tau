@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import stat
 import tarfile
 
@@ -14,6 +15,15 @@ from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.node import InstanceLock
 from tau.tangents.tan import init_db
+
+
+def _sqlite_dump(path):
+    """Logical dump of a SQLite file, for comparing database content."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return "\n".join(conn.iterdump())
+    finally:
+        conn.close()
 
 
 def _init_node(tmp_path, dirname, name):
@@ -121,7 +131,13 @@ def test_backup_restore_round_trip(tmp_path, capsys):
     assert _id_destination(node_b, capsys) == destination_a
     assert stat.S_IMODE(os.stat(node_b / "identity").st_mode) == 0o600
     for name, data in contents_before.items():
-        assert (node_b / name).read_bytes() == data
+        # The Tan database is snapshotted with SQLite's backup API, so
+        # the restored file is content-identical but not byte-identical
+        # (header counters may differ); compare it by logical dump.
+        if name == "tan.sqlite3":
+            assert _sqlite_dump(node_b / name) == _sqlite_dump(node_a / name)
+        else:
+            assert (node_b / name).read_bytes() == data
 
 
 def test_backup_refuses_existing_archive_without_force(tmp_path, capsys):
@@ -176,6 +192,142 @@ def test_backup_refuses_while_node_serving(tmp_path, capsys):
         lock.release()
     assert code == 1
     assert "already serving" in capsys.readouterr().err
+
+
+def test_backup_captures_uncheckpointed_wal_rows(tmp_path, capsys):
+    # A row committed to the Tan database while the only writer holds
+    # its connection open lives in tan.sqlite3-wal, not in the main
+    # file.  The backup must still carry it: the snapshot reads through
+    # the WAL instead of copying the raw file.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    conn = init_db(node_a / "tan.sqlite3")
+    conn.execute(
+        "INSERT INTO posts (hash, author, key, text, created_at, received_at,"
+        " sig, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("abc123", "alice", "key", "hello from the wal", 1000.0, 1000.0, "sig", 1),
+    )
+    conn.commit()
+    assert (node_a / "tan.sqlite3-wal").exists()
+    archive = tmp_path / "backup.tar.gz"
+    try:
+        assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    finally:
+        conn.close()
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    restored = sqlite3.connect(str(node_b / "tan.sqlite3"))
+    try:
+        rows = restored.execute(
+            "SELECT text FROM posts WHERE hash = ?", ("abc123",)
+        ).fetchall()
+    finally:
+        restored.close()
+    assert rows == [("hello from the wal",)]
+
+
+def test_restore_force_removes_state_absent_from_archive(tmp_path, capsys):
+    # A --force restore replaces the whole node state: files the archive
+    # does not hold (including SQLite sidecars) must not survive it.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "bob")
+    (node_b / "peers.json").write_text('{"peers": []}\n', encoding="utf-8")
+    (node_b / "tan.sqlite3").write_bytes(b"stale database")
+    (node_b / "tan.sqlite3-wal").write_bytes(b"stale wal")
+    capsys.readouterr()
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--force"])
+        == 0
+    )
+    capsys.readouterr()
+    assert not (node_b / "peers.json").exists()
+    assert not (node_b / "tan.sqlite3").exists()
+    assert not (node_b / "tan.sqlite3-wal").exists()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_restore_rejects_archive_without_identity(tmp_path):
+    node = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=node)
+    archive = tmp_path / "bad.tar.gz"
+    _write_archive(
+        archive,
+        {"format": 1, "files": ["peers.json"]},
+        [("peers.json", b"{}")],
+    )
+    with pytest.raises(Exception, match="contains no identity"):
+        restore_backup(config, archive)
+    assert not (node / "identity").exists()
+
+
+def test_backup_restores_configured_rns_config(tmp_path, capsys):
+    # With a custom --rns-config directory, the backup must carry that
+    # config file (not the default data_dir/reticulum/config) and the
+    # restore must put it back at the configured location.
+    node_a = tmp_path / "a"
+    custom_a = tmp_path / "rns-a"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(node_a),
+                "--name",
+                "alice",
+                "--rns-config",
+                str(custom_a),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    marker = "# custom rns config for alice\n"
+    (custom_a / "config").write_text(marker, encoding="utf-8")
+
+    archive = tmp_path / "backup.tar.gz"
+    assert (
+        cli.main(
+            [
+                "backup",
+                str(archive),
+                "--data-dir",
+                str(node_a),
+                "--rns-config",
+                str(custom_a),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    custom_b = tmp_path / "rns-b"
+    assert (
+        cli.main(
+            [
+                "restore",
+                str(archive),
+                "--data-dir",
+                str(node_b),
+                "--rns-config",
+                str(custom_b),
+            ]
+        )
+        == 0
+    )
+    assert (custom_b / "config").read_text(encoding="utf-8") == marker
+    capsys.readouterr()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
 
 
 def test_restore_refuses_existing_state_without_force(tmp_path, capsys):

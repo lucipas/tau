@@ -368,12 +368,16 @@ tau restore ~/tau-backup.tar.gz   # into a fresh data directory
 ```
 
 The archive is a gzipped tar with a manifest (format version, node name,
-tau version, file list); the runtime lock file is never included. Both
+tau version, file list); the runtime lock file is never included. The Tan
+database is snapshotted with SQLite's backup API, so committed rows still
+sitting in the write-ahead log are included. Both
 commands refuse while a node is serving on the data directory, so a backup
 never catches the mailbox or the Tan database half-written. `restore`
 validates the archive first — unknown format, unexpected members, absolute
 paths and `..` traversal are all rejected — and refuses to overwrite
-existing node state unless `--force` is given. The archive holds the
+existing node state unless `--force` is given; a `--force` restore also
+removes node state the archive does not hold, so the result reflects only
+the backup. The archive holds the
 identity, so keep it as private as the identity file itself.
 
 ## How it works
