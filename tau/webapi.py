@@ -361,6 +361,11 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Unread counts are stamped with an ever-increasing revision so
+        # the console can drop a queued or delayed count older than one
+        # it already applied.
+        self._unread_lock = threading.Lock()
+        self._unread_revision = 0
         # Outbox ids reported delivered before their send was recorded;
         # send_message reconciles them when it appends the record. An
         # OrderedDict used as a bounded set (its popitem(last=False)
@@ -523,7 +528,11 @@ class WebBridge:
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
         )
-        self.bus.publish({"type": "message", "message": message})
+        # The node appends to its inbox before this callback runs, so
+        # the unread total already includes the new message.
+        self.bus.publish(
+            {"type": "message", "message": message, "unread": self.unread()}
+        )
         return message
 
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
@@ -922,12 +931,51 @@ class WebBridge:
             message_count = len(self._messages)
         return {"messages": message_count, "peers": len(self.peers())}
 
+    def _stamp_unread(self, counts: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the next revision to *counts* (caller holds ``_unread_lock``)."""
+        self._unread_revision = max(time.time_ns(), self._unread_revision + 1)
+        return dict(counts, revision=self._unread_revision)
+
+    def unread(self) -> Dict[str, Any]:
+        """Per-conversation unread counts from the node inbox.
+
+        A node without an inbox (tests, embeds) simply has nothing
+        unread; read state is local to this node either way.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                try:
+                    counts = inbox.unread_counts()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not read inbox unread counts", exc_info=True)
+            return self._stamp_unread(counts)
+
+    def mark_read(self, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Advance the inbox read cursor for one conversation, or all.
+
+        The console calls this when a conversation is opened, so its
+        unread badge clears; other tabs learn from the ``unread`` SSE
+        event.  Read state never leaves this node.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        with self._unread_lock:
+            counts: Dict[str, Any] = {"per_peer": {}, "total": 0}
+            if inbox is not None:
+                counts = inbox.mark_read(peer=peer)
+            stamped = self._stamp_unread(counts)
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": stamped})
+        return stamped
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
+            "unread": self.unread(),
             "bridge": {
                 "version": __version__,
                 "web": self.web_dir is not None,
@@ -1133,6 +1181,22 @@ class _WebHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/messages/read":
+                peer = body.get("peer")
+                if peer is not None and (
+                    not isinstance(peer, str) or not peer.strip()
+                ):
+                    self._send_json(
+                        {"error": {"message": "field 'peer' must be a peer hash"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                counts = self.bridge.mark_read(
+                    peer.strip() if isinstance(peer, str) else None
+                )
+                self._send_json({"ok": True, "unread": counts}, head_only)
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)

@@ -32,10 +32,25 @@ export function Console() {
     setMode(next);
   }
 
+  const { markRead } = tau;
+  const openUnread =
+    mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
+
+  // The open conversation reads as read: the auto-selected one on load,
+  // and one that gets new mail while it stays open. A failed call leaves
+  // the badge in place until the count next changes.
+  useEffect(() => {
+    if (!target || openUnread === 0) return;
+    void markRead(target).catch(() => undefined);
+  }, [target, openUnread, markRead]);
+
   function selectPeer(destination: string) {
     customPicked.current = false;
     setMode("peer");
     setTarget(destination);
+    // Opening the conversation advances its read cursor on the node,
+    // so the badge clears. A failed call leaves the badge in place.
+    void tau.markRead(destination).catch(() => undefined);
     const textarea = document.getElementById(
       "message-text",
     ) as HTMLTextAreaElement | null;
@@ -76,6 +91,7 @@ export function Console() {
             peers={tau.peers}
             bridge={tau.bridge}
             pings={tau.pings}
+            unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);

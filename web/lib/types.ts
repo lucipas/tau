@@ -53,6 +53,22 @@ export interface Counts {
   peers: number;
 }
 
+// Per-conversation unread counts from the node inbox: how many
+// received DMs sit after each sender's read cursor. Read state is
+// local to the node; the console only displays and clears it.
+export interface UnreadCounts {
+  per_peer: Record<string, number>;
+  total: number;
+  // Stamped by the node; a count with an older revision than one
+  // already applied is stale and is ignored.
+  revision?: number;
+}
+
+export interface MarkReadResponse {
+  ok: boolean;
+  unread: UnreadCounts;
+}
+
 export interface BridgeInfo {
   version: string;
   web: boolean;
@@ -64,6 +80,7 @@ export interface Snapshot {
   peers: Peer[];
   messages: TauMessage[];
   counts: Counts;
+  unread: UnreadCounts;
   bridge: BridgeInfo;
 }
 

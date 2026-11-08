@@ -17,6 +17,7 @@ export function PeerSidebar({
   peers,
   bridge,
   pings,
+  unread,
   selected,
   onPing,
   onSelectPeer,
@@ -25,6 +26,7 @@ export function PeerSidebar({
   peers: Peer[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
+  unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
@@ -119,7 +121,7 @@ export function PeerSidebar({
                 <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-mist">
                   GET /api/messages · GET /api/events
                   <br />
-                  POST /api/messages · POST /api/ping
+                  POST /api/messages · POST /api/messages/read · POST /api/ping
                 </p>
               </div>
             ) : null}
@@ -156,6 +158,7 @@ export function PeerSidebar({
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
+              const unreadCount = unread[peer.destination] ?? 0;
               return (
                 <li key={peer.destination}>
                   <div
@@ -176,8 +179,10 @@ export function PeerSidebar({
                           {peer.name.slice(0, 1) || "?"}
                         </span>
                         <span className="min-w-0">
-                          <span className="block truncate text-xs font-medium text-zinc-200">
-                            {peer.name || "unknown"}
+                          <span className="flex items-center gap-1.5">
+                            <span className="block truncate text-xs font-medium text-zinc-200">
+                              {peer.name || "unknown"}
+                            </span>
                             {peer.verified ? (
                               <span
                                 className="ml-1.5 rounded-full border border-signal/40 bg-signal/10 px-1.5 py-px text-[10px] text-signal"
@@ -192,6 +197,14 @@ export function PeerSidebar({
                                 title="Blocked: their DMs are dropped and their Tan posts hidden"
                               >
                                 blocked
+                              </span>
+                            ) : null}
+                            {unreadCount > 0 ? (
+                              <span
+                                className="shrink-0 rounded-full bg-signal px-1.5 py-px font-mono text-[10px] font-semibold text-void"
+                                title={`${unreadCount} unread message${unreadCount === 1 ? "" : "s"}`}
+                              >
+                                {unreadCount > 99 ? "99+" : unreadCount}
                               </span>
                             ) : null}
                           </span>
