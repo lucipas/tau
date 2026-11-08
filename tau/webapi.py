@@ -590,6 +590,8 @@ class WebBridge:
         from .tangents.tan import (
             annotate_reactions,
             annotate_replies,
+            annotate_repost_counts,
+            annotate_reposts,
             apply_display_rules,
             feed,
             following,
@@ -614,8 +616,16 @@ class WebBridge:
                         feed(conn, author=target, limit=limit, posts_only=True)
                     )
                 )
-                posts = annotate_replies(
-                    conn, annotate_reactions(conn, posts, viewer=viewer)
+                posts = annotate_reposts(
+                    conn,
+                    annotate_replies(
+                        conn,
+                        annotate_repost_counts(
+                            conn,
+                            annotate_reactions(conn, posts, viewer=viewer),
+                            viewer=viewer,
+                        ),
+                    ),
                 )
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)

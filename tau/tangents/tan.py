@@ -126,15 +126,23 @@ KIND_LIKE = "like"
 KIND_UNLIKE = "unlike"
 KIND_DELETE = "delete"
 KIND_REPLY = "reply"
+KIND_REPOST = "repost"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-# Reactions and deletes carry no text; replies carry text but are still
-# targeted entries, so their parent link is signed like a reaction's.
-TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE,)
-# Targeted entries (reactions, deletes and replies) point at another post.
+# Reactions, deletes and reposts carry no text; replies carry text but are
+# still targeted entries, so their parent link is signed like a reaction's.
+TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE, KIND_REPOST)
+# Targeted entries (reactions, deletes, replies and reposts) point at
+# another post.
 TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY,)
 ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
-# Kinds that appear as timeline items: top-level posts and replies.
-TIMELINE_KINDS = (KIND_POST, KIND_REPLY)
+# Kinds that appear as timeline items: top-level posts, replies and
+# reposts (a repost shows the original post's text with attribution).
+TIMELINE_KINDS = (KIND_POST, KIND_REPLY, KIND_REPOST)
+# Kinds a reply or a repost may target: a post or a reply.  A repost is
+# not replyable — it carries no text of its own, so a reply to it would
+# have no parent snippet to show — and neither kind targets reactions
+# or deletes.
+REPLYABLE_KINDS = (KIND_POST, KIND_REPLY)
 
 # Targeted envelopes sign two extra fields on top of the post fields, so a
 # reaction's or deletion's target cannot be swapped without invalidating
@@ -286,7 +294,7 @@ def _normalize_post(mesg: Dict[str, Any], *, now: Optional[float] = None) -> Dic
 
     raw_text = mesg.get("text")
     if kind in TEXTLESS_KINDS:
-        # Reactions and deletes carry no text; normalize_message would also
+        # Reactions, deletes and reposts carry no text; normalize_message would also
         # reject the empty string it requires here.
         if raw_text not in (None, ""):
             raise PostError(f"{kind} entries cannot carry text")
@@ -774,7 +782,7 @@ def create_reply(
     existing = get_post(conn, target)
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
-    if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
+    if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS:
         raise TanError("only posts and replies can be replied to")
     if not existing.get("linked"):
         raise TanError(
@@ -834,7 +842,7 @@ def create_delete(
     existing = get_post(conn, target)
     if existing is not None:
         if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
-            raise TanError("only posts and replies can be deleted")
+            raise TanError("only posts, replies and reposts can be deleted")
         if existing["author"] != author:
             raise TanError("cannot delete a post you did not author")
         if _is_deleted(conn, existing):
@@ -855,6 +863,83 @@ def create_delete(
         "created_at": timestamp,
         "prev": prev,
         "kind": KIND_DELETE,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
+def create_repost(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store a repost of the post *target*.
+
+    A repost is a textless targeted entry like a reaction: ``kind`` is
+    ``repost`` and ``target`` is the original post's hash, so the link
+    is signed — but unlike a reaction it is a timeline item, so the
+    reposter's followers see the original post in their timeline.  It
+    is appended to the reposter's own chain, exactly like a post, and
+    is gossipped and synced through the same paths.
+
+    Only posts and replies can be reposted, and only when they are
+    cached locally, linked, and not deleted — a repost is written to a
+    post the author has seen in full.  You cannot repost your own post,
+    and you cannot repost the same post twice while your earlier
+    repost still stands (deleting it first frees you to repost again).
+    Reposts received from peers for originals that have not arrived
+    yet are still stored through the sync path (:func:`store_post`)
+    and shown without the original's text until it arrives.
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) not in REPLYABLE_KINDS:
+        raise TanError("only posts and replies can be reposted")
+    if not existing.get("linked"):
+        raise TanError(
+            "post has not linked yet; sync its chain before reposting"
+        )
+    if _is_deleted(conn, existing):
+        raise TanError("post has been deleted")
+    if existing["author"] == author:
+        raise TanError("cannot repost your own post")
+    standing = conn.execute(
+        "SELECT hash, author FROM posts WHERE kind = 'repost' "
+        "AND linked = 1 AND author = ? AND target = ?",
+        (author, target),
+    ).fetchall()
+    for row in standing:
+        if not _is_deleted(conn, {"hash": str(row["hash"]), "author": str(row["author"])}):
+            raise TanError("post has already been reposted")
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": "",
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_REPOST,
         "target": target,
     }
     digest = hash(body, previous=prev)
@@ -911,6 +996,63 @@ def like_counts(
             "liked": viewer is not None and viewer in likers,
         }
     return result
+
+
+def repost_counts(
+    conn: sqlite3.Connection,
+    targets: Sequence[str],
+    *,
+    viewer: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return ``{target: {"reposts": n, "reposted": bool}}`` for display.
+
+    Only linked reposts count, and only while they stand: a repost its
+    author deleted stops counting, the same way an unlike retires a
+    like.  ``reposted`` is true when the viewer's own repost of the
+    target still stands.
+    """
+    clean = []
+    for target in targets:
+        try:
+            clean.append(_require_hex(target, HASH_HEX_LENGTH, "target"))
+        except PostError:
+            continue
+    result: Dict[str, Dict[str, Any]] = {
+        target: {"reposts": 0, "reposted": False} for target in clean
+    }
+    if not clean:
+        return result
+    placeholders = ", ".join("?" for _ in clean)
+    rows = conn.execute(
+        "SELECT hash, target, author FROM posts "
+        f"WHERE kind = 'repost' AND linked = 1 AND target IN ({placeholders})",
+        clean,
+    ).fetchall()
+    for row in rows:
+        target = str(row["target"])
+        if _is_deleted(
+            conn, {"hash": str(row["hash"]), "author": str(row["author"])}
+        ):
+            continue
+        result[target]["reposts"] += 1
+        if viewer is not None and str(row["author"]) == viewer:
+            result[target]["reposted"] = True
+    return result
+
+
+def annotate_repost_counts(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    *,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Attach ``reposts``/``reposted`` fields to post dicts, in place."""
+    counts = repost_counts(conn, [post["hash"] for post in posts], viewer=viewer)
+    for post in posts:
+        info = counts.get(post["hash"], {"reposts": 0, "reposted": False})
+        post["reposts"] = info["reposts"]
+        post["reposted"] = info["reposted"]
+    return posts
 
 
 def annotate_reactions(
@@ -996,6 +1138,68 @@ def annotate_replies(
     return posts
 
 
+def annotate_reposts(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``repost_of`` original-post summary to repost entries, in place.
+
+    The summary carries the original's hash, author, name and text
+    when it is cached locally, and is ``None`` when it has not arrived
+    yet — a repost is still shown on its own.  A deleted original is
+    reported as deleted with its text blanked, so the timeline stays
+    readable without resurfacing removed content.  Top-level posts and
+    replies get no ``repost_of`` key.
+
+    Originals are fetched in one query and their deletion status in a
+    second, so a repost-heavy page does not issue one lookup per
+    repost.  Only linked posts and replies count as originals: a
+    repost that points at a reaction, a delete or an unlinked entry is
+    shown without the original's text, the same as an uncached one.
+    """
+    targets = [
+        str(post["target"])
+        for post in posts
+        if post.get("kind") == KIND_REPOST and post.get("target")
+    ]
+    originals: Dict[str, Dict[str, Any]] = {}
+    if targets:
+        placeholders = ", ".join("?" for _ in targets)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            f"WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
+            targets,
+        ).fetchall()
+        for row in rows:
+            originals[str(row["hash"])] = _canonical_post(dict(row))
+    deleted: Set[Tuple[str, str]] = set()
+    if originals:
+        placeholders = ", ".join("?" for _ in originals)
+        rows = conn.execute(
+            "SELECT target, author FROM posts WHERE kind = 'delete' "
+            f"AND linked = 1 AND target IN ({placeholders})",
+            list(originals),
+        ).fetchall()
+        deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    for post in posts:
+        if post.get("kind") != KIND_REPOST:
+            continue
+        original = originals.get(str(post.get("target") or ""))
+        if original is None:
+            post["repost_of"] = None
+            continue
+        is_deleted = (original["hash"], original["author"]) in deleted
+        post["repost_of"] = {
+            "hash": original["hash"],
+            "author": original["author"],
+            "name": original["name"],
+            "text": "" if is_deleted else original["text"],
+            "deleted": is_deleted,
+        }
+    return posts
+
+
 # SQL fragment excluding posts their author deleted.  The outer query must
 # read from a table named ``posts``.  Deletion is derived at read time, the
 # same way like counts are, so a delete that arrives before its post
@@ -1019,7 +1223,7 @@ def deleted_targets(conn: sqlite3.Connection) -> Set[str]:
     rows = conn.execute(
         "SELECT p.hash FROM posts p "
         "JOIN posts d ON d.target = p.hash AND d.author = p.author "
-        "WHERE p.kind IN ('post', 'reply') AND p.linked = 1 "
+        "WHERE p.kind IN ('post', 'reply', 'repost') AND p.linked = 1 "
         "AND d.kind = 'delete' AND d.linked = 1"
     ).fetchall()
     return {str(row["hash"]) for row in rows}
@@ -1080,7 +1284,7 @@ def resolve_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
         except ValueError:
             raise TanError(f"unknown post: {ref!r}") from None
         rows = conn.execute(
-            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "SELECT hash FROM posts WHERE kind IN ('post', 'reply', 'repost') "
             "AND hash LIKE ? LIMIT 8",
             (value + "%",),
         ).fetchall()
@@ -1139,7 +1343,7 @@ def feed(
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         kind_filter = ""
         if posts_only:
-            kind_filter = f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+            kind_filter = f" AND kind IN ('post', 'reply', 'repost') AND {_NOT_DELETED}"
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE author = ? AND linked = 1 AND seq > ?{kind_filter} "
@@ -1151,7 +1355,7 @@ def feed(
     params: List[Any] = []
     where = "linked = 1"
     if posts_only:
-        where += f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+        where += f" AND kind IN ('post', 'reply', 'repost') AND {_NOT_DELETED}"
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -1288,13 +1492,21 @@ def timeline(
     is annotated with its derived ``likes`` count and, when *viewer* is
     given, whether the viewer's like currently stands and whether the
     post is the viewer's own.  Replies appear as timeline items,
-    annotated with their parent post when it is cached.  Posts their
-    author deleted never appear either.
+    annotated with their parent post when it is cached.  Reposts appear
+    as timeline items too, annotated with the original post they point
+    at and with their own repost count.  Posts their author deleted
+    never appear either.
     """
     if include_all:
         posts = feed(conn, limit=limit, before=before, posts_only=True)
-        return annotate_replies(
-            conn, annotate_reactions(conn, posts, viewer=viewer)
+        return annotate_reposts(
+            conn,
+            annotate_replies(
+                conn,
+                annotate_repost_counts(
+                    conn, annotate_reactions(conn, posts, viewer=viewer), viewer=viewer
+                ),
+            ),
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1304,7 +1516,7 @@ def timeline(
     placeholders = ", ".join("?" for _ in clean_authors)
     params: List[Any] = list(clean_authors)
     where = (
-        f"linked = 1 AND kind IN ('post', 'reply') AND author IN ({placeholders}) "
+        f"linked = 1 AND kind IN ('post', 'reply', 'repost') AND author IN ({placeholders}) "
         f"AND {_NOT_DELETED}"
     )
     if before is not None:
@@ -1316,8 +1528,16 @@ def timeline(
         "ORDER BY created_at DESC, hash DESC LIMIT ?",
         params,
     ).fetchall()
-    return annotate_replies(
-        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    return annotate_reposts(
+        conn,
+        annotate_replies(
+            conn,
+            annotate_repost_counts(
+                conn,
+                annotate_reactions(conn, _public_posts(rows), viewer=viewer),
+                viewer=viewer,
+            ),
+        ),
     )
 
 
@@ -1341,8 +1561,9 @@ def thread(
     """Return the thread rooted at the post *ref* names, oldest first.
 
     *ref* may name any entry in the thread — a reply resolves to its
-    root post, walking up through cached, linked, non-deleted parents.
-    The root is the highest such ancestor; a reply whose parent has not
+    root post, walking up through cached, linked, non-deleted parents,
+    and a repost resolves to the original post it points at.  The root
+    is the highest such ancestor; a reply whose parent has not
     arrived yet still anchors its own visible thread.  Every entry
     carries a ``depth`` (the root is 0) and the derived ``likes`` /
     ``liked`` / ``own`` annotations, like the timeline.  Replies appear
@@ -1361,7 +1582,7 @@ def thread(
         raise TanError(f"post has not linked yet: {ref!r}")
     root = start
     ancestors = {root["hash"]}
-    while root.get("kind") == KIND_REPLY and root.get("target"):
+    while root.get("kind") in (KIND_REPLY, KIND_REPOST) and root.get("target"):
         parent = get_post(conn, str(root["target"]))
         if parent is None or parent.get("kind") not in TIMELINE_KINDS:
             break
@@ -1426,7 +1647,7 @@ def thread(
     # Annotation fills each entry in place, so batching keeps the reaction
     # lookup within the parameter limit for long threads.
     for batch in _thread_batches(ordered, _SQL_BATCH):
-        annotate_reactions(conn, batch, viewer=viewer)
+        annotate_repost_counts(conn, annotate_reactions(conn, batch, viewer=viewer), viewer=viewer)
     return ordered
 
 
@@ -1474,7 +1695,11 @@ def search_posts(
         params,
     ).fetchall()
     matches = [row for row in rows if needle in str(row["text"]).casefold()]
-    return annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer)
+    return annotate_repost_counts(
+        conn,
+        annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer),
+        viewer=viewer,
+    )
 
 
 def follow(
@@ -1777,6 +2002,26 @@ class TanApp:
 
     def unlike(self, target: str, **kwargs: Any) -> Dict[str, Any]:
         return self.react(target, liked=False, **kwargs)
+
+    def repost(
+        self,
+        target: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Append a repost entry for *target* (a post or reply)."""
+        conn = self.connect()
+        try:
+            record = create_repost(
+                conn, self.identity, target, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
 
     def delete(
         self,

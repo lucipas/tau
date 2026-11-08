@@ -383,6 +383,14 @@ export function PostCard({
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  // A repost carries no text of its own: the card shows the original
+  // post's text instead, or nothing when it has not arrived / was deleted.
+  const bodyText =
+    post.kind === "repost"
+      ? post.repost_of && !post.repost_of.deleted
+        ? post.repost_of.text
+        : ""
+      : post.text;
   return (
     <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
       <div className="flex items-start gap-3">
@@ -418,9 +426,24 @@ export function PostCard({
               )}
             </p>
           ) : null}
-          <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-            {post.text}
-          </p>
+          {post.kind === "repost" ? (
+            <p className="mt-1 truncate text-[11px] text-mist/80">
+              reposted{" "}
+              {post.repost_of ? (
+                <>
+                  {post.repost_of.name || "anonymous"}
+                  {post.repost_of.deleted ? " · a deleted post" : ""}
+                </>
+              ) : (
+                `${shortHash(post.target ?? "", 16)} (original not cached yet)`
+              )}
+            </p>
+          ) : null}
+          {bodyText ? (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              {bodyText}
+            </p>
+          ) : null}
           <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-mist/60">
             <span className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5">
               {post.prev ? "chained" : "genesis"}
@@ -440,6 +463,16 @@ export function PostCard({
             >
               ♥ {post.likes ?? 0}
             </button>
+            <span
+              title={post.reposted ? "You reposted this" : "Reposts"}
+              className={`rounded border px-1.5 py-0.5 ${
+                post.reposted
+                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                  : "border-line/70 bg-panel/60"
+              }`}
+            >
+              ↻ {post.reposts ?? 0}
+            </span>
             <button
               type="button"
               onClick={() => onReply(post)}

@@ -265,6 +265,7 @@ Global options may appear before or after the command:
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
+| `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
