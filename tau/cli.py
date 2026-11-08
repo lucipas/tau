@@ -59,6 +59,7 @@ from .tangents.tan import (
     following,
     import_entries,
     init_db,
+    mentions,
     mute,
     mute_keyword,
     muted,
@@ -635,6 +636,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts",
     )
     tan_search.set_defaults(func=cmd_tan_search)
+
+    tan_mentions = tan_sub.add_parser(
+        "mentions",
+        parents=[common],
+        help="show replies to your own posts",
+    )
+    tan_mentions.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_mentions.set_defaults(func=cmd_tan_mentions)
 
     tan_thread = tan_sub.add_parser(
         "thread",
@@ -1435,6 +1450,32 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
         display_ruleset = Ruleset()
     posts = apply_display_rules(posts, display_ruleset)
     _print_tan_thread(posts, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_mentions(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        # Mentions are defined relative to this node's identity: a
+        # reply to one of your posts.  Without an identity there is
+        # nothing of yours to be replied to.
+        identity = _tan_identity(config)
+        viewer = destination_hash(identity).hex()
+        posts = mentions(conn, viewer, limit=args.limit)
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_tan_posts(
+        posts,
+        json_output=json_output,
+        empty_message="No replies to your posts yet.",
+    )
     return _EXIT_OK
 
 
