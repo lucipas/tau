@@ -496,7 +496,11 @@ class WebBridge:
     # -- node callbacks ----------------------------------------------------
 
     def record_peer(self, peer: Peer) -> None:
-        payload = peer.public_dict()
+        # local_dict: the console replaces its snapshot record with this
+        # event, so it must carry the same trust fields — a public_dict
+        # event would silently drop the verified badge and any key-change
+        # warning until the next snapshot load.
+        payload = peer.local_dict()
         # Annotate like the snapshot does, so a live update does not
         # erase the frontend's blocked badge for this peer.
         blocklist = getattr(self.node, "blocklist", None)
@@ -874,7 +878,9 @@ class WebBridge:
     def peers(self) -> List[Dict[str, Any]]:
         now = time.time()
         try:
-            items = [peer.public_dict(now) for peer in self.node.registry.all()]
+            # local_dict: verification is this node's own trust state, so
+            # it is shown to the console owner but never sent to peers.
+            items = [peer.local_dict(now) for peer in self.node.registry.all()]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read peer registry", exc_info=True)
             return []

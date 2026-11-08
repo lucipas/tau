@@ -47,7 +47,7 @@ from .node import (
     TauNode,
     check_tcp_listen_ports,
 )
-from .peers import Peer, PeerError, PeerRegistry
+from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
 from .util import atomic_write_text
@@ -360,7 +360,44 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|HASH",
         help="with --exchange, ask only this peer instead of all known peers",
     )
+    peers.add_argument(
+        "--safety-number",
+        action="store_true",
+        help="show each peer's pairwise safety number (compare it with the "
+        "peer over another channel to confirm the key is theirs)",
+    )
     peers.set_defaults(func=cmd_peers)
+    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_verify = peers_sub.add_parser(
+        "verify",
+        parents=[common],
+        help="record that the safety number was compared with a peer "
+        "out of band and matched",
+    )
+    peers_verify.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to mark verified",
+    )
+    peers_verify.set_defaults(func=cmd_peers_verify)
+    peers_forget = peers_sub.add_parser(
+        "forget",
+        parents=[common],
+        help="remove a peer from the local registry (the next genuine "
+        "announce re-adds it; use this to drop a corrupt record)",
+    )
+    peers_forget.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to remove",
+    )
+    peers_forget.add_argument(
+        "--force",
+        action="store_true",
+        help="forget even while messages are still queued for the peer "
+        "(they will not be attempted until the peer is rediscovered)",
+    )
+    peers_forget.set_defaults(func=cmd_peers_forget)
 
     identity = subparsers.add_parser(
         "id",
@@ -1058,19 +1095,25 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> None:
+def _print_peer_table(
+    peers: Iterable[Peer],
+    *,
+    now: Optional[float] = None,
+    safety_numbers: Optional[Dict[str, str]] = None,
+) -> None:
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
         return
     timestamp = now if now is not None else time.time()
-    header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN", "LXMF")
+    header = ("DESTINATION", "NAME", "VERIFIED", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
         table.append(
             (
                 peer.hexhash,
                 peer.display_name,
+                "✓" if peer.is_verified else "",
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
                 peer.lxmf_hash or "—",
@@ -1079,6 +1122,22 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     for row in table:
         print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    changed = [p for p in rows if p.key_change_at is not None]
+    for peer in changed:
+        print(
+            f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+            "presented a different public key under the same destination "
+            "hash; the recorded key was kept. Re-verify this peer out of "
+            "band before trusting it.",
+            file=sys.stderr,
+        )
+    if safety_numbers:
+        print("\nSafety numbers — compare each with the peer over another "
+              "channel; a match confirms the key is theirs:")
+        for peer in rows:
+            number = safety_numbers.get(peer.hexhash)
+            if number:
+                print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
 
 
 def _make_config(
@@ -2499,13 +2558,119 @@ def cmd_peers(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = registry.all(max_age=max_age)
+    safety_numbers: Optional[Dict[str, str]] = None
+    if getattr(args, "safety_number", False):
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise NodeError(
+                f"no identity at {config.identity_path}; run `tau init` first"
+            )
+        local_key = identity.get_public_key()
+        safety_numbers = {
+            peer.hexhash: safety_number(local_key, peer.public_key)
+            for peer in peers
+        }
+    if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        if safety_numbers is not None:
+            for entry in payload:
+                entry["safety_number"] = safety_numbers[entry["destination"]]
+        _emit({"peers": payload, "count": len(peers)}, True)
+    else:
+        _print_peer_table(peers, safety_numbers=safety_numbers)
+    return _EXIT_OK
+
+
+def cmd_peers_verify(args: argparse.Namespace) -> int:
+    """Mark a peer verified after comparing safety numbers out of band."""
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    number = safety_number(identity.get_public_key(), peer.public_key)
+    previously_verified = peer.is_verified
+    previous_fingerprint = peer.verified_fingerprint
+    registry.mark_verified(peer.destination_hash, number)
+    registry.save()
     if _json_mode(args):
         _emit(
-            {"peers": [peer.to_dict() for peer in peers], "count": len(peers)},
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "safety_number": number,
+                "verified_at": peer.verified_at,
+                "reverified": previously_verified,
+                "fingerprint_changed": previously_verified
+                and previous_fingerprint != number,
+            },
             True,
         )
     else:
-        _print_peer_table(peers)
+        print(f"Verified {peer.display_name} ({short_hash(peer.hexhash)}).")
+        print(f"  safety number: {number}")
+        if previously_verified and previous_fingerprint != number:
+            print(
+                "  note: the recorded safety number changed since the last "
+                "verification (the local identity changed); updated."
+            )
+        print(
+            "  Compare this number with the peer over another channel; "
+            "if it matches, the key is theirs."
+        )
+    return _EXIT_OK
+
+
+def cmd_peers_forget(args: argparse.Namespace) -> int:
+    """Remove a peer from the local registry."""
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    # Mail sweeps iterate registered peers: forgetting a peer with
+    # queued mail would strand those messages until it is rediscovered
+    # (or they expire).  Refuse unless the owner explicitly forces it.
+    mailbox = Mailbox(config.mailbox_path)
+    queued = mailbox.outbox_list(to=peer.destination_hash)
+    if queued and not getattr(args, "force", False):
+        raise NodeError(
+            f"{peer.display_name} still has {len(queued)} queued "
+            "message(s); forgetting this peer would strand them until "
+            "it is rediscovered. Deliver or cancel the mail first, or "
+            "pass --force to forget anyway."
+        )
+    registry.forget(peer.destination_hash)
+    registry.save()
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "forgotten": True,
+                "queued_messages": len(queued),
+            },
+            True,
+        )
+    else:
+        print(f"Forgot {peer.display_name} ({short_hash(peer.hexhash)}).")
+        if queued:
+            print(
+                f"  warning: {len(queued)} queued message(s) for this peer "
+                "will not be attempted until it is rediscovered."
+            )
+        print("  The next genuine announce from this peer re-adds it.")
     return _EXIT_OK
 
 
@@ -2578,17 +2743,22 @@ def cmd_id(args: argparse.Namespace) -> int:
         "destination": destination,
         "identity": identity.hexhash,
         "lxmf": lxmf_delivery_hash(identity).hex(),
+        # Fingerprint of this identity alone — the pairwise safety number
+        # for a peer (shown by `tau peers --safety-number`) folds the
+        # peer's key in too, so the two numbers are different by design.
+        "safety_number": safety_number(identity.get_public_key()),
         "data_dir": str(config.data_dir),
         "rns_config": str(config.rns_config_file),
     }
     if _json_mode(args):
         _emit(payload, True)
     else:
-        print(f"name:        {config.name}")
-        print(f"destination: {destination}")
-        print(f"identity:    {identity.hexhash}")
-        print(f"lxmf:        {payload['lxmf']}")
-        print(f"data dir:    {config.data_dir}")
+        print(f"name:          {config.name}")
+        print(f"destination:   {destination}")
+        print(f"identity:      {identity.hexhash}")
+        print(f"lxmf:          {payload['lxmf']}")
+        print(f"safety number: {payload['safety_number']}")
+        print(f"data dir:      {config.data_dir}")
     return _EXIT_OK
 
 
@@ -2671,6 +2841,48 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     f"an identity already exists at {config.identity_path}; "
                     "pass --force to replace it"
                 )
+            # Pairwise safety numbers are computed with the local key, so
+            # verifications made under the old identity mean nothing
+            # under the new one.  An unreadable old identity is treated
+            # the same way: its comparisons cannot be trusted either.
+            try:
+                old_identity = load_identity(config.identity_path)
+                old_key = (
+                    old_identity.get_public_key()
+                    if old_identity is not None
+                    else None
+                )
+            except Exception as exc:
+                # The identity is about to be replaced either way, so the
+                # comparisons are cleared — but say why, so a transient
+                # read failure (e.g. permissions) is not silent.
+                log.warning(
+                    "Could not read the existing identity (%s); clearing "
+                    "peer verifications",
+                    exc,
+                )
+                old_key = None
+            verifications_cleared = 0
+            if old_key != identity.get_public_key():
+                # Persist the invalidation BEFORE replacing the identity:
+                # if the registry write fails, abort with the old
+                # identity still in place rather than leaving the new
+                # identity alongside stale verified markers.
+                registry = PeerRegistry(config.peers_path)
+                verifications_cleared = registry.clear_verifications()
+                if verifications_cleared:
+                    try:
+                        saved = registry.save()
+                    except OSError as exc:
+                        raise NodeError(
+                            "could not save peer registry "
+                            f"({exc}); identity not replaced"
+                        ) from exc
+                    if not saved:
+                        raise NodeError(
+                            "could not save peer registry; "
+                            "identity not replaced"
+                        )
             save_identity(identity, config.identity_path)
     finally:
         lock.release()
@@ -2678,6 +2890,7 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
         "data_dir": str(config.data_dir),
+        "verifications_cleared": verifications_cleared,
     }
     if _json_mode(args):
         _emit(payload, True)
@@ -2685,6 +2898,11 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
+        if verifications_cleared:
+            print(
+                f"verifications cleared: {verifications_cleared} "
+                "(local identity changed; re-verify peers)"
+            )
     return _EXIT_OK
 
 
