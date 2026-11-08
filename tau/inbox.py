@@ -105,12 +105,20 @@ class Inbox:
                 loaded.append(record)
         self._messages = loaded[-MAX_INBOX:]
 
-    def _save(self) -> None:
+    def _save(self, *, strict: bool = False) -> None:
+        """Write the inbox file, warning on failure — unless *strict*.
+
+        Appends tolerate a failed write (delivery already happened);
+        :meth:`delete` passes ``strict=True`` so a failed persist
+        rolls the removal back instead of claiming success.
+        """
         if self.path is None:
             return
         try:
             atomic_write_json(self.path, {"messages": self._messages}, mode=0o600)
         except OSError as exc:
+            if strict:
+                raise
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
 
     @contextmanager

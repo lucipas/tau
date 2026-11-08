@@ -216,3 +216,31 @@ def test_delete_memory_only_inbox():
     inbox.append(_record(id="gone", text="bye"))
     assert inbox.delete("gone")["text"] == "bye"
     assert len(inbox) == 0
+
+
+def test_delete_exact_match_wins_over_folded_prefix(tmp_path):
+    """An exact id wins even when a case-folded prefix would be ambiguous."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="A" * 32, text="upper"))
+    inbox.append(_record(id="a" * 32, text="lower"))
+
+    removed = inbox.delete("A" * 32)
+    assert removed["text"] == "upper"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["a" * 32]
+
+
+def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.inbox
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="keep", text="keep me"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _boom)
+    with pytest.raises(InboxError, match="could not persist inbox"):
+        inbox.delete("keep")
+    # The removal was rolled back: the message is still there.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
