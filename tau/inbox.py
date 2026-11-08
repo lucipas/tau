@@ -165,21 +165,28 @@ class Inbox:
         """
         if not isinstance(ref, str) or not ref.strip():
             raise InboxError("message reference must not be empty")
-        value = ref.strip().lower()
+        value = ref.strip()
         with self._transaction():
             entries = list(self._messages)
-            if len(value) == 32:
-                matches = [
-                    entry
-                    for entry in entries
-                    if str(entry.get("id") or "").lower() == value
-                ]
-            else:
-                matches = [
-                    entry
-                    for entry in entries
-                    if str(entry.get("id") or "").lower().startswith(value)
-                ]
+            # Peer-supplied ids are case-sensitive: an exact match wins
+            # outright; only then fall back to a case-folded prefix.
+            matches = [
+                entry for entry in entries if str(entry.get("id") or "") == value
+            ]
+            if not matches:
+                folded = value.lower()
+                if len(folded) == 32:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower() == folded
+                    ]
+                else:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower().startswith(folded)
+                    ]
             if not matches:
                 raise InboxError(f"unknown message: {ref!r}")
             if len(matches) > 1:
@@ -187,8 +194,16 @@ class Inbox:
                     f"{len(matches)} messages match prefix {ref!r}"
                 )
             removed = matches[0]
+            previous = self._messages
             self._messages = [entry for entry in entries if entry is not removed]
-            self._save()
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous
+                raise InboxError(
+                    f"could not persist inbox; message was not deleted: {exc}"
+                ) from exc
         return dict(removed)
 
     def list_messages(
