@@ -1577,34 +1577,38 @@ def suggest_authors(
             str(row["hash"])
             for row in conn.execute(
                 "SELECT hash FROM posts WHERE author = ? AND linked = 1 "
-                f"AND kind = 'post' AND {_NOT_DELETED}",
+                f"AND kind IN ('post', 'reply') AND {_NOT_DELETED}",
                 (author,),
             ).fetchall()
         ]
-        states = reaction_states(conn, hashes)
+        # Each active like counts once per post, so likes are summed across
+        # the candidate's posts rather than deduplicated per liker.
+        like_total = 0
         likers: Set[str] = set()
-        for reactors in states.values():
-            likers.update(
-                reactor for reactor, kind in reactors.items() if kind == KIND_LIKE
-            )
-        followed_likers = sorted(a for a in likers if a in followed)
-        followed_repliers: List[str] = []
-        if hashes:
-            placeholders = ", ".join("?" for _ in hashes)
-            repliers = {
+        repliers: Set[str] = set()
+        for batch in _thread_batches(hashes, _SQL_BATCH):
+            states = reaction_states(conn, batch)
+            for reactors in states.values():
+                for reactor, kind in reactors.items():
+                    if kind == KIND_LIKE:
+                        like_total += 1
+                        likers.add(reactor)
+            placeholders = ", ".join("?" for _ in batch)
+            repliers.update(
                 str(row["author"])
                 for row in conn.execute(
                     "SELECT DISTINCT author FROM posts WHERE kind = 'reply' "
                     f"AND linked = 1 AND {_NOT_DELETED} "
                     f"AND target IN ({placeholders})",
-                    hashes,
+                    batch,
                 ).fetchall()
-            }
-            followed_repliers = sorted(a for a in repliers if a in followed)
+            )
+        followed_likers = sorted(a for a in likers if a in followed)
+        followed_repliers = sorted(a for a in repliers if a in followed)
         engagers = sorted(set(followed_likers) | set(followed_repliers))
         candidate["posts"] = len(hashes)
-        candidate["likes"] = len(likers)
-        candidate["score"] = SUGGEST_FOLLOWED_WEIGHT * len(engagers) + len(likers)
+        candidate["likes"] = like_total
+        candidate["score"] = SUGGEST_FOLLOWED_WEIGHT * len(engagers) + like_total
         candidate["engagers"] = [_engager_name(a, followed) for a in engagers]
         reasons: List[str] = []
         if followed_likers:
@@ -1613,8 +1617,8 @@ def suggest_authors(
             reasons.append(
                 "replied to by " + _format_engagers(followed_repliers, followed)
             )
-        if likers:
-            reasons.append(f"{len(likers)} like(s)")
+        if like_total:
+            reasons.append(f"{like_total} like(s)")
         if not reasons:
             reasons.append(f"{len(hashes)} post(s)")
         candidate["reason"] = "; ".join(reasons)
@@ -2262,6 +2266,12 @@ class TanApp:
                         fanout=self.gossip_fanout,
                     )
             except Exception:  # pragma: no cover - network dependent
+                log.debug("Tan gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+except Exception:  # pragma: no cover - network dependent
                 log.debug("Tan gossip failed", exc_info=True)
             finally:
                 self._gossip_slots.release()
