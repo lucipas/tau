@@ -1259,6 +1259,10 @@ def apply_display_rules(
         for post in shown:
             post.pop("likes", None)
             post.pop("liked", None)
+    if not ruleset.displays(KIND_REPOST):
+        for post in shown:
+            post.pop("reposts", None)
+            post.pop("reposted", None)
     return shown
 
 
@@ -2384,6 +2388,18 @@ class TanApp:
             try:
                 if self.node is not None and not self._closed:
                     self.publish(
+                        post,
+                        ttl=ttl,
+                        exclude=exclude,
+                        fanout=self.gossip_fanout,
+                    )
+            except Exception:  # pragma: no cover - network dependent
+                log.debug("Tan gossip failed", exc_info=True)
+            finally:
+                self._gossip_slots.release()
+
+        threading.Thread(target=run, name="tau-tan-gossip", daemon=True).start()
+lf.publish(
                         post,
                         ttl=ttl,
                         exclude=exclude,
