@@ -955,6 +955,7 @@ def annotate_replies(
     posts: List[Dict[str, Any]],
     *,
     muted_keywords: Optional[Sequence[str]] = None,
+    exclude_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``reply_to`` parent summary to reply entries, in place.
 
@@ -965,7 +966,9 @@ def annotate_replies(
     stays readable without resurfacing removed content.  A parent
     matching a muted keyword (see :func:`muted_keywords`) is reported
     the same way, with its text blanked and ``muted`` set, so the
-    muted content does not leak through the preview.  Top-level
+    muted content does not leak through the preview.  A parent whose
+    author is in *exclude_authors* (muted) is reported as ``None`` so
+    its name and text never surface.  Top-level
     posts get no ``reply_to`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -1004,7 +1007,9 @@ def annotate_replies(
         if post.get("kind") != KIND_REPLY:
             continue
         parent = parents.get(str(post.get("target") or ""))
-        if parent is None:
+        if parent is None or (
+            exclude_authors and parent["author"] in exclude_authors
+        ):
             post["reply_to"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
@@ -1361,6 +1366,7 @@ def timeline(
             conn,
             annotate_reactions(conn, posts, viewer=viewer),
             muted_keywords=keywords,
+            exclude_authors=silenced,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1399,6 +1405,7 @@ def timeline(
         conn,
         annotate_reactions(conn, posts, viewer=viewer),
         muted_keywords=keywords,
+        exclude_authors=silenced,
     )
 
 
@@ -1979,11 +1986,17 @@ def resolve_author(
     if len(value) >= 4:
         prefix = value.casefold()
         rows = conn.execute(
-            "SELECT DISTINCT author, name FROM posts WHERE author LIKE ? LIMIT 8",
+            "SELECT DISTINCT author FROM posts WHERE author LIKE ? LIMIT 8",
             (prefix + "%",),
         ).fetchall()
         if len(rows) == 1:
-            return str(rows[0]["author"]), str(rows[0]["name"])
+            author = str(rows[0]["author"])
+            row = conn.execute(
+                "SELECT name FROM posts WHERE author = ? AND name != '' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (author,),
+            ).fetchone()
+            return author, (str(row["name"]) if row is not None else "")
         if len(rows) > 1:
             raise TanError(f"{len(rows)} cached authors match {value!r}")
 
@@ -2018,6 +2031,29 @@ def resolve_cached_author(conn: sqlite3.Connection, name: str) -> Tuple[str, str
             "use a destination hash"
         )
     raise TanError(f"no cached posts from an author named {clean!r}")
+
+
+def resolve_muted_name(conn: sqlite3.Connection, name: str) -> Optional[Tuple[str, str]]:
+    """Resolve a muted author by the name recorded when they were muted.
+
+    Returns ``None`` when no muted author has that name.  The match is
+    case-insensitive; more than one match is an error asking for a hash.
+    """
+    clean = name.strip() if isinstance(name, str) else ""
+    if not clean:
+        return None
+    rows = conn.execute(
+        "SELECT author, name FROM muted_authors WHERE name = ? COLLATE NOCASE",
+        (clean,),
+    ).fetchall()
+    if len(rows) == 1:
+        return str(rows[0]["author"]), str(rows[0]["name"])
+    if len(rows) > 1:
+        raise TanError(
+            f"{len(rows)} muted authors are named {clean!r}; "
+            "use a destination hash"
+        )
+    return None
 
 
 # -- network application ---------------------------------------------------

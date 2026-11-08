@@ -1525,9 +1525,17 @@ def cmd_tan_unmute(args: argparse.Namespace) -> int:
     config = _make_config(args)
     conn = init_db(config.social_db_path)
     try:
-        author, name = resolve_author(
-            conn, args.target, registry=PeerRegistry(config.peers_path)
-        )
+        try:
+            author, name = resolve_author(
+                conn, args.target, registry=PeerRegistry(config.peers_path)
+            )
+        except TanError:
+            # Muted authors may be cached without a peer registry entry;
+            # `tan muted` lists them by name, so accept that name here too.
+            match = resolve_muted_name(conn, args.target)
+            if match is None:
+                raise
+            author, name = match
         removed = unmute(conn, author)
     finally:
         conn.close()
