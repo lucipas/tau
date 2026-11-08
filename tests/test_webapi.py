@@ -390,6 +390,65 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_thread_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, create_reply, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        root = create_post(conn, identity, "root post", name="tester", now=1000)
+        reply = create_reply(
+            conn, other, root["hash"], "first reply", name="other", now=1001
+        )
+        nested = create_reply(
+            conn, identity, reply["hash"], "reply to the reply", name="tester", now=1002
+        )
+        create_post(conn, other, "unrelated post", name="other", now=1003)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A hash prefix names the thread; entries come back oldest first
+        # with their depth, and the unrelated post stays out.
+        status, _, payload = _json(bridge, f"/api/tan/thread?ref={root['hash'][:16]}")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "root post",
+            "first reply",
+            "reply to the reply",
+        ]
+        assert [item["depth"] for item in payload["posts"]] == [0, 1, 2]
+        assert payload["count"] == 3
+
+        # Naming a reply resolves to the same thread, rooted at its post.
+        status, _, payload = _json(bridge, f"/api/tan/thread?ref={nested['hash']}")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "root post",
+            "first reply",
+            "reply to the reply",
+        ]
+
+        # Unknown references and a missing ref fail the way the CLI does.
+        status, _, payload = _json(bridge, "/api/tan/thread?ref=ab" * 16)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        status, _, payload = _json(bridge, "/api/tan/thread")
+        assert status == 400
+        assert "field 'ref' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 
