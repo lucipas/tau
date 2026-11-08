@@ -8,6 +8,7 @@ import pytest
 
 from tau.cli import main
 from tau.config import TauConfig
+from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
 from tau.tangents.rules import Ruleset
@@ -19,6 +20,7 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    annotate_reactions,
     annotate_replies,
     author_stats,
     author_timeline,
@@ -41,7 +43,15 @@ from tau.tangents.tan import (
     muted_keywords,
     reaction_states,
     resolve_post,
+    resolve_author,
+    resolve_muted_name,
     max_seq,
+    mentions,
+    mute,
+    muted,
+    muted_author_set,
+    save_post,
+    saved_posts,
     search_posts,
     store,
     store_post,
@@ -49,7 +59,9 @@ from tau.tangents.tan import (
     timeline,
     top_posts,
     unfollow,
+    unmute,
     unmute_keyword,
+    unsave_post,
     verify_post,
     without_muted_keywords,
 )
@@ -150,9 +162,12 @@ def test_out_of_order_posts_link_when_the_parent_arrives(identities, tmp_path):
     destination = init_db(tmp_path / "destination.sqlite3")
     _, is_new = store_post(destination, second)
     assert is_new is True
-    assert destination.execute(
-        "SELECT linked, seq FROM posts WHERE hash = ?", (second["hash"],)
-    ).fetchone()["linked"] == 0
+    assert (
+        destination.execute(
+            "SELECT linked, seq FROM posts WHERE hash = ?", (second["hash"],)
+        ).fetchone()["linked"]
+        == 0
+    )
 
     store_post(destination, first)
     row = destination.execute(
@@ -180,6 +195,167 @@ def test_follow_and_timeline(identities, tmp_path):
     assert timeline(conn, []) == []
 
 
+def test_mute_unmute_and_muted_list(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    bob_post = create_post(conn, bob, "from bob", name="bob", now=1000)
+
+    record = mute(conn, bob_post["author"], name="bob", now=1001)
+    assert record["name"] == "bob"
+    assert record["muted_at"] == 1001
+    # Re-muting keeps the original mute time.
+    assert mute(conn, bob_post["author"], name="robert", now=1002)["muted_at"] == 1001
+    assert [entry["author"] for entry in muted(conn)] == [bob_post["author"]]
+    assert muted_author_set(conn) == {bob_post["author"]}
+    # Muting never deletes anything: the posts stay stored.
+    assert [post["text"] for post in feed(conn, author=bob_post["author"])] == [
+        "from bob"
+    ]
+
+    assert unmute(conn, bob_post["author"]) is True
+    assert unmute(conn, bob_post["author"]) is False
+    assert muted(conn) == []
+    assert muted_author_set(conn) == set()
+
+
+def test_timeline_hides_muted_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    bob_post = create_post(conn, bob, "from bob", name="bob", now=1000)
+    alice_post = create_post(conn, alice, "from alice", name="alice", now=1001)
+    authors = [bob_post["author"], alice_post["author"]]
+
+    mute(conn, bob_post["author"], name="bob")
+    assert [post["text"] for post in timeline(conn, authors)] == ["from alice"]
+    assert [post["text"] for post in timeline(conn, include_all=True)] == ["from alice"]
+    assert timeline(conn, [bob_post["author"]]) == []
+    # An explicit author feed is a direct lookup and still shows them.
+    assert [post["text"] for post in feed(conn, author=bob_post["author"])] == [
+        "from bob"
+    ]
+
+    # Unmuting restores the full timeline.
+    unmute(conn, bob_post["author"])
+    assert [post["text"] for post in timeline(conn, authors)] == [
+        "from alice",
+        "from bob",
+    ]
+
+
+def test_search_hides_muted_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "hello mesh world", name="alice", now=1000)
+    create_post(conn, bob, "HELLO from bob", name="bob", now=1001)
+
+    mute(conn, author_of(bob), name="bob")
+    assert [post["text"] for post in search_posts(conn, "hello")] == [
+        "hello mesh world"
+    ]
+    # An explicit author search still shows the muted author.
+    assert [
+        post["text"] for post in search_posts(conn, "hello", author=author_of(bob))
+    ] == ["HELLO from bob"]
+
+    unmute(conn, author_of(bob))
+    assert [post["text"] for post in search_posts(conn, "hello")] == [
+        "HELLO from bob",
+        "hello mesh world",
+    ]
+
+
+def test_thread_hides_muted_subtree(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    root = create_post(conn, alice, "root post", name="alice", now=1000)
+    reply = create_reply(conn, bob, root["hash"], "bob replies", name="bob", now=1001)
+    nested = create_reply(
+        conn, carol, reply["hash"], "carol replies to bob", name="carol", now=1002
+    )
+    create_reply(
+        conn, carol, root["hash"], "carol replies to root", name="carol", now=1003
+    )
+
+    mute(conn, author_of(bob), name="bob")
+    entries = thread(conn, root["hash"])
+    assert [entry["text"] for entry in entries] == [
+        "root post",
+        "carol replies to root",
+    ]
+    # The named entry always anchors the thread, even when its author
+    # is muted — so the muted reply shows with its own descendants.
+    assert [entry["text"] for entry in thread(conn, reply["hash"])] == [
+        "bob replies",
+        "carol replies to bob",
+    ]
+    # ...while a muted ancestor above the named entry simply ends the
+    # climb instead of being promoted to the root.
+    assert [entry["text"] for entry in thread(conn, nested["hash"])] == [
+        "carol replies to bob"
+    ]
+    # ...and a muted author's own root post still shows when opened by hash.
+    bob_root = create_post(conn, bob, "bob root", name="bob", now=1004)
+    assert [entry["text"] for entry in thread(conn, bob_root["hash"])] == ["bob root"]
+
+    unmute(conn, author_of(bob))
+    assert [entry["text"] for entry in thread(conn, root["hash"])] == [
+        "root post",
+        "bob replies",
+        "carol replies to bob",
+        "carol replies to root",
+    ]
+
+
+def test_timeline_hides_muted_parent_preview(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    parent = create_post(conn, bob, "muted parent text", name="bob", now=1000)
+    create_reply(conn, alice, parent["hash"], "alice replies", name="alice", now=1001)
+
+    mute(conn, author_of(bob), name="bob")
+    posts = timeline(conn, [author_of(alice)], viewer=author_of(alice))
+    assert len(posts) == 1
+    # The muted parent's name and text never surface in the preview.
+    assert posts[0]["reply_to"] is None
+    assert "muted parent text" not in json.dumps(posts)
+
+    # An explicit author lookup still shows the parent preview.
+    shown = feed(conn, author=author_of(alice), posts_only=True)
+    annotated = annotate_replies(
+        conn, annotate_reactions(conn, shown, viewer=author_of(alice))
+    )
+    assert annotated[0]["reply_to"]["text"] == "muted parent text"
+
+
+def test_resolve_author_prefix_with_renamed_author(identities, tmp_path):
+    _, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, bob, "first as bob", name="bob", now=1000)
+    create_post(conn, bob, "now as robert", name="robert", now=1001)
+
+    # A unique hash prefix resolves even though the author posted under
+    # two names, and reports the latest name.
+    author, name = resolve_author(conn, author_of(bob)[:8])
+    assert author == author_of(bob)
+    assert name == "robert"
+
+
+def test_resolve_muted_name(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mute(conn, author_of(bob), name="bob", now=1000)
+
+    assert resolve_muted_name(conn, "bob") == (author_of(bob), "bob")
+    assert resolve_muted_name(conn, "BOB")[0] == author_of(bob)
+    assert resolve_muted_name(conn, "alice") is None
+
+    # Two muted authors sharing a name must be disambiguated by hash.
+    mute(conn, author_of(alice), name="bob", now=1001)
+    with pytest.raises(TanError, match="use a destination hash"):
+        resolve_muted_name(conn, "bob")
+
+
 def test_feed_paginates_by_sequence(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -197,7 +373,9 @@ def test_app_handlers_store_and_serve_posts(identities, tmp_path):
     config = TauConfig.resolve(data_dir=tmp_path, name="alice")
     app = TanApp(config, alice, name="alice", gossip=False)
 
-    post = create_post(init_db(tmp_path / "scratch.sqlite3"), bob, "networked", name="bob", now=1000)
+    post = create_post(
+        init_db(tmp_path / "scratch.sqlite3"), bob, "networked", name="bob", now=1000
+    )
     response = app._handle_post(
         TAN_POST_PATH,
         encode({"post": post, "ttl": 0}),
@@ -301,6 +479,87 @@ def test_cli_post_and_timeline(tmp_path):
     assert len(posts) == 1
     assert posts[0]["text"] == "hello from the cli"
     assert posts[0]["name"] == "alice"
+
+
+def test_cli_mute_muted_unmute(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    bob = RNS.Identity()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        bob_post = create_post(conn, bob, "bob says hello", name="bob", now=1000)
+        create_post(conn, bob, "bob again", name="bob", now=1001)
+    finally:
+        conn.close()
+    bob_author = bob_post["author"]
+    own = destination_hash(load_identity(data_dir / "identity")).hex()
+
+    # Muting yourself is refused.
+    assert main(["tan", "mute", "--data-dir", str(data_dir), own]) == 1
+    assert "cannot mute yourself" in capsys.readouterr().err
+
+    assert main(["tan", "mute", "--data-dir", str(data_dir), "--json", bob_author]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["author"] == bob_author
+
+    # Muted authors leave the timeline; the muted list shows them.
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all", "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == ["hello from the cli"]
+    assert main(["tan", "muted", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["muted"][0]["author"] == bob_author
+
+    # Unmuting restores the timeline; a second unmute is a clean no-op.
+    assert (
+        main(["tan", "unmute", "--data-dir", str(data_dir), "--json", bob_author]) == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unmuted"] is True
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all", "--json"]) == 0
+    )
+    assert len(json.loads(capsys.readouterr().out)["posts"]) == 3
+    assert (
+        main(["tan", "unmute", "--data-dir", str(data_dir), "--json", bob_author]) == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unmuted"] is False
+
+    # Names work too, even though bob is not in the peer registry: the
+    # name comes from his cached posts, and from the mute record itself.
+    assert main(["tan", "mute", "--data-dir", str(data_dir), "--json", "bob"]) == 0
+    assert json.loads(capsys.readouterr().out)["author"] == bob_author
+    assert main(["tan", "unmute", "--data-dir", str(data_dir), "--json", "bob"]) == 0
+    assert json.loads(capsys.readouterr().out)["unmuted"] is True
+
+    # A unique hash prefix works as well.
+    assert (
+        main(["tan", "mute", "--data-dir", str(data_dir), "--json", bob_author[:8]])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["author"] == bob_author
+    assert (
+        main(["tan", "unmute", "--data-dir", str(data_dir), "--json", bob_author[:8]])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["unmuted"] is True
 
 
 def test_export_import_roundtrip(identities, tmp_path):
@@ -559,15 +818,14 @@ def test_cli_tan_export_import(tmp_path):
         == 0
     )
     assert export_path.exists()
-    assert json.loads(export_path.read_text(encoding="utf-8"))["entries"][0][
-        "text"
-    ] == "hello backup"
+    assert (
+        json.loads(export_path.read_text(encoding="utf-8"))["entries"][0]["text"]
+        == "hello backup"
+    )
 
     carol_dir = tmp_path / "carol"
     assert main(["init", "--data-dir", str(carol_dir), "--name", "carol"]) == 0
-    assert (
-        main(["tan", "import", "--data-dir", str(carol_dir), str(export_path)]) == 0
-    )
+    assert main(["tan", "import", "--data-dir", str(carol_dir), str(export_path)]) == 0
     conn = init_db(carol_dir / "tan.sqlite3")
     try:
         posts = feed(conn, all_authors=True)
@@ -595,9 +853,10 @@ def test_cli_tan_export_import(tmp_path):
         )
         == 0
     )
-    assert json.loads(cached_path.read_text(encoding="utf-8"))["entries"][0][
-        "text"
-    ] == "hello backup"
+    assert (
+        json.loads(cached_path.read_text(encoding="utf-8"))["entries"][0]["text"]
+        == "hello backup"
+    )
 
 
 def test_cli_tan_export_import_errors(tmp_path, capsys):
@@ -621,9 +880,7 @@ def test_cli_tan_export_import_errors(tmp_path, capsys):
     assert "cannot be combined" in capsys.readouterr().err
     bad_path = tmp_path / "bad.json"
     bad_path.write_text("not json", encoding="utf-8")
-    assert (
-        main(["tan", "import", "--data-dir", str(data_dir), str(bad_path)]) == 1
-    )
+    assert main(["tan", "import", "--data-dir", str(data_dir), str(bad_path)]) == 1
     assert "not valid JSON" in capsys.readouterr().err
 
 
@@ -705,9 +962,7 @@ def test_reaction_chains_verifies_and_counts(identities, tmp_path):
     create_reaction(conn, bob, post["hash"], liked=False, name="bob", now=1003)
     counts = like_counts(conn, [post["hash"]], viewer=bob_author)
     assert counts[post["hash"]] == {"likes": 0, "liked": False}
-    assert reaction_states(conn, [post["hash"]])[post["hash"]] == {
-        bob_author: "unlike"
-    }
+    assert reaction_states(conn, [post["hash"]])[post["hash"]] == {bob_author: "unlike"}
 
 
 def test_reaction_rejects_tampering(identities, tmp_path):
@@ -768,8 +1023,12 @@ def test_reaction_handler_roundtrip(identities, tmp_path):
         init_db(tmp_path / "scratch.sqlite3"), alice, "hosted", name="alice", now=1000
     )
     like = create_reaction(
-        init_db(tmp_path / "scratch2.sqlite3"), bob, post["hash"],
-        liked=True, name="bob", now=1001,
+        init_db(tmp_path / "scratch2.sqlite3"),
+        bob,
+        post["hash"],
+        liked=True,
+        name="bob",
+        now=1001,
     )
     for entry in (post, like):
         response = app._handle_post(
@@ -815,12 +1074,9 @@ def test_delete_hides_own_post_from_timeline_and_feed(identities, tmp_path):
     assert [item["hash"] for item in timeline(conn, include_all=True)] == [
         other["hash"]
     ]
-    assert [item["hash"] for item in feed(conn, posts_only=True)] == [
-        other["hash"]
-    ]
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [other["hash"]]
     assert [
-        item["hash"]
-        for item in feed(conn, author=post["author"], posts_only=True)
+        item["hash"] for item in feed(conn, author=post["author"], posts_only=True)
     ] == [other["hash"]]
     # The sync feed still carries the whole chain, delete included.
     chain = feed(conn, author=post["author"])
@@ -846,12 +1102,8 @@ def test_search_matches_substring_case_insensitively(identities, tmp_path):
         "HELLO from bob",
         "hello mesh world",
     ]
-    assert [post["text"] for post in search_posts(conn, "MESH")] == [
-        "hello mesh world"
-    ]
+    assert [post["text"] for post in search_posts(conn, "MESH")] == ["hello mesh world"]
     assert search_posts(conn, "nothing matches") == []
-
-
 
 
 def test_search_folds_unicode_case(identities, tmp_path):
@@ -860,11 +1112,11 @@ def test_search_folds_unicode_case(identities, tmp_path):
     create_post(conn, alice, "Äpfel und Öl", name="alice", now=1000)
     create_post(conn, alice, "plain apples", name="alice", now=1001)
 
-    assert [post["text"] for post in search_posts(conn, "äpfel")] == [
-        "Äpfel und Öl"
-    ]
+    assert [post["text"] for post in search_posts(conn, "äpfel")] == ["Äpfel und Öl"]
     assert [post["text"] for post in search_posts(conn, "ÖL")] == ["Äpfel und Öl"]
     assert search_posts(conn, "ÄPFEL") == search_posts(conn, "äpfel")
+
+
 def test_search_treats_wildcards_literally(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -932,6 +1184,8 @@ def test_search_rejects_empty_query(identities, tmp_path):
     for query in ("", "   "):
         with pytest.raises(TanError, match="search text must not be empty"):
             search_posts(conn, query)
+
+
 def test_timeline_marks_own_posts_for_viewer(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -1020,9 +1274,7 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
     record, is_new = store_post(conn, forged)
     assert is_new is True
     assert record["kind"] == "delete"
-    assert [item["hash"] for item in timeline(conn, [post["author"]])] == [
-        post["hash"]
-    ]
+    assert [item["hash"] for item in timeline(conn, [post["author"]])] == [post["hash"]]
     assert deleted_targets(conn) == set()
     assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
 
@@ -1031,9 +1283,7 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
-def test_delete_arriving_before_its_post_applies_on_arrival(
-    identities, tmp_path
-):
+def test_delete_arriving_before_its_post_applies_on_arrival(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     scratch = init_db(tmp_path / "scratch.sqlite3")
@@ -1074,8 +1324,11 @@ def test_delete_handler_roundtrip(identities, tmp_path):
         init_db(tmp_path / "scratch.sqlite3"), alice, "hosted", name="alice", now=1000
     )
     delete = create_delete(
-        init_db(tmp_path / "scratch2.sqlite3"), alice, post["hash"],
-        name="alice", now=1001,
+        init_db(tmp_path / "scratch2.sqlite3"),
+        alice,
+        post["hash"],
+        name="alice",
+        now=1001,
     )
     for entry in (post, delete):
         response = app._handle_post(
@@ -1101,8 +1354,13 @@ def test_cli_delete(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli delete me",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli delete me",
             ]
         )
         == 0
@@ -1110,8 +1368,13 @@ def test_cli_delete(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli keeper",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli keeper",
             ]
         )
         == 0
@@ -1126,8 +1389,13 @@ def test_cli_delete(tmp_path):
     assert (
         main(
             [
-                "tan", "delete", "--data-dir", str(data_dir),
-                "--no-publish", "--json", doomed["hash"][:16],
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                doomed["hash"][:16],
             ]
         )
         == 0
@@ -1145,8 +1413,13 @@ def test_cli_delete(tmp_path):
     assert (
         main(
             [
-                "tan", "delete", "--data-dir", str(data_dir),
-                "--no-publish", "--json", doomed["hash"],
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                doomed["hash"],
             ]
         )
         != 0
@@ -1156,8 +1429,13 @@ def test_cli_delete(tmp_path):
     assert (
         main(
             [
-                "tan", "like", "--data-dir", str(data_dir),
-                "--no-publish", "--json", doomed["hash"],
+                "tan",
+                "like",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                doomed["hash"],
             ]
         )
         != 0
@@ -1178,8 +1456,13 @@ def test_cli_delete_rejects_foreign_post(tmp_path):
     assert (
         main(
             [
-                "tan", "delete", "--data-dir", str(data_dir),
-                "--no-publish", "--json", post["hash"],
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                post["hash"],
             ]
         )
         != 0
@@ -1195,8 +1478,13 @@ def test_cli_delete_accepts_uncached_full_hash(tmp_path):
     assert (
         main(
             [
-                "tan", "delete", "--data-dir", str(data_dir),
-                "--no-publish", "--json", unknown,
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                unknown,
             ]
         )
         == 0
@@ -1230,9 +1518,7 @@ def test_pre_reaction_database_migrates(tmp_path):
 
     conn = init_db(path)
     try:
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(posts)")
-        }
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)")}
         assert {"kind", "target"} <= columns
     finally:
         conn.close()
@@ -1244,8 +1530,13 @@ def test_cli_like_and_unlike(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli reactions",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli reactions",
             ]
         )
         == 0
@@ -1259,8 +1550,13 @@ def test_cli_like_and_unlike(tmp_path):
     assert (
         main(
             [
-                "tan", "like", "--data-dir", str(data_dir),
-                "--no-publish", "--json", post["hash"][:16],
+                "tan",
+                "like",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                post["hash"][:16],
             ]
         )
         == 0
@@ -1274,8 +1570,13 @@ def test_cli_like_and_unlike(tmp_path):
     assert (
         main(
             [
-                "tan", "unlike", "--data-dir", str(data_dir),
-                "--no-publish", "--json", post["hash"],
+                "tan",
+                "unlike",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                post["hash"],
             ]
         )
         == 0
@@ -1294,7 +1595,7 @@ def test_create_post_rejects_oversize_encoded_post(identities, tmp_path):
     # more than the 8 KiB request budget: the post could never be
     # published, so it must not be stored as chain head either.
     with pytest.raises(PostError):
-        create_post(conn, alice, "\U0001F600" * 2000, name="alice", now=1000)
+        create_post(conn, alice, "\U0001f600" * 2000, name="alice", now=1000)
     assert head(conn, author_of(alice)) is None
     assert feed(conn, author=author_of(alice)) == []
 
@@ -1306,7 +1607,7 @@ def test_create_post_rejects_oversize_encoded_post(identities, tmp_path):
 def test_multibyte_post_under_budget_is_accepted(identities, tmp_path):
     alice, _ = identities
     conn = init_db(tmp_path / "tan.sqlite3")
-    post = create_post(conn, alice, "\U0001F600" * 1500, name="alice", now=1000)
+    post = create_post(conn, alice, "\U0001f600" * 1500, name="alice", now=1000)
     assert verify_post(post)["hash"] == post["hash"]
     # And its real publish envelope fits the request budget.
     payload = encode({"post": post, "ttl": 3}, max_bytes=8 * 1024)
@@ -1320,7 +1621,7 @@ def test_store_rejects_oversize_post_from_a_peer(identities, tmp_path):
         "author": author_of(alice),
         "key": alice.get_public_key().hex(),
         "name": "alice",
-        "text": "\U0001F600" * 2000,
+        "text": "\U0001f600" * 2000,
         "created_at": 1000.0,
         "prev": "",
     }
@@ -1338,9 +1639,7 @@ def test_reply_chains_verifies_and_annotates(identities, tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "original thought", name="alice", now=1000)
 
-    reply = create_reply(
-        conn, bob, post["hash"], "seconded", name="bob", now=1001
-    )
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1001)
     assert reply["kind"] == "reply"
     assert reply["target"] == post["hash"]
     assert reply["text"] == "seconded"
@@ -1371,14 +1670,143 @@ def test_reply_chains_verifies_and_annotates(identities, tmp_path):
     ]
 
 
+def test_mentions_lists_replies_to_own_posts_and_replies(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    own_reply = create_reply(
+        conn, alice, post["hash"], "talking to myself", name="alice", now=1001
+    )
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1002)
+    reply_to_reply = create_reply(
+        conn, bob, own_reply["hash"], "even this", name="bob", now=1003
+    )
+    other = create_post(conn, bob, "bob's own post", name="bob", now=1004)
+    to_bob = create_reply(
+        conn, alice, other["hash"], "not a mention", name="alice", now=1005
+    )
+
+    found = mentions(conn, author_of(alice))
+    assert [item["hash"] for item in found] == [
+        reply_to_reply["hash"],
+        reply["hash"],
+    ]
+    # Each mention carries its parent, so the reader sees what was answered.
+    assert found[0]["reply_to"]["hash"] == own_reply["hash"]
+    assert found[0]["reply_to"]["text"] == "talking to myself"
+    assert found[1]["reply_to"]["hash"] == post["hash"]
+    assert found[1]["reply_to"]["text"] == "original thought"
+    # A reply to someone else's post is a mention of them, not of you.
+    assert [item["hash"] for item in mentions(conn, author_of(bob))] == [to_bob["hash"]]
+    assert [item["hash"] for item in mentions(conn, author_of(alice), limit=1)] == [
+        reply_to_reply["hash"]
+    ]
+
+
+def test_mentions_hides_deleted_and_unlinked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1001)
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        reply["hash"]
+    ]
+
+    # A reply its author deleted never appears.
+    create_delete(conn, bob, reply["hash"], name="bob", now=1002)
+    assert mentions(conn, author_of(alice)) == []
+
+    # A reply to a post you deleted never appears either.
+    kept = create_post(conn, alice, "keeping this", name="alice", now=1003)
+    fresh = create_reply(conn, bob, kept["hash"], "still here", name="bob", now=1004)
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        fresh["hash"]
+    ]
+    create_delete(conn, alice, kept["hash"], name="alice", now=1005)
+    assert mentions(conn, author_of(alice)) == []
+
+    # An unlinked reply (its chain predecessor has not arrived yet)
+    # never appears, and shows up once the predecessor lands.
+    source = init_db(tmp_path / "source.sqlite3")
+    store_post(source, post)
+    bob_first = create_post(source, bob, "bob first", name="bob", now=1006)
+    late = create_reply(source, bob, post["hash"], "late arrival", name="bob", now=1007)
+    store_post(conn, late)
+    assert mentions(conn, author_of(alice)) == []
+    store_post(conn, bob_first)
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [late["hash"]]
+
+
+def test_mentions_hides_replies_beneath_deleted_ancestor(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    first = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
+    mine = create_reply(conn, alice, first["hash"], "my answer", name="alice", now=1002)
+    nested = create_reply(conn, bob, mine["hash"], "back at you", name="bob", now=1003)
+
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        nested["hash"],
+        first["hash"],
+    ]
+
+    # Bob deletes his reply: the thread view hides the whole subtree
+    # under it, so the reply to my reply beneath it must not leak
+    # into mentions even though its immediate parent is untouched.
+    create_delete(conn, bob, first["hash"], name="bob", now=1004)
+    assert mentions(conn, author_of(alice)) == []
+
+
+def test_cli_mentions(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "hello mesh",
+            ]
+        )
+        == 0
+    )
+    post = json.loads(capsys.readouterr().out)["post"]
+
+    # No replies yet is a clean empty result, not an error.
+    assert main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    # A reply from another author, stored as if it had synced in.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        create_reply(
+            conn, RNS.Identity(), post["hash"], "seconded", name="bob", now=1001
+        )
+    finally:
+        conn.close()
+    assert main(["tan", "mentions", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "seconded"
+    assert payload["posts"][0]["reply_to"]["text"] == "hello mesh"
+
+    assert main(["tan", "mentions", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "seconded" in out
+    assert "in reply to alice: hello mesh" in out
+
+
 def test_reply_rejects_tampering(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "target practice", name="alice", now=1000)
     other = create_post(conn, alice, "decoy", name="alice", now=1001)
-    reply = create_reply(
-        conn, bob, post["hash"], "agreed", name="bob", now=1002
-    )
+    reply = create_reply(conn, bob, post["hash"], "agreed", name="bob", now=1002)
 
     # The parent link is signed: swapping it invalidates the signature.
     with pytest.raises(PostError):
@@ -1426,9 +1854,7 @@ def test_reply_to_parent_not_yet_synced_shows_without_snippet(identities, tmp_pa
     alice, bob = identities
     source = init_db(tmp_path / "source.sqlite3")
     post = create_post(source, alice, "original thought", name="alice", now=1000)
-    reply = create_reply(
-        source, bob, post["hash"], "early reply", name="bob", now=1001
-    )
+    reply = create_reply(source, bob, post["hash"], "early reply", name="bob", now=1001)
 
     # The reply arrives (via gossip or sync) before its parent: the
     # store path keeps it, and the timeline shows it without a parent
@@ -1488,9 +1914,7 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    reply = create_reply(
-        conn, bob, post["hash"], "first reply", name="bob", now=1001
-    )
+    reply = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
     nested = create_reply(
         conn, alice, reply["hash"], "reply to the reply", name="alice", now=1002
     )
@@ -1530,15 +1954,11 @@ def test_thread_returns_root_and_nested_replies(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    first = create_reply(
-        conn, bob, post["hash"], "first reply", name="bob", now=1001
-    )
+    first = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
     nested = create_reply(
         conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
     )
-    second = create_reply(
-        conn, bob, post["hash"], "second reply", name="bob", now=1003
-    )
+    second = create_reply(conn, bob, post["hash"], "second reply", name="bob", now=1003)
     create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
 
     # Depth-first, siblings oldest first: a reply, then its own
@@ -1580,15 +2000,11 @@ def test_thread_hides_deleted_reply_subtree(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    first = create_reply(
-        conn, bob, post["hash"], "first reply", name="bob", now=1001
-    )
+    first = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
     nested = create_reply(
         conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
     )
-    second = create_reply(
-        conn, bob, post["hash"], "second reply", name="bob", now=1003
-    )
+    second = create_reply(conn, bob, post["hash"], "second reply", name="bob", now=1003)
 
     # Deleting the first reply hides it and the nested reply that
     # hangs off it, rather than re-parenting the nested reply.
@@ -1647,9 +2063,7 @@ def test_thread_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    first = create_reply(
-        conn, bob, post["hash"], "first reply", name="bob", now=1001
-    )
+    first = create_reply(conn, bob, post["hash"], "first reply", name="bob", now=1001)
     nested = create_reply(
         conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
     )
@@ -1660,9 +2074,7 @@ def test_thread_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
         thread(conn, nested["hash"])
 
 
-def test_thread_rejects_reply_beneath_deleted_unlinked_ancestor(
-    identities, tmp_path
-):
+def test_thread_rejects_reply_beneath_deleted_unlinked_ancestor(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     parent = "aa" * 32
@@ -1673,12 +2085,20 @@ def test_thread_rejects_reply_beneath_deleted_unlinked_ancestor(
     # shortcut, or the reply below it re-roots as its own thread.
     _insert_stub(conn, parent, author=author_of(alice), linked=False)
     _insert_stub(
-        conn, delete, author=author_of(alice), linked=True,
-        kind="delete", target=parent,
+        conn,
+        delete,
+        author=author_of(alice),
+        linked=True,
+        kind="delete",
+        target=parent,
     )
     _insert_stub(
-        conn, reply, author=author_of(bob), linked=True,
-        kind="reply", target=parent,
+        conn,
+        reply,
+        author=author_of(bob),
+        linked=True,
+        kind="reply",
+        target=parent,
     )
 
     with pytest.raises(TanError, match="has been deleted"):
@@ -1701,7 +2121,11 @@ def test_thread_batches_wide_generations(identities, tmp_path, monkeypatch):
         replies.append(reply)
         children.append(
             create_reply(
-                conn, alice, reply["hash"], f"child {index}", name="alice",
+                conn,
+                alice,
+                reply["hash"],
+                f"child {index}",
+                name="alice",
                 now=1010 + index,
             )
         )
@@ -1724,8 +2148,13 @@ def test_cli_tan_thread(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli thread starter",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli thread starter",
             ]
         )
         == 0
@@ -1738,9 +2167,15 @@ def test_cli_tan_thread(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json",
-                "--reply-to", post["hash"][:16], "cli reply",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--reply-to",
+                post["hash"][:16],
+                "cli reply",
             ]
         )
         == 0
@@ -1751,8 +2186,12 @@ def test_cli_tan_thread(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "thread", "--data-dir", str(data_dir),
-                "--json", post["hash"][:16],
+                "tan",
+                "thread",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                post["hash"][:16],
             ]
         )
         == 0
@@ -1766,20 +2205,13 @@ def test_cli_tan_thread(tmp_path, capsys):
     assert [entry["depth"] for entry in payload["posts"]] == [0, 1]
 
     # Text output indents the reply under its parent.
-    assert (
-        main(
-            ["tan", "thread", "--data-dir", str(data_dir), post["hash"][:16]]
-        )
-        == 0
-    )
+    assert main(["tan", "thread", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
     out = capsys.readouterr().out
     assert "cli thread starter" in out
     assert "  cli reply" in out
 
     # An unknown reference is a clean CLI error, not a traceback.
-    assert (
-        main(["tan", "thread", "--data-dir", str(data_dir), "cd" * 32]) != 0
-    )
+    assert main(["tan", "thread", "--data-dir", str(data_dir), "cd" * 32]) != 0
     assert "tau: error: unknown post" in capsys.readouterr().err
 
 
@@ -1789,8 +2221,13 @@ def test_cli_post_reply_to(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli thread starter",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli thread starter",
             ]
         )
         == 0
@@ -1804,9 +2241,15 @@ def test_cli_post_reply_to(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json",
-                "--reply-to", post["hash"][:16], "cli reply",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--reply-to",
+                post["hash"][:16],
+                "cli reply",
             ]
         )
         == 0
@@ -1824,9 +2267,15 @@ def test_cli_post_reply_to(tmp_path):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json",
-                "--reply-to", "cd" * 32, "nowhere",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--reply-to",
+                "cd" * 32,
+                "nowhere",
             ]
         )
         != 0
@@ -1839,8 +2288,13 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json", "cli thread starter",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "cli thread starter",
             ]
         )
         == 0
@@ -1853,9 +2307,15 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "post", "--data-dir", str(data_dir),
-                "--no-publish", "--json",
-                "--reply-to", post["hash"][:16], "cli reply",
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "--reply-to",
+                post["hash"][:16],
+                "cli reply",
             ]
         )
         == 0
@@ -1865,8 +2325,12 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "timeline", "--data-dir", str(data_dir),
-                "--author", post["author"],
+                "tan",
+                "timeline",
+                "--data-dir",
+                str(data_dir),
+                "--author",
+                post["author"],
             ]
         )
         == 0
@@ -1879,8 +2343,13 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "timeline", "--data-dir", str(data_dir),
-                "--author", post["author"], "--json",
+                "tan",
+                "timeline",
+                "--data-dir",
+                str(data_dir),
+                "--author",
+                post["author"],
+                "--json",
             ]
         )
         == 0
@@ -2039,15 +2508,11 @@ def test_thread_hides_muted_reply_subtree(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    first = create_reply(
-        conn, bob, post["hash"], "crypto thread", name="bob", now=1001
-    )
+    first = create_reply(conn, bob, post["hash"], "crypto thread", name="bob", now=1001)
     nested = create_reply(
         conn, alice, first["hash"], "reply to the muted reply", name="alice", now=1002
     )
-    second = create_reply(
-        conn, bob, post["hash"], "second reply", name="bob", now=1003
-    )
+    second = create_reply(conn, bob, post["hash"], "second reply", name="bob", now=1003)
     mute_keyword(conn, "crypto")
 
     # The muted reply hides its whole subtree, like a deleted reply.
@@ -2078,15 +2543,11 @@ def test_thread_stops_climb_at_muted_ancestor(identities, tmp_path):
     assert [item["depth"] for item in items] == [0, 1]
 
 
-def test_thread_rejects_muted_named_reply_beneath_deleted_post(
-    identities, tmp_path
-):
+def test_thread_rejects_muted_named_reply_beneath_deleted_post(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    muted = create_reply(
-        conn, bob, post["hash"], "crypto thread", name="bob", now=1001
-    )
+    muted = create_reply(conn, bob, post["hash"], "crypto thread", name="bob", now=1001)
     create_delete(conn, alice, post["hash"], name="alice", now=1002)
     mute_keyword(conn, "crypto")
 
@@ -2102,9 +2563,7 @@ def test_thread_rejects_reply_beneath_muted_ancestor_with_deleted_parent(
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
     post = create_post(conn, alice, "thread starter", name="alice", now=1000)
-    muted = create_reply(
-        conn, bob, post["hash"], "crypto chat", name="bob", now=1001
-    )
+    muted = create_reply(conn, bob, post["hash"], "crypto chat", name="bob", now=1001)
     nested = create_reply(
         conn, alice, muted["hash"], "deeper reply", name="alice", now=1002
     )
@@ -2147,8 +2606,13 @@ def test_cli_mute_keyword(tmp_path, capsys):
         assert (
             main(
                 [
-                    "tan", "post", "--data-dir", str(data_dir),
-                    "--no-publish", "--json", text,
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
                 ]
             )
             == 0
@@ -2158,8 +2622,12 @@ def test_cli_mute_keyword(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "mute-keyword", "--data-dir", str(data_dir),
-                "--json", "crypto",
+                "tan",
+                "mute-keyword",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "crypto",
             ]
         )
         == 0
@@ -2167,15 +2635,11 @@ def test_cli_mute_keyword(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["keyword"] == "crypto"
 
-    assert (
-        main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
-    )
+    assert main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [post["text"] for post in payload["posts"]] == ["mesh notes"]
 
-    assert (
-        main(["tan", "muted-keywords", "--data-dir", str(data_dir), "--json"]) == 0
-    )
+    assert main(["tan", "muted-keywords", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 1
     assert payload["muted_keywords"][0]["keyword"] == "crypto"
@@ -2183,8 +2647,12 @@ def test_cli_mute_keyword(tmp_path, capsys):
     assert (
         main(
             [
-                "tan", "unmute-keyword", "--data-dir", str(data_dir),
-                "--json", "crypto",
+                "tan",
+                "unmute-keyword",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                "crypto",
             ]
         )
         == 0
@@ -2192,14 +2660,204 @@ def test_cli_mute_keyword(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["unmuted"] is True
 
-    assert (
-        main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
-    )
+    assert main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [post["text"] for post in payload["posts"]] == [
         "mesh notes",
         "crypto to the moon",
     ]
+
+
+def test_save_post_round_trip(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, bob, "worth keeping", name="bob", now=1000)
+    second = create_post(conn, alice, "mine too", name="alice", now=1001)
+
+    record = save_post(conn, first["hash"][:16], now=2000)
+    assert record["hash"] == first["hash"]
+    assert record["already_saved"] is False
+    assert record["saved_at"] == 2000
+
+    # Saving again is a no-op that reports the original save time.
+    again = save_post(conn, first["hash"], now=3000)
+    assert again["already_saved"] is True
+    assert again["saved_at"] == 2000
+
+    save_post(conn, second["hash"], now=2001)
+    saved = saved_posts(conn)
+    assert [post["hash"] for post in saved] == [second["hash"], first["hash"]]
+    assert saved[0]["saved_at"] == 2001
+
+    removed = unsave_post(conn, first["hash"][:16])
+    assert removed == {"hash": first["hash"], "unsaved": True}
+    assert unsave_post(conn, first["hash"]) == {
+        "hash": first["hash"],
+        "unsaved": False,
+    }
+    assert [post["hash"] for post in saved_posts(conn)] == [second["hash"]]
+
+
+def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        save_post(source, "ab" * 32)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # saving it would file a post with no verified chain behind it.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        save_post(destination, second["hash"])
+
+    # A post its author deleted cannot be saved.
+    create_delete(source, alice, first["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        save_post(source, first["hash"])
+    # ... but a post deleted after being saved stays listed, blanked.
+    keep = create_post(source, bob, "keep me", name="bob", now=1003)
+    save_post(source, keep["hash"], now=2000)
+    create_delete(source, bob, keep["hash"], name="bob", now=1004)
+    saved = saved_posts(source)
+    assert len(saved) == 1
+    assert saved[0]["hash"] == keep["hash"]
+    assert saved[0]["deleted"] is True
+    assert saved[0]["text"] == ""
+
+
+def test_cli_tan_save(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "save this for later",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert main(["tan", "save", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert f"saved {post['hash'][:8]}" in capsys.readouterr().out
+
+    # JSON output lists the saved post with its save time.
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["saved"][0]["text"] == "save this for later"
+    assert payload["saved"][0]["saved_at"] > 0
+
+    # Text output shows the post and when it was saved.
+    assert main(["tan", "saved", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "save this for later" in out
+    assert "saved " in out
+
+    # Unsaving by prefix reports the full hash in JSON output, so
+    # machine-readable callers can identify the affected post.
+    assert (
+        main(
+            [
+                "tan",
+                "unsave",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"hash": post["hash"], "unsaved": True}
+
+    # Unsaving twice: the second time reports it was not saved.
+    assert main(["tan", "unsave", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "was not saved" in capsys.readouterr().out
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    # An unknown reference is a clean CLI error, not a traceback.
+    assert main(["tan", "save", "--data-dir", str(data_dir), "cd" * 32]) != 0
+    assert "tau: error: unknown post" in capsys.readouterr().err
+
+
+def test_cli_tan_saved_deleted_post(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "soon to be deleted",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert main(["tan", "save", "--data-dir", str(data_dir), post["hash"]]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "delete",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                post["hash"],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # Text output keeps the save but marks the post as deleted.
+    assert main(["tan", "saved", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "(deleted post)" in out
+    assert "soon to be deleted" not in out
+
+    # JSON output lists it as deleted with blank text.
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["saved"][0]["deleted"] is True
+    assert payload["saved"][0]["text"] == ""
+
+    # Unsaving the deleted post succeeds and empties the list.
+    assert main(["tan", "unsave", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "unsaved" in capsys.readouterr().out
+    assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
 
 
 def test_top_posts_ranks_by_likes_then_recency(identities, tmp_path):

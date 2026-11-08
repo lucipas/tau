@@ -217,6 +217,11 @@ tau tan mute-keyword "climate change"
 tau tan muted-keywords
 tau tan unmute-keyword crypto
 
+# Mute an author: their posts leave your timeline, search and threads,
+# but keep syncing and storing — unmute to see them again
+tau tan mute alice
+tau tan muted
+
 # Back up your posts (or every cached author's) and restore them later —
 # every entry's signature and hash are re-verified on import
 tau tan export --output tan-backup.json
@@ -239,6 +244,10 @@ chain, so it propagates to peers and the post disappears from timelines
 phrase can be muted locally with `tau tan mute-keyword <word>` — matching
 posts disappear from your timeline and threads (a muted reply hides its
 whole subtree), while search still finds them and unmuting restores them.
+An author can also be muted with `tau tan mute <peer>` — their posts and
+replies leave your timeline, search results and threads, while their
+entries keep syncing and storing, so `tau tan unmute <peer>` brings the
+whole history back. Muting is display-only and never touches DMs.
 In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
@@ -284,12 +293,19 @@ Global options may appear before or after the command:
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan top` | Show the most-liked stored posts, best first |
+| `tau tan mentions` | Show replies to your own posts |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
 | `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
 | `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
 | `tau tan muted-keywords` | List muted keywords |
+| `tau tan mute PEER` | Hide an author's posts from local views |
+| `tau tan unmute PEER` | Show a muted author's posts again |
+| `tau tan muted` | List muted authors |
+| `tau tan save POST` | Save a post to read later (local only, never published) |
+| `tau tan unsave POST` | Remove a post from your saved list |
+| `tau tan saved` | List your saved posts, newest first |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |

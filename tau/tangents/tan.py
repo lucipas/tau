@@ -113,8 +113,10 @@ MAX_POST_CHARS = MAX_MESSAGE_CHARS
 MAX_FEED_POSTS = 20
 DEFAULT_FEED_LIMIT = 20
 MAX_FOLLOWS = 512
+MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_KEYWORD_LENGTH = 100
+MAX_SAVED_POSTS = 512
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
@@ -444,6 +446,17 @@ CREATE TABLE IF NOT EXISTS muted_keywords (
     keyword TEXT PRIMARY KEY,
     display TEXT NOT NULL,
     added_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS muted_authors (
+    author TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    muted_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS saved_posts (
+    hash TEXT PRIMARY KEY,
+    saved_at REAL NOT NULL
 );
 """
 
@@ -948,6 +961,7 @@ def annotate_replies(
     posts: List[Dict[str, Any]],
     *,
     muted_keywords: Optional[Sequence[str]] = None,
+    exclude_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``reply_to`` parent summary to reply entries, in place.
 
@@ -958,7 +972,9 @@ def annotate_replies(
     stays readable without resurfacing removed content.  A parent
     matching a muted keyword (see :func:`muted_keywords`) is reported
     the same way, with its text blanked and ``muted`` set, so the
-    muted content does not leak through the preview.  Top-level
+    muted content does not leak through the preview.  A parent whose
+    author is in *exclude_authors* (muted) is reported as ``None`` so
+    its name and text never surface.  Top-level
     posts get no ``reply_to`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -997,7 +1013,9 @@ def annotate_replies(
         if post.get("kind") != KIND_REPLY:
             continue
         parent = parents.get(str(post.get("target") or ""))
-        if parent is None:
+        if parent is None or (
+            exclude_authors and parent["author"] in exclude_authors
+        ):
             post["reply_to"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
@@ -1148,6 +1166,7 @@ def feed(
     all_authors: bool = False,
     before: Optional[float] = None,
     posts_only: bool = False,
+    exclude_authors: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Read cached entries in chain order or reverse chronological order.
 
@@ -1175,6 +1194,17 @@ def feed(
     where = "linked = 1"
     if posts_only:
         where += f" AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+    if exclude_authors:
+        # Display-only exclusion: the author-specific path above is an
+        # explicit lookup and never excludes.  Sync callers leave this
+        # unset, so chains stay complete for every author.
+        clean_excluded = [
+            _require_hex(item, AUTHOR_HEX_LENGTH, "author")
+            for item in exclude_authors
+        ]
+        placeholders = ", ".join("?" for _ in clean_excluded)
+        where += f" AND author NOT IN ({placeholders})"
+        params.extend(clean_excluded)
     if before is not None:
         where += " AND created_at < ?"
         params.append(float(before))
@@ -1316,10 +1346,12 @@ def timeline(
     muted keyword (see :func:`muted_keywords`) never appear either,
     and a reply to one keeps its ``reply_to`` preview text blanked —
     muting is display-only, so entries stay stored and unmuting
-    restores them.  Pages are read until ``limit`` unmuted posts are
+    restores them.  Posts by muted authors never appear either, for the
+    same reason.  Pages are read until ``limit`` unmuted posts are
     collected or the feed is exhausted, so muted posts never shrink the
     result below what is available.
     """
+    silenced = muted_author_set(conn)
     keywords = _muted_keyword_list(conn)
     if include_all:
         posts = _fill_unmuted(
@@ -1327,7 +1359,11 @@ def timeline(
             keywords,
             limit,
             lambda cursor: feed(
-                conn, limit=MAX_FEED_POSTS, before=cursor, posts_only=True
+                conn,
+                limit=MAX_FEED_POSTS,
+                before=cursor,
+                posts_only=True,
+                exclude_authors=silenced,
             ),
             before,
             lambda post: float(post["created_at"]),
@@ -1336,10 +1372,12 @@ def timeline(
             conn,
             annotate_reactions(conn, posts, viewer=viewer),
             muted_keywords=keywords,
+            exclude_authors=silenced,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
     ]
+    clean_authors = [author for author in clean_authors if author not in silenced]
     if not clean_authors:
         return []
     placeholders = ", ".join("?" for _ in clean_authors)
@@ -1373,6 +1411,7 @@ def timeline(
         conn,
         annotate_reactions(conn, posts, viewer=viewer),
         muted_keywords=keywords,
+        exclude_authors=silenced,
     )
 
 
@@ -1550,7 +1589,11 @@ def thread(
     sibling — with siblings oldest first, so the thread reads as a
     conversation.  Deleted and unlinked entries never appear, and a
     reply to a deleted entry is hidden with its parent's subtree rather
-    than re-parented.  An unknown, ambiguous or deleted reference
+    than re-parented.  Replies by muted authors are hidden the same
+    way, subtree included — except the entry the caller named, which
+    always anchors the thread even when its author is muted, and a
+    muted ancestor above it, which simply ends the climb instead of
+    being promoted to the root.  An unknown, ambiguous or deleted reference
     raises :class:`TanError`, exactly as :func:`resolve_post` does; so
     does a reference to an unlinked entry or to a reply beneath a
     deleted entry, since showing it would present a partial thread.
@@ -1564,13 +1607,16 @@ def thread(
     if not start.get("linked"):
         # A cached entry still awaiting its chain predecessor is not shown.
         raise TanError(f"post has not linked yet: {ref!r}")
+    silenced = muted_author_set(conn)
     muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
     root = start
     ancestors = {root["hash"]}
     # Once a muted entry is met (the named entry itself, or an ancestor),
     # the visible root stops moving, but the climb continues so that
     # deleted ancestors above it are still rejected.
-    anchored = _text_matches_muted_keywords(str(start.get("text") or ""), muted_pattern)
+    anchored = start["author"] in silenced or _text_matches_muted_keywords(
+        str(start.get("text") or ""), muted_pattern
+    )
     cursor = start
     while cursor.get("kind") == KIND_REPLY and cursor.get("target"):
         parent = get_post(conn, str(cursor["target"]))
@@ -1589,8 +1635,11 @@ def thread(
             break
         ancestors.add(parent["hash"])
         cursor = parent
-        if not anchored and _text_matches_muted_keywords(
-            str(parent.get("text") or ""), muted_pattern
+        if not anchored and (
+            parent["author"] in silenced
+            or _text_matches_muted_keywords(
+                str(parent.get("text") or ""), muted_pattern
+            )
         ):
             # A muted ancestor ends the visible climb: the named entry
             # anchors its own thread rather than promoting the muted
@@ -1625,11 +1674,13 @@ def thread(
             _public_posts(rows), key=lambda post: (post["created_at"], post["hash"])
         )
         # A muted reply hides its whole subtree: it never enters the
-        # frontier, so its own replies are never collected.
+        # frontier, so its own replies are never collected.  Replies by
+        # muted authors are hidden the same way.
         children = [
             child
             for child in generation
             if child["hash"] not in seen
+            and child["author"] not in silenced
             and not _text_matches_muted_keywords(
                 str(child.get("text") or ""), muted_pattern
             )
@@ -1688,7 +1739,9 @@ def search_posts(
     local post table only, which a personal mesh feed keeps small.
 
     Search is an explicit lookup, so it ignores muted keywords
-    entirely: searching for a word you muted still finds it.
+    entirely: searching for a word you muted still finds it.  Posts by
+    muted authors never match an open search either; searching with an
+    explicit *author* is a direct lookup and still shows their posts.
     """
     if not isinstance(query, str) or not query.strip():
         raise TanError("search text must not be empty")
@@ -1706,7 +1759,79 @@ def search_posts(
         params,
     ).fetchall()
     matches = [row for row in rows if needle in str(row["text"]).casefold()]
+    if author is None:
+        silenced = muted_author_set(conn)
+        matches = [row for row in matches if str(row["author"]) not in silenced]
     return annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer)
+
+
+# Mentions share search's ceiling: they are a display surface like the
+# timeline, not a sync page.
+MAX_MENTIONS_POSTS = MAX_SEARCH_POSTS
+
+
+def _hidden_under_deleted(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """Whether the reply *row* sits beneath a deleted ancestor.
+
+    Walks up from the reply's target the same way :func:`thread` walks
+    up to its root, stopping where the thread view stops, and reports
+    True when any entry on that chain has been deleted by its author.
+    """
+    seen = {str(row["hash"])}
+    parent_hash = str(row["target"] or "")
+    while parent_hash and parent_hash not in seen:
+        seen.add(parent_hash)
+        parent = get_post(conn, parent_hash)
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            return False
+        if _is_deleted(conn, parent):
+            return True
+        if not parent.get("linked") or parent.get("kind") != KIND_REPLY:
+            return False
+        parent_hash = str(parent.get("target") or "")
+    return False
+
+
+def mentions(
+    conn: sqlite3.Connection,
+    viewer: str,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Return stored replies to the viewer's own posts, newest first.
+
+    A mention is a linked ``reply`` entry whose target is a linked
+    ``post`` or ``reply`` authored by *viewer* — a reply to something
+    you wrote, including a reply to one of your own replies.  A reply
+    you wrote to your own post is not a mention of you.  The same
+    hiding rules as the thread view apply: a reply its author deleted
+    never appears, and neither does a reply to a post you deleted.
+    Unlinked replies never appear either.  Results carry the same like
+    annotations and ``reply_to`` parent summary as the timeline, and
+    the query reads only the local store: it makes no network requests.
+    """
+    viewer = _require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer")
+    count = max(1, min(int(limit), MAX_MENTIONS_POSTS))
+    rows = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r "
+        "WHERE r.linked = 1 AND r.kind = 'reply' AND r.author != ? "
+        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+        "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
+        "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
+        "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
+        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+        "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
+        "ORDER BY r.created_at DESC, r.hash DESC",
+        (viewer, viewer),
+    ).fetchall()
+    # A reply beneath a deleted ancestor is hidden with that subtree, as
+    # the thread view hides it, so filter on the ancestor chain before
+    # applying the limit to keep the requested count of visible mentions.
+    visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
+    rows = visible[:count]
+    return annotate_replies(
+        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+    )
 
 
 def follow(
@@ -1867,6 +1992,65 @@ def muted_keywords(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
+def mute(
+    conn: sqlite3.Connection,
+    author: str,
+    *,
+    name: str = "",
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Mute *author*: hide their posts from local views, keep storing them.
+
+    Muting is display-only, unlike blocking at admission: the author's
+    entries keep syncing and stay stored, so unmuting restores the full
+    history.  Re-muting an already-muted author keeps the original
+    ``muted_at`` and only refreshes the stored name when one is given.
+    """
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    clean_name = sanitize_name(name, fallback="") if name else ""
+    timestamp = float(now if now is not None else time.time())
+    existing = conn.execute(
+        "SELECT muted_at FROM muted_authors WHERE author = ?", (author,)
+    ).fetchone()
+    if existing is None:
+        count = conn.execute("SELECT COUNT(*) AS n FROM muted_authors").fetchone()["n"]
+        if int(count) >= MAX_MUTED:
+            raise TanError(f"mute list is limited to {MAX_MUTED} authors")
+    with conn:
+        conn.execute(
+            "INSERT INTO muted_authors(author, name, muted_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(author) DO UPDATE SET "
+            "name = CASE WHEN excluded.name != '' THEN excluded.name ELSE muted_authors.name END, "
+            "muted_at = muted_authors.muted_at",
+            (author, clean_name, timestamp),
+        )
+    if existing is not None:
+        timestamp = float(existing["muted_at"])
+    return {"author": author, "name": clean_name, "muted_at": timestamp}
+
+
+def unmute(conn: sqlite3.Connection, author: str) -> bool:
+    author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+    with conn:
+        cursor = conn.execute("DELETE FROM muted_authors WHERE author = ?", (author,))
+    return cursor.rowcount > 0
+
+
+def muted(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Muted authors, most recently muted first."""
+    rows = conn.execute(
+        "SELECT author, name, muted_at FROM muted_authors ORDER BY muted_at DESC"
+    ).fetchall()
+    return [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"]),
+            "muted_at": float(row["muted_at"]),
+        }
+        for row in rows
+    ]
+
+
 def _muted_keyword_list(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute("SELECT keyword FROM muted_keywords").fetchall()
     return [str(row["keyword"]) for row in rows]
@@ -1896,6 +2080,139 @@ def without_muted_keywords(
         for post in posts
         if not _text_matches_muted_keywords(str(post.get("text") or ""), pattern)
     ]
+
+
+def muted_author_set(conn: sqlite3.Connection) -> Set[str]:
+    """Authors currently muted, as a set of destination hashes."""
+    rows = conn.execute("SELECT author FROM muted_authors").fetchall()
+    return {str(row["author"]) for row in rows}
+
+
+def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
+    """Resolve a saved-post reference to a cached post hash.
+
+    Unlike :func:`resolve_post`, a post its author deleted still
+    resolves: unsaving must keep working after the save's target is
+    deleted.  A reference to nothing cached fails as unknown.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise TanError("post reference must not be empty")
+    value = ref.strip().lower()
+    if len(value) == HASH_HEX_LENGTH:
+        post = get_post(conn, _require_hex(value, HASH_HEX_LENGTH, "post"))
+        if post is not None and post.get("kind", KIND_POST) in TIMELINE_KINDS:
+            return str(post["hash"])
+        raise TanError(f"unknown post: {ref!r}")
+    if len(value) >= 8:
+        try:
+            bytes.fromhex(value)
+        except ValueError:
+            raise TanError(f"unknown post: {ref!r}") from None
+        rows = conn.execute(
+            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "AND hash LIKE ? LIMIT 8",
+            (value + "%",),
+        ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["hash"])
+        if len(rows) > 1:
+            raise TanError(f"{len(rows)} posts match prefix {value!r}")
+    raise TanError(f"unknown post: {ref!r}")
+
+
+def save_post(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Save a cached post to the local read-later list.
+
+    Saves are private to this node — no signed entry, nothing gossiped.
+    The target must be a cached, linked post or reply that has not been
+    deleted; saving the same post twice is a no-op that reports the
+    original save time.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        raise TanError("post has not linked yet; sync its chain before saving")
+    digest = str(post["hash"])
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing save and the
+    # capacity, so a competing save cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT saved_at FROM saved_posts WHERE hash = ?", (digest,)
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "hash": digest,
+                "author": str(post["author"]),
+                "name": str(post.get("name") or ""),
+                "saved_at": float(existing["saved_at"]),
+                "already_saved": True,
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM saved_posts").fetchone()["n"]
+        if int(count) >= MAX_SAVED_POSTS:
+            raise TanError(f"saved posts are limited to {MAX_SAVED_POSTS} entries")
+        conn.execute(
+            "INSERT INTO saved_posts(hash, saved_at) VALUES(?, ?)",
+            (digest, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {
+        "hash": digest,
+        "author": str(post["author"]),
+        "name": str(post.get("name") or ""),
+        "saved_at": timestamp,
+        "already_saved": False,
+    }
+
+
+def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Remove a post from the local read-later list.
+
+    Returns the resolved post hash with whether a save was removed, so
+    callers — including ``--json`` output — can identify the post even
+    when *ref* was a short prefix.
+    """
+    digest = _resolve_saved_ref(conn, ref)
+    with conn:
+        cursor = conn.execute("DELETE FROM saved_posts WHERE hash = ?", (digest,))
+    return {"hash": digest, "unsaved": cursor.rowcount > 0}
+
+
+def saved_posts(
+    conn: sqlite3.Connection, *, limit: int = DEFAULT_FEED_LIMIT
+) -> List[Dict[str, Any]]:
+    """Saved posts, newest save first.
+
+    A post deleted after being saved stays in the list with its text
+    blanked and ``deleted`` set, so the save is not silently lost.
+    """
+    count = max(1, min(int(limit), MAX_SAVED_POSTS))
+    rows = conn.execute(
+        "SELECT p.*, s.saved_at FROM saved_posts s "
+        "JOIN posts p ON p.hash = s.hash "
+        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ?",
+        (count,),
+    ).fetchall()
+    deleted = deleted_targets(conn)
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        post = _row_to_post(row)
+        post["saved_at"] = float(row["saved_at"])
+        if str(post["hash"]) in deleted:
+            post["deleted"] = True
+            post["text"] = ""
+        records.append(post)
+    return records
+
 
 
 def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
@@ -1953,11 +2270,17 @@ def resolve_author(
     if len(value) >= 4:
         prefix = value.casefold()
         rows = conn.execute(
-            "SELECT DISTINCT author, name FROM posts WHERE author LIKE ? LIMIT 8",
+            "SELECT DISTINCT author FROM posts WHERE author LIKE ? LIMIT 8",
             (prefix + "%",),
         ).fetchall()
         if len(rows) == 1:
-            return str(rows[0]["author"]), str(rows[0]["name"])
+            author = str(rows[0]["author"])
+            row = conn.execute(
+                "SELECT name FROM posts WHERE author = ? AND name != '' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (author,),
+            ).fetchone()
+            return author, (str(row["name"]) if row is not None else "")
         if len(rows) > 1:
             raise TanError(f"{len(rows)} cached authors match {value!r}")
 
@@ -1992,6 +2315,29 @@ def resolve_cached_author(conn: sqlite3.Connection, name: str) -> Tuple[str, str
             "use a destination hash"
         )
     raise TanError(f"no cached posts from an author named {clean!r}")
+
+
+def resolve_muted_name(conn: sqlite3.Connection, name: str) -> Optional[Tuple[str, str]]:
+    """Resolve a muted author by the name recorded when they were muted.
+
+    Returns ``None`` when no muted author has that name.  The match is
+    case-insensitive; more than one match is an error asking for a hash.
+    """
+    clean = name.strip() if isinstance(name, str) else ""
+    if not clean:
+        return None
+    rows = conn.execute(
+        "SELECT author, name FROM muted_authors WHERE name = ? COLLATE NOCASE",
+        (clean,),
+    ).fetchall()
+    if len(rows) == 1:
+        return str(rows[0]["author"]), str(rows[0]["name"])
+    if len(rows) > 1:
+        raise TanError(
+            f"{len(rows)} muted authors are named {clean!r}; "
+            "use a destination hash"
+        )
+    return None
 
 
 # -- network application ---------------------------------------------------
