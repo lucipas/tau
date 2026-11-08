@@ -1316,19 +1316,25 @@ def timeline(
     muted keyword (see :func:`muted_keywords`) never appear either,
     and a reply to one keeps its ``reply_to`` preview text blanked —
     muting is display-only, so entries stay stored and unmuting
-    restores them.  The page ``limit`` applies before the mute filter,
-    so a heavily muted page can return fewer than ``limit`` posts.
+    restores them.  Pages are read until ``limit`` unmuted posts are
+    collected or the feed is exhausted, so muted posts never shrink the
+    result below what is available.
     """
     keywords = _muted_keyword_list(conn)
     if include_all:
-        posts = feed(conn, limit=limit, before=before, posts_only=True)
+        posts = _fill_unmuted(
+            conn,
+            keywords,
+            limit,
+            lambda cursor: feed(
+                conn, limit=MAX_FEED_POSTS, before=cursor, posts_only=True
+            ),
+            before,
+            lambda post: float(post["created_at"]),
+        )
         return annotate_replies(
             conn,
-            annotate_reactions(
-                conn,
-                without_muted_keywords(conn, posts, keywords),
-                viewer=viewer,
-            ),
+            annotate_reactions(conn, posts, viewer=viewer),
             muted_keywords=keywords,
         )
     clean_authors = [
@@ -1337,29 +1343,98 @@ def timeline(
     if not clean_authors:
         return []
     placeholders = ", ".join("?" for _ in clean_authors)
-    params: List[Any] = list(clean_authors)
-    where = (
-        f"linked = 1 AND kind IN ('post', 'reply') AND author IN ({placeholders}) "
-        f"AND {_NOT_DELETED}"
+
+    def page(cursor: Optional[float]) -> List[Dict[str, Any]]:
+        params: List[Any] = list(clean_authors)
+        where = (
+            f"linked = 1 AND kind IN ('post', 'reply') AND author IN ({placeholders}) "
+            f"AND {_NOT_DELETED}"
+        )
+        if cursor is not None:
+            where += " AND created_at < ?"
+            params.append(float(cursor))
+        params.append(MAX_FEED_POSTS)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
+            "ORDER BY created_at DESC, hash DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return _public_posts(rows)
+
+    posts = _fill_unmuted(
+        conn,
+        keywords,
+        limit,
+        page,
+        before,
+        lambda post: float(post["created_at"]),
     )
-    if before is not None:
-        where += " AND created_at < ?"
-        params.append(float(before))
-    params.append(max(1, min(int(limit), 200)))
-    rows = conn.execute(
-        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
-        "ORDER BY created_at DESC, hash DESC LIMIT ?",
-        params,
-    ).fetchall()
     return annotate_replies(
         conn,
-        annotate_reactions(
-            conn,
-            without_muted_keywords(conn, _public_posts(rows), keywords),
-            viewer=viewer,
-        ),
+        annotate_reactions(conn, posts, viewer=viewer),
         muted_keywords=keywords,
     )
+
+
+def author_timeline(
+    conn: sqlite3.Connection,
+    author: str,
+    *,
+    limit: int = 30,
+    viewer: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return one author's posts newest first, with muted posts skipped.
+
+    Pages through the author's chain until *limit* unmuted posts are
+    collected, so muted posts never shrink the result.  Reply previews
+    are redacted for muted parents, as in :func:`timeline`.
+    """
+    keywords = _muted_keyword_list(conn)
+    posts = _fill_unmuted(
+        conn,
+        keywords,
+        limit,
+        lambda cursor: feed(
+            conn,
+            author=author,
+            after_seq=int(cursor),
+            limit=MAX_FEED_POSTS,
+            posts_only=True,
+        ),
+        0,
+        lambda post: post["seq"],
+    )
+    return annotate_replies(
+        conn,
+        annotate_reactions(conn, list(reversed(posts)), viewer=viewer),
+        muted_keywords=keywords,
+    )
+
+
+def _fill_unmuted(
+    conn: sqlite3.Connection,
+    keywords: List[str],
+    limit: int,
+    fetch: Callable[[Any], List[Dict[str, Any]]],
+    cursor: Any,
+    next_cursor: Callable[[Dict[str, Any]], Any],
+) -> List[Dict[str, Any]]:
+    """Collect up to *limit* unmuted posts by paging through *fetch*.
+
+    *fetch* receives a cursor and returns one page of at most
+    ``MAX_FEED_POSTS`` posts in feed order; *next_cursor* derives the
+    cursor for the page after the last post it returned.  A short page
+    means the feed is exhausted.
+    """
+    wanted = max(1, min(int(limit), 200))
+    kept: List[Dict[str, Any]] = []
+    while len(kept) < wanted:
+        page = fetch(cursor)
+        kept.extend(without_muted_keywords(conn, page, keywords))
+        if len(page) < MAX_FEED_POSTS:
+            break
+        cursor = next_cursor(page[-1])
+    return kept[:wanted]
 
 
 # Upper bound on bound parameters per thread query.  SQLite builds often cap
@@ -1408,32 +1483,36 @@ def thread(
     muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
     root = start
     ancestors = {root["hash"]}
-    if not _text_matches_muted_keywords(str(start.get("text") or ""), muted_pattern):
-        # A muted start anchors its own visible thread, so the climb
-        # is skipped entirely — mirroring the muted-author rule.
-        while root.get("kind") == KIND_REPLY and root.get("target"):
-            parent = get_post(conn, str(root["target"]))
-            if parent is None or parent.get("kind") not in TIMELINE_KINDS:
-                break
-            if parent["hash"] in ancestors:
-                break
-            if _is_deleted(conn, parent):
-                # Replies under a deleted entry stay hidden, even when named
-                # directly, so refuse rather than showing a fragment.  The
-                # deletion check comes before the unlinked shortcut: a
-                # deleted parent whose chain never linked up hides its
-                # subtree just the same.
-                raise TanError(f"post has been deleted: {ref!r}")
-            if _text_matches_muted_keywords(
-                str(parent.get("text") or ""), muted_pattern
-            ):
-                # A muted ancestor ends the climb: the named entry anchors
-                # its own visible thread rather than promoting the muted
-                # parent to the root.
-                break
-            if not parent.get("linked"):
-                break
-            ancestors.add(parent["hash"])
+    # Once a muted entry is met (the named entry itself, or an ancestor),
+    # the visible root stops moving, but the climb continues so that
+    # deleted ancestors above it are still rejected.
+    anchored = _text_matches_muted_keywords(str(start.get("text") or ""), muted_pattern)
+    cursor = start
+    while cursor.get("kind") == KIND_REPLY and cursor.get("target"):
+        parent = get_post(conn, str(cursor["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in ancestors:
+            break
+        if _is_deleted(conn, parent):
+            # Replies under a deleted entry stay hidden, even when named
+            # directly, so refuse rather than showing a fragment.  The
+            # deletion check comes before the unlinked shortcut: a
+            # deleted parent whose chain never linked up hides its
+            # subtree just the same.
+            raise TanError(f"post has been deleted: {ref!r}")
+        if not parent.get("linked"):
+            break
+        ancestors.add(parent["hash"])
+        cursor = parent
+        if not anchored and _text_matches_muted_keywords(
+            str(parent.get("text") or ""), muted_pattern
+        ):
+            # A muted ancestor ends the visible climb: the named entry
+            # anchors its own thread rather than promoting the muted
+            # parent to the root.
+            anchored = True
+        if not anchored:
             root = parent
     root = _canonical_post(root)
     # Collect descendants level by level — one query per depth, so a

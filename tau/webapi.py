@@ -588,15 +588,11 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
-            annotate_reactions,
-            annotate_replies,
             apply_display_rules,
-            feed,
+            author_timeline,
             following,
-            muted_keywords,
             resolve_author,
             timeline,
-            without_muted_keywords,
         )
 
         conn = self._tan_conn()
@@ -611,21 +607,7 @@ class WebBridge:
                 )
             if author:
                 target, _ = resolve_author(conn, author, registry=self.node.registry)
-                posts = list(
-                    reversed(
-                        feed(conn, author=target, limit=limit, posts_only=True)
-                    )
-                )
-                keywords = [record["keyword"] for record in muted_keywords(conn)]
-                posts = annotate_replies(
-                    conn,
-                    annotate_reactions(
-                        conn,
-                        without_muted_keywords(conn, posts, keywords),
-                        viewer=viewer,
-                    ),
-                    muted_keywords=keywords,
-                )
+                posts = author_timeline(conn, target, limit=limit, viewer=viewer)
             elif include_all:
                 posts = timeline(conn, include_all=True, limit=limit, viewer=viewer)
             else:
@@ -1456,6 +1438,25 @@ def _query_flag(query: Dict[str, List[str]], name: str) -> bool:
     if not values:
         return False
     return values[0].strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_param(
+    query: Dict[str, List[str]],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = query.get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int_param(

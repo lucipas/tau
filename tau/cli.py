@@ -51,12 +51,10 @@ from .tangents.tan import (
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
-    annotate_reactions,
-    annotate_replies,
     apply_display_rules,
     author_stats,
+    author_timeline,
     export_entries,
-    feed,
     follow,
     following,
     import_entries,
@@ -72,7 +70,6 @@ from .tangents.tan import (
     timeline,
     unfollow,
     unmute_keyword,
-    without_muted_keywords,
 )
 
 log = logging.getLogger(__name__)
@@ -299,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
     )
-    ping.add_argument("--to", required=True, metavar="NAME|HASH")
+    ping.add_argument("--to", required=True, metavar="NAME|HANAME|HASH")
     ping.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     ping.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     ping.set_defaults(func=cmd_ping)
@@ -1348,21 +1345,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
-            posts = list(
-                reversed(
-                    feed(conn, author=author, limit=args.limit, posts_only=True)
-                )
-            )
-            keywords = [record["keyword"] for record in muted_keywords(conn)]
-            posts = annotate_replies(
-                conn,
-                annotate_reactions(
-                    conn,
-                    without_muted_keywords(conn, posts, keywords),
-                    viewer=viewer,
-                ),
-                muted_keywords=keywords,
-            )
+            posts = author_timeline(conn, author, limit=args.limit, viewer=viewer)
         elif getattr(args, "all", False):
             posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
         else:

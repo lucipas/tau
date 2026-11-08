@@ -1988,6 +1988,31 @@ def test_timeline_blanks_muted_reply_parent_preview(identities, tmp_path):
     assert preview["deleted"] is False
 
 
+def test_timeline_pages_past_muted_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "older clean post", name="alice", now=1000)
+    for index in range(25):
+        create_post(conn, alice, f"crypto {index}", name="alice", now=2000 + index)
+    mute_keyword(conn, "crypto")
+
+    # More muted posts than one page must not hide the older clean post.
+    items = timeline(conn, include_all=True, limit=5)
+    assert [item["text"] for item in items] == ["older clean post"]
+
+
+def test_author_timeline_pages_past_muted_posts(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for index in range(25):
+        create_post(conn, alice, f"crypto {index}", name="alice", now=1000 + index)
+    create_post(conn, alice, "clean ending", name="alice", now=2000)
+    mute_keyword(conn, "crypto")
+
+    items = author_timeline(conn, author_of(alice), limit=5)
+    assert [item["text"] for item in items] == ["clean ending"]
+
+
 def test_thread_hides_muted_reply_subtree(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -2029,6 +2054,45 @@ def test_thread_stops_climb_at_muted_ancestor(identities, tmp_path):
     items = thread(conn, nested["hash"])
     assert [item["hash"] for item in items] == [reply["hash"], nested["hash"]]
     assert [item["depth"] for item in items] == [0, 1]
+
+
+def test_thread_rejects_muted_named_reply_beneath_deleted_post(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    muted = create_reply(
+        conn, bob, post["hash"], "crypto thread", name="bob", now=1001
+    )
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    mute_keyword(conn, "crypto")
+
+    # A muted entry skips the visible climb, but a deleted ancestor
+    # still hides it rather than showing it as a fragment.
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, muted["hash"])
+
+
+def test_thread_rejects_reply_beneath_muted_ancestor_with_deleted_parent(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    muted = create_reply(
+        conn, bob, post["hash"], "crypto chat", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, muted["hash"], "deeper reply", name="alice", now=1002
+    )
+    create_delete(conn, alice, post["hash"], name="alice", now=1003)
+    mute_keyword(conn, "crypto")
+
+    # The muted ancestor ends the visible climb, but the deleted post
+    # above it must still be detected.
+    with pytest.raises(TanError, match="has been deleted"):
+        thread(conn, nested["hash"])
 
 
 def test_search_ignores_muted_keywords(identities, tmp_path):
@@ -2110,6 +2174,11 @@ def test_cli_mute_keyword(tmp_path, capsys):
         main(["tan", "timeline", "--data-dir", str(data_dir), "--json"]) == 0
     )
     payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "mesh notes",
+        "crypto to the moon",
+    ]
+)
     assert [post["text"] for post in payload["posts"]] == [
         "mesh notes",
         "crypto to the moon",
