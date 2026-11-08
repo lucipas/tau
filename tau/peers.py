@@ -48,6 +48,25 @@ def _clean_stored_alias(value: Any) -> Optional[str]:
     return alias
 
 
+def _dedupe_aliases(peers: Iterable[Peer]) -> None:
+    """Drop duplicate aliases in place, keeping the first occurrence.
+
+    Aliases must be unique across the registry for ``resolve`` to pick
+    exactly one peer.  A file written by two racing writers can hold
+    the same alias twice; dropping the later ones keeps resolution
+    unambiguous and lets the next save heal the file.
+    """
+    seen: set = set()
+    for peer in peers:
+        if peer.alias is None:
+            continue
+        key = peer.alias.casefold()
+        if key in seen:
+            peer.alias = None
+        else:
+            seen.add(key)
+
+
 class PeerError(RuntimeError):
     """Base class for peer lookup problems."""
 
@@ -352,7 +371,10 @@ class PeerRegistry:
         (``tau peers alias``) while the node serves would be lost at the
         next save.  Only aliases are refreshed — peer records themselves
         are this process's observations — and a peer absent from the file
-        keeps its alias.  Returns the number of peers whose alias changed.
+        keeps its alias.  A disk alias that another in-memory peer
+        already holds is not applied: applying it would leave two peers
+        sharing one alias and make resolution ambiguous.  Returns the
+        number of peers whose alias changed.
         """
         if self.path is None:
             return 0
@@ -362,6 +384,12 @@ class PeerRegistry:
             return 0
         changed = 0
         with self._lock:
+            claimed: Dict[str, bytes] = {}
+            for peer in self._peers.values():
+                if peer.alias is not None:
+                    claimed.setdefault(
+                        peer.alias.casefold(), peer.destination_hash
+                    )
             for entry in entries:
                 if not isinstance(entry, dict) or "alias" not in entry:
                     continue
@@ -374,8 +402,19 @@ class PeerRegistry:
                 if peer is None:
                     continue
                 alias = _clean_stored_alias(entry.get("alias"))
+                if alias is not None:
+                    owner = claimed.get(alias.casefold())
+                    if owner is not None and owner != peer.destination_hash:
+                        # Another peer already holds this alias (for
+                        # example one missing from this file kept it);
+                        # applying it here would make the alias ambiguous.
+                        continue
                 if peer.alias != alias:
+                    if peer.alias is not None:
+                        claimed.pop(peer.alias.casefold(), None)
                     peer.alias = alias
+                    if alias is not None:
+                        claimed[alias.casefold()] = peer.destination_hash
                     changed += 1
         return changed
 
@@ -513,6 +552,8 @@ class PeerRegistry:
                 log.debug("Skipping invalid peer entry: %s", exc)
                 continue
             loaded[peer.destination_hash] = peer
+
+        _dedupe_aliases(loaded.values())
 
         with self._lock:
             self._peers = loaded

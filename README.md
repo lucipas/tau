@@ -414,7 +414,10 @@ while it serves at its next registry save. Remove one with
 `tau peers unalias PEER`. The DM allow-list is the exception to alias
 resolution: `tau allowlist add` matches asserted names, hashes, and hash
 prefixes only, and lists asserted names, so a local label can never
-stand in for who was actually allowed.
+stand in for who was actually allowed. If a registry file ever holds
+the same alias twice (two writers racing), the first peer keeps it and
+the other is dropped on load, so an alias always resolves to exactly
+one peer.
 
 ### Messaging
 

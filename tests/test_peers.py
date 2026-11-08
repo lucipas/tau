@@ -625,3 +625,52 @@ def test_resolve_can_exclude_aliases(tmp_path):
     assert registry.resolve("LAPTOP", include_alias=False) is named
     assert registry.resolve("dave", include_alias=False) is aliased
     assert registry.resolve("laptop", include_alias=True) is aliased
+
+
+def test_load_drops_duplicate_aliases(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    first = make_peer(registry, 20, "rachel", now=100.0)
+    second = make_peer(registry, 21, "sam", now=200.0)
+    registry.set_alias(first.hexhash, "shared")
+    registry.set_alias(second.hexhash, "other")
+    registry.save()
+
+    # Two writers racing can leave the same alias on two peers; the
+    # file keeps the first occurrence and drops the second on load.
+    raw = json.loads(path.read_text())
+    raw["peers"][1]["alias"] = "SHARED"
+    path.write_text(json.dumps(raw))
+
+    reloaded = PeerRegistry(path)
+    assert reloaded.get(first.destination_hash).alias == "shared"
+    assert reloaded.get(second.destination_hash).alias is None
+    assert reloaded.resolve("shared") is reloaded.get(first.destination_hash)
+
+
+def test_refresh_aliases_never_creates_a_collision(tmp_path):
+    path = tmp_path / "peers.json"
+    node_view = PeerRegistry(path)
+    first = make_peer(node_view, 22, "tina", now=100.0)
+    second = make_peer(node_view, 23, "uma", now=200.0)
+    node_view.set_alias(first.hexhash, "field-kit")
+
+    # A stale one-shot snapshot that omits the first peer and gives its
+    # alias to the second one.
+    raw = json.loads(path.read_text())
+    raw["peers"] = [entry for entry in raw["peers"] if entry["destination"] != first.hexhash]
+    raw["peers"][0]["alias"] = "field-kit"
+    path.write_text(json.dumps(raw))
+
+    assert node_view.refresh_aliases() == 0
+    # The first peer kept its alias (it was absent from the file) and
+    # the colliding alias was not applied to the second peer.
+    assert node_view.get(first.destination_hash).alias == "field-kit"
+    assert node_view.get(second.destination_hash).alias is None
+    assert node_view.resolve("field-kit") is node_view.get(first.destination_hash)
+
+    # The node's next save heals the file instead of persisting the clash.
+    node_view.save()
+    healed = PeerRegistry(path)
+    assert healed.get(first.destination_hash).alias == "field-kit"
+    assert healed.get(second.destination_hash).alias is None
