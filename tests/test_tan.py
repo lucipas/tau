@@ -761,6 +761,33 @@ def test_likers_works_on_replies(identities, tmp_path):
     ]
 
 
+def test_likers_rejects_unlinked_entry(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    digest = "cd" * 32
+    _insert_stub(conn, digest, author=author_of(alice), linked=False)
+
+    with pytest.raises(TanError, match="has not linked yet"):
+        likers(conn, digest)
+
+
+def test_likers_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    first = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    nested = create_reply(
+        conn, alice, first["hash"], "reply to the reply", name="alice", now=1002
+    )
+    create_delete(conn, bob, first["hash"], name="bob", now=1003)
+
+    # Naming the nested reply directly must not show its likers either.
+    with pytest.raises(TanError, match="has been deleted"):
+        likers(conn, nested["hash"])
+
+
 def test_reaction_rejects_tampering(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -1903,6 +1930,23 @@ def test_cli_tan_likes(tmp_path, capsys):
         main(["tan", "likes", "--data-dir", str(data_dir), "cd" * 32]) != 0
     )
     assert "tau: error: unknown post" in capsys.readouterr().err
+
+    # A post the owner's display rules hide is refused, like the thread view.
+    assert (
+        main(
+            [
+                "tan", "rules", "--data-dir", str(data_dir),
+                "--kinds", "like",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(["tan", "likes", "--data-dir", str(data_dir), post["hash"][:16]])
+        != 0
+    )
+    assert "hidden by your Tan display rules" in capsys.readouterr().err
 
 
 def test_cli_post_reply_to(tmp_path):

@@ -533,7 +533,8 @@ tau tan likes 5c04c868         # names the authors whose like currently stands
 
 The timeline only shows counts. `tau tan likes` prints the post followed by
 one line per liker; an author who unliked, or whose like was superseded by a
-later unlike, does not appear.
+later unlike, does not appear. Like the thread view, it refuses a post your
+Tan display rules hide.
 
 The web console shows the same counts with a ♥ toggle on every post
 (`POST /api/tan/like` / `POST /api/tan/unlike`).

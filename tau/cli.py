@@ -1437,6 +1437,14 @@ def cmd_tan_likes(args: argparse.Namespace) -> int:
         result = likers(conn, args.ref)
     finally:
         conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    if not apply_display_rules([result["post"]], display_ruleset):
+        # Like thread() and search(): a post the owner's display rules
+        # hide is not shown here either.
+        raise TanError(f"post is hidden by your Tan display rules: {args.ref!r}")
     _print_tan_likes(result, json_output=json_output)
     return _EXIT_OK
 

@@ -918,12 +918,15 @@ def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
 
     *ref* is a post or reply hash or unique prefix, resolved exactly as
     :func:`resolve_post` does — an unknown, ambiguous or deleted
-    reference raises :class:`TanError`.  The result carries the resolved
-    post under ``"post"`` and the current likers under ``"likers"``: one
-    ``{"author": ..., "name": ...}`` record per reactor whose latest
-    reaction for the post is a like, sorted by name then author hash.
-    The name is the one on the reactor's latest reaction entry for the
-    post.  Only linked reactions count, like :func:`reaction_states`.
+    reference raises :class:`TanError`.  Like :func:`thread`, an
+    unlinked entry and a reply beneath a deleted ancestor are refused
+    the same way, so no likers are shown for a post the thread view
+    would hide.  The result carries the resolved post under ``"post"``
+    and the current likers under ``"likers"``: one ``{"author": ...,
+    "name": ...}`` record per reactor whose latest reaction for the
+    post is a like, sorted by name then author hash.  The name is the
+    one on the reactor's latest reaction entry for the post.  Only
+    linked reactions count, like :func:`reaction_states`.
     """
     post = resolve_post(conn, ref)
     if not post.get("linked"):
@@ -947,12 +950,14 @@ def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     current = [a for a, kind in states.items() if kind == KIND_LIKE]
     records: List[Dict[str, Any]] = []
     if current:
-        placeholders = ", ".join("?" for _ in current)
+        # One target-scoped query, no author list expanded into
+        # placeholders: the name lookup cannot hit SQLite's host
+        # parameter limit no matter how many likers a post has.
         rows = conn.execute(
             "SELECT author, name FROM posts "
             "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
-            f"AND author IN ({placeholders}) ORDER BY author, seq ASC",
-            [target, *current],
+            "ORDER BY author, seq ASC",
+            (target,),
         ).fetchall()
         names: Dict[str, str] = {}
         for row in rows:
