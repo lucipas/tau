@@ -22,7 +22,13 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .config import TauConfig, load_node_name, write_node_metadata, write_rns_config
+from .config import (
+    TauConfig,
+    default_node_name,
+    load_node_name,
+    write_node_metadata,
+    write_rns_config,
+)
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -1752,9 +1758,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
             check_web_console_bind(host, port)
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc
-    node.start(
-        announce=not getattr(args, "no_announce", False), exclusive=True
-    )
+    no_announce = bool(getattr(args, "no_announce", False))
+    node.start(announce=not no_announce, exclusive=True)
+    # A rename may have completed after this process resolved its name but
+    # before the serving lock was taken. Now that the lock is held no rename
+    # can write, so re-read the stored name (unless --name overrides it) and
+    # re-announce if it changed.
+    if getattr(args, "name", None) is None:
+        stored_name = load_node_name(config.data_dir)
+        if stored_name and stored_name != node.name:
+            node.name = stored_name
+            if not no_announce:
+                node.announce()
 
     social_app = None
     if getattr(args, "social", False):
@@ -2147,10 +2162,14 @@ def cmd_id_rename(args: argparse.Namespace) -> int:
     # A running node announces with its in-memory name, so a rename under
     # it would sit ignored on disk until restart. Probe the instance lock
     # (same pattern as `tau serve`) and refuse while the node is serving.
+    # Hold the lock through the write so a serve starting now cannot read
+    # the old name and then start announcing it after the write lands.
     probe = InstanceLock(config.instance_lock_path, config.data_dir)
     probe.acquire()
-    probe.release()
-    write_node_metadata(config.data_dir, new_name)
+    try:
+        write_node_metadata(config.data_dir, new_name)
+    finally:
+        probe.release()
     if _json_mode(args):
         _emit(payload, True)
     else:
