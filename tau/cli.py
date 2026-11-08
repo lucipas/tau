@@ -49,7 +49,13 @@ from .node import (
 )
 from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
+from .protocol import (
+    PROTOCOL_VERSION,
+    ProtocolError,
+    clean_in_reply_to,
+    excerpt_hash,
+    short_hash,
+)
 from .util import atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
@@ -320,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
+    )
+    send.add_argument(
+        "--reply-to",
+        metavar="ID|PREFIX",
+        help="quote an earlier message in this conversation (message id or unique prefix)",
     )
     send.set_defaults(func=cmd_send)
 
@@ -2923,6 +2934,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     node.start()
     targets = args.to if isinstance(args.to, list) else [args.to]
     results: List[Dict[str, Any]] = []
+    reply_ids: Dict[str, str] = {}
     try:
         for target in targets:
             # Outbox ids present before this call: only this node's own
@@ -2933,12 +2945,35 @@ def cmd_send(args: argparse.Namespace) -> int:
             # treated as delivered — the link request succeeded.
             queued_before = {entry.id for entry in node.mailbox.outbox_list()}
             try:
+                reply_to = None
+                if getattr(args, "reply_to", None):
+                    # Derive the conversation hash without network
+                    # discovery, so a reply to a queued message still
+                    # reaches the outbox when the recipient is offline;
+                    # discovery is only a fallback.
+                    target_hash = node._target_hash(target)
+                    if target_hash is None:
+                        peer = node.resolve_peer(
+                            target,
+                            timeout=float(
+                                getattr(args, "discover_timeout", 10.0)
+                            ),
+                        )
+                        target_hash = peer.destination_hash
+                    reply_to = _resolve_reply_target(
+                        Inbox(config.inbox_path),
+                        node.mailbox,
+                        args.reply_to,
+                        target_hash.hex(),
+                    )
+                    reply_ids[target] = reply_to["id"]
                 response = node.send_message(
                     target,
                     text,
                     timeout=float(getattr(args, "timeout", 20.0)),
                     discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
                     queue=not getattr(args, "no_queue", False),
+                    in_reply_to=reply_to,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -3014,10 +3049,16 @@ def cmd_send(args: argparse.Namespace) -> int:
             elif result.get("queued"):
                 print(f"queued for {target} — they are unreachable right now")
                 print(f"  id:      {result['id']}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
             elif result.get("delivered"):
                 print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
             else:
                 print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
                 echo = result.get("echo")
                 if echo is not None:
                     print(f"echo: {echo}")
@@ -3139,6 +3180,79 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
     raise NodeError(f"unknown peer: {target!r}")
 
 
+def _resolve_reply_target(
+    inbox: Inbox, mailbox: Mailbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``--reply-to`` to an ``in_reply_to`` wire reference.
+
+    The quoted message must be in the same conversation: the inbox is
+    searched first (received messages and the node's own sent ones),
+    then the outbox for a still-queued message.  A reference to
+    another peer's message, or to a message this node has never seen,
+    is refused instead of sent dangling — the receiver could only
+    render it as "original not available" anyway.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("--reply-to must not be empty")
+    # Gather candidates from both stores before choosing, so a prefix that
+    # matches distinct messages across the inbox and the outbox is rejected
+    # rather than silently quoting whichever store is searched first.
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for item in inbox.find_prefix(ref, peer=peer_hash):
+        candidates.setdefault(str(item["id"]), item)
+    value = ref.lower()
+    for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        if entry.id.lower().startswith(value):
+            candidates.setdefault(
+                entry.id, {"id": entry.id, "text": entry.text}
+            )
+    if len(candidates) > 1:
+        raise NodeError(
+            f"{len(candidates)} messages in this conversation match {ref!r};"
+            " use a longer prefix"
+        )
+    if not candidates:
+        raise NodeError(
+            f"no message {ref!r} in this conversation to reply to;"
+            " replies quote a message from this peer's history"
+        )
+    quoted = next(iter(candidates.values()))
+    return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
+
+
+def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> Optional[str]:
+    """Render one message's quote, or ``None`` when it has none.
+
+    The quoted text is pulled from the local inbox, in the same
+    conversation only; when the original is not there — or its text
+    no longer matches the excerpt hash the sender quoted — the line
+    says so instead of trusting anything on the wire.
+    """
+    reply_to = entry.get("in_reply_to")
+    if not isinstance(reply_to, dict):
+        return None
+    ref_id = reply_to.get("id")
+    if not isinstance(ref_id, str) or not ref_id:
+        return None
+    quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+    excerpt = reply_to.get("excerpt")
+    if quoted is None or (
+        isinstance(excerpt, str)
+        and excerpt
+        and excerpt_hash(str(quoted.get("text") or "")) != excerpt.lower()
+    ):
+        return "↩ original not available"
+    if quoted.get("direction") == "out":
+        name = "you"
+    else:
+        peer = registry.get(str(quoted.get("destination") or ""))
+        name = peer.display_name if peer is not None else quoted.get("from") or "unknown"
+    quoted_text = str(quoted.get("text") or "")
+    first_line = quoted_text.splitlines()[0][:80] if quoted_text else ""
+    return f"↩ {name}: {first_line}"
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -3218,6 +3332,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
             when = _format_message_time(float(entry.get("received_at", 0)))
             marker = "● " if entry.get("unread") else ""
             print(f"{marker}[{when}] {name} ({sender})")
+            quote = _quote_line(inbox, registry, entry)
+            if quote is not None:
+                print(f"  {quote}")
             for line in str(entry.get("text", "")).splitlines() or [""]:
                 print(f"  {line}")
         if more_unread:

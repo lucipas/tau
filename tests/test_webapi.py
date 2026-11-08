@@ -71,9 +71,19 @@ class FakeNode:
             return self.registry.all()[0]
         raise ValueError(f"unknown peer: {target}")
 
-    def send_message(self, peer, text, *, timeout=20.0, discover_timeout=None):
-        self.sent.append((peer.name, text))
-        return {"ok": True, "echo": text, "server": self.name, "_rtt": 0.012}
+    def send_message(
+        self, peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None
+    ):
+        self.sent.append((peer.name, text, in_reply_to))
+        # A distinct wire id per send, like the real node's generated id.
+        wire_id = f"{len(self.sent):032d}"
+        return {
+            "ok": True,
+            "echo": text,
+            "server": self.name,
+            "_rtt": 0.012,
+            "id": wire_id,
+        }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
         return {"ok": True, "pong": True, "server": self.name, "_rtt": 0.004}
@@ -169,6 +179,8 @@ def test_record_peer_event_carries_trust_fields(bridge, node):
 
 
 def test_send_message_is_recorded_and_published(bridge, node):
+    from tau.protocol import excerpt_hash
+
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
     )
@@ -176,13 +188,106 @@ def test_send_message_is_recorded_and_published(bridge, node):
     assert payload["message"]["direction"] == "out"
     assert payload["message"]["peer_name"] == "alice"
     assert payload["message"]["rtt_ms"] == 12.0
-    assert node.sent == [("alice", "hi")]
+    assert payload["message"]["wire_id"] == "0" * 31 + "1"
+    assert payload["message"]["excerpt_hash"] == excerpt_hash("hi")
+    assert node.sent == [("alice", "hi", None)]
 
     _, _, feed = _json(bridge, "/api/messages")
     assert [m["text"] for m in feed["messages"]] == ["hi"]
 
     events = bridge.bus.replay(0)
     assert any(e["type"] == "message" for e in events)
+
+
+def test_send_reply_resolves_from_console_history(bridge, node):
+    from tau.protocol import excerpt_hash
+
+    status, _, first = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "original thought"},
+    )
+    assert status == 200
+    wire_id = first["message"]["wire_id"]
+    assert wire_id
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "seconded", "reply_to": wire_id[:8]},
+    )
+    assert status == 200
+    assert payload["message"]["in_reply_to"] == {
+        "id": wire_id,
+        "excerpt": excerpt_hash("original thought"),
+    }
+    assert node.sent[-1] == (
+        "alice",
+        "seconded",
+        {"id": wire_id, "excerpt": excerpt_hash("original thought")},
+    )
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][1]["in_reply_to"]["id"] == wire_id
+
+
+def test_send_reply_to_unknown_or_other_peer_is_a_bad_request(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "dangling", "reply_to": "zzz"},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+
+    # A message from another peer must not resolve in this conversation.
+    bridge.record_inbound(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "carol's thought",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "c" * 32,
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "cross", "reply_to": "c" * 8},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+
+
+def test_inbound_message_keeps_reply_and_wire_id(bridge):
+    from tau.protocol import excerpt_hash
+
+    record = {
+        "from": "alice",
+        "destination": "ab" * 16,
+        "text": "seconded",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "b" * 32,
+        "in_reply_to": {
+            "id": "a" * 32,
+            "excerpt": excerpt_hash("original thought"),
+        },
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["wire_id"] == "b" * 32
+    assert feed["messages"][0]["excerpt_hash"] == excerpt_hash("seconded")
+    assert feed["messages"][0]["in_reply_to"] == {
+        "id": "a" * 32,
+        "excerpt": excerpt_hash("original thought"),
+    }
 
 
 def test_inbound_message_comes_back_over_the_api(bridge):
@@ -1186,6 +1291,28 @@ def test_message_history_load_caps_and_drops_invalid_entries(node, tmp_path):
         bridge.stop()
 
 
+def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
+    """A stored excerpt hash is never trusted on load: the hash is
+    derived from the stored text, so a hand-edited history that
+    changed the text but kept the old hash cannot make a changed
+    quote look verified."""
+    from tau.protocol import excerpt_hash
+    from tau.webapi import _clean_stored_message
+
+    entry = _stored_message(1, "changed text")
+    entry["excerpt_hash"] = excerpt_hash("original thought")
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["excerpt_hash"] == excerpt_hash("changed text")
+    assert cleaned["excerpt_hash"] != excerpt_hash("original thought")
+
+    # Records written before hashes existed gain one on load.
+    legacy = _stored_message(2, "legacy text")
+    assert _clean_stored_message(legacy)["excerpt_hash"] == excerpt_hash(
+        "legacy text"
+    )
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)
@@ -1287,6 +1414,27 @@ def test_outbound_text_with_lone_surrogate_stays_persistable(node, tmp_path):
         ]
     finally:
         bridge2.stop()
+
+
+def test_lone_surrogate_entry_is_dropped_on_load(node, tmp_path):
+    """A stored lone surrogate must not break startup.
+
+    Regression test for the CodeRabbit finding on PR #95: hashing the
+    text before the UTF-8 check raised UnicodeEncodeError out of
+    _clean_stored_message instead of dropping the entry.
+    """
+    good = _stored_message(1, "good entry")
+    bad = _stored_message(2, "bad \ud800 text")
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [good, bad], "next_message_id": 3}),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages()] == ["good entry"]
+    finally:
+        bridge.stop()
 
 
 def test_huge_timestamp_entry_is_dropped_on_load(node, tmp_path):

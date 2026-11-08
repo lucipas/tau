@@ -19,6 +19,7 @@ from tau.protocol import (
     build_mail_store,
     decode,
     encode_message,
+    excerpt_hash,
 )
 
 
@@ -784,3 +785,50 @@ def test_deliver_entry_reports_nothing_when_delivery_fails(tmp_path):
     assert node._deliver_entry(peer, entry, timeout=5.0) is False
     assert node.mailbox.get_outbox(entry.id) is not None
     assert delivered == []
+
+
+def test_direct_message_keeps_reply_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    payload = encode_message(
+        "seconded", message_id="reply-1", in_reply_to=reply_to
+    )
+    response = call_handler(node._handle_message, payload)
+
+    assert response["ok"] is True
+    assert received[0]["in_reply_to"] == reply_to
+    assert node.inbox.list_messages()[0]["in_reply_to"] == reply_to
+
+
+def test_direct_message_without_reply_has_no_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    call_handler(node._handle_message, encode_message("plain", message_id="plain-1"))
+
+    assert "in_reply_to" not in received[0]
+    assert "in_reply_to" not in node.inbox.list_messages()[0]
+
+
+def test_collected_reply_keeps_reply_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, name="bob", on_message=received.append)
+    sender = RNS.Identity()
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    message = {
+        "id": "collect-reply-1",
+        "from": destination_hash(sender).hex(),
+        "from_name": "alice",
+        "text": "seconded, via a holder",
+        "sent_at": 12.0,
+        "in_reply_to": reply_to,
+    }
+    assert node._deliver_collected(message) is True
+    assert received[0]["in_reply_to"] == reply_to
+    assert node.inbox.list_messages()[0]["in_reply_to"] == reply_to

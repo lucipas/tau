@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useTau } from "@/lib/use-tau";
+import type { TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
 import { Header } from "./header";
@@ -14,6 +15,7 @@ export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
   const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
 
   useEffect(() => {
@@ -32,6 +34,16 @@ export function Console() {
     setMode(next);
   }
 
+  function handleTargetChange(value: string) {
+    // Retargeting the composer invalidates the pending reply: the
+    // quoted message belongs to the old conversation, and sending it
+    // to the new peer would only be rejected by the bridge.
+    if (replyTo && value !== (replyTo.peer ?? "")) {
+      setReplyTo(null);
+    }
+    setTarget(value);
+  }
+
   const { markRead } = tau;
   const openUnread =
     mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
@@ -48,6 +60,7 @@ export function Console() {
     customPicked.current = false;
     setMode("peer");
     setTarget(destination);
+    setReplyTo(null);
     // Opening the conversation advances its read cursor on the node,
     // so the badge clears. A failed call leaves the badge in place.
     void tau.markRead(destination).catch(() => undefined);
@@ -104,6 +117,13 @@ export function Console() {
               messages={tau.messages}
               node={tau.node}
               live={tau.connection === "live"}
+              onReply={(message) => {
+                setReplyTo(message);
+                if (message.peer) {
+                  setTarget(message.peer);
+                  setMode("peer");
+                }
+              }}
             />
             {tau.outbox.length > 0 ? (
               <div className="mt-4">
@@ -118,9 +138,11 @@ export function Console() {
               peers={tau.peers}
               target={target}
               mode={mode}
-              onTargetChange={setTarget}
+              onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
+              replyTo={replyTo}
+              onCancelReply={() => setReplyTo(null)}
             />
           </div>
         </main>

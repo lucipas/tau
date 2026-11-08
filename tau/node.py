@@ -66,6 +66,7 @@ from .protocol import (
     build_announce,
     build_mail_fetch,
     build_mail_store,
+    clean_in_reply_to,
     decode,
     encode_message,
     generate_message_id,
@@ -868,6 +869,20 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_sent(self, record: Dict[str, Any]) -> None:
+        """Persist an outgoing DM to the inbox; never break sending.
+
+        The inbox keeps both directions so a reply can quote the
+        sender's own earlier message: the receiver renders the quote
+        from its copy, and this node renders the peer's reply to it
+        from this record.  ``Inbox.list_messages`` still shows
+        received messages only.
+        """
+        try:
+            self.inbox.append(record)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not record sent message", exc_info=True)
+
     def _handle_message(
         self,
         path: str,
@@ -932,7 +947,10 @@ class TauNode:
                 "sent_at": message["sent_at"],
                 "received_at": received_at,
                 "id": message_id,
+                "direction": "in",
             }
+            if message.get("in_reply_to") is not None:
+                record["in_reply_to"] = message["in_reply_to"]
             log.info(
                 "Message from %s (%s): %s",
                 caller_name,
@@ -1283,7 +1301,10 @@ class TauNode:
             if self.mailbox.get_outbox(entry.id) is None:
                 return False
         payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+            entry.text,
+            message_id=entry.id,
+            sent_at=entry.created_at,
+            in_reply_to=entry.in_reply_to,
         )
         if not self._still_queued(entry.id):
             return False
@@ -1323,6 +1344,7 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                in_reply_to=entry.in_reply_to,
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1455,7 +1477,10 @@ class TauNode:
             "received_at": time.time(),
             "id": message["id"],
             "relayed": True,
+            "direction": "in",
         }
+        if message.get("in_reply_to") is not None:
+            record["in_reply_to"] = message["in_reply_to"]
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
             message["from_name"],
@@ -1600,6 +1625,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -1608,10 +1634,19 @@ class TauNode:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.
+
+        ``in_reply_to`` quotes an earlier message in the same
+        conversation: ``{"id": <wire id>, "excerpt": <short hash>}``.
+        The reference travels the direct and the store-and-forward
+        paths alike, and the sent message is recorded in the inbox so
+        the peer's reply to it can be rendered from local history.
         """
         normalized = normalize_message(text)
+        reply_to = clean_in_reply_to(in_reply_to)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        payload = encode_message(
+            normalized, message_id=message_id, in_reply_to=reply_to
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1621,6 +1656,23 @@ class TauNode:
                 else min(timeout, 10.0),
             )
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            if isinstance(response, dict):
+                # Always name the outbound wire message, never an id
+                # the peer supplied, so callers (console history, JSON
+                # output) match what was actually sent and recorded.
+                response["id"] = message_id
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": peer.hexhash,
+                    "text": normalized,
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": message_id,
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
+            )
             if self.registry.get(peer.destination_hash) is None:
                 # A caller can hand send_message a Peer that never entered
                 # the registry (resolve_peer returns Peer objects as-is);
@@ -1651,6 +1703,19 @@ class TauNode:
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
+                in_reply_to=reply_to,
+            )
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": dest_hash.hex(),
+                    "text": normalized,
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": message_id,
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
             )
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",
