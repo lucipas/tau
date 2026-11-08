@@ -59,7 +59,9 @@ from .tangents.tan import (
     following,
     import_entries,
     init_db,
+    mute,
     mute_keyword,
+    muted,
     muted_keywords,
     resolve_author,
     resolve_cached_author,
@@ -69,6 +71,7 @@ from .tangents.tan import (
     thread,
     timeline,
     unfollow,
+    unmute,
     unmute_keyword,
 )
 
@@ -658,6 +661,23 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_mute = tan_sub.add_parser(
+        "mute", parents=[common], help="hide an author's posts from local views"
+    )
+    tan_mute.add_argument("target", metavar="NAME|HASH")
+    tan_mute.set_defaults(func=cmd_tan_mute)
+
+    tan_unmute = tan_sub.add_parser(
+        "unmute", parents=[common], help="show a muted author's posts again"
+    )
+    tan_unmute.add_argument("target", metavar="NAME|HASH")
+    tan_unmute.set_defaults(func=cmd_tan_unmute)
+
+    tan_muted = tan_sub.add_parser(
+        "muted", parents=[common], help="list muted authors"
+    )
+    tan_muted.set_defaults(func=cmd_tan_muted)
 
     tan_mute_keyword = tan_sub.add_parser(
         "mute-keyword",
@@ -1479,6 +1499,75 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_tan_mute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = resolve_author(
+            conn, args.target, registry=PeerRegistry(config.peers_path)
+        )
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        if viewer is not None and author == viewer:
+            raise TanError("cannot mute yourself")
+        record = mute(conn, author, name=name)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"muted {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_unmute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = resolve_author(
+            conn, args.target, registry=PeerRegistry(config.peers_path)
+        )
+        removed = unmute(conn, author)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit({"author": author, "unmuted": removed}, True)
+    else:
+        if removed:
+            print(f"unmuted {name or author} ({short_hash(author)})")
+        else:
+            print(f"was not muted: {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_muted(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = muted(conn)
+        for record in records:
+            record.update(author_stats(conn, record["author"]))
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"muted": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No muted authors. Mute one with `tau tan mute alice`.")
+        for record in records:
+            name = record.get("name") or "unknown"
+            when = datetime.fromtimestamp(float(record["muted_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s) muted {when}"
+            )
+    return _EXIT_OK
+
+
 def cmd_tan_mute_keyword(args: argparse.Namespace) -> int:
     config = _make_config(args)
     config.prepare()
@@ -1535,6 +1624,7 @@ def cmd_tan_muted_keywords(args: argparse.Namespace) -> int:
                 "%Y-%m-%d %H:%M"
             )
             print(f"{record['display']} (muted {when})")
+    return _EXIT_OK
     return _EXIT_OK
 
 

@@ -213,6 +213,11 @@ tau tan mute-keyword "climate change"
 tau tan muted-keywords
 tau tan unmute-keyword crypto
 
+# Mute an author: their posts leave your timeline, search and threads,
+# but keep syncing and storing — unmute to see them again
+tau tan mute alice
+tau tan muted
+
 # Back up your posts (or every cached author's) and restore them later —
 # every entry's signature and hash are re-verified on import
 tau tan export --output tan-backup.json
@@ -235,6 +240,10 @@ chain, so it propagates to peers and the post disappears from timelines
 phrase can be muted locally with `tau tan mute-keyword <word>` — matching
 posts disappear from your timeline and threads (a muted reply hides its
 whole subtree), while search still finds them and unmuting restores them.
+An author can also be muted with `tau tan mute <peer>` — their posts and
+replies leave your timeline, search results and threads, while their
+entries keep syncing and storing, so `tau tan unmute <peer>` brings the
+whole history back. Muting is display-only and never touches DMs.
 In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
@@ -285,6 +294,9 @@ Global options may appear before or after the command:
 | `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
 | `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
 | `tau tan muted-keywords` | List muted keywords |
+| `tau tan mute PEER` | Hide an author's posts from local views |
+| `tau tan unmute PEER` | Show a muted author's posts again |
+| `tau tan muted` | List muted authors |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
