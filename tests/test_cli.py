@@ -1292,7 +1292,7 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False):
+        def start(self, *, announce=True, exclusive=False, lxmf=False):
             events.append("node.start")
 
         def stop(self):

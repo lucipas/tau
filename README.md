@@ -690,9 +690,11 @@ unlinked, and stall sync at the gap.
   (media, moderation, follow recommendations).
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
-  console); `tau id` shows this node's own address. Nothing is sent over
-  LXMF yet — the router and the migration of store-and-forward follow
-  under #67.
+  console); `tau id` shows this node's own address. `tau serve --lxmf`
+  (requires the `lxmf` extra) also runs an LXMRouter on the node's
+  identity, registers its delivery destination and announces it.
+  Nothing is sent over LXMF yet — sending and the migration of
+  store-and-forward follow under #67.
 
 ## Development
 
