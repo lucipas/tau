@@ -1551,14 +1551,20 @@ def resolve_author(
     *,
     registry: Any = None,
 ) -> Tuple[str, str]:
-    """Resolve a peer name, destination hash or prefix to an author + name."""
+    """Resolve a peer name, destination hash or prefix to an author + name.
+
+    Aliases are excluded on purpose: an author identity must never be
+    hijacked by a local label, so a peer aliased ``alice`` can never
+    stand in for the peer actually named ``alice`` when following or
+    unfollowing.
+    """
     if not isinstance(target, str) or not target.strip():
         raise TanError("author must not be empty")
     value = target.strip()
 
     if registry is not None and hasattr(registry, "resolve"):
         try:
-            peer = registry.resolve(value)
+            peer = registry.resolve(value, include_alias=False)
         except Exception as exc:
             raise TanError(str(exc)) from exc
         if peer is not None:

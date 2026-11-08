@@ -36,6 +36,7 @@ from tau.tangents.tan import (
     init_db,
     like_counts,
     reaction_states,
+    resolve_author,
     resolve_post,
     max_seq,
     search_posts,
@@ -1882,3 +1883,20 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     reply = next(item for item in payload["posts"] if item["kind"] == "reply")
     assert reply["reply_to"]["hash"] == post["hash"]
     assert reply["reply_to"]["text"] == "cli thread starter"
+
+
+def test_resolve_author_ignores_aliases(tmp_path):
+    from tau.peers import PeerRegistry
+
+    conn = init_db(tmp_path / "tan.sqlite3")
+    registry = PeerRegistry()
+    named = registry.upsert(
+        bytes([1]) * 16, bytes([1]) * 64, name="alice", now=100.0
+    )
+    aliased = registry.upsert(
+        bytes([2]) * 16, bytes([2]) * 64, name="bob", now=200.0
+    )
+    registry.set_alias(aliased.destination_hash, "alice")
+    author, name = resolve_author(conn, "alice", registry=registry)
+    assert author == named.hexhash
+    assert name == "alice"

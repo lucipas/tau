@@ -411,10 +411,11 @@ resolves to exactly one peer; an alias that looks like a destination hash
 or hash prefix (four or more hex characters) is rejected, so an alias can
 never be mistaken for a hash target. A running node picks up aliases set
 while it serves at its next registry save. Remove one with
-`tau peers unalias PEER`. The DM allow-list is the exception to alias
+`tau peers unalias PEER`. The DM allow-list and Tan author resolution are the exceptions to alias
 resolution: `tau allowlist add` matches asserted names, hashes, and hash
-prefixes only, and lists asserted names, so a local label can never
-stand in for who was actually allowed. If a registry file ever holds
+prefixes only, and lists asserted names, and `tau tan follow`/`unfollow`
+resolve authors the same way, so a local label can never stand in for
+who was actually allowed or followed. If a registry file ever holds
 the same alias twice (two writers racing), the first peer keeps it and
 the other is dropped on load, so an alias always resolves to exactly
 one peer.
