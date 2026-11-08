@@ -69,6 +69,7 @@ from .tangents.tan import (
     thread,
     timeline,
     unfollow,
+    verify_store,
 )
 
 log = logging.getLogger(__name__)
@@ -630,6 +631,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts",
     )
     tan_search.set_defaults(func=cmd_tan_search)
+
+    tan_verify = tan_sub.add_parser(
+        "verify",
+        parents=[common],
+        help="re-verify every stored post's signature and chain linkage",
+    )
+    tan_verify.set_defaults(func=cmd_tan_verify)
 
     tan_thread = tan_sub.add_parser(
         "thread",
@@ -1373,6 +1381,40 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
         empty_message=f"No stored posts match {args.query!r}.",
     )
     return _EXIT_OK
+
+
+def cmd_tan_verify(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        report = verify_store(conn)
+    finally:
+        conn.close()
+    if json_output:
+        _emit(report, True)
+        return _EXIT_OK if report["ok"] else _EXIT_ERROR
+    if report["ok"]:
+        print(
+            f"Tan store OK: {report['entries']} entries from "
+            f"{report['authors']} authors verified."
+        )
+        if report["unlinked"]:
+            print(
+                f"{report['unlinked']} unlinked entries are waiting for "
+                "their parent to arrive."
+            )
+        return _EXIT_OK
+    for problem in report["problems"]:
+        print(
+            f"{_safe_id_prefix(problem['hash'])} "
+            f"({short_hash(problem['author'])}): {problem['problem']}"
+        )
+    print(
+        f"Tan store has {len(report['problems'])} problem(s) in "
+        f"{report['entries']} entries."
+    )
+    return _EXIT_ERROR
 
 
 def cmd_tan_thread(args: argparse.Namespace) -> int:

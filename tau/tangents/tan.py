@@ -1545,6 +1545,134 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
+def verify_store(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Audit the local Tan store, re-verifying every entry and its chain.
+
+    Re-checks each stored entry's hash and signature (the same check
+    ``store_post`` runs on ingest), then checks the per-author chains:
+    linked entries must form one unbroken sequence and the ``heads``
+    table must point at each author's latest linked entry.
+
+    Entries whose parent has not arrived yet (unlinked, ``seq == 0``) are
+    legitimate partial-sync state and are only counted, not reported. An
+    entry marked unlinked whose parent *is* stored is an inconsistency
+    and is reported.
+
+    Returns ``{"entries", "authors", "unlinked", "problems", "ok"}``,
+    where each problem is ``{"hash", "author", "problem"}``. Read-only:
+    nothing in the database is changed.
+    """
+    rows = conn.execute("SELECT * FROM posts").fetchall()
+    by_hash = {str(row["hash"]): row for row in rows}
+    problems: List[Dict[str, str]] = []
+
+    def _report(row: Any, problem: str) -> None:
+        problems.append(
+            {
+                "hash": str(row["hash"]),
+                "author": str(row["author"]),
+                "problem": problem,
+            }
+        )
+
+    unlinked = 0
+    linked_by_author: Dict[str, List[Any]] = {}
+    for row in rows:
+        if not bool(row["linked"]):
+            unlinked += 1
+            parent = str(row["prev"])
+            if parent and parent in by_hash:
+                _report(row, "entry is unlinked but its parent is stored")
+            continue
+        linked_by_author.setdefault(str(row["author"]), []).append(row)
+
+    for row in rows:
+        try:
+            verify_post(_row_to_post(row))
+        except PostError as exc:
+            _report(row, str(exc))
+
+    for author, entries in linked_by_author.items():
+        entries.sort(key=lambda row: int(row["seq"]))
+        seen_seqs = set()
+        previous = None
+        for entry in entries:
+            seq = int(entry["seq"])
+            if seq in seen_seqs:
+                _report(entry, f"duplicate sequence number {seq}")
+                continue
+            seen_seqs.add(seq)
+            if previous is None:
+                if seq != 1:
+                    _report(
+                        entry,
+                        f"first linked entry has sequence {seq}, expected 1",
+                    )
+                if str(entry["prev"]):
+                    _report(entry, "first linked entry has a parent")
+            else:
+                if str(entry["prev"]) != str(previous["hash"]):
+                    _report(
+                        entry,
+                        "entry does not point at the previous entry "
+                        "in its chain",
+                    )
+                if seq != int(previous["seq"]) + 1:
+                    _report(
+                        entry,
+                        f"sequence jumps from {int(previous['seq'])} to {seq}",
+                    )
+            previous = entry
+        last = entries[-1]
+        head_row = conn.execute(
+            "SELECT hash, seq FROM heads WHERE author = ?", (author,)
+        ).fetchone()
+        if head_row is None:
+            _report(last, "author has linked entries but no head record")
+            continue
+        head_hash = str(head_row["hash"])
+        head_entry = by_hash.get(head_hash)
+        if head_entry is None:
+            _report(last, "head points at an entry that is not stored")
+            continue
+        if not bool(head_entry["linked"]):
+            _report(
+                head_entry,
+                "head points at an entry that is not linked",
+            )
+            continue
+        if int(head_row["seq"]) != int(head_entry["seq"]):
+            _report(
+                head_entry,
+                "head sequence does not match the entry it points at",
+            )
+        if int(head_entry["seq"]) != int(last["seq"]):
+            _report(
+                head_entry, "head does not point at the author's latest entry"
+            )
+
+    for head_row in conn.execute("SELECT author, hash, seq FROM heads").fetchall():
+        if str(head_row["author"]) not in linked_by_author:
+            problems.append(
+                {
+                    "hash": str(head_row["hash"]),
+                    "author": str(head_row["author"]),
+                    "problem": (
+                        "head record exists but the author "
+                        "has no linked entries"
+                    ),
+                }
+            )
+
+    return {
+        "entries": len(rows),
+        "authors": len({str(row["author"]) for row in rows}),
+        "unlinked": unlinked,
+        "problems": problems,
+        "ok": not problems,
+    }
+
+
 def resolve_author(
     conn: sqlite3.Connection,
     target: str,

@@ -45,6 +45,7 @@ from tau.tangents.tan import (
     timeline,
     unfollow,
     verify_post,
+    verify_store,
 )
 
 
@@ -154,6 +155,163 @@ def test_out_of_order_posts_link_when_the_parent_arrives(identities, tmp_path):
     assert row["linked"] == 1
     assert row["seq"] == 2
     assert head(destination, first["author"]) == second["hash"]
+
+
+def test_verify_store_accepts_a_clean_store(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "from alice", name="alice", now=1000)
+    create_post(conn, alice, "again", name="alice", now=1001)
+    create_post(conn, bob, "from bob", name="bob", now=1002)
+
+    report = verify_store(conn)
+
+    assert report["ok"] is True
+    assert report["entries"] == 3
+    assert report["authors"] == 2
+    assert report["unlinked"] == 0
+    assert report["problems"] == []
+
+
+def test_verify_store_accepts_an_empty_store(tmp_path):
+    conn = init_db(tmp_path / "tan.sqlite3")
+
+    assert verify_store(conn) == {
+        "entries": 0,
+        "authors": 0,
+        "unlinked": 0,
+        "problems": [],
+        "ok": True,
+    }
+
+
+def test_verify_store_counts_unlinked_entries_without_failing(
+    identities, tmp_path
+):
+    alice, _ = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    conn = init_db(tmp_path / "tan.sqlite3")
+    store_post(conn, second)
+
+    report = verify_store(conn)
+    assert report["ok"] is True
+    assert report["entries"] == 1
+    assert report["unlinked"] == 1
+    assert report["problems"] == []
+
+
+def test_verify_store_reports_tampered_text(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original", name="alice", now=1000)
+    conn.execute(
+        "UPDATE posts SET text = 'edited' WHERE hash = ?", (post["hash"],)
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert len(report["problems"]) == 1
+    assert report["problems"][0]["hash"] == post["hash"]
+    assert "hash" in report["problems"][0]["problem"]
+
+
+def test_verify_store_reports_a_bad_signature(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original", name="alice", now=1000)
+    conn.execute(
+        "UPDATE posts SET sig = ? WHERE hash = ?",
+        ("0" * 128, post["hash"]),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert len(report["problems"]) == 1
+    assert report["problems"][0]["hash"] == post["hash"]
+    assert "signature" in report["problems"][0]["problem"]
+
+
+def test_verify_store_reports_a_sequence_gap(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET seq = 5 WHERE hash = ?", (second["hash"],)
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        problem["hash"] == second["hash"]
+        and "jumps from 1 to 5" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_a_stale_head(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, alice, "first", name="alice", now=1000)
+    create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE heads SET hash = ?, seq = 1 WHERE author = ?",
+        (first["hash"], first["author"]),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        "does not point at the author's latest entry" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_an_unlinked_entry_with_its_parent_stored(
+    identities, tmp_path
+):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "first", name="alice", now=1000)
+    second = create_post(conn, alice, "second", name="alice", now=1001)
+    conn.execute(
+        "UPDATE posts SET linked = 0, seq = 0 WHERE hash = ?",
+        (second["hash"],),
+    )
+    conn.commit()
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        problem["hash"] == second["hash"]
+        and "unlinked but its parent is stored" in problem["problem"]
+        for problem in report["problems"]
+    )
+
+
+def test_verify_store_reports_a_forked_sequence(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    first = create_post(conn, alice, "first", name="alice", now=1000)
+    create_post(conn, alice, "second", name="alice", now=1001)
+    # A second entry chained to the first post reuses sequence 2.
+    create_post(
+        conn, alice, "forked", name="alice", now=1002, previous=first["hash"]
+    )
+
+    report = verify_store(conn)
+    assert report["ok"] is False
+    assert any(
+        "duplicate sequence number 2" in problem["problem"]
+        for problem in report["problems"]
+    )
 
 
 def test_follow_and_timeline(identities, tmp_path):
@@ -672,6 +830,78 @@ def test_cli_search(tmp_path, capsys):
         == 0
     )
     assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_cli_tan_verify(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(["tan", "verify", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "Tan store OK: 1 entries from 1 authors verified." in out
+
+    assert (
+        main(["tan", "verify", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "entries": 1,
+        "authors": 1,
+        "unlinked": 0,
+        "problems": [],
+        "ok": True,
+    }
+
+
+def test_cli_tan_verify_reports_problems(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "hello from the cli",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        conn.execute("UPDATE posts SET text = 'edited'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert main(["tan", "verify", "--data-dir", str(data_dir)]) == 1
+    out = capsys.readouterr().out
+    assert "does not match its contents" in out
+    assert "1 problem(s)" in out
+
+    assert (
+        main(["tan", "verify", "--data-dir", str(data_dir), "--json"]) == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert len(payload["problems"]) == 1
 
 
 def test_reaction_chains_verifies_and_counts(identities, tmp_path):

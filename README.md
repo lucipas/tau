@@ -226,6 +226,12 @@ to. An author can delete one of their own posts with
 chain, so it propagates to peers and the post disappears from timelines
 (the entry itself stays stored, keeping chains verifiable). In the web
 console your own posts show a delete button that calls the same endpoint.
+Entries are verified when they are stored, but nothing re-checks the
+local copy afterwards: `tau tan verify` re-verifies every stored entry's
+signature and hash and checks each author's chain linkage, and exits
+non-zero listing any problem it finds — run it after a restore, or
+whenever you suspect the database was damaged. Entries whose parent has
+not arrived yet are counted, not reported.
 The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
@@ -269,6 +275,7 @@ Global options may appear before or after the command:
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan verify` | Re-verify every stored post's signature and chain linkage |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
