@@ -15,6 +15,10 @@ the node's data directory holding three collections:
     peer.  An envelope is encrypted to the recipient and signed by the
     sender, so a holder can neither read nor forge what it carries; it
     only knows the recipient hash, the message id and the expiry.
+    Held mail is also capped per depositing peer (see the
+    ``HELD_QUOTA_*`` constants): one sender cannot fill a relay's
+    storage, and when a deposit would push a sender over quota the
+    relay sheds that sender's oldest envelopes first.
 ``seen``
     Ids of messages already delivered to the user, so a message that
     arrives twice — once directly, once via a holder — is shown once.
@@ -28,12 +32,13 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 try:  # POSIX only; mailbox cross-process locking is a no-op without it.
     import fcntl
@@ -50,6 +55,7 @@ from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
+    clean_in_reply_to,
     decode,
     encode,
     generate_message_id,
@@ -69,6 +75,39 @@ MAX_HELD_PER_RECIPIENT = 64
 MAX_SEEN = 1024
 MAX_HOLDERS_PER_MESSAGE = 3
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer quota override from the environment, or *default*."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+# Held-mail fairness quotas (issue #89): one sender may not fill a
+# relay's storage with envelopes for many recipients.  A holder can only
+# see the peer that asked it to hold an envelope — the sealed blob hides
+# the inner sender — so quotas are keyed by that depositing peer, and
+# deposits over an unidentified link share one "unknown" bucket.  When a
+# deposit would push a sender over quota, the relay sheds that sender's
+# oldest envelopes first; only a single envelope that cannot fit even on
+# its own is refused.  Long-standing known peers with a delivered
+# history get the higher tier.
+HELD_QUOTA_UNKNOWN_COUNT = _env_int("TAU_HELD_QUOTA_UNKNOWN_COUNT", 16)
+HELD_QUOTA_KNOWN_COUNT = _env_int("TAU_HELD_QUOTA_KNOWN_COUNT", 128)
+HELD_QUOTA_UNKNOWN_BYTES = _env_int(
+    "TAU_HELD_QUOTA_UNKNOWN_BYTES", 128 * 1024
+)
+HELD_QUOTA_KNOWN_BYTES = _env_int("TAU_HELD_QUOTA_KNOWN_BYTES", 1024 * 1024)
+# A peer counts as long-standing once it has been in the local registry
+# this long (and was heard directly, not via exchange).
+TRUSTED_PEER_MIN_AGE_SECONDS = _env_int(
+    "TAU_TRUSTED_PEER_MIN_AGE_SECONDS", 24 * 3600
+)
+
 # Direct-delivery retry pacing: after a failed attempt, wait 60s, then
 # double after each further failure, up to an hour.  An announce from the
 # recipient bypasses the wait (see TauNode._mail_round_for_peer).
@@ -77,6 +116,14 @@ DELIVERY_BACKOFF_MAX_SECONDS = 3600.0
 
 _DESTINATION_BYTES = 16
 _PUBLIC_KEY_BYTES = 64
+
+
+def _is_hex(value: str) -> bool:
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
 
 
 class MailboxError(RuntimeError):
@@ -108,6 +155,7 @@ class OutboxEntry:
     # stays in the recipient's inbox even though its queue entry still
     # has a TTL.
     message_expires_at: Optional[float] = None
+    in_reply_to: Optional[Dict[str, Any]] = None
 
     @property
     def to_hex(self) -> str:
@@ -143,7 +191,7 @@ class OutboxEntry:
         return (now if now is not None else time.time()) >= target
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "id": self.id,
             "to": self.to_hex,
             "to_name": self.to_name,
@@ -157,6 +205,9 @@ class OutboxEntry:
             "held_by": dict(self.held_by),
             "message_expires_at": self.message_expires_at,
         }
+        if self.in_reply_to is not None:
+            payload["in_reply_to"] = dict(self.in_reply_to)
+        return payload
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OutboxEntry":
@@ -175,6 +226,8 @@ class OutboxEntry:
             expires_at, (int, float)
         ):
             raise ValueError("invalid outbox timestamps")
+        if not math.isfinite(created_at) or not math.isfinite(expires_at):
+            raise ValueError("non-finite outbox timestamps")
         held_by = raw.get("held_by")
         if not isinstance(held_by, dict):
             held_by = {}
@@ -193,6 +246,13 @@ class OutboxEntry:
                 message_expires_at
             ):
                 message_expires_at = None
+        try:
+            in_reply_to = clean_in_reply_to(raw.get("in_reply_to"))
+        except ValueError:
+            # A corrupt reference on an already-queued entry must not
+            # make the outbox unreadable; the message still delivers,
+            # just without its quote.
+            in_reply_to = None
         return cls(
             id=message_id,
             to=destination,
@@ -215,6 +275,7 @@ class OutboxEntry:
                 if isinstance(v, (int, float))
             },
             message_expires_at=message_expires_at,
+            in_reply_to=in_reply_to,
         )
 
 
@@ -227,6 +288,11 @@ class HeldEnvelope:
     blob: bytes
     stored_at: float
     expires_at: float
+    # Hex destination hash of the peer that asked this node to hold the
+    # envelope ("" when the deposit arrived over an unidentified link).
+    # The sealed blob hides the inner sender, so this is the only
+    # attribution a holder has — and the key for per-sender quotas.
+    depositor: str = ""
 
     @property
     def to_hex(self) -> str:
@@ -239,6 +305,7 @@ class HeldEnvelope:
             "blob": base64.b64encode(self.blob).decode("ascii"),
             "stored_at": self.stored_at,
             "expires_at": self.expires_at,
+            "depositor": self.depositor,
         }
 
     @classmethod
@@ -267,12 +334,24 @@ class HeldEnvelope:
             expires_at, (int, float)
         ):
             raise ValueError("invalid held timestamps")
+        if not math.isfinite(stored_at) or not math.isfinite(expires_at):
+            raise ValueError("non-finite held timestamps")
+        depositor = raw.get("depositor")
+        if (
+            not isinstance(depositor, str)
+            or (depositor and len(depositor) != 32)
+            or (depositor and not _is_hex(depositor))
+        ):
+            # Envelopes stored before per-sender quotas carry no
+            # attribution; they join the unknown bucket.
+            depositor = ""
         return cls(
             id=message_id,
             to=destination,
             blob=blob,
             stored_at=float(stored_at),
             expires_at=float(expires_at),
+            depositor=depositor,
         )
 
 
@@ -315,7 +394,7 @@ class Mailbox:
             try:
                 if self.path is None or fcntl is None:
                     if self.path is not None:
-                        self.load()
+                        self._apply_document()
                     yield
                     return
                 lock_path = self.path.with_name(self.path.name + ".lock")
@@ -323,7 +402,7 @@ class Mailbox:
                 with open(lock_path, "a") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
-                        self.load()
+                        self._apply_document()
                         yield
                     finally:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -336,20 +415,126 @@ class Mailbox:
 
     # -- persistence -------------------------------------------------------
 
-    def load(self) -> None:
+    def load(self) -> Dict[str, int]:
+        """Load the mailbox from disk, dropping duplicate message ids.
+
+        ``mailbox.json`` is a list per collection, so a restored, merged
+        or hand-edited file can carry the same message id twice.  The
+        in-memory collections are keyed by id and already collapse such
+        duplicates, but the file itself never shrank back — every restart
+        re-read the stale copies.  Loading now keeps the newest copy of
+        each duplicated id (by ``created_at`` / ``stored_at``, later in
+        the file winning ties) and, when anything was dropped, rewrites
+        the file so the duplicates are gone for good.
+
+        Returns how many duplicate entries were dropped per collection.
+        """
+        dropped = self._apply_document()
+        if not sum(dropped.values()):
+            return dropped
+        log.info(
+            "Found duplicate mailbox entries at %s: %s",
+            self.path,
+            {k: v for k, v in dropped.items() if v},
+        )
+        try:
+            # Re-read and rewrite under the cross-process lock so a write
+            # from another process between our read and write is not lost.
+            with self._transaction():
+                dropped = self._apply_document()
+                if sum(dropped.values()):
+                    self._write_deduplicated()
+        except OSError as exc:
+            # The in-memory state is already deduplicated; a read-only
+            # mailbox must still load.
+            log.warning("Could not persist mailbox dedupe at %s: %s", self.path, exc)
+        return dropped
+
+    def _apply_document(self) -> Dict[str, int]:
+        """Read the mailbox file and replace the in-memory state with it."""
+        empty: Dict[str, int] = {"outbox": 0, "held": 0, "pending_acks": 0}
         if self.path is None:
-            return
+            return dict(empty)
         raw = read_json(self.path)
         if raw is None:
-            return
+            return dict(empty)
         if not isinstance(raw, dict):
             log.warning("Ignoring mailbox at %s: unexpected format", self.path)
-            return
+            return dict(empty)
+        state, dropped, _, _ = self._parse_document(raw)
+        with self._lock:
+            self._outbox = state["outbox"]
+            self._held = state["held"]
+            self._seen = state["seen"]
+            self._pending_acks = state["pending_acks"]
+            self._dropped_held = state["dropped_held"]
+        log.debug(
+            "Loaded mailbox from %s: %d outbox, %d held",
+            self.path,
+            len(self._outbox),
+            len(self._held),
+        )
+        return dropped
 
+    def _write_deduplicated(self) -> None:
+        """Rewrite the file minus only the duplicate copies.
+
+        Everything else in the on-disk document (invalid entries, full
+        pending-ack lists) is preserved verbatim rather than being
+        replaced by the filtered in-memory view.
+        """
+        raw = read_json(self.path)
+        if not isinstance(raw, dict):
+            return
+        _, dropped, outbox_drop, held_drop = self._parse_document(raw)
+        if not sum(dropped.values()):
+            return
+        cleaned = dict(raw)
+        if isinstance(raw.get("outbox"), list):
+            cleaned["outbox"] = [
+                e for i, e in enumerate(raw["outbox"]) if i not in outbox_drop
+            ]
+        if isinstance(raw.get("held"), list):
+            cleaned["held"] = [
+                e for i, e in enumerate(raw["held"]) if i not in held_drop
+            ]
+        if isinstance(raw.get("pending_acks"), dict):
+            cleaned_acks: Dict[str, Any] = {}
+            for holder, ids in raw["pending_acks"].items():
+                if isinstance(ids, list):
+                    seen_ids: Set[str] = set()
+                    unique: List[Any] = []
+                    for mid in ids:
+                        if isinstance(mid, str):
+                            if mid in seen_ids:
+                                continue
+                            seen_ids.add(mid)
+                        unique.append(mid)
+                    cleaned_acks[holder] = unique
+                else:
+                    cleaned_acks[holder] = ids
+            cleaned["pending_acks"] = cleaned_acks
+        atomic_write_json(self.path, cleaned, mode=0o600)
+        log.info("Dropped duplicate mailbox entries at %s", self.path)
+
+    def _parse_document(
+        self, raw: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, int], Set[int], Set[int]]:
+        """Parse a raw mailbox document.
+
+        Returns ``(state, dropped, outbox_drop, held_drop)`` where ``state``
+        holds the parsed collections and the two index sets name the list
+        positions of duplicate copies in the raw ``outbox`` / ``held`` lists.
+        """
+        empty: Dict[str, int] = {"outbox": 0, "held": 0, "pending_acks": 0}
+        dropped: Dict[str, int] = dict(empty)
+        outbox_drop: Set[int] = set()
+        held_drop: Set[int] = set()
         outbox: Dict[str, OutboxEntry] = {}
+        outbox_index: Dict[str, int] = {}
         entries = raw.get("outbox")
         if isinstance(entries, list):
-            for entry in entries:
+            for index, entry in enumerate(entries):
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -357,12 +542,21 @@ class Mailbox:
                 except (TypeError, ValueError) as exc:
                     log.debug("Skipping invalid outbox entry: %s", exc)
                     continue
+                existing = outbox.get(parsed.id)
+                if existing is not None:
+                    dropped["outbox"] += 1
+                    if parsed.created_at < existing.created_at:
+                        outbox_drop.add(index)
+                        continue
+                    outbox_drop.add(outbox_index[parsed.id])
                 outbox[parsed.id] = parsed
+                outbox_index[parsed.id] = index
 
         held: Dict[str, HeldEnvelope] = {}
+        held_index: Dict[str, int] = {}
         envelopes = raw.get("held")
         if isinstance(envelopes, list):
-            for entry in envelopes:
+            for index, entry in enumerate(envelopes):
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -370,7 +564,15 @@ class Mailbox:
                 except (TypeError, ValueError) as exc:
                     log.debug("Skipping invalid held envelope: %s", exc)
                     continue
+                existing_held = held.get(parsed_held.id)
+                if existing_held is not None:
+                    dropped["held"] += 1
+                    if parsed_held.stored_at < existing_held.stored_at:
+                        held_drop.add(index)
+                        continue
+                    held_drop.add(held_index[parsed_held.id])
                 held[parsed_held.id] = parsed_held
+                held_index[parsed_held.id] = index
 
         seen: Dict[str, float] = {}
         raw_seen = raw.get("seen")
@@ -386,9 +588,17 @@ class Mailbox:
         if isinstance(raw_acks, dict):
             for holder, ids in raw_acks.items():
                 if isinstance(ids, list):
-                    acks[str(holder)] = [
-                        mid for mid in ids if isinstance(mid, str)
-                    ][:100]
+                    kept: List[str] = []
+                    seen_ids: Set[str] = set()
+                    for mid in ids:
+                        if not isinstance(mid, str):
+                            continue
+                        if mid in seen_ids:
+                            dropped["pending_acks"] += 1
+                            continue
+                        seen_ids.add(mid)
+                        kept.append(mid)
+                    acks[str(holder)] = kept[:100]
 
         dropped_held: Dict[str, float] = {}
         raw_dropped = raw.get("dropped_held")
@@ -399,18 +609,14 @@ class Mailbox:
                 if isinstance(v, (int, float))
             }
 
-        with self._lock:
-            self._outbox = outbox
-            self._held = held
-            self._seen = seen
-            self._pending_acks = acks
-            self._dropped_held = dropped_held
-        log.debug(
-            "Loaded mailbox from %s: %d outbox, %d held",
-            self.path,
-            len(outbox),
-            len(held),
-        )
+        state: Dict[str, Any] = {
+            "outbox": outbox,
+            "held": held,
+            "seen": seen,
+            "pending_acks": acks,
+            "dropped_held": dropped_held,
+        }
+        return state, dropped, outbox_drop, held_drop
 
     def save(self) -> bool:
         if self.path is None:
@@ -452,6 +658,7 @@ class Mailbox:
         message_id: Optional[str] = None,
         expires_at: Optional[float] = None,
         now: Optional[float] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -477,6 +684,7 @@ class Mailbox:
                 raise MailboxError("expires_at must be a finite number") from exc
             if not math.isfinite(expires_at):
                 raise MailboxError("expires_at must be a finite number")
+        reply_to = clean_in_reply_to(in_reply_to)
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -498,6 +706,7 @@ class Mailbox:
                 if to_name
                 else "",
                 message_expires_at=expires_at,
+                in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry
             self.save()
@@ -590,19 +799,34 @@ class Mailbox:
         message_id: str,
         expires_at: float,
         now: Optional[float] = None,
+        depositor: Optional[bytes] = None,
+        trusted: bool = False,
     ) -> bool:
         """Store a sealed envelope for *to*.
 
         Returns ``True`` when the envelope was newly stored, ``False``
         when an envelope with the same id was already held.
+
+        *depositor* is the destination hash of the peer that asked this
+        node to hold the envelope (``None`` for an unidentified link);
+        it is recorded on the envelope and keys the per-sender fairness
+        quota.  A *trusted* depositor — a long-standing known peer with
+        a delivered history — gets the higher quota tier.  When a
+        deposit would push its sender over quota, that sender's oldest
+        envelopes are shed first, so one sender can crowd out only its
+        own mail.  A deposit that cannot fit even on its own is refused
+        before anything is shed.
         """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
+        if depositor is not None and len(depositor) != _DESTINATION_BYTES:
+            raise MailboxError("depositor hash must be 16 bytes")
         if len(blob) > MAX_MAIL_BLOB_BYTES:
             raise MailboxError("sealed message is too large to hold")
         if not math.isfinite(expires_at):
             raise MailboxError("expiry must be a finite time")
         timestamp = now if now is not None else time.time()
+        depositor_hex = depositor.hex() if depositor is not None else ""
         with self._transaction():
             if message_id in self._held:
                 return False
@@ -614,12 +838,53 @@ class Mailbox:
                     # have expired anyway.
                     return False
                 del self._dropped_held[message_id]
-            if len(self._held) >= MAX_HELD_TOTAL:
-                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
+            quota_count = (
+                HELD_QUOTA_KNOWN_COUNT if trusted else HELD_QUOTA_UNKNOWN_COUNT
+            )
+            quota_bytes = (
+                HELD_QUOTA_KNOWN_BYTES if trusted else HELD_QUOTA_UNKNOWN_BYTES
+            )
+            if 1 > quota_count or len(blob) > quota_bytes:
+                # A single envelope that cannot fit even on its own is
+                # refused before anything is shed: shedding first would
+                # destroy the sender's existing mail for a deposit that
+                # is rejected anyway.
+                raise MailboxFull("mailbox is full for this sender")
+            own = sorted(
+                (e for e in self._held.values() if e.depositor == depositor_hex),
+                key=lambda e: e.stored_at,
+            )
+            own_count = len(own)
+            own_bytes = sum(len(e.blob) for e in own)
+            victims: List[HeldEnvelope] = []
+            while own and (
+                own_count + 1 > quota_count
+                or own_bytes + len(blob) > quota_bytes
+            ):
+                victim = own.pop(0)
+                victims.append(victim)
+                own_count -= 1
+                own_bytes -= len(victim.blob)
+            # Plan first, then apply: every refusal happens before any
+            # envelope is deleted, so a rejected deposit hides no mail.
+            # Both caps net the planned victims: a sender whose own
+            # oldest envelopes are shed frees those slots, including
+            # slots for this recipient.
             per_recipient = sum(1 for e in self._held.values() if e.to == to)
-            if per_recipient >= MAX_HELD_PER_RECIPIENT:
+            freed_for_recipient = sum(1 for v in victims if v.to == to)
+            if per_recipient - freed_for_recipient >= MAX_HELD_PER_RECIPIENT:
                 raise MailboxFull(
                     f"mailbox is full for this recipient ({MAX_HELD_PER_RECIPIENT})"
+                )
+            if len(self._held) - len(victims) >= MAX_HELD_TOTAL:
+                raise MailboxFull(f"mailbox is full ({MAX_HELD_TOTAL} envelopes)")
+            for victim in victims:
+                del self._held[victim.id]
+            if victims:
+                log.info(
+                    "Shed %d held envelope(s) from %s to stay within quota",
+                    len(victims),
+                    depositor_hex or "unknown sender",
                 )
             self._held[message_id] = HeldEnvelope(
                 id=message_id,
@@ -627,6 +892,7 @@ class Mailbox:
                 blob=bytes(blob),
                 stored_at=timestamp,
                 expires_at=min(float(expires_at), timestamp + MAX_MAIL_TTL),
+                depositor=depositor_hex,
             )
             self.save()
             return True
@@ -643,6 +909,29 @@ class Mailbox:
             envelopes = list(self._held.values())
         envelopes.sort(key=lambda e: e.stored_at)
         return envelopes
+
+    def held_usage(self) -> List[Dict[str, Any]]:
+        """Held-mail usage per depositing peer, busiest first.
+
+        Each entry is ``{"sender": <hex hash or "">, "count": n,
+        "bytes": b}``; ``sender == ""`` is the shared bucket for
+        deposits that arrived over an unidentified link.  Operators use
+        it to see quota pressure (``tau outbox held``).
+        """
+        with self._lock:
+            usage: Dict[str, Dict[str, Any]] = {}
+            for envelope in self._held.values():
+                entry = usage.setdefault(
+                    envelope.depositor,
+                    {"sender": envelope.depositor, "count": 0, "bytes": 0},
+                )
+                entry["count"] += 1
+                entry["bytes"] += len(envelope.blob)
+        return sorted(
+            usage.values(),
+            key=lambda row: (row["count"], row["bytes"]),
+            reverse=True,
+        )
 
     def resolve_held(self, ref: str) -> HeldEnvelope:
         """Resolve a full message id or a unique prefix to its held envelope.
@@ -791,6 +1080,7 @@ def seal_message(
     text: str,
     sent_at: float,
     expires_at: Optional[float] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -823,6 +1113,9 @@ def seal_message(
         if not math.isfinite(expires_at):
             raise MailboxError("expires_at must be a finite number")
         inner["expires_at"] = expires_at
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        inner["in_reply_to"] = reply_to
     canonical = encode(inner)
     signature = sender_identity.sign(canonical)
     if signature is None:  # pragma: no cover - identity without private keys
@@ -910,6 +1203,10 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
             raise MailboxError("sealed message expires_at is invalid") from exc
         if not math.isfinite(expires_at):
             raise MailboxError("sealed message expires_at is invalid")
+    try:
+        in_reply_to = clean_in_reply_to(payload.get("in_reply_to"))
+    except ProtocolError as exc:
+        raise MailboxError(f"sealed message reply is invalid: {exc}") from exc
     return {
         "id": message_id,
         "from": claimed_from.lower(),
@@ -917,4 +1214,5 @@ def open_message(recipient_identity: RNS.Identity, blob: bytes) -> Dict[str, Any
         "text": text,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
         "expires_at": expires_at,
+        "in_reply_to": in_reply_to,
     }

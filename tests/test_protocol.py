@@ -14,6 +14,7 @@ from tau.protocol import (
     decode,
     encode,
     encode_message,
+    excerpt_hash,
     normalize_message,
     parse_announce,
     parse_message,
@@ -116,25 +117,53 @@ def test_message_roundtrip():
     parsed = parse_message(data)
     assert parsed["text"] == "hello there"
     assert isinstance(parsed["sent_at"], float)
-    assert parsed["expires_at"] is None
+    assert parsed["in_reply_to"] is None
 
 
-def test_message_roundtrip_with_expiry():
-    data = encode_message("vanish soon", expires_at=1893456000.0)
+def test_message_roundtrip_with_reply():
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    data = encode_message("seconded", message_id="b" * 32, in_reply_to=reply_to)
     parsed = parse_message(data)
-    assert parsed["text"] == "vanish soon"
-    assert parsed["expires_at"] == 1893456000.0
+    assert parsed["text"] == "seconded"
+    assert parsed["id"] == "b" * 32
+    assert parsed["in_reply_to"] == reply_to
 
 
-def test_message_rejects_invalid_expiry():
+def test_message_reply_respects_request_budget():
+    # Four-byte characters are the worst case: a full-length body fits the
+    # budget alone, but the reference's overhead pushes it past the limit.
+    text = "\U0001F600" * MAX_MESSAGE_CHARS
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
     with pytest.raises(ProtocolError):
-        encode_message("hi", expires_at="soon")
+        encode_message(text, message_id="b" * 32, in_reply_to=reply_to)
+    # A reply that fits stays under the limit.
+    data = encode_message("x" * 1000, message_id="b" * 32, in_reply_to=reply_to)
+    assert len(data) <= MAX_REQUEST_BYTES
+
+
+def test_message_rejects_malformed_reply():
     with pytest.raises(ProtocolError):
-        encode_message("hi", expires_at=float("inf"))
+        encode_message("hi", in_reply_to={"id": ""})
     with pytest.raises(ProtocolError):
-        parse_message(encode({"type": "message", "text": "hi", "expires_at": "soon"}))
+        encode_message("hi", in_reply_to={"id": "x" * 65})
     with pytest.raises(ProtocolError):
-        parse_message(encode({"type": "message", "text": "hi", "expires_at": True}))
+        encode_message("hi", in_reply_to={"id": "a" * 32, "excerpt": "not-hex!"})
+    with pytest.raises(ProtocolError):
+        parse_message(
+            encode(
+                {
+                    "type": "message",
+                    "text": "hi",
+                    "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
+def test_excerpt_hash_is_stable_short_hex():
+    assert excerpt_hash("original thought") == excerpt_hash("original thought")
+    assert len(excerpt_hash("original thought")) == 16
+    assert excerpt_hash("different") != excerpt_hash("original thought")
 
 
 def test_message_rejects_wrong_shape():
@@ -157,3 +186,131 @@ def test_response_helpers():
 def test_short_hash():
     assert short_hash("abcdef1234", 4) == "abcd"
     assert short_hash("", 4) == ""
+
+
+def test_reaction_roundtrip():
+    from tau.protocol import clean_reaction, encode_reaction, parse_reaction
+
+    data = encode_reaction("msg-123", "👍", message_id="react-1")
+    parsed = parse_reaction(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["reaction"] == "👍"
+    assert parsed["id"] == "react-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_reaction_clear_roundtrip():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    parsed = parse_reaction(encode_reaction("msg-123", ""))
+    assert parsed["reaction"] == ""
+
+
+def test_clean_reaction_accepts_emoji_and_short_tokens():
+    from tau.protocol import MAX_REACTION_CHARS, clean_reaction
+
+    assert clean_reaction("👍") == "👍"
+    assert clean_reaction("+1") == "+1"
+    assert clean_reaction("  lol  ") == "lol"
+    assert clean_reaction("") == ""
+    assert clean_reaction("   ") == ""
+    assert clean_reaction(None) == ""
+
+
+def test_clean_reaction_rejects_long_or_non_string_tokens():
+    from tau.protocol import MAX_REACTION_CHARS, clean_reaction
+
+    with pytest.raises(ProtocolError):
+        clean_reaction("x" * (MAX_REACTION_CHARS + 1))
+    with pytest.raises(ProtocolError):
+        clean_reaction(42)
+    with pytest.raises(ProtocolError):
+        clean_reaction(b"bytes")
+
+
+def test_parse_reaction_rejects_wrong_shape():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "message", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "reaction", "target": "msg-1"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(encode({"type": "reaction", "target": "", "reaction": "👍"}))
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode(
+                {
+                    "type": "reaction",
+                    "target": "msg-1",
+                    "reaction": "x" * 33,
+                }
+            )
+        )
+
+
+def test_reaction_signature_roundtrip():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    parsed = parse_reaction(
+        encode_reaction("msg-123", "👍", message_id="react-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["reaction"] == "👍"
+
+
+def test_reaction_without_signature_parses_with_none():
+    from tau.protocol import encode_reaction, parse_reaction
+
+    assert parse_reaction(encode_reaction("msg-1", "👍"))["sig"] is None
+
+
+def test_parse_reaction_rejects_bad_signature():
+    from tau.protocol import parse_reaction
+
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode({"type": "reaction", "target": "msg-1", "reaction": "👍", "sig": "!!!"})
+        )
+    with pytest.raises(ProtocolError):
+        parse_reaction(
+            encode({"type": "reaction", "target": "msg-1", "reaction": "👍", "sig": 42})
+        )
+
+
+def test_reaction_unsigned_bytes_exclude_the_signature():
+    import base64
+
+    from tau.protocol import (
+        encode,
+        encode_reaction,
+        parse_reaction,
+        reaction_dict,
+        reaction_unsigned_bytes,
+    )
+
+    payload = reaction_dict("msg-1", "👍", message_id="react-1", sent_at=12.0)
+    unsigned = encode(payload)
+    payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
+    signed = encode(payload)
+    assert reaction_unsigned_bytes(signed) == unsigned
+    assert parse_reaction(signed)["sig"] == payload["sig"]
+    assert encode_reaction("msg-1", "👍", message_id="react-1", sent_at=12.0) == unsigned
+
+
+def test_message_rejects_invalid_expiry():
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at="soon")
+    with pytest.raises(ProtocolError):
+        encode_message("hi", expires_at=float("inf"))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": "soon"}))
+    with pytest.raises(ProtocolError):
+        parse_message(encode({"type": "message", "text": "hi", "expires_at": True}))
+
+
+def test_message_roundtrip_with_expiry():
+    data = encode_message("vanish soon", expires_at=1893456000.0)
+    parsed = parse_message(data)
+    assert parsed["text"] == "vanish soon"
+    assert parsed["expires_at"] == 1893456000.0

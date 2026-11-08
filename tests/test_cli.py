@@ -17,7 +17,7 @@ from tau.inbox import Inbox
 from tau.lxmf import lxmf_delivery_hash
 from tau.mailbox import Mailbox
 from tau.node import InstanceLock
-from tau.peers import PeerRegistry
+from tau.peers import PeerRegistry, safety_number
 
 
 def test_parser_accepts_global_options_before_and_after_command():
@@ -36,7 +36,7 @@ def test_parser_send_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["send", "--to", "alice", "hello world"])
     assert args.command == "send"
-    assert args.to == "alice"
+    assert args.to == ["alice"]
     assert args.message == "hello world"
     assert args.timeout == 20.0
     assert args.expire is None
@@ -64,6 +64,266 @@ def test_parse_duration():
         cli._parse_duration("31d")
     with pytest.raises(ValueError):
         cli._parse_duration("")
+
+
+def test_parser_send_to_is_repeatable():
+    parser = cli.build_parser()
+    args = parser.parse_args(["send", "--to", "alice", "--to", "bob", "hello"])
+    assert args.to == ["alice", "bob"]
+
+
+class _FakeSendNode:
+    """Stub TauNode for `tau send`: per-target behaviour drives whether
+    a recipient is delivered, queued (a real outbox entry is written,
+    so the post-send flush can flip it), or fails."""
+
+    instances: list = []
+    behaviour: dict = {}
+    deliver_on_flush = False
+
+    def __init__(self, config, **kwargs):
+        from types import SimpleNamespace
+
+        from tau.mailbox import Mailbox
+
+        self.config = config
+        self.mailbox = Mailbox(config.mailbox_path)
+        self.started = False
+        self.calls: list = []
+        self.sent: list = []
+        self.flush_calls: list = []
+        self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
+        _FakeSendNode.instances.append(self)
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target, timeout=10.0):
+        return self.peer
+
+    def _target_hash(self, target):
+        return bytes.fromhex(self.peer.hexhash)
+
+    def send_message(self, target, text, **kwargs):
+        from tau.node import NodeError
+
+        self.calls.append((target, text))
+        self.sent.append((target, text, kwargs.get("in_reply_to")))
+        mode = _FakeSendNode.behaviour.get(target, "delivered")
+        if mode == "error":
+            raise NodeError(f"no path to {target}")
+        if mode == "full":
+            from tau.mailbox import MailboxFull
+
+            raise MailboxFull("outbox is full")
+        if mode == "spoof":
+            # A malicious peer replying with another recipient's label
+            # and a queued flag but no message id.
+            return {"ok": True, "target": "mallory", "queued": True, "echo": text}
+        if mode == "spoof_known_id":
+            # A malicious peer claiming queued with the id of a message
+            # already in this node's outbox (e.g. one it holds a sealed
+            # copy of) — the reply must still be treated as delivered.
+            entries = self.mailbox.outbox_list()
+            known_id = entries[0].id if entries else "00" * 16
+            return {"ok": True, "queued": True, "id": known_id, "to": "bb" * 16}
+        if mode == "queued":
+            entry = self.mailbox.enqueue(
+                to=b"\xbb" * 16,
+                text=text,
+                message_id=f"{len(self.calls):032x}",
+            )
+            return {
+                "ok": True,
+                "queued": True,
+                "id": entry.id,
+                "to": entry.to_hex,
+            }
+        return {"ok": True, "echo": text, "_rtt": 0.05}
+
+    def flush_outbox(self, **kwargs):
+        self.flush_calls.append(kwargs)
+        if _FakeSendNode.deliver_on_flush:
+            for entry in self.mailbox.outbox_list():
+                self.mailbox.remove_outbox(entry.id)
+
+
+def _run_send(tmp_path, monkeypatch, argv, behaviour=None, deliver_on_flush=False):
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = dict(behaviour or {})
+    _FakeSendNode.deliver_on_flush = deliver_on_flush
+    return cli.main(["send", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_send_to_several_peers_delivers_each(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "bob": "delivered"},
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "delivered to bob" in out
+    node = _FakeSendNode.instances[0]
+    assert node.calls == [("alice", "hi"), ("bob", "hi")]
+    assert node.started is False
+    assert node.flush_calls == []
+
+
+def test_send_full_outbox_does_not_stop_later_recipients(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "full", "bob": "delivered"},
+    )
+    assert code != 0
+    out = capsys.readouterr().out
+    # Later recipients are still attempted and reported.
+    assert _FakeSendNode.instances[0].calls == [("alice", "hi"), ("bob", "hi")]
+    assert "delivered to bob" in out
+
+
+def test_send_mixed_delivered_and_queued(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "bob": "queued"},
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "queued for bob" in out
+    # The queued hint is printed once, after every recipient's line.
+    assert out.count("it will be delivered automatically") == 1
+    node = _FakeSendNode.instances[0]
+    assert len(node.flush_calls) == 1
+    assert node.flush_calls[0]["timeout"] == 3.0
+    assert node.flush_calls[0]["max_peers"] == 5
+
+
+def test_send_queued_entry_flips_when_flush_delivers(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "hi"],
+        behaviour={"bob": "queued"},
+        deliver_on_flush=True,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "delivered to bob" in out
+    assert "queued for bob" not in out
+
+
+def test_send_one_failure_does_not_stop_the_rest(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "carol", "--to", "bob", "hi"],
+        behaviour={"alice": "delivered", "carol": "error", "bob": "delivered"},
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "delivered to alice" in captured.out
+    assert "delivered to bob" in captured.out
+    assert "failed to send to carol: no path to carol" in captured.err
+    node = _FakeSendNode.instances[0]
+    assert [call[0] for call in node.calls] == ["alice", "carol", "bob"]
+
+
+def test_send_json_multi_uses_results_list(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "--json", "hi"],
+        behaviour={"alice": "delivered", "bob": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["target"] for r in payload["results"]] == ["alice", "bob"]
+    assert payload["delivered"] == 1
+    assert payload["queued"] == 1
+    assert payload["failed"] == 0
+
+
+def test_send_json_single_keeps_bare_shape(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--json", "hi"],
+        behaviour={"alice": "delivered"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    # The complete payload is the bare peer response: no "results"
+    # wrapper and no "queued" key added for a direct delivery.
+    assert payload == {"ok": True, "echo": "hi", "_rtt": 0.05}
+
+
+def test_send_json_single_queued_keeps_bare_shape(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "--json", "hi"],
+        behaviour={"bob": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued"] is True
+    assert "id" in payload
+
+
+def test_send_peer_response_cannot_relabel_or_fake_queue(
+    tmp_path, capsys, monkeypatch
+):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--to", "bob", "--json", "hi"],
+        behaviour={"alice": "delivered", "bob": "spoof"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    bob = payload["results"][1]
+    assert bob["target"] == "bob"
+    assert bob["queued"] is False
+    assert payload["delivered"] == 2
+    assert payload["queued"] == 0
+
+
+def test_send_spoofed_queued_with_known_id_is_delivered(
+    tmp_path, capsys, monkeypatch
+):
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir)
+    box = Mailbox(config.mailbox_path)
+    held = box.enqueue(to=b"\xbb" * 16, text="held", message_id="cc" * 16)
+
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "bob", "--json", "hi"],
+        behaviour={"bob": "spoof_known_id"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    # The peer's queued claim used a pre-existing outbox id, so the
+    # delivered message is reported delivered, not queued.
+    assert payload["queued"] is False
+    assert payload["id"] == held.id
+    # The real queued entry is untouched by the spoof.
+    assert Mailbox(config.mailbox_path).get_outbox(held.id) is not None
 
 
 def test_parser_serve_http_options():
@@ -150,7 +410,7 @@ def test_id_text_output_includes_lxmf_address(tmp_path, capsys):
     code = cli.main(["id", "--data-dir", str(data_dir)])
     assert code == 0
     lines = capsys.readouterr().out.splitlines()
-    expected = f"lxmf:        {lxmf_delivery_hash(identity).hex()}"
+    expected = f"lxmf:          {lxmf_delivery_hash(identity).hex()}"
     assert expected in lines
 
 
@@ -428,6 +688,338 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
+    """Init a node and register one peer built from a real identity."""
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "owner",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    if capsys is not None:
+        capsys.readouterr()  # drain the init payload so later reads are clean
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name=peer_name,
+        now=100.0,
+    )
+    registry.save()
+    return data_dir, config, peer_identity
+
+
+def test_id_includes_safety_number(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(
+            [
+                "init",
+                "--data-dir",
+                str(data_dir),
+                "--name",
+                "alice",
+                "--no-auto-interface",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    identity = load_identity(data_dir / "identity")
+    assert identity is not None
+
+    code = cli.main(["id", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safety_number"] == safety_number(identity.get_public_key())
+
+    code = cli.main(["id", "--data-dir", str(data_dir)])
+    assert code == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        f"safety number: {safety_number(identity.get_public_key())}" in lines
+    )
+
+
+def test_peers_verify_marks_peer_verified(tmp_path, capsys):
+    data_dir, config, peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+    owner = load_identity(data_dir / "identity")
+    assert owner is not None
+    expected = safety_number(
+        owner.get_public_key(), peer_identity.get_public_key()
+    )
+
+    code = cli.main(["peers", "verify", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Verified alice" in out
+    assert expected in out
+
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.get("alice")
+    assert peer is not None
+    assert peer.is_verified
+    assert peer.verified_fingerprint == expected
+
+    # The table now shows the verified marker.
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "✓" in capsys.readouterr().out
+
+
+def test_peers_verify_json_reports_reverification(tmp_path, capsys):
+    data_dir, config, _peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+
+    code = cli.main(
+        ["peers", "verify", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["reverified"] is False
+    assert first["fingerprint_changed"] is False
+
+    code = cli.main(
+        ["peers", "verify", "alice", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["reverified"] is True
+    assert second["safety_number"] == first["safety_number"]
+
+
+def test_peers_verify_unknown_peer_returns_error(tmp_path, capsys):
+    data_dir, _config, _peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+
+    code = cli.main(["peers", "verify", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_safety_number_lists_pairwise_numbers(tmp_path, capsys):
+    data_dir, _config, peer_identity = _init_and_seed_peer(tmp_path, capsys=capsys)
+    owner = load_identity(data_dir / "identity")
+    assert owner is not None
+    expected = safety_number(
+        owner.get_public_key(), peer_identity.get_public_key()
+    )
+
+    code = cli.main(["peers", "--safety-number", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert expected in capsys.readouterr().out
+
+    code = cli.main(
+        ["peers", "--safety-number", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["peers"][0]["safety_number"] == expected
+
+
+def test_peers_safety_number_without_identity_returns_error(tmp_path, capsys):
+    code = cli.main(
+        ["peers", "--safety-number", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
+
+
+def test_peers_forget_removes_peer(tmp_path, capsys):
+    data_dir, config, _peer_identity = _init_and_seed_peer(
+        tmp_path, capsys=capsys
+    )
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Forgot alice" in capsys.readouterr().out
+    assert PeerRegistry(config.peers_path).get("alice") is None
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_forget_refuses_queued_mail_without_force(tmp_path, capsys):
+    data_dir, config, peer_identity = _init_and_seed_peer(
+        tmp_path, capsys=capsys
+    )
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.enqueue(
+        to=destination_hash(peer_identity), text="hello", to_name="alice"
+    )
+
+    code = cli.main(["peers", "forget", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "queued message" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("alice") is not None
+
+    code = cli.main(
+        ["peers", "forget", "alice", "--force", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "will not be attempted" in capsys.readouterr().out
+    assert PeerRegistry(config.peers_path).get("alice") is None
+
+
+def test_id_import_different_identity_clears_verifications(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    # Seed and verify a peer on node A, then import a different identity.
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verifications_cleared"] == 1
+    assert not PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
+def test_id_import_same_identity_keeps_verifications(tmp_path, capsys):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+
+    backup = tmp_path / "alice.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_a), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # Re-importing the same identity is not an identity change.
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verifications_cleared"] == 0
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
+def test_id_import_registry_save_failure_aborts_replacement(
+    tmp_path, capsys, monkeypatch
+):
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    destination_a = _id_destination(node_a, capsys)
+    config_a = TauConfig.resolve(data_dir=node_a, name="alice")
+    peer_identity = RNS.Identity()
+    registry = PeerRegistry(config_a.peers_path)
+    registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="bob",
+        now=100.0,
+    )
+    registry.save()
+    assert (
+        cli.main(["peers", "verify", "bob", "--data-dir", str(node_a)]) == 0
+    )
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "carol")
+    capsys.readouterr()
+    backup = tmp_path / "carol.identity"
+    assert (
+        cli.main(
+            ["id", "export", "--to", str(backup), "--data-dir", str(node_b), "--json"]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # The registry write fails: the import must abort with the old
+    # identity still in place, not commit the new key alongside stale
+    # verified markers.
+    monkeypatch.setattr(cli.PeerRegistry, "save", lambda self: False)
+    code = cli.main(
+        [
+            "id",
+            "import",
+            "--from",
+            str(backup),
+            "--data-dir",
+            str(node_a),
+            "--force",
+        ]
+    )
+    assert code == 1
+    assert "identity not replaced" in capsys.readouterr().err
+    assert _id_destination(node_a, capsys) == destination_a
+    assert PeerRegistry(config_a.peers_path).get("bob").is_verified
+
+
 def test_parser_messages_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--peer", "alice", "--limit", "5"])
@@ -664,6 +1256,212 @@ def test_messages_out_of_range_timestamp(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "from the far future" in out
     assert "unknown time" in out
+
+
+def test_parser_messages_unread_and_count_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "--unread", "--count"])
+    assert args.unread is True
+    assert args.count is True
+
+    defaults = parser.parse_args(["messages"])
+    assert defaults.unread is False
+    assert defaults.count is False
+
+
+def test_messages_listing_marks_entries_read(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    # Both entries were unread when first listed.
+    assert out.count("● ") == 2
+
+    # A second listing shows the same messages, now read.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "● " not in out
+    assert "second hello" in out
+
+    # --unread finds nothing once the conversation has been read.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--unread"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+
+def test_messages_unread_filter_and_json_flags(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert all(item["unread"] for item in payload["messages"])
+
+    # The --unread listing itself advances the cursor.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+
+    # A --peer listing only marks that conversation read.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "third hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--peer", "alice", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 3
+    assert [item["unread"] for item in payload["messages"]] == [True, False, False]
+
+
+def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "2 unread" in out
+    assert "Total: 2 unread" in out
+
+    # Counting is read-only: the count is unchanged afterwards.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {sender_hash.hex(): 2}, "total": 2}
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--peer", "alice"]
+    )
+    assert code == 0
+    assert "Total: 2 unread" in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--count", "--peer", "nobody"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
+    """An older unread message is not crowded out by newer read ones."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    alice = RNS.Identity()
+    alice_hash = destination_hash(alice)
+    carol = RNS.Identity()
+    carol_hash = destination_hash(carol)
+    registry.upsert(alice_hash, alice.get_public_key(), name="alice", now=100.0)
+    registry.upsert(carol_hash, carol.get_public_key(), name="carol", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": alice_hash.hex(),
+            "text": "old unread",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "a-1",
+        }
+    )
+    for index, received_at in enumerate((11.0, 12.0, 13.0)):
+        inbox.append(
+            {
+                "from": "carol",
+                "destination": carol_hash.hex(),
+                "text": f"read {index}",
+                "sent_at": 11.0,
+                "received_at": received_at,
+                "id": f"c-{index}",
+            }
+        )
+    inbox.mark_read(peer=carol_hash.hex())
+
+    # The three newest messages are all read; --unread must still find
+    # Alice's older one instead of reporting nothing.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--limit", "3", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["a-1"]
+    assert payload["more_unread"] == {}
+
+
+def test_messages_limit_truncation_reports_unshown_unread(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "third hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+
+    # Two of three unread fit in the window; the third stays unread and
+    # is reported, not silently marked read.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--limit", "2", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-3", "m-2"]
+    assert payload["more_unread"] == {sender_hash.hex(): 1}
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {sender_hash.hex(): 3}, "total": 3}
+
+    # The text listing prints the same hint, and the plain listing
+    # truncates the same way.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--limit", "2"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "1 more unread from alice" in out
+    assert "raise --limit to see them" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert json.loads(capsys.readouterr().out)["total"] == 3
+
+
+def test_messages_count_empty(tmp_path, capsys):
+    code = cli.main(["messages", "--data-dir", str(tmp_path / "node"), "--count"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(tmp_path / "node"), "--count", "--json"]
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out) == {"unread": {}, "total": 0}
+
+
 # -- outbox held / drop-held ---------------------------------------------------
 
 
@@ -823,6 +1621,59 @@ def test_outbox_held_lists_envelopes(tmp_path, capsys):
     # The sealed blob itself must never be printed.
     assert "blob" not in payload["held"][0]
     assert "sealed-bytes" not in json.dumps(payload)
+
+
+def test_outbox_held_shows_per_sender_usage(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    box = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    box.hold(
+        to=b"\xbb" * 16,
+        blob=b"sealed-bytes",
+        message_id="a" * 32,
+        expires_at=time.time() + 3600,
+        depositor=sender_hash,
+    )
+    box.hold(
+        to=b"\xbb" * 16,
+        blob=b"sealed-bytes",
+        message_id="b" * 32,
+        expires_at=time.time() + 3600,
+        depositor=sender_hash,
+    )
+    box.hold(
+        to=b"\xaa" * 16,
+        blob=b"sealed-bytes",
+        message_id="c" * 32,
+        expires_at=time.time() + 3600,
+    )
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice")
+    registry.save()
+
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Held per sender:" in out
+    assert "alice" in out
+    assert "unknown" in out
+
+    code = cli.main(["outbox", "held", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["held"][0]["from"] == sender_hash.hex()
+    assert payload["held"][0]["from_name"] == "alice"
+    assert payload["senders"] == [
+        {
+            "sender": sender_hash.hex(),
+            "name": "alice",
+            "count": 2,
+            "bytes": 2 * len(b"sealed-bytes"),
+        },
+        {"sender": "", "name": "", "count": 1, "bytes": len(b"sealed-bytes")},
+    ]
 
 
 def test_outbox_drop_held_by_prefix(tmp_path, capsys):
@@ -1317,7 +2168,7 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False):
+        def start(self, *, announce=True, exclusive=False, lxmf=False):
             events.append("node.start")
 
         def stop(self):
@@ -1356,3 +2207,332 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
         cli.cmd_serve(args)
 
     assert events == ["node.start", "bridge.start", "node.stop"]
+
+
+def _seed_reply_conversation(tmp_path):
+    """One received message and one sent message from the same peer."""
+    from tau.protocol import excerpt_hash
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    peer_hash = "ab" * 16
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "direction": "in",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "seconded",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "b" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    return data_dir, peer_hash
+
+
+def test_messages_renders_quote_from_local_history(tmp_path, capsys):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "↩ alice: original thought" in out
+    assert "seconded" in out
+
+
+def test_messages_reports_unavailable_original(tmp_path, capsys):
+    from tau.protocol import excerpt_hash
+
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "reply to a ghost",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "c" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": excerpt_hash("never arrived"),
+            },
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
+def test_messages_quote_with_wrong_excerpt_is_unavailable(tmp_path, capsys):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": peer_hash,
+            "text": "quoting something else",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "e" * 32,
+            "direction": "in",
+            "in_reply_to": {"id": "a" * 32, "excerpt": "0" * 16},
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
+def test_resolve_reply_target_scopes_to_the_conversation(tmp_path):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+
+    ref = cli._resolve_reply_target(inbox, mailbox, "aaaa", peer_hash)
+    assert ref["id"] == "a" * 32
+    # Another peer's message with the same id shape must not resolve.
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "aaaa", "cd" * 16)
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "zzzz", peer_hash)
+
+
+def test_resolve_reply_target_rejects_prefix_shared_across_stores(tmp_path):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    # A queued message to the same peer shares the "aaaa" prefix with the
+    # received one, so the reference is ambiguous and must be refused.
+    mailbox.enqueue(
+        to=bytes.fromhex(peer_hash),
+        text="queued",
+        message_id="aaaa" + "c" * 28,
+    )
+    with pytest.raises(cli.NodeError, match="2 messages"):
+        cli._resolve_reply_target(inbox, mailbox, "aaaa", peer_hash)
+
+
+def test_send_reply_to_resolves_prefix_and_sends_reference(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "--reply-to",
+            "aaaa",
+            "seconded, again",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    _, _, in_reply_to = node.sent[0]
+    assert in_reply_to["id"] == "a" * 32
+    assert in_reply_to["excerpt"] == cli.excerpt_hash("original thought")
+    assert "in reply to aaaaaaaa" in capsys.readouterr().out
+
+
+def test_send_reply_to_offline_unregistered_hash_does_not_discover(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, peer_hash = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+
+    def _no_discovery(self, target, timeout=10.0):
+        raise cli.NodeError("unknown peer")
+
+    monkeypatch.setattr(_FakeSendNode, "resolve_peer", _no_discovery)
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            peer_hash,
+            "--reply-to",
+            "aaaa",
+            "seconded offline",
+        ]
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    assert node.sent[0][2]["id"] == "a" * 32
+
+
+def test_send_reply_to_unknown_reference_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    code = cli.main(
+        [
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--to",
+            "alice",
+            "--reply-to",
+            "zzzz",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+    assert _FakeSendNode.instances[0].sent == []
+
+
+def test_messages_renders_reactions(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.record_reaction(
+        {
+            "target": "m-1",
+            "destination": sender_hash.hex(),
+            "from": "alice",
+            "reaction": "❤️",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "react-1",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "❤️ alice" in out
+
+
+def test_parser_react_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["react", "abcdef12", "👍"])
+    assert args.command == "react"
+    assert args.message == "abcdef12"
+    assert args.reaction == "👍"
+    assert args.clear is False
+
+    cleared = parser.parse_args(["react", "abcdef12", "--clear"])
+    assert cleared.reaction is None
+    assert cleared.clear is True
+
+
+def test_react_json_and_clear(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["react", "--data-dir", str(data_dir), "m-2", "--clear", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-2"
+    assert payload["to"] == sender_hash.hex()
+    assert payload["cleared"] is True
+    assert _FakeReactNode.instances[0].sent == [
+        (sender_hash.hex(), "m-2", "")
+    ]
+
+
+def test_react_rejects_a_blank_token_without_clear(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "--clear" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_react_rejects_an_oversized_token(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "x" * 33])
+    assert code == cli._EXIT_ERROR
+    assert "longer than 32" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_react_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "zzz", "👍"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_react_requires_exactly_one_of_token_or_clear(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1"])
+    assert code == cli._EXIT_ERROR
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "👍", "--clear"])
+    assert code == cli._EXIT_ERROR
+
+
+def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "m-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "👍" in out
+    node = _FakeReactNode.instances[0]
+    assert node.started is False
+    assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
+
+
+class _FakeReactNode:
+    instances = []
+
+    def __init__(self, config, name=None):
+        self.config = config
+        self.sent = []
+        self.started = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def send_reaction(
+        self, target, message_id, reaction, *, timeout=20.0, discover_timeout=None
+    ):
+        self.sent.append((target, message_id, reaction))
+        return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
