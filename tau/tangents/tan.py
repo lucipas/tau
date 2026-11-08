@@ -1545,6 +1545,54 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
+def list_authors(
+    conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Every author with at least one linked entry in the local store.
+
+    Each record carries the display name from the author's most recent
+    linked entry, the count of visible posts (linked, kind ``post`` and
+    not deleted — the same visibility ``author_stats`` uses), the time
+    of the most recent visible post (0 when the author has none, e.g.
+    only a delete entry has arrived so far), and whether the author is
+    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    """
+    if sort not in ("recent", "posts", "name"):
+        raise TanError(f"unknown author sort: {sort!r}")
+    if limit < 0:
+        raise TanError("--limit must not be negative")
+    rows = conn.execute(
+        "SELECT posts.author AS author, "
+        "(SELECT name FROM posts AS latest WHERE latest.author = posts.author "
+        "AND latest.linked = 1 "
+        "ORDER BY latest.created_at DESC, latest.seq DESC LIMIT 1) AS name, "
+        f"SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) AS posts, "
+        f"MAX(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN posts.created_at ELSE 0 END) AS last_post, "
+        "CASE WHEN follows.author IS NULL THEN 0 ELSE 1 END AS followed "
+        "FROM posts LEFT JOIN follows ON follows.author = posts.author "
+        "WHERE posts.linked = 1 GROUP BY posts.author"
+    ).fetchall()
+    records = [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"] or ""),
+            "posts": int(row["posts"]),
+            "last_post": float(row["last_post"]),
+            "followed": bool(row["followed"]),
+        }
+        for row in rows
+    ]
+    if sort == "posts":
+        records.sort(key=lambda record: (-record["posts"], -record["last_post"], record["author"]))
+    elif sort == "name":
+        records.sort(
+            key=lambda record: ((record["name"] or "").casefold(), record["author"])
+        )
+    else:
+        records.sort(key=lambda record: (-record["last_post"], record["author"]))
+    return records[:limit]
+
+
 def resolve_author(
     conn: sqlite3.Connection,
     target: str,

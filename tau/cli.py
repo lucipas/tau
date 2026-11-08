@@ -61,6 +61,7 @@ from .tangents.tan import (
     following,
     import_entries,
     init_db,
+    list_authors,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -657,6 +658,20 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_authors = tan_sub.add_parser(
+        "authors", parents=[common], help="list every author in the local Tan store"
+    )
+    tan_authors.add_argument(
+        "--sort",
+        choices=["recent", "posts", "name"],
+        default="recent",
+        help="sort order (default: recent)",
+    )
+    tan_authors.add_argument(
+        "--limit", type=int, default=50, metavar="N", help="maximum authors"
+    )
+    tan_authors.set_defaults(func=cmd_tan_authors)
 
     tan_sync = tan_sub.add_parser(
         "sync",
@@ -1453,6 +1468,42 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
             )
+    return _EXIT_OK
+
+
+def cmd_tan_authors(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    limit = getattr(args, "limit", 50)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    # A read-only listing must not create the store on a fresh data dir.
+    if not config.social_db_path.exists():
+        records: List[Dict[str, Any]] = []
+    else:
+        conn = init_db(config.social_db_path)
+        try:
+            records = list_authors(conn, sort=args.sort, limit=limit)
+        finally:
+            conn.close()
+
+    if _json_mode(args):
+        _emit({"authors": records, "count": len(records)}, True)
+        return _EXIT_OK
+    if not records:
+        print("No authors in the local Tan store yet. Post or sync first.")
+        return _EXIT_OK
+    for record in records:
+        name = record.get("name") or "unknown"
+        last = (
+            _format_message_time(record["last_post"])
+            if record["last_post"]
+            else "never"
+        )
+        followed = "following" if record.get("followed") else ""
+        print(
+            f"{name:<20} {short_hash(record['author']):<10} "
+            f"{record.get('posts', 0)} post(s)  last {last}  {followed}".rstrip()
+        )
     return _EXIT_OK
 
 
