@@ -1489,7 +1489,9 @@ def top_posts(
     to one keeps no parent preview at all, as in the timeline —
     muting is display-only, so entries stay stored and unmuting
     restores them.  An explicit *author* is an explicit lookup, like
-    ``timeline --author``: their posts rank even when they are muted.
+    ``timeline --author``: their posts rank even when they are muted,
+    but a reply of theirs to a muted author's post still keeps no
+    parent preview, so the mute never leaks through a preview.
     Results carry the timeline's ``likes`` / ``liked`` / ``own``
     annotations and ``reply_to`` parent summaries.
 
@@ -1500,10 +1502,10 @@ def top_posts(
     """
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
-    silenced = muted_author_set(conn) if author is None else set()
+    silenced = muted_author_set(conn)
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
-    if silenced:
+    if silenced and author is None:
         placeholders = ", ".join("?" for _ in silenced)
         where += f" AND author NOT IN ({placeholders})"
         params.extend(sorted(silenced))

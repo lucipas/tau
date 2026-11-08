@@ -3110,3 +3110,9 @@ def test_top_posts_hides_muted_authors(identities, tmp_path):
     assert [post["text"] for post in top_posts(conn, author=author_of(bob))] == [
         "loud hit"
     ]
+
+    # But even in an explicit lookup, a reply to a muted author keeps
+    # no parent preview — the mute never leaks through a preview.
+    by_alice = top_posts(conn, author=author_of(alice))
+    assert [post["text"] for post in by_alice] == ["agreed", "everyone loves this"]
+    assert by_alice[0]["reply_to"] is None
