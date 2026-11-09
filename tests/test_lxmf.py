@@ -479,3 +479,69 @@ def test_node_lxmf_delivery_callback_never_raises(fake_lxmf, tmp_path):
         assert node.inbox.list_messages() == []
     finally:
         node.stop()
+
+
+def test_node_lxmf_concurrent_duplicates_store_once(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        threads = [
+            threading.Thread(
+                target=node.lxmf_router.delivery_callback, args=(message,)
+            )
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_after_stop_is_dropped(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    router = node.lxmf_router
+    node.stop()
+    router.delivery_callback(_lxmf_message(sender))
+    assert node.inbox.list_messages() == []
+
+
+def test_node_lxmf_stop_waits_for_inflight_delivery(
+    fake_lxmf, tmp_path, monkeypatch
+):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    entered = threading.Event()
+    release = threading.Event()
+    real_append = node.inbox.append
+
+    def _blocking_append(record):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_append(record)
+
+    monkeypatch.setattr(node.inbox, "append", _blocking_append)
+    try:
+        delivery = threading.Thread(
+            target=node.lxmf_router.delivery_callback,
+            args=(_lxmf_message(sender),),
+        )
+        delivery.start()
+        assert entered.wait(timeout=10)
+        stopped = threading.Thread(target=node.stop)
+        stopped.start()
+        # stop() is still waiting for the delivery while it is blocked.
+        stopped.join(timeout=1)
+        assert stopped.is_alive()
+        release.set()
+        stopped.join(timeout=10)
+        assert not stopped.is_alive()
+        delivery.join(timeout=10)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        release.set()
+        node.stop()
