@@ -123,4 +123,36 @@ describe("MessageFeed search", () => {
 
     expect(screen.getByText("bridge unreachable")).toBeTruthy();
   });
+
+  it("resolves reply quotes from the live traffic while searching", () => {
+    // A search hit that is a reply quotes an original that is not itself
+    // a hit: the quote must resolve from the live traffic, not render
+    // as unavailable.
+    const original = makeMessage({
+      id: 1,
+      text: "original thought",
+      wire_id: "a".repeat(32),
+      excerpt_hash: "0123456789abcdef",
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "seconded",
+      wire_id: "b".repeat(32),
+      in_reply_to: { id: "a".repeat(32), excerpt: "0123456789abcdef" },
+    });
+    render(
+      <MessageFeed
+        messages={[reply]}
+        node={null}
+        live={true}
+        searching={true}
+        searchQuery="seconded"
+        quoteContext={[original, reply]}
+        onSearch={mockSearch}
+        onClearSearch={mockClearSearch}
+      />,
+    );
+
+    expect(screen.getByText(/original thought/)).toBeTruthy();
+  });
 });

@@ -390,13 +390,3 @@ function MessageBubble({
     </article>
   );
 }
-hover:bg-void/60 hover:text-zinc-200"
-            >
-              ↩ reply
-            </button>
-          ) : null}
-        </div>
-      </div>
-    </article>
-  );
-}
