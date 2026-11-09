@@ -1010,7 +1010,7 @@ def create_edit(
     existing = get_post(conn, target)
     if existing is None:
         raise TanError(f"unknown post: {target!r}")
-    if existing.get("kind", KIND_POST) not in TIMELINE_KINDS:
+    if existing.get("kind", KIND_POST) not in (KIND_POST, KIND_REPLY):
         raise TanError("only posts and replies can be edited")
     if not existing.get("linked"):
         raise TanError(

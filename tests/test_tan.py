@@ -1477,6 +1477,14 @@ def test_edit_rejects_foreign_unknown_deleted_and_unlinked(
     like = create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1001)
     with pytest.raises(TanError, match="only posts and replies can be edited"):
         create_edit(conn, alice, like["hash"], "nope", name="alice", now=1002)
+    # A quote is a timeline entry, but edits to it would never display
+    # (edit_states only covers posts and replies), so it is rejected
+    # here rather than stored as a silent no-op.
+    quote = create_quote(
+        conn, alice, post["hash"], "sharing", name="alice", now=1002
+    )
+    with pytest.raises(TanError, match="only posts and replies can be edited"):
+        create_edit(conn, alice, quote["hash"], "nope", name="alice", now=1003)
 
     create_delete(conn, alice, post["hash"], name="alice", now=1002)
     with pytest.raises(TanError, match="has been deleted"):
