@@ -179,6 +179,7 @@ class _FakeLXMRouter:
             else bytes(16)
         )
         self.propagation_enabled_calls = 0
+        self.message_storage_limit_mb = None
         self.display_name = None
         self.announced: list = []
         self.exit_handler_calls = 0
@@ -195,6 +196,11 @@ class _FakeLXMRouter:
     def enable_propagation(self):
         self.propagation_enabled_calls += 1
         self.propagation_node = True
+
+    def set_message_storage_limit(
+        self, kilobytes=None, megabytes=None, gigabytes=None
+    ):
+        self.message_storage_limit_mb = megabytes
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
@@ -298,6 +304,9 @@ def test_start_router_with_propagation_enables_it(fake_lxmf, tmp_path):
     )
     assert router.propagation_enabled_calls == 1
     assert router.propagation_node is True
+    # The store is capped before the node advertises itself, so it
+    # cannot fill the filesystem under sustained traffic.
+    assert router.message_storage_limit_mb == 256
     assert lxmf.lxmf_router_propagation_hash(router) == (
         lxmf.lxmf_propagation_hash(identity)
     )
@@ -386,3 +395,18 @@ def test_serve_parser_accepts_lxmf_propagation():
     args = cli.build_parser().parse_args(["serve"])
     assert args.lxmf is False
     assert args.lxmf_propagation is False
+
+def test_enable_propagation_caps_message_store(fake_lxmf, tmp_path):
+    router = _FakeLXMRouter(identity=RNS.Identity(), storagepath=str(tmp_path))
+    lxmf.enable_lxmf_propagation(router, message_storage_limit_mb=64)
+    assert router.message_storage_limit_mb == 64
+    assert router.propagation_enabled_calls == 1
+
+
+def test_node_start_rejects_propagation_without_lxmf(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    with pytest.raises(NodeError, match="lxmf_propagation requires lxmf"):
+        node.start(lxmf_propagation=True)
+    assert node.reticulum is None
+    assert node.lxmf_router is None

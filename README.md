@@ -858,8 +858,9 @@ unlinked, and stall sync at the gap.
   identity, registers its delivery destination and announces it.
   `tau serve --lxmf --lxmf-propagation` also serves as an LXMF
   propagation node, holding mail for offline recipients until they
-  fetch it. Nothing is sent over LXMF yet — sending and the migration
-  of store-and-forward follow under #67.
+  fetch it (message store capped at 256 MB). Nothing is sent over
+  LXMF yet — sending and the migration of store-and-forward follow
+  under #67.
 
 ## Development
 

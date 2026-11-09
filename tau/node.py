@@ -489,6 +489,8 @@ class TauNode:
         also serves as an LXMF propagation node, holding mail for
         offline recipients.
         """
+        if lxmf_propagation and not lxmf:
+            raise NodeError("lxmf_propagation requires lxmf")
         if self.reticulum is not None:
             raise NodeError("node is already running")
         if self._shutdown:

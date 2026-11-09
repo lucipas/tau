@@ -95,7 +95,8 @@ def start_lxmf_router(
 
     With ``propagation`` on, the router also serves as an LXMF
     propagation node (see :func:`enable_lxmf_propagation`): it holds
-    mail for offline recipients until they fetch it.
+    mail for offline recipients until they fetch it, with the
+    message store capped so it cannot fill the filesystem.
 
     Raises :class:`LXMFError` when the ``lxmf`` package is not installed,
     when called off the main thread (LXMRouter installs signal handlers),
@@ -134,16 +135,25 @@ def start_lxmf_router(
     return router
 
 
-def enable_lxmf_propagation(router: Any) -> None:
+def enable_lxmf_propagation(
+    router: Any,
+    *,
+    message_storage_limit_mb: int = 256,
+) -> None:
     """Enable propagation on a running LXMF router.
 
     ``LXMRouter.enable_propagation`` indexes the message store,
     registers the propagation request handlers and announces the
     propagation destination, so LXMF clients can store messages for
-    offline recipients on this node.  Raises :class:`LXMFError` when
-    propagation cannot be enabled.
+    offline recipients on this node.  Before enabling it, the message
+    store is capped at ``message_storage_limit_mb`` megabytes: the
+    router's default is unlimited, so an opt-in propagation node under
+    sustained traffic could otherwise fill its filesystem and stop
+    tau persisting state.  Raises :class:`LXMFError` when propagation
+    cannot be enabled.
     """
     try:
+        router.set_message_storage_limit(megabytes=message_storage_limit_mb)
         router.enable_propagation()
     except Exception as exc:
         raise LXMFError(f"could not enable LXMF propagation: {exc}") from exc
