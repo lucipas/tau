@@ -215,3 +215,37 @@ describe("useTan search", () => {
     ).toBe(false);
   });
 });
+
+describe("useTan search resubmit", () => {
+  it("resubmitting the same query keeps results and refreshes them", async () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const hit = makePost({ hash: "e".repeat(64), text: "mesh post" });
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/search")
+        ? Promise.resolve({ posts: [hit], count: 1 })
+        : path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [timelinePost], count: 1 })
+          : Promise.resolve(emptyFollowing),
+    );
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([timelinePost]));
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    await waitFor(() => expect(result.current.searchResults).toEqual([hit]));
+
+    const searchCallsBefore = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/search"),
+    ).length;
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+
+    // Results are kept, not cleared, and the query is re-fetched.
+    expect(result.current.searchResults).toEqual([hit]);
+    const searchCallsAfter = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/search"),
+    ).length;
+    expect(searchCallsAfter).toBeGreaterThan(searchCallsBefore);
+  });
+});

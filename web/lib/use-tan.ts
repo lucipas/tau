@@ -127,14 +127,25 @@ export function useTan() {
   // A search is a view switch, like `all`: setting the query re-runs the
   // load effect, which fetches the search endpoint instead of the
   // timeline. Clearing it returns to the timeline the same way.
-  const search = useCallback(async (query: string) => {
-    const trimmed = query.trim();
-    if (!trimmed) return;
-    // Drop hits from the previous query so they are not shown as matches
-    // for the new one while its request is in flight.
-    setSearchResults([]);
-    setSearchQuery(trimmed);
-  }, []);
+  const search = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim();
+      if (!trimmed) return;
+      if (trimmed === searchQueryRef.current) {
+        // Resubmitting the current query: setting the same state would
+        // bail out without reloading, so refresh directly — and keep
+        // the current results instead of clearing them, or the feed
+        // would wrongly report no matches until the next poll.
+        await load();
+        return;
+      }
+      // Drop hits from the previous query so they are not shown as matches
+      // for the new one while its request is in flight.
+      setSearchResults([]);
+      setSearchQuery(trimmed);
+    },
+    [load],
+  );
 
   const clearSearch = useCallback(() => {
     setSearchQuery(null);

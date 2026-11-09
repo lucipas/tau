@@ -718,7 +718,13 @@ def test_tan_search_hides_blocked_and_muted(tmp_path):
     import RNS
 
     from tau.config import TauConfig
-    from tau.tangents.tan import create_post, init_db, mute, mute_keyword
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        init_db,
+        mute,
+        mute_keyword,
+    )
 
     node = FakeNode()
     node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
@@ -738,6 +744,19 @@ def test_tan_search_hides_blocked_and_muted(tmp_path):
         # Searching for a muted keyword still finds it: search is explicit.
         create_post(conn, identity, "weather report", name="tester", now=1004)
         mute_keyword(conn, "weather", now=1005)
+        # A quote of a blocked author's post still matches on its own
+        # text, but the embedded original must stay redacted.
+        blocked_original = create_post(
+            conn, blocked_id, "blocked original words", name="blocked", now=1006
+        )
+        create_quote(
+            conn,
+            identity,
+            blocked_original["hash"],
+            "mesh quote",
+            name="tester",
+            now=1007,
+        )
     finally:
         conn.close()
 
@@ -749,7 +768,17 @@ def test_tan_search_hides_blocked_and_muted(tmp_path):
     try:
         status, _, payload = _json(bridge, "/api/tan/search?q=mesh")
         assert status == 200
-        assert [item["text"] for item in payload["posts"]] == ["mesh from me"]
+        assert [item["text"] for item in payload["posts"]] == [
+            "mesh quote",
+            "mesh from me",
+        ]
+        # The quote matches on its own text, but its blocked original
+        # stays redacted: no name, no words.
+        quoted = payload["posts"][0]["quoted"]
+        assert quoted["blocked"] is True
+        assert quoted["name"] == ""
+        assert quoted["text"] == ""
+        assert "blocked original" not in json.dumps(payload)
 
         # An explicit author search still cannot surface a blocked author.
         status, _, payload = _json(

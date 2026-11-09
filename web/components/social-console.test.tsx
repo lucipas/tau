@@ -185,6 +185,32 @@ describe("PostCard quote rendering", () => {
     ).toBeTruthy();
   });
 
+  it("reports a blocked original without resurfacing its name or text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "worth quoting",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "",
+          name: "",
+          text: "",
+          deleted: false,
+          blocked: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("worth quoting")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting a blocked author's post",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows the quote count on the quoted post and hides it at zero", () => {
     const { rerender } = render(
       <PostCard

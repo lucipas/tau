@@ -524,10 +524,14 @@ export function PostCard({
             <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
               quoting{" "}
               {post.quoted ? (
-                <>
-                  {post.quoted.name || "anonymous"} ·{" "}
-                  {post.quoted.deleted ? "a deleted post" : post.quoted.text}
-                </>
+                post.quoted.blocked ? (
+                  "a blocked author's post"
+                ) : (
+                  <>
+                    {post.quoted.name || "anonymous"} ·{" "}
+                    {post.quoted.deleted ? "a deleted post" : post.quoted.text}
+                  </>
+                )
               ) : (
                 shortHash(post.target ?? "", 16)
               )}

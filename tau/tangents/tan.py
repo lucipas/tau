@@ -1184,6 +1184,8 @@ def annotate_quote_counts(
 def annotate_quotes(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
+    *,
+    blocked_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1192,7 +1194,12 @@ def annotate_quotes(
     original has not arrived yet — a quote is still shown on its own.
     A deleted original is reported as deleted with its text blanked,
     so the thread stays readable without resurfacing removed content.
-    Top-level posts and replies get no ``quoted`` key.
+    An original whose author is in *blocked_authors* is reported with
+    its text blanked, its author and name redacted, and ``blocked``
+    set, so blocking an author never leaks their words — or their
+    name — through a quote preview, the same protection
+    :func:`annotate_replies` gives reply snippets.  Top-level posts
+    and replies get no ``quoted`` key.
 
     Parents are fetched in one query and their deletion status in a
     second, so a quote-heavy page does not issue one lookup per quote.
@@ -1234,6 +1241,18 @@ def annotate_quotes(
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
+        if blocked_authors and parent["author"] in blocked_authors:
+            # Redact identity too: a blocked author's name and hash must
+            # not leak through a quote preview, as in annotate_replies.
+            post["quoted"] = {
+                "hash": parent["hash"],
+                "author": "",
+                "name": "",
+                "text": "",
+                "deleted": is_deleted,
+                "blocked": True,
+            }
+            continue
         post["quoted"] = {
             "hash": parent["hash"],
             "author": parent["author"],
@@ -1637,6 +1656,7 @@ def timeline(
                     blocked_authors=blocked,
                 ),
             ),
+            blocked_authors=blocked,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -1683,6 +1703,7 @@ def timeline(
                 blocked_authors=blocked,
             ),
         ),
+        blocked_authors=blocked,
     )
 
 
@@ -1744,6 +1765,7 @@ def author_timeline(
                 blocked_authors=blocked,
             ),
         ),
+        blocked_authors=blocked,
     )
 
 
@@ -1934,6 +1956,7 @@ def thread(
         annotate_quotes(
             conn,
             annotate_quote_counts(conn, annotate_reactions(conn, batch, viewer=viewer)),
+            blocked_authors=excluded,
         )
     return ordered
 
@@ -2009,6 +2032,7 @@ def search_posts(
             conn,
             annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer),
         ),
+        blocked_authors=excluded,
     )
 
 
