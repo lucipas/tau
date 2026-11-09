@@ -38,7 +38,9 @@ from .identity import (
 from .inbox import Inbox
 from .lxmf import (
     LXMFError,
+    build_lxmf_message,
     lxmf_router_delivery_hash,
+    send_lxmf_message,
     start_lxmf_router,
     stop_lxmf_router,
 )
@@ -1572,14 +1574,22 @@ class TauNode:
         )
         if not self._still_queued(entry.id):
             return False
+        via_lxmf = False
         try:
             self._request(peer, REQUEST_MESSAGE, payload, timeout)
         except NodeError as exc:
-            self.mailbox.record_attempt(entry.id, error=str(exc))
-            return False
+            if not self._deliver_via_lxmf(entry, timeout):
+                self.mailbox.record_attempt(entry.id, error=str(exc))
+                return False
+            via_lxmf = True
         self.mailbox.record_delivered(entry.id)
         self.mailbox.remove_outbox(entry.id)
-        log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        log.info(
+            "Delivered queued message %s to %s%s",
+            entry.id,
+            peer.hexhash,
+            " over LXMF" if via_lxmf else "",
+        )
         self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
@@ -1587,6 +1597,37 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
+
+    def _deliver_via_lxmf(self, entry: Any, timeout: float) -> bool:
+        """Try one queued entry over LXMF; True only on confirmation.
+
+        The LXMF router must be running and the recipient must have a
+        registered public key — without it no LXMF address can be
+        derived.  Delivery is confirmed by the router's callback (the
+        peer received it, or a propagation node accepted it); anything
+        else leaves the entry queued for the next sweep.
+        """
+        if self.lxmf_router is None or self.identity is None:
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None or not recipient.public_key:
+            log.debug(
+                "No public key for %s; cannot address an LXMF message",
+                entry.to_hex,
+            )
+            return False
+        try:
+            message = build_lxmf_message(
+                self.identity, recipient.public_key, entry.text
+            )
+            return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
+        except (LXMFError, ValueError) as exc:
+            log.debug(
+                "Could not send queued message %s over LXMF: %s",
+                entry.id,
+                exc,
+            )
+            return False
 
     def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
         # Same re-check as _deliver_entry: do not leave a sealed copy

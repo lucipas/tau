@@ -102,13 +102,7 @@ def start_lxmf_router(
             "the LXMF router must start on the main thread "
             "(LXMRouter installs signal handlers)"
         )
-    try:
-        lxmf_module = importlib.import_module("LXMF")
-    except ImportError as exc:
-        raise LXMFError(
-            "LXMF is not installed; install it with "
-            f"{LXMF_INSTALL_HINT}"
-        ) from exc
+    lxmf_module = _import_lxmf()
     previous = _signal_handlers()
     router = lxmf_module.LXMRouter(identity=identity, storagepath=str(data_dir))
     installed = _signal_handlers()
@@ -189,3 +183,89 @@ def lxmf_router_delivery_hash(router: Optional[Any]) -> Optional[bytes]:
     if not destinations:
         return None
     return next(iter(destinations))
+
+
+# -- sending ---------------------------------------------------------------
+
+def _import_lxmf() -> Any:
+    """Import the ``lxmf`` package or raise :class:`LXMFError`."""
+    try:
+        return importlib.import_module("LXMF")
+    except ImportError as exc:
+        raise LXMFError(
+            "LXMF is not installed; install it with "
+            f"{LXMF_INSTALL_HINT}"
+        ) from exc
+
+
+def _lxmf_destination(identity: RNS.Identity) -> Any:
+    """Return the LXMF delivery ``RNS.Destination`` for *identity*."""
+    return RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        LXMF_APP_NAME,
+        LXMF_DELIVERY_ASPECT,
+    )
+
+
+def build_lxmf_message(
+    source_identity: RNS.Identity,
+    destination_public_key: bytes,
+    text: str,
+) -> Any:
+    """Build an ``LXMessage`` carrying *text* to a peer's LXMF address.
+
+    The destination is the peer's LXMF delivery destination, derived
+    from their public key, and the source is this node's own delivery
+    destination, so the receiver can attribute the message to a known
+    peer exactly like an incoming delivery.  Raises
+    :class:`LXMFError` when the ``lxmf`` package is not installed
+    and :class:`ValueError` for a key that cannot be loaded.
+    """
+    lxmf_module = _import_lxmf()
+    destination = _lxmf_destination(_identity_for_key(destination_public_key))
+    source = _lxmf_destination(source_identity)
+    return lxmf_module.LXMessage(destination, source, content=text)
+
+
+def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:
+    """Hand *message* to *router* and wait for delivery confirmation.
+
+    The router owns retries once the message is handed over, so the
+    caller waits at most *timeout* seconds for the delivery callback
+    (fired when the peer receives the message, or when a propagation
+    node accepts it) or the failed callback.  On timeout the router's
+    copy is cancelled, so it cannot deliver late after the caller has
+    kept the message queued and sends a fresh copy on the next sweep.
+    Returns True only on confirmation.  Raises :class:`LXMFError`
+    when the router refuses the message.
+    """
+    if router is None:
+        raise LXMFError("no LXMF router running")
+    outcome: dict = {}
+    done = threading.Event()
+
+    def _delivered(_message: Any) -> None:
+        outcome["ok"] = True
+        done.set()
+
+    def _failed(_message: Any) -> None:
+        outcome["ok"] = False
+        done.set()
+
+    message.register_delivery_callback(_delivered)
+    message.register_failed_callback(_failed)
+    try:
+        router.handle_outbound(message)
+    except Exception as exc:
+        raise LXMFError(
+            f"could not hand message to the LXMF router: {exc}"
+        ) from exc
+    if done.wait(timeout):
+        return outcome.get("ok", False)
+    try:
+        router.cancel_outbound(getattr(message, "message_id", None))
+    except Exception:  # pragma: no cover - defensive
+        log.debug("Could not cancel timed-out LXMF message", exc_info=True)
+    return False
