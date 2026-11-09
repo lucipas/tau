@@ -827,6 +827,116 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def _hold(node, to_hex, message_id, blob=b"sealed-bytes", expires_at=None,
+          depositor=None, now=None):
+    return node.mailbox.hold(
+        to=bytes.fromhex(to_hex),
+        blob=blob,
+        message_id=message_id,
+        expires_at=expires_at if expires_at is not None else time.time() + 3600,
+        now=now,
+        depositor=bytes.fromhex(depositor) if depositor else None,
+    )
+
+
+def test_outbox_held_lists_envelopes_with_names(bridge, node):
+    first = "cc" + "11" * 15
+    second = "dd" + "22" * 15
+    assert _hold(
+        node, PEER_HASH, first, blob=b"sealed-one",
+        expires_at=5000.0, depositor=OTHER_HASH, now=100.0,
+    )
+    assert _hold(
+        node, OTHER_HASH, second, blob=b"sealed-two!",
+        expires_at=6000.0, depositor=PEER_HASH, now=200.0,
+    )
+
+    status, _, payload = _json(bridge, "/api/outbox/held")
+    assert status == 200
+    assert payload["count"] == 2
+    by_id = {entry["id"]: entry for entry in payload["held"]}
+    assert by_id[first]["to"] == PEER_HASH
+    assert by_id[first]["to_name"] == "alice"
+    # Unknown depositor: no name, but the hash is still shown.
+    assert by_id[first]["from"] == OTHER_HASH
+    assert by_id[first]["from_name"] == ""
+    assert by_id[first]["stored_at"] == 100.0
+    assert by_id[first]["expires_at"] == 5000.0
+    assert by_id[first]["blob_bytes"] == len(b"sealed-one")
+    # Unknown recipient: falls back to the hash, while the known
+    # depositor resolves to a name.
+    assert by_id[second]["to"] == OTHER_HASH
+    assert by_id[second]["to_name"] == ""
+    assert by_id[second]["from"] == PEER_HASH
+    assert by_id[second]["from_name"] == "alice"
+    assert by_id[second]["blob_bytes"] == len(b"sealed-two!")
+    # Oldest first.
+    assert [entry["id"] for entry in payload["held"]] == [first, second]
+
+
+def test_outbox_drop_held_by_id_and_prefix(bridge, node):
+    first = "cc" + "11" * 15
+    second = "dd" + "22" * 15
+    _hold(node, PEER_HASH, first)
+    _hold(node, PEER_HASH, second)
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": first}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["dropped"]["id"] == first
+    assert payload["dropped"]["to_name"] == "alice"
+    assert "already fetched" in payload["dropped"]["note"]
+    # The tombstone stops a sender retry resurrecting the envelope.
+    assert _hold(node, PEER_HASH, first) is False
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": second[:8]}
+    )
+    assert status == 200
+    assert payload["dropped"]["id"] == second
+
+    status, _, payload = _json(bridge, "/api/outbox/held")
+    assert payload == {"held": [], "count": 0}
+
+
+def test_outbox_drop_held_errors(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": "ff" * 16}
+    )
+    assert status == 404
+    assert "unknown held message" in payload["error"]["message"]
+
+    # Two envelopes sharing a prefix make the prefix ambiguous.
+    _hold(node, PEER_HASH, "aa" + "11" * 15)
+    _hold(node, PEER_HASH, "aa" + "22" * 15)
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": "aa"}
+    )
+    assert status == 404
+    assert "match prefix" in payload["error"]["message"]
+
+    # Dropping an envelope that is already gone is a 404 too.
+    gone = "bb" + "33" * 15
+    _hold(node, PEER_HASH, gone)
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": gone}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": gone}
+    )
+    assert status == 404
+    assert "unknown held message" in payload["error"]["message"]
+
+
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
     from tau.mailbox import Mailbox
 

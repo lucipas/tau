@@ -6,6 +6,9 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  DropHeldResponse,
+  HeldMailEntry,
+  HeldMailResponse,
   MarkReadResponse,
   NodeInfo,
   OutboxEntry,
@@ -50,6 +53,7 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
@@ -178,6 +182,7 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const refreshHeldSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -190,12 +195,22 @@ export function useTau() {
     setHeldForOthers(result.held_for_others);
   }, []);
 
+  const refreshHeldMail = useCallback(async () => {
+    // Same stale-response guard as the outbox refresh: a slow poll
+    // must not restore an entry a drop already removed.
+    const requestId = ++refreshHeldSeq.current;
+    const result = await apiGet<HeldMailResponse>("/api/outbox/held");
+    if (requestId !== refreshHeldSeq.current) return;
+    setHeldMail(result.held);
+  }, []);
+
   useEffect(() => {
     if (connection !== "live") return;
     let disposed = false;
     async function tick() {
       try {
         await refreshOutbox();
+        await refreshHeldMail();
       } catch {
         // The outbox is a side panel: a failed poll leaves the last
         // known entries in place instead of flashing an error.
@@ -208,7 +223,7 @@ export function useTau() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox]);
+  }, [connection, refreshOutbox, refreshHeldMail]);
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -231,6 +246,30 @@ export function useTau() {
       return result.cancelled;
     },
     [refreshOutbox],
+  );
+
+  const dropHeldMail = useCallback(
+    async (id: string) => {
+      const result = await apiPost<DropHeldResponse>("/api/outbox/drop-held", {
+        target: id,
+      });
+      // The drop already succeeded: remove the entry locally at once,
+      // and treat the follow-up refreshes as best-effort so a failed
+      // GET cannot make a successful drop look like a failure.
+      const droppedId = result.dropped.id;
+      setHeldMail((previous) =>
+        previous.filter((entry) => entry.id !== droppedId),
+      );
+      setHeldForOthers((previous) => Math.max(0, previous - 1));
+      try {
+        await refreshHeldMail();
+        await refreshOutbox();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.dropped;
+    },
+    [refreshHeldMail, refreshOutbox],
   );
 
   const send = useCallback(
@@ -313,6 +352,7 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    heldMail,
     bridge,
     connection,
     pings,
@@ -323,5 +363,7 @@ export function useTau() {
     markRead,
     refreshOutbox,
     cancelOutbox,
+    refreshHeldMail,
+    dropHeldMail,
   };
 }

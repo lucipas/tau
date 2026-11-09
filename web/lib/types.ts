@@ -147,6 +147,27 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface HeldMailEntry {
+  id: string;
+  to: string;
+  to_name: string;
+  from: string;
+  from_name: string;
+  stored_at: number;
+  expires_at: number;
+  blob_bytes: number;
+}
+
+export interface HeldMailResponse {
+  held: HeldMailEntry[];
+  count: number;
+}
+
+export interface DropHeldResponse {
+  ok: boolean;
+  dropped: HeldMailEntry & { note: string };
+}
+
 export interface ApiErrorBody {
   error?: { message?: string };
 }
