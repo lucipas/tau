@@ -22,7 +22,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
-from .allowlist import AllowList, load_allowlist_or_deny_all, save_allowlist
+from .allowlist import (
+    AllowList,
+    load_allowlist,
+    load_allowlist_or_deny_all,
+    save_allowlist,
+)
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -397,6 +402,7 @@ class TauNode:
         self._shutdown = False
         self.app: Optional[Any] = None
         self._allowlist: Optional[AllowList] = None
+        self._allowlist_lock = threading.RLock()
         self._blocklist: Optional[BlockList] = None
 
     @property
@@ -420,10 +426,32 @@ class TauNode:
         whose saved changes only apply when the node restarts, the
         console *is* the running node.
         """
-        # Persist first: if the write fails, the running node keeps the
-        # policy that is actually on disk.
-        save_allowlist(self.config.allowlist_path, allowlist)
-        self._allowlist = allowlist
+        with self._allowlist_lock:
+            # Persist first: if the write fails, the running node keeps
+            # the policy that is actually on disk.
+            save_allowlist(self.config.allowlist_path, allowlist)
+            self._allowlist = allowlist
+
+    def update_allowlist(
+        self, transform: Callable[[AllowList], AllowList]
+    ) -> AllowList:
+        """Atomically apply *transform* to the DM allow-list.
+
+        The saved list is re-read first, so a change another process
+        (e.g. the CLI) saved while this node runs is preserved instead
+        of overwritten, and a corrupt saved file refuses the edit —
+        the CLI refuses the same edit — instead of replacing the file
+        with the node's fail-closed fallback. The whole
+        read-modify-write is serialised, so overlapping console
+        mutations cannot lose each other's changes.
+        """
+        with self._allowlist_lock:
+            current = load_allowlist(
+                getattr(self.config, "allowlist_path", None)
+            )
+            updated = transform(current)
+            self.set_allowlist(updated)
+            return updated
 
     @property
     def read_receipts_enabled(self) -> bool:

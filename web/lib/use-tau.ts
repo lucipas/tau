@@ -58,8 +58,6 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
-  const allowlistSeq = useRef(0);
-  const allowlistApplied = useRef(0);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -214,10 +212,25 @@ export function useTau() {
     };
   }, [connection, refreshOutbox]);
 
+  const allowlistSeq = useRef(0);
+
+  // Allow-list requests can resolve out of order: only the newest
+  // issued request may replace state, so a slow add cannot restore
+  // the list a later remove already changed — the same pattern as
+  // refreshOutbox and the unread revision guard.
+  const applyAllowlist = useCallback(
+    (requestId: number, result: AllowlistResponse) => {
+      if (requestId !== allowlistSeq.current) return;
+      setAllowlist(result);
+    },
+    [],
+  );
+
   const refreshAllowlist = useCallback(async () => {
+    const requestId = ++allowlistSeq.current;
     const result = await apiGet<AllowlistResponse>("/api/allowlist");
-    setAllowlist(result);
-  }, []);
+    applyAllowlist(requestId, result);
+  }, [applyAllowlist]);
 
   // The allow-list only changes through this console or the CLI, and
   // CLI changes do not apply to the running node until it restarts —
@@ -376,59 +389,6 @@ export function useTau() {
     node,
     peers,
     messages,
-    unread,
-    outbox,
-    heldForOthers,
-    allowlist,
-    bridge,
-    connection,
-    pings,
-    announcing,
-    send,
-    ping,
-    announce,
-    markRead,
-    refreshOutbox,
-    cancelOutbox,
-    refreshAllowlist,
-    addAllowlistPeer,
-    removeAllowlistPeer,
-    setAllowlistEnabled,
-  };
-}
-piPost<MarkReadResponse>(
-      "/api/messages/read",
-      peer ? { peer } : {},
-    );
-    applyUnread(result.unread);
-    return result.unread;
-  }, [applyUnread]);
-
-  return {
-    node,
-    peers,
-    messages,
-    unread,
-    outbox,
-    heldForOthers,
-    allowlist,
-    bridge,
-    connection,
-    pings,
-    announcing,
-    send,
-    ping,
-    announce,
-    markRead,
-    refreshOutbox,
-    cancelOutbox,
-    refreshAllowlist,
-    addAllowlistPeer,
-    removeAllowlistPeer,
-    setAllowlistEnabled,
-  };
-}
-messages,
     unread,
     outbox,
     heldForOthers,

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from tau.allowlist import AllowList, save_allowlist
+from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
@@ -71,6 +71,7 @@ class FakeNode:
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
         self._allowlist = AllowList()
+        self._allowlist_lock = threading.RLock()
         self.allowlist_path = (
             Path(mailbox_path).with_name("allowlist.json")
             if mailbox_path is not None
@@ -97,9 +98,20 @@ class FakeNode:
 
     def set_allowlist(self, allowlist):
         # Mirrors TauNode.set_allowlist: the running node's in-memory
-        # list and the file change together.
-        self._allowlist = allowlist
-        save_allowlist(self.allowlist_path, allowlist)
+        # list and the file change together, persist first.
+        with self._allowlist_lock:
+            save_allowlist(self.allowlist_path, allowlist)
+            self._allowlist = allowlist
+
+    def update_allowlist(self, transform):
+        # Mirrors TauNode.update_allowlist: re-read the saved list so a
+        # change another process saved is preserved, refuse a corrupt
+        # file, and serialise the whole read-modify-write.
+        with self._allowlist_lock:
+            current = load_allowlist(self.allowlist_path)
+            updated = transform(current)
+            self.set_allowlist(updated)
+            return updated
 
     def info(self):
         return {
@@ -1004,6 +1016,85 @@ def test_allowlist_errors(bridge):
     )
     assert status == 400
     assert "boolean" in payload["error"]["message"]
+
+
+def test_allowlist_concurrent_adds_keep_every_entry(bridge):
+    # Overlapping mutations must not lose each other's changes: each
+    # add derives from the latest saved list, not a stale snapshot.
+    hashes = [f"{n:02x}" * 16 for n in range(1, 11)]
+    errors = []
+
+    def add_one(destination):
+        try:
+            status, _, _ = _json(
+                bridge,
+                "/api/allowlist/add",
+                method="POST",
+                body={"target": destination},
+            )
+            assert status == 200
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=add_one, args=(destination,))
+        for destination in hashes
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert [entry["destination"] for entry in payload["entries"]] == sorted(
+        hashes
+    )
+
+
+def test_allowlist_toggle_keeps_cli_saved_entries(bridge, node, tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    # The CLI saved a change while this node runs; the running node's
+    # in-memory list does not know about it yet.
+    save_allowlist(
+        tmp_path / "allowlist.json",
+        AllowList(enabled=False, allow=frozenset({OTHER_HASH})),
+    )
+    assert node.allowlist.is_allowed(OTHER_HASH) is True  # not enforced yet
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    # The console toggle reconciled with the saved file instead of
+    # overwriting it with the stale in-memory list.
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        OTHER_HASH
+    ]
+    assert node.allowlist.is_allowed(OTHER_HASH) is True
+    assert node.allowlist.is_allowed(PEER_HASH) is False
+
+
+def test_allowlist_refuses_to_overwrite_corrupt_file(bridge, node, tmp_path):
+    path = tmp_path / "allowlist.json"
+    path.write_text("{not json", encoding="utf-8")
+    before = path.read_bytes()
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 400
+    assert "allow-list" in payload["error"]["message"]
+    # The file is untouched and the running node's in-memory list is
+    # unchanged by the failed edit.
+    assert path.read_bytes() == before
+    assert node.allowlist.enabled is False
+    assert node.allowlist.allow == frozenset()
 
 
 def _free_port() -> int:

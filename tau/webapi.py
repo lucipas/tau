@@ -1331,7 +1331,9 @@ class WebBridge:
 
     def allowlist(self) -> Dict[str, Any]:
         """The DM allow-list: whether it is enforced, and who is on it."""
-        current = self.node.allowlist
+        return self._describe_allowlist(self.node.allowlist)
+
+    def _describe_allowlist(self, current: Any) -> Dict[str, Any]:
         entries = []
         for destination in sorted(current.allow):
             peer = self.node.registry.get(destination)
@@ -1365,21 +1367,27 @@ class WebBridge:
     def allowlist_add(self, target: Any) -> Dict[str, Any]:
         """Allow DMs from *target* and return the updated list."""
         destination = self._resolve_allowlist_target(target)
-        self.node.set_allowlist(self.node.allowlist.with_added(destination))
-        return self.allowlist()
+        updated = self.node.update_allowlist(
+            lambda current: current.with_added(destination)
+        )
+        return self._describe_allowlist(updated)
 
     def allowlist_remove(self, target: Any) -> Dict[str, Any]:
         """Stop allowing DMs from *target* and return the updated list."""
         destination = self._resolve_allowlist_target(target)
-        self.node.set_allowlist(self.node.allowlist.with_removed(destination))
-        return self.allowlist()
+        updated = self.node.update_allowlist(
+            lambda current: current.with_removed(destination)
+        )
+        return self._describe_allowlist(updated)
 
     def allowlist_set_enabled(self, enabled: Any) -> Dict[str, Any]:
         """Turn allow-list enforcement on or off; return the updated list."""
         if not isinstance(enabled, bool):
             raise AllowListError("field 'enabled' must be a boolean")
-        self.node.set_allowlist(self.node.allowlist.with_enabled(enabled))
-        return self.allowlist()
+        updated = self.node.update_allowlist(
+            lambda current: current.with_enabled(enabled)
+        )
+        return self._describe_allowlist(updated)
 
     def announce(self) -> None:
         self.node.announce()
