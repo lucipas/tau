@@ -217,3 +217,28 @@ export interface TanSyncResponse {
     errors: Array<{ peer: string; author: string; error: string }>;
   };
 }
+
+export interface TanExportDocument {
+  format: string;
+  version: number;
+  exported_at: number;
+  authors: string[];
+  entries: Array<Record<string, unknown>>;
+}
+
+export interface TanImportError {
+  hash: string;
+  error: string;
+}
+
+export interface TanImportResult {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: TanImportError[];
+}
+
+export interface TanImportResponse {
+  ok: boolean;
+  import: TanImportResult;
+}

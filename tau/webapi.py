@@ -23,6 +23,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
     POST /api/tan/sync     pull missing posts from peers
+    GET  /api/tan/export   export stored posts (``?scope=mine|all``)
+    POST /api/tan/import   import an export document (every entry verified)
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -73,6 +75,10 @@ DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
+# An import carries a whole signed chain, so the 32 KiB action cap would
+# reject any real backup. The bridge binds to loopback only and the
+# document is validated entry by entry, so a 16 MiB cap is the bound.
+MAX_IMPORT_BYTES = 16 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
@@ -1093,6 +1099,45 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
+        """Return the portable backup document the CLI writes.
+
+        The node's own chain by default, every cached author with
+        *all_authors* — the same document :func:`tau tan export`
+        produces, so a console backup restores with the CLI and
+        vice versa.
+        """
+        from .tangents.tan import export_entries
+
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            if all_authors:
+                return export_entries(conn, all_authors=True)
+            return export_entries(conn, author=app.author)
+        finally:
+            conn.close()
+
+    def tan_import(self, document: Any) -> Dict[str, Any]:
+        """Store every entry in an export document, verifying each one.
+
+        Returns the same ``{\"imported\", \"present\", \"skipped\",
+        \"errors\"}`` counts as the CLI import; a bad entry is skipped
+        with its error recorded and never aborts the rest.
+        """
+        from .tangents.tan import import_entries
+
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            return import_entries(conn, document)
+        finally:
+            conn.close()
+
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
     ) -> Optional[Dict[str, Any]]:
@@ -1745,6 +1790,22 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"following": records, "count": len(records)}, head_only
                 )
                 return
+            if path == "/api/tan/export":
+                scope = (query.get("scope") or ["mine"])[0]
+                if scope not in ("mine", "all"):
+                    self._send_json(
+                        {"error": {"message": "query 'scope' must be 'mine' or 'all'"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    document = self.bridge.tan_export(all_authors=(scope == "all"))
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(document, head_only)
+                return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
                 posts = self.bridge.tan_posts(limit=limit)
@@ -1754,7 +1815,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
-            body = self._read_body()
+            # An import carries a whole signed chain, so it gets a larger
+            # body cap than a chat message or a single action.
+            max_body = (
+                MAX_IMPORT_BYTES if path == "/api/tan/import" else MAX_BODY_BYTES
+            )
+            body = self._read_body(max_bytes=max_body)
             if path == "/api/messages":
                 self._handle_send(body, head_only)
                 return
@@ -1887,6 +1953,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 502)
                     return
                 self._send_json({"ok": True, "sync": result}, head_only)
+                return
+            if path == "/api/tan/import":
+                try:
+                    result = self.bridge.tan_import(body)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "import": result}, head_only)
                 return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
@@ -2161,7 +2238,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self) -> Dict[str, Any]:
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -2172,7 +2249,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             length = int(raw_length or 0)
         except ValueError:
             raise RequestError("invalid Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
             return {}

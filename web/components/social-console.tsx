@@ -1,10 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type {
+  TanExportDocument,
+  TanImportError,
+  TanImportResult,
+  TanPost,
+} from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
@@ -225,6 +230,13 @@ export function SocialConsole() {
                 </p>
               ) : null}
             </section>
+
+            <TanBackupSection
+              exporting={tan.exporting}
+              importing={tan.importing}
+              onExport={(allAuthors) => tan.exportTan(allAuthors)}
+              onImport={(doc) => tan.importTan(doc)}
+            />
           </aside>
 
           <div className="flex min-w-0 flex-col">
@@ -347,6 +359,126 @@ export function SocialConsole() {
         </footer>
       </div>
     </div>
+  );
+}
+
+export function TanBackupSection({
+  exporting,
+  importing,
+  onExport,
+  onImport,
+}: {
+  exporting: boolean;
+  importing: boolean;
+  onExport: (allAuthors: boolean) => Promise<TanExportDocument>;
+  onImport: (doc: TanExportDocument) => Promise<TanImportResult>;
+}) {
+  const [message, setMessage] = useState<string | null>(null);
+  const [errors, setErrors] = useState<TanImportError[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  async function submitExport(allAuthors: boolean) {
+    setError(null);
+    setMessage(null);
+    setErrors([]);
+    try {
+      const doc = await onExport(allAuthors);
+      setMessage(
+        `exported ${doc.entries.length} entr${doc.entries.length === 1 ? "y" : "ies"}${allAuthors ? " (all authors)" : " (your chain)"}`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "export failed");
+    }
+  }
+
+  async function submitImportFile(file: File) {
+    setError(null);
+    setMessage(null);
+    setErrors([]);
+    let doc: unknown;
+    try {
+      doc = JSON.parse(await file.text());
+    } catch {
+      setError("that file is not a valid export document");
+      return;
+    }
+    try {
+      const result = await onImport(doc as TanExportDocument);
+      setMessage(
+        `imported ${result.imported} · ${result.present} already present · ${result.skipped} skipped`,
+      );
+      setErrors(result.errors);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "import failed");
+    } finally {
+      // Picking the same file again must fire onChange.
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
+  return (
+    <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+      <SectionLabel>backup</SectionLabel>
+      <p className="mt-2 text-[11px] leading-relaxed text-mist">
+        Back up your signed chain as a file, or restore one. Every imported
+        entry is re-verified before it is stored.
+      </p>
+      <div className="mt-3 flex gap-2">
+        <button
+          type="button"
+          onClick={() => void submitExport(false)}
+          disabled={exporting}
+          className="flex-1 rounded-lg border border-line bg-void/70 px-2.5 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+        >
+          {exporting ? "exporting…" : "export mine"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void submitExport(true)}
+          disabled={exporting}
+          className="flex-1 rounded-lg border border-line bg-void/70 px-2.5 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+        >
+          export all
+        </button>
+        <label
+          htmlFor="tan-import-file"
+          className={`flex-1 cursor-pointer rounded-lg border border-line bg-void/70 px-2.5 py-2 text-center font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal ${importing ? "pointer-events-none opacity-50" : ""}`}
+        >
+          {importing ? "importing…" : "import"}
+        </label>
+        <input
+          ref={importInputRef}
+          id="tan-import-file"
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void submitImportFile(file);
+          }}
+        />
+      </div>
+      {message ? (
+        <p className="mt-2 font-mono text-[10px] text-signal/80">{message}</p>
+      ) : null}
+      {error ? (
+        <p className="mt-2 font-mono text-[10px] text-rose-300">{error}</p>
+      ) : null}
+      {errors.length > 0 ? (
+        <ul className="mt-2 space-y-1">
+          {errors.map((entry) => (
+            <li
+              key={entry.hash || entry.error}
+              className="font-mono text-[10px] leading-relaxed text-rose-300/90"
+            >
+              skipped {entry.hash ? shortHash(entry.hash, 8) : "?"}:{" "}
+              {entry.error}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
   );
 }
 

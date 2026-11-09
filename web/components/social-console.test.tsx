@@ -1,9 +1,9 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { TanPost } from "@/lib/types";
+import type { TanExportDocument, TanPost } from "@/lib/types";
 
-import { PostCard } from "./social-console";
+import { PostCard, TanBackupSection } from "./social-console";
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -183,5 +183,120 @@ describe("PostCard quote rendering", () => {
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();
+  });
+});
+
+describe("TanBackupSection", () => {
+  const doc: TanExportDocument = {
+    format: "tau-tan-export",
+    version: 1,
+    exported_at: 1000,
+    authors: ["a".repeat(64)],
+    entries: [{ hash: "c".repeat(64), text: "hello" }],
+  };
+
+  function renderSection(overrides: {
+    exporting?: boolean;
+    importing?: boolean;
+    onExport?: (allAuthors: boolean) => Promise<TanExportDocument>;
+    onImport?: (doc: TanExportDocument) => Promise<{
+      imported: number;
+      present: number;
+      skipped: number;
+      errors: Array<{ hash: string; error: string }>;
+    }>;
+  } = {}) {
+    const onExport = overrides.onExport ?? vi.fn(async () => doc);
+    const onImport =
+      overrides.onImport ??
+      vi.fn(async () => ({
+        imported: 2,
+        present: 1,
+        skipped: 0,
+        errors: [],
+      }));
+    render(
+      <TanBackupSection
+        exporting={overrides.exporting ?? false}
+        importing={overrides.importing ?? false}
+        onExport={onExport}
+        onImport={onImport}
+      />,
+    );
+    return { onExport, onImport };
+  }
+
+  function pickFile(contents: string) {
+    const file = new File([contents], "backup.json", {
+      type: "application/json",
+    });
+    const input = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+  }
+
+  it("exports the node's own chain and reports the entry count", async () => {
+    const { onExport } = renderSection();
+
+    fireEvent.click(screen.getByText("export mine"));
+    await waitFor(() => expect(onExport).toHaveBeenCalledWith(false));
+    expect(
+      await screen.findByText("exported 1 entry (your chain)"),
+    ).toBeTruthy();
+  });
+
+  it("exports all cached authors when asked", async () => {
+    const { onExport } = renderSection();
+
+    fireEvent.click(screen.getByText("export all"));
+    await waitFor(() => expect(onExport).toHaveBeenCalledWith(true));
+    expect(
+      await screen.findByText("exported 1 entry (all authors)"),
+    ).toBeTruthy();
+  });
+
+  it("disables the export buttons while an export is running", () => {
+    renderSection({ exporting: true });
+
+    expect(screen.getByText("exporting…")).toBeTruthy();
+    expect(
+      (screen.getByText("exporting…") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("imports a picked export file and reports the counts", async () => {
+    const { onImport } = renderSection();
+
+    pickFile(JSON.stringify(doc));
+    await waitFor(() => expect(onImport).toHaveBeenCalledWith(doc));
+    expect(
+      await screen.findByText("imported 2 · 1 already present · 0 skipped"),
+    ).toBeTruthy();
+  });
+
+  it("lists per-entry errors from the import", async () => {
+    const onImport = vi.fn(async () => ({
+      imported: 0,
+      present: 1,
+      skipped: 1,
+      errors: [{ hash: "d".repeat(64), error: "bad signature" }],
+    }));
+    renderSection({ onImport });
+
+    pickFile(JSON.stringify(doc));
+    await waitFor(() => expect(onImport).toHaveBeenCalled());
+    const line = await screen.findByText(/bad signature/);
+    expect(line.textContent).toContain("skipped");
+  });
+
+  it("rejects a file that is not a valid export document", async () => {
+    const { onImport } = renderSection();
+
+    pickFile("not json");
+    expect(
+      await screen.findByText("that file is not a valid export document"),
+    ).toBeTruthy();
+    expect(onImport).not.toHaveBeenCalled();
   });
 });

@@ -143,3 +143,101 @@ describe("useTan deletePost", () => {
     expect(result.current.posts).toEqual([second]);
   });
 });
+
+describe("useTan export and import", () => {
+  const doc = {
+    format: "tau-tan-export",
+    version: 1,
+    exported_at: 1000,
+    authors: ["a".repeat(64)],
+    entries: [{ hash: "c".repeat(64), text: "hello" }],
+  };
+
+  function mockFeed() {
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/export")) return Promise.resolve(doc);
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [], count: 0 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+  }
+
+  it("exports the node's own chain and triggers a download", async () => {
+    const createObjectURL = vi.fn((_blob: Blob) => "blob:fake");
+    const revokeObjectURL = vi.fn();
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    try {
+      mockFeed();
+      const { result } = renderHook(() => useTan());
+      await waitFor(() => expect(result.current.loading).toBe(false));
+
+      let returned;
+      await act(async () => {
+        returned = await result.current.exportTan(false);
+      });
+
+      expect(mockedGet).toHaveBeenCalledWith("/api/tan/export?scope=mine");
+      expect(returned).toEqual(doc);
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      const blob = createObjectURL.mock.calls[0][0];
+      expect(blob.type).toBe("application/json");
+      expect(await blob.text()).toContain("tau-tan-export");
+    } finally {
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+    }
+  });
+
+  it("exports all cached authors when asked", async () => {
+    const createObjectURL = vi.fn((_blob: Blob) => "blob:fake");
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = vi.fn();
+    try {
+      mockFeed();
+      const { result } = renderHook(() => useTan());
+      await waitFor(() => expect(result.current.loading).toBe(false));
+
+      await act(async () => {
+        await result.current.exportTan(true);
+      });
+
+      expect(mockedGet).toHaveBeenCalledWith("/api/tan/export?scope=all");
+    } finally {
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+    }
+  });
+
+  it("imports a document and reloads the feed", async () => {
+    mockFeed();
+    mockedPost.mockResolvedValue({
+      ok: true,
+      import: { imported: 2, present: 0, skipped: 0, errors: [] },
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    let outcome;
+    await act(async () => {
+      outcome = await result.current.importTan(doc);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/import", doc);
+    expect(outcome).toEqual({
+      imported: 2,
+      present: 0,
+      skipped: 0,
+      errors: [],
+    });
+    // The feed is reloaded after the import, not just left stale.
+    expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
+  });
+});

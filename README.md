@@ -150,6 +150,8 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
+| `/api/tan/import` | POST | import an export document (every entry verified) |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash

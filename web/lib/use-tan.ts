@@ -4,8 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
+  TanExportDocument,
   TanFollow,
   TanFollowingResponse,
+  TanImportResponse,
+  TanImportResult,
   TanPost,
   TanPostResponse,
   TanSyncResponse,
@@ -21,6 +24,8 @@ export function useTan() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // The filter the timeline is showing right now. Actions refresh through
@@ -181,6 +186,51 @@ export function useTan() {
     }
   }, [load]);
 
+  // Download the signed export document the bridge returns. The anchor
+  // click is the download: a blob URL keeps the file local, and the
+  // revoke is deferred a beat so the browser has started the save.
+  const exportTan = useCallback(async (allAuthors: boolean) => {
+    setExporting(true);
+    try {
+      const scope = allAuthors ? "all" : "mine";
+      const doc = await apiGet<TanExportDocument>(
+        `/api/tan/export?scope=${scope}`,
+      );
+      const blob = new Blob([`${JSON.stringify(doc, null, 2)}\n`], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "tau-tan-export.json";
+        anchor.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      return doc;
+    } finally {
+      setExporting(false);
+    }
+  }, []);
+
+  const importTan = useCallback(
+    async (doc: TanExportDocument): Promise<TanImportResult> => {
+      setImporting(true);
+      try {
+        const result = await apiPost<TanImportResponse>(
+          "/api/tan/import",
+          doc as unknown as Record<string, unknown>,
+        );
+        await load();
+        return result.import;
+      } finally {
+        setImporting(false);
+      }
+    },
+    [load],
+  );
+
   return {
     posts,
     following,
@@ -189,6 +239,8 @@ export function useTan() {
     loading,
     posting,
     syncing,
+    exporting,
+    importing,
     error,
     refresh,
     publish,
@@ -198,5 +250,7 @@ export function useTan() {
     unlike,
     deletePost,
     sync,
+    exportTan,
+    importTan,
   };
 }
