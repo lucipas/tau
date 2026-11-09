@@ -6,6 +6,10 @@ import { apiGet, apiPost } from "./api";
 import type {
   TanFollow,
   TanFollowingResponse,
+  TanMutedAuthor,
+  TanMutedKeyword,
+  TanMutedKeywordsResponse,
+  TanMutedResponse,
   TanPost,
   TanPostResponse,
   TanSyncResponse,
@@ -17,6 +21,8 @@ const POLL_INTERVAL_MS = 5000;
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
+  const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [all, setAll] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -59,13 +65,17 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
+      const [timeline, follows, muted, mutedKeywords] = await Promise.all([
         apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
+        apiGet<TanMutedResponse>("/api/tan/muted"),
+        apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords"),
       ]);
       if (generationRef.current !== generation) return false;
       setPosts(timeline.posts);
       setFollowing(follows.following);
+      setMutedAuthors(muted.muted ?? []);
+      setMutedKeywords(mutedKeywords.muted_keywords ?? []);
       setError(null);
       return true;
     } finally {
@@ -144,6 +154,38 @@ export function useTan() {
     [load],
   );
 
+  const muteAuthor = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/mute", { target });
+      await load();
+    },
+    [load],
+  );
+
+  const unmuteAuthor = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unmute", { target });
+      await load();
+    },
+    [load],
+  );
+
+  const muteKeyword = useCallback(
+    async (keyword: string) => {
+      await apiPost("/api/tan/mute-keyword", { keyword });
+      await load();
+    },
+    [load],
+  );
+
+  const unmuteKeyword = useCallback(
+    async (keyword: string) => {
+      await apiPost("/api/tan/unmute-keyword", { keyword });
+      await load();
+    },
+    [load],
+  );
+
   const like = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/like", { target });
@@ -184,6 +226,8 @@ export function useTan() {
   return {
     posts,
     following,
+    mutedAuthors,
+    mutedKeywords,
     all,
     setAll,
     loading,
@@ -194,6 +238,10 @@ export function useTan() {
     publish,
     follow,
     unfollow,
+    muteAuthor,
+    unmuteAuthor,
+    muteKeyword,
+    unmuteKeyword,
     like,
     unlike,
     deletePost,

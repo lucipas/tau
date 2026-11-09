@@ -22,6 +22,12 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
+    GET  /api/tan/muted    muted authors
+    POST /api/tan/mute     mute an author
+    POST /api/tan/unmute   unmute an author
+    GET  /api/tan/muted-keywords muted keywords
+    POST /api/tan/mute-keyword mute a keyword
+    POST /api/tan/unmute-keyword unmute a keyword
     POST /api/tan/sync     pull missing posts from peers
 
 If a static build of the Next.js console exists (``web/out``), it is served
@@ -1042,6 +1048,108 @@ class WebBridge:
         finally:
             conn.close()
 
+    def _resolve_mute_target(self, conn, target: str):
+        """Resolve a mute/unmute target the way the CLI does.
+
+        The peer registry does not know authors whose posts are only
+        cached, and a muted author may have no cached posts at all — so
+        after the registry/hash/prefix lookup fails, try the name stored
+        with the mute, then the name on the author's cached posts.
+        """
+        from .tangents.tan import (
+            TanError,
+            resolve_author,
+            resolve_cached_author,
+            resolve_muted_name,
+        )
+
+        try:
+            return resolve_author(conn, target, registry=self.node.registry)
+        except TanError as exc:
+            match = resolve_muted_name(conn, target)
+            if match is not None:
+                return match
+            try:
+                return resolve_cached_author(conn, target)
+            except TanError:
+                raise exc from None
+
+    def _tan_viewer(self) -> Optional[str]:
+        """This node's author hash, or None when no identity is loaded."""
+        from .identity import destination_hash, load_identity
+
+        app = self._tan_app()
+        if app is not None:
+            return app.author
+        identity = load_identity(self.node.config.identity_path)
+        return destination_hash(identity).hex() if identity is not None else None
+
+    def tan_mute(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import TanError, mute
+
+        conn = self._tan_conn()
+        try:
+            author, name = self._resolve_mute_target(conn, target)
+            viewer = self._tan_viewer()
+            if viewer is not None and author == viewer:
+                raise TanError("cannot mute yourself")
+            return mute(conn, author, name=name)
+        finally:
+            conn.close()
+
+    def tan_unmute(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unmute
+
+        conn = self._tan_conn()
+        try:
+            author, name = self._resolve_mute_target(conn, target)
+            return {"author": author, "name": name, "unmuted": unmute(conn, author)}
+        finally:
+            conn.close()
+
+    def tan_muted(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import author_stats, muted
+
+        conn = self._tan_conn()
+        try:
+            records = muted(conn)
+            for record in records:
+                record.update(author_stats(conn, record["author"]))
+            return records
+        finally:
+            conn.close()
+
+    def tan_mute_keyword(self, keyword: str) -> Dict[str, Any]:
+        from .tangents.tan import mute_keyword
+
+        conn = self._tan_conn()
+        try:
+            return mute_keyword(conn, keyword)
+        finally:
+            conn.close()
+
+    def tan_unmute_keyword(self, keyword: str) -> Dict[str, Any]:
+        from .tangents.tan import unmute_keyword
+
+        conn = self._tan_conn()
+        try:
+            removed = unmute_keyword(conn, keyword)
+            return {
+                "keyword": " ".join(str(keyword).split()).casefold(),
+                "unmuted": removed,
+            }
+        finally:
+            conn.close()
+
+    def tan_muted_keywords(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import muted_keywords
+
+        conn = self._tan_conn()
+        try:
+            return muted_keywords(conn)
+        finally:
+            conn.close()
+
     def tan_posts(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._tan_posts)
@@ -1745,6 +1853,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"following": records, "count": len(records)}, head_only
                 )
                 return
+            if path == "/api/tan/muted":
+                records = self.bridge.tan_muted()
+                self._send_json(
+                    {"muted": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/muted-keywords":
+                records = self.bridge.tan_muted_keywords()
+                self._send_json(
+                    {"muted_keywords": records, "count": len(records)},
+                    head_only,
+                )
+                return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
                 posts = self.bridge.tan_posts(limit=limit)
@@ -1834,6 +1955,44 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "follow": result}, head_only)
+                return
+            if path in ("/api/tan/mute", "/api/tan/unmute"):
+                target = body.get("target") or body.get("author")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unmute"):
+                        result = self.bridge.tan_unmute(target.strip())
+                    else:
+                        result = self.bridge.tan_mute(target.strip())
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
+                return
+            if path in ("/api/tan/mute-keyword", "/api/tan/unmute-keyword"):
+                keyword = body.get("keyword")
+                if not isinstance(keyword, str) or not keyword.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'keyword' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unmute-keyword"):
+                        result = self.bridge.tan_unmute_keyword(keyword)
+                    else:
+                        result = self.bridge.tan_mute_keyword(keyword)
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
                 return
             if path in ("/api/tan/like", "/api/tan/unlike"):
                 target = body.get("target") or body.get("hash")

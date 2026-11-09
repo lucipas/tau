@@ -13,6 +13,7 @@ export function SocialConsole() {
   const tan = useTan();
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
+  const [keyword, setKeyword] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +23,8 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Author hashes with a mute request in flight; same guard as deleting.
+  const [muting, setMuting] = useState<ReadonlySet<string>>(() => new Set());
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -86,6 +89,56 @@ export function SocialConsole() {
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "sync failed");
+    }
+  }
+
+  async function submitMute(post: TanPost) {
+    if (muting.has(post.author)) return;
+    setMuting((previous) => new Set(previous).add(post.author));
+    setError(null);
+    try {
+      await tan.muteAuthor(post.author);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not mute");
+    } finally {
+      setMuting((previous) => {
+        const next = new Set(previous);
+        next.delete(post.author);
+        return next;
+      });
+    }
+  }
+
+  async function submitUnmuteAuthor(author: string) {
+    setError(null);
+    try {
+      await tan.unmuteAuthor(author);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not unmute");
+    }
+  }
+
+  async function submitMuteKeyword() {
+    if (!keyword.trim()) return;
+    setError(null);
+    try {
+      await tan.muteKeyword(keyword.trim());
+      setKeyword("");
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not mute keyword",
+      );
+    }
+  }
+
+  async function submitUnmuteKeyword(keywordValue: string) {
+    setError(null);
+    try {
+      await tan.unmuteKeyword(keywordValue);
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not unmute keyword",
+      );
     }
   }
 
@@ -206,6 +259,99 @@ export function SocialConsole() {
             </section>
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>muted</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.mutedAuthors.length + tan.mutedKeywords.length}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Muted authors and keywords stay stored but never appear in
+                the timeline. Unmuting restores the full history.
+              </p>
+              <form
+                className="mt-3 flex gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitMuteKeyword();
+                }}
+              >
+                <input
+                  value={keyword}
+                  onChange={(event) => setKeyword(event.target.value)}
+                  placeholder="mute a word or phrase"
+                  spellCheck={false}
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+                />
+                <button
+                  type="submit"
+                  disabled={!keyword.trim()}
+                  className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                >
+                  mute
+                </button>
+              </form>
+
+              {tan.mutedAuthors.length === 0 &&
+              tan.mutedKeywords.length === 0 ? (
+                <p className="mt-3 rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                  Nothing muted. Mute an author from their post, or a keyword
+                  above.
+                </p>
+              ) : null}
+              {tan.mutedAuthors.length > 0 ? (
+                <ul className="mt-3 space-y-1.5">
+                  {tan.mutedAuthors.map((record) => (
+                    <li
+                      key={record.author}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-xs text-zinc-200">
+                          {record.name || "unknown"}
+                        </p>
+                        <p className="font-mono text-[10px] text-mist/80">
+                          {shortHash(record.author, 10)} ·{" "}
+                          {record.posts ?? 0} posts
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void submitUnmuteAuthor(record.author)}
+                        className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                        title="unmute this author"
+                      >
+                        unmute
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {tan.mutedKeywords.length > 0 ? (
+                <ul className="mt-3 space-y-1.5">
+                  {tan.mutedKeywords.map((record) => (
+                    <li
+                      key={record.keyword}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                    >
+                      <p className="min-w-0 truncate font-mono text-xs text-zinc-200">
+                        “{record.display}”
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void submitUnmuteKeyword(record.keyword)}
+                        className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                        title="unmute this keyword"
+                      >
+                        unmute
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
               <SectionLabel>replication</SectionLabel>
               <p className="mt-2 text-[11px] leading-relaxed text-mist">
                 Pull posts cached by your peers. New posts are also pushed to
@@ -270,6 +416,8 @@ export function SocialConsole() {
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
+                      onMute={submitMute}
+                      muting={muting.has(post.author)}
                     />
                   ))
                 )}
@@ -374,12 +522,16 @@ export function PostCard({
   onReply,
   onDelete,
   deleting,
+  onMute,
+  muting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
+  onMute?: (post: TanPost) => void;
+  muting?: boolean;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
@@ -477,6 +629,26 @@ export function PostCard({
             >
               reply
             </button>
+            {!post.own && onMute ? (
+              muting ? (
+                <button
+                  type="button"
+                  disabled
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/60"
+                >
+                  muting…
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onMute(post)}
+                  title="Mute this author"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-rose-400/40 hover:text-rose-300"
+                >
+                  mute
+                </button>
+              )
+            ) : null}
             {post.own ? (
               deleting ? (
                 <button

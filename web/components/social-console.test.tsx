@@ -185,3 +185,55 @@ describe("PostCard quote rendering", () => {
     expect(screen.queryByText(/❝/)).toBeNull();
   });
 });
+
+describe("PostCard mute control", () => {
+  function renderCard(post: TanPost, onMute = vi.fn()) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+        onMute={onMute}
+      />,
+    );
+    return onMute;
+  }
+
+  it("shows a mute button on other authors' posts and calls onMute", () => {
+    const post = makePost({ own: false });
+    const onMute = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Mute this author"));
+    expect(onMute).toHaveBeenCalledTimes(1);
+    expect(onMute).toHaveBeenCalledWith(post);
+  });
+
+  it("hides the mute control on your own posts", () => {
+    renderCard(makePost({ own: true }));
+
+    expect(screen.queryByTitle("Mute this author")).toBeNull();
+  });
+
+  it("shows a disabled state while a mute is in flight", () => {
+    const post = makePost({ own: false });
+    const onMute = vi.fn();
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+        onMute={onMute}
+        muting
+      />,
+    );
+
+    expect(screen.getByText("muting…")).toBeTruthy();
+    expect(screen.queryByTitle("Mute this author")).toBeNull();
+    fireEvent.click(screen.getByText("muting…"));
+    expect(onMute).not.toHaveBeenCalled();
+  });
+});
