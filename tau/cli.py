@@ -4182,33 +4182,38 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # just shown, so the next listing only flags what arrived since.  A
     # conversation with unread mail omitted by --limit is left alone:
     # a cursor past the newest shown message would silently clear it.
-    partially_listed = {
-        str(entry.get("destination") or "")
-        for entry in omitted
-        if entry.get("unread")
-    }
-    newest_shown: Dict[str, int] = {}
-    for entry in shown:
-        destination = str(entry.get("destination") or "")
-        if destination in partially_listed:
-            continue
-        newest_shown[destination] = max(
-            newest_shown.get(destination, 0), int(entry["seq"])
-        )
-    for destination, up_to_seq in newest_shown.items():
-        inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
-    # Listing a DM is reading it: send the sender a receipt, unless
-    # this node opted out.  Best-effort — failures stay silent.
-    outcome = _send_displayed_receipts(config, inbox, shown)
-    if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
-        parts = []
-        if outcome["sent"]:
-            parts.append(f"{outcome['sent']} peer(s) told their message was read")
-        if outcome["queued"]:
-            parts.append(
-                f"{outcome['queued']} peer(s) unreachable — receipt queued"
+    # A search is a read-only lookup: messages the filter excluded
+    # were never shown, so nothing is marked read and no receipts go
+    # out — otherwise an older unread message that did not match would
+    # silently lose its unread state.
+    if query is None:
+        partially_listed = {
+            str(entry.get("destination") or "")
+            for entry in omitted
+            if entry.get("unread")
+        }
+        newest_shown: Dict[str, int] = {}
+        for entry in shown:
+            destination = str(entry.get("destination") or "")
+            if destination in partially_listed:
+                continue
+            newest_shown[destination] = max(
+                newest_shown.get(destination, 0), int(entry["seq"])
             )
-        print(f"  ({'; '.join(parts)})")
+        for destination, up_to_seq in newest_shown.items():
+            inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
+        # Listing a DM is reading it: send the sender a receipt, unless
+        # this node opted out.  Best-effort — failures stay silent.
+        outcome = _send_displayed_receipts(config, inbox, shown)
+        if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
+            parts = []
+            if outcome["sent"]:
+                parts.append(f"{outcome['sent']} peer(s) told their message was read")
+            if outcome["queued"]:
+                parts.append(
+                    f"{outcome['queued']} peer(s) unreachable — receipt queued"
+                )
+            print(f"  ({'; '.join(parts)})")
     return _EXIT_OK
 
 

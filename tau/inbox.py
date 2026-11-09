@@ -738,7 +738,11 @@ class Inbox:
             entries = [item for item in entries if item.get("destination") == peer]
         if query is not None:
             needle = query.casefold()
-            entries = [item for item in entries if needle in item["text"].casefold()]
+            entries = [
+                item
+                for item in entries
+                if needle in str(item.get("text") or "").casefold()
+            ]
         if group is not None:
             entries = [
                 item

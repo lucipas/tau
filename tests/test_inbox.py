@@ -108,6 +108,30 @@ def test_list_filters_by_text_query(tmp_path):
     assert [e["id"] for e in inbox.list_messages(query="hello", limit=1)] == ["b1"]
 
 
+def test_list_search_skips_textless_file_records(tmp_path):
+    # A received file has no "text" key; searching must exclude it
+    # instead of raising KeyError.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+        }
+    )
+
+    assert [e["id"] for e in inbox.list_messages(query="hello")] == ["a1"]
+    assert inbox.list_messages(query="notes") == []
+
+
 def test_concurrent_writers_do_not_lose_entries(tmp_path):
     """Two Inbox handles on one file (serve + one-shot) keep each other's entries."""
     path = tmp_path / "inbox.json"

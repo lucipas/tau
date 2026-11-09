@@ -1350,6 +1350,25 @@ def test_messages_search_filters_by_text(tmp_path, capsys):
     assert "--search must not be empty" in capsys.readouterr().err
 
 
+def test_messages_search_does_not_mark_unmatched_unread_read(tmp_path, capsys):
+    # Both seeded messages are unread; only the newer one matches.
+    # Searching is a read-only lookup: it marks nothing read, so the
+    # older unmatched message keeps its unread state instead of being
+    # cleared by the read cursor.
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--search", "SECOND", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "m-2"
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {sender_hash.hex(): 2}, "total": 2}
+
+
 def test_messages_empty_and_unknown_peer(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(tmp_path / "node")])
     assert code == 0
