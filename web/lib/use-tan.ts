@@ -65,17 +65,23 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
+      // A failed mute list keeps its previous contents rather than blocking
+      // the timeline and following refresh.
       const [timeline, follows, muted, mutedKeywords] = await Promise.all([
         apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
-        apiGet<TanMutedResponse>("/api/tan/muted"),
-        apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords"),
+        apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
+        apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
+          () => null,
+        ),
       ]);
       if (generationRef.current !== generation) return false;
       setPosts(timeline.posts);
       setFollowing(follows.following);
-      setMutedAuthors(muted.muted ?? []);
-      setMutedKeywords(mutedKeywords.muted_keywords ?? []);
+      if (muted !== null) setMutedAuthors(muted.muted ?? []);
+      if (mutedKeywords !== null) {
+        setMutedKeywords(mutedKeywords.muted_keywords ?? []);
+      }
       setError(null);
       return true;
     } finally {
