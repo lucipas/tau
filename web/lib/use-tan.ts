@@ -142,7 +142,12 @@ export function useTan() {
           }
           return [result.post, ...previous];
         });
-        await load();
+        try {
+          await load();
+        } catch {
+          // The quote is already published. A failed timeline refresh must
+          // not report the publish as failed; the next poll will catch up.
+        }
         return result.post;
       } finally {
         setPosting(false);
