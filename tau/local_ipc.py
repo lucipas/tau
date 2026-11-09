@@ -18,18 +18,32 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from .identity import IdentityError
+from .mailbox import MailboxError
 from .node import NodeError
+from .peers import PeerError
+from .protocol import ProtocolError
 
 _MAX_BYTES = 64 * 1024
+# A reply may carry a peer's response (up to the protocol's 64 KiB) plus
+# the local message id, result fields, JSON escaping and the IPC wrapper.
+_MAX_RESPONSE_BYTES = 1024 * 1024
+
+# Error types the one-shot path lets reach the caller, re-raised as the same
+# type on the client so both paths treat them identically.
+_REMOTE_ERRORS = {
+    cls.__name__: cls
+    for cls in (NodeError, PeerError, MailboxError, ProtocolError, IdentityError)
+}
 
 
 class LocalIPCUnavailable(Exception):
     """The serving node is not answering on its local socket."""
 
 
-def _read(stream: Any) -> Dict[str, Any]:
-    raw = stream.readline(_MAX_BYTES + 1)
-    if len(raw) > _MAX_BYTES or not raw.endswith(b"\n"):
+def _read(stream: Any, limit: int = _MAX_BYTES) -> Dict[str, Any]:
+    raw = stream.readline(limit + 1)
+    if len(raw) > limit or not raw.endswith(b"\n"):
         raise ValueError("invalid local IPC request size")
     value = json.loads(raw)
     if not isinstance(value, dict):
@@ -58,7 +72,7 @@ class LocalServer:
                     result = handler(**request)
                     response = {"result": result}
                 except Exception as exc:
-                    response = {"error": str(exc)}
+                    response = {"error": str(exc), "kind": type(exc).__name__}
                 try:
                     self.wfile.write(json.dumps(response).encode() + b"\n")
                 except OSError:
@@ -99,11 +113,12 @@ def call_local(path: Path, **request: Any) -> Dict[str, Any]:
             # Handling can wait on network peers. Do not retry on timeout.
             client.settimeout(None)
             with client.makefile("rb") as stream:
-                response = _read(stream)
+                response = _read(stream, _MAX_RESPONSE_BYTES)
     except (OSError, ValueError) as exc:
         raise LocalIPCUnavailable(str(exc)) from exc
     if "error" in response:
-        raise NodeError(str(response["error"]))
+        error_type = _REMOTE_ERRORS.get(str(response.get("kind")), NodeError)
+        raise error_type(str(response["error"]))
     return response["result"]
 
 
