@@ -58,6 +58,8 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  const allowlistSeq = useRef(0);
+  const allowlistApplied = useRef(0);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -239,31 +241,40 @@ export function useTau() {
 
   const addAllowlistPeer = useCallback(
     async (target: string) => {
+      const requestId = ++allowlistSeq.current;
       const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
         target,
       });
-      setAllowlist(result);
+      applyAllowlist(requestId, result);
       return result;
     },
-    [],
+    [applyAllowlist],
   );
 
-  const removeAllowlistPeer = useCallback(async (target: string) => {
-    const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
-      target,
-    });
-    setAllowlist(result);
-    return result;
-  }, []);
+  const removeAllowlistPeer = useCallback(
+    async (target: string) => {
+      const requestId = ++allowlistSeq.current;
+      const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
+        target,
+      });
+      applyAllowlist(requestId, result);
+      return result;
+    },
+    [applyAllowlist],
+  );
 
-  const setAllowlistEnabled = useCallback(async (enabled: boolean) => {
-    const result = await apiPost<AllowlistResponse>(
-      "/api/allowlist/set-enabled",
-      { enabled },
-    );
-    setAllowlist(result);
-    return result;
-  }, []);
+  const setAllowlistEnabled = useCallback(
+    async (enabled: boolean) => {
+      const requestId = ++allowlistSeq.current;
+      const result = await apiPost<AllowlistResponse>(
+        "/api/allowlist/set-enabled",
+        { enabled },
+      );
+      applyAllowlist(requestId, result);
+      return result;
+    },
+    [applyAllowlist],
+  );
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -365,6 +376,59 @@ export function useTau() {
     node,
     peers,
     messages,
+    unread,
+    outbox,
+    heldForOthers,
+    allowlist,
+    bridge,
+    connection,
+    pings,
+    announcing,
+    send,
+    ping,
+    announce,
+    markRead,
+    refreshOutbox,
+    cancelOutbox,
+    refreshAllowlist,
+    addAllowlistPeer,
+    removeAllowlistPeer,
+    setAllowlistEnabled,
+  };
+}
+piPost<MarkReadResponse>(
+      "/api/messages/read",
+      peer ? { peer } : {},
+    );
+    applyUnread(result.unread);
+    return result.unread;
+  }, [applyUnread]);
+
+  return {
+    node,
+    peers,
+    messages,
+    unread,
+    outbox,
+    heldForOthers,
+    allowlist,
+    bridge,
+    connection,
+    pings,
+    announcing,
+    send,
+    ping,
+    announce,
+    markRead,
+    refreshOutbox,
+    cancelOutbox,
+    refreshAllowlist,
+    addAllowlistPeer,
+    removeAllowlistPeer,
+    setAllowlistEnabled,
+  };
+}
+messages,
     unread,
     outbox,
     heldForOthers,
