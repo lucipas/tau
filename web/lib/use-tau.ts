@@ -208,14 +208,11 @@ export function useTau() {
     if (connection !== "live") return;
     let disposed = false;
     async function tick() {
-      try {
-        await refreshOutbox();
-        await refreshHeldMail();
-      } catch {
-        // The outbox is a side panel: a failed poll leaves the last
-        // known entries in place instead of flashing an error.
-        if (disposed) return;
-      }
+      // The two endpoints are independent: a failure on one must not
+      // stop the other from updating its state. The outbox is a side
+      // panel: a failed poll leaves the last known entries in place
+      // instead of flashing an error.
+      await Promise.allSettled([refreshOutbox(), refreshHeldMail()]);
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
@@ -260,13 +257,13 @@ export function useTau() {
       setHeldMail((previous) =>
         previous.filter((entry) => entry.id !== droppedId),
       );
+      // Invalidate any outbox GET issued before this drop so a stale
+      // response cannot restore the old held count.
+      refreshSeq.current++;
       setHeldForOthers((previous) => Math.max(0, previous - 1));
-      try {
-        await refreshHeldMail();
-        await refreshOutbox();
-      } catch {
-        // The next poll reconciles.
-      }
+      // Run both follow-ups independently so a failed held-mail GET
+      // cannot skip reconciling the count.
+      await Promise.allSettled([refreshHeldMail(), refreshOutbox()]);
       return result.dropped;
     },
     [refreshHeldMail, refreshOutbox],
