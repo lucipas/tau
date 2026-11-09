@@ -52,7 +52,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .allowlist import AllowListError, clean_destination
-from .blocklist import BlockListError, load_blocklist, save_blocklist
+from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
@@ -471,6 +471,9 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Serializes block/unblock read-modify-write cycles so concurrent
+        # console requests cannot overwrite each other's changes.
+        self._blocklist_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -1390,41 +1393,43 @@ class WebBridge:
         destination = self._resolve_block_target(target.strip())
         config = getattr(self.node, "config", None)
         path = getattr(config, "blocklist_path", None)
-        current = getattr(self.node, "blocklist", None)
-        if current is None:
+        setter = getattr(self.node, "set_blocklist", None)
+        # Hold the lock across load, modify, save, cache update and publish
+        # so a concurrent edit cannot derive its change from the same stale list.
+        with self._blocklist_lock:
             try:
+                # Always re-read the file: the cached list may predate CLI
+                # edits or a corruption that appeared since it was loaded.
                 current = load_blocklist(path)
             except BlockListError as exc:
+                if callable(setter):
+                    # Fail closed in the running node until the owner
+                    # repairs or removes the file.
+                    setter(BlockList(block_all=True))
                 raise WebBridgeError(
                     "block-list on disk is unusable; fix or remove it "
                     f"before editing ({exc})"
                 ) from exc
-        if current.block_all:
-            # Fail-closed: the on-disk list cannot be trusted, so an
-            # edit that persisted only the new entry would silently
-            # unblock everyone else. Refuse until the owner repairs it.
-            raise WebBridgeError(
-                "block-list on disk is unusable; fix or remove it "
-                "before editing"
+            updated = (
+                current.with_added(destination)
+                if block
+                else current.with_removed(destination)
             )
-        updated = (
-            current.with_added(destination)
-            if block
-            else current.with_removed(destination)
-        )
-        changed = updated.blocked != current.blocked
-        if changed:
-            if path is None:
-                raise WebBridgeError("this node has no block-list path")
-            save_blocklist(path, updated)
-            setter = getattr(self.node, "set_blocklist", None)
+            changed = updated.blocked != current.blocked
+            if changed:
+                if path is None:
+                    raise WebBridgeError("this node has no block-list path")
+                save_blocklist(path, updated)
             if callable(setter):
+                # Refresh the cache from the freshly loaded list, even on a
+                # no-op, so a repaired file clears a previous fail-closed state.
                 setter(updated)
-            peer = self.node.registry.get(destination)
-            if peer is not None:
-                # The cached list is refreshed, so the published event
-                # carries the new blocked flag at once.
-                self.record_peer(peer)
+            if changed:
+                peer = self.node.registry.get(destination)
+                if peer is not None:
+                    # The cached list is refreshed, so the published event
+                    # carries the new blocked flag at once.
+                    self.record_peer(peer)
         return {
             "peer": self._describe_blocked(destination),
             "blocked": destination in updated.blocked,
