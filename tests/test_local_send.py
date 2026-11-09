@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +15,7 @@ from tau.config import TauConfig
 from tau.inbox import Inbox
 from tau.local_send import SendServer, send_server_available
 from tau.mailbox import Mailbox
-from tau.node import NodeError
+from tau.node import InstanceLock, NodeError
 
 
 class _FakeRunningNode:
@@ -210,7 +213,7 @@ def test_stale_send_socket_falls_back_to_local_node(tmp_path, capsys, monkeypatc
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
-def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, monkeypatch):
+def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, capsys, monkeypatch):
     """A send socket that cannot bind must not stop `tau serve` (CodeRabbit Major)."""
     import tau.local_send
 
@@ -251,3 +254,75 @@ def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, monkeypa
     assert events == ["node.start", "node.stop"]
     assert not (tmp_path / "node" / "send.sock").exists()
     assert "Could not start the local send server" in caplog.text
+    # The degraded state is visible in the ready banner, not just the log.
+    assert "socket unavailable" in capsys.readouterr().out
+
+    # ... and as a flag on the JSON ready event.
+    events.clear()
+    args = cli.build_parser().parse_args(
+        ["serve", "--data-dir", str(tmp_path / "node"), "--duration", "0", "--json"]
+    )
+    assert cli.cmd_serve(args) == 0
+    ready = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+    assert ready["event"] == "ready"
+    assert ready["send_socket"] is False
+
+
+def test_instance_lock_free_reads_holder_pid(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    # No lock file at all.
+    assert cli._instance_lock_free(config) is True
+    # A dead holder's PID means the lock is free without probing.
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    config.instance_lock_path.write_text(str(proc.pid))
+    assert cli._instance_lock_free(config) is True
+    # A live PID with no flock held still probes free.
+    config.instance_lock_path.write_text(str(os.getpid()))
+    assert cli._instance_lock_free(config) is True
+    # A live holder blocks.
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        assert cli._instance_lock_free(config) is False
+    finally:
+        lock.release()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_send_waits_for_transient_lock_holder(tmp_path):
+    """A standalone `tau tan post` holds the lock without a send server;
+    a send during it proceeds locally once the lock frees (Qodo Warning)."""
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    released = threading.Event()
+
+    def release_later():
+        time.sleep(0.2)
+        lock.release()
+        released.set()
+
+    thread = threading.Thread(target=release_later, daemon=True)
+    thread.start()
+    try:
+        assert cli._send_routes_via_running_node(config) is False
+    finally:
+        thread.join(timeout=5)
+    assert released.is_set()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_send_fails_closed_when_lock_stays_held(tmp_path, monkeypatch):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    monkeypatch.setattr(cli, "_SEND_ROUTE_WAIT_SECONDS", 0)
+    try:
+        with pytest.raises(NodeError, match="not accepting sends"):
+            cli._send_routes_via_running_node(config)
+    finally:
+        lock.release()

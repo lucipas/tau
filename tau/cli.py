@@ -2787,8 +2787,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             log.warning("Could not start the local send server", exc_info=True)
 
     info = node.info()
+    send_socket = send_server is not None
     if _json_mode(args):
-        _emit_event(args, "ready", node=info)
+        _emit_event(args, "ready", node=info, send_socket=send_socket)
         if console_url is not None:
             _emit_event(args, "web", url=console_url, api=f"{console_url}api/")
         if social_app is not None:
@@ -2807,6 +2808,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if lxmf_info.get("enabled"):
             print(f"  lxmf:        delivery {lxmf_info.get('delivery')}")
         print(f"  data dir:    {config.data_dir}")
+        if not send_socket and hasattr(socket, "AF_UNIX"):
+            # Best-effort serve without a send socket: say so up front,
+            # so the operator can see one-shot sends will fail while
+            # this node serves instead of wondering why.
+            print(
+                "  send:        socket unavailable — tau send fails while "
+                "this node serves"
+            )
         mailbox_counts = info.get("mailbox") or {}
         if mailbox_counts.get("outbox") or mailbox_counts.get("held"):
             print(
@@ -3486,6 +3495,51 @@ def _send_via_running_node(
     return results
 
 
+#: How long a one-shot send waits for a serving node's socket to appear
+#: (or a transient lock holder to finish) before failing closed.
+_SEND_ROUTE_WAIT_SECONDS = 10.0
+
+
+def _read_lock_holder_pid(path: Path) -> Optional[int]:
+    """PID recorded in the lock file, or None when it cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _instance_lock_free(config: TauConfig) -> bool:
+    """True when no live process holds the data-directory lock.
+
+    Reads the holder PID from the lock file without taking the lock, so
+    a one-shot probe cannot make a concurrent `tau serve` startup fail
+    by holding the flock in its window: a dead PID means the holder is
+    gone (its flock died with it), so no probe is needed at all. A live
+    PID, or no usable PID, falls back to a real probe, which stays the
+    ground truth. A holder that has taken the lock but not yet recorded
+    its PID can still read as free for a few microseconds.
+    """
+    holder = _read_lock_holder_pid(config.instance_lock_path)
+    if holder is not None and holder > 0:
+        try:
+            os.kill(holder, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    try:
+        probe.acquire()
+    except InstanceAlreadyRunning:
+        return False
+    probe.release()
+    return True
+
+
 def _send_routes_via_running_node(config: TauConfig) -> bool:
     """True when a serving node should carry the send; False for a local node.
 
@@ -3493,9 +3547,13 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
     answers on its send socket only between startup and shutdown. A
     socket that answers wins. Otherwise the lock decides: when it is free
     no node owns the directory (a stale socket is harmless), so a local
-    one-shot node may start. When it is held, the serve is starting or
-    stopping, so wait briefly for the socket and otherwise fail rather
-    than start a second node on the same identity.
+    one-shot node may start. When it is held, the serve may still be
+    starting, so poll briefly for the socket; the holder may also be
+    transient — a standalone `tau tan post` holds the lock without
+    running a send server — so the poll also watches for the lock to
+    free, and a local send proceeds the moment it does. Only a lock
+    still held after the wait fails closed instead of starting a second
+    node on the same identity.
     """
     from .local_send import send_server_available
 
@@ -3503,23 +3561,21 @@ def _send_routes_via_running_node(config: TauConfig) -> bool:
     if has_socket and send_server_available(config.data_dir):
         return True
     config.prepare()
-    probe = InstanceLock(config.instance_lock_path, config.data_dir)
-    try:
-        probe.acquire()
-    except InstanceAlreadyRunning:
-        deadline = time.monotonic() + 10.0
-        while has_socket:
-            if send_server_available(config.data_dir):
-                return True
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.1)
-        raise NodeError(
-            "a tau node holds this data directory but is not accepting "
-            "sends; retry shortly"
-        ) from None
-    probe.release()
-    return False
+    if _instance_lock_free(config):
+        return False
+    deadline = time.monotonic() + _SEND_ROUTE_WAIT_SECONDS
+    while True:
+        if has_socket and send_server_available(config.data_dir):
+            return True
+        if _instance_lock_free(config):
+            return False
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    raise NodeError(
+        "a tau node holds this data directory but is not accepting "
+        "sends; retry shortly"
+    ) from None
 
 
 def cmd_send(args: argparse.Namespace) -> int:
