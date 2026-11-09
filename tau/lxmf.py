@@ -245,14 +245,22 @@ def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:
         raise LXMFError("no LXMF router running")
     outcome: dict = {}
     done = threading.Event()
+    lock = threading.Lock()
+
+    # The first settlement wins: a callback and the timeout path race
+    # under the lock, so a confirmation that lands at the timeout
+    # boundary is either counted or ignored, never half-applied.
+    def _settle(ok: bool) -> None:
+        with lock:
+            if "ok" not in outcome:
+                outcome["ok"] = ok
+                done.set()
 
     def _delivered(_message: Any) -> None:
-        outcome["ok"] = True
-        done.set()
+        _settle(True)
 
     def _failed(_message: Any) -> None:
-        outcome["ok"] = False
-        done.set()
+        _settle(False)
 
     message.register_delivery_callback(_delivered)
     message.register_failed_callback(_failed)
@@ -262,10 +270,12 @@ def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:
         raise LXMFError(
             f"could not hand message to the LXMF router: {exc}"
         ) from exc
-    if done.wait(timeout):
-        return outcome.get("ok", False)
+    if not done.wait(timeout):
+        _settle(False)
+    if outcome["ok"]:
+        return True
     try:
         router.cancel_outbound(getattr(message, "message_id", None))
     except Exception:  # pragma: no cover - defensive
-        log.debug("Could not cancel timed-out LXMF message", exc_info=True)
+        log.debug("Could not cancel unconfirmed LXMF message", exc_info=True)
     return False

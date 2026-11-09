@@ -369,7 +369,7 @@ def test_send_lxmf_message_returns_false_on_failure(fake_lxmf, tmp_path):
     router.outcome = "fail"
     message = _FakeLXMessage(None, None, content="hi")
     assert lxmf.send_lxmf_message(router, message, timeout=1.0) is False
-    assert router.cancelled == []
+    assert router.cancelled == [message.message_id]
 
 
 def test_send_lxmf_message_cancels_on_timeout(fake_lxmf, tmp_path):
