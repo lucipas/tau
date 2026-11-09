@@ -295,10 +295,10 @@ export function useTau() {
         if (fresh.length === 0) return previous;
         return [...previous, ...fresh].sort((a, b) => a.id - b.id);
       });
-      snapshotMax.current = Math.max(
-        snapshotMax.current,
-        ...result.messages.map((entry) => entry.id),
-      );
+      // Do not advance snapshotMax here: the legs are not a complete
+      // view up to their highest id, and an inbound message recorded
+      // between two legs must still be accepted from its SSE event.
+      // Duplicate leg events are dropped by the dedupe in onMessage.
       // A queued leg lands in the outbox; refresh so it shows at once
       // instead of waiting for the next poll. Best-effort: a failed
       // refresh must not report a successful send as failed.
