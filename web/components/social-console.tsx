@@ -339,7 +339,7 @@ export function SocialConsole() {
                       </p>
                       <button
                         type="button"
-                        onClick={() => void submitUnmuteKeyword(record.keyword)}
+                        onClick={() => void submitUnmuteKeyword(record.display)}
                         className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
                         title="unmute this keyword"
                       >
@@ -687,6 +687,17 @@ export function PostCard({
                   title="Delete this post"
                   className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-rose-400/40 hover:text-rose-300"
                 >
+                  delete
+                </button>
+              )
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+      >
                   delete
                 </button>
               )
