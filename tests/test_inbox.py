@@ -93,6 +93,45 @@ def test_list_filters_by_peer_and_limit(tmp_path):
     assert inbox.list_messages(limit=0) == []
 
 
+def test_list_filters_by_text_query(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, text="HELLO again", received_at=2.0))
+    inbox.append(_record(id="a2", destination="aa" * 16, text="unrelated", received_at=3.0))
+
+    # Case-insensitive substring match, newest first.
+    assert [e["id"] for e in inbox.list_messages(query="hello")] == ["b1", "a1"]
+    assert [e["id"] for e in inbox.list_messages(query="WORLD")] == ["a1"]
+    assert inbox.list_messages(query="missing") == []
+    # Query composes with the peer filter and the limit.
+    assert [e["id"] for e in inbox.list_messages(query="hello", peer="aa" * 16)] == ["a1"]
+    assert [e["id"] for e in inbox.list_messages(query="hello", limit=1)] == ["b1"]
+
+
+def test_list_search_skips_textless_file_records(tmp_path):
+    # A received file has no "text" key; searching must exclude it
+    # instead of raising KeyError.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+        }
+    )
+
+    assert [e["id"] for e in inbox.list_messages(query="hello")] == ["a1"]
+    assert inbox.list_messages(query="notes") == []
+
+
 def test_concurrent_writers_do_not_lose_entries(tmp_path):
     """Two Inbox handles on one file (serve + one-shot) keep each other's entries."""
     path = tmp_path / "inbox.json"

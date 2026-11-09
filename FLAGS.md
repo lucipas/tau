@@ -27,7 +27,7 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
 | `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
-| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
+| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
@@ -124,6 +124,7 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+tau messages --search hello
 
 # Group DMs: fixed membership, no rekeying — a changed roster is a new group
 tau group create weekend --peer bob --peer carol

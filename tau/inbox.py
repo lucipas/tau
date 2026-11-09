@@ -703,18 +703,21 @@ class Inbox:
         *,
         limit: Optional[int] = None,
         peer: Optional[str] = None,
+        query: Optional[str] = None,
         group: Optional[str] = None,
         direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``limit`` caps how many are returned
-        (``None`` means all of them).  Sent messages are recorded here
-        too — a reply quotes the sender's own earlier message as often
-        as the peer's — but they stay out of the default listing, which
-        is the received-message view ``tau messages`` has always shown;
-        pass ``direction="out"`` or ``direction=None`` to see them.
+        filters to one group id; ``query`` keeps only messages whose
+        text contains it (case-insensitive substring); ``limit`` caps
+        how many are returned (``None`` means all of them).  Sent
+        messages are recorded here too — a reply quotes the sender's
+        own earlier message as often as the peer's — but they stay out
+        of the default listing, which is the received-message view
+        ``tau messages`` has always shown; pass ``direction="out"`` or
+        ``direction=None`` to see them.
         Each entry carries ``unread``: whether it arrived after its
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
@@ -733,6 +736,13 @@ class Inbox:
             entries = [item for item in entries if item.get("direction") == direction]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if query is not None:
+            needle = query.casefold()
+            entries = [
+                item
+                for item in entries
+                if needle in str(item.get("text") or "").casefold()
+            ]
         if group is not None:
             entries = [
                 item

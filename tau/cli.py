@@ -725,6 +725,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only show messages from this peer (name, hash or hash prefix)",
     )
     messages.add_argument(
+        "--search",
+        default=None,
+        metavar="TEXT",
+        help="only show messages whose text contains this (case-insensitive)",
+    )
+    messages.add_argument(
         "--limit",
         type=int,
         default=30,
@@ -4078,6 +4084,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
+    query = getattr(args, "search", None)
+    if query is not None and not query.strip():
+        raise NodeError("--search must not be empty")
     if getattr(args, "sent", False):
         return _cmd_messages_sent(args, config, registry, limit)
     # Blocked senders' history stays stored but is hidden locally;
@@ -4085,7 +4094,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # hidden messages do not use up the requested count.  A block-list
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
-    entries = inbox.list_messages(limit=None, peer=peer_hash, group=group_id)
+    entries = inbox.list_messages(limit=None, peer=peer_hash, group=group_id, query=query)
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
         entries = []
@@ -4112,7 +4121,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
             True,
         )
     elif not shown:
-        if more_unread:
+        if query is not None:
+            print(f"No messages matching {query!r}.")
+        elif more_unread:
             _print_more_unread(registry, more_unread)
         else:
             print(
@@ -4171,33 +4182,38 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # just shown, so the next listing only flags what arrived since.  A
     # conversation with unread mail omitted by --limit is left alone:
     # a cursor past the newest shown message would silently clear it.
-    partially_listed = {
-        str(entry.get("destination") or "")
-        for entry in omitted
-        if entry.get("unread")
-    }
-    newest_shown: Dict[str, int] = {}
-    for entry in shown:
-        destination = str(entry.get("destination") or "")
-        if destination in partially_listed:
-            continue
-        newest_shown[destination] = max(
-            newest_shown.get(destination, 0), int(entry["seq"])
-        )
-    for destination, up_to_seq in newest_shown.items():
-        inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
-    # Listing a DM is reading it: send the sender a receipt, unless
-    # this node opted out.  Best-effort — failures stay silent.
-    outcome = _send_displayed_receipts(config, inbox, shown)
-    if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
-        parts = []
-        if outcome["sent"]:
-            parts.append(f"{outcome['sent']} peer(s) told their message was read")
-        if outcome["queued"]:
-            parts.append(
-                f"{outcome['queued']} peer(s) unreachable — receipt queued"
+    # A search is a read-only lookup: messages the filter excluded
+    # were never shown, so nothing is marked read and no receipts go
+    # out — otherwise an older unread message that did not match would
+    # silently lose its unread state.
+    if query is None:
+        partially_listed = {
+            str(entry.get("destination") or "")
+            for entry in omitted
+            if entry.get("unread")
+        }
+        newest_shown: Dict[str, int] = {}
+        for entry in shown:
+            destination = str(entry.get("destination") or "")
+            if destination in partially_listed:
+                continue
+            newest_shown[destination] = max(
+                newest_shown.get(destination, 0), int(entry["seq"])
             )
-        print(f"  ({'; '.join(parts)})")
+        for destination, up_to_seq in newest_shown.items():
+            inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
+        # Listing a DM is reading it: send the sender a receipt, unless
+        # this node opted out.  Best-effort — failures stay silent.
+        outcome = _send_displayed_receipts(config, inbox, shown)
+        if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
+            parts = []
+            if outcome["sent"]:
+                parts.append(f"{outcome['sent']} peer(s) told their message was read")
+            if outcome["queued"]:
+                parts.append(
+                    f"{outcome['queued']} peer(s) unreachable — receipt queued"
+                )
+            print(f"  ({'; '.join(parts)})")
     return _EXIT_OK
 
 
