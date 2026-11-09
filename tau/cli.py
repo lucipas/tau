@@ -3170,8 +3170,8 @@ def cmd_id_import(args: argparse.Namespace) -> int:
     # against a concurrent `tau init` on the same directory.  Lock order
     # (instance, then identity) matches `TauNode.start`, which takes the
     # instance lock before loading or creating its identity.
-    # Note the instance lock is POSIX-only (no-op without fcntl), the
-    # same limitation `tau serve` itself accepts.
+    # Note the instance lock is a no-op on a platform with neither
+    # fcntl nor msvcrt, the same limitation `tau serve` itself accepts.
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
     lock.acquire()
     try:

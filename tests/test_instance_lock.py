@@ -59,6 +59,54 @@ def test_release_is_idempotent(tmp_path):
     lock.release()
 
 
+def test_windows_second_acquire_on_same_dir_fails_fast(tmp_path, windows_lock):
+    """The Windows (msvcrt) lock must detect a serving node too.
+
+    Without it, `tau send`'s lock probe reads "free" on Windows and
+    starts a second Reticulum instance on the serving node's identity.
+    """
+    first = make_lock(tmp_path)
+    first.acquire()
+    try:
+        second = make_lock(tmp_path)
+        with pytest.raises(NodeError) as excinfo:
+            second.acquire()
+        message = str(excinfo.value)
+        assert "already serving" in message
+        assert str(tmp_path) in message
+        assert str(os.getpid()) in message
+    finally:
+        first.release()
+
+
+def test_windows_lock_file_records_holder_pid(tmp_path, windows_lock):
+    lock = make_lock(tmp_path)
+    lock.acquire()
+    try:
+        text = (tmp_path / NODE_LOCK_FILE_NAME).read_text(encoding="utf-8")
+        assert text.strip() == str(os.getpid())
+    finally:
+        lock.release()
+
+
+def test_windows_acquire_after_release(tmp_path, windows_lock):
+    first = make_lock(tmp_path)
+    first.acquire()
+    first.release()
+
+    second = make_lock(tmp_path)
+    second.acquire()
+    second.release()
+
+
+def test_windows_release_is_idempotent(tmp_path, windows_lock):
+    lock = make_lock(tmp_path)
+    lock.release()
+    lock.acquire()
+    lock.release()
+    lock.release()
+
+
 def test_locks_on_different_dirs_do_not_conflict(tmp_path):
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"

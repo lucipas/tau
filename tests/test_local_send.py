@@ -326,3 +326,36 @@ def test_send_fails_closed_when_lock_stays_held(tmp_path, monkeypatch):
             cli._send_routes_via_running_node(config)
     finally:
         lock.release()
+
+
+def test_instance_lock_free_sees_windows_lock_held(tmp_path, windows_lock):
+    """The send probe must see a serving node on simulated Windows.
+
+    With a no-op lock the probe always reads free and `tau send`
+    starts a second Reticulum instance on the serving node's identity.
+    """
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        assert cli._instance_lock_free(config) is False
+    finally:
+        lock.release()
+    assert cli._instance_lock_free(config) is True
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_send_fails_closed_when_windows_lock_stays_held(
+    tmp_path, monkeypatch, windows_lock
+):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    monkeypatch.setattr(cli, "_SEND_ROUTE_WAIT_SECONDS", 0)
+    try:
+        with pytest.raises(NodeError, match="not accepting sends"):
+            cli._send_routes_via_running_node(config)
+    finally:
+        lock.release()
