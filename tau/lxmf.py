@@ -84,6 +84,7 @@ def start_lxmf_router(
     data_dir: Path,
     *,
     display_name: Optional[str] = None,
+    delivery_callback: Optional[Any] = None,
 ) -> Any:
     """Start an ``LXMRouter`` on *identity* and register its delivery identity.
 
@@ -91,6 +92,11 @@ def start_lxmf_router(
     to the storage path it is given).  The router listens on the same
     delivery destination :func:`lxmf_delivery_hash` derives, and that
     destination is announced so other LXMF clients can find a path to it.
+
+    When *delivery_callback* is given it is registered with
+    ``router.register_delivery_callback`` and invoked with each
+    ``LXMessage`` the router delivers; the router calls it on its own
+    thread, so the callback must be thread-safe and must never raise.
 
     Raises :class:`LXMFError` when the ``lxmf`` package is not installed,
     when called off the main thread (LXMRouter installs signal handlers),
@@ -120,6 +126,8 @@ def start_lxmf_router(
         )
         if delivery is None:
             raise LXMFError("could not register the LXMF delivery identity")
+        if delivery_callback is not None:
+            router.register_delivery_callback(delivery_callback)
         router.announce(delivery.hash)
     except BaseException:
         _shutdown_router(router)

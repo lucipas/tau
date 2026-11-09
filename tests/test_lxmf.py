@@ -11,6 +11,8 @@ import pytest
 import RNS
 
 from tau import lxmf
+from tau.allowlist import AllowList
+from tau.blocklist import BlockList
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.node import NodeError, TauNode
@@ -174,6 +176,7 @@ class _FakeLXMRouter:
         self.delivery_destinations = {}
         self.display_name = None
         self.announced: list = []
+        self.delivery_callback = None
         self.exit_handler_calls = 0
         type(self).created.append(self)
 
@@ -184,6 +187,9 @@ class _FakeLXMRouter:
         )
         self.delivery_destinations[destination.hash] = destination
         return destination
+
+    def register_delivery_callback(self, callback):
+        self.delivery_callback = callback
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
@@ -214,6 +220,25 @@ def test_start_router_registers_delivery_and_announces(fake_lxmf, tmp_path):
     delivery = lxmf.lxmf_delivery_hash(identity)
     assert lxmf.lxmf_router_delivery_hash(router) == delivery
     assert router.announced == [delivery]
+
+
+def test_start_router_registers_delivery_callback(fake_lxmf, tmp_path):
+    received: list = []
+
+    def callback(message):
+        received.append(message)
+
+    router = lxmf.start_lxmf_router(
+        RNS.Identity(), tmp_path, delivery_callback=callback
+    )
+    assert router.delivery_callback is callback
+    router.delivery_callback("message")
+    assert received == ["message"]
+
+
+def test_start_router_without_callback_registers_none(fake_lxmf, tmp_path):
+    router = lxmf.start_lxmf_router(RNS.Identity(), tmp_path)
+    assert router.delivery_callback is None
 
 
 def test_start_router_requires_installed_package(monkeypatch, tmp_path):
@@ -277,3 +302,150 @@ def test_node_lxmf_router_missing_package_is_node_error(monkeypatch, tmp_path):
     with pytest.raises(NodeError, match="not installed"):
         node._start_lxmf_router()
     assert node.lxmf_router is None
+
+
+# -- incoming LXMF delivery ------------------------------------------------
+
+def _lxmf_node(tmp_path, *, on_message=None):
+    """A node with a fake LXMF router running, no live Reticulum."""
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(
+        config,
+        registry=PeerRegistry(config.peers_path),
+        on_message=on_message,
+    )
+    node.identity = RNS.Identity()
+    node._start_lxmf_router()
+    return node
+
+
+def _lxmf_peer(node, name="alice"):
+    """Add a peer to *node*'s registry; return (peer, sender identity)."""
+    sender = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(sender),
+        sender.get_public_key(),
+        name=name,
+    )
+    return peer, sender
+
+
+def _lxmf_message(sender, *, text="hello via lxmf", verified=True):
+    """A delivered LXMessage stand-in for *sender*."""
+    return types.SimpleNamespace(
+        source_hash=lxmf.lxmf_delivery_hash(sender),
+        signature_validated=verified,
+        content_as_string=lambda: text,
+        hash=b"\x11" * 16,
+        timestamp=1_700_000_000.0,
+    )
+
+
+def test_node_lxmf_delivery_stores_message(fake_lxmf, tmp_path):
+    seen: list = []
+    node = _lxmf_node(tmp_path, on_message=seen.append)
+    peer, sender = _lxmf_peer(node)
+    try:
+        router = node.lxmf_router
+        assert router.delivery_callback is not None
+        router.delivery_callback(_lxmf_message(sender))
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        record = stored[0]
+        assert record["text"] == "hello via lxmf"
+        assert record["from"] == "alice"
+        assert record["destination"] == peer.hexhash
+        assert record["direction"] == "in"
+        assert record["id"] == "lxmf:" + (b"\x11" * 16).hex()
+        assert record["sent_at"] == 1_700_000_000.0
+        # on_message gets the same record (before the inbox stamps seq).
+        assert len(seen) == 1
+        assert seen[0]["id"] == record["id"]
+        assert seen[0]["text"] == record["text"]
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_requires_verified_signature(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(sender, verified=False)
+        )
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_unknown_sender(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(RNS.Identity()))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_respects_blocklist(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    node._blocklist = BlockList(blocked={peer.hexhash})
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_respects_allowlist(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    node._allowlist = AllowList(enabled=True, allow=frozenset())
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert node.inbox.list_messages() == []
+        node._allowlist = AllowList(enabled=True, allow={peer.hexhash})
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_unreadable_content(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender, text=None))
+        node.lxmf_router.delivery_callback(_lxmf_message(sender, text=""))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_dedupes_redelivery(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        node.lxmf_router.delivery_callback(message)
+        node.lxmf_router.delivery_callback(message)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_callback_never_raises(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        class _BrokenMessage:
+            @property
+            def signature_validated(self):
+                raise RuntimeError("boom")
+
+        # A broken message object must not take the router down with it.
+        node._handle_lxmf_message(_BrokenMessage())
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()

@@ -593,10 +593,12 @@ class TauNode:
         The router listens on the LXMF delivery destination derived from
         the node's identity (the address ``tau id`` and ``tau peers``
         already show) and announces it, so LXMF clients can find a path
-        to this node.  Storage lives under the data directory.  This is
-        the router lifecycle only — nothing is sent over LXMF yet; that
-        follows under the migration tracked in issue #67.  A failure here
-        is a node-start failure: the caller cleans up via :meth:`stop`.
+        to this node.  Incoming LXMF messages are delivered into the DM
+        inbox by :meth:`_handle_lxmf_message`, registered as the
+        router's delivery callback.  Storage lives under the data
+        directory.  Sending over LXMF still follows under the migration
+        tracked in issue #67.  A failure here is a node-start failure:
+        the caller cleans up via :meth:`stop`.
         """
         assert self.identity is not None  # set above, before this runs
         try:
@@ -604,6 +606,7 @@ class TauNode:
                 self.identity,
                 self.config.data_dir,
                 display_name=self.name,
+                delivery_callback=self._handle_lxmf_message,
             )
         except LXMFError as exc:
             raise NodeError(str(exc)) from exc
@@ -612,6 +615,116 @@ class TauNode:
             "LXMF router running, delivery %s",
             delivery.hex() if delivery is not None else "unknown",
         )
+
+    def _handle_lxmf_message(self, message: Any) -> None:
+        """Deliver one incoming LXMF message into the DM inbox.
+
+        The router invokes this on its own thread with a decrypted
+        ``LXMessage`` addressed to this node's delivery destination.
+        It mirrors :meth:`_handle_message`: the signature must verify,
+        the sender must be a known peer, and the block-list and DM
+        allow-list gates apply in the same order.  A message that fails
+        any gate is dropped and logged, never stored.  Any failure
+        inside the handler is caught and logged — the callback must
+        never raise back into the router.
+        """
+        try:
+            self._deliver_lxmf_message(message)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not deliver incoming LXMF message", exc_info=True)
+
+    def _deliver_lxmf_message(self, message: Any) -> None:
+        """Store one verified LXMF message, or drop it with a log line."""
+        if not getattr(message, "signature_validated", False):
+            # The router validates the signature against the recalled
+            # source identity while unpacking; an unverified message
+            # proves nothing about its sender, so it never reaches
+            # the inbox — same fail-closed stance as the DM path.
+            log.info("Dropping LXMF message with an unverified signature")
+            return
+        source_hash = getattr(message, "source_hash", None)
+        if not isinstance(source_hash, (bytes, bytearray)):
+            log.info("Dropping LXMF message with no source hash")
+            return
+        source_hex = bytes(source_hash).hex()
+        sender = None
+        for peer in self.registry.all():
+            if peer.lxmf_hash == source_hex:
+                sender = peer
+                break
+        if sender is None:
+            # The inbox keys on tau destination hashes, and only a
+            # known peer maps an LXMF delivery hash to one.  First
+            # contact still needs a tau announce; an LXMF-only sender
+            # cannot be attributed, so its message is dropped.
+            log.info(
+                "Dropping LXMF message from unknown sender %s",
+                source_hex[:8],
+            )
+            return
+        caller_hash = sender.hexhash
+        if self.blocklist.is_blocked(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the block-list",
+                caller_hash,
+            )
+            return
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the DM allow-list",
+                caller_hash,
+            )
+            return
+        content_as_string = getattr(message, "content_as_string", None)
+        text = content_as_string() if callable(content_as_string) else None
+        if not text:
+            log.info(
+                "Dropping LXMF message from %s with no readable text",
+                caller_hash,
+            )
+            return
+        message_hash = getattr(message, "hash", None)
+        if not isinstance(message_hash, (bytes, bytearray)):
+            log.info(
+                "Dropping LXMF message from %s with no message hash",
+                caller_hash,
+            )
+            return
+        # A propagation copy can redeliver the same message after a
+        # router restart, so dedupe on the LXMF hash exactly like the
+        # DM path dedupes relayed copies on the tau message id.
+        message_id = f"lxmf:{bytes(message_hash).hex()}"
+        if self.mailbox.is_seen(message_id):
+            log.info("Ignoring duplicate LXMF message %s", message_id)
+            return
+        try:
+            sent_at = float(getattr(message, "timestamp", None) or 0.0)
+        except (TypeError, ValueError):
+            sent_at = 0.0
+        received_at = time.time()
+        self.mailbox.mark_seen(message_id)
+        record = {
+            "from": sender.display_name,
+            "destination": caller_hash,
+            "text": text,
+            "sent_at": sent_at,
+            "received_at": received_at,
+            "id": message_id,
+            "expires_at": None,
+            "direction": "in",
+        }
+        log.info(
+            "LXMF message from %s (%s): %s",
+            sender.display_name,
+            caller_hash,
+            text,
+        )
+        self._record_received(record)
+        if self.on_message is not None:
+            try:
+                self.on_message(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
