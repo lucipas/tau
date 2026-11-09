@@ -149,7 +149,12 @@ def enable_lxmf_propagation(
     store is capped at ``message_storage_limit_mb`` megabytes: the
     router's default is unlimited, so an opt-in propagation node under
     sustained traffic could otherwise fill its filesystem and stop
-    tau persisting state.  Raises :class:`LXMFError` when propagation
+    tau persisting state.  Note the cap is enforced by LXMF's periodic
+    message-store cleanup, not at admission — a burst of validly
+    stamped messages can overshoot it between cleanups.  The admission
+    path lives in the upstream router, so tau cannot enforce it
+    without patching LXMF internals; the cap still bounds
+    steady-state usage.  Raises :class:`LXMFError` when propagation
     cannot be enabled.
     """
     try:
