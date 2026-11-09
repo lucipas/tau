@@ -152,6 +152,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["read_at"] = read_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    kind = raw.get("kind")
+    if kind == "group":
+        group_id = raw.get("group")
+        if not isinstance(group_id, str) or len(group_id) != 32:
+            return None
+        record["kind"] = "group"
+        record["group"] = group_id.lower()
+        record["group_name"] = str(raw.get("group_name") or "group")
     return record
 
 
@@ -695,20 +703,21 @@ class Inbox:
         *,
         limit: Optional[int] = None,
         peer: Optional[str] = None,
-        direction: str = "in",
+        group: Optional[str] = None,
+        direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
-        ``peer`` filters to one sender destination hash; ``limit`` caps
-        how many are returned (``None`` means all of them).  Sent
-        messages are recorded here too — a reply quotes the sender's
-        own earlier message as often as the peer's — but they stay out
-        of the default listing, which is the received-message view
-        ``tau messages`` has always shown; pass ``direction="out"``
-        or ``direction=None`` to see them.  Each entry carries
-        ``unread``: whether it arrived after its sender's read cursor,
-        and a ``reactions`` list when the message has any — derived
-        from the reaction store, never stored counters.
+        ``peer`` filters to one sender destination hash; ``group``
+        filters to one group id; ``limit`` caps how many are returned
+        (``None`` means all of them).  Sent messages are recorded here
+        too — a reply quotes the sender's own earlier message as often
+        as the peer's — but they stay out of the default listing, which
+        is the received-message view ``tau messages`` has always shown;
+        pass ``direction="out"`` or ``direction=None`` to see them.
+        Each entry carries ``unread``: whether it arrived after its
+        sender's read cursor, and a ``reactions`` list when the message
+        has any — derived from the reaction store, never stored counters.
         """
         with self._lock:
             entries = list(self._messages)
@@ -724,6 +733,12 @@ class Inbox:
             entries = [item for item in entries if item.get("direction") == direction]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if group is not None:
+            entries = [
+                item
+                for item in entries
+                if item.get("kind") == "group" and item.get("group") == group
+            ]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

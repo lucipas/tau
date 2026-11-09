@@ -102,6 +102,7 @@ export function Console() {
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
+            groups={tau.groups}
             bridge={tau.bridge}
             pings={tau.pings}
             unread={tau.unread.per_peer}

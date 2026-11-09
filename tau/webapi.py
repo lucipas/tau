@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/groups       known group DMs with their member lists
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -354,6 +355,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # Kept so a message still queued across a restart can be matched
         # when its delivery is reported.
         message["mail_id"] = mail_id
+    group = entry.get("group")
+    if isinstance(group, str):
+        message["group"] = group
+        group_name = entry.get("group_name")
+        if isinstance(group_name, str):
+            message["group_name"] = group_name
     wire_id = entry.get("wire_id")
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message, and
@@ -649,6 +656,7 @@ class WebBridge:
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        group = record.get("group") if record.get("kind") == "group" else None
         expires_at = record.get("expires_at")
         if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
             expires_at = None
@@ -661,6 +669,12 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            group=group if isinstance(group, str) else None,
+            group_name=(
+                str(record.get("group_name") or "")
+                if isinstance(record.get("group_name"), str)
+                else None
+            ),
             expires_at=float(expires_at) if expires_at is not None else None,
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
@@ -1350,6 +1364,36 @@ class WebBridge:
             )
         return items
 
+    def groups(self) -> List[Dict[str, Any]]:
+        try:
+            groups = []
+            for group in self.node.groups.list_groups():
+                members = []
+                for member_hash in group["members"]:
+                    peer = self.node.registry.get(member_hash)
+                    members.append(
+                        {
+                            "hash": member_hash,
+                            "name": (
+                                peer.display_name
+                                if peer is not None
+                                else member_hash[:8]
+                            ),
+                        }
+                    )
+                groups.append(
+                    {
+                        "id": group["id"],
+                        "name": group["name"],
+                        "members": members,
+                        "created_at": group["created_at"],
+                    }
+                )
+            return groups
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store", exc_info=True)
+            return []
+
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -1501,6 +1545,7 @@ class WebBridge:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
+            "groups": self.groups(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
             "unread": self.unread(),
@@ -1527,6 +1572,8 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        group: Optional[str] = None,
+        group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
@@ -1547,6 +1594,10 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if group is not None:
+                message["group"] = group
+                if group_name:
+                    message["group_name"] = group_name
             if expires_at is not None:
                 message["expires_at"] = expires_at
             if wire_id is not None:
@@ -1718,6 +1769,10 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/peers":
                 peers = self.bridge.peers()
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
+                return
+            if path == "/api/groups":
+                groups = self.bridge.groups()
+                self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
             if path == "/api/messages":
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)

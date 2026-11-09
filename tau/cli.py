@@ -51,6 +51,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
+from .groups import GroupStore
 from .inbox import Inbox
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
@@ -723,6 +724,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N messages (default 30)",
     )
     messages.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="only show messages from this group (id, id prefix or name)",
+    )
+    messages.add_argument(
         "--sent",
         action="store_true",
         help="show messages this node sent, with their read state, instead",
@@ -738,6 +745,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="print per-peer unread counts instead of listing messages",
     )
     messages.set_defaults(func=cmd_messages)
+
+    group = subparsers.add_parser(
+        "group",
+        parents=[common],
+        help="private group DMs with a fixed member list",
+    )
+    group.set_defaults(func=cmd_group_list)
+    group_sub = group.add_subparsers(dest="group_command", metavar="GROUP_COMMAND")
+
+    group_create = group_sub.add_parser(
+        "create",
+        parents=[common],
+        help="create a group with a fixed member list",
+    )
+    group_create.add_argument("name", help="group name")
+    group_create.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a member peer (repeatable; the creator is always a member)",
+    )
+    group_create.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_create.set_defaults(func=cmd_group_create)
+
+    group_list = group_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list known groups",
+    )
+    group_list.set_defaults(func=cmd_group_list)
+
+    group_delete = group_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a group (frees capacity when a group cap is reached)",
+    )
+    group_delete.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_delete.set_defaults(func=cmd_group_delete)
+
+    group_send = group_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to every member of a group",
+    )
+    group_send.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_send.add_argument(
+        "message", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    group_send.add_argument("--file", type=Path, help="read the message from a file")
+    group_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    group_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when a member is offline",
+    )
+    group_send.set_defaults(func=cmd_group_send)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1464,7 +1546,15 @@ def _node_callbacks(args: argparse.Namespace):
             destination = short_hash(record.get("destination") or "")
             suffix = f" ({destination})" if destination else ""
             text = record.get("text", "")
-            print(f"[{_stamp()}] message from {sender}{suffix}:", flush=True)
+            if record.get("kind") == "group":
+                group_name = record.get("group_name") or "group"
+                print(
+                    f"[{_stamp()}] group message from {sender}{suffix}"
+                    f" in {group_name}:",
+                    flush=True,
+                )
+            else:
+                print(f"[{_stamp()}] message from {sender}{suffix}:", flush=True)
             for line in str(text).splitlines() or [""]:
                 print(f"  {line}", flush=True)
 
@@ -3796,6 +3886,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    group_id = None
+    if getattr(args, "group", None):
+        group_id = GroupStore(config.groups_path).find(args.group)["id"]
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
         counts = inbox.unread_counts()
@@ -3829,7 +3922,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # hidden messages do not use up the requested count.  A block-list
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
-    entries = inbox.list_messages(limit=None, peer=peer_hash)
+    entries = inbox.list_messages(limit=None, peer=peer_hash, group=group_id)
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
         entries = []
@@ -3877,7 +3970,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 if isinstance(message_id, str) and message_id
                 else ""
             )
-            print(f"{marker}[{when}] {name} ({sender}){id_suffix}")
+            group_suffix = ""
+            if entry.get("kind") == "group":
+                group_suffix = f" in {entry.get('group_name') or 'group'}"
+            print(f"{marker}[{when}] {name} ({sender}){id_suffix}{group_suffix}")
             if entry.get("kind") == "file":
                 print(
                     f"  file: {entry.get('name')} "
@@ -3940,6 +4036,155 @@ def cmd_messages(args: argparse.Namespace) -> int:
             )
         print(f"  ({'; '.join(parts)})")
     return _EXIT_OK
+
+
+
+def _describe_group(
+    group: Dict[str, Any], registry: PeerRegistry
+) -> Dict[str, Any]:
+    """A group record with member display names for output."""
+    members = []
+    for member_hash in group["members"]:
+        peer = registry.get(member_hash)
+        members.append(
+            {
+                "hash": member_hash,
+                "name": peer.display_name if peer is not None else member_hash[:8],
+            }
+        )
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "members": members,
+        "created_at": group["created_at"],
+        "created_by": group["created_by"],
+    }
+
+
+def cmd_group_create(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        members: List[str] = [own_hash]
+        for target in getattr(args, "peer", []):
+            peer = node.resolve_peer(
+                target,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            if peer.hexhash == own_hash:
+                raise NodeError("the creator is already a member; drop --peer self")
+            if peer.hexhash not in members:
+                members.append(peer.hexhash)
+        if len(members) < 2:
+            raise NodeError("a group needs at least one other peer")
+        group = node.groups.create(
+            getattr(args, "name"), members, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described}, True)
+        return _EXIT_OK
+    print(f"created group {group['name']} ({group['id'][:8]})")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the group from the first message sent to it.")
+    return _EXIT_OK
+
+
+def cmd_group_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    registry = PeerRegistry(config.peers_path)
+    groups = [_describe_group(group, registry) for group in store.list_groups()]
+    if _json_mode(args):
+        _emit({"groups": groups, "count": len(groups)}, True)
+        return _EXIT_OK
+    if not groups:
+        print("No groups yet — create one with `tau group create NAME --peer ...`.")
+        return _EXIT_OK
+    for group in groups:
+        names = ", ".join(member["name"] for member in group["members"])
+        print(f"{group['name']} ({group['id'][:8]}) — {names}")
+    return _EXIT_OK
+
+
+def cmd_group_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    if not store.delete(group["id"]):
+        raise NodeError(f"unknown group: {args.group!r}")
+    if _json_mode(args):
+        _emit({"deleted": group["id"], "name": group["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted group {group['name']} ({group['id'][:8]})")
+    return _EXIT_OK
+
+
+def cmd_group_send(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    delivered_ids: Set[str] = set()
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        response = node.send_group_message(
+            group,
+            text,
+            timeout=float(getattr(args, "timeout", 20.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            queue=not getattr(args, "no_queue", False),
+        )
+        # One-shot send: give reachable members a brief chance to take
+        # a queued leg before this process exits.
+        if any(result.get("queued") for result in response["results"]):
+            node.flush_outbox(timeout=3.0, max_peers=5)
+            for result in response["results"]:
+                if not result.get("queued"):
+                    continue
+                # Only a delivery acknowledgement counts as delivered; an
+                # entry that merely vanished was cancelled, expired, or
+                # taken by another process.
+                if result["id"] in delivered_ids:
+                    result["queued"] = False
+                    result["delivered"] = True
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = "left the outbox without a delivery confirmation"
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered") and not r.get("queued")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    delivered = [r for r in response["results"] if r.get("delivered")]
+    queued = [r for r in response["results"] if r.get("queued")]
+    failed = failed_legs
+    for result in delivered:
+        print(f"delivered to {result.get('to_name') or result['to'][:8]}")
+    for result in queued:
+        print(
+            f"queued for {result.get('to_name') or result['to'][:8]}"
+            " — they are unreachable right now"
+        )
+    for result in failed:
+        print(
+            f"failed for {result.get('to_name') or result['to'][:8]}:"
+            f" {result.get('error') or 'unknown error'}"
+        )
+    return exit_code
+
 
 
 def cmd_react(args: argparse.Namespace) -> int:

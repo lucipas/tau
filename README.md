@@ -132,6 +132,7 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
@@ -289,7 +290,11 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
 | `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
-| `tau messages` | List received direct messages kept in the node inbox (`--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
+| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
+| `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
+| `tau group list` | List known groups |
+| `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
+| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -378,6 +383,12 @@ tau outbox
 # Read back messages this node received (newest first)
 tau messages
 tau messages --peer alice --limit 10 --json
+
+# Group DMs: fixed membership, no rekeying — a changed roster is a new group
+tau group create weekend --peer bob --peer carol
+tau group send weekend "who is driving?"
+tau messages --group weekend
+tau group list
 
 # Reply to an earlier message in the conversation (message id or prefix)
 tau send --to alice --reply-to a1b2c3d4 "seconded"
@@ -836,7 +847,15 @@ unlinked, and stall sync at the gap.
   sender next hears from the recipient or from a peer holding a sealed
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
-- Request/response messaging, not streaming or group chat.
+- Request/response messaging, not streaming. Group DMs fan one message out
+  per member over the existing encrypted links (no MLS or group ratcheting);
+  membership is fixed at creation, a changed roster is a new group, and a
+  peer running a version that predates groups rejects `/tau/group` requests.
+  The group id is derived from the creator, name and roster, so a roster
+  cannot be forked under an existing id; a peer can still invent a fresh
+  group that includes you, gated by the DM allow-list like a direct message.
+  Members learn a group from the first message sent to it, and the console
+  is read-only for groups — composing from the console comes later.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
