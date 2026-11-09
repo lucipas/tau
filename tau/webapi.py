@@ -1284,6 +1284,8 @@ class WebBridge:
         clean_name = sanitize_file_name(name)
         if not clean_name:
             raise ValueError(f"file name {name!r} is not usable")
+        if len(clean_name.encode("utf-8")) > 255:
+            raise ValueError("file name is too long (more than 255 bytes)")
         if not isinstance(data, (bytes, bytearray)):
             raise ValueError("file data must be bytes")
         data = bytes(data)
@@ -2100,7 +2102,8 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 300.0
-        timeout = max(1.0, min(float(timeout), 300.0))
+        # Clamp before float(): huge ints would overflow float() otherwise.
+        timeout = float(max(1, min(timeout, 300)))
         try:
             raw = base64.b64decode(data, validate=True)
         except (ValueError, base64.binascii.Error):
