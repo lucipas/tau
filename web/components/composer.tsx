@@ -2,32 +2,36 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import type { Peer, TauMessage } from "@/lib/types";
+import type { Peer, TauGroup, TauMessage } from "@/lib/types";
 import { MAX_MESSAGE_CHARS } from "@/lib/constants";
 
 import { SendIcon } from "./ui";
 
 export function Composer({
   peers,
+  groups,
   target,
   mode,
   onTargetChange,
   onModeChange,
   onSend,
+  onSendGroup,
   replyTo,
   onCancelReply,
 }: {
   peers: Peer[];
+  groups: TauGroup[];
   target: string;
-  mode: "peer" | "custom";
+  mode: "peer" | "custom" | "group";
   onTargetChange: (value: string) => void;
-  onModeChange: (mode: "peer" | "custom") => void;
+  onModeChange: (mode: "peer" | "custom" | "group") => void;
   onSend: (
     to: string,
     text: string,
     expiresIn?: number,
     replyTo?: string,
   ) => Promise<TauMessage>;
+  onSendGroup: (group: string, text: string) => Promise<TauMessage[]>;
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
 }) {
@@ -37,8 +41,9 @@ export function Composer({
   const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const custom = peers.length === 0 || mode === "custom";
-  const selectValue = custom ? "__custom" : target;
+  const custom = mode === "custom" || (peers.length === 0 && mode !== "group");
+  const groupMode = mode === "group";
+  const selectValue = custom ? "__custom" : groupMode ? "__group" : target;
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -48,7 +53,11 @@ export function Composer({
     const trimmedTarget = target.trim();
     const trimmedText = text.trim();
     if (!trimmedTarget) {
-      setError("Choose a peer or enter a destination hash first.");
+      setError(
+        groupMode
+          ? "Choose a group first."
+          : "Choose a peer or enter a destination hash first.",
+      );
       return;
     }
     if (!trimmedText) {
@@ -58,12 +67,16 @@ export function Composer({
     setSending(true);
     setError(null);
     try {
-      await onSend(
-        trimmedTarget,
-        text,
-        expireSeconds === null ? undefined : expireSeconds,
-        replyTo?.wire_id,
-      );
+      if (groupMode) {
+        await onSendGroup(trimmedTarget, text);
+      } else {
+        await onSend(
+          trimmedTarget,
+          text,
+          expireSeconds === null ? undefined : expireSeconds,
+          replyTo?.wire_id,
+        );
+      }
       setText("");
       onCancelReply?.();
       textareaRef.current?.focus();
@@ -91,7 +104,35 @@ export function Composer({
           to
         </label>
         <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center">
-          {peers.length > 0 ? (
+          {groupMode ? (
+            <select
+              id="peer-target"
+              value={target}
+              onChange={(event) => {
+                const value = event.target.value;
+                if (value === "__peers") {
+                  if (peers.length > 0) {
+                    onModeChange("peer");
+                    onTargetChange(peers[0].destination);
+                  } else {
+                    onModeChange("custom");
+                    onTargetChange("");
+                  }
+                } else {
+                  onTargetChange(value);
+                }
+              }}
+              className="h-9 w-full rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition focus:border-signal/60 focus:ring-2 focus:ring-signal/20 sm:max-w-[260px]"
+            >
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.name} · {group.members.length} member
+                  {group.members.length === 1 ? "" : "s"}
+                </option>
+              ))}
+              <option value="__peers">← back to peers…</option>
+            </select>
+          ) : peers.length > 0 ? (
             <select
               id="peer-target"
               value={selectValue}
@@ -100,6 +141,9 @@ export function Composer({
                 if (value === "__custom") {
                   onModeChange("custom");
                   onTargetChange("");
+                } else if (value === "__group") {
+                  onModeChange("group");
+                  onTargetChange(groups[0]?.id ?? "");
                 } else {
                   onModeChange("peer");
                   onTargetChange(value);
@@ -112,6 +156,9 @@ export function Composer({
                   {peer.name || "unknown"} · {peer.destination.slice(0, 8)}
                 </option>
               ))}
+              {groups.length > 0 ? (
+                <option value="__group">group chat…</option>
+              ) : null}
               <option value="__custom">custom address…</option>
             </select>
           ) : null}
@@ -130,13 +177,26 @@ export function Composer({
               className="h-9 w-full rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
             />
           ) : null}
+
+          {peers.length === 0 && groups.length > 0 && !groupMode ? (
+            <button
+              type="button"
+              onClick={() => {
+                onModeChange("group");
+                onTargetChange(groups[0]?.id ?? "");
+              }}
+              className="h-9 shrink-0 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 transition hover:border-signal/60"
+            >
+              group chat…
+            </button>
+          ) : null}
         </div>
         <span className="hidden font-mono text-[10px] text-mist/70 sm:inline">
           encrypted link
         </span>
       </div>
 
-      {replyTo ? (
+      {replyTo && !groupMode ? (
         <div className="mt-2 flex items-center gap-2 rounded-lg border border-signal/30 bg-signal/[0.06] px-3 py-2 text-[11px] text-zinc-300">
           <span className="min-w-0 flex-1 truncate font-mono">
             ↩ replying to {replyTo.direction === "out" ? "you" : replyTo.peer_name}:{" "}
@@ -166,9 +226,11 @@ export function Composer({
           rows={2}
           maxLength={MAX_MESSAGE_CHARS}
           placeholder={
-            replyTo
-              ? `Replying to ${replyTo.direction === "out" ? "you" : replyTo.peer_name}…`
-              : "Write something to the mesh…"
+            groupMode
+              ? "Write something to the group…"
+              : replyTo
+                ? `Replying to ${replyTo.direction === "out" ? "you" : replyTo.peer_name}…`
+                : "Write something to the mesh…"
           }
           className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
@@ -200,24 +262,30 @@ export function Composer({
         <span className="font-mono text-[10px] text-mist/60">
           {text.length}/{MAX_MESSAGE_CHARS}
         </span>
-        <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
-          disappears
-          <select
-            aria-label="Message expiry"
-            value={expireSeconds === null ? "" : String(expireSeconds)}
-            onChange={(event) => {
-              const value = event.target.value;
-              setExpireSeconds(value === "" ? null : Number(value));
-            }}
-            className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
-          >
-            <option value="">never</option>
-            <option value="300">in 5 minutes</option>
-            <option value="3600">in 1 hour</option>
-            <option value="86400">in 1 day</option>
-            <option value="604800">in 7 days</option>
-          </select>
-        </label>
+        {groupMode ? (
+          <span className="font-mono text-[10px] text-mist/70">
+            replies and expiry are peer DMs only
+          </span>
+        ) : (
+          <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+            disappears
+            <select
+              aria-label="Message expiry"
+              value={expireSeconds === null ? "" : String(expireSeconds)}
+              onChange={(event) => {
+                const value = event.target.value;
+                setExpireSeconds(value === "" ? null : Number(value));
+              }}
+              className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+            >
+              <option value="">never</option>
+              <option value="300">in 5 minutes</option>
+              <option value="3600">in 1 hour</option>
+              <option value="86400">in 1 day</option>
+              <option value="604800">in 7 days</option>
+            </select>
+          </label>
+        )}
       </div>
     </section>
   );

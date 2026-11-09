@@ -14,23 +14,33 @@ import { PeerSidebar } from "./peer-sidebar";
 export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
-  const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
 
   useEffect(() => {
-    if (tau.peers.length === 0) {
+    if (tau.peers.length === 0 && tau.groups.length === 0) {
       setMode("custom");
       return;
     }
     if (!target && !customPicked.current) {
-      setMode("peer");
-      setTarget(tau.peers[0].destination);
+      if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      }
     }
-  }, [tau.peers, target]);
+  }, [tau.peers, tau.groups, target]);
 
-  function changeMode(next: "peer" | "custom") {
+  function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
+    // A pending reply belongs to a peer conversation: the bridge
+    // rejects replies on group sends, so entering group mode drops it.
+    if (next === "group") {
+      setReplyTo(null);
+    }
     setMode(next);
   }
 
@@ -137,11 +147,13 @@ export function Console() {
             ) : null}
             <Composer
               peers={tau.peers}
+              groups={tau.groups}
               target={target}
               mode={mode}
               onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
+              onSendGroup={tau.sendGroup}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />

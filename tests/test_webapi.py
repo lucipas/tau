@@ -11,6 +11,7 @@ import urllib.request
 
 import pytest
 
+from tau.groups import GroupStore
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
@@ -18,6 +19,7 @@ from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
 
 PEER_HASH = "ab" * 16
 OTHER_HASH = "cd" * 16
+BOB_HASH = "ef" * 16
 
 
 class FakeRegistry:
@@ -57,6 +59,12 @@ class FakeNode:
             ]
         )
         self.sent = []
+        self.group_sent = []
+        self.group_refusals = set()
+        self.groups = GroupStore()
+        self.groups.create(
+            "crew", [PEER_HASH, BOB_HASH], created_by=PEER_HASH
+        )
         self.announced = 0
 
     def info(self):
@@ -96,6 +104,55 @@ class FakeNode:
             "server": self.name,
             "_rtt": 0.012,
             "id": wire_id,
+        }
+
+    def send_group_message(
+        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True
+    ):
+        self.group_sent.append((group["name"], text))
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_refusals:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": "not_allowed",
+                        "id": f"wire-{member[:8]}",
+                    }
+                )
+            elif member == BOB_HASH:
+                # Offline member: queued in the outbox under an entry id.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "bob",
+                        "queued": True,
+                        "id": "mail-bob-1",
+                        "expires_at": 0,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "id": f"wire-{member[:8]}",
+                        "rtt": 0.009,
+                    }
+                )
+        all_ok = all(
+            result.get("delivered") or result.get("queued") for result in results
+        )
+        return {
+            "ok": all_ok,
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "results": results,
         }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
@@ -210,6 +267,122 @@ def test_send_message_is_recorded_and_published(bridge, node):
 
     events = bridge.bus.replay(0)
     assert any(e["type"] == "message" for e in events)
+
+
+def test_send_group_message_records_one_entry_per_leg(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": "hi all"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert node.group_sent == [("crew", "hi all")]
+    messages = payload["messages"]
+    assert len(messages) == 2
+    assert all(m["direction"] == "out" for m in messages)
+    assert all(m["group"] == group_id for m in messages)
+    assert all(m["group_name"] == "crew" for m in messages)
+    assert [m["peer"] for m in messages] == [PEER_HASH, BOB_HASH]
+    assert [m["peer_name"] for m in messages] == ["alice", "bob"]
+    # One leg delivered, one queued: each keeps its own status and id.
+    assert [m["status"] for m in messages] == ["delivered", "queued"]
+    assert messages[0]["rtt_ms"] == 9.0
+    assert messages[0]["wire_id"] == f"wire-{PEER_HASH[:8]}"
+    assert messages[1]["mail_id"] == "mail-bob-1"
+    # The queued leg is named by its outbox id, the same convention
+    # as a queued peer DM: a receipt names the wire id, which for
+    # queued mail is the outbox id.
+    assert messages[1]["wire_id"] == "mail-bob-1"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["hi all", "hi all"]
+
+    # A delivery report for the queued leg flips just that entry.
+    bridge.record_delivery("mail-bob-1")
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["status"] for m in feed["messages"]] == ["delivered", "delivered"]
+
+    events = bridge.bus.replay(0)
+    assert sum(1 for e in events if e["type"] == "message") == 2
+
+
+def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": group_id, "text": "by id"},
+    )
+    assert status == 200
+    assert len(payload["messages"]) == 2
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": group_id[:8], "text": "by prefix"},
+    )
+    assert status == 200
+    assert len(payload["messages"]) == 2
+    assert node.group_sent == [("crew", "by id"), ("crew", "by prefix")]
+
+
+def test_send_group_message_failed_leg_is_recorded(bridge, node):
+    node.group_refusals = {BOB_HASH}
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": "hi all"}
+    )
+    assert status == 200
+    # The fan-out is partial: the response says so, and the refused
+    # leg is visible in the feed instead of silently dropped.
+    assert payload["ok"] is False
+    assert [m["status"] for m in payload["messages"]] == ["delivered", "failed"]
+    assert payload["messages"][1]["peer_name"] == "bob"
+    assert payload["response"]["results"][1]["error"] == "not_allowed"
+
+
+def test_send_group_message_validation(bridge, node):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "nope", "text": "hi"},
+    )
+    assert status == 404
+    assert "unknown group" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "group": "crew", "text": "hi"},
+    )
+    assert status == 400
+    assert "not both" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "reply_to": "a" * 8},
+    )
+    assert status == 400
+    assert "reply_to" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "expires_in": 60},
+    )
+    assert status == 400
+    assert "expires_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"group": "crew", "text": " "}
+    )
+    assert status == 400
+    assert node.group_sent == []
 
 
 def test_send_reply_resolves_from_console_history(bridge, node):

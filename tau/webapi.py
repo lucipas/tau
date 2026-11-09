@@ -9,6 +9,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
+                           or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
+                           (one outbound entry per member; replies and expiry are peer-DM-only)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -1229,6 +1231,97 @@ class WebBridge:
             )
         return message, response
 
+    def send_group_message(
+        self,
+        group: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Send a message to every member of a group from the console.
+
+        The group is resolved by id, id prefix, or exact name through
+        ``GroupStore.find`` (unknown or ambiguous queries raise
+        ``ValueError``).  One outbound feed entry is recorded per leg,
+        each carrying the group id/name badge, its own delivery status,
+        and its outbox id while queued — the same shape as an inbound
+        group message, so the feed renders both directions alike and
+        queued legs flip to delivered through the same delivery-report
+        machinery as a peer DM.  A leg the member explicitly refused,
+        or that could not be queued, is recorded as ``failed`` rather
+        than silently dropped, so the sender sees which members did
+        not get the message.
+        """
+        if not isinstance(group, str) or not group.strip():
+            raise ValueError("target group is required")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("message text is required")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        # Normalise up front so the recorded text is exactly what gets
+        # sent: the node normalises again before sending, so this cannot
+        # change delivery.
+        text = normalize_message(text)
+
+        group_record = self.node.groups.find(group.strip())
+        response = self.node.send_group_message(
+            group_record, text, timeout=timeout
+        )
+        messages: List[Dict[str, Any]] = []
+        for result in response.get("results") or []:
+            member = str(result.get("to") or "")
+            peer_name = result.get("to_name") or (
+                short_hash(member) if member else "unknown"
+            )
+            queued = bool(result.get("queued"))
+            delivered = bool(result.get("delivered"))
+            status = "queued" if queued else "delivered" if delivered else "failed"
+            # The outbox id links a queued leg to a later delivery; only
+            # present while the leg is queued.
+            mail_id = result.get("id") if queued else None
+            wire_id = result.get("id") if isinstance(result.get("id"), str) else None
+            flipped = False
+            early_read: Optional[float] = None
+            with self._send_lock:
+                message = self._append_message(
+                    direction="out",
+                    peer=member or None,
+                    peer_name=peer_name,
+                    text=text,
+                    sent_at=time.time(),
+                    received_at=time.time(),
+                    status=status,
+                    rtt=_as_float(result.get("rtt")),
+                    mail_id=mail_id,
+                    group=group_record["id"],
+                    group_name=group_record.get("name") or "",
+                    wire_id=wire_id,
+                )
+                with self._lock:
+                    if mail_id is not None and mail_id in self._early_deliveries:
+                        del self._early_deliveries[mail_id]
+                        message["status"] = "delivered"
+                        flipped = True
+                    read_key = wire_id or mail_id
+                    if read_key is not None:
+                        early_read = self._early_reads.pop(
+                            (member, read_key), None
+                        )
+                if early_read is not None:
+                    # A read receipt beat the record; it is the later state.
+                    message["status"] = "read"
+                    message["read_at"] = early_read
+                    flipped = True
+                if flipped:
+                    self._save_messages()
+            self.bus.publish({"type": "message", "message": message})
+            if flipped:
+                self.bus.publish(
+                    {"type": "message_updated", "message": dict(message)}
+                )
+            messages.append(message)
+        return messages, response
+
     def react(
         self,
         target: str,
@@ -1950,9 +2043,13 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def _handle_send(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")
+        group = body.get("group")
         text = body.get("text")
         timeout = body.get("timeout", 20.0)
         expires_in = body.get("expires_in")
+        if group is not None:
+            self._handle_group_send(body, group, text, timeout, expires_in, head_only)
+            return
         if not isinstance(target, str) or not target.strip():
             self._send_json(
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
@@ -2014,6 +2111,87 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only
+        )
+
+    def _handle_group_send(
+        self,
+        body: Dict[str, Any],
+        group: Any,
+        text: Any,
+        timeout: Any,
+        expires_in: Any,
+        head_only: bool,
+    ) -> None:
+        # A group send is addressed by group, not by peer, so the two
+        # forms are exclusive; the node group path supports neither
+        # reply quoting nor expiry, so those are rejected outright
+        # instead of silently dropped.
+        if body.get("to") is not None:
+            self._send_json(
+                {"error": {"message": "give 'to' or 'group', not both"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(group, str) or not group.strip():
+            self._send_json(
+                {
+                    "error": {
+                        "message": "field 'group' must be a group id, "
+                        "id prefix or name"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(text, str):
+            self._send_json(
+                {"error": {"message": "field 'text' is required"}}, head_only, 400
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 20.0
+        timeout = max(1.0, min(float(timeout), 120.0))
+        if expires_in is not None:
+            self._send_json(
+                {
+                    "error": {
+                        "message": "group sends do not support 'expires_in'"
+                    }
+                },
+                head_only,
+                400,
+            )
+            return
+        if body.get("reply_to") is not None:
+            self._send_json(
+                {"error": {"message": "group sends do not support 'reply_to'"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            messages, response = self.bridge.send_group_message(
+                group.strip(), text, timeout=timeout
+            )
+        except ValueError as exc:
+            # GroupStore.find raises ValueError for both an unknown
+            # group and an ambiguous query; only the unknown case is
+            # a 404, the ambiguous one stays a 400.
+            status = 404 if str(exc).startswith("unknown group:") else 400
+            self._send_json({"error": {"message": str(exc)}}, head_only, status)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(
+            {
+                "ok": bool(response.get("ok", True)),
+                "messages": messages,
+                "response": response,
+            },
+            head_only,
         )
 
     def _handle_react(self, body: Dict[str, Any], head_only: bool) -> None:

@@ -13,6 +13,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  SendGroupResponse,
   SendResponse,
   Snapshot,
   TauGroup,
@@ -281,6 +282,51 @@ export function useTau() {
     return result.message;
   }, [refreshOutbox]);
 
+  const sendGroup = useCallback(
+    async (group: string, text: string) => {
+      const result = await apiPost<SendGroupResponse>("/api/messages", {
+        group,
+        text,
+      });
+      setMessages((previous) => {
+        const fresh = result.messages.filter(
+          (entry) => !previous.some((known) => known.id === entry.id),
+        );
+        if (fresh.length === 0) return previous;
+        return [...previous, ...fresh].sort((a, b) => a.id - b.id);
+      });
+      snapshotMax.current = Math.max(
+        snapshotMax.current,
+        ...result.messages.map((entry) => entry.id),
+      );
+      // A queued leg lands in the outbox; refresh so it shows at once
+      // instead of waiting for the next poll. Best-effort: a failed
+      // refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      if (!result.ok) {
+        // The legs are already in the feed with their own statuses, so
+        // this only surfaces the summary: the message stays sendable.
+        const failed = (
+          (result.response.results as Array<Record<string, unknown>>) ?? []
+        ).filter((leg) => !leg.delivered && !leg.queued);
+        const names = failed.map(
+          (leg) => String(leg.to_name || leg.to || "a member").slice(0, 8),
+        );
+        throw new Error(
+          names.length > 0
+            ? `could not send to ${names.join(", ")}`
+            : "some group members did not receive the message",
+        );
+      }
+      return result.messages;
+    },
+    [refreshOutbox],
+  );
+
   const ping = useCallback(async (destination: string) => {
     setPings((previous) => ({
       ...previous,
@@ -338,6 +384,7 @@ export function useTau() {
     pings,
     announcing,
     send,
+    sendGroup,
     ping,
     announce,
     markRead,

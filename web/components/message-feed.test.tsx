@@ -49,3 +49,18 @@ describe("MessageFeed reactions", () => {
     expect(screen.queryByLabelText("Reactions")).toBeNull();
   });
 });
+
+describe("MessageFeed outbound status", () => {
+  it("renders a failed group leg as failed, not delivered", () => {
+    const message = makeMessage({
+      direction: "out",
+      status: "failed",
+      group: "a".repeat(32),
+      group_name: "crew",
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("failed")).toBeTruthy();
+    expect(screen.getByText("crew")).toBeTruthy();
+  });
+});
