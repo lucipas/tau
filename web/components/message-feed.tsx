@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef } from "react";
 
+import { API_BASE } from "@/lib/api";
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
