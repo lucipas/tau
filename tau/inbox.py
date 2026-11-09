@@ -359,15 +359,6 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "direction": "in",
         "seq": seq,
     }
-    kind = raw.get("kind")
-    if kind == "group":
-        group_id = raw.get("group")
-        if not isinstance(group_id, str) or len(group_id) != 32:
-            return None
-        record["kind"] = "group"
-        record["group"] = group_id.lower()
-        record["group_name"] = str(raw.get("group_name") or "group")
-    return record
 
 
 class Inbox:

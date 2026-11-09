@@ -1195,6 +1195,20 @@ class TauNode:
         caller_hash = self._caller_label(remote_identity)
         if remote_identity is not None:
             caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins.  The drop is silent — the sender
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  The
+            # message is never stored, never marked seen, and never
+            # passed to on_message; the group is not pinned either.
+            log.info(
+                "Group message from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Group message from %s denied by the DM allow-list",

@@ -1916,33 +1916,3 @@ def _validated_sealed_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ids": cleaned_ids,
         "read_at": float(read_at),
     }
-    group_raw = payload.get("group")
-    if group_raw is not None:
-        if not isinstance(group_raw, dict):
-            raise MailboxError("sealed message group must be an object")
-        group_id = group_raw.get("id")
-        group_creator = group_raw.get("creator")
-        group_members = group_raw.get("members")
-        if not (
-            isinstance(group_id, str)
-            and len(group_id) == 32
-            and isinstance(group_creator, str)
-            and len(group_creator) == 32
-            and isinstance(group_members, list)
-            and all(isinstance(m, str) and len(m) == 32 for m in group_members)
-        ):
-            raise MailboxError("sealed message group is invalid")
-        try:
-            bytes.fromhex(group_id)
-            bytes.fromhex(group_creator)
-            for member in group_members:
-                bytes.fromhex(member)
-        except ValueError as exc:
-            raise MailboxError("sealed message group has a non-hex hash") from exc
-        result["group"] = {
-            "id": group_id.lower(),
-            "name": sanitize_group_name(group_raw.get("name")),
-            "creator": group_creator.lower(),
-            "members": [m.lower() for m in group_members],
-        }
-    return result

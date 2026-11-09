@@ -397,6 +397,35 @@ def test_group_message_from_non_member_rejected(tmp_path):
     assert len(node.groups) == 0
 
 
+def test_group_message_from_blocked_sender_dropped_silently(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    # Blocking wins over the allow-list: the sender gets a generic
+    # delivery failure, never a signal that they are blocked.
+    node._blocklist = node.blocklist.with_added(sender_hash)
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "hi all",
+            message_id="gm-blocked",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unavailable"
+    assert received == []
+    assert len(node.inbox) == 0
+    # The group is not pinned from a blocked sender's message.
+    assert node.groups.get(group_id) is None
+
+
 def test_group_message_for_group_without_this_node_rejected(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
