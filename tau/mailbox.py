@@ -744,6 +744,7 @@ class Mailbox:
                 to_hex = record.get("to")
                 sent_at = record.get("sent_at")
                 read_at = record.get("read_at")
+                delivered_at = record.get("delivered_at")
                 text = record.get("text")
                 if (
                     not isinstance(message_id, str)
@@ -754,6 +755,10 @@ class Mailbox:
                         read_at is not None
                         and not isinstance(read_at, (int, float))
                     )
+                    or (
+                        delivered_at is not None
+                        and not isinstance(delivered_at, (int, float))
+                    )
                     or not isinstance(text, str)
                 ):
                     continue
@@ -761,12 +766,24 @@ class Mailbox:
                     bytes.fromhex(to_hex)
                 except ValueError:
                     continue
-                sent[message_id] = {
+                parsed = {
                     "to": to_hex.lower(),
                     "sent_at": float(sent_at),
                     "read_at": float(read_at) if read_at is not None else None,
                     "text": text,
                 }
+                if "delivered_at" in record:
+                    # Delivery confirmation must survive a reload: the
+                    # queued-to-delivered flip and the sent-messages
+                    # display both read it after one. Records written
+                    # before it was tracked carry no such key and keep
+                    # counting as delivered.
+                    parsed["delivered_at"] = (
+                        float(delivered_at)
+                        if delivered_at is not None
+                        else None
+                    )
+                sent[message_id] = parsed
 
         receipts: Dict[str, ReceiptEntry] = {}
         raw_receipts = raw.get("receipts")
