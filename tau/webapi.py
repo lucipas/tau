@@ -1017,15 +1017,19 @@ class WebBridge:
         Mirrors :func:`tau.cli.cmd_tan_mentions`: the same selection
         and visibility rules, so the console shows exactly what the
         CLI shows for the same store, plus the console's display rules
-        (the thread view applies the same).  Without an identity there
-        is nothing of yours to be replied to, so
-        :func:`tau.tangents.tan.mentions` raises and the HTTP layer
-        reports it as a 400.
+        (the thread view applies the same).  The node's block-list is
+        applied as in :meth:`tan_timeline`.  Without an identity there
+        is nothing of yours to be replied to, so this raises
+        :class:`RequestError`, which the HTTP layer reports as a 400.
         """
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import apply_display_rules, mentions
 
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
             app = self._tan_app()
@@ -1036,7 +1040,18 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            posts = mentions(conn, viewer, limit=limit)
+            if viewer is None:
+                raise RequestError(
+                    "this node has no identity, so there are no replies to show; "
+                    "run `tau init` to create one"
+                )
+            posts = mentions(
+                conn,
+                viewer,
+                limit=limit,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1783,7 +1798,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 try:
                     posts = self.bridge.tan_mentions(limit=limit)
-                except Exception as exc:
+                except RequestError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)

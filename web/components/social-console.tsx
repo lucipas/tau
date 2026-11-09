@@ -287,7 +287,11 @@ export function SocialConsole() {
               </div>
 
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
-                {shown.length === 0 ? (
+                {shown.length === 0 && tan.error ? (
+                  <p className="px-4 py-10 text-center text-xs leading-relaxed text-rose-300">
+                    {tan.error}
+                  </p>
+                ) : shown.length === 0 ? (
                   <EmptyState mentions={tan.showMentions} />
                 ) : (
                   shown.map((post) => (

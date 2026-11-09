@@ -704,6 +704,77 @@ def test_tan_mentions_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_mentions_hide_blocked_and_muted(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        MAX_FEED_POSTS,
+        TanApp,
+        create_post,
+        create_reply,
+        init_db,
+        mute,
+        mute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    blocked_id = RNS.Identity()
+    muted_id = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "my post", name="tester", now=1000)
+        # Older visible reply: it must still fill the limit after the
+        # newer hidden replies below are paged past.
+        create_reply(conn, other, mine["hash"], "friendly reply", name="other", now=1001)
+        blocked_author = create_reply(
+            conn, blocked_id, mine["hash"], "blocked reply", name="blocked", now=1002
+        )["author"]
+        # Newer keyword-muted filler spans more than one page, so the
+        # older visible reply is reached only by paging past it.
+        for index in range(MAX_FEED_POSTS + 5):
+            create_reply(
+                conn,
+                other,
+                mine["hash"],
+                f"spam filler {index}",
+                name="other",
+                now=2000 + index,
+            )
+        muted_author = create_reply(
+            conn, muted_id, mine["hash"], "muted author reply", name="muted", now=1003
+        )["author"]
+        create_reply(conn, other, mine["hash"], "spam keyword reply", name="other", now=1004)
+        mute(conn, muted_author, name="muted", now=1005)
+        mute_keyword(conn, "spam", now=1006)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.blocklist = SimpleNamespace(
+        blocked=frozenset({blocked_author}), block_all=False
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["friendly reply"]
+
+        # A block-list that failed closed hides every mention.
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 
