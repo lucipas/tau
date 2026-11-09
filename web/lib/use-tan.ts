@@ -128,6 +128,29 @@ export function useTan() {
     [load],
   );
 
+  const quote = useCallback(
+    async (target: string, text: string) => {
+      setPosting(true);
+      try {
+        const result = await apiPost<TanPostResponse>("/api/tan/quote", {
+          target,
+          text,
+        });
+        setPosts((previous) => {
+          if (previous.some((post) => post.hash === result.post.hash)) {
+            return previous;
+          }
+          return [result.post, ...previous];
+        });
+        await load();
+        return result.post;
+      } finally {
+        setPosting(false);
+      }
+    },
+    [load],
+  );
+
   const follow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
@@ -192,6 +215,7 @@ export function useTan() {
     error,
     refresh,
     publish,
+    quote,
     follow,
     unfollow,
     like,

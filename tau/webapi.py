@@ -17,6 +17,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/following followed authors
     POST /api/tan/posts    publish a Tan post
+    POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
     POST /api/tan/delete   delete one of your own posts
@@ -1074,6 +1075,19 @@ class WebBridge:
             conn.close()
         return app.react(post_hash, liked=liked, publish=True)
 
+    def tan_quote(self, target: str, text: str) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_post
+
+            post_hash = resolve_post(conn, target)["hash"]
+        finally:
+            conn.close()
+        return app.quote(post_hash, text, publish=True)
+
     def tan_delete(self, target: str) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
@@ -1815,6 +1829,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
                     return
                 self._send_json({"ok": True, "post": post}, head_only)
+                return
+            if path == "/api/tan/quote":
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    quote = self.bridge.tan_quote(target.strip(), text)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "post": quote}, head_only)
                 return
             if path in ("/api/tan/follow", "/api/tan/unfollow"):
                 target = body.get("target") or body.get("author")

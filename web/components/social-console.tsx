@@ -14,6 +14,7 @@ export function SocialConsole() {
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
+  const [quoteTarget, setQuoteTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Hashes with a delete request in flight. While one is pending the card
@@ -27,6 +28,12 @@ export function SocialConsole() {
     if (!text.trim()) return;
     setError(null);
     try {
+      if (quoteTarget) {
+        await tan.quote(quoteTarget.hash, text.trim());
+        setText("");
+        setQuoteTarget(null);
+        return;
+      }
       await tan.publish(text.trim(), replyTarget?.hash);
       setText("");
       setReplyTarget(null);
@@ -267,7 +274,14 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
-                      onReply={(target) => setReplyTarget(target)}
+                      onReply={(target) => {
+                        setQuoteTarget(null);
+                        setReplyTarget(target);
+                      }}
+                      onQuote={(target) => {
+                        setReplyTarget(null);
+                        setQuoteTarget(target);
+                      }}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
                     />
@@ -277,6 +291,23 @@ export function SocialConsole() {
             </section>
 
             <section className="mt-3 rounded-2xl border border-line/80 bg-panel/60 p-3">
+              {quoteTarget ? (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-signal/30 bg-signal/10 px-2.5 py-1.5 text-[11px] text-signal">
+                  <span className="min-w-0 truncate">
+                    Quoting {quoteTarget.name || "anonymous"} ·{" "}
+                    {quoteTarget.text.length > 80
+                      ? `${quoteTarget.text.slice(0, 80)}…`
+                      : quoteTarget.text}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setQuoteTarget(null)}
+                    className="shrink-0 font-mono text-[10px] text-mist/80 transition hover:text-zinc-100"
+                  >
+                    cancel
+                  </button>
+                </div>
+              ) : null}
               {replyTarget ? (
                 <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-signal/30 bg-signal/10 px-2.5 py-1.5 text-[11px] text-signal">
                   <span className="min-w-0 truncate">
@@ -311,9 +342,11 @@ export function SocialConsole() {
                   rows={2}
                   maxLength={2000}
                   placeholder={
-                    replyTarget
-                      ? `Reply to ${replyTarget.name || "anonymous"}…`
-                      : "Write something to the mesh…"
+                    quoteTarget
+                      ? `Quote ${quoteTarget.name || "anonymous"}…`
+                      : replyTarget
+                        ? `Reply to ${replyTarget.name || "anonymous"}…`
+                        : "Write something to the mesh…"
                   }
                   className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
                 />
@@ -372,12 +405,14 @@ export function PostCard({
   post,
   onToggleLike,
   onReply,
+  onQuote,
   onDelete,
   deleting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
+  onQuote: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
 }) {
@@ -477,6 +512,16 @@ export function PostCard({
             >
               reply
             </button>
+            {post.kind !== "quote" ? (
+              <button
+                type="button"
+                onClick={() => onQuote(post)}
+                title="Quote this post with your own comment"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                quote
+              </button>
+            ) : null}
             {post.own ? (
               deleting ? (
                 <button
