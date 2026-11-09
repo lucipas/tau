@@ -13,7 +13,7 @@ import RNS
 from tau import lxmf
 from tau.config import TauConfig
 from tau.identity import destination_hash
-from tau.node import NodeError, TauNode
+from tau.node import NodeError, NotAllowedError, PeerRefusedError, TauNode
 from tau.peers import Peer, PeerRegistry
 
 
@@ -426,6 +426,34 @@ def _failing_request(node, monkeypatch):
         raise NodeError("no path")
 
     monkeypatch.setattr(node, "_request", _boom)
+
+
+def _request_raising(node, monkeypatch, error):
+    def _raise(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(node, "_request", _raise)
+
+
+def test_deliver_entry_never_routes_a_refusal_over_lxmf(
+    tmp_path, monkeypatch, fake_lxmf
+):
+    # A peer that explicitly refuses the DM — allow-list (NotAllowedError)
+    # or block-list ("unavailable" answers as PeerRefusedError) — must
+    # never have the refused text routed around the refusal via LXMF.
+    node, peer, router = _lxmf_node(tmp_path)
+    router.outcome = "deliver"
+    for message_id, error in [
+        ("cc" + "59" * 15, NotAllowedError("peer rejected the request: not allowed")),
+        ("cc" + "5a" * 15, PeerRefusedError("peer rejected the request: unavailable")),
+    ]:
+        entry = node.mailbox.enqueue(
+            to=peer.destination_hash, text="refused", message_id=message_id
+        )
+        _request_raising(node, monkeypatch, error)
+        assert node._deliver_entry(peer, entry, timeout=1.0) is False
+        assert node.mailbox.get_outbox(entry.id) is not None
+    assert router.outbound == []
 
 
 def test_deliver_entry_falls_back_to_lxmf_when_direct_fails(
