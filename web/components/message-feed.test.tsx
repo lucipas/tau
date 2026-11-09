@@ -67,8 +67,11 @@ describe("MessageFeed file entries", () => {
     expect(screen.getByText("report.pdf")).toBeTruthy();
     expect(screen.getByText("2.0 KB")).toBeTruthy();
     const link = screen.getByRole("link", { name: "Download" });
+    // jsdom runs on :3000, so the configured API base points at the
+    // bridge on :8787 — the link must target the bridge, not the
+    // page's own origin.
     expect(link.getAttribute("href")).toBe(
-      `/api/files/${message.peer}/report.pdf`,
+      `http://localhost:8787/api/files/${message.peer}/report.pdf`,
     );
   });
 

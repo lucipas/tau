@@ -262,7 +262,7 @@ function MessageBubble({
             {message.direction === "in" && message.peer ? (
               <a
                 className="shrink-0 text-signal hover:underline"
-                href={`/api/files/${message.peer}/${encodeURIComponent(message.file.name)}`}
+                href={`${API_BASE}/api/files/${message.peer}/${encodeURIComponent(message.file.name)}`}
                 download={message.file.name}
               >
                 Download

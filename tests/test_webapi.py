@@ -2066,7 +2066,7 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
 # -- received-file downloads -------------------------------------------------
 
-SENDER_HASH = "ab" * 32
+SENDER_HASH = "ab" * 16
 
 
 def _receive_file(node, tmp_path, *, sender, name, data, size=None, sha256=None, path=None):
@@ -2121,7 +2121,7 @@ def test_download_received_file_unknown_is_404(bridge, node, tmp_path):
     status, _, payload = _json(bridge, f"/api/files/{SENDER_HASH}/missing.txt")
     assert status == 404
     assert "no such received file" in payload["error"]["message"]
-    status, _, _ = _json(bridge, f"/api/files/{'cd' * 32}/notes.txt")
+    status, _, _ = _json(bridge, f"/api/files/{'cd' * 16}/notes.txt")
     assert status == 404
     # Wrong shape: no name, or an extra segment, is a 404 too.
     status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}")
@@ -2266,3 +2266,53 @@ def test_stored_message_keeps_file_metadata(tmp_path):
         }
     finally:
         reloaded.stop()
+
+
+def test_download_received_file_blocked_sender_is_404(bridge, node, tmp_path):
+    from tau.blocklist import BlockList
+
+    _with_config(node, tmp_path)
+    _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=b"hello file"
+    )
+    node.blocklist = BlockList(blocked=frozenset({SENDER_HASH}))
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/notes.txt")
+    assert status == 404
+
+
+def test_download_received_file_symlink_loop_is_404(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    sender_dir = node.config.files_dir / SENDER_HASH
+    sender_dir.mkdir(parents=True, exist_ok=True)
+    loop = sender_dir / "loop.txt"
+    loop.symlink_to(loop)
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": SENDER_HASH,
+            "name": "loop.txt",
+            "size": 10,
+            "sha256": "ab" * 32,
+            "path": str(loop),
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "33" * 16,
+        }
+    )
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/loop.txt")
+    assert status == 404
+
+
+def test_download_received_file_oversized_replacement_is_404(bridge, node, tmp_path):
+    from pathlib import Path
+
+    _with_config(node, tmp_path)
+    record = _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=b"hello file"
+    )
+    # The bytes are replaced by something far larger than the recorded
+    # size: the download must 404 without loading the whole file.
+    Path(record["path"]).write_bytes(b"x" * (1024 * 1024))
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/notes.txt")
+    assert status == 404

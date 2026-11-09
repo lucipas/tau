@@ -54,6 +54,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
+from .allowlist import AllowListError, clean_destination
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
@@ -1492,12 +1493,10 @@ class WebBridge:
         bare file name); anything else that does not check out is
         simply not found.
         """
-        if (
-            not isinstance(sender, str)
-            or len(sender) != 64
-            or any(char not in "0123456789abcdef" for char in sender)
-        ):
-            raise ValueError("sender must be a destination hash")
+        try:
+            sender = clean_destination(sender)
+        except AllowListError as exc:
+            raise ValueError("sender must be a destination hash") from exc
         if not isinstance(name, str) or sanitize_file_name(name) != name:
             raise ValueError("file name is not usable")
         # Blocked senders' files stay hidden, matching messages(); the
