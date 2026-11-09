@@ -356,6 +356,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": True,
         }
         assert calls == []
@@ -365,6 +366,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": True,
         }
         assert calls == []
@@ -388,6 +390,7 @@ def test_flush_outbox_skips_when_lock_busy_unless_waiting(tmp_path):
         "delivered": 0,
         "deposited": 0,
         "received": 0,
+        "receipts": 0,
         "lock_busy": False,
     }
     holder.join(timeout=5.0)
@@ -449,6 +452,109 @@ def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
     assert node._deliver_entry(make_peer(), entry, timeout=1.0) is True
     assert len(calls) == 1
     assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    entry = node.mailbox.enqueue(
+        to=b"\xbb" * 16,
+        text="seconded",
+        message_id="cc" + "66" * 15,
+        in_reply_to=reply_to,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    assert node._deliver_entry(make_peer(), entry, timeout=1.0) is True
+    assert len(calls) == 1
+    from tau.protocol import parse_message
+
+    sent = parse_message(calls[0][2])
+    assert sent["in_reply_to"] == reply_to
+    assert sent["text"] == "seconded"
+
+
+def test_send_message_records_sent_message_for_quote_lookup(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "resolve_peer", lambda *args, **kwargs: peer)
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "echo": "hello"},
+    )
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+
+    response = node.send_message(peer, "hello", in_reply_to=reply_to)
+
+    assert response["ok"] is True
+    assert response["id"]
+    # The sent message is recorded so the peer's reply to it renders
+    # from local history; it stays out of the received listing.
+    assert node.inbox.list_messages() == []
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["text"] == "hello"
+    assert sent[0]["destination"] == peer.hexhash
+    assert sent[0]["in_reply_to"] == reply_to
+    assert node.inbox.find(response["id"], peer=peer.hexhash) is not None
+
+
+def test_send_message_ignores_peer_supplied_id(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "resolve_peer", lambda *args, **kwargs: peer)
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "id": "ff" * 16},
+    )
+
+    response = node.send_message(peer, "hello")
+
+    assert response["id"] != "ff" * 16
+    sent = node.inbox.list_messages(direction="out")
+    assert sent[0]["id"] == response["id"]
+
+
+def test_send_message_queues_reply_when_peer_is_offline(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "resolve_peer", lambda *args, **kwargs: peer)
+    monkeypatch.setattr(node, "reticulum", object())
+
+    def _boom(*args, **kwargs):
+        from tau.node import NodeError
+
+        raise NodeError("no route")
+
+    monkeypatch.setattr(node, "_request", _boom)
+    monkeypatch.setattr(node, "flush_outbox", lambda *args, **kwargs: None)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+
+    response = node.send_message(peer, "seconded", in_reply_to=reply_to)
+
+    assert response["queued"] is True
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.in_reply_to == reply_to
+    assert node.inbox.list_messages(direction="out")[0]["id"] == response["id"]
 
 
 def test_deposit_entry_skips_message_cancelled_by_another_process(
@@ -639,6 +745,32 @@ def test_wait_for_delivery_returns_when_mailbox_lock_stalls(tmp_path, monkeypatc
         elapsed = time.monotonic() - started
         assert elapsed >= 0.3
         assert elapsed < 2.0, "the wait must not block past its deadline"
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_flush_outbox_with_deadline_returns_when_mailbox_lock_stalls(
+    tmp_path,
+):
+    # A stalled mailbox-lock holder must not hold a targeted flush
+    # past its deadline: prune and the outbox reads share the
+    # remaining budget, so the round ends promptly with the entry
+    # still queued.
+    fcntl = pytest.importorskip("fcntl")
+    node = make_node(tmp_path)
+    entry = _seed_wait_entry(node)
+    node.reticulum = object()  # started enough for flush_outbox
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        summary = node.flush_outbox(timeout=1.0, deadline=time.monotonic() + 0.3)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, "the flush must not block past its deadline"
+        assert summary["delivered"] == 0
     finally:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()

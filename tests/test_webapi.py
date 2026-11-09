@@ -11,6 +11,7 @@ import urllib.request
 
 import pytest
 
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
 from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
@@ -27,6 +28,11 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
+        if isinstance(destination_hash, str):
+            try:
+                destination_hash = bytes.fromhex(destination_hash)
+            except ValueError:
+                return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
@@ -37,6 +43,7 @@ class FakeNode:
     def __init__(self, mailbox_path=None):
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
+        self.inbox = Inbox()
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -69,9 +76,27 @@ class FakeNode:
             return self.registry.all()[0]
         raise ValueError(f"unknown peer: {target}")
 
-    def send_message(self, peer, text, *, timeout=20.0, discover_timeout=None):
-        self.sent.append((peer.name, text))
-        return {"ok": True, "echo": text, "server": self.name, "_rtt": 0.012}
+    def send_message(
+        self,
+        peer,
+        text,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        in_reply_to=None,
+        expires_at=None,
+    ):
+        self.sent.append((peer.name, text, in_reply_to))
+        self.last_expires_at = expires_at
+        # A distinct wire id per send, like the real node's generated id.
+        wire_id = f"{len(self.sent):032d}"
+        return {
+            "ok": True,
+            "echo": text,
+            "server": self.name,
+            "_rtt": 0.012,
+            "id": wire_id,
+        }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
         return {"ok": True, "pong": True, "server": self.name, "_rtt": 0.004}
@@ -134,7 +159,41 @@ def test_status_snapshot(bridge):
     assert payload["messages"] == []
 
 
+def test_peers_endpoint_includes_verification_state(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+
+    status, _, payload = _json(bridge, "/api/peers")
+    assert status == 200
+    assert payload["count"] == 1
+    entry = payload["peers"][0]
+    assert entry["verified"] is True
+    assert entry["verified_at"] == 1500.0
+    assert entry["key_change_at"] is None
+    # Verification state is local-only: the public description stays clean.
+    assert "verified" not in peer.public_dict()
+
+
+def test_record_peer_event_carries_trust_fields(bridge, node):
+    peer = node.registry.all()[0]
+    peer.verified_at = 1500.0
+    peer.verified_fingerprint = "00001 00002"
+    peer.key_change_at = 1600.0
+
+    bridge.record_peer(peer)
+    events = bridge.bus.replay(0)
+    peer_events = [event for event in events if event.get("type") == "peer"]
+    assert peer_events
+    # A live announce must not replace the snapshot record with a
+    # trust-free one: the badge and warning survive the event.
+    assert peer_events[-1]["peer"]["verified"] is True
+    assert peer_events[-1]["peer"]["key_change_at"] == 1600.0
+
+
 def test_send_message_is_recorded_and_published(bridge, node):
+    from tau.protocol import excerpt_hash
+
     status, _, payload = _json(
         bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
     )
@@ -142,13 +201,106 @@ def test_send_message_is_recorded_and_published(bridge, node):
     assert payload["message"]["direction"] == "out"
     assert payload["message"]["peer_name"] == "alice"
     assert payload["message"]["rtt_ms"] == 12.0
-    assert node.sent == [("alice", "hi")]
+    assert payload["message"]["wire_id"] == "0" * 31 + "1"
+    assert payload["message"]["excerpt_hash"] == excerpt_hash("hi")
+    assert node.sent == [("alice", "hi", None)]
 
     _, _, feed = _json(bridge, "/api/messages")
     assert [m["text"] for m in feed["messages"]] == ["hi"]
 
     events = bridge.bus.replay(0)
     assert any(e["type"] == "message" for e in events)
+
+
+def test_send_reply_resolves_from_console_history(bridge, node):
+    from tau.protocol import excerpt_hash
+
+    status, _, first = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "original thought"},
+    )
+    assert status == 200
+    wire_id = first["message"]["wire_id"]
+    assert wire_id
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "seconded", "reply_to": wire_id[:8]},
+    )
+    assert status == 200
+    assert payload["message"]["in_reply_to"] == {
+        "id": wire_id,
+        "excerpt": excerpt_hash("original thought"),
+    }
+    assert node.sent[-1] == (
+        "alice",
+        "seconded",
+        {"id": wire_id, "excerpt": excerpt_hash("original thought")},
+    )
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][1]["in_reply_to"]["id"] == wire_id
+
+
+def test_send_reply_to_unknown_or_other_peer_is_a_bad_request(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "dangling", "reply_to": "zzz"},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+
+    # A message from another peer must not resolve in this conversation.
+    bridge.record_inbound(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "carol's thought",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "c" * 32,
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "cross", "reply_to": "c" * 8},
+    )
+    assert status == 400
+    assert "no message" in payload["error"]["message"]
+
+
+def test_inbound_message_keeps_reply_and_wire_id(bridge):
+    from tau.protocol import excerpt_hash
+
+    record = {
+        "from": "alice",
+        "destination": "ab" * 16,
+        "text": "seconded",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "b" * 32,
+        "in_reply_to": {
+            "id": "a" * 32,
+            "excerpt": excerpt_hash("original thought"),
+        },
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["wire_id"] == "b" * 32
+    assert feed["messages"][0]["excerpt_hash"] == excerpt_hash("seconded")
+    assert feed["messages"][0]["in_reply_to"] == {
+        "id": "a" * 32,
+        "excerpt": excerpt_hash("original thought"),
+    }
 
 
 def test_inbound_message_comes_back_over_the_api(bridge):
@@ -165,6 +317,152 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["direction"] == "in"
     assert feed["messages"][0]["peer_name"] == "bob"
     assert feed["messages"][0]["text"] == "from the mesh"
+
+
+def test_inbound_group_message_keeps_group_fields(bridge):
+    record = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "hello group",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "kind": "group",
+        "group": "aa" * 16,
+        "group_name": "weekend",
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    message = feed["messages"][0]
+    assert message["group"] == "aa" * 16
+    assert message["group_name"] == "weekend"
+
+    plain = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "plain",
+        "sent_at": 102.0,
+        "received_at": 103.0,
+    }
+    bridge.record_inbound(plain)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "group" not in feed["messages"][1]
+
+
+def test_api_groups_lists_known_groups(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["count"] == 1
+    group = payload["groups"][0]
+    assert group["name"] == "weekend"
+    assert [member["hash"] for member in group["members"]] == [
+        PEER_HASH,
+        OTHER_HASH,
+    ]
+    # The registry resolves the first member's display name.
+    assert group["members"][0]["name"] == "alice"
+
+
+def _inbound_record(node, **overrides):
+    """A received DM, appended to the node inbox first — the order the
+    node itself uses before it hands the record to the bridge."""
+    record = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "m-1",
+    }
+    record.update(overrides)
+    node.inbox.append(record)
+    return record
+
+
+def _counts(unread):
+    """Unread counts without the revision stamp, for shape checks."""
+    return {key: value for key, value in unread.items() if key != "revision"}
+
+
+def test_snapshot_carries_unread_counts(bridge, node):
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+
+    _, _, payload = _json(bridge, "/api/status")
+    assert _counts(payload["unread"]) == {"per_peer": {PEER_HASH: 2}, "total": 2}
+
+
+def test_unread_revisions_only_increase(bridge, node):
+    first = bridge.unread()["revision"]
+    second = bridge.unread()["revision"]
+    assert second > first
+
+
+def test_inbound_message_event_carries_unread_total(bridge, node):
+    record = _inbound_record(node)
+    bridge.record_inbound(record)
+
+    events = bridge.bus.replay(0)
+    message_events = [event for event in events if event["type"] == "message"]
+    assert _counts(message_events[-1]["unread"]) == {
+        "per_peer": {PEER_HASH: 1},
+        "total": 1,
+    }
+
+
+def test_mark_read_endpoint_clears_a_conversation(bridge, node):
+    _inbound_record(node)
+    _inbound_record(node, id="m-2", received_at=102.0)
+    _inbound_record(
+        node,
+        destination=OTHER_HASH,
+        **{"from": "carol", "id": "m-3", "received_at": 103.0},
+    )
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": PEER_HASH}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert _counts(payload["unread"]) == {"per_peer": {OTHER_HASH: 1}, "total": 1}
+
+    # Other tabs learn from the published unread event.
+    events = bridge.bus.replay(0)
+    unread_events = [event for event in events if event["type"] == "unread"]
+    assert _counts(unread_events[-1]["unread"]) == {
+        "per_peer": {OTHER_HASH: 1},
+        "total": 1,
+    }
+
+    # Marking everything read clears the rest.
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={}
+    )
+    assert status == 200
+    assert _counts(payload["unread"]) == {"per_peer": {}, "total": 0}
+
+
+def test_mark_read_endpoint_rejects_a_bad_peer(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": "  "}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/read", method="POST", body={"peer": 42}
+    )
+    assert status == 400
+    assert "peer" in payload["error"]["message"]
 
 
 def test_send_validation(bridge):
@@ -1056,6 +1354,28 @@ def test_message_history_load_caps_and_drops_invalid_entries(node, tmp_path):
         bridge.stop()
 
 
+def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
+    """A stored excerpt hash is never trusted on load: the hash is
+    derived from the stored text, so a hand-edited history that
+    changed the text but kept the old hash cannot make a changed
+    quote look verified."""
+    from tau.protocol import excerpt_hash
+    from tau.webapi import _clean_stored_message
+
+    entry = _stored_message(1, "changed text")
+    entry["excerpt_hash"] = excerpt_hash("original thought")
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["excerpt_hash"] == excerpt_hash("changed text")
+    assert cleaned["excerpt_hash"] != excerpt_hash("original thought")
+
+    # Records written before hashes existed gain one on load.
+    legacy = _stored_message(2, "legacy text")
+    assert _clean_stored_message(legacy)["excerpt_hash"] == excerpt_hash(
+        "legacy text"
+    )
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)
@@ -1157,6 +1477,27 @@ def test_outbound_text_with_lone_surrogate_stays_persistable(node, tmp_path):
         ]
     finally:
         bridge2.stop()
+
+
+def test_lone_surrogate_entry_is_dropped_on_load(node, tmp_path):
+    """A stored lone surrogate must not break startup.
+
+    Regression test for the CodeRabbit finding on PR #95: hashing the
+    text before the UTF-8 check raised UnicodeEncodeError out of
+    _clean_stored_message instead of dropping the entry.
+    """
+    good = _stored_message(1, "good entry")
+    bad = _stored_message(2, "bad \ud800 text")
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [good, bad], "next_message_id": 3}),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages()] == ["good entry"]
+    finally:
+        bridge.stop()
 
 
 def test_huge_timestamp_entry_is_dropped_on_load(node, tmp_path):
@@ -1267,3 +1608,456 @@ def test_tan_reply_via_api(tmp_path):
         assert payload["post"]["kind"] == "post"
     finally:
         bridge.stop()
+
+
+def test_peers_marks_blocked_peers(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["destination"] == PEER_HASH
+    assert payload["peers"][0]["blocked"] is True
+
+    node.blocklist = BlockList()
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is False
+
+
+def test_peers_marks_everyone_blocked_when_list_failed_closed(bridge, node):
+    from tau.blocklist import BlockList
+
+    node.blocklist = BlockList(block_all=True)
+    _, _, payload = _json(bridge, "/api/peers")
+    assert payload["peers"][0]["blocked"] is True
+
+
+def test_messages_hides_blocked_senders(bridge, node):
+    from tau.blocklist import BlockList
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "from alice",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "mallory",
+            "destination": OTHER_HASH,
+            "text": "from mallory",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice"]
+
+    # Unblocking restores the view: nothing was deleted.
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice", "from mallory"]
+
+    # A list that failed closed hides every inbound message.
+    node.blocklist = BlockList(block_all=True)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
+def test_tan_timeline_hides_blocked_authors(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "from alice", name="alice", now=1000)
+        create_post(conn, bob, "from bob", name="bob", now=1001)
+    finally:
+        conn.close()
+    # The console uses the node's cached block-list, the same snapshot
+    # the DM gate enforces.
+    node.blocklist = BlockList(blocked=frozenset({destination_hash(alice).hex()}))
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["from bob"]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
+def test_messages_reconciles_cli_made_reactions(node, tmp_path):
+    """A reaction written to the shared inbox by another process (the
+    CLI) shows up on the next read of the console history.
+
+    The write goes through a *second* Inbox object on the same path —
+    the way a separate ``tau react`` process writes — so the bridge's
+    own inbox must reload from disk to see it; reading its in-memory
+    cache would stay stale.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        cli_inbox = Inbox(inbox_path)
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        # The CLI process writes only the inbox; the bridge never sees
+        # a live callback for it.
+        cli_inbox.record_reaction(
+            {
+                "target": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        messages = bridge.messages()
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        # ...and a CLI retraction clears it on the next read too.
+        cli_inbox.record_reaction(
+            {
+                "target": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "",
+                "sent_at": 104.0,
+                "received_at": 105.0,
+                "id": "react-2",
+            }
+        )
+        assert bridge.messages()[0]["reactions"] == []
+    finally:
+        bridge.stop()
+
+
+def test_react_endpoint_reacts_to_a_history_message(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    sent = []
+
+    def send_reaction(peer, target, token, *, timeout=20.0, discover_timeout=None):
+        sent.append((peer, target, token))
+        # Mirror the node's local recording so the console annotates.
+        bridge.record_reaction(
+            {
+                "target": target,
+                "reaction": token,
+                "from": "tester",
+                "destination": "cd" * 16,
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        return {"ok": True, "reaction": token, "target": target, "id": "react-1"}
+
+    node.send_reaction = send_reaction
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["target"] == "wire-1"
+    assert payload["reaction"] == "👍"
+    assert payload["cleared"] is False
+    assert sent == [(PEER_HASH, "wire-1", "👍")]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["reactions"] == [
+        {"reactor": "cd" * 16, "name": "tester", "reaction": "👍"}
+    ]
+
+
+def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
+    status, _, payload = _json(
+        bridge, "/api/react", method="POST", body={"target": "nope", "reaction": "👍"}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "x" * 33},
+    )
+    assert status == 400
+    assert "longer than 32" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍", "clear": True},
+    )
+    assert status == 400
+
+
+def test_reaction_annotates_matching_history_entry(bridge):
+    record = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-1",
+    }
+    bridge.record_inbound(record)
+
+    updated = bridge.record_reaction(_reaction_record())
+    assert updated is not None
+    assert updated["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+    assert feed["messages"][0]["wire_id"] == "wire-1"
+    events = bridge.bus.replay(0)
+    assert any(
+        e["type"] == "message_updated"
+        and e["message"]["reactions"]
+        for e in events
+    )
+
+
+def test_reaction_latest_per_reactor_and_clear(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    bridge.record_reaction(_reaction_record(reaction="👍"))
+    bridge.record_reaction(_reaction_record(reaction="❤️", id="react-2"))
+    updated = bridge.record_reaction(_reaction_record(reaction="", id="react-3"))
+    assert updated is not None
+    assert updated["reactions"] == []
+
+
+def test_reaction_to_unknown_history_entry_is_dropped(bridge):
+    assert bridge.record_reaction(_reaction_record()) is None
+
+
+def test_reactions_and_wire_id_survive_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        bridge.record_reaction(_reaction_record())
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert len(messages) == 1
+        assert messages[0]["wire_id"] == "wire-1"
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge2.stop()
+
+
+def test_send_message_records_wire_id(node, tmp_path):
+    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None, expires_at=None):
+        return {"ok": True, "echo": text, "server": "tester", "id": "wire-9"}
+
+    node.send_message = send_with_id
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        message, _ = bridge.send_message("alice", "hi")
+        assert message["wire_id"] == "wire-9"
+    finally:
+        bridge.stop()
+
+
+def _reaction_record(**overrides):
+    record = {
+        "target": "wire-1",
+        "reaction": "👍",
+        "from": "alice",
+        "destination": PEER_HASH,
+        "sent_at": 12.0,
+        "received_at": 13.0,
+        "id": "react-1",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_expired_history_is_purged_on_load(node, tmp_path):
+    now = time.time()
+    gone = _stored_message(1, "gone")
+    gone["expires_at"] = now - 10
+    staying = _stored_message(2, "staying")
+    staying["expires_at"] = now + 3600
+    (tmp_path / "messages.json").write_text(
+        json.dumps(
+            {
+                "messages": [gone, staying, _stored_message(3, "plain")],
+                "next_message_id": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        assert [m["text"] for m in bridge.messages(limit=0)] == [
+            "staying",
+            "plain",
+        ]
+        # The purge is persisted: the expired entry is gone from disk.
+        stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+        assert [m["text"] for m in stored["messages"]] == ["staying", "plain"]
+    finally:
+        bridge.stop()
+
+
+def test_inbound_message_keeps_expiry(bridge):
+    record = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "read fast",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "expires_at": 1893456000.0,
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["expires_at"] == 1893456000.0
+
+
+def test_messages_filters_expired_at_read_time(bridge):
+    now = time.time()
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="gone",
+        sent_at=now - 100,
+        received_at=now - 100,
+        status="received",
+        expires_at=now - 10,
+    )
+    bridge._append_message(
+        direction="in",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="staying",
+        sent_at=now,
+        received_at=now,
+        status="received",
+        expires_at=now + 3600,
+    )
+    # The deadline passed while the bridge was running: the read path
+    # drops it without waiting for a restart.
+    assert [m["text"] for m in bridge.messages(limit=0)] == ["staying"]
+
+
+def test_send_rejects_bad_expires_in(bridge):
+    for bad in (0, -5, "soon", True, 31 * 86400, 10**400):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "hi", "expires_in": bad},
+        )
+        assert status == 400
+        assert "expires_in" in payload["error"]["message"]
+
+
+def test_send_requires_a_target(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"text": "hi"}
+    )
+    assert status == 400
+    assert "to" in payload["error"]["message"]
+
+
+def test_send_with_expires_in_records_deadline(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "vanish soon", "expires_in": 3600},
+    )
+    assert status == 200
+    expires_at = payload["message"]["expires_at"]
+    assert before + 3590 <= expires_at <= time.time() + 3610
+    assert node.last_expires_at == expires_at
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["expires_at"] == expires_at
