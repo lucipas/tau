@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
 import type { TanLiker, TanPost } from "@/lib/types";
@@ -28,6 +28,16 @@ export function SocialConsole() {
   // a stale list behind.
   const [likersOpen, setLikersOpen] = useState<string | null>(null);
   const [likers, setLikers] = useState<TanLiker[] | null>(null);
+  // Bumped on every open, close, or switch of the liker list. A pending
+  // fetch or like completion applies only if the generation it started
+  // under is still current, so superseded results never reach the UI.
+  const likersGeneration = useRef(0);
+
+  function closeLikers() {
+    likersGeneration.current += 1;
+    setLikersOpen(null);
+    setLikers(null);
+  }
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -54,6 +64,8 @@ export function SocialConsole() {
 
   async function toggleLike(post: TanPost) {
     setError(null);
+    const generation = likersGeneration.current;
+    const listOpenForPost = likersOpen === post.hash;
     try {
       if (post.liked) {
         await tan.unlike(post.hash);
@@ -61,10 +73,11 @@ export function SocialConsole() {
         await tan.like(post.hash);
       }
       // The like count changed, so an open liker list for this post is
-      // stale; close it and let the count button fetch a fresh one.
-      if (likersOpen === post.hash) {
-        setLikersOpen(null);
-        setLikers(null);
+      // stale; close it and let the count button fetch a fresh one. If
+      // the list was closed or reopened while the reaction was pending,
+      // leave the current list alone.
+      if (listOpenForPost && likersGeneration.current === generation) {
+        closeLikers();
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
@@ -73,16 +86,19 @@ export function SocialConsole() {
 
   async function toggleLikers(post: TanPost) {
     if (likersOpen === post.hash) {
-      setLikersOpen(null);
-      setLikers(null);
+      closeLikers();
       return;
     }
+    const generation = ++likersGeneration.current;
     setLikersOpen(post.hash);
     setLikers(null);
     setError(null);
     try {
-      setLikers(await tan.fetchLikers(post.hash));
+      const result = await tan.fetchLikers(post.hash);
+      if (likersGeneration.current !== generation) return;
+      setLikers(result);
     } catch (caught) {
+      if (likersGeneration.current !== generation) return;
       setError(
         caught instanceof Error ? caught.message : "could not load likers",
       );
@@ -503,7 +519,7 @@ export function PostCard({
                   : "border-line/70 bg-panel/60 text-mist/80 hover:text-rose-300"
               }`}
             >
-              ♥
+              ♥ {post.likes ?? 0}
             </button>
             {(post.likes ?? 0) > 0 ? (
               <button

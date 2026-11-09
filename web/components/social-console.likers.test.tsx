@@ -52,6 +52,7 @@ describe("PostCard likers", () => {
   it("shows no count button when the post has no likes", () => {
     renderCard(makePost({ likes: 0 }));
     expect(screen.queryByTitle("Show who liked this post")).toBeNull();
+    expect(screen.getByText("♥ 0")).toBeTruthy();
   });
 
   it("shows the count button when the post has likes", () => {
