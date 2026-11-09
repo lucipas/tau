@@ -722,6 +722,8 @@ class Inbox:
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
         """
+        if direction is not None and direction not in ("in", "out"):
+            raise ValueError('direction must be "in" or "out"')
         with self._lock:
             entries = list(self._messages)
             cursors = {

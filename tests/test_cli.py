@@ -1254,9 +1254,13 @@ def test_parser_messages_arguments():
     assert defaults.peer is None
     assert defaults.limit == 30
     assert defaults.search is None
+    assert defaults.sent is False
 
     args = parser.parse_args(["messages", "--search", "hello"])
     assert args.search == "hello"
+
+    args = parser.parse_args(["messages", "--sent"])
+    assert args.sent is True
 
 
 def _seed_messages(tmp_path):

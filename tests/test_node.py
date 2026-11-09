@@ -8,8 +8,9 @@ import RNS
 import pytest
 
 from tau.config import TauConfig
+from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.node import NodeError, TauNode
+from tau.node import NodeError, NotAllowedError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT
 
@@ -83,6 +84,70 @@ def test_info_requires_start(tmp_path):
         node.info()
     with pytest.raises(NodeError):
         node.send_message("alice", "hi")
+
+
+def test_send_message_records_sent_message_in_inbox(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    monkeypatch.setattr(node, "_request", lambda *args, **kwargs: {"ok": True})
+
+    response = node.send_message("alice", "hello there")
+
+    assert response["ok"] is True
+    entries = node.inbox.list_messages(direction=None)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["direction"] == "out"
+    assert entry["destination"] == peer.hexhash
+    assert entry["text"] == "hello there"
+    assert entry["from"] == "tester"
+    assert entry["id"]
+    # The record survives a reload from disk.
+    assert len(Inbox(node.config.inbox_path)) == 1
+
+
+def test_send_message_records_queued_message_in_inbox(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def _fail(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", _fail)
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    node.reticulum = object()  # started, without a live Reticulum
+
+    response = node.send_message("alice", "queued hello")
+
+    assert response["queued"] is True
+    assert len(node.mailbox.outbox_list()) == 1
+    entries = node.inbox.list_messages(direction=None)
+    assert len(entries) == 1
+    assert entries[0]["direction"] == "out"
+    assert entries[0]["text"] == "queued hello"
+    assert entries[0]["id"] == response["id"]
+
+
+def test_send_message_records_nothing_when_peer_refuses(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def _denied(*args, **kwargs):
+        raise NotAllowedError("peer rejected the request: not allowed")
+
+    monkeypatch.setattr(node, "_request", _denied)
+    with pytest.raises(NotAllowedError):
+        node.send_message("alice", "hello")
+    assert len(node.inbox) == 0
 
 
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):
