@@ -396,8 +396,16 @@ export function SocialConsole() {
                 </button>
               </div>
               <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
-                <p className={`text-[11px] ${error ? "text-rose-300" : "text-mist/70"}`}>
-                  {error ?? "Enter to post · Shift+Enter for a new line"}
+                <p
+                  className={`text-[11px] ${
+                    error || (showingSearch && tan.error)
+                      ? "text-rose-300"
+                      : "text-mist/70"
+                  }`}
+                >
+                  {error ??
+                    (showingSearch && tan.error) ??
+                    "Enter to post · Shift+Enter for a new line"}
                 </p>
                 <span className="font-mono text-[10px] text-mist/60">
                   {text.length}/2000
