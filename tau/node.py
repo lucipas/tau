@@ -420,8 +420,10 @@ class TauNode:
         whose saved changes only apply when the node restarts, the
         console *is* the running node.
         """
-        self._allowlist = allowlist
+        # Persist first: if the write fails, the running node keeps the
+        # policy that is actually on disk.
         save_allowlist(self.config.allowlist_path, allowlist)
+        self._allowlist = allowlist
 
     @property
     def read_receipts_enabled(self) -> bool:
