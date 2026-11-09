@@ -503,7 +503,7 @@ def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):
         "delivered": 0,
         "deposited": 0,
     }
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     node.flush_outbox(max_peers=2)
@@ -531,14 +531,14 @@ def test_flush_outbox_respects_delivery_backoff(tmp_path):
 
     attempted = []
 
-    def deliver(p, entry, timeout):
+    def deliver(p, entry, timeout, **kwargs):
         # Mirror the real _deliver_entry: success removes the entry.
         attempted.append(entry.id)
         node.mailbox.remove_outbox(entry.id)
         return True
 
     node._deliver_entry = deliver
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     # The periodic sweep only attempts entries whose backoff has elapsed.
@@ -582,13 +582,13 @@ def test_capped_sweep_prioritises_due_recipients(tmp_path):
 
     attempted = []
 
-    def deliver(p, entry, timeout):
+    def deliver(p, entry, timeout, **kwargs):
         attempted.append(entry.id)
         node.mailbox.remove_outbox(entry.id)
         return True
 
     node._deliver_entry = deliver
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     summary = node.flush_outbox(max_peers=16)

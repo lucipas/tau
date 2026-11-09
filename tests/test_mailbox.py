@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 
 import RNS
@@ -931,6 +932,100 @@ def test_transaction_is_reentrant(tmp_path):
     with box._transaction():
         entry = box.enqueue(to=BOB, text="nested write", now=time.time())
     assert box.get_outbox(entry.id) is not None
+
+
+def test_transaction_timeout_when_lock_held(tmp_path):
+    # A stalled lock holder (another process holding the flock) must
+    # not block a bounded transaction past its budget.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with box.transaction(timeout=0.1):
+                raise AssertionError("must not acquire a held lock")
+        assert time.monotonic() - started < 2.0
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    # Once the holder releases, the same bounded transaction succeeds.
+    with box.transaction(timeout=1.0):
+        assert box.get_outbox(box.outbox_list()[0].id) is not None
+
+
+def test_transaction_shares_timeout_across_both_locks(tmp_path):
+    # The in-process lock and the flock share one deadline: a
+    # transaction that waits on both must not take up to twice its
+    # timeout.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    acquired = threading.Event()
+
+    def hold_in_process_lock():
+        box._lock.acquire()
+        acquired.set()
+        try:
+            time.sleep(0.4)
+        finally:
+            box._lock.release()
+
+    holder = threading.Thread(target=hold_in_process_lock, daemon=True)
+    holder.start()
+    assert acquired.wait(5.0)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with box.transaction(timeout=0.5):
+                raise AssertionError("must not acquire the held locks")
+        elapsed = time.monotonic() - started
+        # 0.4s on the in-process lock leaves 0.1s for the flock: the
+        # shared deadline expires at ~0.5s, not 0.4 + 0.5.
+        assert elapsed < 0.75, "the two lock waits must share one deadline"
+        assert elapsed >= 0.4
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    holder.join(timeout=5.0)
+
+
+def test_outbox_list_timeout_when_lock_held(tmp_path):
+    # A bounded outbox read raises instead of waiting out a stalled
+    # in-process lock holder.
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        box._lock.acquire()
+        acquired.set()
+        try:
+            release.wait(5.0)
+        finally:
+            box._lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert acquired.wait(5.0)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            box.outbox_list(timeout=0.1)
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        holder.join(timeout=5.0)
+    assert len(box.outbox_list()) == 1
 
 
 def test_enqueue_caps_entry_expiry_at_message_expiry(tmp_path):

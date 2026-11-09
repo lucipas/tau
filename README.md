@@ -362,6 +362,10 @@ echo "piped message" | tau send --to alice
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
 
+# Wait up to 30 seconds for a queued message to be delivered
+# (exits non-zero if it is still queued when the wait expires)
+tau send --to alice "hi" --wait 30
+
 # Send a small file (at most 10 MiB) over a direct link. The receiver
 # first gets a signed offer (name, size, SHA-256) and may refuse it;
 # files are never queued and never stored-and-forwarded. A node only

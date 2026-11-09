@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -344,6 +345,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
+    )
+    send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
     )
     send.add_argument(
         "--reply-to",
@@ -3387,6 +3395,19 @@ def cmd_id_import(args: argparse.Namespace) -> int:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
+    # Validate flags before reading the message, so an invalid command
+    # fails at once instead of blocking on stdin.
+    wait_given = getattr(args, "wait", None) is not None
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if wait_given and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
     text = _read_message(args)
     config = _make_config(args)
     expires_at = None
@@ -3398,6 +3419,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     targets = args.to if isinstance(args.to, list) else [args.to]
     results: List[Dict[str, Any]] = []
     reply_ids: Dict[str, str] = {}
+    wait_failed = False
     try:
         for target in targets:
             # Outbox ids present before this call: only this node's own
@@ -3468,7 +3490,39 @@ def cmd_send(args: argparse.Namespace) -> int:
                 if result["queued"] and "to" not in response:
                     result["to"] = target
             results.append(result)
-        if any(result.get("queued") for result in results):
+        if wait > 0:
+            # --wait replaces the one-shot flush below: wait for each
+            # queued message in turn, each with the full budget, and
+            # record the outcome on its result.  A direct delivery
+            # records `waited: 0.0`, so --json callers always see
+            # `delivered` and `waited` when they passed --wait.
+            for result in results:
+                if not result.get("queued"):
+                    if result.get("ok", True):
+                        result["delivered"] = True
+                        result["waited"] = 0.0
+                    continue
+                started = time.monotonic()
+                delivered = node.wait_for_delivery(result["id"], timeout=wait)
+                waited = time.monotonic() - started
+                if delivered:
+                    result.pop("queued", None)
+                    result["delivered"] = True
+                    result["waited"] = round(waited, 1)
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    # The entry left the queue without a delivery
+                    # confirmation from this node: cancelled by another
+                    # process, or delivered by one.  Either way it must
+                    # not be reported as delivered.
+                    result["queued"] = False
+                    result["delivered"] = False
+                    result["waited"] = round(waited, 1)
+                    wait_failed = True
+                else:
+                    result["delivered"] = False
+                    result["waited"] = round(waited, 1)
+                    wait_failed = True
+        elif any(result.get("queued") for result in results):
             # One-shot send: give reachable peers a brief chance to take a
             # sealed copy (or the message itself) before this process exits.
             node.flush_outbox(timeout=3.0, max_peers=5)
@@ -3505,7 +3559,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                 {
                     "results": results,
                     "delivered": sum(
-                        1 for r in results if r.get("ok", True) and not r.get("queued")
+                        1
+                        for r in results
+                        if r.get("ok", True)
+                        and not r.get("queued")
+                        and r.get("delivered") is not False
                     ),
                     "queued": sum(1 for r in results if r.get("queued")),
                     "failed": len(failed),
@@ -3517,15 +3575,38 @@ def cmd_send(args: argparse.Namespace) -> int:
             target = result["target"]
             if not result.get("ok", True):
                 print(f"failed to send to {target}: {result['error']}", file=sys.stderr)
+            elif (
+                result.get("waited") is not None
+                and not result.get("delivered")
+                and not result.get("queued")
+            ):
+                # The entry left the queue while waiting without a delivery
+                # confirmation from this node: cancelled, or delivered by
+                # another process.  Say so instead of claiming delivery.
+                print(f"no longer queued for {target} after {result['waited']:.1f}s")
+                print("  delivery was not confirmed — it may have been cancelled,")
+                print("  or delivered by another process sharing this data directory")
             elif result.get("queued"):
-                print(f"queued for {target} — they are unreachable right now")
+                waited = result.get("waited")
+                if waited is not None:
+                    print(f"still queued for {target} after {waited:.1f}s")
+                else:
+                    print(f"queued for {target} — they are unreachable right now")
                 print(f"  id:      {result['id']}")
                 if reply_ids.get(target):
                     print(f"  in reply to {short_hash(reply_ids[target])}")
                 if expires_at is not None:
                     print(f"  disappears in {_ago(expires_at - time.time())}")
             elif result.get("delivered"):
-                print(f"delivered to {target}")
+                waited = result.get("waited")
+                if (
+                    waited is not None
+                    and "_rtt" not in result
+                    and "echo" not in result
+                ):
+                    print(f"delivered to {target} after {waited:.1f}s")
+                else:
+                    print(f"delivered to {target}")
                 if reply_ids.get(target):
                     print(f"  in reply to {short_hash(reply_ids[target])}")
                 if expires_at is not None:
@@ -3547,7 +3628,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         if any(result.get("queued") for result in results):
             print("  it will be delivered automatically when they are heard from;")
             print("  check `tau outbox` for the queue, or just leave a node serving")
-    return _EXIT_ERROR if failed else _EXIT_OK
+    return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
+
+
 
 
 def cmd_send_file(args: argparse.Namespace) -> int:
@@ -3586,6 +3669,8 @@ def cmd_send_file(args: argparse.Namespace) -> int:
     print(f"  id:     {response['id']}")
     print(f"  sha256: {response['sha256']}")
     return _EXIT_OK
+
+
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:

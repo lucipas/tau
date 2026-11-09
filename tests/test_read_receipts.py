@@ -494,7 +494,7 @@ def test_collected_sealed_receipt_records_reads(tmp_path):
         message_ids=["msg-1"],
         read_at=150.0,
     )
-    node._request = lambda peer, path, payload, timeout: {
+    node._request = lambda peer, path, payload, timeout, deadline=None: {
         "ok": True,
         "messages": [
             {
