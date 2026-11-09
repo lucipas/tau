@@ -1307,6 +1307,25 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def _was_delivered(self, mail_id: str) -> bool:
+        """True if this bridge recorded a delivery for *mail_id*.
+
+        The node's delivery callback flows through
+        :meth:`record_delivery`, so a delivery by a concurrent mail
+        round — one this retry did not run itself — still shows up
+        here, either as a flipped console record or, for mail queued
+        outside the console, in the early-delivery buffer.
+        """
+        with self._lock:
+            if mail_id in self._early_deliveries:
+                return True
+            return any(
+                message.get("direction") == "out"
+                and message.get("mail_id") == mail_id
+                and message.get("status") in ("delivered", "read")
+                for message in self._messages
+            )
+
     def retry_outbox(self, target: Optional[str] = None) -> Dict[str, Any]:
         """Try delivering queued mail now, ignoring backoff.
 
@@ -1315,9 +1334,12 @@ class WebBridge:
         attempted — nothing is deposited with the peer — otherwise the
         whole queue is retried.  Backoff is ignored either way: the
         operator asked for a retry *now*, not at the next scheduled
-        attempt.  A targeted entry counts as delivered only when the
-        flush itself reports a delivery for it; ``still_queued`` is
-        read back from the queue afterwards.
+        attempt.  A targeted entry counts as delivered when this
+        flush reports a delivery for it, or when the bridge already
+        recorded one — a concurrent mail round can deliver the entry
+        after resolution but before this flush visits it, and that
+        delivery must not be reported as an expiry or a cancel.
+        ``still_queued`` is read back from the queue afterwards.
         """
         to = None
         message_id = None
@@ -1346,7 +1368,10 @@ class WebBridge:
         }
         if message_id is not None:
             payload["target"] = message_id
-            payload["target_delivered"] = summary["delivered"] > 0
+            payload["target_delivered"] = (
+                summary["delivered"] > 0
+                or self._was_delivered(message_id)
+            )
             with self.node.mailbox.transaction():
                 payload["target_still_queued"] = (
                     self.node.mailbox.get_outbox(message_id) is not None

@@ -37,15 +37,22 @@ function makeResult(
 
 function renderSection(
   entries: OutboxEntry[],
-  onRetry = vi.fn(async () => makeResult()),
+  {
+    onRetry = vi.fn(async () => makeResult()),
+    onCancel = vi.fn(async () => undefined),
+  }: {
+    onRetry?: (id?: string) => Promise<RetryOutboxResponse>;
+    onCancel?: (id: string) => Promise<unknown>;
+  } = {},
 ) {
   return {
     onRetry,
+    onCancel,
     ...render(
       <OutboxSection
         entries={entries}
         heldForOthers={0}
-        onCancel={vi.fn(async () => undefined)}
+        onCancel={onCancel}
         onRetry={onRetry}
       />,
     ),
@@ -64,7 +71,7 @@ describe("OutboxSection retry", () => {
     ).toBeTruthy();
   });
 
-  it("retries one entry and reports the delivery", async () => {
+  it("retries one entry by id and reports the delivery", async () => {
     const onRetry = vi.fn(async (id?: string) =>
       makeResult({
         delivered: 1,
@@ -74,7 +81,7 @@ describe("OutboxSection retry", () => {
         target_still_queued: false,
       }),
     );
-    renderSection([makeEntry()], onRetry);
+    renderSection([makeEntry()], { onRetry });
 
     fireEvent.click(screen.getByRole("button", { name: "retry" }));
 
@@ -94,12 +101,31 @@ describe("OutboxSection retry", () => {
         target_still_queued: true,
       }),
     );
-    renderSection([makeEntry()], onRetry);
+    renderSection([makeEntry()], { onRetry });
 
     fireEvent.click(screen.getByRole("button", { name: "retry" }));
 
     expect(
       await screen.findByText("still queued — peer unreachable"),
+    ).toBeTruthy();
+  });
+
+  it("does not guess why an entry left the queue unconfirmed", async () => {
+    const onRetry = vi.fn(async (id?: string) =>
+      makeResult({
+        delivered: 0,
+        still_queued: 0,
+        target: id,
+        target_delivered: false,
+        target_still_queued: false,
+      }),
+    );
+    renderSection([makeEntry()], { onRetry });
+
+    fireEvent.click(screen.getByRole("button", { name: "retry" }));
+
+    expect(
+      await screen.findByText("left the queue — delivery not confirmed"),
     ).toBeTruthy();
   });
 
@@ -109,7 +135,7 @@ describe("OutboxSection retry", () => {
     );
     renderSection(
       [makeEntry(), makeEntry({ id: "bb".repeat(16), to_name: "bob" })],
-      onRetry,
+      { onRetry },
     );
 
     fireEvent.click(screen.getByRole("button", { name: "retry all" }));
@@ -124,7 +150,7 @@ describe("OutboxSection retry", () => {
     const onRetry = vi.fn(async () => {
       throw new Error("a mail round is already running; try again shortly");
     });
-    renderSection([makeEntry()], onRetry);
+    renderSection([makeEntry()], { onRetry });
 
     fireEvent.click(screen.getByRole("button", { name: "retry" }));
 
@@ -133,5 +159,56 @@ describe("OutboxSection retry", () => {
         "a mail round is already running; try again shortly",
       ),
     ).toBeTruthy();
+  });
+
+  it("renders nothing when the queue is empty and there is no feedback", () => {
+    const { container } = renderSection([]);
+
+    expect(container.textContent).toBe("");
+  });
+
+  it("disables cancel while a retry is in flight", () => {
+    const onRetry = vi.fn(() => new Promise<RetryOutboxResponse>(() => {}));
+    renderSection([makeEntry()], { onRetry });
+
+    fireEvent.click(screen.getByRole("button", { name: "retry" }));
+
+    expect(screen.getByRole("button", { name: "retrying…" })).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "cancel" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("disables retry while a cancel is in flight", () => {
+    const onCancel = vi.fn(() => new Promise<unknown>(() => {}));
+    renderSection([makeEntry()], { onCancel });
+
+    fireEvent.click(screen.getByRole("button", { name: "cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "confirm cancel" }));
+
+    expect(onCancel).toHaveBeenCalledWith("aa".repeat(16));
+    expect(
+      (screen.getByRole("button", { name: "retry" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "retry all" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("does not confirm a cancel while a retry is in flight", () => {
+    const onRetry = vi.fn(() => new Promise<RetryOutboxResponse>(() => {}));
+    const onCancel = vi.fn(async () => undefined);
+    renderSection([makeEntry()], { onRetry, onCancel });
+
+    fireEvent.click(screen.getByRole("button", { name: "cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "retry" }));
+    // The confirm click lands while the retry is running: the guard
+    // drops it instead of racing the delivery.
+    fireEvent.click(screen.getByRole("button", { name: "confirm cancel" }));
+
+    expect(onCancel).not.toHaveBeenCalled();
   });
 });

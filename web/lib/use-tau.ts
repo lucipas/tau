@@ -250,11 +250,15 @@ export function useTau() {
       }
       // Refresh so the rest of the queue is current. Best-effort, like
       // cancel: a failed GET cannot make a successful retry look like
-      // a failure.
+      // a failure — but a retry-all cannot name which entries left,
+      // so a failed refresh gets one delayed re-attempt before the
+      // list is left to the next poll.
       try {
         await refreshOutbox();
       } catch {
-        // The next poll reconciles.
+        setTimeout(() => {
+          void refreshOutbox().catch(() => undefined);
+        }, 2000);
       }
       return result;
     },

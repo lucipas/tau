@@ -57,6 +57,7 @@ class FakeNode:
         self.flush_lock_busy = False
         self.flush_deliver_all = False
         self.flush_deliver_target = True
+        self.flush_concurrent_delivery = False
 
     def flush_outbox(
         self,
@@ -94,7 +95,12 @@ class FakeNode:
             }
         delivered = 0
         if message_id is not None:
-            if self.flush_deliver_target and self.mailbox.remove_outbox(
+            if self.flush_concurrent_delivery:
+                # Another round delivered the entry while this flush
+                # waited for the mail lock: it leaves the queue, but
+                # this flush reports no delivery of its own.
+                self.mailbox.remove_outbox(message_id)
+            elif self.flush_deliver_target and self.mailbox.remove_outbox(
                 message_id
             ):
                 delivered = 1
@@ -966,6 +972,16 @@ def test_outbox_retry_errors(bridge, node):
     assert status == 400
     assert "target" in payload["error"]["message"]
 
+    # A supplied-but-blank target is a 400 too: {"target": ""} must
+    # not silently become a retry of the whole queue.
+    for body in ({"target": ""}, {"target": "   "}, {"id": ""}, {"target": 0}):
+        status, _, payload = _json(
+            bridge, "/api/outbox/retry", method="POST", body=body
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    assert node.flush_calls == []
+
     # Unknown and ambiguous ids are 404s, like cancel.
     status, _, payload = _json(
         bridge,
@@ -993,6 +1009,41 @@ def test_outbox_retry_errors(bridge, node):
     assert status == 409
     assert "already running" in payload["error"]["message"]
     assert node.mailbox.counts()["outbox"] == 2
+
+
+def test_outbox_retry_counts_concurrent_delivery(bridge, node):
+    # A concurrent mail round delivers the entry after resolution but
+    # before this flush visits it: the flush reports no delivery and
+    # the entry is gone, yet the bridge's delivery record confirms it
+    # was delivered — not expired or cancelled.
+    entry = _queue(node, PEER_HASH, "concurrent")
+    node.flush_concurrent_delivery = True
+    assert bridge.record_delivery(entry.id) is None  # buffered: no console record
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["target_delivered"] is True
+    assert payload["target_still_queued"] is False
+    assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_outbox_retry_unconfirmed_departure(bridge, node):
+    # The entry leaves the queue with no delivery recorded anywhere —
+    # expired, or cancelled by another process. The response says so
+    # honestly (not delivered, not queued) instead of guessing.
+    entry = _queue(node, PEER_HASH, "gone")
+    node.flush_concurrent_delivery = True
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["target_delivered"] is False
+    assert payload["target_still_queued"] is False
 
 
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
