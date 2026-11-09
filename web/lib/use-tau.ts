@@ -206,7 +206,6 @@ export function useTau() {
 
   useEffect(() => {
     if (connection !== "live") return;
-    let disposed = false;
     async function tick() {
       // The two endpoints are independent: a failure on one must not
       // stop the other from updating its state. The outbox is a side
@@ -217,7 +216,6 @@ export function useTau() {
     void tick();
     const timer = setInterval(() => void tick(), 15000);
     return () => {
-      disposed = true;
       clearInterval(timer);
     };
   }, [connection, refreshOutbox, refreshHeldMail]);
