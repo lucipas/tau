@@ -28,6 +28,7 @@ export function SocialConsole() {
   // a stale list behind.
   const [likersOpen, setLikersOpen] = useState<string | null>(null);
   const [likers, setLikers] = useState<TanLiker[] | null>(null);
+  const [likersTotal, setLikersTotal] = useState(0);
   // Bumped on every open, close, or switch of the liker list. A pending
   // fetch or like completion applies only if the generation it started
   // under is still current, so superseded results never reach the UI.
@@ -37,6 +38,7 @@ export function SocialConsole() {
     likersGeneration.current += 1;
     setLikersOpen(null);
     setLikers(null);
+    setLikersTotal(0);
   }
 
   async function submitPost() {
@@ -92,18 +94,21 @@ export function SocialConsole() {
     const generation = ++likersGeneration.current;
     setLikersOpen(post.hash);
     setLikers(null);
+    setLikersTotal(0);
     setError(null);
     try {
       const result = await tan.fetchLikers(post.hash);
+      // A newer open supersedes this response: opening another post's
+      // list first must not show this post's names under that post.
       if (likersGeneration.current !== generation) return;
-      setLikers(result);
+      setLikers(result.likers);
+      setLikersTotal(result.total);
     } catch (caught) {
       if (likersGeneration.current !== generation) return;
       setError(
         caught instanceof Error ? caught.message : "could not load likers",
       );
-      setLikersOpen(null);
-      setLikers(null);
+      closeLikers();
     }
   }
 
@@ -318,6 +323,7 @@ export function SocialConsole() {
                       onToggleLikers={toggleLikers}
                       likersOpen={likersOpen === post.hash}
                       likers={likersOpen === post.hash ? likers : null}
+                      likersTotal={likersOpen === post.hash ? likersTotal : 0}
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
@@ -425,6 +431,7 @@ export function PostCard({
   onToggleLikers,
   likersOpen,
   likers,
+  likersTotal,
   onReply,
   onDelete,
   deleting,
@@ -437,6 +444,8 @@ export function PostCard({
   likersOpen?: boolean;
   // The likers for the open list, or null while it is loading.
   likers?: TanLiker[] | null;
+  // Full liker count before the server's cap; 0 when unknown.
+  likersTotal?: number;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
@@ -529,7 +538,7 @@ export function PostCard({
                 title="Show who liked this post"
                 className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-rose-300"
               >
-                {post.likes} {post.likes === 1 ? "like" : "likes"}
+                who liked
               </button>
             ) : null}
             {(post.quotes ?? 0) > 0 ? (
@@ -601,16 +610,23 @@ export function PostCard({
               ) : likers.length === 0 ? (
                 <p className="mt-1 text-[12px] text-mist/80">no likes yet</p>
               ) : (
-                <ul className="mt-1 space-y-0.5">
-                  {likers.map((liker) => (
-                    <li
-                      key={liker.author}
-                      className="text-[12px] text-zinc-200"
-                    >
-                      {liker.name || shortHash(liker.author, 16)}
-                    </li>
-                  ))}
-                </ul>
+                <>
+                  <ul className="mt-1 space-y-0.5">
+                    {likers.map((liker) => (
+                      <li
+                        key={liker.author}
+                        className="text-[12px] text-zinc-200"
+                      >
+                        {liker.name || shortHash(liker.author, 16)}
+                      </li>
+                    ))}
+                  </ul>
+                  {(likersTotal ?? 0) > likers.length ? (
+                    <p className="mt-1 text-[11px] text-mist/70">
+                      showing first {likers.length} of {likersTotal} likers
+                    </p>
+                  ) : null}
+                </>
               )}
             </div>
           ) : null}

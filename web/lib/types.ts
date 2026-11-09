@@ -212,6 +212,7 @@ export interface TanLikesResponse {
   target: string;
   likers: TanLiker[];
   count: number;
+  total: number;
 }
 
 export interface TanPostResponse {

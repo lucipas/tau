@@ -30,6 +30,7 @@ function renderCard(
     onToggleLikers?: (post: TanPost) => void;
     likersOpen?: boolean;
     likers?: TanLiker[] | null;
+    likersTotal?: number;
   } = {},
 ) {
   const onToggleLikers = props.onToggleLikers ?? vi.fn();
@@ -40,6 +41,7 @@ function renderCard(
       onToggleLikers={onToggleLikers}
       likersOpen={props.likersOpen}
       likers={props.likers}
+      likersTotal={props.likersTotal}
       onReply={() => {}}
       onDelete={() => {}}
       deleting={false}
@@ -49,21 +51,22 @@ function renderCard(
 }
 
 describe("PostCard likers", () => {
-  it("shows no count button when the post has no likes", () => {
+  it("keeps the ♥ 0 count on a post with no likes", () => {
     renderCard(makePost({ likes: 0 }));
-    expect(screen.queryByTitle("Show who liked this post")).toBeNull();
     expect(screen.getByText("♥ 0")).toBeTruthy();
+    expect(screen.queryByTitle("Show who liked this post")).toBeNull();
   });
 
-  it("shows the count button when the post has likes", () => {
+  it("shows the count on the heart and a who-liked button otherwise", () => {
     renderCard(makePost({ likes: 2 }));
-    expect(screen.getByText("2 likes")).toBeTruthy();
+    expect(screen.getByText("♥ 2")).toBeTruthy();
+    expect(screen.getByText("who liked")).toBeTruthy();
   });
 
-  it("opens the liker list from the count button", () => {
+  it("opens the liker list from the who-liked button", () => {
     const post = makePost({ likes: 1 });
     const onToggleLikers = renderCard(post);
-    fireEvent.click(screen.getByText("1 like"));
+    fireEvent.click(screen.getByText("who liked"));
     expect(onToggleLikers).toHaveBeenCalledTimes(1);
     expect(onToggleLikers).toHaveBeenCalledWith(post);
   });
@@ -87,6 +90,24 @@ describe("PostCard likers", () => {
   it("says so when the list loads empty", () => {
     renderCard(makePost(), { likersOpen: true, likers: [] });
     expect(screen.getByText("no likes yet")).toBeTruthy();
+  });
+
+  it("says when the list is truncated by the server cap", () => {
+    renderCard(makePost(), {
+      likersOpen: true,
+      likers: [{ author: "e".repeat(32), name: "bob", liked_at: 1002 }],
+      likersTotal: 3,
+    });
+    expect(screen.getByText("showing first 1 of 3 likers")).toBeTruthy();
+  });
+
+  it("says nothing about truncation when the list is complete", () => {
+    renderCard(makePost(), {
+      likersOpen: true,
+      likers: [{ author: "e".repeat(32), name: "bob", liked_at: 1002 }],
+      likersTotal: 1,
+    });
+    expect(screen.queryByText(/showing first/)).toBeNull();
   });
 
   it("hides the list when it is not open", () => {
