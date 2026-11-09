@@ -417,6 +417,22 @@ def test_api_groups_create_is_idempotent(bridge, node, tmp_path):
     assert listed["count"] == 1
 
 
+def test_api_groups_create_rejects_unknown_member(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+
+
 def test_api_groups_create_rejects_bad_input(bridge, node, tmp_path):
     from tau.groups import GroupStore
 
@@ -428,7 +444,7 @@ def test_api_groups_create_rejects_bad_input(bridge, node, tmp_path):
         ({"name": "weekend", "members": []}, "field 'members' must be a non-empty list"),
         (
             {"name": "weekend", "members": ["not-a-hash"]},
-            "invalid group",
+            "unknown peer",
         ),
         (
             {"name": "weekend", "members": [node.destination_hexhash]},
