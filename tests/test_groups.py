@@ -727,6 +727,26 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert queued[0].group_creator == OWN_HASH
     assert queued[0].group_members == [OWN_HASH, OTHER_HASH, THIRD_HASH]
 
+    # Each leg is registered for read receipts, like a peer DM: the
+    # delivered leg under its wire id, so a recipient's receipt
+    # verifies instead of being rejected as unknown. (The queued leg
+    # is registered under the same id twice over: the outbox entry
+    # reuses the wire id as its id, so the second registration is a
+    # no-op, exactly as for a queued peer DM.)
+    delivered_id = by_to[OTHER_HASH]["id"]
+    assert node.mailbox.sent_record(delivered_id) is not None
+    assert (
+        node.mailbox.record_read(delivered_id, time.time(), reader_hash=OTHER_HASH)
+        is True
+    )
+    assert node.mailbox.read_at(delivered_id) is not None
+    third_records = [
+        record for record in node.mailbox.sent_list() if record["to"] == THIRD_HASH
+    ]
+    assert len(third_records) == 1
+    assert third_records[0]["id"] == by_to[THIRD_HASH]["id"]
+    assert third_records[0]["id"] == queued[0].id
+
 
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     node = make_node(tmp_path)
@@ -751,6 +771,9 @@ def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     assert all(entry.get("error") == "not_allowed" for entry in result["results"])
     assert len(result["results"]) == 2
     assert node.mailbox.outbox_list() == []
+    # A refused leg leaves no sent record behind: a later receipt
+    # for its id must not verify.
+    assert node.mailbox.sent_list() == []
 
 
 def test_send_group_message_treats_not_a_member_as_final(tmp_path):
@@ -812,6 +835,40 @@ def test_send_group_message_keeps_results_when_outbox_full(tmp_path):
     assert result["results"][1].get("ok") is False
     assert result["results"][1]["error"].startswith("could not queue")
     assert len(node.mailbox.outbox_list()) == 1
+    # The queued leg is registered under its id (wire id and outbox
+    # id are the same here); the leg that could not be queued leaves
+    # no sent record behind.
+    sent = node.mailbox.sent_list()
+    assert len(sent) == 1
+    assert sent[0]["to"] == OTHER_HASH
+    assert sent[0]["id"] == result["results"][0]["id"]
+
+
+def test_send_group_message_queues_legs_past_the_deadline(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+
+    def no_request(peer, path, payload, timeout):
+        raise AssertionError("leg attempted past the deadline")
+
+    node._request = no_request  # type: ignore[method-assign]
+    # A zero timeout leaves no budget for any attempt: every leg must
+    # still reach the outbox instead of being dropped to the deadline,
+    # so the members get the message on a later retry.
+    result = node.send_group_message(group, "hello", timeout=0.0)
+    assert result["ok"] is True
+    assert len(result["results"]) == 2
+    assert all(entry.get("queued") is True for entry in result["results"])
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 2
+    assert all(entry.group_id == group["id"] for entry in queued)
+    assert all(
+        node.mailbox.sent_record(entry["id"]) is not None
+        for entry in result["results"]
+    )
 
 
 def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):

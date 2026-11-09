@@ -2971,8 +2971,11 @@ class TauNode:
         leg is a ``/tau/group`` request carrying the roster; a member
         that cannot be reached is queued in the outbox (with the group
         context, so a retry re-sends the group payload) unless it
-        explicitly refused the message.  Returns a per-member result
-        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        explicitly refused the message.  The whole fan-out is bounded
+        by ``timeout``: a leg the deadline leaves no time to attempt
+        is queued the same way instead of dropped.  Returns a
+        per-member result list: ``delivered``, ``queued``, or an
+        ``error`` for that leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3025,13 +3028,55 @@ class TauNode:
             peer: Optional[Peer] = None
             budget = _remaining(deadline) or 0.0
             if budget <= 0.0:
+                # Out of time for another attempt — but the leg must
+                # not be dropped to the deadline: queueing is local
+                # disk I/O, so the member still gets the message on a
+                # later retry, exactly as if the attempt had failed to
+                # reach them.
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": "not attempted: group send time limit reached",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name="",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                any_queued = True
                 results.append(
                     {
                         "to": member,
                         "to_name": "",
-                        "ok": False,
-                        "error": "not attempted: group send time limit reached",
-                        "id": message_id,
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
                     }
                 )
                 continue
@@ -3120,6 +3165,19 @@ class TauNode:
                         }
                     )
                     continue
+                # A queued leg is registered under its outbox id, like
+                # a queued peer DM, so a receipt for it verifies. When
+                # resolve already succeeded the wire id was registered
+                # above (the outbox reuses it as its id, so this is a
+                # no-op); when resolve failed, this is the leg's only
+                # record, and without it the receipt would be rejected
+                # as unknown.
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "

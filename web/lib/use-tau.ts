@@ -310,15 +310,23 @@ export function useTau() {
       if (!result.ok) {
         // The legs are already in the feed with their own statuses, so
         // this only surfaces the summary: the message stays sendable.
-        const failed = (
-          (result.response.results as Array<Record<string, unknown>>) ?? []
-        ).filter((leg) => !leg.delivered && !leg.queued);
-        const names = failed.map(
-          (leg) => String(leg.to_name || leg.to || "a member").slice(0, 8),
+        // Name the members who already received it, so a retry is a
+        // deliberate duplicate fan-out, not a silent one.
+        const legs = (result.response.results as Array<
+          Record<string, unknown>
+        >) ?? [];
+        const failed = legs.filter((leg) => !leg.delivered && !leg.queued);
+        const deliveredNames = legs
+          .filter((leg) => leg.delivered)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const names = failed.map((leg) =>
+          String(leg.to_name || leg.to || "a member").slice(0, 8),
         );
         throw new Error(
           names.length > 0
-            ? `could not send to ${names.join(", ")}`
+            ? deliveredNames.length > 0
+              ? `could not send to ${names.join(", ")} — ${deliveredNames.join(", ")} already received this; sending again resends it to the whole group`
+              : `could not send to ${names.join(", ")}`
             : "some group members did not receive the message",
         );
       }

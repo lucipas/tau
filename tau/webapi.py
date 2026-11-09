@@ -1280,9 +1280,15 @@ class WebBridge:
             delivered = bool(result.get("delivered"))
             status = "queued" if queued else "delivered" if delivered else "failed"
             # The outbox id links a queued leg to a later delivery; only
-            # present while the leg is queued.
+            # present while the leg is queued. A failed leg carries no
+            # wire id: the recipient never saw that message, so no reply
+            # may be quoted against it.
             mail_id = result.get("id") if queued else None
-            wire_id = result.get("id") if isinstance(result.get("id"), str) else None
+            wire_id = (
+                result.get("id")
+                if (delivered or queued) and isinstance(result.get("id"), str)
+                else None
+            )
             flipped = False
             early_read: Optional[float] = None
             with self._send_lock:

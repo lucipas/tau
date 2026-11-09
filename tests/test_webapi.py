@@ -42,7 +42,7 @@ class FakeRegistry:
 
 
 class FakeNode:
-    def __init__(self, mailbox_path=None):
+    def __init__(self, mailbox_path=None, groups_path=None):
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
@@ -61,7 +61,7 @@ class FakeNode:
         self.sent = []
         self.group_sent = []
         self.group_refusals = set()
-        self.groups = GroupStore()
+        self.groups = GroupStore(groups_path)
         self.groups.create(
             "crew", [PEER_HASH, BOB_HASH], created_by=PEER_HASH
         )
@@ -327,6 +327,40 @@ def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
     assert node.group_sent == [("crew", "by id"), ("crew", "by prefix")]
 
 
+def test_send_group_message_sees_groups_changed_by_another_process(tmp_path):
+    # The serving bridge holds a cached group store; another process
+    # (a one-shot `tau group create`, or an inbound group message)
+    # can create or delete a group on disk meanwhile. The send must
+    # see the persisted state, not the stale cache.
+    groups_path = tmp_path / "groups.json"
+    node = FakeNode(tmp_path / "mailbox.json", groups_path=groups_path)
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        other = GroupStore(groups_path)
+        other.create("late", [PEER_HASH, BOB_HASH], created_by=PEER_HASH)
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"group": "late", "text": "hi late"},
+        )
+        assert status == 200
+        assert len(payload["messages"]) == 2
+        assert node.group_sent == [("late", "hi late")]
+
+        assert other.delete(other.find("late")["id"]) is True
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"group": "late", "text": "hi again"},
+        )
+        assert status == 404
+        assert "unknown group" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_send_group_message_failed_leg_is_recorded(bridge, node):
     node.group_refusals = {BOB_HASH}
     status, _, payload = _json(
@@ -338,6 +372,9 @@ def test_send_group_message_failed_leg_is_recorded(bridge, node):
     assert payload["ok"] is False
     assert [m["status"] for m in payload["messages"]] == ["delivered", "failed"]
     assert payload["messages"][1]["peer_name"] == "bob"
+    # A refused leg carries no wire id: the member never saw that
+    # message, so no reply may be quoted against it.
+    assert "wire_id" not in payload["messages"][1]
     assert payload["response"]["results"][1]["error"] == "not_allowed"
 
 

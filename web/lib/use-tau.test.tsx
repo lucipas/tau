@@ -191,7 +191,7 @@ describe("useTau sendGroup", () => {
 
     await act(async () => {
       await expect(result.current.sendGroup(GROUP_ID, "hi all")).rejects.toThrow(
-        "bob",
+        /could not send to bob — alice already received this/,
       );
     });
 
