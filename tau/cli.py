@@ -2735,7 +2735,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     previous_handlers = _install_stop_handlers(stop)
 
     social_interval = max(0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0))
-    sync_thread = None
     if social_app is not None and social_interval > 0:
 
         def social_sync_loop() -> None:
@@ -2749,10 +2748,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except Exception:  # pragma: no cover - network dependent
                     log.warning("Tan background sync failed", exc_info=True)
 
-        sync_thread = threading.Thread(
+        threading.Thread(
             target=social_sync_loop, name="tau-tan-sync", daemon=True
-        )
-        sync_thread.start()
+        ).start()
 
     publish_server = None
     if social_app is not None and hasattr(socket, "AF_UNIX"):
@@ -2779,19 +2777,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 config.data_dir,
                 lambda **request: _send_local_message(node, **request),
             )
-        except BaseException:
-            # Stop the periodic Tan sync before the node goes away, so it
-            # cannot keep working against a stopped node.
-            stop.set()
-            if sync_thread is not None:
-                sync_thread.join(timeout=10)
-            if publish_server is not None:
-                publish_server.stop()
-            if bridge is not None:
-                bridge.stop()
-            node.stop()
-            _restore_stop_handlers(previous_handlers)
-            raise
+        except Exception:
+            # The send socket is best-effort: a data directory too long
+            # for a Unix socket path, or a filesystem without socket
+            # support, must not stop the node from serving. One-shot
+            # sends fail closed in that case — the lock probe refuses to
+            # start a second instance on this identity — so no send is
+            # lost silently.
+            log.warning("Could not start the local send server", exc_info=True)
 
     info = node.info()
     if _json_mode(args):

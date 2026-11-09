@@ -207,3 +207,47 @@ def test_stale_send_socket_falls_back_to_local_node(tmp_path, capsys, monkeypatc
     assert node.calls == [("alice", "hi")]
     assert node.started is False
     assert "delivered to alice" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, monkeypatch):
+    """A send socket that cannot bind must not stop `tau serve` (CodeRabbit Major)."""
+    import tau.local_send
+
+    events = []
+
+    class RecordingNode:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            self.identity = None
+
+        def start(self, *, announce=True, exclusive=False, lxmf=False):
+            events.append("node.start")
+
+        def stop(self):
+            events.append("node.stop")
+
+        def info(self):
+            return {
+                "name": "test",
+                "destination": "ab" * 16,
+                "rns_version": "test",
+                "mailbox": {},
+                "lxmf": {},
+            }
+
+    class FailingSendServer:
+        def __init__(self, *args, **kwargs):
+            raise OSError("no socket support here")
+
+    (tmp_path / "node").mkdir()
+    monkeypatch.setattr(cli, "TauNode", RecordingNode)
+    monkeypatch.setattr(tau.local_send, "SendServer", FailingSendServer)
+
+    args = cli.build_parser().parse_args(
+        ["serve", "--data-dir", str(tmp_path / "node"), "--duration", "0"]
+    )
+    assert cli.cmd_serve(args) == 0
+    assert events == ["node.start", "node.stop"]
+    assert not (tmp_path / "node" / "send.sock").exists()
+    assert "Could not start the local send server" in caplog.text
