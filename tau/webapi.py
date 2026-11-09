@@ -1371,8 +1371,13 @@ class WebBridge:
         number = safety_number(identity.get_public_key(), peer.public_key)
         previously_verified = peer.is_verified
         previous_fingerprint = peer.verified_fingerprint
-        self.node.registry.mark_verified(peer.destination_hash, number)
-        self.node.registry.save()
+        # Hold the node's peer-save lock across the mark and the write: a
+        # concurrent node save could otherwise snapshot the unverified
+        # registry first and replace our file after ours, silently
+        # dropping the verification.
+        with self.node._save_lock:
+            self.node.registry.mark_verified(peer.destination_hash, number)
+            self.node.registry.save()
         return {
             "peer": peer.hexhash,
             "name": peer.display_name,
