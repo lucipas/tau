@@ -43,6 +43,8 @@ export function OutboxSection({
   }
 
   async function confirmCancel(id: string) {
+    // A retry in flight may be delivering this entry; don't race it.
+    if (retryingId !== null || cancellingId !== null) return;
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
     setConfirmingId(null);
     setCancellingId(id);
@@ -67,7 +69,7 @@ export function OutboxSection({
       if (result.target_still_queued) {
         return "still queued — peer unreachable";
       }
-      return "left the queue (expired or cancelled)";
+      return "left the queue — delivery not confirmed";
     }
     const parts = [
       `delivered ${result.delivered}`,
@@ -79,6 +81,8 @@ export function OutboxSection({
   }
 
   async function runRetry(id?: string) {
+    // A cancel in flight may remove this entry; don't race it.
+    if (retryingId !== null || cancellingId !== null) return;
     const key = id ?? "all";
     // The entry may leave the list on refresh; keep its name for the
     // result line before the request resolves.
@@ -96,6 +100,10 @@ export function OutboxSection({
     }
   }
 
+  // Nothing queued and no feedback to show: stay out of the way, but
+  // keep this component (and its result state) mounted.
+  if (entries.length === 0 && !notice && !error) return null;
+
   return (
     <section className="rounded-2xl border border-line/80 bg-panel/60 p-4 shadow-[0_20px_60px_-40px_rgba(0,0,0,0.9)]">
       <div className="flex items-center justify-between">
@@ -103,7 +111,7 @@ export function OutboxSection({
         <span className="inline-flex items-center gap-2">
           <button
             type="button"
-            disabled={retryingId !== null}
+            disabled={retryingId !== null || cancellingId !== null}
             onClick={() => void runRetry()}
             className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
           >
@@ -145,7 +153,7 @@ export function OutboxSection({
               <div className="flex shrink-0 gap-2">
                 <button
                   type="button"
-                  disabled={retryingId !== null}
+                  disabled={retryingId !== null || cancellingId !== null}
                   onClick={() => void runRetry(entry.id)}
                   className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
                 >
@@ -153,7 +161,7 @@ export function OutboxSection({
                 </button>
                 <button
                   type="button"
-                  disabled={cancellingId === entry.id}
+                  disabled={cancellingId !== null || retryingId !== null}
                   onClick={() => {
                     if (confirmingId === entry.id) {
                       void confirmCancel(entry.id);

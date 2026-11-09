@@ -2071,10 +2071,11 @@ class _WebHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
     def _handle_outbox_retry(self, body: Dict[str, Any], head_only: bool) -> None:
-        target = body.get("target") or body.get("id")
-        if target is not None and (
-            not isinstance(target, str) or not target.strip()
-        ):
+        # An explicitly supplied target (even blank) must be valid; only
+        # an absent one means "retry the whole queue".
+        supplied = "target" in body or "id" in body
+        target = body["target"] if "target" in body else body.get("id")
+        if supplied and (not isinstance(target, str) or not target.strip()):
             self._send_json(
                 {"error": {"message": "field 'target' must be a message id"}},
                 head_only,
@@ -2083,7 +2084,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             result = self.bridge.retry_outbox(
-                target.strip() if isinstance(target, str) else None
+                target.strip() if supplied else None
             )
         except ValueError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
