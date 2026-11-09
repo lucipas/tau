@@ -3559,7 +3559,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                 {
                     "results": results,
                     "delivered": sum(
-                        1 for r in results if r.get("ok", True) and not r.get("queued")
+                        1
+                        for r in results
+                        if r.get("ok", True)
+                        and not r.get("queued")
+                        and r.get("delivered") is not False
                     ),
                     "queued": sum(1 for r in results if r.get("queued")),
                     "failed": len(failed),

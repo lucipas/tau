@@ -479,6 +479,30 @@ def test_send_wait_reports_unconfirmed_removal_not_delivery(
     assert "not confirmed" in out
 
 
+def test_send_wait_json_multi_counts_unconfirmed_removal_as_not_delivered(
+    tmp_path, capsys, monkeypatch
+):
+    # An entry that leaves the queue mid-wait without a delivery
+    # confirmation must not be counted in the multi-recipient
+    # `delivered` total.
+    monkeypatch.setattr(cli, "TauNode", _FakeWaitNode)
+    _FakeWaitNode.instances.clear()
+    _FakeWaitNode.deliver = False
+    _FakeWaitNode.vanish = True
+    code = cli.main(
+        ["send", "--to", "alice", "--to", "bob", "--wait", "5", "hello",
+         "--data-dir", str(tmp_path / "node"), "--json"]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == 1
+    assert payload["queued"] == 0
+    assert payload["failed"] == 0
+    alice, bob = payload["results"]
+    assert alice["delivered"] is False
+    assert bob["delivered"] is True
+
+
 def test_send_wait_rejects_nonfinite_and_explicit_zero_with_no_queue(
     tmp_path, capsys, monkeypatch
 ):
