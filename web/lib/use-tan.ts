@@ -222,7 +222,15 @@ export function useTan() {
           "/api/tan/import",
           doc as unknown as Record<string, unknown>,
         );
-        await load();
+        // The entries are already stored once the POST succeeds, so a feed
+        // refresh failure must not turn the import into a reported failure.
+        try {
+          await load();
+        } catch (caught) {
+          setError(
+            caught instanceof Error ? caught.message : "could not load the feed",
+          );
+        }
         return result.import;
       } finally {
         setImporting(false);
