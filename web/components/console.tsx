@@ -111,6 +111,8 @@ export function Console() {
               void tau.ping(destination);
             }}
             onSelectPeer={selectPeer}
+            onCreateGroup={(name, members) => tau.createGroup(name, members)}
+            onDeleteGroup={(group) => tau.deleteGroup(group)}
           />
 
           <div className="flex min-w-0 flex-col">

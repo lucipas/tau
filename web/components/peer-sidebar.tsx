@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
+
 import type { BridgeInfo, NodeInfo, Peer, TauGroup } from "@/lib/types";
 import type { PingState } from "@/lib/use-tau";
 import {
@@ -22,6 +24,8 @@ export function PeerSidebar({
   selected,
   onPing,
   onSelectPeer,
+  onCreateGroup,
+  onDeleteGroup,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
@@ -32,8 +36,65 @@ export function PeerSidebar({
   selected: string;
   onPing: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
+  onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
+  onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
 }) {
   const now = useNow();
+  const [showCreate, setShowCreate] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [pickedMembers, setPickedMembers] = useState<string[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [groupError, setGroupError] = useState<string | null>(null);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    };
+  }, []);
+
+  function armDeleteConfirm(id: string) {
+    setGroupError(null);
+    setConfirmingId(id);
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    confirmTimer.current = setTimeout(() => setConfirmingId(null), 5000);
+  }
+
+  async function confirmDelete(id: string) {
+    if (!onDeleteGroup) return;
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    setConfirmingId(null);
+    setDeletingId(id);
+    setGroupError(null);
+    try {
+      await onDeleteGroup(id);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "delete failed");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  async function submitCreate(event: React.FormEvent) {
+    event.preventDefault();
+    if (!onCreateGroup) return;
+    const name = groupName.trim();
+    if (!name || pickedMembers.length === 0) return;
+    setCreating(true);
+    setGroupError(null);
+    try {
+      await onCreateGroup(name, pickedMembers);
+      setGroupName("");
+      setPickedMembers([]);
+      setShowCreate(false);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "create failed");
+    } finally {
+      setCreating(false);
+    }
+  }
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -280,13 +341,107 @@ export function PeerSidebar({
           </span>
         </div>
 
+        {onCreateGroup ? (
+          showCreate ? (
+            <form onSubmit={submitCreate} className="mt-3 space-y-2">
+              <input
+                type="text"
+                value={groupName}
+                onChange={(event) => setGroupName(event.target.value)}
+                placeholder="Group name"
+                aria-label="Group name"
+                maxLength={64}
+                className="w-full rounded-lg border border-line/80 bg-void/60 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+              />
+              {peers.length === 0 ? (
+                <p className="text-[11px] leading-relaxed text-mist">
+                  No peers yet — a group needs at least one other peer.
+                </p>
+              ) : (
+                <fieldset>
+                  <legend className="sr-only">Members</legend>
+                  <ul className="max-h-32 space-y-1 overflow-y-auto thin-scroll">
+                    {peers.map((peer) => (
+                      <li key={peer.destination}>
+                        <label className="flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-xs text-zinc-200 hover:bg-void/40">
+                          <input
+                            type="checkbox"
+                            checked={pickedMembers.includes(peer.destination)}
+                            onChange={(event) => {
+                              setPickedMembers((previous) =>
+                                event.target.checked
+                                  ? [...previous, peer.destination]
+                                  : previous.filter(
+                                      (hash) => hash !== peer.destination,
+                                    ),
+                              );
+                            }}
+                            className="h-3.5 w-3.5 accent-emerald-400"
+                          />
+                          <span className="min-w-0 truncate">
+                            {peer.name || "unknown"}{" "}
+                            <span className="font-mono text-[10px] text-mist">
+                              {shortHash(peer.destination, 10)}
+                            </span>
+                          </span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                </fieldset>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={
+                    creating ||
+                    !groupName.trim() ||
+                    pickedMembers.length === 0
+                  }
+                  className="rounded-md border border-signal/50 bg-signal/10 px-2.5 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {creating ? "creating…" : "create group"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCreate(false);
+                    setGroupName("");
+                    setPickedMembers([]);
+                    setGroupError(null);
+                  }}
+                  className="rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-200"
+                >
+                  cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setGroupError(null);
+                setShowCreate(true);
+              }}
+              className="mt-3 rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/50 hover:text-signal"
+            >
+              + new group
+            </button>
+          )
+        ) : null}
+
+        {groupError ? (
+          <p className="mt-2 font-mono text-[11px] text-rose-400">
+            {groupError}
+          </p>
+        ) : null}
+
         {groups.length === 0 ? (
           <p className="mt-3 text-[11px] leading-relaxed text-mist">
-            No group chats yet. Create one with{" "}
-            <code className="text-zinc-300">
-              tau group create NAME --peer ...
-            </code>
-            ; composing from the console comes later.
+            No group chats yet.
+            {onCreateGroup
+              ? " Create one above — pick a name and at least one peer."
+              : " Create one with tau group create NAME --peer ..."}
           </p>
         ) : (
           <ul className="mt-2 space-y-2">
@@ -295,12 +450,40 @@ export function PeerSidebar({
                 key={group.id}
                 className="rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
               >
-                <p className="truncate text-xs font-medium text-zinc-200">
-                  {group.name}
-                </p>
-                <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
-                  {group.members.map((member) => member.name).join(", ")}
-                </p>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-medium text-zinc-200">
+                      {group.name}
+                    </p>
+                    <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
+                      {group.members.map((member) => member.name).join(", ")}
+                    </p>
+                  </div>
+                  {onDeleteGroup ? (
+                    <button
+                      type="button"
+                      disabled={deletingId === group.id}
+                      onClick={() => {
+                        if (confirmingId === group.id) {
+                          void confirmDelete(group.id);
+                        } else {
+                          armDeleteConfirm(group.id);
+                        }
+                      }}
+                      className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                        confirmingId === group.id
+                          ? "border-amber/60 bg-amber/10 text-amber"
+                          : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                      }`}
+                    >
+                      {deletingId === group.id
+                        ? "deleting…"
+                        : confirmingId === group.id
+                          ? "confirm delete"
+                          : "delete"}
+                    </button>
+                  ) : null}
+                </div>
               </li>
             ))}
           </ul>

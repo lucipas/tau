@@ -6,6 +6,8 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  CreateGroupResponse,
+  DeleteGroupResponse,
   GroupsResponse,
   MarkReadResponse,
   NodeInfo,
@@ -313,6 +315,41 @@ export function useTau() {
     }
   }, []);
 
+  const createGroup = useCallback(
+    async (name: string, members: string[]) => {
+      const result = await apiPost<CreateGroupResponse>("/api/groups", {
+        name,
+        members,
+      });
+      // The create already succeeded: refresh best-effort so the new
+      // group shows at once instead of waiting for the next poll.
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.group;
+    },
+    [refreshGroups],
+  );
+
+  const deleteGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<DeleteGroupResponse>("/api/groups/delete", {
+        group,
+      });
+      // Same best-effort refresh as create: a failed GET must not
+      // report a successful delete as failed.
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.deleted;
+    },
+    [refreshGroups],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -341,6 +378,8 @@ export function useTau() {
     ping,
     announce,
     markRead,
+    createGroup,
+    deleteGroup,
     refreshOutbox,
     refreshGroups,
     cancelOutbox,
