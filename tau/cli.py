@@ -2735,6 +2735,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     previous_handlers = _install_stop_handlers(stop)
 
     social_interval = max(0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0))
+    sync_thread = None
     if social_app is not None and social_interval > 0:
 
         def social_sync_loop() -> None:
@@ -2748,9 +2749,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 except Exception:  # pragma: no cover - network dependent
                     log.warning("Tan background sync failed", exc_info=True)
 
-        threading.Thread(
+        sync_thread = threading.Thread(
             target=social_sync_loop, name="tau-tan-sync", daemon=True
-        ).start()
+        )
+        sync_thread.start()
 
     publish_server = None
     if social_app is not None and hasattr(socket, "AF_UNIX"):
@@ -2778,6 +2780,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 lambda **request: _send_local_message(node, **request),
             )
         except BaseException:
+            # Stop the periodic Tan sync before the node goes away, so it
+            # cannot keep working against a stopped node.
+            stop.set()
+            if sync_thread is not None:
+                sync_thread.join(timeout=10)
             if publish_server is not None:
                 publish_server.stop()
             if bridge is not None:
@@ -3305,10 +3312,19 @@ def _reconcile_queued_sends(
         return
     node.flush_outbox(timeout=3.0, max_peers=5)
     for result in results:
-        if result.get("queued") and node.mailbox.get_outbox(result["id"]) is None:
-            message_id = result["id"]
+        if not result.get("queued"):
+            continue
+        message_id = result["id"]
+        # Leaving the outbox is not proof of delivery: an entry can also
+        # expire or be cancelled. Only a recorded delivery counts.
+        sent = node.mailbox.sent_record(message_id)
+        if node.mailbox.get_outbox(message_id) is None and (
+            sent is not None and sent.get("delivered_at") is not None
+        ):
             to_hex = result["to"]
             target = result["target"]
+            # Keep the private "_" fields (e.g. the resolved reply id).
+            private = {k: v for k, v in result.items() if k.startswith("_")}
             result.clear()
             result.update(
                 {
@@ -3322,6 +3338,7 @@ def _reconcile_queued_sends(
                         if expires_at is not None
                         else {}
                     ),
+                    **private,
                 }
             )
 
@@ -3476,6 +3493,42 @@ def _send_via_running_node(
     return results
 
 
+def _send_routes_via_running_node(config: TauConfig) -> bool:
+    """True when a serving node should carry the send; False for a local node.
+
+    A serving node holds the data-directory lock for its whole life but
+    answers on its send socket only between startup and shutdown. A
+    socket that answers wins. Otherwise the lock decides: when it is free
+    no node owns the directory (a stale socket is harmless), so a local
+    one-shot node may start. When it is held, the serve is starting or
+    stopping, so wait briefly for the socket and otherwise fail rather
+    than start a second node on the same identity.
+    """
+    from .local_send import send_server_available
+
+    has_socket = hasattr(socket, "AF_UNIX")
+    if has_socket and send_server_available(config.data_dir):
+        return True
+    config.prepare()
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    try:
+        probe.acquire()
+    except InstanceAlreadyRunning:
+        deadline = time.monotonic() + 10.0
+        while has_socket:
+            if send_server_available(config.data_dir):
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        raise NodeError(
+            "a tau node holds this data directory but is not accepting "
+            "sends; retry shortly"
+        ) from None
+    probe.release()
+    return False
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
@@ -3486,12 +3539,8 @@ def cmd_send(args: argparse.Namespace) -> int:
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
     # A serving node owns the data directory: send through it instead of
-    # starting a second Reticulum instance on the same identity. A stale
-    # socket left by a crashed serve answers nothing, so the probe below
-    # falls back to the local one-shot node.
-    from .local_send import send_server_available
-
-    if send_server_available(config.data_dir):
+    # starting a second Reticulum instance on the same identity.
+    if _send_routes_via_running_node(config):
         results = _send_via_running_node(
             args, config, text, targets, expires_at, reply_ids
         )

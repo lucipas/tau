@@ -46,6 +46,7 @@ class _FakeRunningNode:
                 text=text,
                 message_id=f"{len(self.calls):032x}",
             )
+            self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
             return {"ok": True, "queued": True, "id": entry.id, "to": entry.to_hex}
         return {"ok": True, "echo": text, "_rtt": 0.05}
 
@@ -53,6 +54,8 @@ class _FakeRunningNode:
         self.flush_calls.append(kwargs)
         if self.deliver_on_flush:
             for entry in self.mailbox.outbox_list():
+                # The real node records delivery before leaving the outbox.
+                self.mailbox.record_delivered(entry.id)
                 self.mailbox.remove_outbox(entry.id)
 
 
