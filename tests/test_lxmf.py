@@ -172,6 +172,13 @@ class _FakeLXMRouter:
         self.identity = identity
         self.storagepath = storagepath
         self.delivery_destinations = {}
+        self.propagation_node = False
+        self.propagation_destination = _FakeDeliveryDestination(
+            lxmf.lxmf_propagation_hash(identity)
+            if identity is not None
+            else bytes(16)
+        )
+        self.propagation_enabled_calls = 0
         self.display_name = None
         self.announced: list = []
         self.exit_handler_calls = 0
@@ -184,6 +191,10 @@ class _FakeLXMRouter:
         )
         self.delivery_destinations[destination.hash] = destination
         return destination
+
+    def enable_propagation(self):
+        self.propagation_enabled_calls += 1
+        self.propagation_node = True
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
@@ -277,3 +288,101 @@ def test_node_lxmf_router_missing_package_is_node_error(monkeypatch, tmp_path):
     with pytest.raises(NodeError, match="not installed"):
         node._start_lxmf_router()
     assert node.lxmf_router is None
+
+# -- propagation node ------------------------------------------------------
+
+def test_start_router_with_propagation_enables_it(fake_lxmf, tmp_path):
+    identity = RNS.Identity()
+    router = lxmf.start_lxmf_router(
+        identity, tmp_path, display_name="tester", propagation=True
+    )
+    assert router.propagation_enabled_calls == 1
+    assert router.propagation_node is True
+    assert lxmf.lxmf_router_propagation_hash(router) == (
+        lxmf.lxmf_propagation_hash(identity)
+    )
+    # The delivery destination is still registered and announced.
+    assert lxmf.lxmf_router_delivery_hash(router) == (
+        lxmf.lxmf_delivery_hash(identity)
+    )
+    assert router.announced == [lxmf.lxmf_delivery_hash(identity)]
+
+
+def test_start_router_without_propagation_leaves_it_off(fake_lxmf, tmp_path):
+    identity = RNS.Identity()
+    router = lxmf.start_lxmf_router(identity, tmp_path)
+    assert router.propagation_enabled_calls == 0
+    assert router.propagation_node is False
+    assert lxmf.lxmf_router_propagation_hash(router) is None
+
+
+def test_router_propagation_hash_none_without_router_or_flag(
+    fake_lxmf, tmp_path
+):
+    assert lxmf.lxmf_router_propagation_hash(None) is None
+    router = _FakeLXMRouter(identity=RNS.Identity(), storagepath=str(tmp_path))
+    assert lxmf.lxmf_router_propagation_hash(router) is None
+
+
+def test_start_router_propagation_failure_tears_down_router(
+    fake_lxmf, tmp_path, monkeypatch
+):
+    def enable_broken(self):
+        raise RuntimeError("no message store")
+
+    monkeypatch.setattr(_FakeLXMRouter, "enable_propagation", enable_broken)
+    with pytest.raises(lxmf.LXMFError, match="could not enable LXMF propagation"):
+        lxmf.start_lxmf_router(RNS.Identity(), tmp_path, propagation=True)
+    # The half-started router is torn down, not left running.
+    assert fake_lxmf[0].exit_handler_calls == 1
+
+
+def test_node_lxmf_router_propagation(fake_lxmf, tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    node.identity = RNS.Identity()
+    node._start_lxmf_router(propagation=True)
+    assert fake_lxmf == [node.lxmf_router]
+    assert lxmf.lxmf_router_propagation_hash(node.lxmf_router) == (
+        lxmf.lxmf_propagation_hash(node.identity)
+    )
+    node.stop()
+    assert node.lxmf_router is None
+
+
+def test_node_lxmf_router_propagation_failure_is_node_error(
+    fake_lxmf, tmp_path, monkeypatch
+):
+    def enable_broken(self):
+        raise RuntimeError("no message store")
+
+    monkeypatch.setattr(_FakeLXMRouter, "enable_propagation", enable_broken)
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    node.identity = RNS.Identity()
+    with pytest.raises(NodeError, match="could not enable LXMF propagation"):
+        node._start_lxmf_router(propagation=True)
+    assert node.lxmf_router is None
+
+
+def test_serve_propagation_requires_lxmf(monkeypatch):
+    from tau import cli
+
+    args = cli.build_parser().parse_args(
+        ["serve", "--lxmf-propagation", "--data-dir", "/tmp/tau-test"]
+    )
+    with pytest.raises(cli.NodeError, match="requires --lxmf"):
+        cli.cmd_serve(args)
+
+
+def test_serve_parser_accepts_lxmf_propagation():
+    from tau import cli
+
+    args = cli.build_parser().parse_args(
+        ["serve", "--lxmf", "--lxmf-propagation"]
+    )
+    assert args.lxmf is True
+    assert args.lxmf_propagation is True
+    args = cli.build_parser().parse_args(["serve"])
+    assert args.lxmf is False
+    assert args.lxmf_propagation is False

@@ -291,6 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(requires the lxmf extra: pip install \"tau-p2p[lxmf]\")"
         ),
     )
+    serve.add_argument(
+        "--lxmf-propagation",
+        action="store_true",
+        help=(
+            "also serve as an LXMF propagation node, holding mail for "
+            "offline recipients (requires --lxmf)"
+        ),
+    )
     serve.set_defaults(func=cmd_serve)
 
     discover = subparsers.add_parser(
@@ -2612,6 +2620,10 @@ def cmd_bundle_import(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    if getattr(args, "lxmf_propagation", False) and not getattr(
+        args, "lxmf", False
+    ):
+        raise NodeError("--lxmf-propagation requires --lxmf")
     interval = max(
         0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
     )
@@ -2687,6 +2699,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         announce=not getattr(args, "no_announce", False),
         exclusive=True,
         lxmf=bool(getattr(args, "lxmf", False)),
+        lxmf_propagation=bool(getattr(args, "lxmf_propagation", False)),
     )
 
     social_app = None
@@ -2788,6 +2801,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         lxmf_info = info.get("lxmf") or {}
         if lxmf_info.get("enabled"):
             print(f"  lxmf:        delivery {lxmf_info.get('delivery')}")
+            if lxmf_info.get("propagation"):
+                print(
+                    f"  lxmf:        propagation {lxmf_info.get('propagation')}"
+                )
         print(f"  data dir:    {config.data_dir}")
         mailbox_counts = info.get("mailbox") or {}
         if mailbox_counts.get("outbox") or mailbox_counts.get("held"):
