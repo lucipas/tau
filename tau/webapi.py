@@ -5,6 +5,8 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
+    POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -49,6 +51,8 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .allowlist import AllowListError, clean_destination
+from .blocklist import BlockListError, load_blocklist, save_blocklist
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
@@ -1350,7 +1354,93 @@ class WebBridge:
             )
         return items
 
+    def _resolve_block_target(self, target: str) -> str:
+        """Resolve a block/unblock target the way the CLI does.
+
+        Registry name, destination hash or hash prefix first, then a
+        bare destination hash; anything else is an unknown peer.
+        """
+        try:
+            peer = self.node.registry.resolve(target)
+        except PeerError as exc:
+            raise ValueError(str(exc)) from exc
+        if peer is not None:
+            return peer.hexhash
+        try:
+            return clean_destination(target)
+        except AllowListError:
+            raise ValueError(f"unknown peer or destination: {target!r}") from None
+
+    def _describe_blocked(self, destination: str) -> Dict[str, Any]:
+        peer = self.node.registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    def _edit_blocklist(self, target: str, *, block: bool) -> Dict[str, Any]:
+        """Block or unblock a peer and persist the change.
+
+        The running node's cached list is refreshed so the DM gate and
+        the Tan display rules enforce the change at once, and a ``peer``
+        event carries the new blocked flag to every console client.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        destination = self._resolve_block_target(target.strip())
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "blocklist_path", None)
+        current = getattr(self.node, "blocklist", None)
+        if current is None:
+            try:
+                current = load_blocklist(path)
+            except BlockListError as exc:
+                raise WebBridgeError(
+                    "block-list on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+        if current.block_all:
+            # Fail-closed: the on-disk list cannot be trusted, so an
+            # edit that persisted only the new entry would silently
+            # unblock everyone else. Refuse until the owner repairs it.
+            raise WebBridgeError(
+                "block-list on disk is unusable; fix or remove it "
+                "before editing"
+            )
+        updated = (
+            current.with_added(destination)
+            if block
+            else current.with_removed(destination)
+        )
+        changed = updated.blocked != current.blocked
+        if changed:
+            if path is None:
+                raise WebBridgeError("this node has no block-list path")
+            save_blocklist(path, updated)
+            setter = getattr(self.node, "set_blocklist", None)
+            if callable(setter):
+                setter(updated)
+            peer = self.node.registry.get(destination)
+            if peer is not None:
+                # The cached list is refreshed, so the published event
+                # carries the new blocked flag at once.
+                self.record_peer(peer)
+        return {
+            "peer": self._describe_blocked(destination),
+            "blocked": destination in updated.blocked,
+            "changed": changed,
+        }
+
+    def block_peer(self, target: str) -> Dict[str, Any]:
+        """Block a peer: drop their DMs and hide their Tan posts."""
+        return self._edit_blocklist(target, block=True)
+
+    def unblock_peer(self, target: str) -> Dict[str, Any]:
+        """Unblock a peer."""
+        return self._edit_blocklist(target, block=False)
+
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
         # live feed never show an expired entry.
@@ -1782,6 +1872,28 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
+                return
+            if path in ("/api/peers/block", "/api/peers/unblock"):
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unblock"):
+                        result = self.bridge.unblock_peer(target.strip())
+                    else:
+                        result = self.bridge.block_peer(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "block": result}, head_only)
                 return
             if path == "/api/announce":
                 self.bridge.announce()

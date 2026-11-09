@@ -11,9 +11,10 @@ import urllib.request
 
 import pytest
 
+from tau.blocklist import BlockList
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.peers import Peer
+from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
 
 PEER_HASH = "ab" * 16
@@ -28,9 +29,53 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
+        if isinstance(destination_hash, str):
+            value = destination_hash.strip()
+            if len(value) == 32 and all(
+                char in "0123456789abcdefABCDEF" for char in value
+            ):
+                for peer in self._peers:
+                    if peer.hexhash == value.casefold():
+                        return peer
+                return None
+            for peer in self._peers:
+                if peer.name.casefold() == value.casefold():
+                    return peer
+            return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
+        return None
+
+    def resolve(self, target):
+        # Mirror PeerRegistry.resolve for the single-peer fixture: name,
+        # destination hash or hash prefix, with ambiguity rejected.
+        if not isinstance(target, str):
+            raise PeerError("peer target must be a string or bytes")
+        value = target.strip()
+        if not value:
+            return None
+        if len(value) == 32 and all(
+            char in "0123456789abcdefABCDEF" for char in value
+        ):
+            return self.get(value)
+        by_name = [p for p in self._peers if p.name.casefold() == value.casefold()]
+        if len(by_name) == 1:
+            return by_name[0]
+        if len(by_name) > 1:
+            raise AmbiguousPeer(
+                f"{len(by_name)} peers are named {value!r}; use a destination hash"
+            )
+        if len(value) >= 4:
+            by_prefix = [
+                p for p in self._peers if p.hexhash.startswith(value.casefold())
+            ]
+            if len(by_prefix) == 1:
+                return by_prefix[0]
+            if len(by_prefix) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_prefix)} peers match the hash prefix {value!r}"
+                )
         return None
 
 
@@ -53,6 +98,11 @@ class FakeNode:
         )
         self.sent = []
         self.announced = 0
+        self.blocklist = None
+        self.config = None
+
+    def set_blocklist(self, blocklist):
+        self.blocklist = blocklist
 
     def info(self):
         return {
@@ -629,6 +679,110 @@ def test_tan_timeline_and_follow(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_unblock_via_api(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Block by name; the file and the node's cached list both update,
+        # and the peers snapshot carries the new blocked flag.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["peer"]["destination"] == PEER_HASH
+        assert payload["block"]["peer"]["name"] == "alice"
+        assert payload["block"]["blocked"] is True
+        assert payload["block"]["changed"] is True
+        assert node.blocklist is not None
+        assert node.blocklist.is_blocked(PEER_HASH)
+        assert json.loads((tmp_path / "blocklist.json").read_text()) == {
+            "blocked": [PEER_HASH]
+        }
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["blocked"] is True
+
+        # Re-blocking is a no-op.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["changed"] is False
+        assert payload["block"]["blocked"] is True
+
+        # Unblock by hash prefix.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/unblock",
+            method="POST",
+            body={"target": PEER_HASH[:8]},
+        )
+        assert status == 200
+        assert payload["block"]["blocked"] is False
+        assert payload["block"]["changed"] is True
+        assert not node.blocklist.is_blocked(PEER_HASH)
+        status, _, payload = _json(bridge, "/api/peers")
+        assert payload["peers"][0]["blocked"] is False
+
+        # Unblocking again is a no-op.
+        status, _, payload = _json(
+            bridge, "/api/peers/unblock", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["changed"] is False
+
+        # Unknown peers and missing targets are rejected.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "nobody"}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={}
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_corrupt_list_refuses(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    (tmp_path / "blocklist.json").write_text("{not json", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        # Nothing was persisted over the corrupt file.
+        assert (tmp_path / "blocklist.json").read_text() == "{not json"
+
+        # A node already running fail-closed (block-all) refuses edits
+        # too: persisting one entry would silently unblock everyone else.
+        node.blocklist = BlockList(block_all=True)
+        (tmp_path / "blocklist.json").write_text(
+            '{"blocked": []}', encoding="utf-8"
+        )
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        assert json.loads((tmp_path / "blocklist.json").read_text()) == {
+            "blocked": []
+        }
     finally:
         bridge.stop()
 

@@ -132,6 +132,8 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/block` | POST | block `{"target": "alice"}` |
+| `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |

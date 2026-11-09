@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
+  BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
   MarkReadResponse,
@@ -31,6 +32,11 @@ export interface PingState {
   error?: string;
 }
 
+export interface BlockState {
+  pending?: boolean;
+  error?: string;
+}
+
 function sortPeers(peers: Peer[]): Peer[] {
   return [...peers].sort((a, b) => b.last_seen - a.last_seen);
 }
@@ -53,6 +59,7 @@ export function useTau() {
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
@@ -294,6 +301,55 @@ export function useTau() {
     }
   }, []);
 
+  const editBlock = useCallback(
+    async (destination: string, block: boolean) => {
+      setBlocks((previous) => ({
+        ...previous,
+        [destination]: { pending: true },
+      }));
+      try {
+        const result = await apiPost<BlockPeerResponse>(
+          block ? "/api/peers/block" : "/api/peers/unblock",
+          { target: destination },
+        );
+        // The bridge also publishes a peer event with the new flag, so
+        // this local update is only the immediate feedback; the event
+        // reconciles it for every open console.
+        setPeers((previous) =>
+          previous.map((entry) =>
+            entry.destination === destination
+              ? { ...entry, blocked: result.block.blocked }
+              : entry,
+          ),
+        );
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {},
+        }));
+        return result.block;
+      } catch (error) {
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {
+            error: error instanceof Error ? error.message : "block failed",
+          },
+        }));
+        throw error;
+      }
+    },
+    [],
+  );
+
+  const blockPeer = useCallback(
+    (destination: string) => editBlock(destination, true),
+    [editBlock],
+  );
+
+  const unblockPeer = useCallback(
+    (destination: string) => editBlock(destination, false),
+    [editBlock],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -316,9 +372,12 @@ export function useTau() {
     bridge,
     connection,
     pings,
+    blocks,
     announcing,
     send,
     ping,
+    blockPeer,
+    unblockPeer,
     announce,
     markRead,
     refreshOutbox,
