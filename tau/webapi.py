@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import nullcontext
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1371,11 +1372,13 @@ class WebBridge:
         number = safety_number(identity.get_public_key(), peer.public_key)
         previously_verified = peer.is_verified
         previous_fingerprint = peer.verified_fingerprint
-        # Hold the node's peer-save lock across the mark and the write: a
-        # concurrent node save could otherwise snapshot the unverified
-        # registry first and replace our file after ours, silently
-        # dropping the verification.
-        with self.node._save_lock:
+        # Hold the node's peer-save lock across the mark and the write
+        # when the node has one: a concurrent node save could otherwise
+        # snapshot the unverified registry first and replace our file
+        # after ours, silently dropping the verification.  A node-like
+        # without the lock (e.g. in tests) simply marks and saves.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
             self.node.registry.mark_verified(peer.destination_hash, number)
             self.node.registry.save()
         return {

@@ -139,11 +139,27 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      // A peer event queued before a successful verify carries the
+      // older trust state; the local verification is newer, so keep
+      // it instead of letting the stale event undo the badge. A
+      // snapshot resets the record (see onSnapshot): it is
+      // authoritative, and any event after it is newer than the verify.
+      const localVerified = localVerifiedAt.current[peer.destination];
+      const currentPeer =
+        localVerified != null &&
+        (peer.verified_at == null || peer.verified_at < localVerified)
+          ? {
+              ...peer,
+              verified: true,
+              verified_at: localVerified,
+              key_change_at: null,
+            }
+          : peer;
       setPeers((previous) => {
         const next = previous.filter(
-          (entry) => entry.destination !== peer.destination,
+          (entry) => entry.destination !== currentPeer.destination,
         );
-        next.push(peer);
+        next.push(currentPeer);
         return sortPeers(next);
       });
     };
