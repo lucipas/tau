@@ -31,6 +31,7 @@ SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
 ALLOWLIST_FILE_NAME = "allowlist.json"
 FILES_DIR_NAME = "files"
+BLOCKLIST_FILE_NAME = "blocklist.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
@@ -60,6 +61,7 @@ class TauConfig:
     social_db_path: Path
     tan_rules_path: Path
     allowlist_path: Path
+    blocklist_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -95,6 +97,7 @@ class TauConfig:
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             tan_rules_path=base / TAN_RULES_FILE_NAME,
             allowlist_path=base / ALLOWLIST_FILE_NAME,
+            blocklist_path=base / BLOCKLIST_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,
@@ -143,13 +146,25 @@ def _node_file_lock(path: Path) -> Iterator[None]:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def send_read_receipts_enabled(data_dir: Path) -> bool:
+    """True unless this node opted out of sending read receipts.
+
+    A node that never sends receipts simply never does; senders treat
+    the absence of a receipt as unknown, not unread-forever.  Only an
+    explicit ``false`` in ``node.json`` disables sending — any other
+    value (including a corrupt one) keeps the default on.
+    """
+    return load_node_settings(data_dir).get("send_read_receipts", True) is not False
+
+
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
     path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
     with _node_file_lock(path):
         # Preserve settings written since init (e.g. the file-acceptance
-        # policy): re-running `tau init` must not silently reset them.
+        # policy and the read-receipt opt-out): re-running `tau init`
+        # must not silently reset them.
         raw = read_json(path, default=None)
         metadata = dict(raw) if isinstance(raw, dict) else {}
         metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
