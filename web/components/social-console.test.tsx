@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { shortHash } from "@/lib/format";
@@ -318,5 +318,31 @@ describe("SocialConsole muted sidebar", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "mute" }));
     expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
+  });
+
+  it("keeps text typed while a keyword mute is in flight", async () => {
+    let resolveMute!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      resolveMute = resolve;
+    });
+    const tan = setTan({ muteKeyword: vi.fn(() => pending) });
+    render(<SocialConsole />);
+
+    const input = screen.getByPlaceholderText("mute a word or phrase");
+    fireEvent.change(input, { target: { value: "bitcoin" } });
+    fireEvent.click(screen.getByRole("button", { name: "mute" }));
+    expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
+
+    // Typing continues while the request is in flight; the clear after
+    // success must only drop the text that was actually muted.
+    fireEvent.change(input, { target: { value: "bitcoin ethereum" } });
+    await act(async () => {
+      resolveMute({ ok: true });
+    });
+
+    expect(
+      (screen.getByPlaceholderText("mute a word or phrase") as HTMLInputElement)
+        .value,
+    ).toBe("bitcoin ethereum");
   });
 });

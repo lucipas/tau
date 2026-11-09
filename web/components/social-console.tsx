@@ -120,10 +120,13 @@ export function SocialConsole() {
 
   async function submitMuteKeyword() {
     if (!keyword.trim()) return;
+    // Capture the submitted text: typing during the request must not be
+    // wiped by the clear below, only the text that was actually muted.
+    const submitted = keyword;
     setError(null);
     try {
-      await tan.muteKeyword(keyword.trim());
-      setKeyword("");
+      await tan.muteKeyword(submitted.trim());
+      setKeyword((current) => (current === submitted ? "" : current));
     } catch (caught) {
       setError(
         caught instanceof Error ? caught.message : "could not mute keyword",
@@ -687,17 +690,6 @@ export function PostCard({
                   title="Delete this post"
                   className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-rose-400/40 hover:text-rose-300"
                 >
-                  delete
-                </button>
-              )
-            ) : null}
-          </div>
-        </div>
-      </div>
-    </article>
-  );
-}
-      >
                   delete
                 </button>
               )
