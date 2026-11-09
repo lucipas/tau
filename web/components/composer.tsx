@@ -229,6 +229,7 @@ export function Composer({
                 const picked = event.target.files?.[0] ?? null;
                 if (picked && picked.size > MAX_FILE_BYTES) {
                   setError("File is larger than 10 MiB.");
+                  setFile(null);
                   event.target.value = "";
                   return;
                 }
