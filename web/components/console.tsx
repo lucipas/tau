@@ -6,6 +6,7 @@ import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
+import { AllowlistSection } from "./allowlist-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
 import { OutboxSection } from "./outbox-section";
@@ -99,18 +100,26 @@ export function Console() {
         ) : null}
 
         <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
-          <PeerSidebar
-            node={tau.node}
-            peers={tau.peers}
-            bridge={tau.bridge}
-            pings={tau.pings}
-            unread={tau.unread.per_peer}
-            selected={target}
-            onPing={(destination) => {
-              void tau.ping(destination);
-            }}
-            onSelectPeer={selectPeer}
-          />
+          <div className="flex min-w-0 flex-col gap-4">
+            <PeerSidebar
+              node={tau.node}
+              peers={tau.peers}
+              bridge={tau.bridge}
+              pings={tau.pings}
+              unread={tau.unread.per_peer}
+              selected={target}
+              onPing={(destination) => {
+                void tau.ping(destination);
+              }}
+              onSelectPeer={selectPeer}
+            />
+            <AllowlistSection
+              allowlist={tau.allowlist}
+              onAdd={(value) => tau.addAllowlistPeer(value)}
+              onRemove={(value) => tau.removeAllowlistPeer(value)}
+              onToggle={(enabled) => tau.setAllowlistEnabled(enabled)}
+            />
+          </div>
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed

@@ -139,6 +139,10 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
+| `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
+| `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |
+| `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
+| `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/following` | GET | followed authors and their post counts |
@@ -716,7 +720,8 @@ when it restarts.
 Direct messages are open by default, like Tan posts. The owner can
 restrict them to known senders with an allow-list, stored as
 `allowlist.json` in the data directory (mode `0600`) and managed via
-the CLI:
+the CLI or the web console's allow-list section (console changes apply
+to the running node immediately; CLI changes apply when it restarts):
 
 ```bash
 tau allowlist list             # show whether the list is enforced and who is on it

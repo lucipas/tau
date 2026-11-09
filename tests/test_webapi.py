@@ -8,9 +8,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
+from tau.allowlist import AllowList, save_allowlist
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
@@ -28,9 +30,38 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
+        if isinstance(destination_hash, str):
+            try:
+                destination_hash = bytes.fromhex(destination_hash.strip())
+            except ValueError:
+                return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
+        return None
+
+    def resolve(self, target):
+        # The real registry's resolution, trimmed to this fixture's
+        # single peer: exact hash, exact name, or a unique hash prefix.
+        if not isinstance(target, str):
+            return None
+        value = target.strip()
+        if not value:
+            return None
+        if len(value) == 32:
+            try:
+                return self.get(bytes.fromhex(value))
+            except ValueError:
+                return None
+        by_name = [p for p in self._peers if p.name.casefold() == value.casefold()]
+        if len(by_name) == 1:
+            return by_name[0]
+        if len(value) >= 4:
+            by_prefix = [
+                p for p in self._peers if p.hexhash.startswith(value.casefold())
+            ]
+            if len(by_prefix) == 1:
+                return by_prefix[0]
         return None
 
 
@@ -39,6 +70,12 @@ class FakeNode:
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
+        self._allowlist = AllowList()
+        self.allowlist_path = (
+            Path(mailbox_path).with_name("allowlist.json")
+            if mailbox_path is not None
+            else None
+        )
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -53,6 +90,16 @@ class FakeNode:
         )
         self.sent = []
         self.announced = 0
+
+    @property
+    def allowlist(self):
+        return self._allowlist
+
+    def set_allowlist(self, allowlist):
+        # Mirrors TauNode.set_allowlist: the running node's in-memory
+        # list and the file change together.
+        self._allowlist = allowlist
+        save_allowlist(self.allowlist_path, allowlist)
 
     def info(self):
         return {
@@ -847,6 +894,118 @@ def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
     assert payload["cancelled"]["id"] == entry.id
     # A fresh view of the file agrees the entry is gone.
     assert Mailbox(tmp_path / "mailbox.json").get_outbox(entry.id) is None
+
+
+def test_allowlist_get_empty(bridge):
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_name_and_remove(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    # The entry survives a fresh GET, with its registry name attached.
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/remove", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_raw_hash_has_no_name(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": OTHER_HASH}
+    )
+    assert status == 200
+    assert payload["entries"] == [{"destination": OTHER_HASH, "name": ""}]
+
+
+def test_allowlist_add_by_prefix(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "abab"}
+    )
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+
+def test_allowlist_set_enabled_applies_immediately(bridge, node, tmp_path):
+    _json(bridge, "/api/allowlist/add", method="POST", body={"target": "alice"})
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    assert payload["enabled"] is True
+    assert [entry["destination"] for entry in payload["entries"]] == [PEER_HASH]
+
+    # The running node's in-memory gate changed too — no restart needed.
+    assert node.allowlist.is_allowed(PEER_HASH) is True
+    assert node.allowlist.is_allowed(OTHER_HASH) is False
+    # And the file agrees, so a restart keeps the same state.
+    from tau.allowlist import load_allowlist
+
+    saved = load_allowlist(tmp_path / "allowlist.json")
+    assert saved.enabled is True
+    assert saved.allow == frozenset({PEER_HASH})
+
+
+def test_allowlist_errors(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "  "}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "nobody"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/remove",
+        method="POST",
+        body={"target": "nobody"},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": "yes"},
+    )
+    assert status == 400
+    assert "boolean" in payload["error"]["message"]
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
+  AllowlistResponse,
   BridgeInfo,
   CancelOutboxResponse,
   MarkReadResponse,
@@ -50,6 +51,7 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
@@ -210,6 +212,59 @@ export function useTau() {
     };
   }, [connection, refreshOutbox]);
 
+  const refreshAllowlist = useCallback(async () => {
+    const result = await apiGet<AllowlistResponse>("/api/allowlist");
+    setAllowlist(result);
+  }, []);
+
+  // The allow-list only changes through this console or the CLI, and
+  // CLI changes do not apply to the running node until it restarts —
+  // so a load on connect plus a refresh after each action is enough;
+  // no polling interval like the outbox needs.
+  useEffect(() => {
+    if (connection !== "live") return;
+    let disposed = false;
+    async function load() {
+      try {
+        await refreshAllowlist();
+      } catch {
+        if (disposed) return;
+      }
+    }
+    void load();
+    return () => {
+      disposed = true;
+    };
+  }, [connection, refreshAllowlist]);
+
+  const addAllowlistPeer = useCallback(
+    async (target: string) => {
+      const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
+        target,
+      });
+      setAllowlist(result);
+      return result;
+    },
+    [],
+  );
+
+  const removeAllowlistPeer = useCallback(async (target: string) => {
+    const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
+      target,
+    });
+    setAllowlist(result);
+    return result;
+  }, []);
+
+  const setAllowlistEnabled = useCallback(async (enabled: boolean) => {
+    const result = await apiPost<AllowlistResponse>(
+      "/api/allowlist/set-enabled",
+      { enabled },
+    );
+    setAllowlist(result);
+    return result;
+  }, []);
+
   const cancelOutbox = useCallback(
     async (id: string) => {
       const result = await apiPost<CancelOutboxResponse>(
@@ -313,6 +368,7 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    allowlist,
     bridge,
     connection,
     pings,
@@ -323,5 +379,9 @@ export function useTau() {
     markRead,
     refreshOutbox,
     cancelOutbox,
+    refreshAllowlist,
+    addAllowlistPeer,
+    removeAllowlistPeer,
+    setAllowlistEnabled,
   };
 }

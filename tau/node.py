@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 import RNS
 
 from . import __version__
-from .allowlist import AllowList, load_allowlist_or_deny_all
+from .allowlist import AllowList, load_allowlist_or_deny_all, save_allowlist
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -411,6 +411,17 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    def set_allowlist(self, allowlist: AllowList) -> None:
+        """Replace the DM allow-list, in memory and on disk.
+
+        The web console uses this so an owner changing the list from
+        the console sees it enforced immediately: unlike the CLI,
+        whose saved changes only apply when the node restarts, the
+        console *is* the running node.
+        """
+        self._allowlist = allowlist
+        save_allowlist(self.config.allowlist_path, allowlist)
 
     @property
     def read_receipts_enabled(self) -> bool:

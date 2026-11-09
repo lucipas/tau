@@ -12,6 +12,10 @@ script) can read what arrives from the mesh and send messages back:
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    GET  /api/allowlist    DM allow-list: whether enforced, and who is on it
+    POST /api/allowlist/add add ``{"target": "<name, hash or prefix>"}``
+    POST /api/allowlist/remove remove ``{"target": "<name, hash or prefix>"}``
+    POST /api/allowlist/set-enabled turn enforcement ``{"enabled": true}`` on/off
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -49,6 +53,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .allowlist import AllowListError, clean_destination
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
@@ -1324,6 +1329,58 @@ class WebBridge:
             else None,
         }
 
+    def allowlist(self) -> Dict[str, Any]:
+        """The DM allow-list: whether it is enforced, and who is on it."""
+        current = self.node.allowlist
+        entries = []
+        for destination in sorted(current.allow):
+            peer = self.node.registry.get(destination)
+            entries.append(
+                {
+                    "destination": destination,
+                    "name": peer.display_name if peer is not None else "",
+                }
+            )
+        return {"enabled": current.enabled, "entries": entries}
+
+    def _resolve_allowlist_target(self, target: Any) -> str:
+        """Resolve a console allow-list target to a destination hash.
+
+        Mirrors the CLI's resolution: a registry name, hash or prefix
+        first, else a raw 32-hex destination hash.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise AllowListError("peer is required")
+        value = target.strip()
+        peer = self.node.registry.resolve(value)
+        if peer is not None:
+            return peer.hexhash
+        try:
+            return clean_destination(value)
+        except AllowListError:
+            raise AllowListError(
+                f"unknown peer or destination: {value!r}"
+            ) from None
+
+    def allowlist_add(self, target: Any) -> Dict[str, Any]:
+        """Allow DMs from *target* and return the updated list."""
+        destination = self._resolve_allowlist_target(target)
+        self.node.set_allowlist(self.node.allowlist.with_added(destination))
+        return self.allowlist()
+
+    def allowlist_remove(self, target: Any) -> Dict[str, Any]:
+        """Stop allowing DMs from *target* and return the updated list."""
+        destination = self._resolve_allowlist_target(target)
+        self.node.set_allowlist(self.node.allowlist.with_removed(destination))
+        return self.allowlist()
+
+    def allowlist_set_enabled(self, enabled: Any) -> Dict[str, Any]:
+        """Turn allow-list enforcement on or off; return the updated list."""
+        if not isinstance(enabled, bool):
+            raise AllowListError("field 'enabled' must be a boolean")
+        self.node.set_allowlist(self.node.allowlist.with_enabled(enabled))
+        return self.allowlist()
+
     def announce(self) -> None:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
@@ -1726,6 +1783,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
                 return
+            if path == "/api/allowlist":
+                self._send_json(self.bridge.allowlist(), head_only)
+                return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
                 include_all = _query_flag(query, "all")
@@ -1782,6 +1842,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
+                return
+            if path in (
+                "/api/allowlist/add",
+                "/api/allowlist/remove",
+                "/api/allowlist/set-enabled",
+            ):
+                self._handle_allowlist(body, head_only, path.rsplit("/", 1)[1])
                 return
             if path == "/api/announce":
                 self.bridge.announce()
@@ -2035,6 +2102,30 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_allowlist(
+        self, body: Dict[str, Any], head_only: bool, action: str
+    ) -> None:
+        try:
+            if action == "set-enabled":
+                result = self.bridge.allowlist_set_enabled(body.get("enabled"))
+            else:
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if action == "add":
+                    result = self.bridge.allowlist_add(target)
+                else:
+                    result = self.bridge.allowlist_remove(target)
+        except (AllowListError, PeerError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
 
