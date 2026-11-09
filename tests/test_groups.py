@@ -696,8 +696,8 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     )
     calls = []
 
-    def fake_request(peer, path, payload, timeout):
-        calls.append((peer.hexhash, path, payload))
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
         return {"ok": True}
 
     def fake_resolve(target, timeout=10.0):
@@ -715,6 +715,9 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert by_to[THIRD_HASH]["queued"] is True
     assert len(calls) == 1
     assert calls[0][1] == "/tau/group"
+    # The shared fan-out deadline rides along, so one slow leg cannot
+    # consume the whole budget stage by stage.
+    assert calls[0][3] is not None
     parsed = parse_group_message(calls[0][2])
     assert parsed["text"] == "hello all"
     assert parsed["group"] == group["id"]
@@ -755,7 +758,7 @@ def test_send_group_message_skips_self_and_records_refusal(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def fake_request(peer, path, payload, timeout):
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
         from tau.node import NotAllowedError
 
         raise NotAllowedError("not allowed")
@@ -785,7 +788,7 @@ def test_send_group_message_treats_not_a_member_as_final(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def fake_request(peer, path, payload, timeout):
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
         raise NotAMemberError("peer rejected the request: not a member")
 
     node._request = fake_request  # type: ignore[method-assign]
@@ -809,7 +812,7 @@ def test_send_group_message_keeps_results_when_outbox_full(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def unreachable(peer, path, payload, timeout):
+    def unreachable(peer, path, payload, timeout, *, deadline=None):
         raise NodeError("unreachable")
 
     node._request = unreachable  # type: ignore[method-assign]
@@ -851,7 +854,7 @@ def test_send_group_message_queues_legs_past_the_deadline(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def no_request(peer, path, payload, timeout):
+    def no_request(peer, path, payload, timeout, *, deadline=None):
         raise AssertionError("leg attempted past the deadline")
 
     node._request = no_request  # type: ignore[method-assign]
@@ -877,7 +880,7 @@ def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     members = [OWN_HASH] + [f"{i:032x}" for i in range(1, 32)]
     group = node.groups.create("big", members, created_by=OWN_HASH)
     calls = []
-    node._request = lambda peer, path, payload, timeout: calls.append(peer)  # type: ignore[method-assign]
+    node._request = lambda peer, path, payload, timeout, **kwargs: calls.append(peer)  # type: ignore[method-assign]
     node.resolve_peer = lambda target, timeout=10.0: _stub_peer(  # type: ignore[method-assign]
         target, "peer"
     )

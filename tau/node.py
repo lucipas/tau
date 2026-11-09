@@ -3098,11 +3098,17 @@ class TauNode:
                     to=bytes.fromhex(member),
                     text=normalized,
                 )
+                # Pass the shared deadline through: without it, path
+                # discovery, link establishment and the response could
+                # each consume the remaining budget on a slow link, and
+                # one leg could take close to a minute against a
+                # 20-second fan-out.
                 response = self._request(
                     peer,
                     REQUEST_GROUP_MESSAGE,
                     payload,
                     _remaining(deadline) or 0.0,
+                    deadline=deadline,
                 )
                 self.mailbox.record_delivered(message_id)
                 results.append(
