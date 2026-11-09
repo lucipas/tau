@@ -315,8 +315,10 @@ class GroupStore:
         matches nothing, so callers can report it plainly.
         """
         query = query.strip()
-        with self._lock:
-            groups = list(self._groups.values())
+        # Reload from disk first, so a group created by another process
+        # (for example `tau group create` while `tau serve` runs) resolves.
+        with self._transaction():
+            groups = [dict(group) for group in self._groups.values()]
         if len(query) == 32:
             group = self.get(query)
             if group is None:

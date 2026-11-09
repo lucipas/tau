@@ -468,6 +468,28 @@ def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     assert listed["count"] == 0
 
 
+def test_api_groups_delete_sees_group_created_by_another_store(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    path = tmp_path / "groups.json"
+    node.groups = GroupStore(path)
+    # A separate process (e.g. `tau group create`) writes the group.
+    other = GroupStore(path)
+    created = other.create(
+        "weekend", [PEER_HASH, node.destination_hexhash], created_by=node.destination_hexhash
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/delete",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    assert status == 200
+    assert payload["deleted"] == {"id": created["id"], "name": "weekend"}
+
+
 def test_api_groups_delete_unknown_group_is_400(bridge, node, tmp_path):
     from tau.groups import GroupStore
 

@@ -1413,6 +1413,14 @@ class WebBridge:
                 raise ValueError("field 'members' must contain peer hashes")
             cleaned.append(member.strip().lower())
         own_hash = self.node.destination_hexhash
+        for member in cleaned:
+            if member == own_hash:
+                continue
+            # Only known peers can receive a group leg; an unknown hash
+            # would leave a delivery that can never be sent.
+            peer = self.node.registry.get(member)
+            if peer is None or peer.destination_hash.hex() != member:
+                raise ValueError(f"unknown peer: {member}")
         if own_hash not in cleaned:
             cleaned.append(own_hash)
         if len(cleaned) < 2:
