@@ -1500,6 +1500,12 @@ class WebBridge:
             raise ValueError("sender must be a destination hash")
         if not isinstance(name, str) or sanitize_file_name(name) != name:
             raise ValueError("file name is not usable")
+        # Blocked senders' files stay hidden, matching messages(); the
+        # blocklist's is_blocked is fail-closed, so an unreadable list
+        # hides the file too.
+        blocklist = getattr(self.node, "blocklist", None)
+        if blocklist is not None and blocklist.is_blocked(sender):
+            return None
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             return None
@@ -1519,15 +1525,12 @@ class WebBridge:
         try:
             resolved = Path(path).resolve()
             base = Path(files_dir).resolve()
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
+            # RuntimeError: symlink loops on supported Python versions.
             return None
         if resolved.parent != base / sender or resolved.name != name:
             return None
         if not resolved.is_file():
-            return None
-        try:
-            data = resolved.read_bytes()
-        except OSError:
             return None
         size = record.get("size")
         if (
@@ -1535,11 +1538,19 @@ class WebBridge:
             or isinstance(size, bool)
             or size < 1
             or size > MAX_FILE_BYTES
-            or len(data) != size
         ):
             return None
         sha256 = record.get("sha256")
         if not isinstance(sha256, str):
+            return None
+        try:
+            # Read at most one byte past the recorded size so a file
+            # replaced by something much larger is never loaded whole.
+            with resolved.open("rb") as handle:
+                data = handle.read(size + 1)
+        except OSError:
+            return None
+        if len(data) != size:
             return None
         if hashlib.sha256(data).hexdigest() != sha256.lower():
             return None
