@@ -1263,6 +1263,9 @@ class WebBridge:
         # change delivery.
         text = normalize_message(text)
 
+        # Reload the persisted store first: a group created or deleted by
+        # another process (``tau group``) must be seen by this send.
+        self.node.groups.list_groups()
         group_record = self.node.groups.find(group.strip())
         response = self.node.send_group_message(
             group_record, text, timeout=timeout
