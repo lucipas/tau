@@ -766,11 +766,15 @@ def test_peers_block_corrupt_list_refuses(tmp_path):
         )
         assert status == 503
         assert "unusable" in payload["error"]["message"]
-        # Nothing was persisted over the corrupt file.
+        # Nothing was persisted over the corrupt file, and the running
+        # node fails closed until the owner repairs it.
         assert (tmp_path / "blocklist.json").read_text() == "{not json"
+        assert node.blocklist is not None
+        assert node.blocklist.block_all
 
-        # A node already running fail-closed (block-all) refuses edits
-        # too: persisting one entry would silently unblock everyone else.
+        # A node still fail-closed in memory accepts edits again once the
+        # owner repairs the file — and the repair clears the cached
+        # block-all, so enforcement matches the file.
         node.blocklist = BlockList(block_all=True)
         (tmp_path / "blocklist.json").write_text(
             '{"blocked": []}', encoding="utf-8"
@@ -778,11 +782,41 @@ def test_peers_block_corrupt_list_refuses(tmp_path):
         status, _, payload = _json(
             bridge, "/api/peers/block", method="POST", body={"target": "alice"}
         )
-        assert status == 503
-        assert "unusable" in payload["error"]["message"]
+        assert status == 200
+        assert payload["block"]["blocked"] is True
+        assert node.blocklist is not None
+        assert not node.blocklist.block_all
+        assert node.blocklist.is_blocked(PEER_HASH)
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_keeps_cli_edits(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # The CLI blocked someone else while this node was running; the
+    # node's cached list predates that edit.
+    (tmp_path / "blocklist.json").write_text(
+        json.dumps({"blocked": [OTHER_HASH]}), encoding="utf-8"
+    )
+    node.blocklist = BlockList()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        # The CLI's entry survives: the edit is derived from the file,
+        # not from the stale cache.
         assert json.loads((tmp_path / "blocklist.json").read_text()) == {
-            "blocked": []
+            "blocked": sorted([OTHER_HASH, PEER_HASH])
         }
+        assert node.blocklist is not None
+        assert node.blocklist.is_blocked(OTHER_HASH)
+        assert node.blocklist.is_blocked(PEER_HASH)
     finally:
         bridge.stop()
 

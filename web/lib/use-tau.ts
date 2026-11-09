@@ -144,6 +144,23 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      // Ordering for block/unblock replies: a peer event that arrives
+      // after a block request was sent is newer than the reply, so the
+      // reply must not overwrite the flag it already delivered.
+      peerEventSeq.current += 1;
+      peerRevision.current.set(peer.destination, peerEventSeq.current);
+      // A blocked sender's inbound history is hidden by the server's
+      // message snapshots; drop it from the live feed too, so a block
+      // from any console takes effect at once. History stays stored
+      // and comes back with the next snapshot after an unblock.
+      if (peer.blocked) {
+        setMessages((previous) =>
+          previous.filter(
+            (entry) =>
+              !(entry.direction === "in" && entry.peer === peer.destination),
+          ),
+        );
+      }
       setPeers((previous) => {
         const next = previous.filter(
           (entry) => entry.destination !== peer.destination,
@@ -337,6 +354,16 @@ export function useTau() {
                 : entry,
             ),
           );
+          if (result.block.blocked) {
+            // Same reconciliation as the peer-event path, for the
+            // acting console before the event arrives.
+            setMessages((previous) =>
+              previous.filter(
+                (entry) =>
+                  !(entry.direction === "in" && entry.peer === destination),
+              ),
+            );
+          }
         }
         setBlocks((previous) => ({
           ...previous,
