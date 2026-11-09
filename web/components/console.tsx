@@ -122,6 +122,7 @@ export function Console() {
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
               searchError={tau.searchError}
+              quoteContext={tau.messages}
               onSearch={tau.search}
               onClearSearch={tau.clearSearch}
               onReply={(message) => {

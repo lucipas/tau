@@ -22,6 +22,7 @@ export function MessageFeed({
   searchError,
   onSearch,
   onClearSearch,
+  quoteContext,
 }: {
   messages: TauMessage[];
   node: NodeInfo | null;
@@ -32,6 +33,9 @@ export function MessageFeed({
   searchError?: string | null;
   onSearch?: (query: string) => Promise<unknown> | unknown;
   onClearSearch?: () => void;
+  // History used to resolve reply quotes; defaults to `messages`. Search
+  // passes the live traffic here so originals outside the hits still resolve.
+  quoteContext?: TauMessage[];
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -54,6 +58,13 @@ export function MessageFeed({
     if (searching || !stickToBottom.current) return;
     endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [messages.length, searching]);
+
+  useEffect(() => {
+    // Show newest-first search hits from the top, not wherever a scrolled
+    // live feed left the container.
+    if (!searching || !scrollRef.current) return;
+    scrollRef.current.scrollTop = 0;
+  }, [searching, messages]);
 
   function onScroll() {
     const element = scrollRef.current;
@@ -155,7 +166,7 @@ export function MessageFeed({
             <MessageBubble
               key={message.id}
               message={message}
-              messages={messages}
+              messages={quoteContext ?? messages}
               onReply={onReply}
             />
           ))
@@ -370,6 +381,16 @@ function MessageBubble({
               title="Reply to this message"
               onClick={() => onReply(message)}
               className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+            >
+              ↩ reply
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </article>
+  );
+}
+hover:bg-void/60 hover:text-zinc-200"
             >
               ↩ reply
             </button>
