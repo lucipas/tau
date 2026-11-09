@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Union
 
 AUTHOR_HEX_LENGTH = 32
-ENTRY_KINDS = ("post", "like", "unlike", "delete", "reply", "edit")
+ENTRY_KINDS = ("post", "like", "unlike", "delete", "reply", "edit", "quote")
 
 
 class RulesError(ValueError):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -13,7 +14,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
 from .allowlist import (
@@ -22,7 +23,27 @@ from .allowlist import (
     load_allowlist,
     save_allowlist,
 )
-from .config import TauConfig, write_node_metadata, write_rns_config
+from .blocklist import (
+    BlockListError,
+    load_blocked_set,
+    load_blocklist,
+    save_blocklist,
+)
+from .bundle import (
+    DEFAULT_MAX_BUNDLE_BYTES,
+    apply_bundle,
+    build_bundle,
+    parse_bundle,
+    serialize_bundle,
+)
+from .config import (
+    TauConfig,
+    accept_files_enabled,
+    send_read_receipts_enabled,
+    set_node_setting,
+    write_node_metadata,
+    write_rns_config,
+)
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -31,6 +52,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
+from .groups import GroupStore
 from .inbox import Inbox
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
@@ -41,34 +63,56 @@ from .node import (
     TauNode,
     check_tcp_listen_ports,
 )
-from .peers import Peer, PeerError, PeerRegistry
+from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
-from .protocol import PROTOCOL_VERSION, ProtocolError, short_hash
-from .util import atomic_write_text
+from .protocol import (
+    MAX_MAIL_TTL,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    clean_in_reply_to,
+    clean_reaction,
+    excerpt_hash,
+    short_hash,
+)
+from .util import atomic_write_bytes, atomic_write_text
 from .tangents.rules import RulesError, Ruleset, load_ruleset, save_ruleset
 from .tangents.tan import (
     DEFAULT_FEED_LIMIT,
     MAX_GOSSIP_TTL,
     TanApp,
     TanError,
+    _author_from_identity,
+    annotate_quote_counts,
+    annotate_quotes,
     annotate_reactions,
     annotate_replies,
     apply_display_rules,
     author_stats,
+    author_timeline,
     export_entries,
-    feed,
     follow,
     following,
     import_entries,
     init_db,
+    mentions,
+    mute,
+    mute_keyword,
+    muted,
+    muted_keywords,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
+    resolve_muted_name,
     resolve_post,
+    save_post,
+    saved_posts,
     search_posts,
     thread,
     timeline,
     unfollow,
+    unmute,
+    unmute_keyword,
+    unsave_post,
 )
 
 log = logging.getLogger(__name__)
@@ -242,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="periodically pull the Tan feed from peers (0 disables)",
     )
+    serve.add_argument(
+        "--lxmf",
+        action="store_true",
+        help=(
+            "also run an LXMF router on this node's identity "
+            "(requires the lxmf extra: pip install \"tau-p2p[lxmf]\")"
+        ),
+    )
     serve.set_defaults(func=cmd_serve)
 
     discover = subparsers.add_parser(
@@ -271,7 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="send a message to a peer",
     )
     send.add_argument(
-        "--to", required=True, metavar="NAME|HASH", help="peer name or destination hash"
+        "--to",
+        action="append",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: send to several peers)",
     )
     send.add_argument(
         "message", nargs="?", help="message text (reads stdin when omitted)"
@@ -290,7 +346,84 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
     )
+    send.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    send.add_argument(
+        "--reply-to",
+        metavar="ID|PREFIX",
+        help="quote an earlier message in this conversation (message id or unique prefix)",
+    )
+    send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receiver's inbox "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
     send.set_defaults(func=cmd_send)
+
+    # `send --file` already means "read the message text from a file",
+    # so file transfer gets its own subcommand instead of overloading it.
+    send_file = subparsers.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a small file to a peer over an RNS Resource",
+    )
+    send_file.add_argument(
+        "--to", required=True, metavar="NAME|HASH", help="peer name or destination hash"
+    )
+    send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long the whole transfer may take (default 300)",
+    )
+    send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    send_file.set_defaults(func=cmd_send_file)
+
+    react = subparsers.add_parser(
+        "react",
+        parents=[common],
+        help="react to a received message",
+    )
+    react.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    react.add_argument(
+        "reaction",
+        nargs="?",
+        help="emoji or short text token, e.g. 👍 or +1 (omit with --clear)",
+    )
+    react.add_argument(
+        "--clear",
+        action="store_true",
+        help="retract your reaction to the message",
+    )
+    react.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    react.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    react.set_defaults(func=cmd_react)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -329,7 +462,44 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME|HASH",
         help="with --exchange, ask only this peer instead of all known peers",
     )
+    peers.add_argument(
+        "--safety-number",
+        action="store_true",
+        help="show each peer's pairwise safety number (compare it with the "
+        "peer over another channel to confirm the key is theirs)",
+    )
     peers.set_defaults(func=cmd_peers)
+    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_verify = peers_sub.add_parser(
+        "verify",
+        parents=[common],
+        help="record that the safety number was compared with a peer "
+        "out of band and matched",
+    )
+    peers_verify.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to mark verified",
+    )
+    peers_verify.set_defaults(func=cmd_peers_verify)
+    peers_forget = peers_sub.add_parser(
+        "forget",
+        parents=[common],
+        help="remove a peer from the local registry (the next genuine "
+        "announce re-adds it; use this to drop a corrupt record)",
+    )
+    peers_forget.add_argument(
+        "target",
+        metavar="NAME|HASH",
+        help="peer to remove",
+    )
+    peers_forget.add_argument(
+        "--force",
+        action="store_true",
+        help="forget even while messages are still queued for the peer "
+        "(they will not be attempted until the peer is rediscovered)",
+    )
+    peers_forget.set_defaults(func=cmd_peers_forget)
 
     identity = subparsers.add_parser(
         "id",
@@ -382,9 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="list messages queued for offline peers (store-and-forward)",
     )
     outbox.set_defaults(func=cmd_outbox)
-    outbox_sub = outbox.add_subparsers(
-        dest="outbox_command", metavar="OUTBOX_COMMAND"
-    )
+    outbox_sub = outbox.add_subparsers(dest="outbox_command", metavar="OUTBOX_COMMAND")
 
     outbox_list = outbox_sub.add_parser(
         "list",
@@ -459,7 +627,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="allow direct messages from a peer (name, hash or prefix)",
     )
-    allowlist_add.add_argument("peer", help="peer name, destination hash or hash prefix")
+    allowlist_add.add_argument(
+        "peer", help="peer name, destination hash or hash prefix"
+    )
     allowlist_add.set_defaults(func=cmd_allowlist)
 
     allowlist_remove = allowlist_sub.add_parser(
@@ -482,6 +652,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     allowlist_off.set_defaults(func=cmd_allowlist)
 
+    config_cmd = subparsers.add_parser(
+        "config",
+        parents=[common],
+        help="show or change this node's own settings",
+    )
+    config_sub = config_cmd.add_subparsers(
+        dest="config_command", metavar="CONFIG_COMMAND"
+    )
+    config_files = config_sub.add_parser(
+        "accept-files",
+        parents=[common],
+        help="turn receiving files on or off (default off)",
+    )
+    config_files.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="whether this node accepts file transfers",
+    )
+    config_files.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    config_receipts = config_sub.add_parser(
+        "read-receipts",
+        parents=[common],
+        help="turn sending read receipts on or off (default on)",
+    )
+    config_receipts.add_argument(
+        "state",
+        choices=["on", "off"],
+        help="whether this node sends read receipts when it reads a DM",
+    )
+    config_receipts.set_defaults(func=cmd_config)
+    config_cmd.set_defaults(func=cmd_config)
+
+    block = subparsers.add_parser(
+        "block",
+        parents=[common],
+        help="silence a peer: drop their DMs and hide their Tan posts",
+    )
+    block.add_argument(
+        "target",
+        nargs="?",
+        help="peer to block (name, hash or prefix); 'list' shows the list, "
+        "'add'/'remove' take the peer as a second word",
+    )
+    block.add_argument(
+        "peer",
+        nargs="?",
+        help="peer for 'add'/'remove'",
+    )
+    block.set_defaults(func=cmd_block)
+
+    unblock = subparsers.add_parser(
+        "unblock",
+        parents=[common],
+        help="unblock a peer (name, hash or prefix)",
+    )
+    unblock.add_argument("peer", help="peer name, destination hash or hash prefix")
+    unblock.set_defaults(func=cmd_block, block_command="remove")
+
+
     messages = subparsers.add_parser(
         "messages",
         parents=[common],
@@ -500,7 +731,103 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="show the newest N messages (default 30)",
     )
+    messages.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="only show messages from this group (id, id prefix or name)",
+    )
+    messages.add_argument(
+        "--sent",
+        action="store_true",
+        help="show messages this node sent, with their read state, instead",
+    )
+    messages.add_argument(
+        "--unread",
+        action="store_true",
+        help="only show messages not yet read",
+    )
+    messages.add_argument(
+        "--count",
+        action="store_true",
+        help="print per-peer unread counts instead of listing messages",
+    )
     messages.set_defaults(func=cmd_messages)
+
+    group = subparsers.add_parser(
+        "group",
+        parents=[common],
+        help="private group DMs with a fixed member list",
+    )
+    group.set_defaults(func=cmd_group_list)
+    group_sub = group.add_subparsers(dest="group_command", metavar="GROUP_COMMAND")
+
+    group_create = group_sub.add_parser(
+        "create",
+        parents=[common],
+        help="create a group with a fixed member list",
+    )
+    group_create.add_argument("name", help="group name")
+    group_create.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a member peer (repeatable; the creator is always a member)",
+    )
+    group_create.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_create.set_defaults(func=cmd_group_create)
+
+    group_list = group_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list known groups",
+    )
+    group_list.set_defaults(func=cmd_group_list)
+
+    group_delete = group_sub.add_parser(
+        "delete",
+        parents=[common],
+        help="delete a group (frees capacity when a group cap is reached)",
+    )
+    group_delete.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_delete.set_defaults(func=cmd_group_delete)
+
+    group_send = group_sub.add_parser(
+        "send",
+        parents=[common],
+        help="send a message to every member of a group",
+    )
+    group_send.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_send.add_argument(
+        "message", nargs="?", help="message text (reads stdin when omitted)"
+    )
+    group_send.add_argument("--file", type=Path, help="read the message from a file")
+    group_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    group_send.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_send.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when a member is offline",
+    )
+    group_send.set_defaults(func=cmd_group_send)
 
     tan = subparsers.add_parser(
         "tan",
@@ -515,7 +842,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="sign and store a post, then publish it to known peers",
     )
-    tan_post.add_argument("text", nargs="?", help="post text (reads stdin when omitted)")
+    tan_post.add_argument(
+        "text", nargs="?", help="post text (reads stdin when omitted)"
+    )
     tan_post.add_argument("--file", type=Path, help="read the post text from a file")
     tan_post.add_argument(
         "--reply-to",
@@ -538,6 +867,34 @@ def build_parser() -> argparse.ArgumentParser:
     tan_post.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
     tan_post.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_post.set_defaults(func=cmd_tan_post)
+
+    tan_quote = tan_sub.add_parser(
+        "quote",
+        parents=[common],
+        help="quote a post with your own comment (writes a signed quote entry to your chain)",
+    )
+    tan_quote.add_argument(
+        "target", metavar="POST", help="post hash or unique hash prefix"
+    )
+    tan_quote.add_argument(
+        "text", nargs="?", help="quote comment (reads stdin when omitted)"
+    )
+    tan_quote.add_argument("--file", type=Path, help="read the comment from a file")
+    tan_quote.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_quote.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_quote.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_quote.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+    tan_quote.set_defaults(func=cmd_tan_quote)
 
     for verb, help_text in (
         ("like", "like a post (writes a signed like entry to your chain)"),
@@ -562,12 +919,8 @@ def build_parser() -> argparse.ArgumentParser:
         tan_react.add_argument(
             "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
         )
-        tan_react.add_argument(
-            "--timeout", type=float, default=15.0, metavar="SECONDS"
-        )
-        tan_react.set_defaults(
-            func=cmd_tan_like if verb == "like" else cmd_tan_unlike
-        )
+        tan_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
+        tan_react.set_defaults(func=cmd_tan_like if verb == "like" else cmd_tan_unlike)
 
     tan_delete = tan_sub.add_parser(
         "delete",
@@ -589,12 +942,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="store locally without contacting peers",
     )
-    tan_delete.add_argument(
-        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
-    )
-    tan_delete.add_argument(
-        "--timeout", type=float, default=15.0, metavar="SECONDS"
-    )
+    tan_delete.add_argument("--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS")
+    tan_delete.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     tan_delete.set_defaults(func=cmd_tan_delete)
 
     tan_edit = tan_sub.add_parser(
@@ -655,13 +1004,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_search.set_defaults(func=cmd_tan_search)
 
+    tan_mentions = tan_sub.add_parser(
+        "mentions",
+        parents=[common],
+        help="show replies to your own posts",
+    )
+    tan_mentions.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_mentions.set_defaults(func=cmd_tan_mentions)
+
     tan_thread = tan_sub.add_parser(
         "thread",
         parents=[common],
         help="show a post with its replies as a nested thread",
     )
     tan_thread.add_argument(
-        "ref", metavar="HASH|PREFIX", help="post or reply hash (full hash or unique prefix)"
+        "ref",
+        metavar="HASH|PREFIX",
+        help="post or reply hash (full hash or unique prefix)",
     )
     tan_thread.set_defaults(func=cmd_tan_thread)
 
@@ -681,6 +1046,76 @@ def build_parser() -> argparse.ArgumentParser:
         "following", parents=[common], help="list followed authors"
     )
     tan_following.set_defaults(func=cmd_tan_following)
+
+    tan_mute = tan_sub.add_parser(
+        "mute", parents=[common], help="hide an author's posts from local views"
+    )
+    tan_mute.add_argument("target", metavar="NAME|HASH")
+    tan_mute.set_defaults(func=cmd_tan_mute)
+
+    tan_unmute = tan_sub.add_parser(
+        "unmute", parents=[common], help="show a muted author's posts again"
+    )
+    tan_unmute.add_argument("target", metavar="NAME|HASH")
+    tan_unmute.set_defaults(func=cmd_tan_unmute)
+
+    tan_muted = tan_sub.add_parser("muted", parents=[common], help="list muted authors")
+    tan_muted.set_defaults(func=cmd_tan_muted)
+
+    tan_mute_keyword = tan_sub.add_parser(
+        "mute-keyword",
+        parents=[common],
+        help="hide posts containing a word or phrase from local views",
+    )
+    tan_mute_keyword.add_argument(
+        "keyword", metavar="WORD|PHRASE", help="word or phrase to mute"
+    )
+    tan_mute_keyword.set_defaults(func=cmd_tan_mute_keyword)
+
+    tan_unmute_keyword = tan_sub.add_parser(
+        "unmute-keyword",
+        parents=[common],
+        help="stop hiding posts containing a word or phrase",
+    )
+    tan_unmute_keyword.add_argument(
+        "keyword", metavar="WORD|PHRASE", help="word or phrase to unmute"
+    )
+    tan_unmute_keyword.set_defaults(func=cmd_tan_unmute_keyword)
+
+    tan_muted_keywords = tan_sub.add_parser(
+        "muted-keywords",
+        parents=[common],
+        help="list muted keywords",
+    )
+    tan_muted_keywords.set_defaults(func=cmd_tan_muted_keywords)
+
+    tan_save = tan_sub.add_parser(
+        "save", parents=[common], help="save a post to read later"
+    )
+    tan_save.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_save.set_defaults(func=cmd_tan_save)
+
+    tan_unsave = tan_sub.add_parser(
+        "unsave", parents=[common], help="remove a post from your saved list"
+    )
+    tan_unsave.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_unsave.set_defaults(func=cmd_tan_unsave)
+
+    tan_saved = tan_sub.add_parser(
+        "saved", parents=[common], help="list your saved posts"
+    )
+    tan_saved.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_saved.set_defaults(func=cmd_tan_saved)
 
     tan_sync = tan_sub.add_parser(
         "sync",
@@ -805,7 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_rules.add_argument(
         "--kinds",
         default=None,
-        metavar="post,like,unlike,delete",
+        metavar="post,like,unlike,delete,reply,quote",
         help="comma-separated entry kinds to display (display-only: "
         "every kind is still stored, so chains stay complete)",
     )
@@ -815,6 +1250,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="display every entry kind (clears --kinds)",
     )
     tan_rules.set_defaults(func=cmd_tan_rules)
+
+    bundle = subparsers.add_parser(
+        "bundle",
+        parents=[common],
+        help="carry mail and Tan posts on a file (sneakernet)",
+    )
+    bundle_sub = bundle.add_subparsers(
+        dest="bundle_command", metavar="BUNDLE_COMMAND"
+    )
+    bundle_sub.required = True
+
+    bundle_export = bundle_sub.add_parser(
+        "export",
+        parents=[common],
+        help="write sealed mail (and optionally Tan posts) to a signed bundle file",
+    )
+    bundle_export.add_argument(
+        "file", metavar="FILE", type=Path, help="bundle file to write"
+    )
+    bundle_export.add_argument(
+        "--tan",
+        action="store_true",
+        help="also include Tan posts from every stored author",
+    )
+    bundle_export.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to write a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_export.set_defaults(func=cmd_bundle_export)
+
+    bundle_import = bundle_sub.add_parser(
+        "import",
+        parents=[common],
+        help="merge a bundle file into this node's mailbox and Tan store",
+    )
+    bundle_import.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='bundle file to read ("-" reads stdin)',
+    )
+    bundle_import.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to read a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_import.set_defaults(func=cmd_bundle_import)
 
     return parser
 
@@ -917,19 +1404,57 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> None:
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _parse_duration(value: str) -> float:
+    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+
+    A bare number means seconds.  Returns the duration in seconds;
+    raises ``ValueError`` for anything unparseable, non-positive, or
+    longer than the mail TTL (a disappearing message cannot outlive
+    the store-and-forward envelope that might carry it).
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+    unit = 1.0
+    if text[-1] in _DURATION_UNITS:
+        unit = float(_DURATION_UNITS[text[-1]])
+        text = text[:-1]
+    try:
+        amount = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+        ) from exc
+    seconds = amount * unit
+    if not seconds > 0:
+        raise ValueError("--expire duration must be positive")
+    if seconds > MAX_MAIL_TTL:
+        raise ValueError("--expire duration must be at most 30d")
+    return seconds
+
+def _print_peer_table(
+    peers: Iterable[Peer],
+    *,
+    now: Optional[float] = None,
+    safety_numbers: Optional[Dict[str, str]] = None,
+) -> None:
     rows = list(peers)
     if not rows:
         print("No peers known. Run `tau discover` or `tau serve` first.")
         return
     timestamp = now if now is not None else time.time()
-    header = ("DESTINATION", "NAME", "HOPS", "LAST SEEN", "LXMF")
+    header = ("DESTINATION", "NAME", "VERIFIED", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
         table.append(
             (
                 peer.hexhash,
                 peer.display_name,
+                "✓" if peer.is_verified else "",
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
                 peer.lxmf_hash or "—",
@@ -938,6 +1463,22 @@ def _print_peer_table(peers: Iterable[Peer], *, now: Optional[float] = None) -> 
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     for row in table:
         print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
+    changed = [p for p in rows if p.key_change_at is not None]
+    for peer in changed:
+        print(
+            f"WARNING: {peer.display_name} ({short_hash(peer.hexhash)}) "
+            "presented a different public key under the same destination "
+            "hash; the recorded key was kept. Re-verify this peer out of "
+            "band before trusting it.",
+            file=sys.stderr,
+        )
+    if safety_numbers:
+        print("\nSafety numbers — compare each with the peer over another "
+              "channel; a match confirms the key is theirs:")
+        for peer in rows:
+            number = safety_numbers.get(peer.hexhash)
+            if number:
+                print(f"  {peer.display_name} ({short_hash(peer.hexhash)}): {number}")
 
 
 def _make_config(
@@ -1037,11 +1578,33 @@ def _node_callbacks(args: argparse.Namespace):
             destination = short_hash(record.get("destination") or "")
             suffix = f" ({destination})" if destination else ""
             text = record.get("text", "")
-            print(f"[{_stamp()}] message from {sender}{suffix}:", flush=True)
+            if record.get("kind") == "group":
+                group_name = record.get("group_name") or "group"
+                print(
+                    f"[{_stamp()}] group message from {sender}{suffix}"
+                    f" in {group_name}:",
+                    flush=True,
+                )
+            else:
+                print(f"[{_stamp()}] message from {sender}{suffix}:", flush=True)
             for line in str(text).splitlines() or [""]:
                 print(f"  {line}", flush=True)
 
-    return on_peer, on_message
+    def on_file(record: Dict[str, Any]) -> None:
+        if json_output:
+            _emit_event(args, "file", file=record)
+        else:
+            sender = record.get("from", "unknown")
+            destination = short_hash(record.get("destination") or "")
+            suffix = f" ({destination})" if destination else ""
+            print(
+                f"[{_stamp()}] file from {sender}{suffix}: "
+                f"{record.get('name')} ({record.get('size')} bytes)",
+                flush=True,
+            )
+            print(f"  saved to {record.get('path')}", flush=True)
+
+    return on_peer, on_message, on_file
 
 
 def _default_web_dir() -> Optional[Path]:
@@ -1056,7 +1619,7 @@ def _print_tan_posts(
     posts: Sequence[Dict[str, Any]],
     *,
     json_output: bool,
-    empty_message: str = "No posts yet. Try `tau tan post \"hello\"` or `tau tan sync --explore`.",
+    empty_message: str = 'No posts yet. Try `tau tan post "hello"` or `tau tan sync --explore`.',
 ) -> None:
     if json_output:
         _emit({"posts": list(posts), "count": len(posts)}, True)
@@ -1074,8 +1637,12 @@ def _print_tan_posts(
         if post.get("kind") == "reply":
             parent = post.get("reply_to")
             if isinstance(parent, dict):
-                if parent.get("deleted"):
+                if parent.get("blocked"):
+                    print("  in reply to a blocked author's post")
+                elif parent.get("deleted"):
                     print("  in reply to a deleted post")
+                elif parent.get("muted"):
+                    print("  in reply to a muted post")
                 else:
                     parent_text = str(parent.get("text") or "")
                     if len(parent_text) > 80:
@@ -1088,10 +1655,24 @@ def _print_tan_posts(
                 print(f"  in reply to {short_hash(str(post.get('target', '')))}")
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("deleted"):
+                    print("  quoting a deleted post")
+                else:
+                    print(f"  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"    {line}")
+            else:
+                print(f"  quoting {short_hash(str(post.get('target', '')))}")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")
+        quotes = int(post.get("quotes") or 0)
+        if quotes:
+            print(f"  ❝ {quotes}")
 
 
 def _print_tan_thread(
@@ -1120,10 +1701,61 @@ def _print_tan_thread(
         )
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"{indent}  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("deleted"):
+                    print(f"{indent}  quoting a deleted post")
+                else:
+                    print(f"{indent}  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"{indent}    {line}")
+            else:
+                print(
+                    f"{indent}  quoting "
+                    f"{short_hash(str(post.get('target', '')))}"
+                )
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"{indent}  ♥ {likes}{suffix}")
+        quotes = int(post.get("quotes") or 0)
+        if quotes:
+            print(f"{indent}  ❝ {quotes}")
+
+
+def _print_saved_posts(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+) -> None:
+    """Print saved posts, newest save first."""
+    if json_output:
+        _emit({"saved": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No saved posts yet. Try `tau tan save <hash>`.")
+        return
+    for post in posts:
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        saved = datetime.fromtimestamp(float(post.get("saved_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        print(f"  saved {saved}")
+        if post.get("deleted"):
+            print("  (deleted post)")
+            continue
+        for line in str(post.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+        likes = int(post.get("likes") or 0)
+        if likes or post.get("liked"):
+            suffix = " (you liked this)" if post.get("liked") else ""
+            print(f"  ♥ {likes}{suffix}")
 
 
 def _tan_identity(config: TauConfig) -> Any:
@@ -1134,19 +1766,28 @@ def _tan_identity(config: TauConfig) -> Any:
 
 
 def _publish_local_post(
-    node: TauNode, *, text: str,
+    node: TauNode,
+    *,
+    text: str,
     reply_to: Optional[str] = None,
-    to: Optional[List[str]] = None, ttl: int = MAX_GOSSIP_TTL,
+    quote_of: Optional[str] = None,
+    to: Optional[List[str]] = None,
+    ttl: int = MAX_GOSSIP_TTL,
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
     # Use a separate app so per-command timeouts do not mutate the serving app.
-    publisher = TanApp(node.config, node.identity, name=node.name,
-                       request_timeout=float(timeout))
+    publisher = TanApp(
+        node.config, node.identity, name=node.name, request_timeout=float(timeout)
+    )
     publisher.node = node
     targets = [node.resolve_peer(target) for target in to] if to else None
-    post = publisher.create_post(text, reply_to=reply_to)
-    published = publisher.publish(post, targets=targets,
-                                  ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL)))
+    if quote_of is not None:
+        post = publisher.quote(quote_of, text)
+    else:
+        post = publisher.create_post(text, reply_to=reply_to)
+    published = publisher.publish(
+        post, targets=targets, ttl=max(0, min(int(ttl), MAX_GOSSIP_TTL))
+    )
     return {"post": post, "published": published}
 
 
@@ -1175,7 +1816,9 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
             from .local_publish import publish_running
 
             result = publish_running(
-                config.data_dir, text=text, reply_to=reply_to,
+                config.data_dir,
+                text=text,
+                reply_to=reply_to,
                 to=getattr(args, "to", None),
                 ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                 timeout=float(getattr(args, "timeout", 15.0)),
@@ -1184,12 +1827,16 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         else:
             try:
                 app = TanApp(
-                    config, node.identity, name=config.name,
+                    config,
+                    node.identity,
+                    name=config.name,
                     request_timeout=float(getattr(args, "timeout", 15.0)),
                 )
                 node.attach_app(app)
                 result = _publish_local_post(
-                    node, text=text, reply_to=reply_to,
+                    node,
+                    text=text,
+                    reply_to=reply_to,
                     to=getattr(args, "to", None),
                     ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
                     timeout=float(getattr(args, "timeout", 15.0)),
@@ -1205,6 +1852,68 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
         print(f"{verb} {short_hash(post['hash'])}")
         if reply_to is not None:
             print(f"  in reply to {short_hash(reply_to)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
+
+
+def cmd_tan_quote(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        target = resolve_post(conn, args.target)["hash"]
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        post = app.quote(target, text)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        try:
+            node.start(exclusive=True)
+        except InstanceAlreadyRunning:
+            from .local_publish import publish_running
+
+            result = publish_running(
+                config.data_dir, text=text, quote_of=target,
+                to=getattr(args, "to", None),
+                ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            post, published = result["post"], result["published"]
+        else:
+            try:
+                app = TanApp(
+                    config, node.identity, name=config.name,
+                    request_timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                node.attach_app(app)
+                result = _publish_local_post(
+                    node, text=text, quote_of=target,
+                    to=getattr(args, "to", None),
+                    ttl=getattr(args, "ttl", MAX_GOSSIP_TTL),
+                    timeout=float(getattr(args, "timeout", 15.0)),
+                )
+                post, published = result["post"], result["published"]
+            finally:
+                node.stop()
+
+    if json_output:
+        _emit({"post": post, "published": published}, True)
+    else:
+        print(f"quoted {short_hash(post['hash'])}")
+        print(f"  quoting {short_hash(target)}")
         if published is None:
             print("  stored locally (not published)")
         else:
@@ -1248,7 +1957,9 @@ def _cmd_tan_react(args: argparse.Namespace, *, liked: bool) -> int:
             published = app.publish(
                 record,
                 targets=targets,
-                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                ttl=max(
+                    0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)
+                ),
             )
         finally:
             node.stop()
@@ -1309,7 +2020,9 @@ def cmd_tan_delete(args: argparse.Namespace) -> int:
             published = app.publish(
                 record,
                 targets=targets,
-                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+                ttl=max(
+                    0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)
+                ),
             )
         finally:
             node.stop()
@@ -1385,6 +2098,7 @@ def cmd_tan_edit(args: argparse.Namespace) -> int:
 def cmd_tan_timeline(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1393,21 +2107,32 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
             author, _ = resolve_author(
                 conn, args.author, registry=PeerRegistry(config.peers_path)
             )
-            posts = list(
-                reversed(
-                    feed(conn, author=author, limit=args.limit, posts_only=True)
-                )
-            )
-            posts = annotate_replies(
-                conn, annotate_reactions(conn, posts, viewer=viewer)
+            posts = author_timeline(
+                conn,
+                author,
+                limit=args.limit,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
             )
         elif getattr(args, "all", False):
-            posts = timeline(conn, include_all=True, limit=args.limit, viewer=viewer)
+            posts = timeline(
+                conn,
+                include_all=True,
+                limit=args.limit,
+                viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+            )
         else:
             authors = [record["author"] for record in following(conn)]
             if viewer is not None:
                 authors.append(viewer)
-            posts = timeline(conn, authors, limit=args.limit, viewer=viewer)
+            posts = timeline(
+                conn, authors, limit=args.limit, viewer=viewer,
+                exclude_authors=blocked,
+                exclude_all=blocked is None,
+            )
     finally:
         conn.close()
     try:
@@ -1422,6 +2147,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
 def cmd_tan_search(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         identity = load_identity(config.identity_path)
@@ -1437,6 +2163,8 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
             author=author,
             limit=args.limit,
             viewer=viewer,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
         )
     finally:
         conn.close()
@@ -1460,7 +2188,14 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
     try:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
-        posts = thread(conn, args.ref, viewer=viewer)
+        blocked = load_blocked_set(config.blocklist_path)
+        posts = thread(
+            conn,
+            args.ref,
+            viewer=viewer,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
     finally:
         conn.close()
     try:
@@ -1469,6 +2204,32 @@ def cmd_tan_thread(args: argparse.Namespace) -> int:
         display_ruleset = Ruleset()
     posts = apply_display_rules(posts, display_ruleset)
     _print_tan_thread(posts, json_output=json_output)
+    return _EXIT_OK
+
+
+def cmd_tan_mentions(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        # Mentions are defined relative to this node's identity: a
+        # reply to one of your posts.  Without an identity there is
+        # nothing of yours to be replied to.
+        identity = _tan_identity(config)
+        viewer = destination_hash(identity).hex()
+        posts = mentions(conn, viewer, limit=args.limit)
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_tan_posts(
+        posts,
+        json_output=json_output,
+        empty_message="No replies to your posts yet.",
+    )
     return _EXIT_OK
 
 
@@ -1531,6 +2292,213 @@ def cmd_tan_following(args: argparse.Namespace) -> int:
                 f"{name:<20} {short_hash(record['author']):<10} "
                 f"{record.get('posts', 0)} post(s)"
             )
+    return _EXIT_OK
+
+
+def _resolve_mute_target(
+    conn: sqlite3.Connection, target: str, registry: PeerRegistry
+) -> Tuple[str, str]:
+    """Resolve a mute/unmute target, falling back to stored names.
+
+    The peer registry does not know authors whose posts are only cached,
+    and a muted author may have no cached posts at all — so after the
+    registry/hash/prefix lookup fails, try the name stored with the
+    mute, then the name on the author's cached posts.
+    """
+    try:
+        return resolve_author(conn, target, registry=registry)
+    except TanError as exc:
+        match = resolve_muted_name(conn, target)
+        if match is not None:
+            return match
+        try:
+            return resolve_cached_author(conn, target)
+        except TanError:
+            raise exc from None
+
+
+def cmd_tan_mute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = _resolve_mute_target(
+            conn, args.target, PeerRegistry(config.peers_path)
+        )
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        if viewer is not None and author == viewer:
+            raise TanError("cannot mute yourself")
+        record = mute(conn, author, name=name)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"muted {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_unmute(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        author, name = _resolve_mute_target(
+            conn, args.target, PeerRegistry(config.peers_path)
+        )
+        removed = unmute(conn, author)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit({"author": author, "unmuted": removed}, True)
+    else:
+        if removed:
+            print(f"unmuted {name or author} ({short_hash(author)})")
+        else:
+            print(f"was not muted: {name or author} ({short_hash(author)})")
+    return _EXIT_OK
+
+
+def cmd_tan_muted(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = muted(conn)
+        for record in records:
+            record.update(author_stats(conn, record["author"]))
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"muted": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No muted authors. Mute one with `tau tan mute alice`.")
+        for record in records:
+            name = record.get("name") or "unknown"
+            when = datetime.fromtimestamp(float(record["muted_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(
+                f"{name:<20} {short_hash(record['author']):<10} "
+                f"{record.get('posts', 0)} post(s) muted {when}"
+            )
+    return _EXIT_OK
+
+
+def cmd_tan_mute_keyword(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    config.prepare()
+    conn = init_db(config.social_db_path)
+    try:
+        record = mute_keyword(conn, args.keyword)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        print(f"muted keyword {record['display']!r}")
+    return _EXIT_OK
+
+
+def cmd_tan_unmute_keyword(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        removed = unmute_keyword(conn, args.keyword)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(
+            {
+                "keyword": " ".join(args.keyword.split()).casefold(),
+                "unmuted": removed,
+            },
+            True,
+        )
+    else:
+        if removed:
+            print(f"unmuted keyword {args.keyword.strip()!r}")
+        else:
+            print(f"keyword {args.keyword.strip()!r} was not muted")
+    return _EXIT_OK
+
+
+def cmd_tan_muted_keywords(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        records = muted_keywords(conn)
+    finally:
+        conn.close()
+
+    if _json_mode(args):
+        _emit({"muted_keywords": records, "count": len(records)}, True)
+    else:
+        if not records:
+            print("No muted keywords. Try `tau tan mute-keyword WORD`.")
+        for record in records:
+            when = datetime.fromtimestamp(float(record["added_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"{record['display']} (muted {when})")
+    return _EXIT_OK
+
+
+def cmd_tan_save(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = save_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record.get("already_saved"):
+            when = datetime.fromtimestamp(float(record["saved_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"already saved {short_hash(str(record['hash']))} at {when}")
+        else:
+            print(f"saved {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_unsave(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = unsave_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record["unsaved"]:
+            print(f"unsaved {short_hash(str(record['hash']))}")
+        else:
+            print(f"was not saved: {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_saved(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        posts = saved_posts(conn, limit=args.limit)
+        posts = annotate_replies(conn, annotate_reactions(conn, posts, viewer=viewer))
+    finally:
+        conn.close()
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    posts = apply_display_rules(posts, display_ruleset)
+    _print_saved_posts(posts, json_output=json_output)
     return _EXIT_OK
 
 
@@ -1604,7 +2572,9 @@ def cmd_tan_rules(args: argparse.Namespace) -> int:
     else:
         print(f"Tan admission rules ({config.tan_rules_path}):")
         print(f"  default: {data['default']}")
-        print(f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}")
+        print(
+            f"  followed authors admitted: {'yes' if data['allow_followed'] else 'no'}"
+        )
         kinds = data["kinds"]
         print(
             f"  kinds displayed: {', '.join(kinds) if kinds else 'all'}"
@@ -1747,6 +2717,134 @@ def cmd_tan_import(args: argparse.Namespace) -> int:
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
 
 
+def cmd_bundle_export(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    mailbox = Mailbox(config.mailbox_path)
+    registry = PeerRegistry(config.peers_path)
+    include_tan = bool(getattr(args, "tan", False))
+    tan_conn = None
+    try:
+        if include_tan:
+            tan_conn = init_db(config.social_db_path)
+        document, summary = build_bundle(
+            identity=identity,
+            sender_name=config.name,
+            mailbox=mailbox,
+            registry=registry,
+            tan_conn=tan_conn,
+            include_tan=include_tan,
+            max_bytes=int(
+                getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES)
+            ),
+        )
+    finally:
+        if tan_conn is not None:
+            tan_conn.close()
+    atomic_write_bytes(
+        args.file, serialize_bundle(document), restrict_parent=False
+    )
+    if _json_mode(args):
+        _emit(summary, True)
+    else:
+        tan_text = (
+            f" and {summary['tan']} Tan post(s)" if include_tan else ""
+        )
+        print(
+            f"Exported bundle with {summary['mail']} sealed message(s)"
+            f"{tan_text} ({summary['bytes']} bytes) to {args.file}"
+        )
+        for skipped in summary["skipped"]:
+            print(f"  skipped {_safe_id_prefix(skipped['id'])}: {skipped['reason']}")
+    return _EXIT_OK
+
+
+def _bundle_tan_admit(
+    config: TauConfig, identity: Any, tan_conn: Any
+) -> Any:
+    """Admission check for Tan posts carried in a bundle.
+
+    Uses the same ruleset the network path applies.  A ruleset that
+    cannot be parsed fails closed, denying remote posts, as ``TanApp``
+    does.
+    """
+    try:
+        ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError as exc:
+        print(
+            f"tau: warning: Tan ruleset unusable ({exc}); denying remote Tan posts",
+            file=sys.stderr,
+        )
+        ruleset = Ruleset(default_allow=False)
+    own_author = _author_from_identity(identity) if identity is not None else None
+    followed: List[str] = []
+    if ruleset.allow_followed:
+        followed = [record["author"] for record in following(tan_conn)]
+    return lambda author: ruleset.decide(
+        author, own_author=own_author, followed=followed
+    )
+
+
+def cmd_bundle_import(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    max_bytes = int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES))
+    if max_bytes <= 0:
+        raise NodeError("max bundle size must be positive")
+    # Read at most one byte past the cap, so an oversized input is
+    # detected without being loaded whole.
+    if str(args.file) == "-":
+        raw = sys.stdin.buffer.read(max_bytes + 1)
+    else:
+        try:
+            with Path(args.file).expanduser().open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    if len(raw) > max_bytes:
+        raise NodeError(f"bundle is over the {max_bytes} byte cap")
+    document = parse_bundle(raw, max_bytes=max_bytes)
+    mailbox = Mailbox(config.mailbox_path)
+    tan_conn = None
+    try:
+        if document.get("tan") is not None:
+            tan_conn = init_db(config.social_db_path)
+        admit = None
+        if tan_conn is not None:
+            identity = load_identity(config.identity_path)
+            admit = _bundle_tan_admit(config, identity, tan_conn)
+        result = apply_bundle(
+            mailbox=mailbox, tan_conn=tan_conn, document=document, admit=admit
+        )
+    finally:
+        if tan_conn is not None:
+            tan_conn.close()
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        tan = result["tan"]
+        tan_text = ""
+        if tan is not None:
+            tan_text = (
+                f"; Tan: {tan['imported']} imported, "
+                f"{tan['present']} already present, "
+                f"{tan['skipped']} skipped"
+            )
+        print(
+            f"Imported {result['imported']} sealed message(s) "
+            f"({result['present']} already held, "
+            f"{result['skipped']} skipped){tan_text}"
+        )
+        for error in result["errors"]:
+            ref = _safe_id_prefix(error["id"]) if error["id"] else "?"
+            print(f"  skipped {ref}: {error['error']}")
+    tan_clean = result["tan"] is None or result["tan"]["skipped"] == 0
+    return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     interval = max(
         0.0, float(getattr(args, "announce_interval", DEFAULT_ANNOUNCE_INTERVAL))
@@ -1766,12 +2864,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             raise NodeError(str(exc)) from exc
         web_settings = (host, port, web_dir)
 
-    console_peer, console_message = _node_callbacks(args)
+    console_peer, console_message, console_file = _node_callbacks(args)
     node = TauNode(
         config,
         name=config.name,
         on_message=console_message,
         on_peer=console_peer,
+        on_file=console_file,
     )
     if web_settings is not None:
         from .webapi import WebBridge, WebBridgeError, check_web_console_bind
@@ -1796,8 +2895,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
             console_message(record)
             bridge.record_inbound(record)
 
+        def on_file(record: Dict[str, Any]) -> None:
+            console_file(record)
+            # The console lists messages, not files: record the arrival
+            # as an inbound message so the file shows up in its feed
+            # (a download link can follow later).
+            bridge.record_inbound(
+                {
+                    "destination": record.get("destination"),
+                    "from": record.get("from"),
+                    "text": (
+                        f"Received file: {record.get('name')} "
+                        f"({record.get('size')} bytes, "
+                        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
+                    ),
+                    "sent_at": record.get("sent_at"),
+                    "received_at": record.get("received_at"),
+                }
+            )
+
         node.on_peer = on_peer
         node.on_message = on_message
+        node.on_file = on_file
     # The data-directory lock is the more specific guard, so probe it
     # before the port check: a second serve on the same directory
     # reports the instance error even though it would also trip the
@@ -1820,11 +2939,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc
     node.start(
-        announce=not getattr(args, "no_announce", False), exclusive=True
+        announce=not getattr(args, "no_announce", False),
+        exclusive=True,
+        lxmf=bool(getattr(args, "lxmf", False)),
     )
 
     social_app = None
     if getattr(args, "social", False):
+
         def on_tan_post(record: Dict[str, Any]) -> None:
             if _json_mode(args):
                 _emit_event(args, "post", post=record)
@@ -1841,7 +2963,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 try:
                     bridge.record_tan_post(record)
                 except Exception:  # pragma: no cover - optional web layer
-                    log.debug("Could not forward Tan post to web console", exc_info=True)
+                    log.debug(
+                        "Could not forward Tan post to web console", exc_info=True
+                    )
 
         social_app = TanApp(
             config,
@@ -1865,10 +2989,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     stop = threading.Event()
     previous_handlers = _install_stop_handlers(stop)
 
-    social_interval = max(
-        0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0)
-    )
+    social_interval = max(0.0, float(getattr(args, "social_sync_interval", 0.0) or 0.0))
     if social_app is not None and social_interval > 0:
+
         def social_sync_loop() -> None:
             while not stop.wait(social_interval):
                 try:
@@ -1876,9 +2999,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                         node, limit=DEFAULT_FEED_LIMIT, explore=True
                     )
                     if summary.get("stored"):
-                        log.info(
-                            "Tan sync stored %s new post(s)", summary["stored"]
-                        )
+                        log.info("Tan sync stored %s new post(s)", summary["stored"])
                 except Exception:  # pragma: no cover - network dependent
                     log.warning("Tan background sync failed", exc_info=True)
 
@@ -1919,6 +3040,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f'tau node "{info["name"]}" ready', flush=True)
         print(f"  destination: {info['destination']}")
         print(f"  rns:         {info['rns_version']}")
+        lxmf_info = info.get("lxmf") or {}
+        if lxmf_info.get("enabled"):
+            print(f"  lxmf:        delivery {lxmf_info.get('delivery')}")
         print(f"  data dir:    {config.data_dir}")
         mailbox_counts = info.get("mailbox") or {}
         if mailbox_counts.get("outbox") or mailbox_counts.get("held"):
@@ -2000,13 +3124,119 @@ def cmd_peers(args: argparse.Namespace) -> int:
     max_age_days = getattr(args, "max_age", None)
     max_age = float(max_age_days) * 86400.0 if max_age_days is not None else None
     peers = registry.all(max_age=max_age)
+    safety_numbers: Optional[Dict[str, str]] = None
+    if getattr(args, "safety_number", False):
+        identity = load_identity(config.identity_path)
+        if identity is None:
+            raise NodeError(
+                f"no identity at {config.identity_path}; run `tau init` first"
+            )
+        local_key = identity.get_public_key()
+        safety_numbers = {
+            peer.hexhash: safety_number(local_key, peer.public_key)
+            for peer in peers
+        }
+    if _json_mode(args):
+        payload = [peer.to_dict() for peer in peers]
+        if safety_numbers is not None:
+            for entry in payload:
+                entry["safety_number"] = safety_numbers[entry["destination"]]
+        _emit({"peers": payload, "count": len(peers)}, True)
+    else:
+        _print_peer_table(peers, safety_numbers=safety_numbers)
+    return _EXIT_OK
+
+
+def cmd_peers_verify(args: argparse.Namespace) -> int:
+    """Mark a peer verified after comparing safety numbers out of band."""
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(
+            f"no identity at {config.identity_path}; run `tau init` first"
+        )
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    number = safety_number(identity.get_public_key(), peer.public_key)
+    previously_verified = peer.is_verified
+    previous_fingerprint = peer.verified_fingerprint
+    registry.mark_verified(peer.destination_hash, number)
+    registry.save()
     if _json_mode(args):
         _emit(
-            {"peers": [peer.to_dict() for peer in peers], "count": len(peers)},
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "safety_number": number,
+                "verified_at": peer.verified_at,
+                "reverified": previously_verified,
+                "fingerprint_changed": previously_verified
+                and previous_fingerprint != number,
+            },
             True,
         )
     else:
-        _print_peer_table(peers)
+        print(f"Verified {peer.display_name} ({short_hash(peer.hexhash)}).")
+        print(f"  safety number: {number}")
+        if previously_verified and previous_fingerprint != number:
+            print(
+                "  note: the recorded safety number changed since the last "
+                "verification (the local identity changed); updated."
+            )
+        print(
+            "  Compare this number with the peer over another channel; "
+            "if it matches, the key is theirs."
+        )
+    return _EXIT_OK
+
+
+def cmd_peers_forget(args: argparse.Namespace) -> int:
+    """Remove a peer from the local registry."""
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        peer = registry.resolve(args.target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"no peer matches {args.target!r}")
+    # Mail sweeps iterate registered peers: forgetting a peer with
+    # queued mail would strand those messages until it is rediscovered
+    # (or they expire).  Refuse unless the owner explicitly forces it.
+    mailbox = Mailbox(config.mailbox_path)
+    queued = mailbox.outbox_list(to=peer.destination_hash)
+    if queued and not getattr(args, "force", False):
+        raise NodeError(
+            f"{peer.display_name} still has {len(queued)} queued "
+            "message(s); forgetting this peer would strand them until "
+            "it is rediscovered. Deliver or cancel the mail first, or "
+            "pass --force to forget anyway."
+        )
+    registry.forget(peer.destination_hash)
+    registry.save()
+    if _json_mode(args):
+        _emit(
+            {
+                "peer": peer.hexhash,
+                "name": peer.display_name,
+                "forgotten": True,
+                "queued_messages": len(queued),
+            },
+            True,
+        )
+    else:
+        print(f"Forgot {peer.display_name} ({short_hash(peer.hexhash)}).")
+        if queued:
+            print(
+                f"  warning: {len(queued)} queued message(s) for this peer "
+                "will not be attempted until it is rediscovered."
+            )
+        print("  The next genuine announce from this peer re-adds it.")
     return _EXIT_OK
 
 
@@ -2016,9 +3246,7 @@ def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
     node.start()
     try:
         target = getattr(args, "to", None)
-        targets = (
-            [node.resolve_peer(target)] if target else node.registry.all()
-        )
+        targets = [node.resolve_peer(target)] if target else node.registry.all()
         results: List[Dict[str, Any]] = []
         for peer in targets:
             try:
@@ -2033,7 +3261,9 @@ def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
                     }
                 )
                 continue
-            results.append({"peer": peer.hexhash, "name": peer.display_name, "ok": True, **summary})
+            results.append(
+                {"peer": peer.hexhash, "name": peer.display_name, "ok": True, **summary}
+            )
         totals = {
             key: sum(int(r.get(key, 0)) for r in results if r.get("ok"))
             for key in ("added", "updated", "skipped")
@@ -2079,17 +3309,22 @@ def cmd_id(args: argparse.Namespace) -> int:
         "destination": destination,
         "identity": identity.hexhash,
         "lxmf": lxmf_delivery_hash(identity).hex(),
+        # Fingerprint of this identity alone — the pairwise safety number
+        # for a peer (shown by `tau peers --safety-number`) folds the
+        # peer's key in too, so the two numbers are different by design.
+        "safety_number": safety_number(identity.get_public_key()),
         "data_dir": str(config.data_dir),
         "rns_config": str(config.rns_config_file),
     }
     if _json_mode(args):
         _emit(payload, True)
     else:
-        print(f"name:        {config.name}")
-        print(f"destination: {destination}")
-        print(f"identity:    {identity.hexhash}")
-        print(f"lxmf:        {payload['lxmf']}")
-        print(f"data dir:    {config.data_dir}")
+        print(f"name:          {config.name}")
+        print(f"destination:   {destination}")
+        print(f"identity:      {identity.hexhash}")
+        print(f"lxmf:          {payload['lxmf']}")
+        print(f"safety number: {payload['safety_number']}")
+        print(f"data dir:      {config.data_dir}")
     return _EXIT_OK
 
 
@@ -2149,7 +3384,9 @@ def cmd_id_import(args: argparse.Namespace) -> int:
     except Exception as exc:
         # A backup file is untrusted input: any parse failure is a bad backup.
         raise NodeError(f"not a valid identity backup: {exc}") from exc
-    if identity is None:  # pragma: no cover - load_identity returns None only when missing
+    if (
+        identity is None
+    ):  # pragma: no cover - load_identity returns None only when missing
         raise NodeError(f"no identity backup at {source}")
     config.prepare()
     # Hold the instance lock across the whole replacement: a node that
@@ -2170,6 +3407,48 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                     f"an identity already exists at {config.identity_path}; "
                     "pass --force to replace it"
                 )
+            # Pairwise safety numbers are computed with the local key, so
+            # verifications made under the old identity mean nothing
+            # under the new one.  An unreadable old identity is treated
+            # the same way: its comparisons cannot be trusted either.
+            try:
+                old_identity = load_identity(config.identity_path)
+                old_key = (
+                    old_identity.get_public_key()
+                    if old_identity is not None
+                    else None
+                )
+            except Exception as exc:
+                # The identity is about to be replaced either way, so the
+                # comparisons are cleared — but say why, so a transient
+                # read failure (e.g. permissions) is not silent.
+                log.warning(
+                    "Could not read the existing identity (%s); clearing "
+                    "peer verifications",
+                    exc,
+                )
+                old_key = None
+            verifications_cleared = 0
+            if old_key != identity.get_public_key():
+                # Persist the invalidation BEFORE replacing the identity:
+                # if the registry write fails, abort with the old
+                # identity still in place rather than leaving the new
+                # identity alongside stale verified markers.
+                registry = PeerRegistry(config.peers_path)
+                verifications_cleared = registry.clear_verifications()
+                if verifications_cleared:
+                    try:
+                        saved = registry.save()
+                    except OSError as exc:
+                        raise NodeError(
+                            "could not save peer registry "
+                            f"({exc}); identity not replaced"
+                        ) from exc
+                    if not saved:
+                        raise NodeError(
+                            "could not save peer registry; "
+                            "identity not replaced"
+                        )
             save_identity(identity, config.identity_path)
     finally:
         lock.release()
@@ -2177,6 +3456,7 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         "destination": destination_hash(identity).hex(),
         "identity": identity.hexhash,
         "data_dir": str(config.data_dir),
+        "verifications_cleared": verifications_cleared,
     }
     if _json_mode(args):
         _emit(payload, True)
@@ -2184,54 +3464,291 @@ def cmd_id_import(args: argparse.Namespace) -> int:
         print(f"identity:    {payload['identity']}")
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
+        if verifications_cleared:
+            print(
+                f"verifications cleared: {verifications_cleared} "
+                "(local identity changed; re-verify peers)"
+            )
     return _EXIT_OK
 
 
 def cmd_send(args: argparse.Namespace) -> int:
+    # Validate flags before reading the message, so an invalid command
+    # fails at once instead of blocking on stdin.
+    wait_given = getattr(args, "wait", None) is not None
+    wait = float(getattr(args, "wait", None) or 0.0)
+    if not math.isfinite(wait):
+        print("error: --wait must be a finite number of seconds", file=sys.stderr)
+        return 2
+    if wait < 0:
+        print("error: --wait must not be negative", file=sys.stderr)
+        return 2
+    if wait_given and getattr(args, "no_queue", False):
+        print("error: --wait cannot be combined with --no-queue", file=sys.stderr)
+        return 2
     text = _read_message(args)
     config = _make_config(args)
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        expires_at = time.time() + _parse_duration(expire_text)
     node = TauNode(config, name=config.name)
     node.start()
+    targets = args.to if isinstance(args.to, list) else [args.to]
+    results: List[Dict[str, Any]] = []
+    reply_ids: Dict[str, str] = {}
+    wait_failed = False
     try:
-        response = node.send_message(
-            args.to,
-            text,
-            timeout=float(getattr(args, "timeout", 20.0)),
-            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
-            queue=not getattr(args, "no_queue", False),
-        )
-        if response.get("queued"):
+        for target in targets:
+            # Outbox ids present before this call: only this node's own
+            # queue path creates an entry for the message it just queued,
+            # so a "queued" reply is only genuine when its id is new
+            # since this snapshot. A peer claiming queued with a
+            # pre-existing id (e.g. one it holds a sealed copy of) is
+            # treated as delivered — the link request succeeded.
+            queued_before = {entry.id for entry in node.mailbox.outbox_list()}
+            try:
+                reply_to = None
+                if getattr(args, "reply_to", None):
+                    # Derive the conversation hash without network
+                    # discovery, so a reply to a queued message still
+                    # reaches the outbox when the recipient is offline;
+                    # discovery is only a fallback.
+                    target_hash = node._target_hash(target)
+                    if target_hash is None:
+                        peer = node.resolve_peer(
+                            target,
+                            timeout=float(
+                                getattr(args, "discover_timeout", 10.0)
+                            ),
+                        )
+                        target_hash = peer.destination_hash
+                    reply_to = _resolve_reply_target(
+                        Inbox(config.inbox_path),
+                        node.mailbox,
+                        args.reply_to,
+                        target_hash.hex(),
+                    )
+                    reply_ids[target] = reply_to["id"]
+                response = node.send_message(
+                    target,
+                    text,
+                    timeout=float(getattr(args, "timeout", 20.0)),
+                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    queue=not getattr(args, "no_queue", False),
+                    in_reply_to=reply_to,
+                    expires_at=expires_at,
+                )
+            except (NodeError, PeerError, MailboxError) as exc:
+                if len(targets) == 1:
+                    # Single recipient keeps the historical behaviour:
+                    # the error reaches main() and exits non-zero.
+                    raise
+                # One recipient failing must not stop the rest; the
+                # failure is reported per recipient below. This also
+                # covers a full outbox: enqueue raises MailboxFull
+                # inside send_message, and that must not abort the
+                # remaining recipients.
+                results.append({"target": target, "ok": False, "error": str(exc)})
+                continue
+            # The peer response is untrusted JSON: keep the local
+            # recipient label authoritative, so a peer cannot relabel
+            # this result. A "queued" claim only counts with a new id
+            # (see above); a direct delivery keeps no "queued" key at
+            # all, preserving the established single-recipient JSON shape.
+            result = dict(response)
+            result["target"] = target
+            if expires_at is not None:
+                result["expires_at"] = expires_at
+            if response.get("queued"):
+                result["queued"] = (
+                    isinstance(response.get("id"), str)
+                    and response["id"] not in queued_before
+                )
+                if result["queued"] and "to" not in response:
+                    result["to"] = target
+            results.append(result)
+        if wait > 0:
+            # --wait replaces the one-shot flush below: wait for each
+            # queued message in turn, each with the full budget, and
+            # record the outcome on its result.  A direct delivery
+            # records `waited: 0.0`, so --json callers always see
+            # `delivered` and `waited` when they passed --wait.
+            for result in results:
+                if not result.get("queued"):
+                    if result.get("ok", True):
+                        result["delivered"] = True
+                        result["waited"] = 0.0
+                    continue
+                started = time.monotonic()
+                delivered = node.wait_for_delivery(result["id"], timeout=wait)
+                waited = time.monotonic() - started
+                if delivered:
+                    result.pop("queued", None)
+                    result["delivered"] = True
+                    result["waited"] = round(waited, 1)
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    # The entry left the queue without a delivery
+                    # confirmation from this node: cancelled by another
+                    # process, or delivered by one.  Either way it must
+                    # not be reported as delivered.
+                    result["queued"] = False
+                    result["delivered"] = False
+                    result["waited"] = round(waited, 1)
+                    wait_failed = True
+                else:
+                    result["delivered"] = False
+                    result["waited"] = round(waited, 1)
+                    wait_failed = True
+        elif any(result.get("queued") for result in results):
             # One-shot send: give reachable peers a brief chance to take a
             # sealed copy (or the message itself) before this process exits.
             node.flush_outbox(timeout=3.0, max_peers=5)
-            if node.mailbox.get_outbox(response["id"]) is None:
-                response = {
-                    "ok": True,
-                    "delivered": True,
-                    "id": response["id"],
-                    "to": response["to"],
-                }
+            for result in results:
+                if result.get("queued") and node.mailbox.get_outbox(result["id"]) is None:
+                    message_id = result["id"]
+                    to_hex = result["to"]
+                    target = result["target"]
+                    result.clear()
+                    result.update(
+                        {
+                            "target": target,
+                            "ok": True,
+                            "delivered": True,
+                            "id": message_id,
+                            "to": to_hex,
+                            **(
+                                {"expires_at": expires_at}
+                                if expires_at is not None
+                                else {}
+                            ),
+                        }
+                    )
+    finally:
+        node.stop()
+
+    failed = [result for result in results if not result.get("ok", True)]
+    if _json_mode(args):
+        if len(results) == 1 and not failed:
+            # Single recipient keeps the historical bare-response shape.
+            _emit({k: v for k, v in results[0].items() if k != "target"}, True)
+        else:
+            _emit(
+                {
+                    "results": results,
+                    "delivered": sum(
+                        1
+                        for r in results
+                        if r.get("ok", True)
+                        and not r.get("queued")
+                        and r.get("delivered") is not False
+                    ),
+                    "queued": sum(1 for r in results if r.get("queued")),
+                    "failed": len(failed),
+                },
+                True,
+            )
+    else:
+        for result in results:
+            target = result["target"]
+            if not result.get("ok", True):
+                print(f"failed to send to {target}: {result['error']}", file=sys.stderr)
+            elif (
+                result.get("waited") is not None
+                and not result.get("delivered")
+                and not result.get("queued")
+            ):
+                # The entry left the queue while waiting without a delivery
+                # confirmation from this node: cancelled, or delivered by
+                # another process.  Say so instead of claiming delivery.
+                print(f"no longer queued for {target} after {result['waited']:.1f}s")
+                print("  delivery was not confirmed — it may have been cancelled,")
+                print("  or delivered by another process sharing this data directory")
+            elif result.get("queued"):
+                waited = result.get("waited")
+                if waited is not None:
+                    print(f"still queued for {target} after {waited:.1f}s")
+                else:
+                    print(f"queued for {target} — they are unreachable right now")
+                print(f"  id:      {result['id']}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+            elif result.get("delivered"):
+                waited = result.get("waited")
+                if (
+                    waited is not None
+                    and "_rtt" not in result
+                    and "echo" not in result
+                ):
+                    print(f"delivered to {target} after {waited:.1f}s")
+                else:
+                    print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+            else:
+                print(f"delivered to {target}")
+                if reply_ids.get(target):
+                    print(f"  in reply to {short_hash(reply_ids[target])}")
+                echo = result.get("echo")
+                if echo is not None:
+                    print(f"echo: {echo}")
+                rtt = result.get("_rtt")
+                if isinstance(rtt, (int, float)):
+                    print(f"round trip: {rtt * 1000:.0f} ms")
+                if result.get("expired"):
+                    print("  the receiver dropped it — past its expiry")
+                if expires_at is not None:
+                    print(f"  disappears in {_ago(expires_at - time.time())}")
+        if any(result.get("queued") for result in results):
+            print("  it will be delivered automatically when they are heard from;")
+            print("  check `tau outbox` for the queue, or just leave a node serving")
+    return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
+
+
+
+
+def cmd_send_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    last_percent = -1
+
+    def on_progress(progress: float) -> None:
+        nonlocal last_percent
+        percent = int(progress * 100)
+        if _json_mode(args) or percent == last_percent:
+            return
+        last_percent = percent
+        print(f"\r  sending… {percent}%", end="", flush=True)
+
+    try:
+        response = node.send_file(
+            args.to,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            progress_callback=on_progress,
+        )
     finally:
         node.stop()
 
     if _json_mode(args):
         _emit(response, True)
-    elif response.get("queued"):
-        print(f"queued for {args.to} — they are unreachable right now")
-        print(f"  id:      {response['id']}")
-        print("  it will be delivered automatically when they are heard from;")
-        print("  check `tau outbox` for the queue, or just leave a node serving")
-    elif response.get("delivered"):
-        print(f"delivered to {args.to}")
-    else:
-        print(f"delivered to {args.to}")
-        echo = response.get("echo")
-        if echo is not None:
-            print(f"echo: {echo}")
-        rtt = response.get("_rtt")
-        if isinstance(rtt, (int, float)):
-            print(f"round trip: {rtt * 1000:.0f} ms")
+        return _EXIT_OK
+    if last_percent >= 0:
+        print()
+    print(
+        f"sent {response['name']} ({response['size']} bytes) to {args.to}"
+    )
+    print(f"  id:     {response['id']}")
+    print(f"  sha256: {response['sha256']}")
     return _EXIT_OK
+
+
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:
@@ -2246,6 +3763,9 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         payload = entry.to_dict()
         payload["to_name"] = peer.display_name if peer is not None else entry.to_name
         payload["held_by"] = sorted(entry.held_by)
+        # Still queued, so never read — but the field keeps the shape
+        # identical to the sent history, where read_at is meaningful.
+        payload["read_at"] = mailbox.read_at(entry.id)
         return payload
 
     if _json_mode(args):
@@ -2254,6 +3774,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                 "outbox": [describe(entry) for entry in entries],
                 "count": len(entries),
                 "held_for_others": counts["held"],
+                "receipts_queued": counts["receipts"],
             },
             True,
         )
@@ -2292,13 +3813,16 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                 f"Also holding {counts['held']} sealed message(s) for other peers"
                 " — see `tau outbox held`."
             )
+        if counts["receipts"]:
+            print(
+                f"Also waiting to send {counts['receipts']} read receipt(s)"
+                " to offline senders."
+            )
     return _EXIT_OK
 
 
 def _is_hex32(value: str) -> bool:
-    return len(value) == 32 and all(
-        char in "0123456789abcdefABCDEF" for char in value
-    )
+    return len(value) == 32 and all(char in "0123456789abcdefABCDEF" for char in value)
 
 
 def _format_message_time(timestamp: float) -> str:
@@ -2309,9 +3833,7 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
-def _resolve_inbox_peer(
-    inbox: Inbox, registry: PeerRegistry, target: str
-) -> str:
+def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
@@ -2334,23 +3856,190 @@ def _resolve_inbox_peer(
         )
     if len(target) >= 4:
         prefix = target.casefold()
-        senders = {
-            peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)
-        }
+        senders = {peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)}
         senders |= {
             str(entry.get("destination") or "").casefold()
             for entry in inbox.list_messages(limit=None)
-            if str(entry.get("destination") or "")
-            .casefold()
-            .startswith(prefix)
+            if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
         if len(senders) == 1:
             return senders.pop()
         if len(senders) > 1:
-            raise NodeError(
-                f"{len(senders)} senders match the hash prefix {target!r}"
-            )
+            raise NodeError(f"{len(senders)} senders match the hash prefix {target!r}")
     raise NodeError(f"unknown peer: {target!r}")
+
+
+def _send_displayed_receipts(
+    config: TauConfig, inbox: Inbox, entries: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    """Receipt the displayed messages, directly or via the serving node.
+
+    Listing a DM is reading it, so displayed messages are stamped
+    ``read_at`` in the inbox first — that stamp is the durable
+    handoff: when a serving node already holds this data directory's
+    TCP listen port, a second Reticulum instance cannot start here
+    (Reticulum exits the process on the bind failure), so the serving
+    node's mail sweep delivers those receipts instead.  When no node
+    is serving, this command sends them directly over a one-shot node.
+    Only messages never receipted before are covered, so listing the
+    same inbox twice does not re-send.  Best-effort: a receipt failure
+    never breaks the listing.  Returns how many peers got a live
+    receipt and how many had one queued for store-and-forward.
+    """
+    unreceipted = [
+        entry
+        for entry in entries
+        if isinstance(entry.get("id"), str)
+        and entry.get("id")
+        and entry.get("receipt_sent_at") is None
+    ]
+    if not unreceipted:
+        return {"sent": 0, "queued": 0}
+    if not send_read_receipts_enabled(config.data_dir):
+        return {"sent": 0, "queued": 0}
+    try:
+        inbox.mark_read([str(entry["id"]) for entry in unreceipted])
+    except Exception:  # pragma: no cover - defensive
+        pass
+    if not config.identity_path.exists():
+        # No identity yet: starting a node here would create one as a
+        # side effect of merely listing messages.  The read stamp above
+        # is the handoff for when a node next serves this directory.
+        return {"sent": 0, "queued": 0}
+    try:
+        check_tcp_listen_ports(config)
+    except NodeError:
+        # A serving node already holds the listen port; its mail sweep
+        # delivers the receipts from the read stamps above.
+        return {"sent": 0, "queued": 0}
+    by_peer: Dict[str, List[str]] = {}
+    for entry in unreceipted:
+        peer_hash = str(entry.get("destination") or "")
+        if peer_hash:
+            by_peer.setdefault(peer_hash, []).append(str(entry["id"]))
+    if not by_peer:
+        return {"sent": 0, "queued": 0}
+    # No mail loop or announce: this node only sends the explicit receipts
+    # below, so a background sweep cannot send the same ids concurrently.
+    node = TauNode(config, name=config.name)
+    try:
+        node.start(mail_loop=False, announce=False)
+    except Exception:
+        return {"sent": 0, "queued": 0}
+    sent = queued = 0
+    stamped: List[str] = []
+    try:
+        for peer_hash, ids in by_peer.items():
+            try:
+                result = node.send_read_receipts(peer_hash, ids)
+            except Exception:
+                continue
+            handled = result.get("ids") or []
+            if not handled:
+                continue
+            if result.get("queued"):
+                queued += 1
+            elif result.get("ok"):
+                sent += 1
+            stamped.extend(handled)
+    finally:
+        node.stop()
+    if stamped:
+        try:
+            inbox.mark_receipt_sent(stamped)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return {"sent": sent, "queued": queued}
+
+
+def _resolve_sent_peer(registry: PeerRegistry, target: str) -> str:
+    """Resolve ``--peer`` to a recipient hash for the sent view.
+
+    A full destination hash filters directly even when the peer has
+    been pruned from the registry; names and prefixes resolve through
+    it.
+    """
+    target = target.strip()
+    if _is_hex32(target):
+        return target.lower()
+    try:
+        peer = registry.resolve(target)
+    except PeerError as exc:
+        raise NodeError(str(exc)) from exc
+    if peer is None:
+        raise NodeError(f"unknown peer: {target!r}")
+    return peer.hexhash
+def _resolve_reply_target(
+    inbox: Inbox, mailbox: Mailbox, ref: str, peer_hash: str
+) -> Dict[str, Any]:
+    """Resolve ``--reply-to`` to an ``in_reply_to`` wire reference.
+
+    The quoted message must be in the same conversation: the inbox is
+    searched first (received messages and the node's own sent ones),
+    then the outbox for a still-queued message.  A reference to
+    another peer's message, or to a message this node has never seen,
+    is refused instead of sent dangling — the receiver could only
+    render it as "original not available" anyway.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("--reply-to must not be empty")
+    # Gather candidates from both stores before choosing, so a prefix that
+    # matches distinct messages across the inbox and the outbox is rejected
+    # rather than silently quoting whichever store is searched first.
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for item in inbox.find_prefix(ref, peer=peer_hash):
+        candidates.setdefault(str(item["id"]), item)
+    value = ref.lower()
+    for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        if entry.id.lower().startswith(value):
+            candidates.setdefault(
+                entry.id, {"id": entry.id, "text": entry.text}
+            )
+    if len(candidates) > 1:
+        raise NodeError(
+            f"{len(candidates)} messages in this conversation match {ref!r};"
+            " use a longer prefix"
+        )
+    if not candidates:
+        raise NodeError(
+            f"no message {ref!r} in this conversation to reply to;"
+            " replies quote a message from this peer's history"
+        )
+    quoted = next(iter(candidates.values()))
+    return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
+
+
+def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> Optional[str]:
+    """Render one message's quote, or ``None`` when it has none.
+
+    The quoted text is pulled from the local inbox, in the same
+    conversation only; when the original is not there — or its text
+    no longer matches the excerpt hash the sender quoted — the line
+    says so instead of trusting anything on the wire.
+    """
+    reply_to = entry.get("in_reply_to")
+    if not isinstance(reply_to, dict):
+        return None
+    ref_id = reply_to.get("id")
+    if not isinstance(ref_id, str) or not ref_id:
+        return None
+    quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+    excerpt = reply_to.get("excerpt")
+    if quoted is None or (
+        isinstance(excerpt, str)
+        and excerpt
+        and excerpt_hash(str(quoted.get("text") or "")) != excerpt.lower()
+    ):
+        return "↩ original not available"
+    if quoted.get("direction") == "out":
+        name = "you"
+    else:
+        peer = registry.get(str(quoted.get("destination") or ""))
+        name = peer.display_name if peer is not None else quoted.get("from") or "unknown"
+    quoted_text = str(quoted.get("text") or "")
+    first_line = quoted_text.splitlines()[0][:80] if quoted_text else ""
+    return f"↩ {name}: {first_line}"
 
 
 def cmd_messages(args: argparse.Namespace) -> int:
@@ -2360,32 +4049,399 @@ def cmd_messages(args: argparse.Namespace) -> int:
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    group_id = None
+    if getattr(args, "group", None):
+        group_id = GroupStore(config.groups_path).find(args.group)["id"]
+    if getattr(args, "count", False):
+        # A count is for scripting: it never advances the read cursor.
+        counts = inbox.unread_counts()
+        per_peer = counts["per_peer"]
+        if peer_hash is not None:
+            per_peer = {
+                destination: count
+                for destination, count in per_peer.items()
+                if destination == peer_hash
+            }
+        total = sum(per_peer.values())
+        if _json_mode(args):
+            _emit({"unread": per_peer, "total": total}, True)
+            return _EXIT_OK
+        if not per_peer:
+            print("No unread messages.")
+            return _EXIT_OK
+        for destination, count in sorted(per_peer.items()):
+            peer = registry.get(destination)
+            name = peer.display_name if peer is not None else "unknown"
+            print(f"{name} ({short_hash(destination)}): {count} unread")
+        print(f"Total: {total} unread")
+        return _EXIT_OK
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
-    entries = inbox.list_messages(limit=limit, peer=peer_hash)
+    if getattr(args, "sent", False):
+        return _cmd_messages_sent(args, config, registry, limit)
+    # Blocked senders' history stays stored but is hidden locally;
+    # unblocking restores the view.  Filter before applying the limit so
+    # hidden messages do not use up the requested count.  A block-list
+    # that cannot be read hides everything, matching the node, which
+    # blocks all senders on the same condition.
+    entries = inbox.list_messages(limit=None, peer=peer_hash, group=group_id)
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        entries = []
+    elif blocked:
+        entries = [
+            entry for entry in entries if entry.get("destination") not in blocked
+        ]
+    # Filter before limiting, so --unread finds older unread mail even
+    # when newer messages from the same listing are already read.
+    unread_only = getattr(args, "unread", False)
+    if unread_only:
+        entries = [entry for entry in entries if entry.get("unread")]
+    shown = entries if limit is None else entries[:limit]
+    omitted = entries[len(shown):]
+    # Unread mail the window omitted: reported, never silently cleared.
+    more_unread: Dict[str, int] = {}
+    for entry in omitted:
+        if entry.get("unread"):
+            destination = str(entry.get("destination") or "")
+            more_unread[destination] = more_unread.get(destination, 0) + 1
     if _json_mode(args):
-        _emit({"messages": entries, "count": len(entries)}, True)
-        return _EXIT_OK
-    if not entries:
-        print("No messages received yet.")
-        return _EXIT_OK
-    for entry in entries:
-        peer = registry.get(entry.get("destination") or "")
-        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
-        sender = short_hash(str(entry.get("destination") or ""))
-        when = _format_message_time(float(entry.get("received_at", 0)))
-        print(f"[{when}] {name} ({sender})")
-        for line in str(entry.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
+        _emit(
+            {"messages": shown, "count": len(shown), "more_unread": more_unread},
+            True,
+        )
+    elif not shown:
+        if more_unread:
+            _print_more_unread(registry, more_unread)
+        else:
+            print(
+                "No unread messages." if unread_only else "No messages received yet."
+            )
+    else:
+        for entry in shown:
+            peer = registry.get(entry.get("destination") or "")
+            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+            sender = short_hash(str(entry.get("destination") or ""))
+            when = _format_message_time(float(entry.get("received_at", 0)))
+            marker = "● " if entry.get("unread") else ""
+            # The short id is what `tau react` takes: without it the
+            # listing gives the user no way to name a message to react to.
+            message_id = entry.get("id")
+            id_suffix = (
+                f" #{_safe_id_prefix(str(message_id))}"
+                if isinstance(message_id, str) and message_id
+                else ""
+            )
+            group_suffix = ""
+            if entry.get("kind") == "group":
+                group_suffix = f" in {entry.get('group_name') or 'group'}"
+            print(f"{marker}[{when}] {name} ({sender}){id_suffix}{group_suffix}")
+            if entry.get("kind") == "file":
+                print(
+                    f"  file: {entry.get('name')} "
+                    f"({entry.get('size')} bytes, "
+                    f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
+                )
+                print(f"  saved to {entry.get('path')}")
+                continue
+            quote = _quote_line(inbox, registry, entry)
+            if quote is not None:
+                print(f"  {quote}")
+            for line in str(entry.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
+            for reaction in entry.get("reactions") or []:
+                reactor = registry.get(str(reaction.get("destination") or ""))
+                reactor_name = (
+                    reactor.display_name
+                    if reactor is not None
+                    else str(reaction.get("from") or "unknown")
+                )
+                print(f"  {reaction.get('reaction')} {reactor_name}")
+            entry_expires_at = entry.get("expires_at")
+            if isinstance(entry_expires_at, (int, float)) and float(
+                entry_expires_at
+            ) > time.time():
+                print(
+                    f"  disappears in {_ago(float(entry_expires_at) - time.time())}"
+                )
+        if more_unread:
+            _print_more_unread(registry, more_unread)
+    # Reading a conversation advances its cursor to the newest message
+    # just shown, so the next listing only flags what arrived since.  A
+    # conversation with unread mail omitted by --limit is left alone:
+    # a cursor past the newest shown message would silently clear it.
+    partially_listed = {
+        str(entry.get("destination") or "")
+        for entry in omitted
+        if entry.get("unread")
+    }
+    newest_shown: Dict[str, int] = {}
+    for entry in shown:
+        destination = str(entry.get("destination") or "")
+        if destination in partially_listed:
+            continue
+        newest_shown[destination] = max(
+            newest_shown.get(destination, 0), int(entry["seq"])
+        )
+    for destination, up_to_seq in newest_shown.items():
+        inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
+    # Listing a DM is reading it: send the sender a receipt, unless
+    # this node opted out.  Best-effort — failures stay silent.
+    outcome = _send_displayed_receipts(config, inbox, shown)
+    if not _json_mode(args) and (outcome["sent"] or outcome["queued"]):
+        parts = []
+        if outcome["sent"]:
+            parts.append(f"{outcome['sent']} peer(s) told their message was read")
+        if outcome["queued"]:
+            parts.append(
+                f"{outcome['queued']} peer(s) unreachable — receipt queued"
+            )
+        print(f"  ({'; '.join(parts)})")
     return _EXIT_OK
+
+
+
+def _describe_group(
+    group: Dict[str, Any], registry: PeerRegistry
+) -> Dict[str, Any]:
+    """A group record with member display names for output."""
+    members = []
+    for member_hash in group["members"]:
+        peer = registry.get(member_hash)
+        members.append(
+            {
+                "hash": member_hash,
+                "name": peer.display_name if peer is not None else member_hash[:8],
+            }
+        )
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "members": members,
+        "created_at": group["created_at"],
+        "created_by": group["created_by"],
+    }
+
+
+def cmd_group_create(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        members: List[str] = [own_hash]
+        for target in getattr(args, "peer", []):
+            peer = node.resolve_peer(
+                target,
+                timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+            if peer.hexhash == own_hash:
+                raise NodeError("the creator is already a member; drop --peer self")
+            if peer.hexhash not in members:
+                members.append(peer.hexhash)
+        if len(members) < 2:
+            raise NodeError("a group needs at least one other peer")
+        group = node.groups.create(
+            getattr(args, "name"), members, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described}, True)
+        return _EXIT_OK
+    print(f"created group {group['name']} ({group['id'][:8]})")
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the group from the first message sent to it.")
+    return _EXIT_OK
+
+
+def cmd_group_list(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    registry = PeerRegistry(config.peers_path)
+    groups = [_describe_group(group, registry) for group in store.list_groups()]
+    if _json_mode(args):
+        _emit({"groups": groups, "count": len(groups)}, True)
+        return _EXIT_OK
+    if not groups:
+        print("No groups yet — create one with `tau group create NAME --peer ...`.")
+        return _EXIT_OK
+    for group in groups:
+        names = ", ".join(member["name"] for member in group["members"])
+        print(f"{group['name']} ({group['id'][:8]}) — {names}")
+    return _EXIT_OK
+
+
+def cmd_group_delete(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    if not store.delete(group["id"]):
+        raise NodeError(f"unknown group: {args.group!r}")
+    if _json_mode(args):
+        _emit({"deleted": group["id"], "name": group["name"]}, True)
+        return _EXIT_OK
+    print(f"deleted group {group['name']} ({group['id'][:8]})")
+    return _EXIT_OK
+
+
+def cmd_group_send(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    config = _make_config(args)
+    delivered_ids: Set[str] = set()
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        response = node.send_group_message(
+            group,
+            text,
+            timeout=float(getattr(args, "timeout", 20.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            queue=not getattr(args, "no_queue", False),
+        )
+        # One-shot send: give reachable members a brief chance to take
+        # a queued leg before this process exits.
+        if any(result.get("queued") for result in response["results"]):
+            node.flush_outbox(timeout=3.0, max_peers=5)
+            for result in response["results"]:
+                if not result.get("queued"):
+                    continue
+                # Only a delivery acknowledgement counts as delivered; an
+                # entry that merely vanished was cancelled, expired, or
+                # taken by another process.
+                if result["id"] in delivered_ids:
+                    result["queued"] = False
+                    result["delivered"] = True
+                elif node.mailbox.get_outbox(result["id"]) is None:
+                    result["queued"] = False
+                    result["ok"] = False
+                    result["error"] = "left the outbox without a delivery confirmation"
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered") and not r.get("queued")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    delivered = [r for r in response["results"] if r.get("delivered")]
+    queued = [r for r in response["results"] if r.get("queued")]
+    failed = failed_legs
+    for result in delivered:
+        print(f"delivered to {result.get('to_name') or result['to'][:8]}")
+    for result in queued:
+        print(
+            f"queued for {result.get('to_name') or result['to'][:8]}"
+            " — they are unreachable right now"
+        )
+    for result in failed:
+        print(
+            f"failed for {result.get('to_name') or result['to'][:8]}:"
+            f" {result.get('error') or 'unknown error'}"
+        )
+    return exit_code
+
+
+
+def cmd_react(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "clear", False)) == bool(getattr(args, "reaction", None)):
+        raise NodeError("give a reaction, or --clear to retract it (not both)")
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to react to")
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known sender to react to")
+    if getattr(args, "clear", False):
+        token = ""
+    else:
+        # Validate the token before starting the node: a bad token is a
+        # usage error, not a delivery failure.  A blank argument cleans to
+        # the retraction token, so reject it unless --clear was given.
+        token = clean_reaction(str(args.reaction))
+        if not token:
+            raise NodeError("reaction is empty; use --clear to retract it")
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        try:
+            response = node.send_reaction(
+                author,
+                str(target["id"]),
+                token,
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        except NodeError as exc:
+            # Reactions ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver reaction: {exc} "
+                "(reactions need the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "reaction": token,
+                "cleared": not token,
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif not token:
+        print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    else:
+        print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
+def _print_more_unread(
+    registry: PeerRegistry, more_unread: Dict[str, int]
+) -> None:
+    """Hint lines for unread mail a limited listing did not show."""
+    for destination, count in sorted(more_unread.items()):
+        peer = registry.get(destination)
+        name = peer.display_name if peer is not None else "unknown"
+        print(
+            f"{count} more unread from {name} ({short_hash(destination)})"
+            " — raise --limit to see them."
+        )
+
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
-    """First *length* characters of *ref* with control characters dropped.
+    """First *length* printable characters of *ref*.
 
     Held ids arrive from remote senders and may contain terminal escapes
     or newlines; never print them verbatim. JSON output keeps the raw id.
+    Non-printable characters are dropped from the full id first, then
+    the result is truncated — so the tag is always a true prefix of the
+    stored id that ``Inbox.resolve`` can match.
     """
-    return "".join(char for char in ref[:length] if char.isprintable())
+    cleaned = "".join(char for char in ref if char.isprintable())
+    return cleaned[:length]
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:
@@ -2393,13 +4449,31 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
     mailbox = Mailbox(config.mailbox_path)
     registry = PeerRegistry(config.peers_path)
     envelopes = mailbox.held_list()
+    usage = mailbox.held_usage()
+
+    def describe_sender(row: Dict[str, Any]) -> Dict[str, Any]:
+        sender = row["sender"]
+        peer = registry.get(bytes.fromhex(sender)) if sender else None
+        return {
+            "sender": sender,
+            "name": peer.display_name if peer is not None else "",
+            "count": row["count"],
+            "bytes": row["bytes"],
+        }
 
     def describe(envelope: Any) -> Dict[str, Any]:
         peer = registry.get(envelope.to)
+        sender_peer = (
+            registry.get(bytes.fromhex(envelope.depositor))
+            if envelope.depositor
+            else None
+        )
         return {
             "id": envelope.id,
             "to": envelope.to_hex,
             "to_name": peer.display_name if peer is not None else "",
+            "from": envelope.depositor,
+            "from_name": sender_peer.display_name if sender_peer is not None else "",
             "stored_at": envelope.stored_at,
             "expires_at": envelope.expires_at,
             "blob_bytes": len(envelope.blob),
@@ -2407,7 +4481,11 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
 
     if _json_mode(args):
         _emit(
-            {"held": [describe(e) for e in envelopes], "count": len(envelopes)},
+            {
+                "held": [describe(e) for e in envelopes],
+                "count": len(envelopes),
+                "senders": [describe_sender(row) for row in usage],
+            },
             True,
         )
     else:
@@ -2433,6 +4511,35 @@ def cmd_outbox_held(args: argparse.Namespace) -> int:
             for row in rows:
                 print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
             print(f"\n{len(envelopes)} sealed message(s) held for other peers.")
+        if usage:
+            print("\nHeld per sender:")
+            sender_header = ("SENDER", "NAME", "COUNT", "BYTES")
+            sender_rows: List[tuple] = [sender_header]
+            for row in usage:
+                peer = (
+                    registry.get(bytes.fromhex(row["sender"]))
+                    if row["sender"]
+                    else None
+                )
+                sender_rows.append(
+                    (
+                        row["sender"] if row["sender"] else "unknown",
+                        peer.display_name if peer is not None else "-",
+                        str(row["count"]),
+                        str(row["bytes"]),
+                    )
+                )
+            sender_widths = [
+                max(len(row[i]) for row in sender_rows)
+                for i in range(len(sender_header))
+            ]
+            for row in sender_rows:
+                print(
+                    "  ".join(
+                        value.ljust(sender_widths[i])
+                        for i, value in enumerate(row)
+                    )
+                )
     return _EXIT_OK
 
 
@@ -2560,9 +4667,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
     # expired, or delivered by another process — never counted delivered.
     queued_before = {e.id: e for e in mailbox.outbox_list()}
     delivered_ids: Set[str] = set()
-    node = TauNode(
-        config, name=config.name, on_delivered=delivered_ids.add
-    )
+    node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start(mail_loop=False)
     try:
         summary = node.flush_outbox(
@@ -2657,7 +4762,9 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 next_text = "now"
             else:
                 next_text = f"in {_ago(next_try - time.time())}"
-            print(f"still queued: {label} (attempt {fresh.attempts}, next try {next_text})")
+            print(
+                f"still queued: {label} (attempt {fresh.attempts}, next try {next_text})"
+            )
             if deposited:
                 print(
                     f"  left a sealed copy with {deposited} peer(s)"
@@ -2700,6 +4807,55 @@ def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
         return clean_destination(value)
     except AllowListError:
         raise AllowListError(f"unknown peer or destination: {value!r}") from None
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show or change this node's own settings (stored in node.json)."""
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    command = getattr(args, "config_command", None)
+
+    if command == "accept-files":
+        enabled = getattr(args, "state", "on") == "on"
+        set_node_setting(config.data_dir, "accept_files", enabled)
+        state = "on" if enabled else "off"
+        if json_output:
+            _emit({"accept_files": enabled}, True)
+        else:
+            print(f"Accept files: {state}")
+            if not enabled:
+                print("  this node refuses file transfers unless the sender")
+                print("  is on its DM allow-list")
+        return _EXIT_OK
+
+    if command == "read-receipts":
+        enabled = getattr(args, "state", "on") == "on"
+        set_node_setting(config.data_dir, "send_read_receipts", enabled)
+        state = "on" if enabled else "off"
+        if json_output:
+            _emit({"send_read_receipts": enabled}, True)
+        else:
+            print(f"Read receipts: {state}")
+            if not enabled:
+                print("  this node will not send read receipts; senders see")
+                print("  its messages as delivered, never read")
+        return _EXIT_OK
+
+    settings = {
+        "accept_files": accept_files_enabled(config.data_dir),
+        "send_read_receipts": send_read_receipts_enabled(config.data_dir),
+    }
+    if json_output:
+        _emit(settings, True)
+    else:
+        accept_state = "on" if settings["accept_files"] else "off"
+        receipts_state = "on" if settings["send_read_receipts"] else "off"
+        print(f"Settings ({config.data_dir / 'node.json'}):")
+        print(f"  accept files: {accept_state}")
+        print(f"  send read receipts: {receipts_state}")
+        print("  change with: tau config accept-files on|off")
+        print("  change with: tau config read-receipts on|off")
+    return _EXIT_OK
 
 
 def cmd_allowlist(args: argparse.Namespace) -> int:
@@ -2755,6 +4911,82 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
         if not allowlist.allow:
             print("  no senders listed — when enforced, nobody may message this node")
         for entry in sorted(allowlist.allow):
+            peer = registry.get(entry)
+            name = f" ({peer.display_name})" if peer is not None else ""
+            print(f"  {entry}{name}")
+        if changed:
+            print("  (a running serve applies saved changes when it restarts)")
+    return _EXIT_OK
+
+
+def cmd_block(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    try:
+        blocklist = load_blocklist(config.blocklist_path)
+    except BlockListError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+
+    # Forms: `tau block <peer>` blocks, `tau unblock <peer>` unblocks,
+    # `tau block list` lists, and `tau block add/remove <peer>` keep
+    # working as the allow-list-shaped aliases.  A peer literally
+    # named "list", "add" or "remove" is blocked via `block add <name>`.
+    command = getattr(args, "block_command", None)
+    target = getattr(args, "target", None)
+    peer_arg = getattr(args, "peer", None)
+    registry = PeerRegistry(config.peers_path)
+    changed = False
+
+    if command == "remove":
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination in blocklist.blocked:
+            blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif target in (None, "list") and peer_arg is None:
+        pass  # list
+    elif target == "add":
+        if peer_arg is None:
+            raise NodeError("`tau block add` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination not in blocklist.blocked:
+            blocklist = blocklist.with_added(destination)
+            changed = True
+    elif target == "remove":
+        if peer_arg is None:
+            raise NodeError("`tau block remove` needs a peer")
+        destination = _resolve_allowlist_peer(registry, peer_arg)
+        if destination in blocklist.blocked:
+            blocklist = blocklist.with_removed(destination)
+            changed = True
+    elif peer_arg is not None:
+        raise NodeError(f"unexpected argument: {peer_arg!r}")
+    else:
+        destination = _resolve_allowlist_peer(registry, target)
+        if destination not in blocklist.blocked:
+            blocklist = blocklist.with_added(destination)
+            changed = True
+
+    if changed:
+        save_blocklist(config.blocklist_path, blocklist)
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    if json_output:
+        payload = blocklist.to_dict()
+        payload["entries"] = [describe(value) for value in sorted(blocklist.blocked)]
+        payload["path"] = str(config.blocklist_path)
+        _emit(payload, True)
+    else:
+        print(f"Block-list ({config.blocklist_path}):")
+        if not blocklist.blocked:
+            print("  nobody blocked")
+        for entry in sorted(blocklist.blocked):
             peer = registry.get(entry)
             name = f" ({peer.display_name})" if peer is not None else ""
             print(f"  {entry}{name}")
@@ -2838,3 +5070,67 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
+
+
+def _cmd_messages_sent(
+    args: argparse.Namespace,
+    config: TauConfig,
+    registry: PeerRegistry,
+    limit: Optional[int],
+) -> int:
+    """List messages this node sent, with their read state."""
+    mailbox = Mailbox(config.mailbox_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_sent_peer(registry, args.peer)
+    entries = mailbox.sent_list()
+    if peer_hash is not None:
+        entries = [entry for entry in entries if entry.get("to") == peer_hash]
+    entries.reverse()  # newest first
+    if limit is not None:
+        entries = entries[: max(0, limit)]
+    queued_ids = {entry.id for entry in mailbox.outbox_list()}
+
+    def describe(entry: Dict[str, Any]) -> Dict[str, Any]:
+        peer = registry.get(entry.get("to") or "")
+        read_at = entry.get("read_at")
+        # ``delivered_at`` is set only once a delivery was confirmed.  Records
+        # from before it was tracked have no such key and count as delivered.
+        delivered_at = entry.get("delivered_at", entry.get("sent_at"))
+        if entry["id"] in queued_ids:
+            state = "queued"
+        elif read_at is not None:
+            state = "read"
+        elif delivered_at is not None:
+            state = "delivered"
+        else:
+            # Cancelled or expired before any delivery was confirmed.
+            state = "unknown"
+        return {
+            "id": entry["id"],
+            "to": entry.get("to"),
+            "to_name": peer.display_name if peer is not None else "",
+            "text": entry.get("text", ""),
+            "sent_at": entry.get("sent_at"),
+            "read_at": read_at,
+            "state": state,
+        }
+
+    described = [describe(entry) for entry in entries]
+    if _json_mode(args):
+        _emit({"messages": described, "count": len(described)}, True)
+        return _EXIT_OK
+    if not described:
+        print("No messages sent yet.")
+        return _EXIT_OK
+    for entry in described:
+        name = entry["to_name"] or short_hash(entry["to"] or "")
+        when = _format_message_time(float(entry.get("sent_at") or 0))
+        if entry["state"] == "read":
+            state = f"read {_format_message_time(float(entry['read_at'] or 0))}"
+        else:
+            state = entry["state"]
+        print(f"[{when}] to {name} — {state}")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
