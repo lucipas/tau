@@ -61,6 +61,10 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Verification time the console last applied per peer. Peer events
+  // queued before a successful verify carry the older trust state and
+  // must not undo the badge.
+  const localVerifiedAt = useRef<Record<string, number | null>>({});
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -92,6 +96,7 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
+      localVerifiedAt.current = {};
       setPeers(sortPeers(snapshot.peers));
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
@@ -309,6 +314,7 @@ export function useTau() {
         target: destination,
       });
       const verify = result.verify;
+      localVerifiedAt.current[destination] = verify.verified_at;
       setVerifications((previous) => ({
         ...previous,
         [destination]: { result: verify },
