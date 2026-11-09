@@ -282,6 +282,8 @@ Global options may appear before or after the command:
 | `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
 | `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
 | `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
+| `tau send-file --to PEER PATH` | Send a small file (at most 10 MiB) over an RNS Resource on a direct link |
+| `tau config accept-files on\|off` | Opt in or out of receiving files (off by default) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
@@ -354,6 +356,18 @@ echo "piped message" | tau send --to alice
 
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
+
+# Send a small file (at most 10 MiB) over a direct link. The receiver
+# first gets a signed offer (name, size, SHA-256) and may refuse it;
+# files are never queued and never stored-and-forwarded. A node only
+# accepts files when its owner opted in — or when the sender is on
+# its DM allow-list — and received files land in
+# <data-dir>/files/<sender>/, verified against the offered hash.
+# The opt-in runs on the RECEIVER's node, not the sender's:
+tau config accept-files on
+
+# Then, from the sender's node:
+tau send-file --to alice photo.png
 
 # Send the same message to several peers (one message id per recipient)
 tau send --to alice --to bob "hi"
@@ -847,8 +861,12 @@ unlinked, and stall sync at the gap.
   in `tau peers` and the console until you re-verify it out of band
   (`tau peers verify`).
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
-- Natural extensions: group destinations, file transfer using Reticulum
-  resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
+- File transfer is direct links only: a file goes over an RNS Resource
+  after a signed offer, at most 10 MiB, and only to a node that opted
+  in (or allow-listed the sender). There is no store-and-forward for
+  files yet — the recipient must be online — and no resume: a failed
+  transfer restarts from the beginning.
+- Natural extensions: group destinations, allow-lists, typed messages, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
   (media, moderation, follow recommendations).
 - LXMF addressing is in place: every peer's LXMF delivery address is

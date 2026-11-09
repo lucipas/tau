@@ -8,6 +8,8 @@ encrypted Reticulum ``Link``:
     /tau/ping     -> liveness and clock information
     /tau/info     -> static node information
     /tau/message  -> deliver a text message, echo it back
+    /tau/file     -> offer a small file transfer (signed header first;
+                    the bytes follow over an RNS Resource on the same link)
     /tau/peers    -> ask a peer which peers it has heard from; the answer
                     carries each peer's public key, so the receiver can verify
                     the key derives the reported destination hash (peer exchange)
@@ -56,9 +58,17 @@ MAX_MAIL_REQUEST_BYTES = 24 * 1024
 MAX_MAIL_BLOB_BYTES = 12 * 1024
 MAX_MAIL_TTL = 30 * 24 * 60 * 60
 
+# File transfer: one small file per transfer, direct links only (no
+# store-and-forward in v1).  The receiver verifies the SHA-256 of the
+# assembled bytes against the signed offer, so the cap also bounds how
+# much an accepted-but-spoofed advertisement can make a node buffer.
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_FILE_NAME_LENGTH = 255
+
 REQUEST_PING = "/tau/ping"
 REQUEST_INFO = "/tau/info"
 REQUEST_MESSAGE = "/tau/message"
+REQUEST_FILE = "/tau/file"
 REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
 REQUEST_PEERS = "/tau/peers"
@@ -68,6 +78,7 @@ REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
     REQUEST_MESSAGE,
+    REQUEST_FILE,
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_PEERS,
@@ -163,7 +174,7 @@ def build_announce(name: str) -> bytes:
         "v": PROTOCOL_VERSION,
         "name": sanitize_name(name),
         "proto": APP_NAME,
-        "caps": ["message", "ping", "peers", "mail", "read"],
+        "caps": ["message", "ping", "peers", "mail", "file", "read"],
     }
     data = encode(payload)
     # Reticulum announces have a very small payload budget.  Shorten the name
@@ -578,6 +589,177 @@ def parse_read_receipt(
     return {
         "ids": cleaned_ids,
         "read_at": float(read_at),
+        "from": claimed_from.lower(),
+    }
+
+
+def sanitize_file_name(name: Any) -> str:
+    """Reduce *name* to a safe bare file name, or ``""`` when unusable.
+
+    Only the final path component survives — a sender cannot smuggle
+    in ``../`` or an absolute path — control characters are dropped
+    and the result is capped at :data:`MAX_FILE_NAME_LENGTH`.
+    """
+    if not isinstance(name, str):
+        return ""
+    cleaned = "".join(char for char in name if char.isprintable())
+    cleaned = cleaned.replace("\\", "/").split("/")[-1].strip()
+    if cleaned in ("", ".", ".."):
+        return ""
+    return cleaned[:MAX_FILE_NAME_LENGTH]
+
+
+def build_file_offer(
+    sender_identity: Any,
+    *,
+    transfer_id: str,
+    to: str,
+    name: str,
+    size: int,
+    sha256: str,
+    sent_at: Optional[float] = None,
+) -> bytes:
+    """Encode a signed file offer for the ``/tau/file`` request.
+
+    The offer is the receiver's chance to refuse before any bytes
+    move: it names the file, its size and its SHA-256, and carries the
+    sender's public key plus a signature over every other field, so
+    the receiver can authenticate the offer without trusting the link
+    alone.  It also names its intended recipient (``to``): a signed
+    offer captured by one peer cannot be replayed to another, because
+    the receiver only honors offers addressed to itself.  The transfer
+    itself follows as an RNS Resource whose metadata is the transfer
+    id, and the receiver re-checks the hash once the bytes are
+    assembled.
+    """
+    clean_name = sanitize_file_name(name)
+    if not clean_name:
+        raise ProtocolError("file name must not be empty")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise ProtocolError("file size must be an integer")
+    if size < 1 or size > MAX_FILE_BYTES:
+        raise ProtocolError(
+            f"file of {size} bytes exceeds the {MAX_FILE_BYTES} byte limit"
+        )
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ProtocolError("sha256 must be a 64 character hex digest")
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise ProtocolError("sha256 must be a 64 character hex digest") from exc
+    sender_hash = RNS.Destination.hash(sender_identity, APP_NAME, ASPECT).hex()
+    payload: Dict[str, Any] = {
+        "type": "file_offer",
+        "v": PROTOCOL_VERSION,
+        "id": _clean_message_id(transfer_id),
+        "to": _clean_hexhash(to, "to"),
+        "name": clean_name,
+        "size": size,
+        "sha256": sha256.lower(),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "from": sender_hash,
+        "from_key": sender_identity.get_public_key().hex(),
+    }
+    signature = sender_identity.sign(encode(payload))
+    if signature is None:  # pragma: no cover - identity without private keys
+        raise ProtocolError("sender identity cannot sign")
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+
+
+def parse_file_offer(
+    raw: Any,
+    *,
+    remote_identity: Optional[Any] = None,
+    expected_recipient: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate a signed ``/tau/file`` request body.
+
+    Verifies the signature against the carried public key, checks the
+    key derives the claimed sender hash, and — when the link supplied
+    an identity — checks that identity is the claimed sender too.  The
+    offer must also name its intended recipient: when
+    ``expected_recipient`` is given, an offer addressed to anyone
+    else is rejected, so a signed offer captured by one peer cannot
+    be replayed to another.  A forged, oversized, badly named or
+    misaddressed offer is rejected outright; the receiver still
+    re-checks the assembled bytes against ``sha256`` after the
+    transfer.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "file_offer":
+        raise ProtocolError("expected a file_offer payload")
+    transfer_id = _clean_message_id(payload.get("id"))
+    to = _clean_hexhash(payload.get("to"), "to")
+    if expected_recipient is not None and to != expected_recipient.lower():
+        raise ProtocolError("file offer is addressed to another node")
+    name = payload.get("name")
+    if not isinstance(name, str) or sanitize_file_name(name) != name:
+        raise ProtocolError("file name is not a safe bare file name")
+    size = payload.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise ProtocolError("file size must be an integer")
+    if size < 1 or size > MAX_FILE_BYTES:
+        raise ProtocolError(
+            f"file of {size} bytes exceeds the {MAX_FILE_BYTES} byte limit"
+        )
+    sha256 = payload.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ProtocolError("sha256 must be a 64 character hex digest")
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise ProtocolError("sha256 must be a 64 character hex digest") from exc
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+
+    signature_text = payload.get("sig")
+    if not isinstance(signature_text, str):
+        raise ProtocolError("file offer is missing its signature")
+    try:
+        signature = base64.b64decode(signature_text, validate=True)
+    except ValueError as exc:
+        raise ProtocolError("file offer signature is not valid base64") from exc
+    from_key = payload.get("from_key")
+    if not isinstance(from_key, str):
+        raise ProtocolError("file offer is missing its sender key")
+    try:
+        sender_key = bytes.fromhex(from_key)
+    except ValueError as exc:
+        raise ProtocolError("file offer sender key is not hex") from exc
+    if len(sender_key) != 64:
+        raise ProtocolError("file offer sender key has the wrong length")
+    sender = RNS.Identity(create_keys=False)
+    if sender.load_public_key(sender_key) is False or sender.hash is None:
+        raise ProtocolError("could not load the sender public key")
+    claimed_from = payload.get("from")
+    if (
+        not isinstance(claimed_from, str)
+        or RNS.Destination.hash(sender, APP_NAME, ASPECT).hex()
+        != claimed_from.lower()
+    ):
+        raise ProtocolError("sender key does not match the claimed sender")
+    if remote_identity is not None:
+        if (
+            RNS.Destination.hash(remote_identity, APP_NAME, ASPECT).hex()
+            != claimed_from.lower()
+        ):
+            raise ProtocolError("file offer sender does not match the link")
+    unsigned = {k: v for k, v in payload.items() if k != "sig"}
+    try:
+        verified = sender.validate(signature, encode(unsigned))
+    except Exception as exc:
+        raise ProtocolError(f"could not verify file offer: {exc}") from exc
+    if not verified:
+        raise ProtocolError("file offer signature does not verify")
+    return {
+        "id": transfer_id,
+        "to": to,
+        "name": name,
+        "size": size,
+        "sha256": sha256.lower(),
+        "sent_at": sent_at,
         "from": claimed_from.lower(),
     }
 

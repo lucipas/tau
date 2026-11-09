@@ -74,9 +74,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     record from the inbox.  ``received_at`` is node-generated, so a
     non-finite value there means a corrupt file and the entry is
     skipped instead.
+
+    File records (``kind == "file"``) carry no text: they describe a
+    received file by name, size, SHA-256 and where it was saved.
     """
     if not isinstance(raw, dict):
         return None
+    if raw.get("kind") == "file":
+        return _valid_file_record(raw)
     text = raw.get("text")
     if not isinstance(text, str) or not text:
         return None
@@ -290,6 +295,62 @@ def merge_reaction(items: List[Dict[str, Any]], entry: Dict[str, Any]) -> bool:
             break
     items.append(entry)
     return True
+
+
+def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a received-file record, or ``None`` when unusable."""
+    from .protocol import sanitize_file_name
+
+    name = raw.get("name")
+    if not isinstance(name, str) or sanitize_file_name(name) != name:
+        return None
+    size = raw.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        return None
+    sha256 = raw.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        return None
+    try:
+        bytes.fromhex(sha256)
+    except ValueError:
+        return None
+    path = raw.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        sent_at = float(raw.get("sent_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    received_at = raw.get("received_at")
+    try:
+        received_at = float(received_at) if received_at is not None else time.time()
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sent_at):
+        sent_at = 0.0
+    if not math.isfinite(received_at):
+        return None
+    # File records are always received: main's direction tracking
+    # (added after this feature branched) defaults text records to
+    # "in" the same way, and `list_messages` only shows "in" by
+    # default — without it a received file never lists.
+    seq = raw.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+        seq = None
+    return {
+        "kind": "file",
+        "from": str(raw.get("from") or "unknown"),
+        "destination": str(raw.get("destination") or ""),
+        "name": name,
+        "size": size,
+        "sha256": sha256.lower(),
+        "path": path,
+        "sent_at": sent_at,
+        "received_at": received_at,
+        "id": raw.get("id"),
+        "direction": "in",
+        "seq": seq,
+    }
 
 
 class Inbox:
