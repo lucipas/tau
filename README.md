@@ -363,7 +363,10 @@ tau send --to alice "hi" --no-queue
 # accepts files when its owner opted in — or when the sender is on
 # its DM allow-list — and received files land in
 # <data-dir>/files/<sender>/, verified against the offered hash.
+# The opt-in runs on the RECEIVER's node, not the sender's:
 tau config accept-files on
+
+# Then, from the sender's node:
 tau send-file --to alice photo.png
 
 # Send the same message to several peers (one message id per recipient)
