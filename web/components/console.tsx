@@ -23,6 +23,20 @@ export function Console() {
       setMode("custom");
       return;
     }
+    // A refresh can remove the selected group: never keep submitting its
+    // stale id. Fall back to a remaining group, then to a peer.
+    if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
+      if (tau.groups.length > 0) {
+        setTarget(tau.groups[0].id);
+      } else if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      return;
+    }
     if (!target && !customPicked.current) {
       if (tau.peers.length > 0) {
         setMode("peer");
@@ -32,7 +46,7 @@ export function Console() {
         setTarget(tau.groups[0].id);
       }
     }
-  }, [tau.peers, tau.groups, target]);
+  }, [tau.peers, tau.groups, target, mode]);
 
   function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
