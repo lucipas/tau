@@ -29,9 +29,15 @@ export function SocialConsole() {
     setError(null);
     try {
       if (quoteTarget) {
-        await tan.quote(quoteTarget.hash, text.trim());
-        setText("");
-        setQuoteTarget(null);
+        const submittedHash = quoteTarget.hash;
+        const submittedText = text.trim();
+        await tan.quote(submittedHash, submittedText);
+        // Clear only the composer state that still belongs to this quote, so
+        // a target or draft changed while the request was in flight survives.
+        setText((current) => (current.trim() === submittedText ? "" : current));
+        setQuoteTarget((current) =>
+          current?.hash === submittedHash ? null : current,
+        );
         return;
       }
       await tan.publish(text.trim(), replyTarget?.hash);
