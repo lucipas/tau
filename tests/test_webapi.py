@@ -2114,6 +2114,11 @@ def test_download_received_file(bridge, node, tmp_path):
         'attachment; filename="notes.txt"'
     )
     assert headers["Content-Length"] == str(len(data))
+    # A destination hash is case-insensitive: an uppercase sender is
+    # normalised to the same hash, not rejected.
+    status, _, body = _request(bridge, f"/api/files/{SENDER_HASH.upper()}/notes.txt")
+    assert status == 200
+    assert body == data
 
 
 def test_download_received_file_unknown_is_404(bridge, node, tmp_path):
