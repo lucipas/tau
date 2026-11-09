@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
@@ -17,15 +17,26 @@ export function MessageFeed({
   node,
   live,
   onReply,
+  searching,
+  searchQuery,
+  searchError,
+  onSearch,
+  onClearSearch,
 }: {
   messages: TauMessage[];
   node: NodeInfo | null;
   live: boolean;
   onReply?: (message: TauMessage) => void;
+  searching?: boolean;
+  searchQuery?: string | null;
+  searchError?: string | null;
+  onSearch?: (query: string) => Promise<unknown> | unknown;
+  onClearSearch?: () => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const [searchText, setSearchText] = useState("");
 
   const counts = useMemo(() => {
     let inbound = 0;
@@ -38,9 +49,11 @@ export function MessageFeed({
   }, [messages]);
 
   useEffect(() => {
-    if (!stickToBottom.current) return;
+    // Search results are newest first: sticking to the bottom would land
+    // on the oldest match, so only the live feed auto-scrolls.
+    if (searching || !stickToBottom.current) return;
     endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
-  }, [messages.length]);
+  }, [messages.length, searching]);
 
   function onScroll() {
     const element = scrollRef.current;
@@ -50,24 +63,79 @@ export function MessageFeed({
     stickToBottom.current = distance < 140;
   }
 
+  async function submitSearch() {
+    if (!searchText.trim() || !onSearch) return;
+    await onSearch(searchText.trim());
+  }
+
+  function clearSearch() {
+    setSearchText("");
+    onClearSearch?.();
+  }
+
   return (
     <section className="flex min-h-0 flex-1 flex-col rounded-2xl border border-line/80 bg-panel/40">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
         <div className="flex items-center gap-3">
-          <SectionLabel>traffic</SectionLabel>
+          <SectionLabel>{searching ? "search results" : "traffic"}</SectionLabel>
           <span className="font-mono text-[10px] text-mist">
-            {counts.inbound} in / {counts.outbound} out
+            {searching
+              ? `${messages.length} match(es)`
+              : `${counts.inbound} in / ${counts.outbound} out`}
           </span>
         </div>
-        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-mist">
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              live ? "bg-signal" : "bg-amber"
-            }`}
-          />
-          {live ? "streaming" : "waiting for bridge"}
-        </span>
+        <div className="flex items-center gap-2">
+          {searching && onClearSearch ? (
+            <button
+              type="button"
+              onClick={clearSearch}
+              className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
+            >
+              clear search
+            </button>
+          ) : null}
+          <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-mist">
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                live ? "bg-signal" : "bg-amber"
+              }`}
+            />
+            {live ? "streaming" : "waiting for bridge"}
+          </span>
+        </div>
       </div>
+
+      {onSearch ? (
+        <form
+          className="flex gap-2 border-b border-line/60 px-4 py-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitSearch();
+          }}
+        >
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="Search stored messages…"
+            spellCheck={false}
+            aria-label="Search stored messages"
+            className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+          />
+          <button
+            type="submit"
+            disabled={!searchText.trim()}
+            className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+          >
+            search
+          </button>
+        </form>
+      ) : null}
+
+      {searchError ? (
+        <p className="border-b border-line/60 px-4 py-2 font-mono text-[11px] text-rose-400">
+          {searchError}
+        </p>
+      ) : null}
 
       <div
         ref={scrollRef}
@@ -77,7 +145,11 @@ export function MessageFeed({
         className="thin-scroll min-h-[320px] flex-1 space-y-4 overflow-y-auto px-4 py-5 lg:max-h-[calc(100dvh-330px)]"
       >
         {messages.length === 0 ? (
-          <EmptyState node={node} />
+          searching ? (
+            <SearchEmptyState query={searchQuery ?? ""} />
+          ) : (
+            <EmptyState node={node} />
+          )
         ) : (
           messages.map((message) => (
             <MessageBubble
@@ -91,6 +163,23 @@ export function MessageFeed({
         <div ref={endRef} />
       </div>
     </section>
+  );
+}
+
+function SearchEmptyState({ query }: { query: string }) {
+  return (
+    <div className="flex h-full min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        τ
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No stored messages match “{query}”
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Search covers the text of stored messages, sent and received. Try a
+        different word, or clear the search to return to the live traffic.
+      </p>
+    </div>
   );
 }
 

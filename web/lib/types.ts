@@ -192,6 +192,11 @@ export interface TanFollow {
   last_post?: number;
 }
 
+export interface MessagesSearchResponse {
+  messages: TauMessage[];
+  count: number;
+}
+
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;

@@ -133,6 +133,7 @@ The same bridge is the local integration point for scripts:
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
 | `/api/messages` | GET | recent inbound/outbound messages |
+| `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |

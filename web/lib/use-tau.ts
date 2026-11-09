@@ -7,6 +7,7 @@ import type {
   BridgeInfo,
   CancelOutboxResponse,
   MarkReadResponse,
+  MessagesSearchResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
@@ -47,6 +48,13 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [messages, setMessages] = useState<TauMessage[]>([]);
+  // The search the feed is showing, or null for the live traffic. Kept
+  // beside `messages` so a search result list is never mixed into the
+  // live feed: new arrivals keep updating `messages` underneath, and
+  // clearing the search returns to it.
+  const [searchResults, setSearchResults] = useState<TauMessage[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
@@ -56,6 +64,11 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  const searchQueryRef = useRef(searchQuery);
+
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -306,10 +319,60 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  // A search is a view switch, like the Tan search: setting the query
+  // fetches the search endpoint instead of showing the live feed.
+  // Clearing it returns to the live traffic the same way.
+  const runSearch = useCallback(async (trimmed: string) => {
+    try {
+      const result = await apiGet<MessagesSearchResponse>(
+        `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
+      );
+      setSearchResults(result.messages);
+      setSearchError(null);
+    } catch (caught) {
+      setSearchError(
+        caught instanceof Error ? caught.message : "search failed",
+      );
+    }
+  }, []);
+
+  const search = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim();
+      if (!trimmed) return;
+      if (trimmed === searchQueryRef.current) {
+        // Resubmitting the current query: setting the same state would
+        // bail out without reloading, so refresh directly — and keep
+        // the current results instead of clearing them, or the feed
+        // would wrongly report no matches until the next message.
+        await runSearch(trimmed);
+        return;
+      }
+      // Drop hits from the previous query so they are not shown as matches
+      // for the new one while its request is in flight.
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchQuery(trimmed);
+      await runSearch(trimmed);
+    },
+    [runSearch],
+  );
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery(null);
+    setSearchResults([]);
+    setSearchError(null);
+  }, []);
+
   return {
     node,
     peers,
     messages,
+    searchResults,
+    searchQuery,
+    searchError,
+    search,
+    clearSearch,
     unread,
     outbox,
     heldForOthers,
