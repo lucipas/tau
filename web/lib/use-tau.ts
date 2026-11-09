@@ -14,6 +14,7 @@ import type {
   PingResult,
   SendResponse,
   Snapshot,
+  SocialInfo,
   TauMessage,
   UnreadCounts,
 } from "./types";
@@ -51,6 +52,7 @@ export function useTau() {
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
+  const [social, setSocial] = useState<SocialInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
   const [announcing, setAnnouncing] = useState(false);
@@ -94,6 +96,7 @@ export function useTau() {
       // cannot overwrite it.
       applyUnread(snapshot.unread ?? EMPTY_UNREAD, true);
       setBridge(snapshot.bridge);
+      setSocial(snapshot.social ?? null);
       setConnection("live");
     };
 
@@ -314,6 +317,7 @@ export function useTau() {
     outbox,
     heldForOthers,
     bridge,
+    social,
     connection,
     pings,
     announcing,

@@ -1,6 +1,6 @@
 "use client";
 
-import type { BridgeInfo, NodeInfo, Peer } from "@/lib/types";
+import type { BridgeInfo, NodeInfo, Peer, SocialInfo } from "@/lib/types";
 import type { PingState } from "@/lib/use-tau";
 import {
   formatAge,
@@ -16,6 +16,7 @@ export function PeerSidebar({
   node,
   peers,
   bridge,
+  social,
   pings,
   unread,
   selected,
@@ -25,6 +26,7 @@ export function PeerSidebar({
   node: NodeInfo | null;
   peers: Peer[];
   bridge: BridgeInfo | null;
+  social: SocialInfo | null;
   pings: Record<string, PingState>;
   unread: Record<string, number>;
   selected: string;
@@ -111,6 +113,46 @@ export function PeerSidebar({
                 ))
               )}
             </div>
+
+            {node.mailbox || node.lxmf || social ? (
+              <div className="mt-3 border-t border-line/60 pt-3">
+                <SectionLabel>stores</SectionLabel>
+                <dl className="mt-2 space-y-1.5 text-[11px]">
+                  {node.mailbox ? (
+                    <div className="flex items-baseline justify-between gap-2">
+                      <dt className="text-mist">mailbox</dt>
+                      <dd
+                        className="font-mono text-zinc-300"
+                        title={`${node.mailbox.seen} seen · ${node.mailbox.sent} sent · ${node.mailbox.receipts} receipts`}
+                      >
+                        {node.mailbox.outbox} queued · {node.mailbox.held}{" "}
+                        held
+                      </dd>
+                    </div>
+                  ) : null}
+                  {node.lxmf ? (
+                    <div className="flex items-baseline justify-between gap-2">
+                      <dt className="text-mist">lxmf</dt>
+                      <dd className="font-mono text-zinc-300">
+                        {node.lxmf.enabled
+                          ? `on · ${shortHash(node.lxmf.delivery, 10)}`
+                          : "off"}
+                      </dd>
+                    </div>
+                  ) : null}
+                  {social ? (
+                    <div className="flex items-baseline justify-between gap-2">
+                      <dt className="text-mist">tan</dt>
+                      <dd className="font-mono text-zinc-300">
+                        {social.enabled
+                          ? `${social.posts} post${social.posts === 1 ? "" : "s"} cached`
+                          : "off"}
+                      </dd>
+                    </div>
+                  ) : null}
+                </dl>
+              </div>
+            ) : null}
 
             {bridge ? (
               <div className="mt-3 border-t border-line/60 pt-3">

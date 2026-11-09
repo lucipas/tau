@@ -63,6 +63,29 @@ export interface InterfaceInfo {
   online: boolean;
 }
 
+// Mailbox counters from TauNode.info(): what the store-and-forward
+// layer is holding for this node and for other peers.
+export interface MailboxCounts {
+  outbox: number;
+  held: number;
+  seen: number;
+  sent: number;
+  receipts: number;
+}
+
+// LXMF store-and-forward state from TauNode.info().
+export interface LxmfInfo {
+  enabled: boolean;
+  delivery: string | null;
+}
+
+// Tan store state from the snapshot: whether Tan is enabled and how
+// many posts this node has cached locally.
+export interface SocialInfo {
+  enabled: boolean;
+  posts: number;
+}
+
 export interface NodeInfo {
   name: string;
   destination: string;
@@ -72,6 +95,10 @@ export interface NodeInfo {
   uptime: number;
   peers: number;
   interfaces: InterfaceInfo[];
+  // Absent on snapshots from an older bridge; the panel hides the
+  // store rows instead of guessing.
+  mailbox?: MailboxCounts;
+  lxmf?: LxmfInfo;
 }
 
 export interface Counts {
@@ -108,6 +135,8 @@ export interface Snapshot {
   counts: Counts;
   unread: UnreadCounts;
   bridge: BridgeInfo;
+  // Absent on snapshots from an older bridge.
+  social?: SocialInfo;
 }
 
 export interface PingResult {

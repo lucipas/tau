@@ -103,6 +103,7 @@ export function Console() {
             node={tau.node}
             peers={tau.peers}
             bridge={tau.bridge}
+            social={tau.social}
             pings={tau.pings}
             unread={tau.unread.per_peer}
             selected={target}
