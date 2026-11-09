@@ -423,6 +423,36 @@ def test_node_lxmf_delivery_drops_unreadable_content(fake_lxmf, tmp_path):
         node.stop()
 
 
+def test_node_lxmf_delivery_drops_invalid_utf8(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+
+        def _undecodable():
+            return b"\xff\xfe".decode("utf-8")  # raises UnicodeDecodeError
+
+        message.content_as_string = _undecodable
+        node.lxmf_router.delivery_callback(message)
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_long_hash_id_fits_wire_limit(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        message.hash = b"\xab" * 32  # full-length LXMF hash
+        node.lxmf_router.delivery_callback(message)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        assert len(stored[0]["id"]) <= 64
+    finally:
+        node.stop()
+
+
 def test_node_lxmf_delivery_dedupes_redelivery(fake_lxmf, tmp_path):
     node = _lxmf_node(tmp_path)
     _peer, sender = _lxmf_peer(node)

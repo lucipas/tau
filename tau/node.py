@@ -693,8 +693,19 @@ class TauNode:
         # A propagation copy can redeliver the same message after a
         # router restart, so dedupe on the LXMF hash exactly like the
         # DM path dedupes relayed copies on the tau message id.
-        message_id = f"lxmf:{bytes(message_hash).hex()}"
+        # Tau message ids are capped at 64 characters on the wire, so the
+        # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
+        # still collision-free in practice).
+        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
         if self.mailbox.is_seen(message_id):
+            log.info("Ignoring duplicate LXMF message %s", message_id)
+            return
+        if any(
+            entry.get("id") == message_id
+            for entry in self.inbox.list_messages(direction=None)
+        ):
+            # Stored earlier but interrupted before it was marked seen.
+            self.mailbox.mark_seen(message_id)
             log.info("Ignoring duplicate LXMF message %s", message_id)
             return
         try:
@@ -702,7 +713,6 @@ class TauNode:
         except (TypeError, ValueError):
             sent_at = 0.0
         received_at = time.time()
-        self.mailbox.mark_seen(message_id)
         record = {
             "from": sender.display_name,
             "destination": caller_hash,
@@ -719,7 +729,15 @@ class TauNode:
             caller_hash,
             text,
         )
-        self._record_received(record)
+        try:
+            self.inbox.append(record)
+        except Exception:
+            # Not stored, so leave it unseen: a redelivery can retry it.
+            log.warning(
+                "Could not record LXMF message %s", message_id, exc_info=True
+            )
+            return
+        self.mailbox.mark_seen(message_id)
         if self.on_message is not None:
             try:
                 self.on_message(record)
