@@ -136,7 +136,16 @@ class NodeError(RuntimeError):
     """Raised when a node operation fails."""
 
 
-class NotAllowedError(NodeError):
+class PeerRefusedError(NodeError):
+    """Raised when a peer explicitly refuses a request.
+
+    Distinct from transport failures: a refusal must never be retried
+    over another route (such as LXMF), since that bypasses the peer's
+    policy.
+    """
+
+
+class NotAllowedError(PeerRefusedError):
     """Raised when a peer explicitly rejects a request (allow-list denial).
 
     Distinct from other :class:`NodeError` failures so callers can tell
@@ -1578,6 +1587,17 @@ class TauNode:
         try:
             self._request(peer, REQUEST_MESSAGE, payload, timeout)
         except NodeError as exc:
+            # An explicit refusal (allow-list, block-list) is final: falling
+            # back to LXMF would deliver to the peer's separate destination
+            # and bypass the policy that refused it.  Only transport
+            # failures may try LXMF.
+            if isinstance(exc, PeerRefusedError) or not self._still_queued(
+                entry.id
+            ):
+                # A cancel may have landed while the direct request was in
+                # flight; do not start a fresh send for a cancelled entry.
+                self.mailbox.record_attempt(entry.id, error=str(exc))
+                return False
             if not self._deliver_via_lxmf(entry, timeout):
                 self.mailbox.record_attempt(entry.id, error=str(exc))
                 return False
@@ -2758,6 +2778,10 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "unavailable":
+                # The block-list drops silently with this generic code;
+                # it is still the peer's explicit refusal, not transport.
+                raise PeerRefusedError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
