@@ -1629,6 +1629,18 @@ class TauNode:
         """
         if self.lxmf_router is None or self.identity is None:
             return False
+        if entry.expires_at <= time.time() or (
+            entry.message_expires_at is not None
+            and entry.message_expires_at <= time.time()
+        ):
+            # The deadline passed while the direct request was in
+            # flight. The LXMF receiver carries no deadline, so an
+            # expired message must not go out over LXMF.
+            log.debug(
+                "Skipping LXMF send for expired queued message %s",
+                entry.id,
+            )
+            return False
         recipient = self.registry.get(entry.to)
         if recipient is None or not recipient.public_key:
             log.debug(

@@ -456,6 +456,34 @@ def test_deliver_entry_never_routes_a_refusal_over_lxmf(
     assert router.outbound == []
 
 
+def test_deliver_via_lxmf_skips_expired_message(tmp_path, fake_lxmf):
+    # A deadline that passes while the direct request is in flight must
+    # not be sent over LXMF: the LXMF receiver carries no deadline, so
+    # the copy would live in the recipient's inbox past its expiry.
+    node, peer, router = _lxmf_node(tmp_path)
+    router.outcome = "deliver"
+    entry = node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text="too late",
+        message_id="cc" + "5b" * 15,
+        expires_at=time.time() - 1.0,
+    )
+    assert node._deliver_via_lxmf(entry, timeout=1.0) is False
+    assert router.outbound == []
+
+    # Same for a message expiry alone: the queue entry is still live,
+    # but the sender-set deadline has passed.
+    live = node.mailbox.enqueue(
+        to=peer.destination_hash,
+        text="also too late",
+        message_id="cc" + "5c" * 15,
+        expires_at=time.time() + 3600.0,
+    )
+    live.message_expires_at = time.time() - 1.0
+    assert node._deliver_via_lxmf(live, timeout=1.0) is False
+    assert router.outbound == []
+
+
 def test_deliver_entry_falls_back_to_lxmf_when_direct_fails(
     tmp_path, monkeypatch, fake_lxmf
 ):
