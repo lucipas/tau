@@ -34,6 +34,7 @@ who can reach this API can send messages as this node.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import logging
 import math
@@ -1134,9 +1135,16 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         conn = self._tan_conn()
         try:
-            return import_entries(conn, document)
+            result = import_entries(conn, document)
         finally:
             conn.close()
+        # An invalid entry's hash comes from untrusted JSON and may hold a
+        # lone surrogate, which the UTF-8 response encoder cannot write.
+        # Replace unencodable characters so the counts still reach the console.
+        for error in result["errors"]:
+            error["hash"] = error["hash"].encode("utf-8", "replace").decode("utf-8")
+            error["error"] = error["error"].encode("utf-8", "replace").decode("utf-8")
+        return result
 
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
@@ -1815,6 +1823,18 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
+            # Bulk imports write many entries with no per-request quota, so
+            # they are accepted only from the local machine, even when the
+            # bridge is bound to a remote interface.
+            if path == "/api/tan/import" and not _is_loopback_client(
+                self.client_address[0]
+            ):
+                self._send_json(
+                    {"error": {"message": "tan import is only accepted from localhost"}},
+                    head_only,
+                    403,
+                )
+                return
             # An import carries a whole signed chain, so it gets a larger
             # body cap than a chat message or a single action.
             max_body = (
