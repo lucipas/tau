@@ -16,6 +16,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/following followed authors
+    GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
@@ -1022,6 +1023,49 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_likers(self, target: Any) -> Dict[str, Any]:
+        """List who liked one Tan post, newest like first.
+
+        Names resolve from the peer registry first, then from the name on
+        the liker's latest stored post; an author with no known name keeps
+        an empty name and the console falls back to the short hash. Only
+        author identities are exposed, never reaction contents.
+        """
+        from .tangents.tan import TanError, get_post, post_likers
+
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target is required")
+        clean = target.strip()
+        conn = self._tan_conn()
+        try:
+            if get_post(conn, clean) is None:
+                raise TanError(f"unknown post: {clean!r}")
+            likers = []
+            for entry in post_likers(conn, clean):
+                author = entry["author"]
+                name = ""
+                peer = self.node.registry.get(author)
+                if peer is not None:
+                    name = peer.display_name
+                if not name:
+                    row = conn.execute(
+                        "SELECT name FROM posts WHERE author = ? AND name != '' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (author,),
+                    ).fetchone()
+                    if row is not None:
+                        name = str(row["name"])
+                likers.append(
+                    {
+                        "author": author,
+                        "name": name,
+                        "liked_at": entry["liked_at"],
+                    }
+                )
+            return {"target": clean, "likers": likers, "count": len(likers)}
+        finally:
+            conn.close()
+
     def tan_follow(self, target: str) -> Dict[str, Any]:
         from .tangents.tan import follow, resolve_author
 
@@ -1744,6 +1788,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"following": records, "count": len(records)}, head_only
                 )
+                return
+            if path == "/api/tan/likes":
+                target = (query.get("target") or [None])[0]
+                try:
+                    payload = self.bridge.tan_likers(target)
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
                 return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)

@@ -202,6 +202,18 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanLiker {
+  author: string;
+  name: string;
+  liked_at: number;
+}
+
+export interface TanLikesResponse {
+  target: string;
+  likers: TanLiker[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;

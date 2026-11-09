@@ -1017,6 +1017,36 @@ def like_counts(
     return result
 
 
+def post_likers(
+    conn: sqlite3.Connection, target: str
+) -> List[Dict[str, Any]]:
+    """Return the likers of one post, newest like first.
+
+    Each entry is ``{"author": <hex>, "liked_at": <created_at>}``. Only
+    linked reactions count and the latest entry per reactor wins, so an
+    ``unlike`` after a ``like`` removes that author. A target with no
+    reactions (or no stored post at all) yields an empty list.
+    """
+    clean = _require_hex(target, HASH_HEX_LENGTH, "target")
+    rows = conn.execute(
+        "SELECT author, kind, created_at FROM posts "
+        "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
+        "ORDER BY author, seq ASC",
+        (clean,),
+    ).fetchall()
+    latest: Dict[str, Tuple[str, float]] = {}
+    for row in rows:
+        # Rows arrive in chain order per reactor, so the last write wins.
+        latest[str(row["author"])] = (str(row["kind"]), float(row["created_at"]))
+    likers = [
+        {"author": author, "liked_at": liked_at}
+        for author, (kind, liked_at) in latest.items()
+        if kind == KIND_LIKE
+    ]
+    likers.sort(key=lambda entry: entry["liked_at"], reverse=True)
+    return likers
+
+
 def annotate_reactions(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],

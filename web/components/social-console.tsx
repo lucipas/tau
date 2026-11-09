@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type { TanLiker, TanPost } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
@@ -22,6 +22,12 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Hash of the post whose liker list is open, if any, and the likers for
+  // it (null while the list is loading). Only one list is open at a time,
+  // and it is always fetched fresh on open so a like toggle cannot leave
+  // a stale list behind.
+  const [likersOpen, setLikersOpen] = useState<string | null>(null);
+  const [likers, setLikers] = useState<TanLiker[] | null>(null);
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -54,8 +60,34 @@ export function SocialConsole() {
       } else {
         await tan.like(post.hash);
       }
+      // The like count changed, so an open liker list for this post is
+      // stale; close it and let the count button fetch a fresh one.
+      if (likersOpen === post.hash) {
+        setLikersOpen(null);
+        setLikers(null);
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
+  async function toggleLikers(post: TanPost) {
+    if (likersOpen === post.hash) {
+      setLikersOpen(null);
+      setLikers(null);
+      return;
+    }
+    setLikersOpen(post.hash);
+    setLikers(null);
+    setError(null);
+    try {
+      setLikers(await tan.fetchLikers(post.hash));
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not load likers",
+      );
+      setLikersOpen(null);
+      setLikers(null);
     }
   }
 
@@ -267,6 +299,9 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onToggleLikers={toggleLikers}
+                      likersOpen={likersOpen === post.hash}
+                      likers={likersOpen === post.hash ? likers : null}
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
@@ -371,12 +406,21 @@ function EmptyState() {
 export function PostCard({
   post,
   onToggleLike,
+  onToggleLikers,
+  likersOpen,
+  likers,
   onReply,
   onDelete,
   deleting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  // Optional so existing callers (and tests) that only exercise the
+  // like toggle keep working; when absent the count button is inert.
+  onToggleLikers?: (post: TanPost) => void;
+  likersOpen?: boolean;
+  // The likers for the open list, or null while it is loading.
+  likers?: TanLiker[] | null;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
@@ -459,8 +503,19 @@ export function PostCard({
                   : "border-line/70 bg-panel/60 text-mist/80 hover:text-rose-300"
               }`}
             >
-              ♥ {post.likes ?? 0}
+              ♥
             </button>
+            {(post.likes ?? 0) > 0 ? (
+              <button
+                type="button"
+                onClick={() => onToggleLikers?.(post)}
+                aria-expanded={Boolean(likersOpen)}
+                title="Show who liked this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-rose-300"
+              >
+                {post.likes} {post.likes === 1 ? "like" : "likes"}
+              </button>
+            ) : null}
             {(post.quotes ?? 0) > 0 ? (
               <span
                 title="Quotes of this post"
@@ -520,6 +575,29 @@ export function PostCard({
               )
             ) : null}
           </div>
+          {likersOpen ? (
+            <div className="mt-2 rounded border border-line/70 bg-panel/60 px-2 py-1.5">
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">
+                liked by
+              </p>
+              {likers === null || likers === undefined ? (
+                <p className="mt-1 text-[12px] text-mist/80">loading…</p>
+              ) : likers.length === 0 ? (
+                <p className="mt-1 text-[12px] text-mist/80">no likes yet</p>
+              ) : (
+                <ul className="mt-1 space-y-0.5">
+                  {likers.map((liker) => (
+                    <li
+                      key={liker.author}
+                      className="text-[12px] text-zinc-200"
+                    >
+                      {liker.name || shortHash(liker.author, 16)}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
         </div>
       </div>
     </article>

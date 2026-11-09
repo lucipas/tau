@@ -28,6 +28,13 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
+        # Mirror the real Registry: a hex string resolves to the peer
+        # whose 16-byte destination hash it names.
+        if isinstance(destination_hash, str):
+            try:
+                destination_hash = bytes.fromhex(destination_hash)
+            except ValueError:
+                return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
@@ -731,6 +738,68 @@ def test_tan_delete_via_api(tmp_path):
         "delete",
         "delete",
     ]
+
+
+def test_tan_likers_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, create_reaction, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    # A liker the node knows as a peer resolves to the registry name,
+    # not the name on their stored posts.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=destination_hash(alice),
+            name="alice-on-record",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, bob, "likeable via api", name="bob", now=1000)
+        create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1001)
+        create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1002)
+        # Carol's unlike supersedes her like.
+        create_reaction(conn, carol, post["hash"], liked=False, name="carol", now=1003)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 1
+        assert payload["likers"] == [
+            {
+                "author": destination_hash(alice).hex(),
+                "name": "alice-on-record",
+                "liked_at": 1001.0,
+            }
+        ]
+
+        # Unknown post hash -> 400, per the issue spec.
+        status, _, payload = _json(bridge, "/api/tan/likes?target=" + "cd" * 32)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target -> 400.
+        status, _, payload = _json(bridge, "/api/tan/likes")
+        assert status == 400
+        assert "target is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
 
 
 def _queue(node, to_hex, text, message_id=None):
