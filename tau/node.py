@@ -3009,6 +3009,9 @@ class TauNode:
                 f"group message is too large to send with its roster ({exc}); "
                 "shorten the message"
             ) from exc
+        # One deadline bounds the whole fan-out: the legs run one after
+        # another, so a per-leg timeout would multiply with the roster size.
+        deadline = time.monotonic() + timeout
         for member in members:
             message_id = generate_message_id()
             payload = encode_group_message(
@@ -3020,16 +3023,43 @@ class TauNode:
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group send time limit reached",
+                        "id": message_id,
+                    }
+                )
+                continue
             try:
                 peer = self.resolve_peer(
                     member,
-                    timeout=discover_timeout
-                    if discover_timeout is not None
-                    else min(timeout, 10.0),
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                # Remember the leg before the request so a read receipt
+                # from this member verifies; a refused or unqueued leg
+                # is forgotten below.
+                self.mailbox.record_sent(
+                    message_id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
                 )
                 response = self._request(
-                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                    peer,
+                    REQUEST_GROUP_MESSAGE,
+                    payload,
+                    _remaining(deadline) or 0.0,
                 )
+                self.mailbox.record_delivered(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3042,6 +3072,7 @@ class TauNode:
             except (NotAllowedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; queueing
                 # would retry a refusal until its TTL expires.
+                self.mailbox.discard_sent(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3055,6 +3086,7 @@ class TauNode:
                 )
             except NodeError as exc:
                 if not queue or not self.started:
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3077,6 +3109,7 @@ class TauNode:
                     # The outbox is full (or the write failed): record the
                     # leg as failed and keep going, so the legs already
                     # delivered or queued are not lost with the exception.
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
