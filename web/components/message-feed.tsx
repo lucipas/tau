@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
+  formatFileSize,
   formatRtt,
   formatTime,
   shortHash,
@@ -241,6 +242,33 @@ function MessageBubble({
           ) : null}
           {message.text}
         </div>
+
+        {message.file ? (
+          <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line/70 bg-void/50 px-2.5 py-1.5 font-mono text-[11px] text-zinc-300">
+            <span aria-hidden="true">📎</span>
+            <span className="min-w-0 flex-1 truncate" title={message.file.name}>
+              {message.file.name}
+            </span>
+            <span className="shrink-0 text-mist">
+              {formatFileSize(message.file.size)}
+            </span>
+            <span
+              className="hidden shrink-0 text-mist/70 sm:inline"
+              title={`SHA-256 ${message.file.sha256}`}
+            >
+              sha256 {shortHash(message.file.sha256, 8)}
+            </span>
+            {message.direction === "in" && message.peer ? (
+              <a
+                className="shrink-0 text-signal hover:underline"
+                href={`/api/files/${message.peer}/${encodeURIComponent(message.file.name)}`}
+                download={message.file.name}
+              >
+                Download
+              </a>
+            ) : null}
+          </div>
+        ) : null}
 
         {message.reactions && message.reactions.length > 0 ? (
           <div

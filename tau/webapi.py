@@ -9,6 +9,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
+    GET  /api/files/<sender>/<name>
+                           download a file received from ``<sender>``
+                           (sender destination hash, sanitised file name)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -33,6 +36,7 @@ who can reach this API can send messages as this node.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import math
@@ -47,7 +51,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
@@ -56,6 +60,7 @@ from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
+    MAX_FILE_BYTES,
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
@@ -63,6 +68,7 @@ from .protocol import (
     clean_reaction,
     excerpt_hash,
     normalize_message,
+    sanitize_file_name,
     sanitize_name,
     short_hash,
 )
@@ -275,6 +281,35 @@ def _clean_stored_reaction(entry: Any) -> Optional[Dict[str, Any]]:
     return {"reactor": reactor, "name": name, "reaction": reaction}
 
 
+def _clean_stored_file(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate stored file metadata for a message, or ``None``.
+
+    A file entry names the file that arrived with a message
+    (``{"name", "size", "sha256"}``).  The name must already be
+    sanitised — anything else is a smuggled path, not a file name —
+    and the size must fit the transfer budget, so a hand-edited
+    history file cannot point the console at an arbitrary path.
+    """
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or sanitize_file_name(name) != name:
+        return None
+    size = value.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        return None
+    if size < 1 or size > MAX_FILE_BYTES:
+        return None
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        return None
+    try:
+        bytes.fromhex(sha256)
+    except ValueError:
+        return None
+    return {"name": name, "size": size, "sha256": sha256.lower()}
+
+
 def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     """Validate one message record loaded from ``messages.json``.
 
@@ -377,6 +412,9 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         in_reply_to = None
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
+    stored_file = _clean_stored_file(entry.get("file"))
+    if stored_file is not None:
+        message["file"] = stored_file
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -678,6 +716,7 @@ class WebBridge:
             expires_at=float(expires_at) if expires_at is not None else None,
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
+            file=record.get("file"),
         )
         # The node appends to its inbox before this callback runs, so
         # the unread total already includes the new message.
@@ -1436,6 +1475,76 @@ class WebBridge:
             self._with_inbox_reactions(dict(item), by_target) for item in items
         ]
 
+    def received_file(
+        self, sender: str, name: str
+    ) -> Optional[Tuple[bytes, str]]:
+        """Return the bytes and name of a received file, or ``None``.
+
+        The file must be one the node inbox actually records for
+        *sender* under *name*: the stored record's size and SHA-256
+        are re-checked against the bytes on disk, and the recorded
+        path must resolve inside this sender's directory under the
+        node's files directory — a record pointing anywhere else (a
+        hand-edited inbox, a planted symlink) serves nothing.
+
+        Raises ``ValueError`` when the sender or name is not usable
+        at all (a malformed hash, a name that is not already a safe
+        bare file name); anything else that does not check out is
+        simply not found.
+        """
+        if (
+            not isinstance(sender, str)
+            or len(sender) != 64
+            or any(char not in "0123456789abcdef" for char in sender)
+        ):
+            raise ValueError("sender must be a destination hash")
+        if not isinstance(name, str) or sanitize_file_name(name) != name:
+            raise ValueError("file name is not usable")
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return None
+        record = None
+        for entry in inbox.list_messages(peer=sender, direction="in"):
+            if entry.get("kind") == "file" and entry.get("name") == name:
+                record = entry
+                break
+        if record is None:
+            return None
+        files_dir = getattr(getattr(self.node, "config", None), "files_dir", None)
+        if files_dir is None:
+            return None
+        path = record.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            resolved = Path(path).resolve()
+            base = Path(files_dir).resolve()
+        except (OSError, ValueError):
+            return None
+        if resolved.parent != base / sender or resolved.name != name:
+            return None
+        if not resolved.is_file():
+            return None
+        try:
+            data = resolved.read_bytes()
+        except OSError:
+            return None
+        size = record.get("size")
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 1
+            or size > MAX_FILE_BYTES
+            or len(data) != size
+        ):
+            return None
+        sha256 = record.get("sha256")
+        if not isinstance(sha256, str):
+            return None
+        if hashlib.sha256(data).hexdigest() != sha256.lower():
+            return None
+        return data, name
+
     def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
         """Node inbox reactions grouped by target, reloaded once per read.
 
@@ -1577,6 +1686,7 @@ class WebBridge:
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
+        file: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -1613,6 +1723,9 @@ class WebBridge:
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
                 message["in_reply_to"] = reply_to
+            cleaned_file = _clean_stored_file(file) if file is not None else None
+            if cleaned_file is not None:
+                message["file"] = cleaned_file
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1777,6 +1890,17 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages":
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                return
+            if path.startswith("/api/files/"):
+                parts = [
+                    unquote(part) for part in path[len("/api/files/") :].split("/")
+                ]
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    self._send_json(
+                        {"error": {"message": "not found"}}, head_only, 404
+                    )
+                    return
+                self._handle_download_file(parts[0], parts[1], head_only)
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
@@ -1947,6 +2071,49 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"error": {"message": "method not allowed"}}, head_only, 405)
+
+    def _handle_download_file(
+        self, sender: str, name: str, head_only: bool
+    ) -> None:
+        """Serve one received file's bytes as an attachment.
+
+        The bridge resolves the file against the node inbox, so only
+        a file this node actually received from *sender* under *name*
+        is ever served; anything else is a 404, and a malformed
+        sender or name is a 400.
+        """
+        try:
+            found = self.bridge.received_file(sender, name)
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        if found is None:
+            self._send_json(
+                {"error": {"message": "no such received file"}}, head_only, 404
+            )
+            return
+        data, file_name = found
+        # The name is already sanitised, but the header value must
+        # still be ASCII-safe: quote anything outside it, and carry
+        # the exact name in the RFC 5987 form for non-ASCII names.
+        ascii_name = "".join(
+            char if 32 <= ord(char) < 127 and char not in '"\\' else "_"
+            for char in file_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(file_name)}",
+        )
+        self._cors_headers()
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(data)
 
     def _handle_send(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")
