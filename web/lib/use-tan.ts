@@ -16,8 +16,13 @@ const POLL_INTERVAL_MS = 5000;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [all, setAll] = useState(false);
+  // Whether the feed shows replies to your own posts instead of the
+  // timeline. Kept beside `all` so a view switch mid-action reloads
+  // the view that is actually selected, the same way `all` works.
+  const [showMentions, setShowMentions] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -30,6 +35,11 @@ export function useTan() {
   useEffect(() => {
     allRef.current = all;
   }, [all]);
+
+  const showMentionsRef = useRef(showMentions);
+  useEffect(() => {
+    showMentionsRef.current = showMentions;
+  }, [showMentions]);
 
   // Monotonic generation of feed loads. A newer load supersedes an older
   // one, so a slow response (for example a poll tick started before a
@@ -59,12 +69,18 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
-        apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+      const [feed, follows] = await Promise.all([
+        showMentionsRef.current
+          ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+          : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
       ]);
       if (generationRef.current !== generation) return false;
-      setPosts(timeline.posts);
+      if (showMentionsRef.current) {
+        setMentions(feed.posts);
+      } else {
+        setPosts(feed.posts);
+      }
       setFollowing(follows.following);
       setError(null);
       return true;
@@ -99,7 +115,7 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, load]);
+  }, [all, showMentions, load]);
 
   const refresh = useCallback(async () => {
     await load();
@@ -183,9 +199,12 @@ export function useTan() {
 
   return {
     posts,
+    mentions,
     following,
     all,
     setAll,
+    showMentions,
+    setShowMentions,
     loading,
     posting,
     syncing,

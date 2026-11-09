@@ -633,6 +633,77 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_mentions_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        TanApp,
+        create_delete,
+        create_post,
+        create_reply,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "original thought", name="tester", now=1000
+        )
+        reply = create_reply(
+            conn, other, mine["hash"], "seconded", name="other", now=1001
+        )
+        # A reply to my own post from myself is not a mention of me.
+        create_reply(
+            conn, identity, mine["hash"], "talking to myself", name="tester", now=1002
+        )
+        # A reply to someone else's post mentions them, not me.
+        theirs = create_post(conn, other, "bob's own post", name="other", now=1003)
+        create_reply(
+            conn, identity, theirs["hash"], "not a mention", name="tester", now=1004
+        )
+        # A reply its author deleted never appears.
+        doomed = create_reply(
+            conn, other, mine["hash"], "take it back", name="other", now=1005
+        )
+        create_delete(conn, other, doomed["hash"], name="other", now=1006)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["count"] == 1
+        # Each mention carries its parent, so the reader sees what was answered.
+        assert payload["posts"][0]["reply_to"]["hash"] == mine["hash"]
+        assert payload["posts"][0]["reply_to"]["text"] == "original thought"
+        assert reply["hash"] == payload["posts"][0]["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/mentions?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+    finally:
+        bridge.stop()
+
+    # Without an identity there is nothing of yours to be replied to.
+    node.app = None
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

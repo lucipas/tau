@@ -141,6 +141,7 @@ The same bridge is the local integration point for scripts:
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |

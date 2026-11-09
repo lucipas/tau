@@ -15,6 +15,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/mentions replies to your own posts
     GET  /api/tan/following followed authors
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -1010,6 +1011,45 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_mentions(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+        """Return replies to this node's own posts, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_mentions`: the same selection
+        and visibility rules, so the console shows exactly what the
+        CLI shows for the same store, plus the console's display rules
+        (the thread view applies the same).  Without an identity there
+        is nothing of yours to be replied to, so
+        :func:`tau.tangents.tan.mentions` raises and the HTTP layer
+        reports it as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, mentions
+
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            posts = mentions(conn, viewer, limit=limit)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
     def tan_following(self) -> List[Dict[str, Any]]:
         from .tangents.tan import author_stats, following
 
@@ -1734,6 +1774,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                     posts = self.bridge.tan_timeline(
                         limit=limit, include_all=include_all, author=author
                     )
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/mentions":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                try:
+                    posts = self.bridge.tan_mentions(limit=limit)
                 except Exception as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return

@@ -22,6 +22,9 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // The feed shows the timeline or, when the mentions view is selected,
+  // the replies to your own posts instead.
+  const shown = tan.showMentions ? tan.mentions : tan.posts;
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -231,38 +234,63 @@ export function SocialConsole() {
             <section className="rounded-2xl border border-line/80 bg-panel/40">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
                 <div className="flex items-center gap-3">
-                  <SectionLabel>{tan.all ? "public cache" : "timeline"}</SectionLabel>
+                  <SectionLabel>
+                    {tan.showMentions
+                      ? "mentions"
+                      : tan.all
+                        ? "public cache"
+                        : "timeline"}
+                  </SectionLabel>
                   <span className="font-mono text-[10px] text-mist">
-                    {tan.posts.length} post(s)
+                    {shown.length} post(s)
                   </span>
                 </div>
                 <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
                   <button
                     type="button"
-                    onClick={() => tan.setAll(false)}
+                    onClick={() => {
+                      tan.setShowMentions(false);
+                      tan.setAll(false);
+                    }}
                     className={`rounded px-2 py-1 ${
-                      tan.all ? "text-mist" : "bg-signal/15 text-signal"
+                      tan.showMentions || tan.all
+                        ? "text-mist"
+                        : "bg-signal/15 text-signal"
                     }`}
                   >
                     following
                   </button>
                   <button
                     type="button"
-                    onClick={() => tan.setAll(true)}
+                    onClick={() => {
+                      tan.setShowMentions(false);
+                      tan.setAll(true);
+                    }}
                     className={`rounded px-2 py-1 ${
-                      tan.all ? "bg-signal/15 text-signal" : "text-mist"
+                      !tan.showMentions && tan.all
+                        ? "bg-signal/15 text-signal"
+                        : "text-mist"
                     }`}
                   >
                     everything
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => tan.setShowMentions(true)}
+                    className={`rounded px-2 py-1 ${
+                      tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
+                    }`}
+                  >
+                    mentions
                   </button>
                 </div>
               </div>
 
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
-                {tan.posts.length === 0 ? (
-                  <EmptyState />
+                {shown.length === 0 ? (
+                  <EmptyState mentions={tan.showMentions} />
                 ) : (
-                  tan.posts.map((post) => (
+                  shown.map((post) => (
                     <PostCard
                       key={post.hash}
                       post={post}
@@ -350,19 +378,27 @@ export function SocialConsole() {
   );
 }
 
-function EmptyState() {
+function EmptyState({ mentions = false }: { mentions?: boolean }) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
         τ
       </div>
-      <h3 className="mt-4 text-sm font-medium text-zinc-200">No posts yet</h3>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        {mentions ? "No replies yet" : "No posts yet"}
+      </h3>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
-        Start a node with{" "}
-        <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
-          tau serve --social --http
-        </code>
-        , publish a post, then sync or follow another author.
+        {mentions ? (
+          "When someone replies to one of your posts, it shows up here."
+        ) : (
+          <>
+            Start a node with{" "}
+            <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+              tau serve --social --http
+            </code>
+            , publish a post, then sync or follow another author.
+          </>
+        )}
       </p>
     </div>
   );
