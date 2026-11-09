@@ -1,9 +1,18 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { shortHash } from "@/lib/format";
 import type { TanPost } from "@/lib/types";
 
-import { PostCard } from "./social-console";
+import { PostCard, SocialConsole } from "./social-console";
+
+const mockTan = vi.hoisted(() => ({
+  current: {} as Record<string, unknown>,
+}));
+
+vi.mock("@/lib/use-tan", () => ({
+  useTan: () => mockTan.current,
+}));
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -235,5 +244,79 @@ describe("PostCard mute control", () => {
     expect(screen.queryByTitle("Mute this author")).toBeNull();
     fireEvent.click(screen.getByText("muting…"));
     expect(onMute).not.toHaveBeenCalled();
+  });
+});
+
+describe("SocialConsole muted sidebar", () => {
+  const authorHash = "a".repeat(64);
+
+  function setTan(overrides: Record<string, unknown>) {
+    mockTan.current = {
+      posts: [],
+      following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      ...overrides,
+    };
+    return mockTan.current;
+  }
+
+  it("shows the empty state when nothing is muted", () => {
+    setTan({});
+    render(<SocialConsole />);
+
+    expect(screen.getByText(/Nothing muted\./)).toBeTruthy();
+  });
+
+  it("lists muted authors and keywords and unmutes each by its key", () => {
+    const tan = setTan({
+      mutedAuthors: [
+        { author: authorHash, name: "bob", muted_at: 1, posts: 3, seq: 3, last_post: 1 },
+      ],
+      mutedKeywords: [
+        { keyword: "crypto", display: "Crypto", added_at: 1 },
+      ],
+    });
+    render(<SocialConsole />);
+
+    expect(screen.queryByText(/Nothing muted\./)).toBeNull();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText(`${shortHash(authorHash, 10)} · 3 posts`)).toBeTruthy();
+    expect(screen.getByText("“Crypto”")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("unmute this author"));
+    expect(tan.unmuteAuthor).toHaveBeenCalledWith(authorHash);
+
+    fireEvent.click(screen.getByTitle("unmute this keyword"));
+    expect(tan.unmuteKeyword).toHaveBeenCalledWith("Crypto");
+  });
+
+  it("submits a typed keyword through muteKeyword", () => {
+    const tan = setTan({});
+    render(<SocialConsole />);
+
+    fireEvent.change(screen.getByPlaceholderText("mute a word or phrase"), {
+      target: { value: "bitcoin" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "mute" }));
+    expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
   });
 });
