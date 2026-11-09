@@ -12,6 +12,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  RetryOutboxResponse,
   SendResponse,
   Snapshot,
   TauMessage,
@@ -233,6 +234,26 @@ export function useTau() {
     [refreshOutbox],
   );
 
+  const retryOutbox = useCallback(
+    async (id?: string) => {
+      const result = await apiPost<RetryOutboxResponse>(
+        "/api/outbox/retry",
+        id ? { target: id } : {},
+      );
+      // The retry already ran: refresh so delivered entries leave at
+      // once instead of waiting for the next poll. Best-effort, like
+      // cancel: a failed GET cannot make a successful retry look like
+      // a failure.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshOutbox],
+  );
+
   const send = useCallback(
     async (to: string, text: string, expiresIn?: number, replyTo?: string) => {
       const body: {
@@ -323,5 +344,6 @@ export function useTau() {
     markRead,
     refreshOutbox,
     cancelOutbox,
+    retryOutbox,
   };
 }

@@ -147,6 +147,18 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface RetryOutboxResponse {
+  ok: boolean;
+  delivered: number;
+  deposited: number;
+  received: number;
+  still_queued: number;
+  lock_busy: boolean;
+  target?: string;
+  target_delivered?: boolean;
+  target_still_queued?: boolean;
+}
+
 export interface ApiErrorBody {
   error?: { message?: string };
 }

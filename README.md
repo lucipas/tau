@@ -138,6 +138,7 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |

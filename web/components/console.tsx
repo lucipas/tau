@@ -131,6 +131,7 @@ export function Console() {
                   entries={tau.outbox}
                   heldForOthers={tau.heldForOthers}
                   onCancel={tau.cancelOutbox}
+                  onRetry={tau.retryOutbox}
                 />
               </div>
             ) : null}
