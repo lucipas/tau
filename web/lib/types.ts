@@ -117,6 +117,28 @@ export interface PingResult {
   rtt_ms: number | null;
 }
 
+export interface PeerVerifyResult {
+  peer: string;
+  name: string;
+  // Pairwise safety number: compare it with the peer over another
+  // channel; if it matches, the recorded key is theirs.
+  safety_number: string;
+  verified_at: number | null;
+  reverified: boolean;
+  fingerprint_changed: boolean;
+}
+
+export interface VerifyPeerResponse {
+  ok: boolean;
+  verify: PeerVerifyResult;
+}
+
+export interface VerifyState {
+  pending?: boolean;
+  result?: PeerVerifyResult;
+  error?: string;
+}
+
 export interface SendResponse {
   ok: boolean;
   message: TauMessage;

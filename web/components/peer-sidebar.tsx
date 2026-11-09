@@ -1,6 +1,6 @@
 "use client";
 
-import type { BridgeInfo, NodeInfo, Peer } from "@/lib/types";
+import type { BridgeInfo, NodeInfo, Peer, VerifyState } from "@/lib/types";
 import type { PingState } from "@/lib/use-tau";
 import {
   formatAge,
@@ -17,18 +17,22 @@ export function PeerSidebar({
   peers,
   bridge,
   pings,
+  verifications,
   unread,
   selected,
   onPing,
+  onVerify,
   onSelectPeer,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
+  verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onVerify: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
 }) {
   const now = useNow();
@@ -154,6 +158,7 @@ export function PeerSidebar({
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
             {peers.map((peer) => {
               const ping = pings[peer.destination];
+              const verification = verifications[peer.destination];
               const age = now
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
@@ -244,6 +249,24 @@ export function PeerSidebar({
                           }`}
                         />
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => onVerify(peer.destination)}
+                        disabled={verification?.pending}
+                        aria-label={`Verify ${peer.name}`}
+                        title={
+                          peer.key_change_at
+                            ? "Re-verify — this peer presented a different key"
+                            : "Verify this peer"
+                        }
+                        className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[10px] transition disabled:opacity-50 ${
+                          peer.key_change_at
+                            ? "border-amber-300/50 text-amber-300 hover:border-amber-300"
+                            : "border-line/70 text-mist hover:border-signal/50 hover:text-signal"
+                        }`}
+                      >
+                        {verification?.pending ? "verifying…" : "Verify"}
+                      </button>
                     </div>
                     {ping ? (
                       <p
@@ -260,6 +283,34 @@ export function PeerSidebar({
                           : ping.error
                             ? ping.error
                             : `pong ${formatRtt(ping.rtt_ms)}`}
+                      </p>
+                    ) : null}
+                    {verification?.result ? (
+                      <div className="mt-1 pl-[42px]">
+                        <p className="font-mono text-[10px] leading-relaxed text-mist">
+                          safety number — compare it with {peer.name} over
+                          another channel; if it matches, this key is theirs
+                        </p>
+                        <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-zinc-200">
+                          {verification.result.safety_number}
+                        </p>
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          <CopyButton
+                            value={verification.result.safety_number}
+                            label="copy number"
+                          />
+                          {verification.result.fingerprint_changed ? (
+                            <span className="font-mono text-[10px] text-amber-300">
+                              number changed since the last verification —
+                              updated
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
+                    {verification?.error ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {verification.error}
                       </p>
                     ) : null}
                   </div>

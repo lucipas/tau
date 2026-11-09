@@ -16,6 +16,8 @@ import type {
   Snapshot,
   TauMessage,
   UnreadCounts,
+  VerifyPeerResponse,
+  VerifyState,
 } from "./types";
 
 export type ConnectionState =
@@ -53,6 +55,9 @@ export function useTau() {
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [verifications, setVerifications] = useState<
+    Record<string, VerifyState>
+  >({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
@@ -294,6 +299,47 @@ export function useTau() {
     }
   }, []);
 
+  const verifyPeer = useCallback(async (destination: string) => {
+    setVerifications((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<VerifyPeerResponse>("/api/peers/verify", {
+        target: destination,
+      });
+      const verify = result.verify;
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: { result: verify },
+      }));
+      // The badge and warning update at once instead of waiting for
+      // the next snapshot: the peer is verified now, and any earlier
+      // key-change warning about it is answered.
+      setPeers((previous) =>
+        previous.map((peer) =>
+          peer.destination === destination
+            ? {
+                ...peer,
+                verified: true,
+                verified_at: verify.verified_at,
+                key_change_at: null,
+              }
+            : peer,
+        ),
+      );
+      return verify;
+    } catch (error) {
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "verify failed",
+        },
+      }));
+      throw error;
+    }
+  }, []);
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -316,9 +362,11 @@ export function useTau() {
     bridge,
     connection,
     pings,
+    verifications,
     announcing,
     send,
     ping,
+    verifyPeer,
     announce,
     markRead,
     refreshOutbox,

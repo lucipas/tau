@@ -5,6 +5,7 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    POST /api/peers/verify mark a peer verified ``{"target": "alice"}``
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -53,7 +54,7 @@ from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
-from .peers import Peer, PeerError
+from .peers import Peer, PeerError, safety_number
 from .protocol import (
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
@@ -1350,6 +1351,38 @@ class WebBridge:
             )
         return items
 
+    def peers_verify(self, target: str) -> Dict[str, Any]:
+        """Mark a peer verified after comparing safety numbers out of band.
+
+        Mirrors ``tau peers verify``: resolves *target* in the local
+        registry, computes the pairwise safety number from this node's
+        identity and the peer's public key, records the verification
+        (clearing any key-change warning) and persists the registry.
+        The returned number is for the console owner to compare with
+        the peer over another channel; verification itself stays a
+        local judgement, never sent to peers.
+        """
+        identity = getattr(self.node, "identity", None)
+        if identity is None:
+            raise WebBridgeError("no local identity; run `tau init` first")
+        peer = self.node.registry.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        number = safety_number(identity.get_public_key(), peer.public_key)
+        previously_verified = peer.is_verified
+        previous_fingerprint = peer.verified_fingerprint
+        self.node.registry.mark_verified(peer.destination_hash, number)
+        self.node.registry.save()
+        return {
+            "peer": peer.hexhash,
+            "name": peer.display_name,
+            "safety_number": number,
+            "verified_at": peer.verified_at,
+            "reverified": previously_verified,
+            "fingerprint_changed": previously_verified
+            and previous_fingerprint != number,
+        }
+
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -1782,6 +1815,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
+                return
+            if path == "/api/peers/verify":
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.peers_verify(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except PeerError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "verify": result}, head_only)
                 return
             if path == "/api/announce":
                 self.bridge.announce()

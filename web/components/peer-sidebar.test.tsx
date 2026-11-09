@@ -24,9 +24,11 @@ function renderSidebar(unread: Record<string, number>, onSelectPeer = vi.fn()) {
       peers={[makePeer(), makePeer({ destination: "cd".repeat(16), name: "bob" })]}
       bridge={null}
       pings={{}}
+      verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
+      onVerify={() => {}}
       onSelectPeer={onSelectPeer}
     />,
   );
