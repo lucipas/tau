@@ -1,9 +1,33 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TanPost } from "@/lib/types";
 
-import { PostCard } from "./social-console";
+import { PostCard, SocialConsole } from "./social-console";
+
+// The search tests render the whole console, so the data hook and the
+// Next link are mocked; the PostCard tests above never touch either.
+const { mockUseTan } = vi.hoisted(() => ({ mockUseTan: vi.fn() }));
+
+vi.mock("@/lib/use-tan", () => ({
+  useTan: (...args: unknown[]) => mockUseTan(...args),
+}));
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+  }: {
+    href: string;
+    children: ReactNode;
+    className?: string;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}));
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -183,5 +207,85 @@ describe("PostCard quote rendering", () => {
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();
+  });
+});
+
+
+describe("SocialConsole search", () => {
+  const mockSearch = vi.fn();
+  const mockClearSearch = vi.fn();
+
+  function makeTan(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      following: [],
+      all: false,
+      setAll: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: mockSearch,
+      clearSearch: mockClearSearch,
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it("submits the query to the search hook", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    mockUseTan.mockReturnValue(makeTan({ posts: [timelinePost] }));
+    render(<SocialConsole />);
+
+    fireEvent.change(screen.getByLabelText("Search stored posts"), {
+      target: { value: "mesh" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "search" }));
+
+    expect(mockSearch).toHaveBeenCalledTimes(1);
+    expect(mockSearch).toHaveBeenCalledWith("mesh");
+  });
+
+  it("shows search results instead of the timeline while searching", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const hit = makePost({ hash: "e".repeat(64), text: "mesh post" });
+    mockUseTan.mockReturnValue(
+      makeTan({
+        posts: [timelinePost],
+        searchResults: [hit],
+        searchQuery: "mesh",
+      }),
+    );
+    render(<SocialConsole />);
+
+    expect(screen.getByText("mesh post")).toBeTruthy();
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("search results")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "clear search" }));
+    expect(mockClearSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when nothing matches the search", () => {
+    mockUseTan.mockReturnValue(
+      makeTan({ posts: [makePost()], searchResults: [], searchQuery: "zzz" }),
+    );
+    render(<SocialConsole />);
+
+    expect(screen.getByText("No stored posts match “zzz”")).toBeTruthy();
+    expect(screen.queryByText("No posts yet")).toBeNull();
   });
 });

@@ -16,6 +16,11 @@ const POLL_INTERVAL_MS = 5000;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  const [searchResults, setSearchResults] = useState<TanPost[]>([]);
+  // The search the feed is showing, or null for the timeline. Kept beside
+  // `all` so a search mid-action reloads the search, the same way `all`
+  // works — a like or delete on a search result refreshes the results.
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [all, setAll] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -30,6 +35,11 @@ export function useTan() {
   useEffect(() => {
     allRef.current = all;
   }, [all]);
+
+  const searchQueryRef = useRef(searchQuery);
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
 
   // Monotonic generation of feed loads. A newer load supersedes an older
   // one, so a slow response (for example a poll tick started before a
@@ -58,13 +68,22 @@ export function useTan() {
     const generation = ++generationRef.current;
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
+      const activeSearch = searchQueryRef.current;
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
-        apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+      const [feed, follows] = await Promise.all([
+        activeSearch !== null
+          ? apiGet<TanTimelineResponse>(
+              `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
+            )
+          : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
       ]);
       if (generationRef.current !== generation) return false;
-      setPosts(timeline.posts);
+      if (activeSearch !== null) {
+        setSearchResults(feed.posts);
+      } else {
+        setPosts(feed.posts);
+      }
       setFollowing(follows.following);
       setError(null);
       return true;
@@ -99,11 +118,25 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, load]);
+  }, [all, searchQuery, load]);
 
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // A search is a view switch, like `all`: setting the query re-runs the
+  // load effect, which fetches the search endpoint instead of the
+  // timeline. Clearing it returns to the timeline the same way.
+  const search = useCallback(async (query: string) => {
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    setSearchQuery(trimmed);
+  }, []);
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery(null);
+    setSearchResults([]);
+  }, []);
 
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
@@ -183,6 +216,8 @@ export function useTan() {
 
   return {
     posts,
+    searchResults,
+    searchQuery,
     following,
     all,
     setAll,
@@ -191,6 +226,8 @@ export function useTan() {
     syncing,
     error,
     refresh,
+    search,
+    clearSearch,
     publish,
     follow,
     unfollow,

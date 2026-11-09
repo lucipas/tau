@@ -13,6 +13,7 @@ export function SocialConsole() {
   const tan = useTan();
   const [text, setText] = useState("");
   const [target, setTarget] = useState("");
+  const [searchText, setSearchText] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -44,6 +45,21 @@ export function SocialConsole() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not follow");
     }
+  }
+
+  async function submitSearch() {
+    if (!searchText.trim()) return;
+    setError(null);
+    try {
+      await tan.search(searchText.trim());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "search failed");
+    }
+  }
+
+  function clearSearch() {
+    setSearchText("");
+    tan.clearSearch();
   }
 
   async function toggleLike(post: TanPost) {
@@ -88,6 +104,12 @@ export function SocialConsole() {
       setError(caught instanceof Error ? caught.message : "sync failed");
     }
   }
+
+  // While a search is active the feed shows its results instead of the
+  // timeline; the following/everything toggle is a timeline filter, so it
+  // hides until the search is cleared.
+  const showingSearch = tan.searchQuery !== null;
+  const visiblePosts = showingSearch ? tan.searchResults : tan.posts;
 
   return (
     <div className="relative min-h-dvh">
@@ -231,38 +253,82 @@ export function SocialConsole() {
             <section className="rounded-2xl border border-line/80 bg-panel/40">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
                 <div className="flex items-center gap-3">
-                  <SectionLabel>{tan.all ? "public cache" : "timeline"}</SectionLabel>
+                  <SectionLabel>
+                    {showingSearch
+                      ? "search results"
+                      : tan.all
+                        ? "public cache"
+                        : "timeline"}
+                  </SectionLabel>
                   <span className="font-mono text-[10px] text-mist">
-                    {tan.posts.length} post(s)
+                    {visiblePosts.length} post(s)
                   </span>
                 </div>
-                <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
+                {showingSearch ? (
                   <button
                     type="button"
-                    onClick={() => tan.setAll(false)}
-                    className={`rounded px-2 py-1 ${
-                      tan.all ? "text-mist" : "bg-signal/15 text-signal"
-                    }`}
+                    onClick={clearSearch}
+                    className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
                   >
-                    following
+                    clear search
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => tan.setAll(true)}
-                    className={`rounded px-2 py-1 ${
-                      tan.all ? "bg-signal/15 text-signal" : "text-mist"
-                    }`}
-                  >
-                    everything
-                  </button>
-                </div>
+                ) : (
+                  <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => tan.setAll(false)}
+                      className={`rounded px-2 py-1 ${
+                        tan.all ? "text-mist" : "bg-signal/15 text-signal"
+                      }`}
+                    >
+                      following
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => tan.setAll(true)}
+                      className={`rounded px-2 py-1 ${
+                        tan.all ? "bg-signal/15 text-signal" : "text-mist"
+                      }`}
+                    >
+                      everything
+                    </button>
+                  </div>
+                )}
               </div>
 
+              <form
+                className="flex gap-2 border-b border-line/60 px-4 py-3"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void submitSearch();
+                }}
+              >
+                <input
+                  value={searchText}
+                  onChange={(event) => setSearchText(event.target.value)}
+                  placeholder="Search stored posts…"
+                  spellCheck={false}
+                  aria-label="Search stored posts"
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+                />
+                <button
+                  type="submit"
+                  disabled={!searchText.trim()}
+                  className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                >
+                  search
+                </button>
+              </form>
+
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
-                {tan.posts.length === 0 ? (
-                  <EmptyState />
+                {visiblePosts.length === 0 ? (
+                  showingSearch ? (
+                    <SearchEmptyState query={tan.searchQuery ?? ""} />
+                  ) : (
+                    <EmptyState />
+                  )
                 ) : (
-                  tan.posts.map((post) => (
+                  visiblePosts.map((post) => (
                     <PostCard
                       key={post.hash}
                       post={post}
@@ -346,6 +412,23 @@ export function SocialConsole() {
           <span>signed posts · no servers · no accounts</span>
         </footer>
       </div>
+    </div>
+  );
+}
+
+function SearchEmptyState({ query }: { query: string }) {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        τ
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No stored posts match “{query}”
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Search covers the text of stored posts and quotes. Try a different
+        word, or sync to pull posts cached by your peers first.
+      </p>
     </div>
   );
 }

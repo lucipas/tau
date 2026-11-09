@@ -633,6 +633,151 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_search_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        create_delete,
+        create_post,
+        create_reply,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "hello from the mesh", name="tester", now=1000
+        )
+        create_post(conn, identity, "another MESH note", name="tester", now=1001)
+        create_post(conn, other, "unrelated weather chat", name="other", now=1002)
+        # A reply is not a post: its text never matches, even on keyword.
+        create_reply(
+            conn, other, mine["hash"], "mesh reply", name="other", now=1003
+        )
+        # A deleted post never matches either.
+        doomed = create_post(
+            conn, other, "mesh post to delete", name="other", now=1004
+        )
+        create_delete(conn, other, doomed["hash"], name="other", now=1005)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Case-insensitive, newest first.
+        status, _, payload = _json(bridge, "/api/tan/search?q=MESH")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "another MESH note",
+            "hello from the mesh",
+        ]
+        assert payload["count"] == 2
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh&limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["posts"][0]["text"] == "another MESH note"
+
+        # An explicit author narrows the search to their posts.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={mine['author']}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "another MESH note",
+            "hello from the mesh",
+        ]
+
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=weather&author={mine['author']}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+
+        # An empty query and an unknown author are client errors.
+        status, _, payload = _json(bridge, "/api/tan/search?q=%20%20")
+        assert status == 400
+        assert "must not be empty" in payload["error"]["message"]
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh&author=nobody")
+        assert status == 400
+        assert "unknown author" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_search_hides_blocked_and_muted(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db, mute, mute_keyword
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    blocked_id = RNS.Identity()
+    muted_id = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "mesh from me", name="tester", now=1000)
+        blocked_author = create_post(
+            conn, blocked_id, "mesh from blocked", name="blocked", now=1001
+        )["author"]
+        muted_author = create_post(
+            conn, muted_id, "mesh from muted", name="muted", now=1002
+        )["author"]
+        mute(conn, muted_author, name="muted", now=1003)
+        # Searching for a muted keyword still finds it: search is explicit.
+        create_post(conn, identity, "weather report", name="tester", now=1004)
+        mute_keyword(conn, "weather", now=1005)
+    finally:
+        conn.close()
+
+    node.blocklist = SimpleNamespace(
+        blocked=frozenset({blocked_author}), block_all=False
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["mesh from me"]
+
+        # An explicit author search still cannot surface a blocked author.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={blocked_author}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+
+        # ... but it can surface a muted one: that is a direct lookup.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={muted_author}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["mesh from muted"]
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=weather")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["weather report"]
+
+        # A block-list that failed closed hides every result.
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 
