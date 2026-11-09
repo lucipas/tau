@@ -18,6 +18,7 @@ export function PeerSidebar({
   groups,
   bridge,
   pings,
+  unread,
   selected,
   onPing,
   onSelectPeer,
@@ -27,6 +28,7 @@ export function PeerSidebar({
   groups: TauGroup[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
+  unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
@@ -121,7 +123,7 @@ export function PeerSidebar({
                 <p className="mt-1.5 font-mono text-[10px] leading-relaxed text-mist">
                   GET /api/messages · GET /api/events
                   <br />
-                  POST /api/messages · POST /api/ping
+                  POST /api/messages · POST /api/messages/read · POST /api/ping
                 </p>
               </div>
             ) : null}
@@ -158,6 +160,7 @@ export function PeerSidebar({
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
+              const unreadCount = unread[peer.destination] ?? 0;
               return (
                 <li key={peer.destination}>
                   <div
@@ -178,13 +181,47 @@ export function PeerSidebar({
                           {peer.name.slice(0, 1) || "?"}
                         </span>
                         <span className="min-w-0">
-                          <span className="block truncate text-xs font-medium text-zinc-200">
-                            {peer.name || "unknown"}
+                          <span className="flex items-center gap-1.5">
+                            <span className="block truncate text-xs font-medium text-zinc-200">
+                              {peer.name || "unknown"}
+                            </span>
+                            {peer.verified ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-signal/40 bg-signal/10 px-1.5 py-px text-[10px] text-signal"
+                                title="Safety number compared out of band — this key is confirmed theirs"
+                              >
+                                ✓ verified
+                              </span>
+                            ) : null}
+                            {peer.blocked ? (
+                              <span
+                                className="ml-1.5 rounded-full border border-rose-400/40 bg-rose-400/10 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-rose-300"
+                                title="Blocked: their DMs are dropped and their Tan posts hidden"
+                              >
+                                blocked
+                              </span>
+                            ) : null}
+                            {unreadCount > 0 ? (
+                              <span
+                                className="shrink-0 rounded-full bg-signal px-1.5 py-px font-mono text-[10px] font-semibold text-void"
+                                title={`${unreadCount} unread message${unreadCount === 1 ? "" : "s"}`}
+                              >
+                                {unreadCount > 99 ? "99+" : unreadCount}
+                              </span>
+                            ) : null}
                           </span>
                           <span className="block truncate font-mono text-[10px] text-mist">
                             {shortHash(peer.destination, 10)} · {peer.hops} hop
                             {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
                           </span>
+                          {peer.key_change_at ? (
+                            <span
+                              className="block truncate font-mono text-[10px] text-amber-300"
+                              title="This destination presented a different public key; the recorded key was kept"
+                            >
+                              ⚠ key changed — re-verify before trusting
+                            </span>
+                          ) : null}
                           {peer.lxmf ? (
                             <span
                               className="block truncate font-mono text-[10px] text-mist"
