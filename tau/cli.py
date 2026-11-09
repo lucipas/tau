@@ -3500,37 +3500,20 @@ def _send_via_running_node(
 _SEND_ROUTE_WAIT_SECONDS = 10.0
 
 
-def _read_lock_holder_pid(path: Path) -> Optional[int]:
-    """PID recorded in the lock file, or None when it cannot be read."""
-    try:
-        text = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
 def _instance_lock_free(config: TauConfig) -> bool:
     """True when no live process holds the data-directory lock.
 
-    Reads the holder PID from the lock file without taking the lock, so
-    a one-shot probe cannot make a concurrent `tau serve` startup fail
-    by holding the flock in its window: a dead PID means the holder is
-    gone (its flock died with it), so no probe is needed at all. A live
-    PID, or no usable PID, falls back to a real probe, which stays the
-    ground truth. A holder that has taken the lock but not yet recorded
-    its PID can still read as free for a few microseconds.
+    The probe is the ground truth: taking the lock (and releasing it)
+    is the only way to know no holder owns the directory.  A PID read
+    from the lock file is never trusted on its own — a holder records
+    its PID just after taking the lock, so the file can still name a
+    dead predecessor while a new holder is starting up, and a dead
+    PID then reads as "free" while a serve is mid-startup.  The probe
+    holds the lock only for microseconds; a `tau serve` starting in
+    that exact window fails fast with "already serving" and can be
+    retried, which beats a false "free" starting a second node on the
+    same identity.
     """
-    holder = _read_lock_holder_pid(config.instance_lock_path)
-    if holder is not None and holder > 0:
-        try:
-            os.kill(holder, 0)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            pass
     probe = InstanceLock(config.instance_lock_path, config.data_dir)
     try:
         probe.acquire()

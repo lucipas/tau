@@ -269,17 +269,15 @@ def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, capsys, 
 
 
 def test_instance_lock_free_reads_holder_pid(tmp_path):
+    """The probe is ground truth; a PID in the lock file is not trusted."""
     config = TauConfig.resolve(data_dir=tmp_path)
     config.prepare()
     # No lock file at all.
     assert cli._instance_lock_free(config) is True
-    # A dead holder's PID means the lock is free without probing.
+    # A dead holder's PID with no lock held: free, via the probe.
     proc = subprocess.Popen(["true"])
     proc.wait()
     config.instance_lock_path.write_text(str(proc.pid))
-    assert cli._instance_lock_free(config) is True
-    # A live PID with no flock held still probes free.
-    config.instance_lock_path.write_text(str(os.getpid()))
     assert cli._instance_lock_free(config) is True
     # A live holder blocks.
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
@@ -288,6 +286,47 @@ def test_instance_lock_free_reads_holder_pid(tmp_path):
         assert cli._instance_lock_free(config) is False
     finally:
         lock.release()
+
+
+def test_instance_lock_free_ignores_dead_pid_when_lock_held(tmp_path):
+    """A dead PID in the file must not read as free while locked.
+
+    A serve records its PID just after taking the lock, so the file
+    can still name a dead predecessor mid-startup; trusting the PID
+    would start a second node on the serving node's identity
+    (CodeRabbit Major on PR #190).
+    """
+    fcntl = pytest.importorskip("fcntl")
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    config.instance_lock_path.write_text(str(proc.pid))
+    handle = open(config.instance_lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert cli._instance_lock_free(config) is False
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def test_instance_lock_free_ignores_dead_pid_when_windows_lock_held(
+    tmp_path, windows_lock
+):
+    """Same dead-PID case on simulated Windows (msvcrt lock)."""
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    config.instance_lock_path.write_text(str(proc.pid))
+    handle = open(config.instance_lock_path, "a+", encoding="utf-8")
+    try:
+        windows_lock.locking(handle.fileno(), windows_lock.LK_NBLCK, 1)
+        assert cli._instance_lock_free(config) is False
+    finally:
+        windows_lock.locking(handle.fileno(), windows_lock.LK_UNLCK, 1)
+        handle.close()
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
