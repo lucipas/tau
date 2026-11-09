@@ -38,6 +38,17 @@ liked, and can be deleted by their own author.  A reply whose parent has
 not arrived yet is stored anyway; the timeline shows it without a parent
 snippet until the parent is cached.
 
+An edit is a targeted entry of the same shape, written by the *author*
+onto their own chain with ``kind`` ``"edit"``, ``target`` set to the
+post (or reply) being corrected, and the replacement text carried like a
+post's.  Only the post's own author may edit it — an edit from anyone
+else is stored, so the editor's chain stays complete, but is inert and
+never changes what the post shows.  The latest edit wins, and a delete
+still hides the post (and its edits) from display.  Like replies, an
+edit is a new entry kind: a peer running a version that predates edits
+rejects it, leaving that author's later entries unlinked until it
+upgrades and resyncs.
+
 What gets committed at all is the owner's decision: a ruleset (see
 ``tau.tangents.rules``) can allow or block authors by identity, admit
 only followed authors, or deny by default.  It is consulted for
@@ -131,15 +142,16 @@ KIND_LIKE = "like"
 KIND_UNLIKE = "unlike"
 KIND_DELETE = "delete"
 KIND_REPLY = "reply"
+KIND_EDIT = "edit"
 KIND_QUOTE = "quote"
 REACTION_KINDS = (KIND_LIKE, KIND_UNLIKE)
-# Reactions and deletes carry no text; replies and quotes carry text but
-# are still targeted entries, so their parent link is signed like a
-# reaction's.
+# Reactions and deletes carry no text; replies, edits and quotes carry
+# text but are still targeted entries, so their parent link is signed
+# like a reaction's.
 TEXTLESS_KINDS = REACTION_KINDS + (KIND_DELETE,)
-# Targeted entries (reactions, deletes, replies and quotes) point at
-# another post.
-TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_QUOTE)
+# Targeted entries (reactions, deletes, replies, edits and quotes)
+# point at another post.
+TARGETED_KINDS = TEXTLESS_KINDS + (KIND_REPLY, KIND_EDIT, KIND_QUOTE)
 ENTRY_KINDS = (KIND_POST,) + TARGETED_KINDS
 # Kinds that appear as timeline items: top-level posts, replies and
 # quotes.  A quote is a post-like entry: it carries its own text, can be
@@ -969,6 +981,72 @@ def create_delete(
     return record
 
 
+def create_edit(
+    conn: sqlite3.Connection,
+    identity: RNS.Identity,
+    target: str,
+    text: str,
+    *,
+    name: str = "anonymous",
+    now: Optional[float] = None,
+    previous: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create, sign and store an edit entry for the post *target*.
+
+    The edit is appended to the editor's own chain, exactly like a
+    reply: ``kind`` is ``edit`` and ``target`` is the post hash, and
+    the replacement text is carried like a post's.  Only the post's
+    author can edit it, and only posts and replies can be edited.
+    When the target is not cached locally, is not linked yet, or has
+    been deleted, this raises: an edit is written to a post the
+    author has seen in full.  Edits received from peers for posts
+    that have not arrived yet are still stored through the sync path
+    (:func:`store_post`); they stay inert until the post arrives and
+    its author matches (see :func:`edit_states`).
+    """
+    target = _require_hex(target, HASH_HEX_LENGTH, "target")
+    timestamp = round(float(now if now is not None else time.time()), 3)
+    author = _author_from_identity(identity)
+    existing = get_post(conn, target)
+    if existing is None:
+        raise TanError(f"unknown post: {target!r}")
+    if existing.get("kind", KIND_POST) not in (KIND_POST, KIND_REPLY):
+        raise TanError("only posts and replies can be edited")
+    if not existing.get("linked"):
+        raise TanError(
+            "post has not linked yet; sync its chain before editing"
+        )
+    if existing["author"] != author:
+        raise TanError("cannot edit a post you did not author")
+    if _is_deleted(conn, existing):
+        raise TanError("post has been deleted")
+    clean_text = normalize_message(text)
+    prev = previous
+    if prev is None:
+        prev = head(conn, author) or ""
+    prev = prev.strip().lower()
+    if prev:
+        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+
+    body = {
+        "v": TAN_VERSION,
+        "author": author,
+        "key": identity.get_public_key().hex(),
+        "name": sanitize_name(name),
+        "text": clean_text,
+        "created_at": timestamp,
+        "prev": prev,
+        "kind": KIND_EDIT,
+        "target": target,
+    }
+    digest = hash(body, previous=prev)
+    mesg = dict(body)
+    mesg["hash"] = digest
+    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+    record, _ = store_post(conn, mesg, now=timestamp)
+    return record
+
+
 def reaction_states(
     conn: sqlite3.Connection, targets: Sequence[str]
 ) -> Dict[str, Dict[str, str]]:
@@ -1094,6 +1172,10 @@ def annotate_replies(
             list(parents),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    if parents:
+        # A parent's snippet shows its current text, so apply its
+        # author's latest edit before the summary is built.
+        annotate_edits(conn, list(parents.values()))
     muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_REPLY:
@@ -1127,6 +1209,7 @@ def annotate_replies(
             "name": parent["name"],
             "text": "" if is_deleted or is_muted else parent["text"],
             "deleted": is_deleted,
+            "edited": bool(parent.get("edited")),
         }
         if is_muted:
             # Only present when muted, so unmuted previews keep their
@@ -1241,6 +1324,115 @@ def annotate_quotes(
             "text": "" if is_deleted else parent["text"],
             "deleted": is_deleted,
         }
+    return posts
+
+
+def edit_states(
+    conn: sqlite3.Connection, targets: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Map each target hash to its latest edit by the post's own author.
+
+    Only linked (chain-verified) edits count; an edit from anyone
+    other than the target post's author is inert — it is stored so
+    the editor's chain stays complete, but it never changes what the
+    post shows.  An edit that arrives before its post applies as soon
+    as the post is stored, the same way a delete does.  The latest
+    edit wins: rows arrive in chain order per editor, so the last
+    write for a target decides its text.
+    """
+    clean = []
+    for target in targets:
+        try:
+            clean.append(_require_hex(target, HASH_HEX_LENGTH, "target"))
+        except PostError:
+            continue
+    states: Dict[str, Dict[str, Any]] = {}
+    if not clean:
+        return states
+    authors: Dict[str, str] = {}
+    for start in range(0, len(clean), _SQL_BATCH):
+        batch = clean[start : start + _SQL_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT hash, author FROM posts WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
+            batch,
+        ).fetchall()
+        authors.update({str(row["hash"]): str(row["author"]) for row in rows})
+    if not authors:
+        return states
+    # Only edits on the post author's retained chain (from their head back
+    # through ``prev``) may count; sibling forks with the same seq are ignored.
+    chains: Dict[str, Set[str]] = {}
+    for author in set(authors.values()):
+        chains[author] = _chain_hashes(conn, author)
+    targets = list(authors)
+    for start in range(0, len(targets), _SQL_BATCH):
+        batch = targets[start : start + _SQL_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT target, author, text, created_at, hash FROM posts "
+            f"WHERE kind = 'edit' AND linked = 1 AND target IN ({placeholders}) "
+            "ORDER BY target, author, seq ASC",
+            batch,
+        ).fetchall()
+        for row in rows:
+            target = str(row["target"])
+            author = str(row["author"])
+            if author != authors.get(target):
+                continue
+            if str(row["hash"]) not in chains.get(author, set()):
+                continue
+            states[target] = {
+                "text": str(row["text"]),
+                "edited_at": float(row["created_at"]),
+                "edit": str(row["hash"]),
+            }
+    return states
+
+
+def _chain_hashes(conn: sqlite3.Connection, author: str) -> Set[str]:
+    """Hashes of linked entries on *author*'s chain, from the retained head back."""
+    head_row = conn.execute(
+        "SELECT hash FROM heads WHERE author = ?", (author,)
+    ).fetchone()
+    if head_row is None:
+        return set()
+    rows = conn.execute(
+        "WITH RECURSIVE chain(hash, prev) AS ("
+        "SELECT hash, prev FROM posts WHERE hash = ? AND author = ? AND linked = 1 "
+        "UNION ALL "
+        "SELECT p.hash, p.prev FROM posts p JOIN chain c ON p.hash = c.prev "
+        "WHERE p.author = ? AND p.linked = 1"
+        ") SELECT hash FROM chain",
+        (str(head_row["hash"]), author, author),
+    ).fetchall()
+    return {str(row["hash"]) for row in rows}
+
+
+def annotate_edits(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Replace post text with the author's latest edit, in place.
+
+    Each post gains an ``edited`` flag (and ``edited_at`` when it was
+    edited) so display surfaces can mark edited posts.  The post's
+    hash, author and creation time are untouched — an edit is a new
+    entry on the author's chain, not a rewrite of the original.
+    Applying this twice is a no-op: the same edit text is written
+    again, so callers that already received annotated posts (through
+    :func:`feed` with ``posts_only``) can annotate again safely.
+    """
+    states = edit_states(conn, [post["hash"] for post in posts])
+    for post in posts:
+        edit = states.get(post["hash"])
+        if edit is None:
+            post["edited"] = False
+            continue
+        post["text"] = edit["text"]
+        post["edited"] = True
+        post["edited_at"] = edit["edited_at"]
     return posts
 
 
@@ -1423,7 +1615,8 @@ def feed(
             "ORDER BY seq ASC LIMIT ?",
             (author, max(0, int(after_seq)), count),
         ).fetchall()
-        return _public_posts(rows)
+        posts = _public_posts(rows)
+        return annotate_edits(conn, posts) if posts_only else posts
 
     params: List[Any] = []
     where = "linked = 1"
@@ -1445,7 +1638,8 @@ def feed(
         "ORDER BY created_at DESC, hash DESC LIMIT ?",
         params,
     ).fetchall()
-    return _public_posts(rows)
+    posts = _public_posts(rows)
+    return annotate_edits(conn, posts) if posts_only else posts
 
 
 TAN_EXPORT_FORMAT = "tau-tan-export"
@@ -1631,7 +1825,7 @@ def timeline(
                 conn,
                 annotate_replies(
                     conn,
-                    annotate_reactions(conn, posts, viewer=viewer),
+                    annotate_edits(conn, annotate_reactions(conn, posts, viewer=viewer)),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
                     blocked_authors=blocked,
@@ -1677,7 +1871,7 @@ def timeline(
             conn,
             annotate_replies(
                 conn,
-                annotate_reactions(conn, posts, viewer=viewer),
+                annotate_edits(conn, annotate_reactions(conn, posts, viewer=viewer)),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
                 blocked_authors=blocked,
@@ -1739,7 +1933,9 @@ def author_timeline(
             conn,
             annotate_replies(
                 conn,
-                annotate_reactions(conn, list(reversed(posts)), viewer=viewer),
+                annotate_edits(
+                    conn, annotate_reactions(conn, list(reversed(posts)), viewer=viewer)
+                ),
                 muted_keywords=keywords,
                 blocked_authors=blocked,
             ),
@@ -1773,9 +1969,9 @@ def _fill_unmuted(
     return kept[:wanted]
 
 
-# Upper bound on bound parameters per thread query.  SQLite builds often cap
-# host parameters at 999, so wide generations and long threads are processed
-# in batches of this size.
+# Upper bound on bound parameters per batched query.  SQLite builds often cap
+# host parameters at 999, so wide generations, long threads and large edit
+# lookups are processed in batches of this size.
 _SQL_BATCH = 500
 
 
@@ -1933,7 +2129,10 @@ def thread(
     for batch in _thread_batches(ordered, _SQL_BATCH):
         annotate_quotes(
             conn,
-            annotate_quote_counts(conn, annotate_reactions(conn, batch, viewer=viewer)),
+            annotate_quote_counts(
+                conn,
+                annotate_edits(conn, annotate_reactions(conn, batch, viewer=viewer)),
+            ),
         )
     return ordered
 
@@ -1958,11 +2157,12 @@ def search_posts(
     Only linked ``post`` and ``quote`` entries match: reaction entries
     never appear as results, and posts their author deleted are
     excluded the same way the timeline excludes them.  The match is a
-    case-insensitive substring search over the post text — ``casefold``
-    on both sides, so it folds Unicode case (``Ä`` matches ``ä``) —
-    and the search reads only the local store: it makes no network
-    requests.  Results carry the same like and quote annotations as
-    the timeline.
+    case-insensitive substring search over the post's current text — an
+    edited post matches its edited text, not the original — with
+    ``casefold`` on both sides, so it folds Unicode case (``Ä`` matches
+    ``ä``) — and the search reads only the local store: it makes no
+    network requests.  Results carry the same like, quote and edit
+    annotations as the timeline.
 
     The match runs in Python rather than as a SQL ``LIKE``: SQLite's
     ``LIKE`` folds ASCII case only, so a ``LIKE`` query would miss
@@ -1994,20 +2194,29 @@ def search_posts(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    matches = [row for row in rows if needle in str(row["text"]).casefold()]
+    candidates = _public_posts(rows)
+    states = edit_states(conn, [post["hash"] for post in candidates])
+    matches = [
+        post
+        for post in candidates
+        if needle
+        in (states[post["hash"]]["text"] if post["hash"] in states else post["text"]).casefold()
+    ]
     if author is None:
         silenced = muted_author_set(conn)
         matches = [
-            row
-            for row in matches
-            if str(row["author"]) not in silenced
-            and str(row["author"]) not in excluded
+            post
+            for post in matches
+            if str(post["author"]) not in silenced
+            and str(post["author"]) not in excluded
         ]
     return annotate_quotes(
         conn,
         annotate_quote_counts(
             conn,
-            annotate_reactions(conn, _public_posts(matches[:count]), viewer=viewer),
+            annotate_edits(
+                conn, annotate_reactions(conn, matches[:count], viewer=viewer)
+            ),
         ),
     )
 
@@ -2077,7 +2286,10 @@ def mentions(
     visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
     rows = visible[:count]
     return annotate_replies(
-        conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+        conn,
+        annotate_edits(
+            conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+        ),
     )
 
 
@@ -2782,6 +2994,27 @@ class TanApp:
         try:
             record = create_delete(
                 conn, self.identity, target, name=self.name
+            )
+        finally:
+            conn.close()
+        if publish and self.node is not None:
+            self.publish(record, targets=targets, ttl=ttl)
+        return record
+
+    def edit(
+        self,
+        target: str,
+        text: str,
+        *,
+        publish: bool = False,
+        targets: Optional[Sequence[Any]] = None,
+        ttl: int = MAX_GOSSIP_TTL,
+    ) -> Dict[str, Any]:
+        """Append an edit entry for *target* (one of your own posts)."""
+        conn = self.connect()
+        try:
+            record = create_edit(
+                conn, self.identity, target, text, name=self.name
             )
         finally:
             conn.close()

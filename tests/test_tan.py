@@ -19,6 +19,7 @@ from tau.tangents.tan import (
     PostError,
     TanApp,
     TanError,
+    annotate_edits,
     annotate_quote_counts,
     annotate_quotes,
     annotate_reactions,
@@ -26,11 +27,13 @@ from tau.tangents.tan import (
     author_stats,
     author_timeline,
     create_delete,
+    create_edit,
     create_post,
     create_quote,
     create_reaction,
     create_reply,
     deleted_targets,
+    edit_states,
     export_entries,
     feed,
     follow,
@@ -1350,6 +1353,306 @@ def test_delete_handler_roundtrip(identities, tmp_path):
         conn.close()
 
 
+def test_edit_updates_timeline_feed_and_thread(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "orginal typo", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "nice post", name="bob", now=1001
+    )
+
+    edit = create_edit(conn, alice, post["hash"], "original, fixed", name="alice", now=1002)
+    assert edit["kind"] == "edit"
+    assert edit["target"] == post["hash"]
+    assert edit["text"] == "original, fixed"
+    assert verify_post(edit)["hash"] == edit["hash"]
+
+    # The original entry is untouched; display surfaces show the edit.
+    assert get_post(conn, post["hash"])["text"] == "orginal typo"
+    items = timeline(conn, [post["author"], reply["author"]])
+    assert [item["text"] for item in items] == ["nice post", "original, fixed"]
+    assert items[1]["edited"] is True
+    assert items[1]["edited_at"] == 1002
+    assert items[0]["edited"] is False
+    assert [item["text"] for item in feed(conn, posts_only=True)] == [
+        "nice post",
+        "original, fixed",
+    ]
+    assert [item["text"] for item in thread(conn, post["hash"])] == [
+        "original, fixed",
+        "nice post",
+    ]
+    assert thread(conn, post["hash"])[0]["edited"] is True
+
+
+def test_edit_latest_wins_and_reply_parent_shows_edited_text(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "v1", name="alice", now=1000)
+    create_edit(conn, alice, post["hash"], "v2", name="alice", now=1001)
+    create_edit(conn, alice, post["hash"], "v3", name="alice", now=1002)
+    reply = create_reply(
+        conn, bob, post["hash"], "quoting you", name="bob", now=1003
+    )
+
+    states = edit_states(conn, [post["hash"]])
+    assert states[post["hash"]]["text"] == "v3"
+    items = timeline(conn, [post["author"], reply["author"]])
+    assert [item["text"] for item in items] == ["quoting you", "v3"]
+    assert items[0]["reply_to"]["text"] == "v3"
+    assert items[0]["reply_to"]["edited"] is True
+    # Editing a reply works the same way.
+    create_edit(conn, bob, reply["hash"], "quoting you (fixed)", name="bob", now=1004)
+    items = timeline(conn, [post["author"], reply["author"]])
+    assert [item["text"] for item in items] == [
+        "quoting you (fixed)",
+        "v3",
+    ]
+
+
+def test_edit_search_matches_edited_text_not_original(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "bananas", name="alice", now=1000)
+    create_edit(conn, alice, post["hash"], "apples", name="alice", now=1001)
+
+    assert [item["hash"] for item in search_posts(conn, "apples")] == [
+        post["hash"]
+    ]
+    assert search_posts(conn, "bananas") == []
+    assert search_posts(conn, "apples")[0]["edited"] is True
+
+
+def test_edit_fork_keeps_retained_chain_text(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "v1", name="alice", now=1000)
+    first = create_edit(
+        conn, alice, post["hash"], "head branch", name="alice", now=1001
+    )
+    # A second edit branched from the same parent (e.g. written on
+    # another device before it saw the first edit) shares the sequence
+    # number; only the edit on the retained head chain counts.
+    create_edit(
+        conn, alice, post["hash"], "forked branch", name="alice", now=1002,
+        previous=post["hash"],
+    )
+    assert head(conn, post["author"]) == first["hash"]
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["head branch"]
+    # An edit chained onto the retained head supersedes both.
+    create_edit(
+        conn, alice, post["hash"], "head branch, again", name="alice", now=1003
+    )
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["head branch, again"]
+
+
+def test_search_batches_edit_lookups_over_large_feeds(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for n in range(1100):
+        create_post(conn, alice, f"bulk post {n}", name="alice", now=1000 + n)
+    # 1100 candidates exceeds SQLite's 999 host-variable limit; the
+    # edit lookup must batch instead of failing the whole search.
+    results = search_posts(conn, "bulk", limit=200)
+    assert len(results) == 200
+    assert all(item["edited"] is False for item in results)
+
+
+def test_edit_rejects_foreign_unknown_deleted_and_unlinked(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "mine", name="alice", now=1000)
+
+    with pytest.raises(TanError, match="did not author"):
+        create_edit(conn, bob, post["hash"], "hijack", name="bob", now=1001)
+    with pytest.raises(TanError, match="unknown post"):
+        create_edit(conn, alice, "ab" * 32, "ghost", name="alice", now=1001)
+    # Only posts and replies can be edited, even by their own author.
+    like = create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1001)
+    with pytest.raises(TanError, match="only posts and replies can be edited"):
+        create_edit(conn, alice, like["hash"], "nope", name="alice", now=1002)
+    # A quote is a timeline entry, but edits to it would never display
+    # (edit_states only covers posts and replies), so it is rejected
+    # here rather than stored as a silent no-op.
+    quote = create_quote(
+        conn, alice, post["hash"], "sharing", name="alice", now=1002
+    )
+    with pytest.raises(TanError, match="only posts and replies can be edited"):
+        create_edit(conn, alice, quote["hash"], "nope", name="alice", now=1003)
+
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        create_edit(conn, alice, post["hash"], "too late", name="alice", now=1003)
+
+
+def test_edit_by_non_author_is_inert(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "mine", name="alice", now=1000)
+
+    # A forged edit smuggled in through the store path is kept (chains
+    # stay complete) but is inert: the post keeps its own text.  It has
+    # to be hand-built — create_edit refuses a foreign post outright.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "hijacked",
+        "created_at": 1001.0,
+        "prev": "",
+        "kind": "edit",
+        "target": post["hash"],
+    }
+    digest = hash(body, previous="")
+    forged = dict(
+        body,
+        hash=digest,
+        sig=bob.sign(bytes.fromhex(digest)).hex(),
+    )
+    record, is_new = store_post(conn, forged)
+    assert is_new is True
+    assert record["kind"] == "edit"
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["mine"]
+    assert items[0]["edited"] is False
+    assert edit_states(conn, [post["hash"]]) == {}
+
+
+def test_edit_arriving_before_its_post_applies_on_arrival(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "late arrival", name="alice", now=1000)
+    edit = create_edit(scratch, alice, post["hash"], "late arrival, fixed", name="alice", now=1001)
+
+    # The edit lands first; with no post cached it is inert.
+    store_post(conn, edit)
+    assert edit_states(conn, [post["hash"]]) == {}
+
+    # Once the post itself is synced in, the earlier edit applies.
+    store_post(conn, post)
+    items = timeline(conn, [post["author"]])
+    assert [item["text"] for item in items] == ["late arrival, fixed"]
+    assert items[0]["edited"] is True
+
+
+def test_edit_rejects_tampering(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "target practice", name="alice", now=1000)
+    other = create_post(conn, alice, "decoy", name="alice", now=1001)
+    edit = create_edit(conn, alice, post["hash"], "fixed", name="alice", now=1002)
+
+    with pytest.raises(PostError):
+        verify_post(dict(edit, target=other["hash"]))
+    with pytest.raises(PostError):
+        verify_post(dict(edit, text="sneaky"))
+    with pytest.raises(PostError):
+        verify_post(dict(post, kind="edit", target=post["hash"]))
+
+
+def test_edit_survives_export_import_roundtrip(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "typo here", name="alice", now=1000)
+    create_edit(conn, alice, post["hash"], "typo fixed", name="alice", now=1001)
+    document = export_entries(conn, all_authors=True)
+    assert [entry["kind"] for entry in document["entries"]] == ["post", "edit"]
+
+    restored = init_db(tmp_path / "restored.sqlite3")
+    result = import_entries(restored, document)
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    items = timeline(restored, [post["author"]])
+    assert [item["text"] for item in items] == ["typo fixed"]
+    assert items[0]["edited"] is True
+
+
+def test_edit_then_delete_hides_post(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "typo here", name="alice", now=1000)
+    create_edit(conn, alice, post["hash"], "typo fixed", name="alice", now=1001)
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+
+    assert timeline(conn, [post["author"]]) == []
+    assert search_posts(conn, "typo") == []
+    assert deleted_targets(conn) == {post["hash"]}
+
+
+def test_cli_edit(tmp_path):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan", "post", "--data-dir", str(data_dir),
+                "--no-publish", "--json", "cli typo here",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        posts = feed(conn, all_authors=True)
+    finally:
+        conn.close()
+    target = next(item for item in posts if item["text"] == "cli typo here")
+
+    assert (
+        main(
+            [
+                "tan", "edit", "--data-dir", str(data_dir),
+                "--no-publish", "--json", target["hash"][:16], "cli typo fixed",
+            ]
+        )
+        == 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        remaining = timeline(conn, include_all=True)
+        assert [item["text"] for item in remaining] == ["cli typo fixed"]
+        assert remaining[0]["edited"] is True
+        # The original entry is untouched.
+        assert get_post(conn, target["hash"])["text"] == "cli typo here"
+    finally:
+        conn.close()
+
+
+def test_cli_edit_rejects_foreign_post(tmp_path):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    # Plant another author's post in alice's cache, as a sync would.
+    other = RNS.Identity()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        foreign = create_post(conn, other, "not yours", name="mallory", now=1000)
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "tan", "edit", "--data-dir", str(data_dir),
+                "--no-publish", "--json", foreign["hash"][:16], "hijack",
+            ]
+        )
+        != 0
+    )
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        assert timeline(conn, include_all=True)[0]["text"] == "not yours"
+    finally:
+        conn.close()
+
+
 def test_cli_delete(tmp_path):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
@@ -1660,6 +1963,7 @@ def test_reply_chains_verifies_and_annotates(identities, tmp_path):
         "name": "alice",
         "text": "original thought",
         "deleted": False,
+        "edited": False,
     }
     assert "reply_to" not in items[1]
     assert [item["hash"] for item in feed(conn, posts_only=True)] == [
@@ -1947,6 +2251,7 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
         "name": "bob",
         "text": "",
         "deleted": True,
+        "edited": False,
     }
     with pytest.raises(TanError, match="has been deleted"):
         create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
@@ -2152,6 +2457,7 @@ def test_quote_can_be_liked_deleted_and_replied_to(identities, tmp_path):
         "name": "bob",
         "text": "",
         "deleted": True,
+        "edited": False,
     }
     with pytest.raises(TanError, match="has been deleted"):
         thread(conn, quote["hash"])
