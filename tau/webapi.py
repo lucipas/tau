@@ -78,7 +78,10 @@ DEFAULT_WEB_HOST = "127.0.0.1"
 MAX_BODY_BYTES = 32 * 1024
 # An import carries a whole signed chain, so the 32 KiB action cap would
 # reject any real backup. The bridge binds to loopback only and the
-# document is validated entry by entry, so a 16 MiB cap is the bound.
+# document is validated entry by entry, so a 16 MiB cap is the bound —
+# and the export is held to the same cap, so the console never hands
+# out a backup it cannot import back (larger caches back up with the
+# CLI, which has no cap).
 MAX_IMPORT_BYTES = 16 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
@@ -195,6 +198,19 @@ def _is_local_origin(origin: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return host in _LOCAL_ORIGIN_HOSTS or host.endswith(".localhost")
+
+
+def _is_loopback_client(client: str) -> bool:
+    """True when the connected client is the local machine.
+
+    Bulk imports are accepted only from loopback, even when the bridge
+    is bound to a remote interface: an import writes many entries in
+    one request, so it stays a local-operator action.
+    """
+    try:
+        return ipaddress.ip_address(client).is_loopback
+    except ValueError:
+        return False
 
 
 class EventBus:
@@ -1116,10 +1132,23 @@ class WebBridge:
         conn = self._tan_conn()
         try:
             if all_authors:
-                return export_entries(conn, all_authors=True)
-            return export_entries(conn, author=app.author)
+                document = export_entries(conn, all_authors=True)
+            else:
+                document = export_entries(conn, author=app.author)
         finally:
             conn.close()
+        # The console must never hand out a backup it cannot import
+        # back: the import route rejects bodies over MAX_IMPORT_BYTES,
+        # so an export past that size is refused here, with the CLI as
+        # the route for larger caches.
+        size = len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+        if size > MAX_IMPORT_BYTES:
+            raise ValueError(
+                "this export is larger than the console can import back "
+                f"({MAX_IMPORT_BYTES // (1024 * 1024)} MiB); back up with "
+                "`tau tan export` from the command line instead"
+            )
+        return document
 
     def tan_import(self, document: Any) -> Dict[str, Any]:
         """Store every entry in an export document, verifying each one.
@@ -1811,6 +1840,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                     document = self.bridge.tan_export(all_authors=(scope == "all"))
                 except WebBridgeError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json(document, head_only)
                 return

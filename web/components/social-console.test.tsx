@@ -299,4 +299,23 @@ describe("TanBackupSection", () => {
     ).toBeTruthy();
     expect(onImport).not.toHaveBeenCalled();
   });
+
+  it("lets the same invalid file be picked again after a parse failure", async () => {
+    const { onImport } = renderSection();
+    const input = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+
+    pickFile("not json");
+    await screen.findByText("that file is not a valid export document");
+    // The input is cleared even though parsing failed, so choosing
+    // the same file again fires onChange instead of doing nothing.
+    expect(input.value).toBe("");
+
+    pickFile("not json");
+    expect(
+      await screen.findByText("that file is not a valid export document"),
+    ).toBeTruthy();
+    expect(onImport).not.toHaveBeenCalled();
+  });
 });

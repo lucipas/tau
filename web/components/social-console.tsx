@@ -396,23 +396,26 @@ export function TanBackupSection({
     setError(null);
     setMessage(null);
     setErrors([]);
-    let doc: unknown;
     try {
-      doc = JSON.parse(await file.text());
-    } catch {
-      setError("that file is not a valid export document");
-      return;
-    }
-    try {
-      const result = await onImport(doc as TanExportDocument);
-      setMessage(
-        `imported ${result.imported} · ${result.present} already present · ${result.skipped} skipped`,
-      );
-      setErrors(result.errors);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "import failed");
+      let doc: unknown;
+      try {
+        doc = JSON.parse(await file.text());
+      } catch {
+        setError("that file is not a valid export document");
+        return;
+      }
+      try {
+        const result = await onImport(doc as TanExportDocument);
+        setMessage(
+          `imported ${result.imported} · ${result.present} already present · ${result.skipped} skipped`,
+        );
+        setErrors(result.errors);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "import failed");
+      }
     } finally {
-      // Picking the same file again must fire onChange.
+      // Picking the same file again must fire onChange, including
+      // after a parse failure that returns before the import runs.
       if (importInputRef.current) importInputRef.current.value = "";
     }
   }

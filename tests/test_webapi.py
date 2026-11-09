@@ -885,6 +885,80 @@ def test_tan_export_import_requires_social(tmp_path):
         bridge.stop()
 
 
+def test_tan_export_too_large_for_import_is_refused(tmp_path, monkeypatch):
+    import RNS
+
+    import tau.webapi as webapi
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "one post", name="tester", now=1000)
+    finally:
+        conn.close()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A cache the console could not import back must not be
+        # exported either: shrink the bound to prove the check.
+        monkeypatch.setattr(webapi, "MAX_IMPORT_BYTES", 10)
+        status, _, payload = _json(bridge, "/api/tan/export")
+        assert status == 400
+        assert "larger than the console can import" in payload["error"]["message"]
+        assert "tau tan export" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_import_sanitizes_unencodable_error_hash(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+    node.app = TanApp(node.config, RNS.Identity(), name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A hash with a lone surrogate comes from untrusted JSON; the
+        # response encoder (ensure_ascii=False + UTF-8) cannot write it,
+        # so the bridge must replace it instead of failing the request.
+        document = {
+            "format": "tau-tan-export",
+            "version": 1,
+            "exported_at": 1000,
+            "authors": [],
+            "entries": [{"hash": "\ud800", "text": "bogus"}],
+        }
+        status, _, payload = _json(
+            bridge, "/api/tan/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["skipped"] == 1
+        # The UTF-8 "replace" handler turns the lone surrogate into "?".
+        assert payload["import"]["errors"][0]["hash"] == "?"
+    finally:
+        bridge.stop()
+
+
+def test_is_loopback_client():
+    from tau.webapi import _is_loopback_client
+
+    assert _is_loopback_client("127.0.0.1") is True
+    assert _is_loopback_client("::1") is True
+    assert _is_loopback_client("192.168.1.5") is False
+    assert _is_loopback_client("not an address") is False
+
+
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),
