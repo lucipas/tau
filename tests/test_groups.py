@@ -715,8 +715,8 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert by_to[THIRD_HASH]["queued"] is True
     assert len(calls) == 1
     assert calls[0][1] == "/tau/group"
-    # The shared fan-out deadline rides along, so one slow leg cannot
-    # consume the whole budget stage by stage.
+    # The leg's deadline rides along, so one slow leg cannot
+    # consume its whole budget stage by stage.
     assert calls[0][3] is not None
     parsed = parse_group_message(calls[0][2])
     assert parsed["text"] == "hello all"
@@ -872,6 +872,41 @@ def test_send_group_message_queues_legs_past_the_deadline(tmp_path):
         node.mailbox.sent_record(entry["id"]) is not None
         for entry in result["results"]
     )
+
+
+def test_send_group_message_slow_first_leg_does_not_starve_later_legs(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    attempts = []
+
+    def fake_resolve(target, timeout=10.0):
+        return _stub_peer(target, "peer")
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        attempts.append(peer.hexhash)
+        if peer.hexhash == OTHER_HASH:
+            # An offline member's path wait consumes its whole leg
+            # budget before the attempt fails.
+            time.sleep(1.2)
+            raise NodeError("no path")
+        return {"ok": True}
+
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    node._request = fake_request  # type: ignore[method-assign]
+    # The roster is attempted in sorted order (OTHER before THIRD).
+    # With a single fan-out-wide deadline, the first leg burning its
+    # budget left every later member queued without an attempt — the
+    # regression behind the flaky
+    # test_three_nodes_exchange_group_messages integration failure,
+    # where an offline member sorting first starved the online one.
+    result = node.send_group_message(group, "hello", timeout=1.0)
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["queued"] is True
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert attempts == [OTHER_HASH, THIRD_HASH]
 
 
 def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):

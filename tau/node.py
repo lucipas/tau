@@ -2971,9 +2971,10 @@ class TauNode:
         leg is a ``/tau/group`` request carrying the roster; a member
         that cannot be reached is queued in the outbox (with the group
         context, so a retry re-sends the group payload) unless it
-        explicitly refused the message.  The whole fan-out is bounded
-        by ``timeout``: a leg the deadline leaves no time to attempt
-        is queued the same way instead of dropped.  Returns a
+        explicitly refused the message.  Each leg is bounded by
+        ``timeout``: the stages of one delivery share that leg's
+        budget, and a leg the deadline leaves no time to attempt is
+        queued the same way instead of dropped.  Returns a
         per-member result list: ``delivered``, ``queued``, or an
         ``error`` for that leg.
         """
@@ -3012,9 +3013,6 @@ class TauNode:
                 f"group message is too large to send with its roster ({exc}); "
                 "shorten the message"
             ) from exc
-        # One deadline bounds the whole fan-out: the legs run one after
-        # another, so a per-leg timeout would multiply with the roster size.
-        deadline = time.monotonic() + timeout
         for member in members:
             message_id = generate_message_id()
             payload = encode_group_message(
@@ -3026,6 +3024,19 @@ class TauNode:
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None
+            # One deadline bounds each leg, and the budget is per leg:
+            # the stages of a single delivery (resolve, path, link,
+            # response) share the leg's budget instead of each taking
+            # the full timeout, but one member's leg must not consume
+            # another's.  The roster is in sorted-hash order, so who
+            # runs first is arbitrary — with a single fan-out-wide
+            # deadline, an offline member sorted first burned the whole
+            # budget waiting for a path that could never appear, and
+            # every later (reachable) member was queued without an
+            # attempt.  A per-leg deadline reserves the full attempt
+            # window for every member while keeping each leg capped at
+            # ``timeout``.
+            deadline = time.monotonic() + timeout
             budget = _remaining(deadline) or 0.0
             if budget <= 0.0:
                 # Out of time for another attempt — but the leg must
@@ -3098,11 +3109,10 @@ class TauNode:
                     to=bytes.fromhex(member),
                     text=normalized,
                 )
-                # Pass the shared deadline through: without it, path
+                # Pass the leg's deadline through: without it, path
                 # discovery, link establishment and the response could
-                # each consume the remaining budget on a slow link, and
-                # one leg could take close to a minute against a
-                # 20-second fan-out.
+                # each consume the leg's budget on a slow link, and
+                # one leg could take close to three timeouts.
                 response = self._request(
                     peer,
                     REQUEST_GROUP_MESSAGE,
