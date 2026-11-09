@@ -65,6 +65,7 @@ export function useTau() {
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
   const searchQueryRef = useRef(searchQuery);
+  const searchSeq = useRef(0);
 
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -323,13 +324,19 @@ export function useTau() {
   // fetches the search endpoint instead of showing the live feed.
   // Clearing it returns to the live traffic the same way.
   const runSearch = useCallback(async (trimmed: string) => {
+    // Each request takes a sequence number; a response only applies if it
+    // is still the latest request, so superseded or cleared searches
+    // cannot overwrite the active view.
+    const seq = ++searchSeq.current;
     try {
       const result = await apiGet<MessagesSearchResponse>(
         `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
       );
+      if (seq !== searchSeq.current) return;
       setSearchResults(result.messages);
       setSearchError(null);
     } catch (caught) {
+      if (seq !== searchSeq.current) return;
       setSearchError(
         caught instanceof Error ? caught.message : "search failed",
       );
@@ -359,6 +366,8 @@ export function useTau() {
   );
 
   const clearSearch = useCallback(() => {
+    // Invalidate any in-flight search so its late response is discarded.
+    searchSeq.current += 1;
     setSearchQuery(null);
     setSearchResults([]);
     setSearchError(null);
