@@ -1031,18 +1031,58 @@ class WebBridge:
         an empty name and the console falls back to the short hash. Only
         author identities are exposed, never reaction contents.
         """
-        from .tangents.tan import TanError, get_post, post_likers
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            _NOT_DELETED,
+            KIND_LIKE,
+            KIND_UNLIKE,
+            TIMELINE_KINDS_SQL,
+            TanError,
+            muted_author_set,
+            post_likers,
+        )
 
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target is required")
-        clean = target.strip()
+        # Hashes are stored lowercase; normalize before any lookup.
+        clean = target.strip().lower()
+        # Same author exclusions as tan_timeline, including fail-closed
+        # block-all, so a liker list never shows hidden identities.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = set(blocklist.blocked) if blocklist is not None else set()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
         conn = self._tan_conn()
         try:
-            if get_post(conn, clean) is None:
+            # A target is visible only when the timeline would show it:
+            # linked, a timeline kind, not deleted by its author, and by
+            # an author who is neither muted nor blocked.
+            row = conn.execute(
+                "SELECT author FROM posts WHERE hash = ? AND linked = 1 "
+                f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}",
+                (clean,),
+            ).fetchone()
+            hidden = muted_author_set(conn) | blocked
+            if row is None or exclude_all or str(row["author"]) in hidden:
                 raise TanError(f"unknown post: {clean!r}")
+            app = self._tan_app()
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            if not (ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE)):
+                # Reactions are hidden for this viewer, so the timeline
+                # shows no like annotations; disclose no likers either.
+                return {"target": clean, "likers": [], "count": 0}
             likers = []
             for entry in post_likers(conn, clean):
                 author = entry["author"]
+                if author in hidden:
+                    continue
                 name = ""
                 peer = self.node.registry.get(author)
                 if peer is not None:
@@ -1790,10 +1830,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/api/tan/likes":
+                from .tangents.tan import TanError
+
                 target = (query.get("target") or [None])[0]
                 try:
                     payload = self.bridge.tan_likers(target)
-                except Exception as exc:
+                except (TanError, ValueError) as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json(payload, head_only)
