@@ -911,7 +911,7 @@ def test_outbox_drop_held_errors(bridge, node):
     status, _, payload = _json(
         bridge, "/api/outbox/drop-held", method="POST", body={"target": "ff" * 16}
     )
-    assert status == 404
+    assert status == 400
     assert "unknown held message" in payload["error"]["message"]
 
     # Two envelopes sharing a prefix make the prefix ambiguous.
@@ -920,7 +920,7 @@ def test_outbox_drop_held_errors(bridge, node):
     status, _, payload = _json(
         bridge, "/api/outbox/drop-held", method="POST", body={"target": "aa"}
     )
-    assert status == 404
+    assert status == 400
     assert "match prefix" in payload["error"]["message"]
 
     # Dropping an envelope that is already gone is a 404 too.
@@ -933,7 +933,7 @@ def test_outbox_drop_held_errors(bridge, node):
     status, _, payload = _json(
         bridge, "/api/outbox/drop-held", method="POST", body={"target": gone}
     )
-    assert status == 404
+    assert status == 400
     assert "unknown held message" in payload["error"]["message"]
 
 

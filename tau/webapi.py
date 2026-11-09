@@ -2100,7 +2100,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         except MailboxError as exc:
-            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json({"ok": True, "dropped": dropped}, head_only)
 
