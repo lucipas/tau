@@ -130,6 +130,9 @@ export function useTan() {
   const search = useCallback(async (query: string) => {
     const trimmed = query.trim();
     if (!trimmed) return;
+    // Drop hits from the previous query so they are not shown as matches
+    // for the new one while its request is in flight.
+    setSearchResults([]);
     setSearchQuery(trimmed);
   }, []);
 
