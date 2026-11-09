@@ -775,6 +775,38 @@ def test_tan_mentions_hide_blocked_and_muted(tmp_path):
         bridge.stop()
 
 
+def test_tan_mentions_unexpected_failure_is_500(tmp_path, monkeypatch):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "original thought", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        import tau.tangents.tan as tan_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("database exploded")
+
+        monkeypatch.setattr(tan_module, "mentions", _boom)
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 500
+        assert payload["error"]["message"] == "internal error"
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

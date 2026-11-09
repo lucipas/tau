@@ -2075,14 +2075,17 @@ def mentions(
     keywords = _muted_keyword_list(conn)
     author_clause = ""
     if hidden:
-        author_clause = (
-            f"AND r.author NOT IN ({', '.join('?' for _ in hidden)}) "
-        )
+        # One JSON parameter instead of one placeholder per author,
+        # so a large mute/block list cannot exceed SQLite's
+        # bound-variable limit — the same pattern :func:`feed` uses.
+        author_clause = "AND r.author NOT IN (SELECT value FROM json_each(?)) "
     kept: List[Dict[str, Any]] = []
     cursor: Optional[Tuple[float, str]] = None
     while len(kept) < count:
         where = "r.linked = 1 AND r.kind = 'reply' AND r.author != ? " + author_clause
-        params: List[Any] = [viewer, *hidden]
+        params: List[Any] = [viewer]
+        if hidden:
+            params.append(json.dumps(hidden))
         if cursor is not None:
             where += "AND (r.created_at < ? OR (r.created_at = ? AND r.hash < ?)) "
             params.extend([cursor[0], cursor[0], cursor[1]])

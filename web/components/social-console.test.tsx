@@ -273,4 +273,17 @@ describe("SocialConsole mentions view", () => {
     render(<SocialConsole />);
     expect(screen.getByText("No replies yet")).toBeTruthy();
   });
+
+  it("shows the load error instead of an empty state when the feed fails", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({
+        showMentions: true,
+        error: "this node has no identity yet",
+      }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.getByText("this node has no identity yet")).toBeTruthy();
+    expect(screen.queryByText("No replies yet")).toBeNull();
+  });
 });
