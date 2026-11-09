@@ -1108,13 +1108,14 @@ class WebBridge:
             conn.close()
 
     def tan_muted(self) -> List[Dict[str, Any]]:
-        from .tangents.tan import author_stats, muted
+        from .tangents.tan import author_stats_many, muted
 
         conn = self._tan_conn()
         try:
             records = muted(conn)
+            stats = author_stats_many(conn, [record["author"] for record in records])
             for record in records:
-                record.update(author_stats(conn, record["author"]))
+                record.update(stats[record["author"]])
             return records
         finally:
             conn.close()
@@ -1965,12 +1966,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
+                from .tangents.tan import TanError
+
                 try:
                     if path.endswith("unmute"):
                         result = self.bridge.tan_unmute(target.strip())
                     else:
                         result = self.bridge.tan_mute(target.strip())
-                except Exception as exc:
+                except TanError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "mute": result}, head_only)
