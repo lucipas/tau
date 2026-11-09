@@ -49,3 +49,25 @@ describe("MessageFeed reactions", () => {
     expect(screen.queryByLabelText("Reactions")).toBeNull();
   });
 });
+
+describe("MessageFeed file entries", () => {
+  it("renders the file name, size and hash for a sent file", () => {
+    const message = makeMessage({
+      direction: "out",
+      text: "Sent file: notes.txt (10 bytes)",
+      file: { name: "notes.txt", size: 10, sha256: "a".repeat(64) },
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByText("10 B")).toBeTruthy();
+    expect(screen.getByTitle(`SHA-256 ${"a".repeat(64)}`)).toBeTruthy();
+  });
+
+  it("renders nothing extra when a message carries no file", () => {
+    render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    expect(screen.queryByText("10 B")).toBeNull();
+  });
+});

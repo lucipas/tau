@@ -8,6 +8,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
+    POST /api/send-file    send a file ``{"to": "...", "name": "...", "data": "<base64>"}``
+                           (optional ``"timeout"`` seconds, default 300)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -31,7 +33,9 @@ who can reach this API can send messages as this node.
 
 from __future__ import annotations
 
+import base64
 import errno
+import hashlib
 import json
 import logging
 import math
@@ -39,6 +43,7 @@ import mimetypes
 import queue
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -55,6 +60,7 @@ from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
 from .protocol import (
+    MAX_FILE_BYTES,
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     ProtocolError,
@@ -62,6 +68,7 @@ from .protocol import (
     clean_reaction,
     excerpt_hash,
     normalize_message,
+    sanitize_file_name,
     sanitize_name,
     short_hash,
 )
@@ -73,6 +80,10 @@ DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
+# A file send carries the bytes as base64 inside one JSON body: a 10 MiB
+# file is ~13.4 MB once encoded, so this endpoint gets its own cap.  The
+# bridge still enforces the 10 MiB file limit after decoding.
+MAX_FILE_BODY_BYTES = 15 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
@@ -274,6 +285,37 @@ def _clean_stored_reaction(entry: Any) -> Optional[Dict[str, Any]]:
     return {"reactor": reactor, "name": name, "reaction": reaction}
 
 
+def _clean_stored_file(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate stored file metadata for a sent-file message, or ``None``.
+
+    A file entry names the file that was sent (``{"name", "size",
+    "sha256"}``).  Anything else — a wrong shape, an impossible size,
+    a hash that is not a SHA-256 hex digest — is dropped rather than
+    trusted, like every other stored field.
+    """
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    size = value.get("size")
+    sha256 = value.get("sha256")
+    if not isinstance(name, str) or not name:
+        return None
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or size > MAX_FILE_BYTES
+    ):
+        return None
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(char not in "0123456789abcdef" for char in sha256.lower())
+    ):
+        return None
+    return {"name": name, "size": size, "sha256": sha256.lower()}
+
+
 def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     """Validate one message record loaded from ``messages.json``.
 
@@ -370,6 +412,9 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         in_reply_to = None
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
+    stored_file = _clean_stored_file(entry.get("file"))
+    if stored_file is not None:
+        message["file"] = stored_file
     try:
         # The writer serialises with ensure_ascii=False, so a stored
         # string that is not UTF-8 encodable (e.g. a lone surrogate from a
@@ -1215,6 +1260,61 @@ class WebBridge:
             )
         return message, response
 
+    def send_file(
+        self,
+        target: str,
+        name: str,
+        data: bytes,
+        *,
+        timeout: float = 300.0,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Send a file to a peer from the console.
+
+        The bytes are staged in a temporary directory under the
+        sanitised file name — ``TauNode.send_file`` takes a path — and
+        the staging directory is removed once the transfer finishes or
+        fails.  The sent file is recorded in the console feed as a file
+        entry (name, size, SHA-256) with status ``delivered``; a failed
+        transfer raises instead of recording anything, like a failed
+        text send.  Files are direct links only in v1, so a refused or
+        unreachable peer fails fast instead of queueing.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        clean_name = sanitize_file_name(name)
+        if not clean_name:
+            raise ValueError(f"file name {name!r} is not usable")
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("file data must be bytes")
+        data = bytes(data)
+        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+            raise ValueError(
+                f"file of {len(data)} bytes is outside the "
+                f"1..{MAX_FILE_BYTES} byte limit"
+            )
+        peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        digest = hashlib.sha256(data).hexdigest()
+        sent_at = time.time()
+        with tempfile.TemporaryDirectory(prefix="tau-send-file-") as staging:
+            staged = Path(staging) / clean_name
+            staged.write_bytes(data)
+            response = self.node.send_file(peer, staged, timeout=timeout)
+        wire_id = response.get("id") if isinstance(response.get("id"), str) else None
+        with self._send_lock:
+            message = self._append_message(
+                direction="out",
+                peer=peer.hexhash,
+                peer_name=peer.display_name,
+                text=f"Sent file: {clean_name} ({len(data)} bytes)",
+                sent_at=sent_at,
+                received_at=time.time(),
+                status="delivered",
+                wire_id=wire_id,
+                file={"name": clean_name, "size": len(data), "sha256": digest},
+            )
+        self.bus.publish({"type": "message", "message": message})
+        return message, response
+
     def react(
         self,
         target: str,
@@ -1530,6 +1630,7 @@ class WebBridge:
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
+        file: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -1562,6 +1663,10 @@ class WebBridge:
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
                 message["in_reply_to"] = reply_to
+            if file is not None:
+                # Validated by the caller (bridge.send_file) and
+                # re-validated on load by _clean_stored_message.
+                message["file"] = dict(file)
             self._next_message_id += 1
             self._messages.append(message)
         self._save_messages()
@@ -1754,9 +1859,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
-            body = self._read_body()
+            # A file send carries base64 bytes, so it gets the larger
+            # body cap; every other endpoint keeps the 32 KiB limit.
+            limit = (
+                MAX_FILE_BODY_BYTES
+                if path == "/api/send-file"
+                else MAX_BODY_BYTES
+            )
+            body = self._read_body(max_bytes=limit)
             if path == "/api/messages":
                 self._handle_send(body, head_only)
+                return
+            if path == "/api/send-file":
+                self._handle_send_file(body, head_only)
                 return
             if path == "/api/react":
                 self._handle_react(body, head_only)
@@ -1947,6 +2062,60 @@ class _WebHandler(BaseHTTPRequestHandler):
                 timeout=timeout,
                 expires_at=expires_at,
                 reply_to=reply_to,
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(
+            {"ok": True, "message": message, "response": response}, head_only
+        )
+
+    def _handle_send_file(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("to")
+        name = body.get("name")
+        data = body.get("data")
+        timeout = body.get("timeout", 300.0)
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'to' is required"}}, head_only, 400
+            )
+            return
+        if not isinstance(name, str) or not name.strip():
+            self._send_json(
+                {"error": {"message": "field 'name' is required"}}, head_only, 400
+            )
+            return
+        if not isinstance(data, str):
+            self._send_json(
+                {"error": {"message": "field 'data' must be base64"}},
+                head_only,
+                400,
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 300.0
+        timeout = max(1.0, min(float(timeout), 300.0))
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (ValueError, base64.binascii.Error):
+            self._send_json(
+                {"error": {"message": "field 'data' must be valid base64"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            message, response = self.bridge.send_file(
+                target,
+                name,
+                raw,
+                timeout=timeout,
             )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
@@ -2161,7 +2330,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self) -> Dict[str, Any]:
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -2172,7 +2341,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             length = int(raw_length or 0)
         except ValueError:
             raise RequestError("invalid Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
             return {}

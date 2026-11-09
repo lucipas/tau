@@ -52,6 +52,7 @@ class FakeNode:
             ]
         )
         self.sent = []
+        self.sent_files = []
         self.announced = 0
 
     def info(self):
@@ -91,6 +92,30 @@ class FakeNode:
             "server": self.name,
             "_rtt": 0.012,
             "id": wire_id,
+        }
+
+    def send_file(
+        self,
+        target,
+        path,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        progress_callback=None,
+    ):
+        import hashlib
+        from pathlib import Path
+
+        data = Path(path).read_bytes()
+        peer = target if isinstance(target, Peer) else self.resolve_peer(target)
+        self.sent_files.append((peer.name, Path(path).name, data))
+        return {
+            "ok": True,
+            "id": f"{len(self.sent_files):032d}",
+            "name": Path(path).name,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "to": peer.hexhash,
         }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
@@ -1321,6 +1346,25 @@ def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
     )
 
 
+def test_stored_file_metadata_survives_load_and_bad_shapes_drop():
+    from tau.webapi import _clean_stored_file, _clean_stored_message
+
+    good = {"name": "notes.txt", "size": 10, "sha256": "a" * 64}
+    assert _clean_stored_file(good) == good
+    assert _clean_stored_file({"name": "x", "size": 0, "sha256": "a" * 64}) is None
+    assert _clean_stored_file({"name": "x", "size": 10, "sha256": "zz"}) is None
+    assert _clean_stored_file("notes.txt") is None
+
+    entry = _stored_message(1, "Sent file: notes.txt (10 bytes)", direction="out")
+    entry["file"] = good
+    cleaned = _clean_stored_message(entry)
+    assert cleaned is not None
+    assert cleaned["file"] == good
+
+    entry["file"] = {"name": "x", "size": -1, "sha256": "a" * 64}
+    assert "file" not in _clean_stored_message(entry)
+
+
 def test_corrupt_message_history_starts_empty(node, tmp_path):
     (tmp_path / "messages.json").write_text("{not json", encoding="utf-8")
     bridge = _bridge_with_data_dir(node, tmp_path)
@@ -2006,3 +2050,130 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["expires_at"] == expires_at
+
+
+def test_send_file_is_recorded_with_file_metadata(bridge, node):
+    import hashlib
+
+    data = b"hello mesh"
+    message, response = bridge.send_file("alice", "notes.txt", data)
+    assert message["direction"] == "out"
+    assert message["status"] == "delivered"
+    assert message["text"] == "Sent file: notes.txt (10 bytes)"
+    assert message["file"] == {
+        "name": "notes.txt",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    assert message["wire_id"] == response["id"]
+    assert response["name"] == "notes.txt"
+    assert node.sent_files == [("alice", "notes.txt", data)]
+    # The feed carries the entry, and the bus tells live consoles.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["file"]["sha256"] == hashlib.sha256(data).hexdigest()
+    published = [e for e in bridge.bus.replay(0) if e.get("type") == "message"]
+    assert published[-1]["message"]["id"] == message["id"]
+
+
+def test_send_file_sanitises_the_name(bridge, node):
+    message, _ = bridge.send_file("alice", "../escape.txt", b"x")
+    assert message["file"]["name"] == "escape.txt"
+    assert node.sent_files[0][1] == "escape.txt"
+
+
+def test_send_file_validation(bridge):
+    from tau.protocol import MAX_FILE_BYTES
+
+    with pytest.raises(ValueError, match="not usable"):
+        bridge.send_file("alice", "..", b"x")
+    with pytest.raises(ValueError, match="outside the"):
+        bridge.send_file("alice", "a.txt", b"")
+    with pytest.raises(ValueError, match="outside the"):
+        bridge.send_file("alice", "a.txt", b"x" * (MAX_FILE_BYTES + 1))
+    with pytest.raises(ValueError, match="unknown peer"):
+        bridge.send_file("nobody", "a.txt", b"x")
+
+
+def test_send_file_survives_bridge_restart(node, tmp_path):
+    import hashlib
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        data = b"restart me"
+        bridge.send_file("alice", "keep.txt", data)
+    finally:
+        bridge.stop()
+    stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+    assert stored["messages"][0]["file"]["name"] == "keep.txt"
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        [loaded] = bridge2.messages()
+        assert loaded["file"] == {
+            "name": "keep.txt",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    finally:
+        bridge2.stop()
+
+
+def test_send_file_endpoint(bridge, node):
+    import base64
+
+    data = base64.b64encode(b"hello mesh").decode("ascii")
+    status, _, payload = _json(
+        bridge,
+        "/api/send-file",
+        method="POST",
+        body={"to": "alice", "name": "notes.txt", "data": data},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["message"]["file"]["name"] == "notes.txt"
+    assert payload["response"]["size"] == 10
+    assert node.sent_files == [("alice", "notes.txt", b"hello mesh")]
+
+
+def test_send_file_endpoint_rejects_bad_requests(bridge):
+    for body, fragment in (
+        ({"name": "a.txt", "data": "eA=="}, "to"),
+        ({"to": "alice", "data": "eA=="}, "name"),
+        ({"to": "alice", "name": "a.txt"}, "data"),
+        ({"to": "alice", "name": "a.txt", "data": "not base64!!"}, "data"),
+        ({"to": "nobody", "name": "a.txt", "data": "eA=="}, "unknown peer"),
+    ):
+        status, _, payload = _json(
+            bridge, "/api/send-file", method="POST", body=body
+        )
+        assert status == 400
+        assert fragment in payload["error"]["message"]
+
+
+def test_send_file_endpoint_accepts_bodies_over_the_json_cap(bridge, node):
+    import base64
+
+    # 40 KiB of file is ~55 KiB base64: far over the 32 KiB JSON cap,
+    # but well under this endpoint's 15 MiB cap.
+    data = base64.b64encode(bytes(40 * 1024)).decode("ascii")
+    status, _, payload = _json(
+        bridge,
+        "/api/send-file",
+        method="POST",
+        body={"to": "alice", "name": "big.bin", "data": data},
+    )
+    assert status == 200
+    assert payload["message"]["file"]["size"] == 40 * 1024
+    assert node.sent_files[0][1] == "big.bin"
+
+
+def test_other_endpoints_keep_the_json_body_cap(bridge):
+    # The same oversized body to /api/messages must still be refused.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "x" * (40 * 1024)},
+    )
+    assert status == 400
+    assert "too large" in payload["error"]["message"]

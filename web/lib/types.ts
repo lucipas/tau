@@ -38,6 +38,9 @@ export interface TauMessage {
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.
   in_reply_to?: { id: string; excerpt: string | null } | null;
+  // Sent-file metadata, present on file entries: the name, size and
+  // SHA-256 of the file this message carried.
+  file?: { name: string; size: number; sha256: string };
 }
 
 export interface Peer {
@@ -118,6 +121,12 @@ export interface PingResult {
 }
 
 export interface SendResponse {
+  ok: boolean;
+  message: TauMessage;
+  response: Record<string, unknown>;
+}
+
+export interface SendFileResponse {
   ok: boolean;
   message: TauMessage;
   response: Record<string, unknown>;
