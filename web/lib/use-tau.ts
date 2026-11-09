@@ -63,6 +63,12 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Ordering of authoritative peer state: each peer event or snapshot
+  // gets a sequence number. A block/unblock reply sent before a newer
+  // one must not overwrite the flag the event already delivered.
+  const peerEventSeq = useRef(0);
+  const peerRevision = useRef<Map<string, number>>(new Map());
+  const snapshotRevision = useRef(0);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -94,6 +100,8 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
+      peerEventSeq.current += 1;
+      snapshotRevision.current = peerEventSeq.current;
       setPeers(sortPeers(snapshot.peers));
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
@@ -307,6 +315,7 @@ export function useTau() {
         ...previous,
         [destination]: { pending: true },
       }));
+      const requestSeq = peerEventSeq.current;
       try {
         const result = await apiPost<BlockPeerResponse>(
           block ? "/api/peers/block" : "/api/peers/unblock",
@@ -314,14 +323,21 @@ export function useTau() {
         );
         // The bridge also publishes a peer event with the new flag, so
         // this local update is only the immediate feedback; the event
-        // reconciles it for every open console.
-        setPeers((previous) =>
-          previous.map((entry) =>
-            entry.destination === destination
-              ? { ...entry, blocked: result.block.blocked }
-              : entry,
-          ),
+        // reconciles it for every open console. Skip it when a newer
+        // peer event or snapshot arrived after the request was sent.
+        const newestSeq = Math.max(
+          peerRevision.current.get(destination) ?? 0,
+          snapshotRevision.current,
         );
+        if (newestSeq <= requestSeq) {
+          setPeers((previous) =>
+            previous.map((entry) =>
+              entry.destination === destination
+                ? { ...entry, blocked: result.block.blocked }
+                : entry,
+            ),
+          );
+        }
         setBlocks((previous) => ({
           ...previous,
           [destination]: {},
