@@ -240,8 +240,15 @@ export function useTau() {
         "/api/outbox/retry",
         id ? { target: id } : {},
       );
-      // The retry already ran: refresh so delivered entries leave at
-      // once instead of waiting for the next poll. Best-effort, like
+      // The retry already ran: drop a confirmed delivery locally at once,
+      // so a failed refresh cannot leave it listed as actionable.
+      if (result.target && result.target_delivered) {
+        const deliveredId = result.target;
+        setOutbox((previous) =>
+          previous.filter((entry) => entry.id !== deliveredId),
+        );
+      }
+      // Refresh so the rest of the queue is current. Best-effort, like
       // cancel: a failed GET cannot make a successful retry look like
       // a failure.
       try {
