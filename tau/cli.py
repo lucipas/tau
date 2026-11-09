@@ -4510,6 +4510,15 @@ def cmd_info(args: argparse.Namespace) -> int:
         ):
             if key in response:
                 print(f"{key + ':':<13} {response[key]}")
+        lxmf_info = response.get("lxmf") or {}
+        if lxmf_info.get("enabled"):
+            print(f"{'lxmf:':<13} delivery {lxmf_info.get('delivery')}")
+            if lxmf_info.get("propagation"):
+                print(
+                    f"{'lxmf:':<13} propagation {lxmf_info.get('propagation')}"
+                )
+            else:
+                print(f"{'lxmf:':<13} propagation disabled")
     return _EXIT_OK
 
 
