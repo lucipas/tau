@@ -1036,9 +1036,8 @@ class WebBridge:
 
         # Same block-list snapshot as the timeline: the console hides
         # posts by blocked authors, and a failed-closed list hides all.
-        # top_posts has no exclude parameters, so the block-list is
-        # applied after the ranking — a blocked author's post can take
-        # a result slot, it just never reaches the console.
+        # The block-list is applied inside top_posts, before the limit,
+        # so blocked posts never take up result slots.
         blocklist = getattr(self.node, "blocklist", None)
         blocked = blocklist.blocked if blocklist is not None else frozenset()
         exclude_all = bool(blocklist is not None and blocklist.block_all)
@@ -1072,8 +1071,8 @@ class WebBridge:
                 limit=limit,
                 viewer=viewer,
                 ruleset=ruleset,
+                exclude_authors=blocked,
             )
-            posts = [post for post in posts if post.get("author") not in blocked]
             return apply_display_rules(posts, ruleset)
         finally:
             conn.close()
@@ -1851,9 +1850,11 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/tan/top":
                 limit = _int_param(query, "limit", default=10, minimum=1, maximum=100)
                 author = (query.get("author") or [None])[0]
+                from .tangents.tan import TanError
+
                 try:
                     posts = self.bridge.tan_top(limit=limit, author=author)
-                except Exception as exc:
+                except TanError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)

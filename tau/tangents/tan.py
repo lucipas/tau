@@ -2367,8 +2367,14 @@ def top_posts(
     limit: int = 10,
     viewer: Optional[str] = None,
     ruleset: Optional[Ruleset] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the most-liked posts in the local store, best first.
+
+    Posts by *exclude_authors* (blocked) are dropped in the query, before
+    the limit is applied, so they never take up result slots.  A reply
+    to a blocked author's post keeps its parent preview redacted, as in
+    the timeline.
 
     When *ruleset* is given, kinds it hides are dropped before the limit
     is applied, so hidden entries never take up result slots.  If it
@@ -2401,12 +2407,17 @@ def top_posts(
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if silenced and author is None:
         placeholders = ", ".join("?" for _ in silenced)
         where += f" AND author NOT IN ({placeholders})"
         params.extend(sorted(silenced))
+    if blocked:
+        placeholders = ", ".join("?" for _ in blocked)
+        where += f" AND author NOT IN ({placeholders})"
+        params.extend(sorted(blocked))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
@@ -2416,7 +2427,10 @@ def top_posts(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
+    # Edits first, so keyword muting and the ruleset see the text that
+    # is actually displayed.
+    candidates = annotate_edits(conn, _public_posts(rows))
+    candidates = without_muted_keywords(conn, candidates, keywords)
     if ruleset is not None:
         candidates = [
             post
@@ -2441,11 +2455,17 @@ def top_posts(
         # newest first, so keep that order and only attach ownership.
         for post in candidates:
             post["own"] = viewer is not None and post["author"] == viewer
-    return annotate_replies(
+    shown = annotate_replies(
         conn,
         candidates[:count],
         muted_keywords=keywords,
         exclude_authors=silenced,
+        blocked_authors=blocked,
+    )
+    return annotate_repost_counts(
+        conn,
+        annotate_quote_counts(conn, shown),
+        viewer=viewer,
     )
 
 
