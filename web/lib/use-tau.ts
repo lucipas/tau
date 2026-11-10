@@ -59,6 +59,9 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Bumped on every peer event per destination, so a slow alias response
+  // cannot overwrite a newer event that arrived while it was in flight.
+  const peerEventVersion = useRef<Record<string, number>>({});
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -133,6 +136,8 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      peerEventVersion.current[peer.destination] =
+        (peerEventVersion.current[peer.destination] ?? 0) + 1;
       setPeers((previous) => {
         const next = previous.filter(
           (entry) => entry.destination !== peer.destination,
@@ -327,19 +332,23 @@ export function useTau() {
 
   const setPeerAlias = useCallback(
     async (destination: string, alias: string | null) => {
+      const versionBefore = peerEventVersion.current[destination] ?? 0;
       const result = await apiPost<{ ok: boolean; peer: Peer }>(
         "/api/peers/alias",
         { destination, alias },
       );
       // The server also publishes a peer event, so other tabs learn at
       // once; apply the returned record now so this edit reflects
-      // without waiting for it.
-      setPeers((previous) =>
-        sortPeers([
-          ...previous.filter((entry) => entry.destination !== destination),
-          result.peer,
-        ]),
-      );
+      // without waiting for it. Skip it if a peer event for this peer
+      // arrived meanwhile: that event is newer than this response.
+      if ((peerEventVersion.current[destination] ?? 0) === versionBefore) {
+        setPeers((previous) =>
+          sortPeers([
+            ...previous.filter((entry) => entry.destination !== destination),
+            result.peer,
+          ]),
+        );
+      }
       return result.peer;
     },
     [],
