@@ -835,6 +835,29 @@ def test_doctor_reports_a_corrupt_store(bridge, node, tmp_path):
     assert "peers.json" in by_name["peers"]["detail"]
 
 
+def test_doctor_rejects_a_concurrent_run(bridge, node, tmp_path):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+    assert bridge._doctor_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(WebBridgeError, match="already running"):
+            bridge.doctor()
+    finally:
+        bridge._doctor_lock.release()
+
+
+def test_doctor_endpoint_reports_busy_when_a_check_is_running(
+    bridge, node, tmp_path
+):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+    assert bridge._doctor_lock.acquire(blocking=False)
+    try:
+        status, _, payload = _json(bridge, "/api/doctor")
+    finally:
+        bridge._doctor_lock.release()
+    assert status == 503
+    assert payload["error"]["message"] == "a health check is already running"
+
+
 def test_outbox_empty(bridge):
     status, _, payload = _json(bridge, "/api/outbox")
     assert status == 200

@@ -32,6 +32,9 @@ export function DoctorSection({
   async function run() {
     setRunning(true);
     setError(null);
+    // Drop the previous verdict first: if this run fails, the old
+    // healthy badge must not stay visible next to the new error.
+    setReport(null);
     try {
       setReport(await onRun());
     } catch (caught) {

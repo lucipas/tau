@@ -476,6 +476,10 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # One health check at a time: run_checks reads whole store files
+        # and runs a SQLite integrity check, so concurrent scans would
+        # contend with the serving node for threads, disk and CPU.
+        self._doctor_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -1328,10 +1332,20 @@ class WebBridge:
         against the serving node.  The import is deferred because
         ``tau.doctor`` imports this module for its message-cleaning
         helpers.
+
+        One check runs at a time: a second request while a scan is in
+        progress gets a ``WebBridgeError`` (the route maps it to 503)
+        instead of starting another full scan.  The lock is taken here,
+        not in the route, so a HEAD request cannot bypass it.
         """
         from .doctor import all_ok, run_checks
 
-        checks = run_checks(self.node.config)
+        if not self._doctor_lock.acquire(blocking=False):
+            raise WebBridgeError("a health check is already running")
+        try:
+            checks = run_checks(self.node.config)
+        finally:
+            self._doctor_lock.release()
         return {
             "ok": all_ok(checks),
             "checks": [check.to_dict() for check in checks],
@@ -1802,7 +1816,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json(self.bridge.outbox(), head_only)
                 return
             if path == "/api/doctor":
-                self._send_json(self.bridge.doctor(), head_only)
+                try:
+                    self._send_json(self.bridge.doctor(), head_only)
+                except WebBridgeError as exc:
+                    # A check already in progress: 503, like the other
+                    # bridge errors, so the caller retries instead of
+                    # queueing another full scan.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
                 return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)

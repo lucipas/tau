@@ -71,4 +71,21 @@ describe("DoctorSection", () => {
     fireEvent.click(screen.getByRole("button", { name: "run health check" }));
     expect(await screen.findByText("bridge unreachable")).toBeTruthy();
   });
+
+  it("clears a previous verdict when a rerun fails", async () => {
+    const onRun = vi
+      .fn<() => Promise<DoctorResponse>>()
+      .mockResolvedValueOnce(makeReport())
+      .mockRejectedValueOnce(new Error("bridge unreachable"));
+
+    render(<DoctorSection onRun={onRun} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "run health check" }));
+    expect(await screen.findByText("healthy")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "run again" }));
+    expect(await screen.findByText("bridge unreachable")).toBeTruthy();
+    expect(screen.queryByText("healthy")).toBeNull();
+    expect(screen.queryByText("identity")).toBeNull();
+  });
 });
