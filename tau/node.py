@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import hashlib
 import logging
 import os
 import random
@@ -11,62 +12,123 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Union
 
 import RNS
 
 from . import __version__
 from .allowlist import AllowList, load_allowlist_or_deny_all
-from .config import TauConfig, tcp_listen_endpoints, write_rns_config
+from .blocklist import BlockList, load_blocklist_or_block_all
+from .config import (
+    TauConfig,
+    accept_files_enabled,
+    send_read_receipts_enabled,
+    tcp_listen_endpoints,
+    write_rns_config,
+)
+from .groups import GroupStore
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
     load_public_key,
 )
 from .inbox import Inbox
-from .instance_lock import InstanceAlreadyRunning, InstanceLock, NodeError
+from .instance_lock import (
+    InstanceAlreadyRunning,
+    InstanceLock,
+    NodeError,
+    instance_lock_holder,
+)
+from .lxmf import (
+    LXMFError,
+    lxmf_router_delivery_hash,
+    start_lxmf_router,
+    stop_lxmf_router,
+)
 from .mailbox import (
     MAX_HOLDERS_PER_MESSAGE,
+    TRUSTED_PEER_MIN_AGE_SECONDS,
     Mailbox,
     MailboxError,
     MailboxFull,
-    open_message,
+    open_sealed_envelope,
     seal_message,
+    seal_receipt,
 )
 from .peers import DESTINATION_HASH_BYTES, Peer, PeerError, PeerRegistry
 from .protocol import (
     APP_NAME,
     ASPECT,
     ASPECT_FILTER,
+    MAX_FILE_BYTES,
     MAX_MAIL_REQUEST_BYTES,
     MAX_MAIL_TTL,
+    MAX_READ_IDS,
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
+    REQUEST_FILE,
     REQUEST_INFO,
+    REQUEST_GROUP_MESSAGE,
     REQUEST_MAIL_FETCH,
     REQUEST_MAIL_STORE,
     REQUEST_MESSAGE,
     REQUEST_PEERS,
     REQUEST_PING,
+    REQUEST_READ,
+    REQUEST_REACT,
     ProtocolError,
     build_announce,
+    build_file_offer,
     build_mail_fetch,
     build_mail_store,
+    build_read_receipt,
+    clean_in_reply_to,
+    clean_reaction,
     decode,
+    derive_group_id,
+    encode_group_message,
+    encode,
     encode_message,
     generate_message_id,
     normalize_message,
     parse_announce,
+    parse_group_message,
+    parse_file_offer,
     parse_mail_fetch,
     parse_mail_store,
     parse_message,
+    parse_read_receipt,
+    parse_reaction,
+    reaction_dict,
+    reaction_unsigned_bytes,
     response_error,
     response_ok,
+    sanitize_file_name,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _budget(timeout: float, deadline: Optional[float]) -> float:
+    """Clip a network timeout to what is left before a monotonic deadline."""
+    if deadline is None:
+        return timeout
+    return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
+def _past(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _remaining(deadline: Optional[float]) -> Optional[float]:
+    """Time left before a monotonic deadline, or None when unbounded."""
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
 
 # Reticulum adds framing and resource overhead on top of request payloads.
 _REQUEST_WIRE_LIMIT = MAX_REQUEST_BYTES + 2 * 1024
@@ -88,7 +150,35 @@ _EXCHANGE_INTERVAL = 900.0
 # runs every _MAIL_INTERVAL seconds, so a cap only spreads the work out.
 _MAIL_SWEEP_PEERS = 16
 _DEPOSIT_RETRY_AFTER = 3600.0
+# A holder record older than this no longer counts toward the holder cap:
+# the holder may have shed the copy under its sender quota, so the message
+# can be deposited with another relay.  This can let a message end up held
+# by more than MAX_HOLDERS_PER_MESSAGE relays when the original holders
+# still have their copies — accepted deliberately: extra sealed copies are
+# deduped on delivery, while a strict cap could strand mail whose holders
+# all shed it.  There is no shed signal from holder to sender, so record
+# age is the only evidence available.  The window matches the deposit
+# retry interval.
+_HOLDER_RECORD_TTL = 3600.0
 _FETCH_BLOB_BUDGET = 40 * 1024
+# A file offer stays valid this long: the sender advertises the
+# Resource right after the offer is accepted, so an offer that is
+# never followed by bytes expires instead of letting a stranger
+# fill the disk later with an old id.
+_FILE_OFFER_TTL = 300.0
+# Bounds on offers awaiting their Resource, so accepted offers that
+# never receive bytes cannot grow memory without limit.
+_MAX_PENDING_FILE_OFFERS = 64
+_MAX_PENDING_FILE_OFFERS_PER_SENDER = 4
+# Default budget for one file transfer (offer + Resource bytes).
+_FILE_TRANSFER_TIMEOUT = 300.0
+# A Resource advertisement's data size is the file size plus the
+# metadata carried with it (the transfer id: a 3-byte length prefix
+# around a msgpack'd 32-character string, 37 bytes in total).  The
+# receiver matches advertisements against pending offers with this
+# much slack; the exact size and hash are re-checked once the bytes
+# are assembled, so the slack only admits a bounded pre-filter.
+_FILE_METADATA_OVERHEAD = 64
 
 
 class NotAllowedError(NodeError):
@@ -100,6 +190,12 @@ class NotAllowedError(NodeError):
     """
 
 
+class NotAMemberError(NodeError):
+    """Raised when a peer rejects a group message as not a group member.
+
+    A changed roster or a non-member sender is a permanent refusal, so
+    the group leg is not queued for retry.
+    """
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
@@ -229,6 +325,66 @@ class _AnnounceHandler:
         self.node._on_announce(destination_hash, announced_identity, app_data)
 
 
+def _read_resource_data(resource: Any) -> Optional[bytes]:
+    """Read the assembled bytes of a concluded Resource.
+
+    A received Resource keeps its bytes in a file on disk, so
+    ``resource.data`` is an open binary file, not ``bytes`` — read
+    it.  (A locally built Resource holds plain bytes instead.)
+    """
+    raw = getattr(resource, "data", None)
+    if raw is None:
+        return None
+    if hasattr(raw, "read"):
+        try:
+            return bytes(raw.read())
+        except Exception:  # pragma: no cover - defensive
+            return None
+    try:
+        return bytes(raw)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
+    """Write *data* to a new file in *directory*, never overwriting.
+
+    Each candidate is created with an exclusive open (``O_EXCL``), so
+    an existing name, including a symlink, is never opened for
+    writing; the next numbered name is tried instead.  The check and
+    the create are one syscall, so concurrent transfers cannot pick
+    the same destination.
+    """
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    counter = 1
+    while True:
+        candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
+        candidate = directory / candidate_name
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            counter += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except BaseException:
+            try:
+                os.unlink(candidate)
+            except OSError:  # pragma: no cover - best effort
+                pass
+            raise
+        return candidate
+
+
 class TauNode:
     """A peer in a tau network.
 
@@ -247,6 +403,9 @@ class TauNode:
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
+        on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -255,13 +414,24 @@ class TauNode:
         )
         self.mailbox = Mailbox(config.mailbox_path)
         self.inbox = Inbox(config.inbox_path)
+        self.groups = GroupStore(getattr(config, "groups_path", None))
         self.on_message = on_message
         self.on_peer = on_peer
         self.on_delivered = on_delivered
+        self.on_file = on_file
+        self.on_read = on_read
+        self.on_reaction = on_reaction
+        # Ids whose delivery this node confirmed by a successful send,
+        # newest last, capped so a long-lived node does not grow the
+        # record without bound.  An outbox entry that disappears without
+        # an id here was cancelled, expired, or removed elsewhere — not
+        # delivered.
+        self._delivered_ids: Deque[str] = deque(maxlen=512)
 
         self.reticulum: Optional[RNS.Reticulum] = None
         self.identity: Optional[RNS.Identity] = None
         self.destination: Optional[RNS.Destination] = None
+        self.lxmf_router: Optional[Any] = None
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
@@ -275,12 +445,15 @@ class TauNode:
         self._started_at: Optional[float] = None
         self._links_lock = threading.Lock()
         self._active_links: Set[RNS.Link] = set()
+        self._pending_file_offers: Dict[str, Dict[str, Any]] = {}
+        self._file_offers_lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._last_peer_save = 0.0
         self._instance_lock: Optional[InstanceLock] = None
         self._shutdown = False
         self.app: Optional[Any] = None
         self._allowlist: Optional[AllowList] = None
+        self._blocklist: Optional[BlockList] = None
 
     @property
     def allowlist(self) -> AllowList:
@@ -294,6 +467,32 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    @property
+    def read_receipts_enabled(self) -> bool:
+        """Whether this node sends read receipts when it reads a DM.
+
+        Read live from ``node.json`` each time, so `tau config
+        read-receipts off` takes effect without a restart.  A node
+        that never sends receipts simply never does; senders treat
+        the absence of a receipt as unknown, not unread-forever.
+        """
+        return send_read_receipts_enabled(self.config.data_dir)
+
+    @property
+    def blocklist(self) -> BlockList:
+        """The DM/Tan block-list, loaded lazily from the data directory.
+
+        Checked before the allow-list: blocking an allow-listed peer
+        wins.  A list that cannot be parsed fails closed — every
+        sender is blocked — so a corrupt list can never silently
+        admit a sender the owner meant to silence.
+        """
+        if self._blocklist is None:
+            self._blocklist = load_blocklist_or_block_all(
+                getattr(self.config, "blocklist_path", None)
+            )
+        return self._blocklist
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -320,6 +519,7 @@ class TauNode:
         announce: bool = True,
         exclusive: bool = False,
         mail_loop: bool = True,
+        lxmf: bool = False,
     ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
@@ -336,6 +536,9 @@ class TauNode:
         one-shot command that flushes the outbox itself (``tau outbox
         retry``) opts out so its own flush cannot lose the mail lock
         to the loop's first round and silently report nothing moved.
+        With ``lxmf`` on, an LXMF router also runs alongside the node
+        (see :meth:`_start_lxmf_router`); it needs the ``lxmf`` extra
+        installed and must start on the main thread.
         """
         if self.reticulum is not None:
             raise NodeError("node is already running")
@@ -352,8 +555,14 @@ class TauNode:
             )
             lock.acquire()
             self._instance_lock = lock
+            # The registry was loaded when this node was constructed,
+            # before the lock was held: a `tau peers forget` in between
+            # could have removed a peer this node would then restore on
+            # its next save. Reload under the lock so the in-memory
+            # snapshot is no older than the lock itself.
+            self.registry.load()
         try:
-            self._start(announce=announce, mail_loop=mail_loop)
+            self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -365,7 +574,7 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool, mail_loop: bool = True) -> None:
+    def _start(self, *, announce: bool, mail_loop: bool = True, lxmf: bool = False) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -399,6 +608,10 @@ class TauNode:
             REQUEST_PING: self._handle_ping,
             REQUEST_INFO: self._handle_info,
             REQUEST_MESSAGE: self._handle_message,
+            REQUEST_GROUP_MESSAGE: self._handle_group_message,
+            REQUEST_FILE: self._handle_file,
+            REQUEST_READ: self._handle_read,
+            REQUEST_REACT: self._handle_reaction,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -430,15 +643,55 @@ class TauNode:
             )
             self._mail_thread.start()
 
+        if lxmf:
+            self._start_lxmf_router()
+
         if announce:
             self.announce()
 
         log.info("tau node %r ready at %s", self.name, self.destination.hexhash)
 
+    def _start_lxmf_router(self) -> None:
+        """Run an LXMF router on this node's identity.
+
+        The router listens on the LXMF delivery destination derived from
+        the node's identity (the address ``tau id`` and ``tau peers``
+        already show) and announces it, so LXMF clients can find a path
+        to this node.  Storage lives under the data directory.  This is
+        the router lifecycle only — nothing is sent over LXMF yet; that
+        follows under the migration tracked in issue #67.  A failure here
+        is a node-start failure: the caller cleans up via :meth:`stop`.
+        """
+        assert self.identity is not None  # set above, before this runs
+        try:
+            self.lxmf_router = start_lxmf_router(
+                self.identity,
+                self.config.data_dir,
+                display_name=self.name,
+            )
+        except LXMFError as exc:
+            raise NodeError(str(exc)) from exc
+        delivery = lxmf_router_delivery_hash(self.lxmf_router)
+        log.info(
+            "LXMF router running, delivery %s",
+            delivery.hex() if delivery is not None else "unknown",
+        )
+
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
         # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
+
+        if self.lxmf_router is not None:
+            # The router's exit handler persists its state and tears its
+            # destinations down; it runs before Reticulum exits because
+            # it still needs a live Transport.  It is idempotent, so the
+            # atexit handler it registered is a harmless no-op afterwards.
+            try:
+                stop_lxmf_router(self.lxmf_router)
+            except Exception:  # pragma: no cover - defensive
+                log.debug("LXMF router shutdown failed", exc_info=True)
+            self.lxmf_router = None
 
         if self._announce_handler is not None:
             try:
@@ -611,13 +864,69 @@ class TauNode:
                 if deadline - time.time() <= 0:
                     break
 
+    def wait_for_delivery(
+        self,
+        message_id: str,
+        *,
+        timeout: float,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """Block until a queued message leaves the outbox, or time out.
+
+        Returns True only when this node confirmed the delivery of the
+        entry.  An entry that vanishes without that confirmation was
+        cancelled, expired, or removed elsewhere, so the result is False
+        at once.  False is also returned when the entry is still queued
+        when the deadline passes.  Each pass runs a targeted flush that
+        ignores the entry's delivery backoff: the caller explicitly asked
+        to wait for this message, so a backoff from an earlier failed
+        attempt must not swallow the whole wait.  The flush shares the
+        same deadline, so no peer or request starts after it.  The
+        queue check is bounded by the time left as well, so a stalled
+        mailbox-lock holder cannot keep the wait from reporting expiry.
+        Retries stay at `poll_interval`: growing the pause would let the last
+        attempt land long before the deadline, so a peer that becomes
+        reachable late in the wait would be missed.  The wait never
+        removes the entry itself; a message still queued at the deadline
+        is left for the background mail loop.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            # The queue check itself is bounded by the time left: a
+            # stalled mailbox-lock holder must not keep the wait from
+            # reporting expiry, so the check treats an unacquirable lock
+            # as "still queued" and the deadline check below ends it.
+            if not self._still_queued(message_id, timeout=max(0.0, remaining)):
+                return message_id in self._delivered_ids
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.flush_outbox(
+                timeout=min(remaining, _MAIL_REQUEST_TIMEOUT),
+                message_id=message_id,
+                respect_backoff=False,
+                wait_for_lock=min(remaining, 5.0),
+                deadline=deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if not self._still_queued(message_id, timeout=max(0.0, remaining)):
+                return message_id in self._delivered_ids
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+
     def _owed_hashes(self) -> Set[bytes]:
         """Destination hashes the node still owes mail or acks to.
 
         Peers holding mail we have fetched stay too: their pending
-        acknowledgements go out with the next fetch.
+        acknowledgements go out with the next fetch.  Peers owed a
+        read receipt are kept as well, so pruning cannot strand a
+        receipt for a long-unseen sender.
         """
         owed = {entry.to for entry in self.mailbox.outbox_list()}
+        owed |= {entry.to for entry in self.mailbox.receipt_outbox_list()}
         for holder in self.mailbox.pending_ack_holders():
             try:
                 raw = bytes.fromhex(holder)
@@ -713,6 +1022,48 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
+        """Persist a reaction and fan it out.
+
+        A reaction whose target this node has never seen is still
+        stored — the target may arrive later (a relayed copy can land
+        after the reaction) — but it is only rendered under a message
+        the inbox actually holds, so spraying unknown targets buys a
+        peer nothing visible.
+
+        With ``strict=True`` (the receive handler) a storage failure
+        raises, so the handler can answer with an error instead of
+        acknowledging a reaction it did not store.  Otherwise a failed
+        local record is logged and delivery still succeeds — the
+        sender's own copy is best-effort; the peer already accepted
+        the reaction.
+        """
+        try:
+            self.inbox.record_reaction(record)
+        except Exception:  # pragma: no cover - storage failure
+            log.warning("Could not record reaction", exc_info=True)
+            if strict:
+                raise
+        if self.on_reaction is not None:
+            try:
+                self.on_reaction(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_reaction callback failed", exc_info=True)
+
+    def _record_sent(self, record: Dict[str, Any]) -> None:
+        """Persist an outgoing DM to the inbox; never break sending.
+
+        The inbox keeps both directions so a reply can quote the
+        sender's own earlier message: the receiver renders the quote
+        from its copy, and this node renders the peer's reply to it
+        from this record.  ``Inbox.list_messages`` still shows
+        received messages only.
+        """
+        try:
+            self.inbox.append(record)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not record sent message", exc_info=True)
+
     def _handle_message(
         self,
         path: str,
@@ -733,6 +1084,23 @@ class TauNode:
             # outside the registry; the inbox keys on Tau destination
             # hashes, so derive that here instead.
             caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins.  The drop is silent — the sender
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  A fake
+            # success reply was considered and rejected: the ticket
+            # says blocked messages "simply never confirm", and a
+            # success reply would falsely confirm delivery and stop
+            # the sender's retries.  The message is never stored,
+            # never marked seen, and never passed to on_message.
+            log.info(
+                "Message from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
         if not self.allowlist.is_allowed(caller_hash):
             log.info(
                 "Message from %s denied by the DM allow-list",
@@ -750,7 +1118,13 @@ class TauNode:
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
-        if not duplicate:
+        # A delayed direct request past the sender's deadline is dropped
+        # unrecorded (and not marked seen), so it is never shown.
+        expires_at = message.get("expires_at")
+        expired = expires_at is not None and expires_at <= received_at
+        if expired:
+            log.info("Dropping expired message %s from %s", message_id, caller_hash)
+        if not duplicate and not expired:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -760,7 +1134,11 @@ class TauNode:
                 "sent_at": message["sent_at"],
                 "received_at": received_at,
                 "id": message_id,
+                "expires_at": message.get("expires_at"),
+                "direction": "in",
             }
+            if message.get("in_reply_to") is not None:
+                record["in_reply_to"] = message["in_reply_to"]
             log.info(
                 "Message from %s (%s): %s",
                 caller_name,
@@ -780,7 +1158,398 @@ class TauNode:
             server=self.name,
             node=self.destination_hexhash,
             duplicate=duplicate,
+            expired=expired,
         )
+
+    def _accept_group_message(
+        self, sender_hash: str, group: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a group message's roster; pin the group on first sight.
+
+        Returns the pinned group record, or ``None`` when the message
+        must be rejected: the sender is not on the roster, this node is
+        not on the roster, the id does not derive from the creator,
+        name and roster, or the roster disagrees with the one already
+        pinned for the group id (a changed roster means a new group).
+        The sender is authenticated by the link identity (direct) or by
+        the sealed envelope's signature (relayed), never by the payload;
+        the id derivation is what binds the roster to the id, so a
+        member cannot fork an id onto a recipient that has not seen it.
+        """
+        members = group.get("members") or []
+        own_hash = self.destination_hexhash
+        if sender_hash not in members or own_hash not in members:
+            return None
+        creator = group.get("creator") or ""
+        try:
+            if derive_group_id(creator, group.get("name") or "group", members) != group["id"]:
+                return None
+        except (ProtocolError, ValueError):
+            return None
+        return self.groups.record(
+            group["id"], group.get("name") or "group", members, creator=creator
+        )
+
+    def _handle_group_message(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            message = parse_group_message(data)
+        except ProtocolError as exc:
+            return response_error("invalid_message", str(exc))
+
+        received_at = time.time()
+        caller_hash = self._caller_label(remote_identity)
+        if remote_identity is not None:
+            caller_hash = tau_destination_hash(remote_identity).hex()
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins.  The drop is silent — the sender
+            # gets a generic delivery failure, never a signal that they
+            # are blocked, so blocking leaves no error oracle.  The
+            # message is never stored, never marked seen, and never
+            # passed to on_message; the group is not pinned either.
+            log.info(
+                "Group message from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Group message from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        group = self._accept_group_message(
+            caller_hash,
+            {
+                "id": message["group"],
+                "name": message["group_name"],
+                "creator": message["creator"],
+                "members": message["members"],
+            },
+        )
+        if group is None:
+            log.info(
+                "Group message from %s rejected: sender or node not on "
+                "the roster, or the roster changed for group %s",
+                caller_hash or "anonymous",
+                message["group"],
+            )
+            return response_error(
+                "not_a_member", "sender or recipient is not a group member"
+            )
+
+        # Store-and-forward retries and relay copies can deliver the same
+        # message twice; the id makes delivery idempotent.
+        message_id = message.get("id")
+        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+        if not duplicate:
+            if message_id:
+                self.mailbox.mark_seen(message_id)
+            record = {
+                "from": caller_name,
+                "destination": caller_hash,
+                "text": message["text"],
+                "sent_at": message["sent_at"],
+                "received_at": received_at,
+                "id": message_id,
+                "kind": "group",
+                "group": group["id"],
+                "group_name": group["name"],
+            }
+            log.info(
+                "Group message from %s (%s) in %s: %s",
+                caller_name,
+                caller_hash or "anonymous",
+                group["name"],
+                message["text"],
+            )
+            self._record_received(record)
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+
+        return response_ok(
+            echo=message["text"],
+            received_at=received_at,
+            server=self.name,
+            node=self.destination_hexhash,
+            group=group["id"],
+            duplicate=duplicate,
+        )
+
+    def _handle_file(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Accept or refuse a signed file offer (``/tau/file``).
+
+        The offer itself carries no bytes — it is the sender asking
+        whether the transfer may start.  Acceptance registers a
+        pending offer (transfer id, name, size, SHA-256) that the
+        link's resource callback matches against the advertised
+        Resource; the bytes are verified against the hash again once
+        assembled, and never written to disk otherwise.
+
+        Anti-replay: the offer is only honored on a link whose peer
+        identified itself — an unidentified link skips the sender
+        check, so it is refused outright — and only when the signed
+        offer names this node as its recipient, so a captured offer
+        cannot be replayed to a third node.  The Resource stage
+        additionally binds the transfer to the sender authenticated
+        on its link (see ``_on_resource_advertised``).
+
+        Policy: files are off unless the owner opted in with
+        ``tau config accept-files on`` — except that a sender on the
+        DM allow-list is always allowed, and a sender the allow-list
+        excludes is refused even when acceptance is on.  A refusal
+        answers ``not_allowed`` so the sender fails fast instead of
+        queueing a file nobody wants.
+        """
+        if remote_identity is None:
+            log.info("File offer refused: sender did not identify on the link")
+            return response_error(
+                "invalid_offer", "sender did not identify on the link"
+            )
+        expected_recipient = (
+            self.destination.hexhash if self.destination is not None else None
+        )
+        try:
+            offer = parse_file_offer(
+                data,
+                remote_identity=remote_identity,
+                expected_recipient=expected_recipient,
+            )
+        except ProtocolError as exc:
+            return response_error("invalid_offer", str(exc))
+
+        sender_hash = offer["from"]
+        if not self.allowlist.is_allowed(sender_hash):
+            log.info(
+                "File offer from %s denied by the DM allow-list",
+                sender_hash[:8],
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        explicitly_listed = bool(
+            self.allowlist.enabled and sender_hash in self.allowlist.allow
+        )
+        if not explicitly_listed and not accept_files_enabled(
+            self.config.data_dir
+        ):
+            log.info(
+                "File offer from %s refused: this node does not accept files",
+                sender_hash[:8],
+            )
+            return response_error(
+                "not_allowed",
+                "this node does not accept files "
+                "(see `tau config accept-files on`)",
+            )
+        self._prune_file_offers()
+        with self._file_offers_lock:
+            pending = list(self._pending_file_offers.values())
+            if len(pending) >= _MAX_PENDING_FILE_OFFERS or (
+                sum(1 for item in pending if item["from"] == sender_hash)
+                >= _MAX_PENDING_FILE_OFFERS_PER_SENDER
+            ):
+                return response_error(
+                    "busy", "too many file offers are pending; try again later"
+                )
+            self._pending_file_offers[offer["id"]] = {
+                **offer,
+                "expires_at": time.time() + _FILE_OFFER_TTL,
+            }
+        log.info(
+            "Accepted file offer %s (%s, %d bytes) from %s",
+            offer["id"][:8],
+            offer["name"],
+            offer["size"],
+            sender_hash[:8],
+        )
+        return response_ok(accepted=True, id=offer["id"], name=offer["name"])
+
+    def _handle_reaction(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            reaction = parse_reaction(data)
+        except ProtocolError as exc:
+            return response_error("invalid_reaction", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # A reaction is state keyed by its reactor: without an
+            # authenticated link identity there is no reactor to key on,
+            # and an anonymous reaction could overwrite anyone's.
+            return response_error(
+                "unidentified", "identify on the link to react"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Reactions are signed entries, like Tan likes: the signature
+        # covers the whole payload and is verified against the link
+        # identity, so attribution does not depend on trusting the
+        # transport — a relayed or replayed reaction still has to prove
+        # its reactor.  (parse_reaction already checked the base64.)
+        signature_text = reaction.get("sig")
+        if not signature_text:
+            return response_error(
+                "invalid_reaction", "reaction is missing its signature"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = reaction_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_reaction", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_reaction", f"could not verify reaction: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_reaction", "reaction signature does not verify"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Reaction from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        # A retried or relayed reaction replays with the same id; the
+        # latest-per-reactor state makes a replay harmless anyway, but
+        # dedupe here keeps the inbox from churning on every retry.
+        reaction_id = reaction.get("id")
+        # Reactions get their own namespace, keyed by the reactor too, so a
+        # reaction id can never mark a direct message id as seen.
+        seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
+        duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
+        if not duplicate:
+            record = {
+                "target": reaction["target"],
+                "reaction": reaction["reaction"],
+                "from": caller_name,
+                "destination": caller_hash,
+                "sent_at": reaction["sent_at"],
+                "received_at": received_at,
+                "id": reaction_id,
+            }
+            try:
+                self._record_reaction(record, strict=True)
+            except OSError as exc:
+                # Do not acknowledge a reaction that was not stored, and
+                # do not mark its id seen — the sender can retry with the
+                # same id and it will be recorded then.
+                return response_error(
+                    "storage_failed", f"could not store reaction: {exc}"
+                )
+            if seen_key:
+                self.mailbox.mark_seen(seen_key)
+            log.info(
+                "Reaction from %s (%s) on %s: %s",
+                caller_name,
+                caller_hash or "anonymous",
+                reaction["target"][:8],
+                reaction["reaction"] or "(retracted)",
+            )
+
+        return response_ok(
+            reaction=reaction["reaction"],
+            target=reaction["target"],
+            received_at=received_at,
+            duplicate=duplicate,
+        )
+
+    def _record_receipt(
+        self, *, reader_hash: str, message_ids: List[str], read_at: float
+    ) -> List[str]:
+        """Apply a verified receipt: mark the ids read, notify listeners.
+
+        Returns the ids actually recorded.  An id this node never sent,
+        or sent to someone other than the reader, is rejected by
+        ``Mailbox.record_read`` — a forged receipt changes nothing.
+        Receipts are never receipted themselves.
+        """
+        recorded = []
+        for message_id in message_ids:
+            if self.mailbox.record_read(
+                message_id, read_at, reader_hash=reader_hash
+            ):
+                recorded.append(message_id)
+        if recorded and self.on_read is not None:
+            try:
+                self.on_read(
+                    {
+                        "reader": reader_hash,
+                        "ids": recorded,
+                        "read_at": read_at,
+                    }
+                )
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_read callback failed", exc_info=True)
+        return recorded
+
+    def _handle_read(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Accept a signed read receipt for messages this node sent."""
+        try:
+            receipt = parse_read_receipt(data, remote_identity=remote_identity)
+        except ProtocolError as exc:
+            return response_error("invalid_receipt", str(exc))
+        reader_hash = receipt["from"]
+        recorded = self._record_receipt(
+            reader_hash=reader_hash,
+            message_ids=receipt["ids"],
+            read_at=receipt["read_at"],
+        )
+        log.info(
+            "Read receipt from %s: %d of %d message(s) recorded",
+            reader_hash[:8],
+            len(recorded),
+            len(receipt["ids"]),
+        )
+        return response_ok(recorded=recorded, count=len(recorded))
 
     def _handle_mail_store(
         self,
@@ -796,12 +1565,35 @@ class TauNode:
             return response_error("invalid_mail", str(exc))
         if store["expires_at"] <= time.time():
             return response_error("mail_expired", "envelope has already expired")
+        # Quotas are keyed by the peer that asked us to hold the
+        # envelope: the sealed blob hides the inner sender, so the
+        # depositing peer is the only attribution a holder has.  A
+        # long-standing known peer gets the higher quota tier: in the
+        # registry 24h+, heard directly rather than via exchange, and
+        # with at least one message this node has delivered to it.
+        depositor = (
+            tau_destination_hash(remote_identity)
+            if remote_identity is not None
+            else None
+        )
+        trusted = False
+        if depositor is not None:
+            peer = self.registry.get(depositor)
+            if (
+                peer is not None
+                and not peer.via_exchange
+                and time.time() - peer.first_seen >= TRUSTED_PEER_MIN_AGE_SECONDS
+                and peer.delivered_count > 0
+            ):
+                trusted = True
         try:
             stored = self.mailbox.hold(
                 to=bytes.fromhex(store["to"]),
                 blob=store["blob"],
                 message_id=store["id"],
                 expires_at=store["expires_at"],
+                depositor=depositor,
+                trusted=trusted,
             )
         except MailboxFull as exc:
             return response_error("mailbox_full", str(exc))
@@ -945,6 +1737,7 @@ class TauNode:
         to: Optional[bytes] = None,
         message_id: Optional[str] = None,
         wait_for_lock: float = 0.0,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Try to move queued mail: direct delivery, deposits, collection.
 
@@ -963,12 +1756,16 @@ class TauNode:
         concurrent mail round to finish instead of skipping the sweep;
         0 (the default) keeps the skip-when-busy behaviour, which is
         what the background loop wants.  A one-shot caller that must
-        know the outcome waits; a background round never does.
+        know the outcome waits; a background round never does.  With
+        ``deadline`` (a ``time.monotonic()`` value) set, no new peer or
+        request starts once it has passed, and each request is bounded
+        by the time left before it.
         """
         summary = {
             "delivered": 0,
             "deposited": 0,
             "received": 0,
+            "receipts": 0,
             "lock_busy": False,
         }
         if not self.started:
@@ -981,7 +1778,10 @@ class TauNode:
             summary["lock_busy"] = True
             return summary
         try:
-            self.mailbox.prune()
+            # A targeted flush shares the caller's deadline: a stalled
+            # mailbox-lock holder must not hold the sweep past it.  A
+            # background round (no deadline) keeps the unbounded waits.
+            self.mailbox.prune(timeout=_remaining(deadline))
             summary["received"] += self._process_local_held()
             peers = self.registry.all()
             if to is not None:
@@ -993,9 +1793,18 @@ class TauNode:
             # visited for deposits and collection when slots remain.
             # A backoff-ignoring round ranks every owed recipient first.
             if respect_backoff:
-                targets = {entry.to for entry in self.mailbox.due_outbox()}
+                targets = {
+                    entry.to
+                    for entry in self.mailbox.due_outbox(timeout=_remaining(deadline))
+                }
             else:
-                targets = {entry.to for entry in self.mailbox.outbox_list()}
+                targets = {
+                    entry.to
+                    for entry in self.mailbox.outbox_list(timeout=_remaining(deadline))
+                }
+            # Peers owed queued read receipts are delivered to in the same
+            # visit, so they are prioritised alongside message recipients.
+            targets |= {entry.to for entry in self.mailbox.receipt_outbox_list()}
             # Peers heard only through exchange come after directly heard
             # ones inside each group, so second-hand entries cannot crowd
             # out reachable peers.
@@ -1005,17 +1814,41 @@ class TauNode:
             if max_peers is not None:
                 peers = peers[:max_peers]
             for peer in peers:
+                if _past(deadline):
+                    break
                 moved = self._flush_peer(
                     peer,
                     timeout,
                     respect_backoff=respect_backoff,
                     message_id=message_id,
+                    deadline=deadline,
                 )
                 summary["delivered"] += moved["delivered"]
                 summary["deposited"] += moved["deposited"]
-                summary["received"] += self._collect_mail(peer, timeout)
+                summary["receipts"] += moved.get("receipts", 0)
+                if _past(deadline):
+                    break
+                summary["received"] += self._collect_mail(
+                    peer, timeout, deadline=deadline
+                )
+        except TimeoutError:
+            # A mailbox lock wait ran past the deadline: end the round
+            # with what it moved so far; the entries stay queued for a
+            # later round.
+            log.debug("mailbox lock busy past deadline; ending flush round")
+            return summary
         finally:
             self._mail_lock.release()
+        # Receipts for messages a reader displayed but could not
+        # receipt itself (a one-shot `tau messages` shares this
+        # data directory with the serving node and cannot start a
+        # second Reticulum instance on its listen port).  A targeted
+        # retry touches only its own entry, so it skips this sweep.
+        # Flushed after the mail lock is released: resolving an
+        # unknown sender can wait seconds for discovery, and that
+        # wait must not stall other mail rounds.
+        if to is None and message_id is None:
+            summary["receipts"] += self._flush_read_receipts()
         return summary
 
     def _flush_peer(
@@ -1025,33 +1858,50 @@ class TauNode:
         *,
         respect_backoff: bool = True,
         message_id: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, int]:
-        moved = {"delivered": 0, "deposited": 0}
+        moved = {"delivered": 0, "deposited": 0, "receipts": 0}
         if respect_backoff:
-            due = self.mailbox.due_outbox(to=peer.destination_hash)
+            due = self.mailbox.due_outbox(
+                to=peer.destination_hash, timeout=_remaining(deadline)
+            )
         else:
-            due = self.mailbox.outbox_list(to=peer.destination_hash)
+            due = self.mailbox.outbox_list(
+                to=peer.destination_hash, timeout=_remaining(deadline)
+            )
         if message_id is not None:
             due = [entry for entry in due if entry.id == message_id]
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
             for entry in due:
-                if self._deliver_entry(peer, entry, timeout):
+                if _past(deadline):
+                    return moved
+                if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                     moved["delivered"] += 1
+            if message_id is None:
+                moved["receipts"] = self._flush_receipts(peer, timeout)
             return moved
 
         for entry in due:
-            if self._deliver_entry(peer, entry, timeout):
+            if _past(deadline):
+                return moved
+            if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                 moved["delivered"] += 1
 
         now = time.time()
-        for entry in self.mailbox.outbox_list():
+        for entry in self.mailbox.outbox_list(timeout=_remaining(deadline)):
+            if _past(deadline):
+                return moved
             if entry.to == peer.destination_hash:
                 continue
             if message_id is not None and entry.id != message_id:
                 continue
-            holders = entry.held_by
+            holders = {
+                holder: deposited_at
+                for holder, deposited_at in entry.held_by.items()
+                if now - deposited_at < _HOLDER_RECORD_TTL
+            }
             if (
                 len(holders) >= MAX_HOLDERS_PER_MESSAGE
                 and peer.hexhash not in holders
@@ -1060,41 +1910,129 @@ class TauNode:
             last_deposit = holders.get(peer.hexhash)
             if last_deposit is not None and now - last_deposit < _DEPOSIT_RETRY_AFTER:
                 continue
-            if self._deposit_entry(peer, entry, timeout):
+            if self._deposit_entry(peer, entry, timeout, deadline=deadline):
                 moved["deposited"] += 1
+        if message_id is None:
+            moved["receipts"] = self._flush_receipts(peer, timeout)
         return moved
 
-    def _still_queued(self, message_id: str) -> bool:
+    def _still_queued(self, message_id: str, timeout: Optional[float] = None) -> bool:
         """True if the outbox still holds this entry, reloaded from disk.
 
         The sweep works from a snapshot, so a cancel can land after the
         snapshot was taken; each delivery attempt re-checks instead of
         trusting the snapshot.  A send already in flight cannot be
-        recalled — cancelling only stops future attempts.
+        recalled — cancelling only stops future attempts.  With
+        ``timeout`` set, the wait for the mailbox lock is bounded by
+        it: when the lock cannot be acquired in time the entry is
+        treated as still queued, so a caller with its own deadline
+        reports expiry instead of blocking past it.
         """
-        with self.mailbox.transaction():
-            return self.mailbox.get_outbox(message_id) is not None
+        try:
+            with self.mailbox.transaction(timeout=timeout):
+                return self.mailbox.get_outbox(message_id) is not None
+        except TimeoutError:
+            return True
 
-    def _deliver_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+    def _deliver_entry(
+        self,
+        peer: Peer,
+        entry: Any,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         # The sweep lists the outbox before acting, so a message cancelled
         # by another process (``tau outbox cancel``) can still be sitting
         # in this pass's snapshot. Re-check the queue under the mailbox
-        # lock — which reloads the on-disk state — before sending.
-        with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
-                return False
-        payload = encode_message(
-            entry.text, message_id=entry.id, sent_at=entry.created_at
+        # lock — which reloads the on-disk state — before sending.  The
+        # wait for it is bounded by the deadline, like every other lock
+        # wait in a targeted flush: a stalled holder must not hold the
+        # send past it.
+        try:
+            with self.mailbox.transaction(timeout=_remaining(deadline)):
+                fresh = self.mailbox.get_outbox(entry.id)
+                if fresh is None:
+                    return False
+                if fresh.expires_at <= time.time():
+                    # Past its deadline (sender-set expiry or queue TTL) since
+                    # the sweep listed it: the receiver would drop the message
+                    # anyway, so do not spend a send on it.  The next prune
+                    # removes the entry.
+                    log.info(
+                        "Skipping expired queued message %s to %s",
+                        entry.id,
+                        peer.hexhash,
+                    )
+                    return False
+        except TimeoutError:
+            return False
+        payload = (
+            encode_group_message(
+                entry.text,
+                message_id=entry.id,
+                sent_at=entry.created_at,
+                group_id=entry.group_id,
+                group_name=entry.group_name,
+                creator=entry.group_creator,
+                members=entry.group_members,
+            )
+            if entry.group_id is not None
+            else encode_message(
+                entry.text,
+                message_id=entry.id,
+                sent_at=entry.created_at,
+                expires_at=entry.message_expires_at,
+                in_reply_to=entry.in_reply_to,
+            )
         )
-        if not self._still_queued(entry.id):
+        if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
         try:
-            self._request(peer, REQUEST_MESSAGE, payload, timeout)
-        except NodeError as exc:
-            self.mailbox.record_attempt(entry.id, error=str(exc))
+            self._request(
+                peer,
+                REQUEST_GROUP_MESSAGE
+                if entry.group_id is not None
+                else REQUEST_MESSAGE,
+                payload,
+                timeout,
+                deadline=deadline,
+            )
+        except NotAMemberError as exc:
+            # Permanent refusal: the recipient will not accept this roster,
+            # so stop retrying rather than holding the leg until its TTL.
+            log.warning("Dropping queued group message %s: %s", entry.id, exc)
+            self.mailbox.remove_outbox(entry.id)
             return False
-        self.mailbox.remove_outbox(entry.id)
+        except NodeError as exc:
+            try:
+                self.mailbox.record_attempt(
+                    entry.id, error=str(exc), timeout=_remaining(deadline)
+                )
+            except TimeoutError:
+                log.debug(
+                    "Could not record failed delivery attempt for %s: "
+                    "mailbox lock busy",
+                    entry.id,
+                )
+            return False
+        # Record the confirmed delivery before the entry leaves the outbox,
+        # so a waiter that sees the entry gone can tell it was delivered.
+        self._delivered_ids.append(entry.id)
+        try:
+            self.mailbox.record_delivered(entry.id, timeout=_remaining(deadline))
+            self.mailbox.remove_outbox(entry.id, timeout=_remaining(deadline))
+        except TimeoutError:
+            # The delivery is confirmed, so report success; the entry
+            # stays queued and a later round re-delivers it (the peer
+            # dedupes by message id) and retries the bookkeeping.
+            log.warning(
+                "Delivered queued message %s but the mailbox lock stayed "
+                "busy; leaving it queued for a later round",
+                entry.id,
+            )
         log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
                 self.on_delivered(entry.id)
@@ -1102,12 +2040,36 @@ class TauNode:
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
 
-    def _deposit_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+    def _deposit_entry(
+        self,
+        peer: Peer,
+        entry: Any,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
         # Same re-check as _deliver_entry: do not leave a sealed copy
         # with a holder for a message cancelled since the sweep listed it.
-        with self.mailbox.transaction():
-            if self.mailbox.get_outbox(entry.id) is None:
-                return False
+        # The wait for the lock is bounded by the deadline, like every
+        # other lock wait in a targeted flush.
+        try:
+            with self.mailbox.transaction(timeout=_remaining(deadline)):
+                fresh = self.mailbox.get_outbox(entry.id)
+                if fresh is None:
+                    return False
+                if fresh.expires_at <= time.time():
+                    # Past its deadline since the sweep listed it: a holder
+                    # would only ever hand the recipient a copy the receiver
+                    # drops, so do not deposit it.  The next prune removes
+                    # the entry.
+                    log.info(
+                        "Skipping expired queued message %s for deposit with %s",
+                        entry.id,
+                        peer.hexhash,
+                    )
+                    return False
+        except TimeoutError:
+            return False
         if self.identity is None:
             return False
         recipient = self.registry.get(entry.to)
@@ -1123,6 +2085,18 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                group=(
+                    {
+                        "id": entry.group_id,
+                        "name": entry.group_name,
+                        "creator": entry.group_creator,
+                        "members": entry.group_members,
+                    }
+                    if entry.group_id is not None
+                    else None
+                ),
+                expires_at=entry.message_expires_at,
+                in_reply_to=entry.in_reply_to,
             )
             payload = build_mail_store(
                 to=entry.to_hex,
@@ -1133,13 +2107,28 @@ class TauNode:
         except (MailboxError, ProtocolError) as exc:
             log.debug("Could not seal queued message %s: %s", entry.id, exc)
             return False
-        if not self._still_queued(entry.id):
+        if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
         try:
-            self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
+            self._request(
+                peer, REQUEST_MAIL_STORE, payload, timeout, deadline=deadline
+            )
         except NodeError:
             return False
-        self.mailbox.record_deposit(entry.id, peer.hexhash)
+        try:
+            self.mailbox.record_deposit(
+                entry.id, peer.hexhash, timeout=_remaining(deadline)
+            )
+        except TimeoutError:
+            # The sealed copy is with the holder; the deposit record
+            # stays unrecorded, so a later round may deposit it again
+            # (the holder dedupes by message id).
+            log.warning(
+                "Left a sealed copy of %s with %s but the mailbox lock "
+                "stayed busy; the deposit is unrecorded",
+                entry.id,
+                peer.hexhash,
+            )
         log.info(
             "Left a sealed copy of %s with %s for %s",
             entry.id,
@@ -1148,7 +2137,183 @@ class TauNode:
         )
         return True
 
-    def _collect_mail(self, peer: Peer, timeout: float) -> int:
+    def _flush_read_receipts(self) -> int:
+        """Send receipts for inbox messages stamped read but unreceipted.
+
+        A one-shot reader stamps ``read_at`` when it displays a DM;
+        this sweep — run by the serving node's mail loop and by any
+        one-shot flush — is what actually delivers those receipts.
+        A sender that cannot be discovered gets its receipt queued by
+        hash (see ``send_read_receipts``), so the ids are stamped and
+        later sweeps do not repeat the discovery wait.  Returns how
+        many receipts were sent or queued.
+        """
+        if not self.read_receipts_enabled:
+            return 0
+        if self.identity is None:
+            return 0
+        # The stamp may have been written by a one-shot `tau messages`
+        # in another process; reload before deciding what is owed.
+        try:
+            self.inbox.reload()
+        except Exception:
+            log.debug("Could not reload inbox", exc_info=True)
+            return 0
+        try:
+            pending = self.inbox.read_unreceipted()
+        except Exception:
+            log.debug("Could not list read messages", exc_info=True)
+            return 0
+        if not pending:
+            return 0
+        by_peer: Dict[str, List[str]] = {}
+        read_times: Dict[str, float] = {}
+        for entry in pending:
+            peer_hash = str(entry.get("destination") or "")
+            message_id = str(entry.get("id") or "")
+            if not peer_hash or not message_id:
+                continue
+            ids = by_peer.setdefault(peer_hash, [])
+            if message_id not in ids:
+                ids.append(message_id)
+            read_times[message_id] = float(entry.get("read_at") or time.time())
+        dispatched = 0
+        for peer_hash, ids in by_peer.items():
+            read_at = max(read_times[mid] for mid in ids)
+            try:
+                result = self.send_read_receipts(
+                    peer_hash, ids, read_at=read_at, timeout=_MAIL_REQUEST_TIMEOUT
+                )
+            except Exception:
+                log.debug(
+                    "Could not send read receipt to %s", peer_hash, exc_info=True
+                )
+                continue
+            handled = result.get("ids") or []
+            if handled:
+                dispatched += 1
+                try:
+                    self.inbox.mark_receipt_sent(handled)
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("Could not stamp read receipts", exc_info=True)
+        return dispatched
+
+    def _flush_receipts(self, peer: Peer, timeout: float) -> int:
+        """Move queued read receipts for *peer*: direct, then deposits.
+
+        Direct delivery uses the signed ``/tau/read`` request, which
+        needs no mail capability — a pre-mail peer can still be told
+        its messages were read.  Deposits (sealed copies left with a
+        holder) need the mail capability, like message deposits, and
+        are skipped for a recipient that advertises caps without
+        ``read``: an old node would only drop the sealed receipt.
+        """
+        moved = 0
+        # Queued receipts pause while the reader has opted out; they are
+        # kept (not discarded) and resume if the setting is turned back on.
+        if not self.read_receipts_enabled:
+            return 0
+        if peer.caps and "read" not in peer.caps:
+            return 0
+        for entry in self.mailbox.due_receipts(to=peer.destination_hash):
+            if self._deliver_receipt_entry(peer, entry, timeout):
+                moved += 1
+        if peer.caps and "mail" not in peer.caps:
+            return moved
+        now = time.time()
+        for entry in self.mailbox.receipt_outbox_list():
+            if entry.to == peer.destination_hash:
+                continue
+            recipient = self.registry.get(entry.to)
+            if recipient is not None and recipient.caps and "read" not in recipient.caps:
+                continue
+            holders = entry.held_by
+            if (
+                len(holders) >= MAX_HOLDERS_PER_MESSAGE
+                and peer.hexhash not in holders
+            ):
+                continue
+            last_deposit = holders.get(peer.hexhash)
+            if last_deposit is not None and now - last_deposit < _DEPOSIT_RETRY_AFTER:
+                continue
+            if self._deposit_receipt_entry(peer, entry, timeout):
+                moved += 1
+        return moved
+
+    def _deliver_receipt_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        """Send one queued receipt direct over the link to its sender."""
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        if self.identity is None:
+            return False
+        try:
+            payload = build_read_receipt(
+                self.identity,
+                message_ids=list(entry.message_ids),
+                read_at=entry.read_at,
+            )
+        except ProtocolError as exc:
+            log.debug("Could not sign queued receipt %s: %s", entry.id, exc)
+            return False
+        try:
+            self._request(peer, REQUEST_READ, payload, timeout)
+        except NodeError as exc:
+            self.mailbox.record_receipt_attempt(entry.id, error=str(exc))
+            return False
+        self.mailbox.remove_receipt_outbox(entry.id)
+        log.info("Delivered read receipt %s to %s", entry.id, peer.hexhash)
+        return True
+
+    def _deposit_receipt_entry(self, peer: Peer, entry: Any, timeout: float) -> bool:
+        """Leave a sealed copy of a receipt with *peer* for its sender."""
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        if self.identity is None:
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None:
+            # Without the sender's public key the receipt cannot be
+            # sealed for anyone else to hold; direct delivery only.
+            return False
+        try:
+            blob = seal_receipt(
+                self.identity,
+                sender_name=self.name,
+                recipient_public_key=recipient.public_key,
+                receipt_id=entry.id,
+                message_ids=list(entry.message_ids),
+                read_at=entry.read_at,
+            )
+            payload = build_mail_store(
+                to=entry.to_hex,
+                message_id=entry.id,
+                blob=blob,
+                expires_at=entry.expires_at,
+            )
+        except (MailboxError, ProtocolError) as exc:
+            log.debug("Could not seal queued receipt %s: %s", entry.id, exc)
+            return False
+        with self.mailbox.transaction():
+            if self.mailbox.get_receipt_outbox(entry.id) is None:
+                return False
+        try:
+            self._request(peer, REQUEST_MAIL_STORE, payload, timeout)
+        except NodeError:
+            return False
+        self.mailbox.record_receipt_deposit(entry.id, peer.hexhash)
+        log.info(
+            "Left a sealed copy of receipt %s with %s for %s",
+            entry.id,
+            peer.hexhash,
+            entry.to_hex,
+        )
+        return True
+
+    def _collect_mail(
+        self, peer: Peer, timeout: float, *, deadline: Optional[float] = None
+    ) -> int:
         # Without a consumer, fetched mail would be marked seen and acked
         # while never shown to anyone, so leave it held for a live node.
         if self.on_message is None:
@@ -1160,7 +2325,11 @@ class TauNode:
         acks = self.mailbox.take_pending_acks(peer.hexhash)
         try:
             response = self._request(
-                peer, REQUEST_MAIL_FETCH, build_mail_fetch(acks), timeout
+                peer,
+                REQUEST_MAIL_FETCH,
+                build_mail_fetch(acks),
+                timeout,
+                deadline=deadline,
             )
         except NodeError:
             if acks:
@@ -1181,10 +2350,21 @@ class TauNode:
             new_acks.append(message_id)
             try:
                 blob = base64.b64decode(blob_text, validate=True)
-                message = open_message(self.identity, blob)
+                kind, payload = open_sealed_envelope(self.identity, blob)
             except (ValueError, MailboxError) as exc:
                 log.warning("Dropping unreadable held mail %s: %s", message_id, exc)
                 continue
+            if kind == "sealed_receipt":
+                # A receipt is not a message: record the reads and move
+                # on.  The envelope is already acked above, and a
+                # receipt is never receipted itself.
+                self._record_receipt(
+                    reader_hash=payload["from"],
+                    message_ids=payload["ids"],
+                    read_at=payload["read_at"],
+                )
+                continue
+            message = payload
             if self._deliver_collected(message):
                 received += 1
         if new_acks:
@@ -1200,12 +2380,13 @@ class TauNode:
         received = 0
         for envelope in self.mailbox.held_for(self.destination.hash):
             try:
-                message = open_message(self.identity, envelope.blob)
+                kind, payload = open_sealed_envelope(self.identity, envelope.blob)
             except MailboxError as exc:
                 log.warning(
                     "Dropping unreadable held mail %s: %s", envelope.id, exc
                 )
-                message = None
+                payload = None
+                kind = None
             still_held = self.mailbox.drop_held(
                 envelope.id, to=self.destination.hash
             )
@@ -1213,13 +2394,33 @@ class TauNode:
                 # Dropped by the owner (tau outbox drop-held) after this
                 # sweep listed it: do not surface a copy we no longer hold.
                 continue
-            if message is not None and self._deliver_collected(message):
+            if kind == "sealed_receipt" and payload is not None:
+                self._record_receipt(
+                    reader_hash=payload["from"],
+                    message_ids=payload["ids"],
+                    read_at=payload["read_at"],
+                )
+                continue
+            if kind != "sealed_message" or payload is None:
+                continue
+            if self._deliver_collected(payload):
                 received += 1
         return received
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
         """Hand a decrypted relayed message to the user, at most once."""
         sender = message.get("from")
+        if self.blocklist.is_blocked(
+            sender if isinstance(sender, str) else None
+        ):
+            # Same silent drop as a direct message, checked before the
+            # allow-list.  Do not mark it seen: another holder's copy
+            # may still be delivered if the sender is unblocked later.
+            log.info(
+                "Relayed message from %s denied by the block-list",
+                sender or "unknown",
+            )
+            return False
         if not self.allowlist.is_allowed(
             sender if isinstance(sender, str) else None
         ):
@@ -1235,6 +2436,25 @@ class TauNode:
             return False
         if self.mailbox.is_seen(message["id"]):
             return False
+        expires_at = message.get("expires_at")
+        if expires_at is not None and expires_at <= time.time():
+            # Past the sender's deadline: do not record or show it.
+            log.info("Dropping expired relayed message %s", message["id"])
+            return False
+        group = message.get("group")
+        pinned: Optional[Dict[str, Any]] = None
+        if group is not None:
+            sender = message.get("from")
+            pinned = self._accept_group_message(
+                sender if isinstance(sender, str) else "", group
+            )
+            if pinned is None:
+                log.info(
+                    "Relayed group message from %s rejected: sender or "
+                    "node not on the roster, or the roster changed",
+                    sender or "unknown",
+                )
+                return False
         self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
@@ -1244,7 +2464,15 @@ class TauNode:
             "received_at": time.time(),
             "id": message["id"],
             "relayed": True,
+            "expires_at": message.get("expires_at"),
+            "direction": "in",
         }
+        if pinned is not None:
+            record["kind"] = "group"
+            record["group"] = pinned["id"]
+            record["group_name"] = pinned["name"]
+        if message.get("in_reply_to") is not None:
+            record["in_reply_to"] = message["in_reply_to"]
         log.info(
             "Message from %s (%s) via store-and-forward: %s",
             message["from_name"],
@@ -1298,6 +2526,7 @@ class TauNode:
             ]
         except Exception:  # pragma: no cover - introspection only
             pass
+        lxmf_delivery = lxmf_router_delivery_hash(self.lxmf_router)
         return {
             "name": self.name,
             "destination": self.destination.hexhash,
@@ -1308,6 +2537,10 @@ class TauNode:
             "peers": len(self.registry),
             "mailbox": self.mailbox.counts(),
             "interfaces": interfaces,
+            "lxmf": {
+                "enabled": self.lxmf_router is not None,
+                "delivery": lxmf_delivery.hex() if lxmf_delivery else None,
+            },
         }
 
     def resolve_peer(
@@ -1376,6 +2609,131 @@ class TauNode:
             f"{timeout:.1f}s; check the interface and announce interval"
         )
 
+    def _queue_read_receipts(
+        self, dest_hash: bytes, message_ids: List[str], read_at: float
+    ) -> List[Any]:
+        """Queue receipts for *dest_hash*, at most MAX_READ_IDS per entry.
+
+        ``Mailbox.queue_receipt`` (and the wire payload) reject batches
+        over 100 ids, so a longer list is split here rather than left
+        unreceipted.
+        """
+        entries = []
+        for start in range(0, len(message_ids), MAX_READ_IDS):
+            entries.append(
+                self.mailbox.queue_receipt(
+                    to=dest_hash,
+                    message_ids=message_ids[start : start + MAX_READ_IDS],
+                    read_at=read_at,
+                )
+            )
+        return entries
+
+    def send_read_receipts(
+        self,
+        target: Union[str, bytes, Peer],
+        message_ids: List[str],
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        read_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Tell *target* that its messages were read.
+
+        One signed receipt covers up to ``MAX_READ_IDS`` message ids;
+        a longer list is split into one receipt per batch, sent direct
+        or queued per batch.  When the sender is reachable the receipt
+        goes direct over the link; otherwise it is queued in the
+        receipts outbox and rides store-and-forward like a message —
+        including when the sender cannot even be discovered: a known
+        destination hash is enough to queue by, so a failed discovery
+        neither drops the receipt nor repeats on every sweep.  A node
+        that opted out never sends receipts (returns
+        ``{"ok": False, "disabled": True}``).  Receipts are never
+        receipted themselves.
+        """
+        if not self.started:
+            raise NodeError("node has not been started")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        if not self.read_receipts_enabled:
+            return {"ok": False, "disabled": True, "ids": []}
+        ids = []
+        for message_id in message_ids:
+            if isinstance(message_id, str) and message_id and message_id not in ids:
+                ids.append(message_id)
+        if not ids:
+            return {"ok": True, "ids": [], "recorded": []}
+        try:
+            peer = self.resolve_peer(
+                target,
+                timeout=discover_timeout
+                if discover_timeout is not None
+                else min(timeout, 10.0),
+            )
+        except (NodeError, PeerError):
+            # Discovery failed: queue by destination hash so
+            # store-and-forward can deliver the receipt when the
+            # sender is reachable, instead of dropping it and waiting
+            # out discovery again on the next sweep.
+            dest_hash = self._target_hash(target)
+            if dest_hash is None:
+                raise
+            stamp = read_at if isinstance(read_at, (int, float)) else time.time()
+            entries = self._queue_read_receipts(dest_hash, ids, stamp)
+            return {
+                "ok": True,
+                "queued": True,
+                "receipt_id": entries[0].id,
+                "receipt_ids": [entry.id for entry in entries],
+                "ids": ids,
+            }
+        stamp = read_at if isinstance(read_at, (int, float)) else time.time()
+        if len(ids) > MAX_READ_IDS:
+            # One receipt names at most MAX_READ_IDS messages; send the
+            # rest as further receipts.  A failed chunk is left out of
+            # "ids" so the caller retries only that chunk later.
+            handled: List[str] = []
+            recorded: List[Any] = []
+            ok = True
+            for start in range(0, len(ids), MAX_READ_IDS):
+                chunk = ids[start : start + MAX_READ_IDS]
+                try:
+                    result = self.send_read_receipts(
+                        peer,
+                        chunk,
+                        timeout=timeout,
+                        read_at=stamp,
+                    )
+                except Exception:
+                    log.debug("Could not send a read receipt chunk", exc_info=True)
+                    ok = False
+                    continue
+                handled.extend(result.get("ids") or [])
+                recorded.extend(result.get("recorded") or [])
+                ok = ok and bool(result.get("ok"))
+            return {"ok": ok, "ids": handled, "recorded": recorded}
+        if peer.caps and "read" not in peer.caps:
+            # An old peer cannot consume a receipt, and a receipt it can
+            # never read would only occupy a queue slot for its whole TTL.
+            # Nothing is queued; the messages are treated as handled.
+            return {"ok": True, "skipped": True, "ids": ids, "recorded": []}
+        try:
+            payload = build_read_receipt(
+                self.identity, message_ids=ids, read_at=stamp
+            )
+            response = self._request(peer, REQUEST_READ, payload, timeout)
+        except (NodeError, ProtocolError):
+            entry = self.mailbox.queue_receipt(
+                to=peer.destination_hash, message_ids=ids, read_at=stamp
+            )
+            return {"ok": True, "queued": True, "receipt_id": entry.id, "ids": ids}
+        return {
+            "ok": True,
+            "ids": ids,
+            "recorded": response.get("recorded", []),
+        }
+
     def send_message(
         self,
         target: Union[str, bytes, Peer],
@@ -1384,6 +2742,8 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        expires_at: Optional[float] = None,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -1392,10 +2752,29 @@ class TauNode:
         the returned dict has ``queued: True`` and the message id, and
         delivery is retried automatically whenever the peer — or any peer
         willing to hold a sealed copy — is heard from.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds):
+        it travels in the message payload and inside sealed relay
+        envelopes, the receiver purges the message once it passes, and
+        a queued copy expires at the same deadline.  Expiry is
+        cooperative — a modified client can keep copies — so this is
+        hygiene, not a guarantee.
+
+        ``in_reply_to`` quotes an earlier message in the same
+        conversation: ``{"id": <wire id>, "excerpt": <short hash>}``.
+        The reference travels the direct and the store-and-forward
+        paths alike, and the sent message is recorded in the inbox so
+        the peer's reply to it can be rendered from local history.
         """
         normalized = normalize_message(text)
+        reply_to = clean_in_reply_to(in_reply_to)
         message_id = generate_message_id()
-        payload = encode_message(normalized, message_id=message_id)
+        payload = encode_message(
+            normalized,
+            message_id=message_id,
+            expires_at=expires_at,
+            in_reply_to=reply_to,
+        )
         peer: Optional[Peer] = None
         try:
             peer = self.resolve_peer(
@@ -1404,13 +2783,56 @@ class TauNode:
                 if discover_timeout is not None
                 else min(timeout, 10.0),
             )
-            return self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            # Remember the send (and its recipient) before the request: the
+            # recipient's message callback can send a read receipt back
+            # before this request returns, and that receipt must already
+            # verify.  A refused or failed send is forgotten below.
+            self.mailbox.record_sent(
+                message_id,
+                to=peer.destination_hash,
+                text=normalized,
+            )
+            response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
+            self.mailbox.record_delivered(message_id)
+            if isinstance(response, dict):
+                # Always name the outbound wire message, never an id
+                # the peer supplied, so callers (console history, JSON
+                # output) match what was actually sent and recorded —
+                # delivery reports and reactions key off this id.
+                response["id"] = message_id
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": peer.hexhash,
+                    "text": normalized,
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": message_id,
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
+            )
+            if self.registry.get(peer.destination_hash) is None:
+                # A caller can hand send_message a Peer that never entered
+                # the registry (resolve_peer returns Peer objects as-is);
+                # a peer we just reached is a known peer, so record it
+                # before stamping the delivery — otherwise the history
+                # is silently lost and the peer never earns its quota tier.
+                self.registry.upsert(
+                    peer.destination_hash, peer.public_key, name=peer.name
+                )
+            self.registry.record_delivered(peer.destination_hash)
+            return response
         except NotAllowedError:
             # The peer is online and explicitly refused the message;
             # queueing it would retry a refusal until its TTL expires.
+            if peer is not None:
+                self.mailbox.discard_sent(message_id)
             raise
         except NodeError:
             if not queue or not self.started:
+                if peer is not None:
+                    self.mailbox.discard_sent(message_id)
                 raise
             dest_hash = (
                 peer.destination_hash
@@ -1418,12 +2840,34 @@ class TauNode:
                 else self._target_hash(target)
             )
             if dest_hash is None:
+                if peer is not None:
+                    self.mailbox.discard_sent(message_id)
                 raise
             entry = self.mailbox.enqueue(
                 to=dest_hash,
                 text=normalized,
                 to_name=peer.display_name if peer is not None else "",
                 message_id=message_id,
+                expires_at=expires_at,
+                in_reply_to=reply_to,
+            )
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": dest_hash.hex(),
+                    "text": normalized,
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": message_id,
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
+            )
+            self.mailbox.record_sent(
+                entry.id,
+                to=dest_hash,
+                text=normalized,
+                sent_at=entry.created_at,
             )
             log.info(
                 "Peer %s is unreachable; queued message %s in the outbox",
@@ -1444,6 +2888,351 @@ class TauNode:
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
             }
+
+    def send_group_message(
+        self,
+        group: Union[str, Dict[str, Any]],
+        text: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        queue: bool = True,
+    ) -> Dict[str, Any]:
+        """Fan *text* out to every member of a group except this node.
+
+        *group* is a group id, id prefix, name, or group record.  Each
+        leg is a ``/tau/group`` request carrying the roster; a member
+        that cannot be reached is queued in the outbox (with the group
+        context, so a retry re-sends the group payload) unless it
+        explicitly refused the message.  Returns a per-member result
+        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        """
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        creator = group.get("creator") or ""
+        if not creator:
+            raise NodeError(
+                "group record has no creator; delete it and re-create it"
+            )
+        normalized = normalize_message(text)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        context = {
+            "id": group["id"],
+            "name": group["name"],
+            "creator": creator,
+            "members": list(group["members"]),
+        }
+        results: List[Dict[str, Any]] = []
+        any_queued = False
+        # Check the full group request size once, before any leg is sent
+        # or queued, so an oversized message fails cleanly up front rather
+        # than aborting the fan-out partway through.
+        try:
+            encode_group_message(
+                normalized,
+                message_id=generate_message_id(),
+                group_id=group["id"],
+                group_name=group["name"],
+                creator=creator,
+                members=list(group["members"]),
+            )
+        except ProtocolError as exc:
+            raise NodeError(
+                f"group message is too large to send with its roster ({exc}); "
+                "shorten the message"
+            ) from exc
+        for member in members:
+            message_id = generate_message_id()
+            payload = encode_group_message(
+                normalized,
+                message_id=message_id,
+                group_id=group["id"],
+                group_name=group["name"],
+                creator=creator,
+                members=list(group["members"]),
+            )
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=discover_timeout
+                    if discover_timeout is not None
+                    else min(timeout, 10.0),
+                )
+                response = self._request(
+                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "id": message_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; queueing
+                # would retry a refusal until its TTL expires.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "id": message_id,
+                    }
+                )
+            except NodeError as exc:
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "error": str(exc),
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name=peer.display_name if peer is not None else "",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    # The outbox is full (or the write failed): record the
+                    # leg as failed and keep going, so the legs already
+                    # delivered or queued are not lost with the exception.
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                any_queued = True
+                log.info(
+                    "Member %s is unreachable; queued group message %s "
+                    "in the outbox",
+                    member,
+                    entry.id,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": entry.to_name,
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                    }
+                )
+        if any_queued:
+            threading.Thread(
+                target=self.flush_outbox,
+                kwargs={"timeout": _MAIL_REQUEST_TIMEOUT, "max_peers": 5},
+                name="tau-mail-flush",
+                daemon=True,
+            ).start()
+        # Aggregate success only when every leg was delivered or queued;
+        # an explicit refusal or unqueued failure is a failed fan-out.
+        all_ok = all(r.get("delivered") or r.get("queued") for r in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "results": results,
+        }
+
+    def send_file(
+        self,
+        target: Union[str, bytes, Peer],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> Dict[str, Any]:
+        """Send a small file to a peer over an RNS Resource.
+
+        The receiver first gets a signed ``/tau/file`` offer (name,
+        size, SHA-256) and may refuse it — a refused or unreachable
+        peer raises instead of queueing, because files are direct
+        links only in v1 (no store-and-forward).  Once accepted, the
+        bytes travel as a Resource on the same link; the receiver
+        verifies the hash before writing anything to disk.
+        """
+        source = Path(path).expanduser()
+        if not source.is_file():
+            raise NodeError(f"no such file: {source}")
+        try:
+            # Read at most one byte past the limit so an oversized (or
+            # growing) file is rejected without loading it all.
+            with source.open("rb") as handle:
+                data = handle.read(MAX_FILE_BYTES + 1)
+        except OSError as exc:
+            raise NodeError(f"could not read {source}: {exc}") from exc
+        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+            raise NodeError(
+                f"file of {len(data)} bytes is outside the 1..{MAX_FILE_BYTES} "
+                "byte limit"
+            )
+        name = sanitize_file_name(source.name)
+        if not name:
+            raise NodeError(f"file name {source.name!r} is not usable")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        transfer_id = generate_message_id()
+        digest = hashlib.sha256(data).hexdigest()
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        # The offer names its recipient, so a captured offer cannot be
+        # replayed to a third node: address it to this peer.
+        offer = build_file_offer(
+            self.identity,
+            transfer_id=transfer_id,
+            to=peer.destination_hash.hex(),
+            name=name,
+            size=len(data),
+            sha256=digest,
+        )
+        link = self._open_link(peer, min(timeout, 30.0))
+        try:
+            # The offer request runs on this link, and the Resource
+            # follows on the same link — the receiver's resource
+            # callback matches the advertisement against this offer.
+            self._request_on_link(link, REQUEST_FILE, offer, 20.0)
+            concluded = threading.Event()
+            state: Dict[str, Any] = {}
+
+            def on_concluded(resource: Any) -> None:
+                state["status"] = getattr(resource, "status", None)
+                concluded.set()
+
+            def on_progress(resource: Any) -> None:
+                if progress_callback is None:
+                    return
+                try:
+                    progress_callback(float(resource.get_progress()))
+                except Exception:  # pragma: no cover - user callback
+                    log.debug("file progress callback failed", exc_info=True)
+
+            resource = RNS.Resource(
+                data,
+                link,
+                metadata=transfer_id,
+                advertise=False,
+                callback=on_concluded,
+                progress_callback=on_progress,
+            )
+            # Advertise exactly once: the constructor would also
+            # advertise by default, and a second advertise job
+            # corrupts the transfer's timing and cancels it.
+            resource.advertise()
+            if not concluded.wait(timeout):
+                try:
+                    resource.cancel()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                raise NodeError(
+                    f"file transfer {transfer_id[:8]} did not finish "
+                    f"within {timeout:.0f}s"
+                )
+            if state.get("status") != RNS.Resource.COMPLETE:
+                raise NodeError(
+                    f"file transfer {transfer_id[:8]} failed "
+                    f"(status={state.get('status')})"
+                )
+            return {
+                "ok": True,
+                "v": PROTOCOL_VERSION,
+                "id": transfer_id,
+                "name": name,
+                "size": len(data),
+                "sha256": digest,
+                "to": peer.hexhash,
+            }
+        finally:
+            try:
+                link.teardown()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    def send_reaction(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        reaction: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send a reaction to a peer's DM and return the decoded response.
+
+        ``message_id`` names the reacted-to message, ``reaction`` is one
+        emoji or short text token (``""`` retracts the sender's reaction
+        to that message).  Reactions are their own signed message kind:
+        the payload is signed with this node's Reticulum identity and
+        verified by the receiver against the link identity, exactly like
+        a sealed mail envelope — and the receiver resolves state per
+        (message, reactor) with the latest reaction winning.
+
+        Reactions are delivered live in v1: unlike ``send_message``
+        there is no outbox queue, because the sealed-mail path is
+        text-shaped throughout.  An unreachable peer raises
+        :class:`NodeError`; queueing reactions for offline peers is a
+        follow-up once the mailbox can carry non-text kinds.
+        """
+        token = clean_reaction(reaction)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("reaction target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        reaction_id = generate_message_id()
+        payload = reaction_dict(target_id, token, message_id=reaction_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign reaction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
+        # Record the outgoing reaction locally, so the reactor sees it
+        # under the message in their own inbox and console.
+        record = {
+            "target": target_id,
+            "reaction": token,
+            "from": self.name,
+            "destination": self.destination_hexhash
+            if self.destination is not None
+            else "",
+            "sent_at": time.time(),
+            "received_at": time.time(),
+            "id": reaction_id,
+        }
+        self._record_reaction(record)
+        return dict(response, id=reaction_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""
@@ -1602,20 +3391,194 @@ class TauNode:
             time.sleep(0.1)
         raise NodeError(f"no path to {dest_hash.hex()} after {timeout:.1f}s")
 
-    def _configure_link(self, link: RNS.Link, resource_limit: int) -> None:
+    def _configure_link(self, link: RNS.Link) -> None:
+        """Accept plain Resources on *link* only as file transfers.
+
+        Request and response payloads travel as Reticulum request
+        resources and never reach this callback — RNS dispatches
+        them on the advertisement's request/response flags before
+        consulting the app callback (verified against RNS 1.5.7:
+        ``Link.request`` sets a request id, so ``is_request`` is
+        true for over-MDU protocol requests).  It only ever sees an
+        advertisement for a standalone Resource, which in tau means
+        a file transfer.  An advertisement is accepted only when a
+        signed ``/tau/file`` offer for (nearly) that many bytes is
+        pending — the advertised size includes the transfer-id
+        metadata, see ``_FILE_METADATA_OVERHEAD`` — and anything
+        else is refused before a single part is requested, so a
+        stranger cannot make this node buffer arbitrary data.
+        """
         try:
             link.set_resource_strategy(RNS.Link.ACCEPT_APP)
+            # Bind each callback to its link: an offer only matches a
+            # Resource arriving from the same authenticated sender.
             link.set_resource_callback(
-                lambda resource: resource.get_data_size() <= resource_limit
+                lambda advertisement: self._on_resource_advertised(
+                    advertisement, link
+                )
+            )
+            link.set_resource_concluded_callback(
+                lambda resource: self._on_resource_concluded(resource, link)
             )
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not configure link resources", exc_info=True)
 
+    def _prune_file_offers(self) -> None:
+        now = time.time()
+        with self._file_offers_lock:
+            expired = [
+                transfer_id
+                for transfer_id, offer in self._pending_file_offers.items()
+                if offer["expires_at"] <= now
+            ]
+            for transfer_id in expired:
+                del self._pending_file_offers[transfer_id]
+
+    def _link_sender_hash(self, link: Any) -> Optional[str]:
+        """Destination hash (hex) of the identity authenticated on *link*."""
+        try:
+            identity = link.get_remote_identity()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if identity is None:
+            return None
+        return RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+
+    def _on_resource_advertised(self, advertisement: Any, link: Any = None) -> bool:
+        """Accept a Resource only for a pending, matching file offer.
+
+        The advertised data size is the offered file size plus the
+        transfer-id metadata prepended to the Resource (see
+        ``_FILE_METADATA_OVERHEAD``), so the match allows that much
+        slack; the exact size and the SHA-256 are re-checked once
+        the bytes are assembled.  Only offers made by the sender
+        authenticated on *link* are considered.
+        """
+        sender = self._link_sender_hash(link)
+        if sender is None:
+            return False
+        try:
+            size = advertisement.get_data_size()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Resource advertisement without a size", exc_info=True)
+            return False
+        if (
+            not isinstance(size, int)
+            or size < 1
+            or size > MAX_FILE_BYTES + _FILE_METADATA_OVERHEAD
+        ):
+            return False
+        self._prune_file_offers()
+        with self._file_offers_lock:
+            return any(
+                offer["from"] == sender
+                and offer["size"] <= size <= offer["size"] + _FILE_METADATA_OVERHEAD
+                for offer in self._pending_file_offers.values()
+            )
+
+    def _on_resource_concluded(self, resource: Any, link: Any = None) -> None:
+        """Handle a fully transferred Resource: verify, save, record.
+
+        The Resource's metadata is the transfer id from the signed
+        offer; the bytes are checked against the offer's SHA-256
+        before anything is written to disk, and a transfer nobody
+        offered (or whose hash mismatches) is dropped silently.  The
+        offer must have been made by the sender on *link*.
+        """
+        try:
+            transfer_id = resource.metadata
+            if isinstance(transfer_id, bytes):
+                transfer_id = transfer_id.decode("utf-8", "ignore")
+            if not isinstance(transfer_id, str):
+                return
+            sender = self._link_sender_hash(link)
+            with self._file_offers_lock:
+                offer = self._pending_file_offers.get(transfer_id)
+                if offer is None or offer["from"] != sender:
+                    offer = None
+                else:
+                    del self._pending_file_offers[transfer_id]
+            if offer is None:
+                log.info("Ignoring Resource for unknown transfer %r", transfer_id)
+                return
+            if getattr(resource, "status", None) != RNS.Resource.COMPLETE:
+                log.info("File transfer %s did not complete", transfer_id[:8])
+                return
+            data = _read_resource_data(resource)
+            if data is None:
+                log.warning(
+                    "File transfer %s has unreadable data", transfer_id[:8]
+                )
+                return
+            if len(data) != offer["size"]:
+                log.warning(
+                    "File transfer %s size mismatch: got %d, offered %d",
+                    transfer_id[:8],
+                    len(data),
+                    offer["size"],
+                )
+                return
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != offer["sha256"]:
+                log.warning(
+                    "File transfer %s hash mismatch: discarding",
+                    transfer_id[:8],
+                )
+                return
+            peer = self.registry.get(offer["from"])
+            if peer is not None:
+                offer["from_name"] = peer.display_name
+            record = self._save_received_file(offer, data)
+            if record is None:
+                return
+            self._record_received(record)
+            if self.on_file is not None:
+                try:
+                    self.on_file(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_file callback failed", exc_info=True)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not handle concluded Resource", exc_info=True)
+
+    def _save_received_file(
+        self, offer: Dict[str, Any], data: bytes
+    ) -> Optional[Dict[str, Any]]:
+        """Write *data* under ``files/<sender>/<name>`` and describe it.
+
+        Never overwrites: a name that already exists gets a numeric
+        suffix before the extension.  Returns the inbox record, or
+        ``None`` when the write fails.
+        """
+        sender_dir = self.config.files_dir / offer["from"]
+        try:
+            sender_dir.mkdir(parents=True, exist_ok=True)
+            if self.config.files_dir.is_symlink() or sender_dir.is_symlink():
+                raise OSError("files directory must not be a symlink")
+            target = _create_unique_file(sender_dir, offer["name"], data)
+        except OSError as exc:
+            log.warning("Could not save received file %s: %s", offer["name"], exc)
+            return None
+        log.info(
+            "Received file %s (%d bytes) from %s",
+            offer["name"],
+            len(data),
+            offer["from"][:8],
+        )
+        return {
+            "kind": "file",
+            "from": offer.get("from_name") or offer["from"][:8],
+            "destination": offer["from"],
+            "name": target.name,
+            "size": len(data),
+            "sha256": offer["sha256"],
+            "path": str(target),
+            "sent_at": offer.get("sent_at") or 0.0,
+            "received_at": time.time(),
+            "id": offer["id"],
+        }
+
     def _on_incoming_link(self, link: RNS.Link) -> None:
-        # Incoming requests can be mail-sized (a sealed envelope store is
-        # up to _MAIL_WIRE_LIMIT on the wire), so accept resources up to
-        # the larger of the two budgets, not just the plain request one.
-        self._configure_link(link, max(_REQUEST_WIRE_LIMIT, _MAIL_WIRE_LIMIT))
+        self._configure_link(link)
         with self._links_lock:
             self._active_links.add(link)
         link.set_link_closed_callback(self._on_link_closed)
@@ -1625,15 +3588,24 @@ class TauNode:
         with self._links_lock:
             self._active_links.discard(link)
 
-    def _open_link(self, peer: Peer, timeout: float) -> RNS.Link:
-        self._wait_for_path(peer.destination_hash, timeout)
+    def _open_link(
+        self, peer: Peer, timeout: float, *, deadline: Optional[float] = None
+    ) -> RNS.Link:
+        # Each stage gets only the time left before the deadline, not
+        # the full timeout again: path discovery first, then link
+        # establishment, and the request itself after that.
+        self._wait_for_path(peer.destination_hash, _budget(timeout, deadline))
+        if _past(deadline):
+            raise NodeError(
+                f"deadline passed before a link to {peer.hexhash} was ready"
+            )
         destination = self._destination_for(peer)
 
         established = threading.Event()
         state: Dict[str, Any] = {}
 
         def on_established(link: RNS.Link) -> None:
-            self._configure_link(link, _RESPONSE_WIRE_LIMIT)
+            self._configure_link(link)
             try:
                 link.identify(self.identity)
             except Exception:  # pragma: no cover - defensive
@@ -1654,7 +3626,7 @@ class TauNode:
         with self._links_lock:
             self._active_links.add(link)
 
-        if not established.wait(timeout):
+        if not established.wait(_budget(timeout, deadline)):
             try:
                 link.teardown()
             except Exception:  # pragma: no cover - defensive
@@ -1670,10 +3642,15 @@ class TauNode:
         path: str,
         payload: bytes,
         timeout: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        link = self._open_link(peer, timeout)
+        timeout = _budget(timeout, deadline)
+        link = self._open_link(peer, timeout, deadline=deadline)
         try:
-            return self._request_on_link(link, path, payload, timeout)
+            return self._request_on_link(
+                link, path, payload, timeout, deadline=deadline
+            )
         finally:
             try:
                 link.teardown()
@@ -1681,7 +3658,13 @@ class TauNode:
                 pass
 
     def _request_on_link(
-        self, link: RNS.Link, path: str, payload: bytes, timeout: float
+        self,
+        link: RNS.Link,
+        path: str,
+        payload: bytes,
+        timeout: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         concluded = threading.Event()
         state: Dict[str, Any] = {}
@@ -1696,6 +3679,11 @@ class TauNode:
             state["status"] = receipt.get_status()
             concluded.set()
 
+        # Do not send a request the deadline no longer leaves time to
+        # answer: re-check here, after the link stages consumed time.
+        if _past(deadline):
+            raise NodeError(f"deadline passed before sending {path}")
+        timeout = _budget(timeout, deadline)
         receipt = link.request(
             path,
             payload,
@@ -1707,8 +3695,10 @@ class TauNode:
         if receipt is False:
             raise NodeError("could not send request; link is not ready")
 
-        if not concluded.wait(timeout + 5.0):
-            raise NodeError(f"no response to {path} within {timeout + 5.0:.1f}s")
+        # The response grace is capped by the caller's deadline, if any.
+        wait_for = _budget(timeout + 5.0, deadline)
+        if not concluded.wait(wait_for):
+            raise NodeError(f"no response to {path} within {wait_for:.1f}s")
         if "error" in state:
             raise NodeError(f"{state['error']} (status={state.get('status')})")
 
@@ -1724,6 +3714,8 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))

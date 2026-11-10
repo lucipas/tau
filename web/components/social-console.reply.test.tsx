@@ -67,6 +67,28 @@ describe("PostCard reply display", () => {
     expect(screen.getByText(/a deleted post/)).toBeTruthy();
   });
 
+  it("reports a muted parent without showing an empty preview", () => {
+    const reply = makePost({
+      kind: "reply",
+      target: "f".repeat(64),
+      text: "agreed",
+      reply_to: {
+        hash: "f".repeat(64),
+        author: "a".repeat(64),
+        name: "alice",
+        text: "",
+        deleted: false,
+        muted: true,
+      },
+    });
+    render(
+      <PostCard post={reply} onToggleLike={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />,
+    );
+
+    const line = screen.getByText(/in reply to/);
+    expect(line.textContent).toContain("a muted post");
+  });
+
   it("falls back to the parent hash when the parent has not arrived", () => {
     const reply = makePost({
       kind: "reply",

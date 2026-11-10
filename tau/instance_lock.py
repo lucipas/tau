@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,6 +30,12 @@ class InstanceAlreadyRunning(NodeError):
 
 class BackupError(NodeError):
     """Raised when a backup or restore fails (bad archive, bad target)."""
+
+
+# A `tau status` probe holds the instance lock for an instant; retry briefly
+# so a concurrent `tau serve` startup does not mistake that for a live node.
+_LOCK_PROBE_RETRIES = 10
+_LOCK_PROBE_RETRY_DELAY = 0.05
 
 
 class InstanceLock:
@@ -53,17 +60,22 @@ class InstanceLock:
         if self._handle is not None or fcntl is None:
             return
         handle = open(self.path, "a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            holder = self._read_holder_pid(handle)
-            handle.close()
-            detail = f" (pid {holder})" if holder is not None else ""
-            raise InstanceAlreadyRunning(
-                "another tau node is already serving on data directory "
-                f"{self.data_dir}{detail}; stop it before starting a "
-                "second node on the same directory"
-            ) from None
+        for attempt in range(_LOCK_PROBE_RETRIES + 1):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt < _LOCK_PROBE_RETRIES:
+                    time.sleep(_LOCK_PROBE_RETRY_DELAY)
+                    continue
+                holder = self._read_holder_pid(handle)
+                handle.close()
+                detail = f" (pid {holder})" if holder is not None else ""
+                raise InstanceAlreadyRunning(
+                    "another tau node is already serving on data directory "
+                    f"{self.data_dir}{detail}; stop it before starting a "
+                    "second node on the same directory"
+                ) from None
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
@@ -92,4 +104,37 @@ class InstanceLock:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:  # pragma: no cover - defensive
             log.debug("Could not unlock %s", self.path, exc_info=True)
+        handle.close()
+
+
+def instance_lock_holder(path: Path) -> Optional[int]:
+    """PID of the process holding the data-directory lock, or ``None``.
+
+    A read-only probe for commands like ``tau status``: it never writes
+    to the lock file, never blocks, and never takes the lock itself.
+    Returns ``None`` when the lock is free, the file does not exist yet,
+    or advisory locking is unavailable (non-POSIX).  A held lock whose
+    holder PID cannot be read reports ``-1`` so callers can still tell
+    a node is serving.  A lock file that exists but cannot be opened
+    raises :class:`NodeError`, since the serving state is then unknown.
+    """
+    if fcntl is None:
+        return None
+    try:
+        handle = open(path, "r", encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NodeError(
+            f"cannot read instance lock {path}: {exc}; serving state unknown"
+        ) from exc
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = InstanceLock._read_holder_pid(handle)
+            return holder if holder is not None else -1
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return None
+    finally:
         handle.close()
