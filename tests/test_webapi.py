@@ -224,6 +224,28 @@ def test_peers_alias_endpoint_sets_lists_and_clears(bridge, node, tmp_path):
     assert payload["peer"]["alias"] is None
 
 
+def test_peers_alias_response_keeps_blocked_flag(bridge, node, tmp_path):
+    """The alias response replaces the console's peer record, so it must
+    carry the same annotations as the peer list — a bare local_dict
+    would silently drop the blocked badge until the next snapshot."""
+    from tau.blocklist import BlockList
+
+    _seed_alias_registry(node, tmp_path)
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/alias",
+            method="POST",
+            body={"destination": PEER_HASH, "alias": "laptop"},
+        )
+    finally:
+        node.blocklist = BlockList()
+    assert status == 200
+    assert payload["peer"]["alias"] == "laptop"
+    assert payload["peer"]["blocked"] is True
+
+
 def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):
     registry = _seed_alias_registry(node, tmp_path)
     registry.set_alias(bytes.fromhex(OTHER_HASH), "laptop")

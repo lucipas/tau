@@ -1381,7 +1381,10 @@ class WebBridge:
         else:
             peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
-        return peer.local_dict()
+        # The annotated payload, not bare local_dict: the hook replaces
+        # its peer record with this response, and a bare dict would drop
+        # the blocked badge until the next snapshot.
+        return self._local_peer_payload(peer)
 
     def groups(self) -> List[Dict[str, Any]]:
         try:
