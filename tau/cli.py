@@ -5432,6 +5432,14 @@ def cmd_retract(args: argparse.Namespace) -> int:
     recipient = target.get("destination") or ""
     if not recipient:
         raise NodeError("that message has no known recipient to retract from")
+    # A message still in the outbox has not reached its recipient yet; a
+    # retract answered "not found" would let the queued copy arrive later.
+    # Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it instead"
+        )
     node = TauNode(config, name=config.name)
     node.start()
     try:
