@@ -539,6 +539,40 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     return conn
 
 
+def open_readonly_db(path: Union[str, Path]) -> sqlite3.Connection:
+    """Open an existing Tan database read-only, without schema or metadata writes.
+
+    The store must already have the current schema: a store created by an
+    older tau (before reactions) needs one migrating open first — any other
+    ``tau tan`` command does that — so a stale schema raises TanError
+    instead of failing mid-query on a missing column.
+    """
+    target = Path(path).expanduser().resolve()
+    conn = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(posts)").fetchall()
+        }
+        tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    except sqlite3.Error as exc:
+        conn.close()
+        raise TanError(f"could not read the Tan store: {exc}") from exc
+    required = {"author", "name", "created_at", "seq", "kind", "target", "linked"}
+    if not required <= columns or "follows" not in tables:
+        conn.close()
+        raise TanError(
+            "Tan store schema is outdated; run `tau tan timeline` once to migrate it"
+        )
+    return conn
+
+
 def open_db_readonly(path: Union[str, Path]) -> sqlite3.Connection:
     """Open an existing Tan database read-only, without migrating it.
 
@@ -549,6 +583,7 @@ def open_db_readonly(path: Union[str, Path]) -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
     return conn
 
 
@@ -2918,6 +2953,67 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
         "seq": int(seq_row["seq"]),
         "last_post": float(row["last_post"]),
     }
+
+
+def list_authors(
+    conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Every author with at least one linked entry in the local store.
+
+    Each record carries the display name from the author's most recent
+    linked entry, the count of visible posts (linked, kind ``post`` and
+    not deleted — the same visibility ``author_stats`` uses), the time
+    of the most recent visible post (0 when the author has none, e.g.
+    only a delete entry has arrived so far), and whether the author is
+    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    """
+    if sort not in ("recent", "posts", "name"):
+        raise TanError(f"unknown author sort: {sort!r}")
+    if limit < 0:
+        raise TanError("--limit must not be negative")
+    # Only authors with at least one visible post are listed.
+    stats = (
+        "SELECT posts.author AS author, "
+        "(SELECT name FROM posts AS latest WHERE latest.author = posts.author "
+        "AND latest.linked = 1 "
+        "ORDER BY latest.created_at DESC, latest.seq DESC LIMIT 1) AS name, "
+        f"SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) AS posts, "
+        f"MAX(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN posts.created_at ELSE 0 END) AS last_post, "
+        "CASE WHEN follows.author IS NULL THEN 0 ELSE 1 END AS followed "
+        "FROM posts LEFT JOIN follows ON follows.author = posts.author "
+        "WHERE posts.linked = 1 GROUP BY posts.author "
+        f"HAVING SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) > 0"
+    )
+    order_by = {
+        "recent": "last_post DESC, author ASC",
+        "posts": "posts DESC, last_post DESC, author ASC",
+    }.get(sort)
+    if order_by is not None:
+        # Ordering and limiting happen in SQL so only the page is materialised.
+        rows = conn.execute(
+            f"SELECT author, name, posts, last_post, followed FROM ({stats}) "
+            f"ORDER BY {order_by} LIMIT ?",
+            (limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(stats).fetchall()
+    records = [
+        {
+            "author": str(row["author"]),
+            "name": str(row["name"] or ""),
+            "posts": int(row["posts"]),
+            "last_post": float(row["last_post"]),
+            "followed": bool(row["followed"]),
+        }
+        for row in rows
+    ]
+    if order_by is None:
+        # Unicode casefold ordering for names is not expressible in SQLite.
+        records.sort(
+            key=lambda record: ((record["name"] or "").casefold(), record["author"])
+        )
+        return records[:limit]
+    return records
 
 
 def _int_or_none(value: Any) -> Optional[int]:

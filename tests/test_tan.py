@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import RNS
@@ -46,6 +47,7 @@ from tau.tangents.tan import (
     init_db,
     like_counts,
     likers,
+    list_authors,
     mute_keyword,
     muted_keywords,
     quote_counts,
@@ -59,6 +61,7 @@ from tau.tangents.tan import (
     mute,
     muted,
     muted_author_set,
+    open_readonly_db,
     save_post,
     saved_posts,
     search_posts,
@@ -1941,6 +1944,161 @@ def test_author_stats_excludes_deleted_posts(identities, tmp_path):
     assert stats["last_post"] == 1000
     # The chain sequence is untouched: the tombstone is still an entry.
     assert stats["seq"] == 3
+
+
+def test_list_authors(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    alice_second = create_post(conn, alice, "alice two", name="alice", now=1002)
+    create_post(conn, alice, "alice one", name="alice", now=1000)
+    create_post(conn, bob, "bob one", name="bob", now=1001)
+    follow(conn, author_of(bob), name="bob")
+
+    records = list_authors(conn)
+    assert [record["name"] for record in records] == ["alice", "bob"]
+    alice_record, bob_record = records
+    assert alice_record["posts"] == 2
+    assert alice_record["last_post"] == 1002
+    assert alice_record["followed"] is False
+    assert bob_record["posts"] == 1
+    assert bob_record["last_post"] == 1001
+    assert bob_record["followed"] is True
+
+    assert [record["name"] for record in list_authors(conn, sort="posts")] == [
+        "alice",
+        "bob",
+    ]
+    assert [record["name"] for record in list_authors(conn, sort="name")] == [
+        "alice",
+        "bob",
+    ]
+    assert [record["name"] for record in list_authors(conn, limit=1)] == ["alice"]
+
+    # Deleting alice's newest post drops her count and last-post time.
+    create_delete(conn, alice, alice_second["hash"], name="alice", now=1003)
+    (alice_record,) = [
+        record for record in list_authors(conn) if record["name"] == "alice"
+    ]
+    assert alice_record["posts"] == 1
+    assert alice_record["last_post"] == 1000
+
+    # An author known only from a delete entry (target not cached yet)
+    # has no visible posts, so they are not listed.
+    create_delete(conn, carol, "ab" * 32, name="carol", now=1004)
+    records = list_authors(conn)
+    assert [record["name"] for record in records] == ["bob", "alice"]
+    assert all(record["posts"] > 0 for record in records)
+
+    with pytest.raises(TanError):
+        list_authors(conn, sort="nope")
+    with pytest.raises(TanError):
+        list_authors(conn, limit=-1)
+
+
+def test_open_readonly_db_leaves_store_untouched(identities, tmp_path):
+    alice, _ = identities
+    path = tmp_path / "tan.sqlite3"
+    conn = init_db(path)
+    create_post(conn, alice, "hello", name="alice", now=1000)
+    conn.close()
+
+    before = path.read_bytes()
+    conn = open_readonly_db(path)
+    try:
+        assert len(list_authors(conn)) == 1
+    finally:
+        conn.close()
+    assert path.read_bytes() == before
+
+
+def test_open_readonly_db_rejects_outdated_schema(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(path))
+    # A pre-reactions store: no kind/target columns, so list_authors
+    # would fail mid-query on a missing column.
+    conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(TanError, match="outdated"):
+        open_readonly_db(path)
+
+
+def test_cli_tan_authors(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    # A fresh data dir has no store yet, and listing must not create one.
+    assert (
+        main(["tan", "authors", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {"authors": [], "count": 0}
+    assert not (data_dir / "tan.sqlite3").exists()
+
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    for text in ("first", "second"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert (
+        main(["tan", "authors", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    (record,) = payload["authors"]
+    assert record["name"] == "alice"
+    assert record["posts"] == 2
+    assert record["followed"] is False
+
+    assert main(["tan", "authors", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "2 post(s)" in out
+
+    # A pre-reactions store fails cleanly, not with a traceback.
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy_conn = sqlite3.connect(str(legacy_dir / "tan.sqlite3"))
+    legacy_conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    legacy_conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+    assert main(["tan", "authors", "--data-dir", str(legacy_dir), "--json"]) != 0
+    captured = capsys.readouterr()
+    assert "outdated" in captured.err
+    assert "Traceback" not in captured.err
+
+    assert main(["tan", "authors", "--data-dir", str(data_dir), "--limit", "-1"]) != 0
 
 
 def test_sync_hides_deleted_posts(identities, tmp_path):
