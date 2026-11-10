@@ -3,7 +3,6 @@
 import { useRef, useState } from "react";
 
 import type {
-  BundleDocument,
   BundleExportResponse,
   BundleImportReport,
   BundleImportResponse,
@@ -18,9 +17,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-function downloadBundle(bundle: BundleDocument) {
+// The server returns the bundle as its serialised text; download that
+// text verbatim. Re-parsing and re-stringifying it here could rewrite
+// a number the signature covers (an integral float such as
+// 1700000000.0 becomes 1700000000) and break the file on import.
+function downloadBundle(bundleText: string) {
   const stamp = new Date().toISOString().slice(0, 10);
-  const blob = new Blob([`${JSON.stringify(bundle, null, 2)}\n`], {
+  const blob = new Blob([bundleText], {
     type: "application/json",
   });
   const url = URL.createObjectURL(blob);
@@ -41,7 +44,7 @@ export function BundleSection({
   onImport,
 }: {
   onExport: (includeTan: boolean) => Promise<BundleExportResponse>;
-  onImport: (document: BundleDocument) => Promise<BundleImportResponse>;
+  onImport: (documentText: string) => Promise<BundleImportResponse>;
 }) {
   const [includeTan, setIncludeTan] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -73,17 +76,11 @@ export function BundleSection({
     setError(null);
     setImportReport(null);
     try {
-      const text = await file.text();
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        throw new Error("that file is not valid JSON");
-      }
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("that file is not a bundle document");
-      }
-      const result = await onImport(parsed as BundleDocument);
+      // The file's text goes to the server verbatim: the bundle is
+      // signed, and a JSON parse/stringify round trip here can rewrite
+      // a number the signature covers. The server reports a file that
+      // is not a valid bundle.
+      const result = await onImport(await file.text());
       setImportReport(result.import);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "import failed");
@@ -205,6 +202,18 @@ export function BundleSection({
                       className="font-mono text-[10px] leading-relaxed text-amber/80"
                     >
                       skipped {entry.id || "?"}: {entry.error}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {importReport.tan && importReport.tan.errors.length > 0 ? (
+                <ul className="mt-1 flex flex-col gap-0.5">
+                  {importReport.tan.errors.map((entry, index) => (
+                    <li
+                      key={`${entry.hash}-${index}`}
+                      className="font-mono text-[10px] leading-relaxed text-amber/80"
+                    >
+                      Tan skipped {entry.hash || "?"}: {entry.error}
                     </li>
                   ))}
                 </ul>

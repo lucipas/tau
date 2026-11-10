@@ -186,19 +186,13 @@ export interface BundleSummary {
   bytes: number;
 }
 
-export interface BundleDocument {
-  format: string;
-  version: number;
-  manifest: Record<string, unknown>;
-  mail: Array<Record<string, unknown>>;
-  tan: Record<string, unknown> | null;
-  sig: string;
-  [key: string]: unknown;
-}
-
 export interface BundleExportResponse {
   ok: boolean;
-  bundle: BundleDocument;
+  // The server's serialised bundle text, verbatim: the bundle is
+  // signed, so the console downloads this string as-is instead of
+  // parsing and re-stringifying it (a client round trip can rewrite
+  // a number the signature covers, e.g. 1700000000.0 to 1700000000).
+  bundle: string;
   summary: BundleSummary;
 }
 
@@ -207,11 +201,17 @@ export interface BundleImportError {
   error: string;
 }
 
+// Tan import errors name the post by its hash, not a mail id.
+export interface BundleTanError {
+  hash: string;
+  error: string;
+}
+
 export interface BundleTanReport {
   imported: number;
   present: number;
   skipped: number;
-  errors: BundleImportError[];
+  errors: BundleTanError[];
 }
 
 export interface BundleImportReport {

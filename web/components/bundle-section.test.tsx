@@ -2,34 +2,40 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
-  BundleDocument,
   BundleExportResponse,
   BundleImportResponse,
 } from "@/lib/types";
 
 import { BundleSection } from "./bundle-section";
 
-function makeBundle(overrides: Partial<BundleDocument> = {}): BundleDocument {
-  return {
-    format: "tau-bundle",
-    version: 1,
-    manifest: { mail: 1, tan: 0 },
-    mail: [],
-    tan: null,
-    sig: "c2ln",
-    ...overrides,
-  };
+// The server's serialised bundle text, exactly as an export returns it.
+const BUNDLE_TEXT = `{
+  "format": "tau-bundle",
+  "version": 1,
+  "manifest": {
+    "created_at": 1700000000.0,
+    "exporter": "${"ab".repeat(16)}",
+    "exporter_key": "${"cd".repeat(32)}",
+    "mail": 0,
+    "tan": 0
+  },
+  "mail": [],
+  "tan": null,
+  "sig": "c2ln"
 }
+`;
 
 function makeExportResponse(): BundleExportResponse {
   return {
     ok: true,
-    bundle: makeBundle(),
+    bundle: BUNDLE_TEXT,
     summary: { mail: 2, tan: 3, skipped: [], bytes: 2048 },
   };
 }
 
-function makeImportResponse(): BundleImportResponse {
+function makeImportResponse(
+  overrides: Partial<BundleImportResponse["import"]> = {},
+): BundleImportResponse {
   return {
     ok: true,
     import: {
@@ -38,17 +44,37 @@ function makeImportResponse(): BundleImportResponse {
       skipped: 0,
       tan: null,
       errors: [],
+      ...overrides,
     },
   };
 }
 
+function stubDownload() {
+  const blobParts: unknown[] = [];
+  class FakeBlob {
+    constructor(parts: unknown[]) {
+      blobParts.push(...parts);
+    }
+  }
+  vi.stubGlobal("Blob", FakeBlob);
+  vi.stubGlobal("URL", {
+    ...URL,
+    createObjectURL: vi.fn(() => "blob:fake"),
+    revokeObjectURL: vi.fn(),
+  });
+  const click = vi.fn();
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(click);
+  return { blobParts, click };
+}
+
+function unstubDownload() {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+}
+
 describe("BundleSection", () => {
-  it("exports a bundle, downloads it and shows the summary", async () => {
-    const createObjectURL = vi.fn(() => "blob:fake");
-    const revokeObjectURL = vi.fn();
-    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
-    const click = vi.fn();
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(click);
+  it("exports a bundle, downloads the server text verbatim and shows the summary", async () => {
+    const { blobParts, click } = stubDownload();
     const onExport = vi.fn(async () => makeExportResponse());
 
     render(<BundleSection onExport={onExport} onImport={vi.fn()} />);
@@ -57,24 +83,19 @@ describe("BundleSection", () => {
 
     await waitFor(() => {
       expect(onExport).toHaveBeenCalledWith(false);
-      expect(createObjectURL).toHaveBeenCalledTimes(1);
       expect(click).toHaveBeenCalledTimes(1);
       expect(
         screen.getByText(/2 sealed messages · 3 Tan posts · 2\.0 KiB/),
       ).toBeTruthy();
     });
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:fake");
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
+    // The downloaded file is the server's text as-is: re-stringifying
+    // the document could rewrite a number the signature covers.
+    expect(blobParts).toEqual([BUNDLE_TEXT]);
+    unstubDownload();
   });
 
   it("passes the include-Tan choice through to the export", async () => {
-    vi.stubGlobal("URL", {
-      ...URL,
-      createObjectURL: vi.fn(() => "blob:fake"),
-      revokeObjectURL: vi.fn(),
-    });
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    stubDownload();
     const onExport = vi.fn(async () => makeExportResponse());
 
     render(<BundleSection onExport={onExport} onImport={vi.fn()} />);
@@ -85,8 +106,7 @@ describe("BundleSection", () => {
     await waitFor(() => {
       expect(onExport).toHaveBeenCalledWith(true);
     });
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
+    unstubDownload();
   });
 
   it("shows the export error instead of a summary", async () => {
@@ -106,16 +126,17 @@ describe("BundleSection", () => {
     expect(screen.queryByText(/sealed messages/)).toBeNull();
   });
 
-  it("imports a chosen bundle file and shows the merge report", async () => {
+  it("imports a chosen bundle file verbatim and shows the merge report", async () => {
     const onImport = vi.fn(async () => makeImportResponse());
-    const file = new File([JSON.stringify(makeBundle())], "bundle.json", {
-      type: "application/json",
-    });
 
     render(<BundleSection onExport={vi.fn()} onImport={onImport} />);
 
     const input = document.getElementById("bundle-file") as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [file] } });
+    fireEvent.change(input, {
+      target: { files: [new File([BUNDLE_TEXT], "bundle.json", {
+        type: "application/json",
+      })] },
+    });
 
     await waitFor(() => {
       expect(onImport).toHaveBeenCalledTimes(1);
@@ -123,47 +144,70 @@ describe("BundleSection", () => {
         screen.getByText(/imported 1 · already held 0 · skipped 0/),
       ).toBeTruthy();
     });
-    expect(onImport).toHaveBeenCalledWith(
-      expect.objectContaining({ format: "tau-bundle" }),
+    // The file's text reaches the server byte-for-byte: the integral
+    // float in the signed manifest must survive the trip.
+    expect(onImport).toHaveBeenCalledWith(BUNDLE_TEXT);
+  });
+
+  it("shows skipped Tan posts with their reasons", async () => {
+    const onImport = vi.fn(async () =>
+      makeImportResponse({
+        imported: 0,
+        present: 0,
+        skipped: 1,
+        tan: {
+          imported: 0,
+          present: 0,
+          skipped: 1,
+          errors: [
+            {
+              hash: "abc123",
+              error: "entry denied by this node's Tan ruleset",
+            },
+          ],
+        },
+      }),
     );
-  });
-
-  it("reports a file that is not valid JSON instead of importing", async () => {
-    const onImport = vi.fn();
-    const file = new File(["{not json"], "bundle.json", {
-      type: "application/json",
-    });
 
     render(<BundleSection onExport={vi.fn()} onImport={onImport} />);
 
     const input = document.getElementById("bundle-file") as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [file] } });
-
-    await waitFor(() => {
-      expect(screen.getByText("that file is not valid JSON")).toBeTruthy();
+    fireEvent.change(input, {
+      target: { files: [new File([BUNDLE_TEXT], "bundle.json", {
+        type: "application/json",
+      })] },
     });
-    expect(onImport).not.toHaveBeenCalled();
-  });
-
-  it("shows an import failure from the bridge", async () => {
-    const onImport = vi.fn(async () => {
-      throw new Error("invalid bundle: bundle signature does not verify");
-    });
-    const file = new File([JSON.stringify(makeBundle())], "bundle.json", {
-      type: "application/json",
-    });
-
-    render(<BundleSection onExport={vi.fn()} onImport={onImport} />);
-
-    const input = document.getElementById("bundle-file") as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [file] } });
 
     await waitFor(() => {
       expect(
         screen.getByText(
-          "invalid bundle: bundle signature does not verify",
+          "Tan skipped abc123: entry denied by this node's Tan ruleset",
         ),
       ).toBeTruthy();
     });
+  });
+
+  it("shows an import failure from the bridge", async () => {
+    const onImport = vi.fn(async () => {
+      throw new Error("invalid bundle: bundle is not valid JSON");
+    });
+
+    render(<BundleSection onExport={vi.fn()} onImport={onImport} />);
+
+    const input = document.getElementById("bundle-file") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["{not json"], "bundle.json", {
+        type: "application/json",
+      })] },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("invalid bundle: bundle is not valid JSON"),
+      ).toBeTruthy();
+    });
+    // The file's text still went to the server: the bridge, not the
+    // console, decides what counts as a bundle.
+    expect(onImport).toHaveBeenCalledWith("{not json");
   });
 });

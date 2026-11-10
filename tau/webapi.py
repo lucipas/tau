@@ -1352,38 +1352,40 @@ class WebBridge:
         try:
             if include_tan:
                 tan_conn = self._tan_conn()
-            document, summary = build_bundle(
-                identity=identity,
-                sender_name=self.node.name,
-                mailbox=self.node.mailbox,
-                registry=self.node.registry,
-                tan_conn=tan_conn,
-                include_tan=include_tan,
-            )
+            # Read under the mailbox transaction, as the outbox API
+            # does: a separate process (e.g. a one-shot `tau send`)
+            # may have queued mail since this process loaded its
+            # snapshot, and the export must not silently omit it.
+            with self.node.mailbox.transaction():
+                document, summary = build_bundle(
+                    identity=identity,
+                    sender_name=self.node.name,
+                    mailbox=self.node.mailbox,
+                    registry=self.node.registry,
+                    tan_conn=tan_conn,
+                    include_tan=include_tan,
+                )
         finally:
             if tan_conn is not None:
                 tan_conn.close()
         return {"document": document, "summary": summary}
 
     def bundle_import(self, document: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge a sneakernet bundle document into this node.
+        """Merge a verified sneakernet bundle document into this node.
 
-        The document is re-serialised and run through
-        :func:`tau.bundle.parse_bundle`, so a tampered bundle fails
-        its signature check before anything inside it is applied, and
-        through :func:`tau.bundle.apply_bundle`, so every envelope and
-        Tan post meets the same checks as the network path.  Returns
-        the merge report (imported / already present / skipped).
+        *document* must already have passed
+        :func:`tau.bundle.parse_bundle` — the HTTP handler verifies the
+        container signature and size cap on the request's original bytes
+        before calling here — so this only runs
+        :func:`tau.bundle.apply_bundle`: every envelope and Tan post
+        meets the same checks as the network path.  Returns the merge
+        report (imported / already present / skipped).
         """
-        from .bundle import apply_bundle, parse_bundle, serialize_bundle
+        from .bundle import apply_bundle
 
-        try:
-            parsed = parse_bundle(serialize_bundle(document))
-        except BundleError as exc:
-            raise ValueError(f"invalid bundle: {exc}") from exc
         tan_conn = None
         try:
-            if parsed.get("tan") is not None:
+            if document.get("tan") is not None:
                 tan_conn = self._tan_conn()
             admit = None
             if tan_conn is not None:
@@ -1391,7 +1393,7 @@ class WebBridge:
             return apply_bundle(
                 mailbox=self.node.mailbox,
                 tan_conn=tan_conn,
-                document=parsed,
+                document=document,
                 admit=admit,
             )
         finally:
@@ -1916,14 +1918,10 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
-            # A bundle import carries the whole signed document, up to
-            # the 8 MiB bundle cap — far past the 32 KiB limit every
-            # other route uses. parse_bundle re-checks the cap, so the
-            # larger read window cannot smuggle in an oversized bundle.
             if path == "/api/bundle/import":
-                body = self._read_body(max_bytes=DEFAULT_MAX_BUNDLE_BYTES)
-            else:
-                body = self._read_body()
+                self._handle_bundle_import(head_only)
+                return
+            body = self._read_body()
             if path == "/api/messages":
                 self._handle_send(body, head_only)
                 return
@@ -2045,45 +2043,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "delete": record}, head_only)
                 return
             if path == "/api/bundle/export":
-                include_tan = body.get("include_tan", False)
-                if not isinstance(include_tan, bool):
-                    self._send_json(
-                        {
-                            "error": {
-                                "message": "field 'include_tan' must be a boolean"
-                            }
-                        },
-                        head_only,
-                        400,
-                    )
-                    return
-                try:
-                    result = self.bridge.bundle_export(include_tan=include_tan)
-                except BundleError as exc:
-                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
-                    return
-                except WebBridgeError as exc:
-                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
-                    return
-                self._send_json(
-                    {
-                        "ok": True,
-                        "bundle": result["document"],
-                        "summary": result["summary"],
-                    },
-                    head_only,
-                )
-                return
-            if path == "/api/bundle/import":
-                try:
-                    result = self.bridge.bundle_import(body)
-                except ValueError as exc:
-                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
-                    return
-                except WebBridgeError as exc:
-                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
-                    return
-                self._send_json({"ok": True, "import": result}, head_only)
+                self._handle_bundle_export(body, head_only)
                 return
             if path == "/api/tan/sync":
                 try:
@@ -2207,6 +2167,64 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
             return
         self._send_json(result, head_only)
+
+    def _handle_bundle_export(self, body: Dict[str, Any], head_only: bool) -> None:
+        include_tan = body.get("include_tan", False)
+        if not isinstance(include_tan, bool):
+            self._send_json(
+                {"error": {"message": "field 'include_tan' must be a boolean"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.bundle_export(include_tan=include_tan)
+        except BundleError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        from .bundle import serialize_bundle
+
+        # Return the server's serialised bundle text, not a re-encoded
+        # object: the bundle is signed, and a client that parses and
+        # re-stringifies it can rewrite a number the signature covers
+        # (an integral float such as 1700000000.0 becomes 1700000000)
+        # and break verification of the file it downloads.
+        self._send_json(
+            {
+                "ok": True,
+                "bundle": serialize_bundle(result["document"]).decode("utf-8"),
+                "summary": result["summary"],
+            },
+            head_only,
+        )
+
+    def _handle_bundle_import(self, head_only: bool) -> None:
+        # A bundle import carries the whole signed document, up to the
+        # 8 MiB bundle cap — far past the 32 KiB limit every other
+        # route uses. Verify the submitted bytes themselves: measuring
+        # a pretty-printed reconstruction instead would reject a
+        # compact, correctly signed document near the cap, and parsing
+        # through JavaScript numbers on the way in can rewrite a float
+        # the signature covers.
+        raw = self._read_raw_body(max_bytes=DEFAULT_MAX_BUNDLE_BYTES)
+        from .bundle import parse_bundle
+
+        try:
+            document = parse_bundle(raw)
+        except BundleError as exc:
+            self._send_json(
+                {"error": {"message": f"invalid bundle: {exc}"}}, head_only, 400
+            )
+            return
+        try:
+            result = self.bridge.bundle_import(document)
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, "import": result}, head_only)
 
     def _handle_outbox_cancel(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("target") or body.get("id")
@@ -2371,7 +2389,14 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
+    def _read_raw_body(self, *, max_bytes: int) -> bytes:
+        """Read the request body as bytes, enforcing a size cap.
+
+        The JSON parsing lives in :meth:`_read_body`; routes that must
+        verify the submitted bytes themselves (a signed bundle) read
+        them here instead, so no re-serialisation can change what the
+        signature covers or how large it measures.
+        """
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -2385,8 +2410,13 @@ class _WebHandler(BaseHTTPRequestHandler):
         if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
+        raw = self._read_raw_body(max_bytes=max_bytes)
+        if not raw:
             return {}
-        raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):

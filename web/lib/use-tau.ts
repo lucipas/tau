@@ -2,10 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiGet, apiPost, eventsUrl } from "./api";
+import { apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
   BridgeInfo,
-  BundleDocument,
   BundleExportResponse,
   BundleImportResponse,
   CancelOutboxResponse,
@@ -334,8 +333,11 @@ export function useTau() {
     });
   }, []);
 
-  const importBundle = useCallback(async (document: BundleDocument) => {
-    return apiPost<BundleImportResponse>("/api/bundle/import", document);
+  const importBundle = useCallback(async (documentText: string) => {
+    // The file's text goes to the server verbatim: the bundle is
+    // signed, and a JSON parse/stringify round trip here can rewrite
+    // a number the signature covers.
+    return apiPostText<BundleImportResponse>("/api/bundle/import", documentText);
   }, []);
 
   return {
