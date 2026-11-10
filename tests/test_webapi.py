@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -534,11 +535,16 @@ def test_backup_downloads_a_valid_archive(tmp_path, capsys):
     bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
     bridge.start()
     try:
-        status, headers, body = _request(bridge, "/api/backup")
+        # A local Origin (the dev console on :3000) is what makes the
+        # bridge send CORS headers at all.
+        status, headers, body = _request(
+            bridge, "/api/backup", headers={"Origin": "http://localhost:3000"}
+        )
     finally:
         bridge.stop()
     assert status == 200
     assert headers["Content-Type"] == "application/gzip"
+    assert headers["Access-Control-Expose-Headers"] == "Content-Disposition"
     disposition = headers["Content-Disposition"]
     assert disposition.startswith("attachment; ")
     assert disposition.endswith('.tar.gz"')
@@ -569,6 +575,159 @@ def test_backup_without_a_data_directory_is_unavailable(bridge):
     status, _, payload = _json(bridge, "/api/backup")
     assert status == 503
     assert "no data directory" in payload["error"]["message"]
+
+
+def test_live_backup_never_splits_seen_marker_from_inbox(tmp_path, capsys):
+    # A delivery marks a message seen (mailbox) and then records it
+    # (inbox).  A backup read between those two writes would restore a
+    # seen marker with no inbox entry, and the message would be lost:
+    # redelivery is rejected as already seen.  Both sides hold the
+    # mailbox transaction — the delivery across both steps, the backup
+    # across the build — so every archive holds either both writes or
+    # neither.  The append is slowed on purpose: without the
+    # coordination the backup would reliably land inside the widened
+    # window.  The simulated delivery below follows the same protocol
+    # the node's receive paths do.
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    capsys.readouterr()
+    # The node's mailbox and inbox must live in the data directory:
+    # create_backup archives the config's paths, not the objects.
+    node = FakeNode(data_dir / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    node.inbox = Inbox(data_dir / "inbox.json")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=tmp_path)
+    original_append = node.inbox.append
+
+    def slow_append(record):
+        time.sleep(0.02)
+        return original_append(record)
+
+    node.inbox.append = slow_append  # type: ignore[method-assign]
+    # Seed one delivered message first, so mailbox.json and inbox.json
+    # exist before the first backup: without them the archive has no
+    # seen/inbox pair to check at all.
+    with node.mailbox.transaction():
+        node.mailbox.mark_seen("msg-seed")
+        node.inbox.append(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "seed",
+                "sent_at": 1000.0,
+                "received_at": 1000.0,
+                "id": "msg-seed",
+                "direction": "in",
+            }
+        )
+    stop = threading.Event()
+
+    def deliver():
+        n = 0
+        while not stop.is_set():
+            message_id = f"msg-{n:04d}"
+            n += 1
+            with node.mailbox.transaction():
+                node.mailbox.mark_seen(message_id)
+                node.inbox.append(
+                    {
+                        "from": "alice",
+                        "destination": PEER_HASH,
+                        "text": f"hello {n}",
+                        "sent_at": 1000.0 + n,
+                        "received_at": 1000.0 + n,
+                        "id": message_id,
+                        "direction": "in",
+                    }
+                )
+
+    worker = threading.Thread(target=deliver, daemon=True)
+    worker.start()
+    try:
+        for i in range(8):
+            result = bridge.backup()
+            archive_path = Path(result["path"])
+            try:
+                restored_dir = tmp_path / f"restored-{i}"
+                restore_backup(
+                    TauConfig.resolve(data_dir=restored_dir), archive_path
+                )
+                restored_mailbox = json.loads(
+                    (restored_dir / "mailbox.json").read_text(encoding="utf-8")
+                )
+                restored_inbox = json.loads(
+                    (restored_dir / "inbox.json").read_text(encoding="utf-8")
+                )
+                seen = set(restored_mailbox.get("seen", {}))
+                kept = {
+                    message["id"]
+                    for message in restored_inbox.get("messages", [])
+                }
+                assert seen <= kept, f"backup lost messages: {sorted(seen - kept)}"
+            finally:
+                bridge.finish_backup(archive_path)
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+
+
+def test_backup_reports_busy_when_two_are_in_flight(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    capsys.readouterr()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=tmp_path)
+    first = bridge.backup()
+    second = bridge.backup()
+    try:
+        with pytest.raises(WebBridgeError, match="too many backups"):
+            bridge.backup()
+    finally:
+        bridge.finish_backup(Path(first["path"]))
+        bridge.finish_backup(Path(second["path"]))
+    # A finished backup frees its slot.
+    third = bridge.backup()
+    bridge.finish_backup(Path(third["path"]))
+
+
+def test_bridge_stop_removes_pending_backup_archive(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    capsys.readouterr()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=tmp_path)
+    result = bridge.backup()
+    archive = Path(result["path"])
+    assert archive.exists()
+    bridge.stop()
+    assert not archive.exists()
+
+
+def test_backup_missing_archive_is_a_clean_error(bridge, monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "backup",
+        lambda: {
+            "path": "/nonexistent/tau-backup.tar.gz",
+            "filename": "tau-backup.tar.gz",
+            "files": [],
+            "size": 0,
+        },
+    )
+    status, _, payload = _json(bridge, "/api/backup")
+    assert status == 500
+    assert payload["error"]["message"] == "internal error"
 
 
 def test_static_console_and_assets(bridge):

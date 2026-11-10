@@ -1129,8 +1129,6 @@ class TauNode:
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
         if not duplicate and not expired:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
             record = {
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1149,7 +1147,16 @@ class TauNode:
                 caller_hash or "anonymous",
                 message["text"],
             )
-            self._record_received(record)
+            # Marking seen and recording the message are one delivery:
+            # hold the mailbox transaction across both, so a live
+            # backup never restores a seen marker with no inbox entry
+            # (the message would then be rejected as already seen and
+            # lost).  The record step takes the inbox transaction
+            # inside this one; the order is mailbox first everywhere.
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1263,8 +1270,6 @@ class TauNode:
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
             record = {
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1283,7 +1288,13 @@ class TauNode:
                 group["name"],
                 message["text"],
             )
-            self._record_received(record)
+            # One delivery: mark seen and record under the mailbox
+            # transaction, so a live backup never restores a seen
+            # marker with no inbox entry (see _handle_message).
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -2459,7 +2470,6 @@ class TauNode:
                     sender or "unknown",
                 )
                 return False
-        self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
             "destination": message["from"],
@@ -2483,7 +2493,12 @@ class TauNode:
             message["from"],
             message["text"],
         )
-        self._record_received(record)
+        # One delivery: mark seen and record under the mailbox
+        # transaction, so a live backup never restores a seen marker
+        # with no inbox entry (see _handle_message).
+        with self.mailbox.transaction():
+            self.mailbox.mark_seen(message["id"])
+            self._record_received(record)
         if self.on_message is not None:
             try:
                 self.on_message(record)

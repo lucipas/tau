@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -540,6 +541,49 @@ def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
     sent = parse_message(calls[0][2])
     assert sent["in_reply_to"] == reply_to
     assert sent["text"] == "seconded"
+
+
+def test_deliver_collected_holds_mailbox_transaction(tmp_path):
+    # A collected (relayed) delivery marks the message seen and then
+    # records it.  Both steps run under the mailbox transaction, so a
+    # live backup holding the same transaction sees either both writes
+    # or neither — never a seen marker with no inbox entry.
+    node = make_node(tmp_path)
+    original_append = node.inbox.append
+    started = threading.Event()
+
+    def slow_append(record):
+        started.set()
+        time.sleep(0.3)
+        return original_append(record)
+
+    node.inbox.append = slow_append  # type: ignore[method-assign]
+    message = {
+        "id": "relayed-1",
+        "from": "ab" * 16,
+        "from_name": "alice",
+        "text": "hello via relay",
+        "sent_at": 1000.0,
+    }
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(node._deliver_collected(message)),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    # The delivery is inside the slowed record step: the mailbox
+    # transaction must still be held, so acquiring it times out.
+    with pytest.raises(TimeoutError):
+        with node.mailbox.transaction(timeout=0.1):
+            pass
+    worker.join(timeout=5)
+    assert result == [True]
+    # The transaction is free again once the delivery finishes.
+    with node.mailbox.transaction(timeout=1.0):
+        pass
+    stored = json.loads((tmp_path / "inbox.json").read_text(encoding="utf-8"))
+    assert any(entry["id"] == "relayed-1" for entry in stored["messages"])
 
 
 def test_send_message_records_sent_message_for_quote_lookup(

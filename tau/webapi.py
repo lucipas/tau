@@ -90,8 +90,6 @@ MAX_SUBSCRIBERS = 32
 # Backup archives in flight at once (being built or still streaming).  Each
 # one is a full copy of the data directory in temporary storage.
 MAX_CONCURRENT_BACKUPS = 2
-# How long a backup waits for the mail lock before reporting the node busy.
-_BACKUP_MAIL_LOCK_WAIT = 30.0
 # How long shutdown waits for an archive build to finish before cleanup.
 _BACKUP_SHUTDOWN_WAIT = 3.0
 SUBSCRIBER_QUEUE_SIZE = 256
@@ -1393,12 +1391,15 @@ class WebBridge:
 
         The bridge runs inside the serving node, so the archive is
         built with the live backup path: the instance lock is skipped
-        (this process already holds it) and each state file is read as
-        a consistent snapshot, because the node's own writes are
-        atomic.  Returns the archive's temp path, download filename,
-        manifest file list and size; the caller streams the file and
-        removes it.  Raises :class:`WebBridgeError` when this node has
-        no data directory to back up.
+        (this process already holds it), each state file is read
+        through a stable descriptor, because the node's own writes are
+        atomic, and the mailbox is read under its transaction, so a
+        delivery cannot land between the seen-marker and inbox writes
+        (deliveries hold the same transaction across both steps).
+        Returns the archive's temp path, download filename, manifest
+        file list and size; the caller streams the file and removes
+        it.  Raises :class:`WebBridgeError` when this node has no data
+        directory to back up.
         """
         config = getattr(self.node, "config", None)
         if config is None or getattr(config, "data_dir", None) is None:
@@ -1437,22 +1438,21 @@ class WebBridge:
             # create_backup refuses an existing target without --force;
             # the mkstemp file only reserved the name.
             target.unlink()
-            # Hold the node's mail lock while the archive is read: mail
-            # delivery marks a message seen and then records it in the
-            # inbox, and a snapshot between those two writes would restore
-            # a seen marker with no inbox entry.
-            mail_lock = getattr(self.node, "_mail_lock", None)
-            if mail_lock is not None and not mail_lock.acquire(
-                timeout=_BACKUP_MAIL_LOCK_WAIT
-            ):
-                raise WebBridgeError(
-                    "the node is busy delivering mail; try again shortly"
-                )
-            try:
+            # Hold the mailbox transaction while the archive is read.
+            # Delivery marks a message seen (mailbox) and then records
+            # it in the inbox, and holds this same transaction across
+            # both steps — so a snapshot between those two writes would
+            # restore a seen marker with no inbox entry, and the
+            # message would then be rejected as already seen and lost.
+            # Holding it here makes the backup see either both writes
+            # or neither.  The mail sweep lock alone would not cover
+            # this: direct deliveries never take it.
+            mailbox = getattr(self.node, "mailbox", None)
+            if mailbox is not None:
+                with mailbox.transaction():
+                    _, manifest = create_backup(config, target, live=True)
+            else:
                 _, manifest = create_backup(config, target, live=True)
-            finally:
-                if mail_lock is not None:
-                    mail_lock.release()
         except BaseException:
             _unlink_quietly(target)
             raise
