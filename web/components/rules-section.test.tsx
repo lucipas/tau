@@ -150,5 +150,25 @@ describe("RulesSection", () => {
       ).toBeTruthy(),
     );
     expect(onUpdate).toHaveBeenCalledTimes(1);
+    // The displayed policy is the confirmed one again, not the rejected draft.
+    expect(screen.getByText("allow all").className).toContain("bg-signal/15");
+    expect(screen.getByText("deny all").className).not.toContain(
+      "bg-signal/15",
+    );
+    expect(
+      screen.getByText(/Every well-signed post is stored/),
+    ).toBeTruthy();
+  });
+
+  it("hides and shows likes and unlikes together", async () => {
+    const { onUpdate } = renderSection(makeRules(), {
+      availableKinds: ["post", "like", "unlike"],
+    });
+    fireEvent.click(screen.getByText("like"));
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ kinds: ["post"] }),
+      ),
+    );
   });
 });

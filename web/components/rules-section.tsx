@@ -7,6 +7,9 @@ import type { TanRules } from "@/lib/types";
 
 import { SectionLabel } from "./ui";
 
+// Reaction kinds the timeline displays as one annotation.
+const REACTION_KINDS = ["like", "unlike"];
+
 interface RulesSectionProps {
   rules: TanRules | null;
   availableKinds: string[];
@@ -56,10 +59,15 @@ export function RulesSection({
 
   function toggleKind(kind: string) {
     if (!draft) return;
+    // The timeline shows likes and unlikes as one reaction annotation, so
+    // hiding or showing either one moves both together.
+    const group = REACTION_KINDS.includes(kind)
+      ? availableKinds.filter((entry) => REACTION_KINDS.includes(entry))
+      : [kind];
     const shown = draft.kinds ?? availableKinds;
-    const next = shown.includes(kind)
-      ? shown.filter((entry) => entry !== kind)
-      : [...shown, kind];
+    const isShown = shown.includes(kind);
+    const rest = shown.filter((entry) => !group.includes(entry));
+    const next = isShown ? rest : [...rest, ...group];
     void apply({
       ...draft,
       kinds:
