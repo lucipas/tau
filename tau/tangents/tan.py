@@ -2914,7 +2914,7 @@ def mentions(
             break
         last = rows[-1]
         cursor = (float(last["created_at"]), str(last["hash"]))
-    posts = kept[:count]
+    posts = annotate_repost_counts(conn, kept[:count], viewer=viewer)
     return annotate_replies(
         conn,
         annotate_edits(
@@ -3494,6 +3494,7 @@ def annotated_saved_posts(
             muted_keywords=keywords,
             exclude_authors=silenced,
         )
+        annotate_repost_counts(conn, batch, viewer=viewer)
         for post in batch:
             post["saved"] = True
         batch = [post for post in batch if post["author"] not in silenced]
