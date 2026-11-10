@@ -249,6 +249,8 @@ export interface TanAuthor {
 export interface TanAuthorsResponse {
   authors: TanAuthor[];
   count: number;
+  // How many authors the directory holds behind the returned page.
+  total: number;
 }
 
 export interface TanPostResponse {

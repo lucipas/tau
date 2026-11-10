@@ -145,7 +145,7 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
 | `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
-| `/api/tan/authors` | GET | every known author (`?sort=recent|posts|name`, `?limit=N`) |
+| `/api/tan/authors` | GET | every known author (`?sort=recent|posts|name`, `?limit=N`, `?offset=N`; the response carries the directory `total`) |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |

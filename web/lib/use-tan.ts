@@ -17,6 +17,8 @@ import type {
 
 const POLL_INTERVAL_MS = 5000;
 const SAVED_PAGE_SIZE = 100;
+// Authors per directory page, matching the API's default limit.
+const AUTHORS_PAGE_SIZE = 50;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
@@ -27,6 +29,14 @@ export function useTan() {
   // with the feed's poll tick, like `following`, so a follow or
   // unfollow from anywhere refreshes it.
   const [authors, setAuthors] = useState<TanAuthor[]>([]);
+  // How many authors the directory holds in total, behind the page
+  // currently shown; the console offers the next page while the shown
+  // count is below this.
+  const [authorsTotal, setAuthorsTotal] = useState(0);
+  // The page size the directory fetches with. Kept in a ref like `all`
+  // so a "show more" click loads the larger page without waiting for
+  // the state update, and the poll tick keeps fetching the same page.
+  const authorsLimitRef = useRef(AUTHORS_PAGE_SIZE);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -95,10 +105,13 @@ export function useTan() {
       // The directory loads on its own so a failed or stalled authors
       // request cannot block the feed or following from updating; on
       // failure the previous directory stays in place.
-      apiGet<TanAuthorsResponse>("/api/tan/authors")
+      apiGet<TanAuthorsResponse>(
+        `/api/tan/authors?limit=${authorsLimitRef.current}`,
+      )
         .then((known) => {
           if (generationRef.current === generation) {
             setAuthors(known.authors);
+            setAuthorsTotal(known.total);
           }
         })
         .catch(() => {});
@@ -193,6 +206,17 @@ export function useTan() {
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // Fetch the next directory page: grow the page by one page size (up
+  // to the total) and reload. The limit lives in a ref, so the reload
+  // fetches the larger page immediately.
+  const loadMoreAuthors = useCallback(async () => {
+    authorsLimitRef.current = Math.min(
+      authorsTotal,
+      authorsLimitRef.current + AUTHORS_PAGE_SIZE,
+    );
+    await load();
+  }, [load, authorsTotal]);
 
   // Saved posts change only through this client's save/unsave actions
   // (or the CLI), so they load on demand instead of on every poll tick.
@@ -431,6 +455,8 @@ export function useTan() {
     mentions,
     following,
     authors,
+    authorsTotal,
+    loadMoreAuthors,
     saved,
     savedLoading,
     savedHasMore,

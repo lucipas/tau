@@ -1137,17 +1137,21 @@ class WebBridge:
         finally:
             conn.close()
 
-    def tan_authors(self, *, sort: str = "recent", limit: int = 50) -> List[Dict[str, Any]]:
-        """Every author with a visible post in the local Tan store.
+    def tan_authors(
+        self, *, sort: str = "recent", limit: int = 50, offset: int = 0
+    ) -> Dict[str, Any]:
+        """One page of authors with a visible post in the local Tan store.
 
         Mirrors :func:`tau.cli.cmd_tan_authors`: the same records and
         sort orders, so the console shows exactly what the CLI shows
         for the same store.  A read-only listing must not create the
         store on a fresh data directory, so a missing database file
-        yields an empty list.  An unknown *sort* raises TanError (a
-        ValueError), which the HTTP layer reports as a 400.
+        yields an empty page.  An unknown *sort* raises TanError (a
+        ValueError), which the HTTP layer reports as a 400.  The
+        returned ``total`` is how many authors the directory holds
+        behind the page, so the console can offer the next one.
         """
-        from .tangents.tan import list_authors, open_readonly_db
+        from .tangents.tan import count_authors, list_authors, open_readonly_db
 
         # Validate before the missing-file short-circuit so an unknown
         # sort is a 400 on a fresh data directory too.
@@ -1155,7 +1159,7 @@ class WebBridge:
             raise ValueError(f"unknown author sort: {sort!r}")
         db_path = self._tan_db_path()
         if not db_path.exists():
-            return []
+            return {"authors": [], "total": 0}
         # One snapshot of the node's block-list, as in tan_timeline: a
         # blocked author is hidden here too, and a fail-closed list hides
         # every author.
@@ -1165,13 +1169,21 @@ class WebBridge:
         # Existing stores are read-only here, as in the CLI authors command.
         conn = open_readonly_db(db_path)
         try:
-            return list_authors(
-                conn,
-                sort=sort,
-                limit=limit,
-                exclude_authors=sorted(blocked),
-                exclude_all=exclude_all,
-            )
+            return {
+                "authors": list_authors(
+                    conn,
+                    sort=sort,
+                    limit=limit,
+                    offset=offset,
+                    exclude_authors=sorted(blocked),
+                    exclude_all=exclude_all,
+                ),
+                "total": count_authors(
+                    conn,
+                    exclude_authors=sorted(blocked),
+                    exclude_all=exclude_all,
+                ),
+            }
         finally:
             conn.close()
 
@@ -2025,13 +2037,23 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/tan/authors":
                 sort = (query.get("sort") or ["recent"])[0]
                 limit = _int_param(query, "limit", default=50, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
                 try:
-                    records = self.bridge.tan_authors(sort=sort, limit=limit)
+                    result = self.bridge.tan_authors(
+                        sort=sort, limit=limit, offset=offset
+                    )
                 except ValueError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json(
-                    {"authors": records, "count": len(records)}, head_only
+                    {
+                        "authors": result["authors"],
+                        "count": len(result["authors"]),
+                        "total": result["total"],
+                    },
+                    head_only,
                 )
                 return
             if path == "/api/tan/saved":

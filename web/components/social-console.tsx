@@ -258,7 +258,7 @@ export function SocialConsole() {
               <div className="flex items-center justify-between">
                 <SectionLabel>authors</SectionLabel>
                 <span className="font-mono text-[10px] text-mist">
-                  {tan.authors.length}
+                  {tan.authorsTotal}
                 </span>
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-mist">
@@ -303,6 +303,15 @@ export function SocialConsole() {
                   </li>
                 ))}
               </ul>
+              {tan.authors.length < tan.authorsTotal ? (
+                <button
+                  type="button"
+                  onClick={() => void tan.loadMoreAuthors()}
+                  className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-line bg-void/70 px-3 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+                >
+                  show more ({tan.authors.length} of {tan.authorsTotal})
+                </button>
+              ) : null}
             </section>
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">

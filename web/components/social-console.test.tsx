@@ -246,6 +246,8 @@ describe("SocialConsole mentions view", () => {
       mentions: [],
       following: [],
       authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
       all: false,
       setAll: vi.fn(),
       showMentions: false,
@@ -334,6 +336,8 @@ describe("SocialConsole authors directory", () => {
       mentions: [],
       following: [],
       authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
       all: false,
       setAll: vi.fn(),
       showMentions: false,
@@ -426,6 +430,30 @@ describe("SocialConsole authors directory", () => {
     expect(
       screen.getByText("No authors yet. Sync to pull posts from your peers."),
     ).toBeTruthy();
+  });
+
+  it("offers the next page while authors are still hidden", () => {
+    const state = hookState({
+      authors: [makeAuthor()],
+      authorsTotal: 120,
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    const button = screen.getByText("show more (1 of 120)");
+    expect(button).toBeTruthy();
+
+    fireEvent.click(button);
+    expect(state.loadMoreAuthors).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the show-more button once every author is shown", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({ authors: [makeAuthor()], authorsTotal: 1 }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.queryByText(/show more/)).toBeNull();
   });
 });
 

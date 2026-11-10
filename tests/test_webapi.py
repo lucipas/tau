@@ -690,6 +690,7 @@ def test_tan_timeline_and_follow(tmp_path):
 
 def test_tan_authors_via_api(tmp_path):
     import RNS
+    from types import SimpleNamespace
 
     from tau.config import TauConfig
     from tau.tangents.tan import create_post, init_db
@@ -702,7 +703,7 @@ def test_tan_authors_via_api(tmp_path):
     try:
         create_post(conn, alice, "first", name="alice", now=1000)
         create_post(conn, alice, "second", name="alice", now=1001)
-        create_post(conn, bob, "hello", name="bob", now=1002)
+        bob_post = create_post(conn, bob, "hello", name="bob", now=1002)
     finally:
         conn.close()
 
@@ -710,10 +711,12 @@ def test_tan_authors_via_api(tmp_path):
     bridge.start()
     try:
         # Default sort is most recent first; both authors listed with
-        # post counts, last-post times and followed state.
+        # post counts, last-post times and followed state, plus the
+        # directory total behind the page.
         status, _, payload = _json(bridge, "/api/tan/authors")
         assert status == 200
         assert payload["count"] == 2
+        assert payload["total"] == 2
         assert [item["name"] for item in payload["authors"]] == ["bob", "alice"]
         assert payload["authors"][1]["posts"] == 2
         assert payload["authors"][1]["last_post"] == 1001
@@ -724,12 +727,73 @@ def test_tan_authors_via_api(tmp_path):
         assert status == 200
         assert [item["name"] for item in payload["authors"]] == ["alice", "bob"]
 
-        # Limit clamps to the page size, and an unknown sort is a 400.
+        # Limit clamps to the page size, offset pages past it, and an
+        # unknown sort is a 400.
         status, _, payload = _json(bridge, "/api/tan/authors?limit=1")
         assert status == 200
         assert payload["count"] == 1
+        assert payload["total"] == 2
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=1&offset=1")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice"]
+        assert payload["total"] == 2
         status, _, payload = _json(bridge, "/api/tan/authors?sort=nope")
         assert status == 400
+
+        # A blocked author is hidden from the directory, like the
+        # timeline hides their posts; a fail-closed list hides all.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_post["author"]}), block_all=False
+        )
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice"]
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload == {"authors": [], "count": 0, "total": 0}
+    finally:
+        bridge.stop()
+
+
+def test_tan_authors_paging_beyond_first_page(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_db(node.config.social_db_path)
+    try:
+        # 55 authors: more than the default page of 50, so the second
+        # page must exist and the total must count all of them.
+        for index in range(55):
+            create_post(
+                conn,
+                RNS.Identity(),
+                f"post {index}",
+                name=f"author {index:02d}",
+                now=1000 + index,
+            )
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload["count"] == 50
+        assert payload["total"] == 55
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=50&offset=50")
+        assert status == 200
+        assert payload["count"] == 5
+        assert payload["total"] == 55
+        # The two pages together cover every author exactly once.
+        first = _json(bridge, "/api/tan/authors?limit=50")[2]["authors"]
+        second = payload["authors"]
+        assert len({item["author"] for item in first + second}) == 55
     finally:
         bridge.stop()
 
@@ -743,10 +807,13 @@ def test_tan_authors_empty_store(tmp_path):
     bridge.start()
     try:
         # A read-only listing must not create the Tan store on a fresh
-        # data directory.
+        # data directory — but an unknown sort is still a 400 there.
         status, _, payload = _json(bridge, "/api/tan/authors")
         assert status == 200
-        assert payload == {"authors": [], "count": 0}
+        assert payload == {"authors": [], "count": 0, "total": 0}
+        assert not node.config.social_db_path.exists()
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=nope")
+        assert status == 400
         assert not node.config.social_db_path.exists()
     finally:
         bridge.stop()

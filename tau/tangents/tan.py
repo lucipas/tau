@@ -3506,32 +3506,15 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
-def list_authors(
-    conn: sqlite3.Connection,
-    *,
-    sort: str = "recent",
-    limit: int = 50,
+def _author_stats_query(
     exclude_authors: Optional[Sequence[str]] = None,
-    exclude_all: bool = False,
-) -> List[Dict[str, Any]]:
-    """Every author with at least one linked entry in the local store.
+) -> Tuple[str, List[str]]:
+    """The per-author stats query shared by ``list_authors`` and
+    ``count_authors``, with the block-list applied the same way.
 
-    Each record carries the display name from the author's most recent
-    linked entry, the count of visible posts (linked, kind ``post`` and
-    not deleted — the same visibility ``author_stats`` uses), the time
-    of the most recent visible post (0 when the author has none, e.g.
-    only a delete entry has arrived so far), and whether the author is
-    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
-    ``exclude_authors`` hides blocked authors entirely and ``exclude_all``
-    hides every author (a block-list that failed closed), as the display
-    surfaces do for posts.
+    Returns the SQL and its parameters.  Callers short-circuit a
+    block-list that failed closed before reaching this helper.
     """
-    if sort not in ("recent", "posts", "name"):
-        raise TanError(f"unknown author sort: {sort!r}")
-    if limit < 0:
-        raise TanError("--limit must not be negative")
-    if exclude_all:
-        return []
     excluded = _clean_excluded(exclude_authors)
     excluded_sql = ""
     excluded_params: List[str] = []
@@ -3553,6 +3536,41 @@ def list_authors(
         f"WHERE posts.linked = 1{excluded_sql} GROUP BY posts.author "
         f"HAVING SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) > 0"
     )
+    return stats, excluded_params
+
+
+def list_authors(
+    conn: sqlite3.Connection,
+    *,
+    sort: str = "recent",
+    limit: int = 50,
+    offset: int = 0,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> List[Dict[str, Any]]:
+    """Every author with at least one linked entry in the local store.
+
+    Each record carries the display name from the author's most recent
+    linked entry, the count of visible posts (linked, kind ``post`` and
+    not deleted — the same visibility ``author_stats`` uses), the time
+    of the most recent visible post (0 when the author has none, e.g.
+    only a delete entry has arrived so far), and whether the author is
+    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    ``exclude_authors`` hides blocked authors entirely and ``exclude_all``
+    hides every author (a block-list that failed closed), as the display
+    surfaces do for posts. ``offset`` pages past the first ``limit``
+    authors in the same sort order; pair it with :func:`count_authors`
+    for the total.
+    """
+    if sort not in ("recent", "posts", "name"):
+        raise TanError(f"unknown author sort: {sort!r}")
+    if limit < 0:
+        raise TanError("--limit must not be negative")
+    if offset < 0:
+        raise TanError("--offset must not be negative")
+    if exclude_all:
+        return []
+    stats, excluded_params = _author_stats_query(exclude_authors)
     order_by = {
         "recent": "last_post DESC, author ASC",
         "posts": "posts DESC, last_post DESC, author ASC",
@@ -3561,8 +3579,8 @@ def list_authors(
         # Ordering and limiting happen in SQL so only the page is materialised.
         rows = conn.execute(
             f"SELECT author, name, posts, last_post, followed FROM ({stats}) "
-            f"ORDER BY {order_by} LIMIT ?",
-            (*excluded_params, limit),
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (*excluded_params, limit, offset),
         ).fetchall()
     else:
         rows = conn.execute(stats, excluded_params).fetchall()
@@ -3581,8 +3599,24 @@ def list_authors(
         records.sort(
             key=lambda record: ((record["name"] or "").casefold(), record["author"])
         )
-        return records[:limit]
+        return records[offset : offset + limit]
     return records
+
+
+def count_authors(
+    conn: sqlite3.Connection,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> int:
+    """How many authors :func:`list_authors` would list with the same
+    block-list applied — the directory total behind a page.
+    """
+    if exclude_all:
+        return 0
+    stats, params = _author_stats_query(exclude_authors)
+    row = conn.execute(f"SELECT COUNT(*) FROM ({stats})", params).fetchone()
+    return int(row[0])
 
 
 def _int_or_none(value: Any) -> Optional[int]:
