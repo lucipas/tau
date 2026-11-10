@@ -1024,6 +1024,60 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_top(
+        self,
+        *,
+        limit: int = 10,
+        author: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, resolve_author, top_posts
+
+        # Same block-list snapshot as the timeline: the console hides
+        # posts by blocked authors, and a failed-closed list hides all.
+        # top_posts has no exclude parameters, so the block-list is
+        # applied after the ranking — a blocked author's post can take
+        # a result slot, it just never reaches the console.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            target = None
+            if author:
+                target, _ = resolve_author(conn, author, registry=self.node.registry)
+            if exclude_all:
+                return []
+            posts = top_posts(
+                conn,
+                author=target,
+                limit=limit,
+                viewer=viewer,
+                ruleset=ruleset,
+            )
+            posts = [post for post in posts if post.get("author") not in blocked]
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
     def tan_following(self) -> List[Dict[str, Any]]:
         from .tangents.tan import author_stats, following
 
@@ -1789,6 +1843,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                     posts = self.bridge.tan_timeline(
                         limit=limit, include_all=include_all, author=author
                     )
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/top":
+                limit = _int_param(query, "limit", default=10, minimum=1, maximum=100)
+                author = (query.get("author") or [None])[0]
+                try:
+                    posts = self.bridge.tan_top(limit=limit, author=author)
                 except Exception as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return

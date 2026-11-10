@@ -1704,6 +1704,66 @@ def test_tan_timeline_hides_blocked_authors(tmp_path):
         bridge.stop()
 
 
+def test_tan_top_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, create_reaction, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "fresh flop", name="alice", now=1003)
+        hit = create_post(conn, bob, "old hit", name="bob", now=1000)
+        create_reaction(conn, alice, hit["hash"], liked=True, name="alice", now=1004)
+        create_reaction(conn, carol, hit["hash"], liked=True, name="carol", now=1005)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "old hit",
+            "fresh flop",
+        ]
+        assert payload["count"] == 2
+        assert payload["posts"][0]["likes"] == 2
+
+        status, _, payload = _json(bridge, "/api/tan/top?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["old hit"]
+
+        status, _, payload = _json(
+            bridge, f"/api/tan/top?author={destination_hash(alice).hex()}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["fresh flop"]
+
+        status, _, payload = _json(bridge, "/api/tan/top?author=nope")
+        assert status == 400
+
+        # Blocked authors never rank, and a failed-closed list hides all.
+        node.blocklist = BlockList(blocked=frozenset({destination_hash(bob).hex()}))
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["fresh flop"]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
 def test_messages_reconciles_cli_made_reactions(node, tmp_path):
     """A reaction written to the shared inbox by another process (the
     CLI) shows up on the next read of the console history.

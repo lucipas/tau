@@ -143,3 +143,72 @@ describe("useTan deletePost", () => {
     expect(result.current.posts).toEqual([second]);
   });
 });
+
+describe("useTan top view", () => {
+  it("loads /api/tan/top when the view switches to top", async () => {
+    const top = makePost({ text: "most liked", likes: 5 });
+    const latest = makePost({ text: "newest", hash: "e".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/top")) {
+        return Promise.resolve({ posts: [top], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [latest], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+    expect(result.current.view).toBe("timeline");
+
+    await act(async () => {
+      result.current.setView("top");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([top]));
+    expect(result.current.view).toBe("top");
+    const topCalls = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    );
+    expect(topCalls.length).toBeGreaterThan(0);
+    expect(topCalls[0][0]).toBe("/api/tan/top?limit=10");
+
+    // Switching back reloads the timeline.
+    await act(async () => {
+      result.current.setView("timeline");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+  });
+
+  it("does not poll while the top view is selected", async () => {
+    vi.useFakeTimers();
+    try {
+      const top = makePost({ text: "most liked", likes: 5 });
+      const queue = [deferred(), deferred(), deferred(), deferred()];
+      let next = 0;
+      mockedGet.mockImplementation(() => queue[next++].promise);
+
+      const { result } = renderHook(() => useTan());
+      // The initial timeline load is in flight; switch to top, which
+      // supersedes it with a top load.
+      expect(mockedGet.mock.calls.length).toBe(2);
+      act(() => {
+        result.current.setView("top");
+      });
+      expect(mockedGet.mock.calls.length).toBe(4);
+
+      await act(async () => {
+        queue[2].resolve({ posts: [top], count: 1 });
+        queue[3].resolve(emptyFollowing);
+      });
+      expect(result.current.posts).toEqual([top]);
+
+      await act(async () => {
+        vi.advanceTimersByTime(15000);
+      });
+      expect(mockedGet.mock.calls.length).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

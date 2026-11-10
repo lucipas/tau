@@ -18,6 +18,10 @@ export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [all, setAll] = useState(false);
+  // Which ranking the feed shows: the chronological timeline, or the
+  // most-liked posts. The top view ignores the following/everything
+  // filter — it ranks the whole visible store, like `tau tan top`.
+  const [view, setView] = useState<"timeline" | "top">("timeline");
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -30,6 +34,11 @@ export function useTan() {
   useEffect(() => {
     allRef.current = all;
   }, [all]);
+
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
 
   // Monotonic generation of feed loads. A newer load supersedes an older
   // one, so a slow response (for example a poll tick started before a
@@ -58,13 +67,19 @@ export function useTan() {
     const generation = ++generationRef.current;
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
-      const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
-        apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+      const isTop = viewRef.current === "top";
+      const endpoint = isTop ? "/api/tan/top" : "/api/tan/timeline";
+      const suffix = isTop
+        ? "?limit=10"
+        : allRef.current
+          ? "?all=1&limit=100"
+          : "?limit=100";
+      const [feed, follows] = await Promise.all([
+        apiGet<TanTimelineResponse>(`${endpoint}${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
       ]);
       if (generationRef.current !== generation) return false;
-      setPosts(timeline.posts);
+      setPosts(feed.posts);
       setFollowing(follows.following);
       setError(null);
       return true;
@@ -94,12 +109,21 @@ export function useTan() {
     // even if a poll for the old one is still in flight; routine polls
     // skip while a load is pending instead of invalidating it.
     void tick(true);
+    // The top ranking changes only when someone likes, unlikes, posts
+    // or deletes, and every one of those actions reloads the current
+    // view — so the top view loads on demand and on manual refresh,
+    // and never joins the timeline's 5s poll.
+    if (view === "top") {
+      return () => {
+        disposed = true;
+      };
+    }
     const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, load]);
+  }, [all, view, load]);
 
   const refresh = useCallback(async () => {
     await load();
@@ -186,6 +210,8 @@ export function useTan() {
     following,
     all,
     setAll,
+    view,
+    setView,
     loading,
     posting,
     syncing,

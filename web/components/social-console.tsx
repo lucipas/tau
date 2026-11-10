@@ -231,7 +231,13 @@ export function SocialConsole() {
             <section className="rounded-2xl border border-line/80 bg-panel/40">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
                 <div className="flex items-center gap-3">
-                  <SectionLabel>{tan.all ? "public cache" : "timeline"}</SectionLabel>
+                  <SectionLabel>
+                    {tan.view === "top"
+                      ? "top posts"
+                      : tan.all
+                        ? "public cache"
+                        : "timeline"}
+                  </SectionLabel>
                   <span className="font-mono text-[10px] text-mist">
                     {tan.posts.length} post(s)
                   </span>
@@ -239,28 +245,49 @@ export function SocialConsole() {
                 <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
                   <button
                     type="button"
-                    onClick={() => tan.setAll(false)}
+                    onClick={() => {
+                      tan.setView("timeline");
+                      tan.setAll(false);
+                    }}
                     className={`rounded px-2 py-1 ${
-                      tan.all ? "text-mist" : "bg-signal/15 text-signal"
+                      tan.view === "timeline" && !tan.all
+                        ? "bg-signal/15 text-signal"
+                        : "text-mist"
                     }`}
                   >
                     following
                   </button>
                   <button
                     type="button"
-                    onClick={() => tan.setAll(true)}
+                    onClick={() => {
+                      tan.setView("timeline");
+                      tan.setAll(true);
+                    }}
                     className={`rounded px-2 py-1 ${
-                      tan.all ? "bg-signal/15 text-signal" : "text-mist"
+                      tan.view === "timeline" && tan.all
+                        ? "bg-signal/15 text-signal"
+                        : "text-mist"
                     }`}
                   >
                     everything
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => tan.setView("top")}
+                    className={`rounded px-2 py-1 ${
+                      tan.view === "top"
+                        ? "bg-signal/15 text-signal"
+                        : "text-mist"
+                    }`}
+                  >
+                    top
                   </button>
                 </div>
               </div>
 
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
                 {tan.posts.length === 0 ? (
-                  <EmptyState />
+                  <EmptyState top={tan.view === "top"} />
                 ) : (
                   tan.posts.map((post) => (
                     <PostCard
@@ -350,7 +377,7 @@ export function SocialConsole() {
   );
 }
 
-function EmptyState() {
+function EmptyState({ top = false }: { top?: boolean }) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
@@ -358,11 +385,20 @@ function EmptyState() {
       </div>
       <h3 className="mt-4 text-sm font-medium text-zinc-200">No posts yet</h3>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
-        Start a node with{" "}
-        <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
-          tau serve --social --http
-        </code>
-        , publish a post, then sync or follow another author.
+        {top ? (
+          <>
+            Once posts arrive, the most-liked rank first here. Like a post
+            to move it up.
+          </>
+        ) : (
+          <>
+            Start a node with{" "}
+            <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+              tau serve --social --http
+            </code>
+            , publish a post, then sync or follow another author.
+          </>
+        )}
       </p>
     </div>
   );
