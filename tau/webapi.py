@@ -1698,26 +1698,28 @@ class WebBridge:
         new_name = sanitize_name(name, fallback="")
         if not new_name:
             raise ValueError("new name must not be empty")
-        old_name = getattr(self.node, "name", None) or "anonymous"
-        if new_name == old_name:
-            return {
-                "ok": True,
-                "name": new_name,
-                "previous_name": old_name,
-                "changed": False,
-            }
-        # Persist first: a failed write leaves the live name untouched.
-        write_node_metadata(self.node.config.data_dir, new_name)
-        self.node.name = new_name
-        app = getattr(self.node, "app", None)
-        if app is not None and hasattr(app, "name"):
-            app.name = new_name
-        try:
-            self.node.announce()
-        except NodeError:
-            # The rename already landed; the periodic announce loop
-            # re-announces with the new name anyway.
-            log.debug("re-announce after rename failed", exc_info=True)
+        with self._rename_lock:
+            old_name = getattr(self.node, "name", None) or "anonymous"
+            if new_name == old_name:
+                return {
+                    "ok": True,
+                    "name": new_name,
+                    "previous_name": old_name,
+                    "changed": False,
+                }
+            # Persist first: a failed write leaves the live name untouched.
+            write_node_metadata(self.node.config.data_dir, new_name)
+            self.node.name = new_name
+            app = getattr(self.node, "app", None)
+            if app is not None and hasattr(app, "name"):
+                app.name = new_name
+            try:
+                self.node.announce()
+            except Exception:
+                # The rename already landed; the periodic announce loop
+                # re-announces with the new name anyway. Any announce
+                # failure is best-effort here, not a failed rename.
+                log.debug("re-announce after rename failed", exc_info=True)
         self.bus.publish({"type": "status", "action": "rename"})
         return {
             "ok": True,
