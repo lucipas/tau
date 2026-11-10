@@ -6,6 +6,7 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  DeleteMessageResponse,
   GroupsResponse,
   MarkReadResponse,
   NodeInfo,
@@ -129,6 +130,14 @@ export function useTau() {
       );
     };
 
+    const onMessageDeleted = (event: Event) => {
+      const payload = readEventData<{ id: number }>(event);
+      if (!payload || typeof payload.id !== "number") return;
+      setMessages((previous) =>
+        previous.filter((entry) => entry.id !== payload.id),
+      );
+    };
+
     const onPeer = (event: Event) => {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
@@ -156,6 +165,7 @@ export function useTau() {
     source.addEventListener("snapshot", onSnapshot);
     source.addEventListener("message", onMessage);
     source.addEventListener("message_updated", onMessageUpdated);
+    source.addEventListener("message_deleted", onMessageDeleted);
     source.addEventListener("peer", onPeer);
     source.addEventListener("unread", onUnread);
     source.addEventListener("error", onError);
@@ -166,6 +176,7 @@ export function useTau() {
       source.removeEventListener("snapshot", onSnapshot);
       source.removeEventListener("message", onMessage);
       source.removeEventListener("message_updated", onMessageUpdated);
+      source.removeEventListener("message_deleted", onMessageDeleted);
       source.removeEventListener("peer", onPeer);
       source.removeEventListener("unread", onUnread);
       source.removeEventListener("error", onError);
@@ -251,6 +262,19 @@ export function useTau() {
     },
     [refreshOutbox],
   );
+
+  const deleteMessage = useCallback(async (id: number) => {
+    const result = await apiPost<DeleteMessageResponse>(
+      "/api/messages/delete",
+      { id },
+    );
+    // The delete already succeeded: drop the bubble locally at once,
+    // and let the message_deleted event reconcile other tabs.
+    setMessages((previous) =>
+      previous.filter((entry) => entry.id !== result.deleted.id),
+    );
+    return result.deleted;
+  }, []);
 
   const send = useCallback(
     async (to: string, text: string, expiresIn?: number, replyTo?: string) => {
@@ -338,6 +362,7 @@ export function useTau() {
     pings,
     announcing,
     send,
+    deleteMessage,
     ping,
     announce,
     markRead,

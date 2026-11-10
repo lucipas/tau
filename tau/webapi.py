@@ -11,6 +11,9 @@ script) can read what arrives from the mesh and send messages back:
                            ``"expires_in"`` seconds for a disappearing message)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
+    POST /api/messages/delete delete ``{"id": <console message id>}`` from
+                           the console history (and the node inbox, when the
+                           message carries a wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
@@ -51,7 +54,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
-from .inbox import MAX_REACTIONS, merge_reaction
+from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
@@ -1281,6 +1284,63 @@ class WebBridge:
             "id": response.get("id"),
         }
 
+    def delete_message(self, target: int) -> Dict[str, Any]:
+        """Delete one stored DM from the console history, by console id.
+
+        Removes the entry from this console's ``messages.json`` log, and
+        when the entry carries a wire id also deletes that id from the
+        node inbox, so ``tau messages`` agrees with the console
+        afterwards.  Only this node's copies are removed — the sender
+        keeps theirs, and sealed copies already held by relays are
+        unaffected.  A wire id the inbox no longer knows is not an
+        error: the console entry is still removed.  Other tabs learn
+        through a ``message_deleted`` event, and the unread badge is
+        re-published because deleting an unread message clears it.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if removed is None:
+                raise ValueError(f"unknown message: {target!r}")
+            wire_id = removed.get("wire_id")
+        inbox = None
+        if isinstance(wire_id, str) and wire_id:
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is not None:
+                try:
+                    inbox.delete(wire_id)
+                except InboxError as exc:
+                    # Already gone from the inbox (a stale wire id):
+                    # the console entry is still removed below.  Any
+                    # other inbox failure leaves the entry in place.
+                    if not str(exc).startswith("unknown message"):
+                        raise
+        with self._lock:
+            kept = [
+                message for message in self._messages if message.get("id") != target
+            ]
+            self._messages.clear()
+            self._messages.extend(kept)
+        self._save_messages()
+        self.bus.publish({"type": "message_deleted", "id": target})
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": self.unread()})
+        return {
+            "ok": True,
+            "deleted": {
+                "id": target,
+                "wire_id": wire_id if isinstance(wire_id, str) else None,
+            },
+        }
+
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
 
@@ -1816,6 +1876,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/react":
                 self._handle_react(body, head_only)
                 return
+            if path == "/api/messages/delete":
+                self._handle_delete_message(body, head_only)
+                return
             if path == "/api/messages/read":
                 peer = body.get("peer")
                 if peer is not None and (
@@ -2050,6 +2113,24 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_delete_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.delete_message(target)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
 

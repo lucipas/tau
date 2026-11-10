@@ -125,6 +125,9 @@ export function Console() {
                   setMode("peer");
                 }
               }}
+              onDelete={async (message) => {
+                await tau.deleteMessage(message.id);
+              }}
             />
             {tau.outbox.length > 0 ? (
               <div className="mt-4">

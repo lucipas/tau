@@ -1848,6 +1848,117 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     assert status == 400
 
 
+def test_delete_message_endpoint_removes_history_and_inbox_entry(bridge, node):
+    node.inbox.append(
+        {
+            "id": "wire-1",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {"ok": True, "deleted": {"id": 1, "wire_id": "wire-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+
+
+def test_delete_message_endpoint_removes_console_only_entry(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            # No wire id: an entry from before ids existed, or one the
+            # node inbox never stored. The console copy still goes.
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {"ok": True, "deleted": {"id": 1, "wire_id": None}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
+def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": "1"}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_delete_message_survives_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "still here",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "wire-2",
+            }
+        )
+        status, _, _ = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 200
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert [message["id"] for message in messages] == [2]
+        assert messages[0]["text"] == "still here"
+    finally:
+        bridge2.stop()
+
+
 def test_reaction_annotates_matching_history_entry(bridge):
     record = {
         "from": "alice",
