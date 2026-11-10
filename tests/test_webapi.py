@@ -2230,3 +2230,55 @@ def test_messages_import_loopback_guard():
     assert _is_loopback_client("::1") is True
     assert _is_loopback_client("192.168.1.5") is False
     assert _is_loopback_client("not an address") is False
+
+
+def test_messages_import_hides_blocked_sender_from_events(bridge, node):
+    from tau.blocklist import BlockList
+
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "from alice",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "m-1",
+                "direction": "in",
+            },
+            {
+                "from": "mallory",
+                "destination": OTHER_HASH,
+                "text": "from mallory",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "m-2",
+                "direction": "in",
+            },
+        ],
+    }
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 2
+    # Only the unblocked sender's restore is announced to live consoles.
+    published = [
+        event["message"]["text"]
+        for event in bridge.bus.replay(0)
+        if event.get("type") == "message"
+        and event["message"].get("text") in ("from alice", "from mallory")
+    ]
+    assert published == ["from alice"]
+    # The blocked record is still stored: unblocking restores the view.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice"]
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == [
+        "from alice",
+        "from mallory",
+    ]

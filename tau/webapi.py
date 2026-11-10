@@ -1266,8 +1266,19 @@ class WebBridge:
             appended.append(message)
         self._save_messages()
         # Live consoles show arrivals from their message events; publish
-        # the restored entries the same way, in feed order.
+        # the restored entries the same way, in feed order. Blocked
+        # senders stay hidden like the messages API hides them: the
+        # record is kept for unblocking, but no event shows it.
+        blocklist = getattr(self.node, "blocklist", None)
         for message in appended:
+            if (
+                message.get("direction") == "in"
+                and blocklist is not None
+                and blocklist.is_blocked(
+                    message.get("destination") or message.get("peer")
+                )
+            ):
+                continue
             self.bus.publish({"type": "message", "message": message})
 
     def _resolve_console_reply(
