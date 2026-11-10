@@ -3507,7 +3507,12 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
 
 
 def list_authors(
-    conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
+    conn: sqlite3.Connection,
+    *,
+    sort: str = "recent",
+    limit: int = 50,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Every author with at least one linked entry in the local store.
 
@@ -3517,11 +3522,24 @@ def list_authors(
     of the most recent visible post (0 when the author has none, e.g.
     only a delete entry has arrived so far), and whether the author is
     followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    ``exclude_authors`` hides blocked authors entirely and ``exclude_all``
+    hides every author (a block-list that failed closed), as the display
+    surfaces do for posts.
     """
     if sort not in ("recent", "posts", "name"):
         raise TanError(f"unknown author sort: {sort!r}")
     if limit < 0:
         raise TanError("--limit must not be negative")
+    if exclude_all:
+        return []
+    excluded = _clean_excluded(exclude_authors)
+    excluded_sql = ""
+    excluded_params: List[str] = []
+    if excluded:
+        excluded_sql = (
+            f" AND posts.author NOT IN ({', '.join('?' for _ in excluded)})"
+        )
+        excluded_params = list(excluded)
     # Only authors with at least one visible post are listed.
     stats = (
         "SELECT posts.author AS author, "
@@ -3532,7 +3550,7 @@ def list_authors(
         f"MAX(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN posts.created_at ELSE 0 END) AS last_post, "
         "CASE WHEN follows.author IS NULL THEN 0 ELSE 1 END AS followed "
         "FROM posts LEFT JOIN follows ON follows.author = posts.author "
-        "WHERE posts.linked = 1 GROUP BY posts.author "
+        f"WHERE posts.linked = 1{excluded_sql} GROUP BY posts.author "
         f"HAVING SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) > 0"
     )
     order_by = {
@@ -3544,10 +3562,10 @@ def list_authors(
         rows = conn.execute(
             f"SELECT author, name, posts, last_post, followed FROM ({stats}) "
             f"ORDER BY {order_by} LIMIT ?",
-            (limit,),
+            (*excluded_params, limit),
         ).fetchall()
     else:
-        rows = conn.execute(stats).fetchall()
+        rows = conn.execute(stats, excluded_params).fetchall()
     records = [
         {
             "author": str(row["author"]),

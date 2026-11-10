@@ -1147,13 +1147,31 @@ class WebBridge:
         yields an empty list.  An unknown *sort* raises TanError (a
         ValueError), which the HTTP layer reports as a 400.
         """
-        from .tangents.tan import list_authors
+        from .tangents.tan import list_authors, open_readonly_db
 
-        if not self._tan_db_path().exists():
+        # Validate before the missing-file short-circuit so an unknown
+        # sort is a 400 on a fresh data directory too.
+        if sort not in ("recent", "posts", "name"):
+            raise ValueError(f"unknown author sort: {sort!r}")
+        db_path = self._tan_db_path()
+        if not db_path.exists():
             return []
-        conn = self._tan_conn()
+        # One snapshot of the node's block-list, as in tan_timeline: a
+        # blocked author is hidden here too, and a fail-closed list hides
+        # every author.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        # Existing stores are read-only here, as in the CLI authors command.
+        conn = open_readonly_db(db_path)
         try:
-            return list_authors(conn, sort=sort, limit=limit)
+            return list_authors(
+                conn,
+                sort=sort,
+                limit=limit,
+                exclude_authors=sorted(blocked),
+                exclude_all=exclude_all,
+            )
         finally:
             conn.close()
 
