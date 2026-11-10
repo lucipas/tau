@@ -2062,3 +2062,168 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["expires_at"] == expires_at
+
+
+def test_messages_export_import_via_api(bridge, node):
+    _inbound_record(node)
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": PEER_HASH,
+            "text": "reply back",
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "m-2",
+            "direction": "out",
+        }
+    )
+
+    status, _, payload = _json(bridge, "/api/messages/export")
+    assert status == 200
+    assert payload["format"] == "tau-messages-export"
+    assert payload["version"] == 1
+    assert [entry["text"] for entry in payload["messages"]] == [
+        "hello",
+        "reply back",
+    ]
+
+    # A fresh node restores the whole document; the restored messages
+    # show up in its console feed, then report as already present on
+    # a second import — without duplicating the feed.
+    node2 = FakeNode()
+    bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+    bridge2.start()
+    try:
+        _, _, document = _json(bridge, "/api/messages/export")
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"] == {
+            "imported": 2,
+            "present": 0,
+            "skipped": 0,
+            "errors": [],
+        }
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert [m["text"] for m in feed["messages"]] == ["hello", "reply back"]
+        assert feed["messages"][0]["direction"] == "in"
+        assert feed["messages"][0]["peer_name"] == "alice"
+        assert feed["messages"][1]["direction"] == "out"
+        assert feed["messages"][1]["status"] == "delivered"
+        assert feed["messages"][1]["peer_name"] == "alice"
+
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 0
+        assert payload["import"]["present"] == 2
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert len(feed["messages"]) == 2
+
+        # An export document is bigger than the 32 KiB cap for
+        # ordinary actions; the import route accepts it.
+        big = json.loads(json.dumps(document))
+        big["messages"] = big["messages"] * 100
+        assert len(json.dumps(big).encode("utf-8")) > 32 * 1024
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=big
+        )
+        assert status == 200
+        assert payload["import"]["skipped"] == 0
+    finally:
+        bridge2.stop()
+
+
+def test_messages_import_rejects_wrong_format(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body={"format": "nope"}
+    )
+    assert status == 400
+    assert "unsupported export format" in payload["error"]["message"]
+
+
+def test_messages_import_skips_bad_entries(bridge):
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "exported_at": 1000.0,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "good one",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "good-1",
+            },
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "bad-1",
+            },
+        ],
+    }
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
+    assert payload["import"]["skipped"] == 1
+    assert len(payload["import"]["errors"]) == 1
+    assert payload["import"]["errors"][0]["id"] == "bad-1"
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["good one"]
+
+
+def test_messages_import_skips_expired_in_feed(bridge):
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "exported_at": 1000.0,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "already gone",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "gone-1",
+                "expires_at": 200.0,
+            }
+        ],
+    }
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
+    # The restore landed in the inbox, but a message whose deadline
+    # already passed is not resurrected into the feed.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    _, _, exported = _json(bridge, "/api/messages/export")
+    assert len(exported["messages"]) == 1
+
+
+def test_messages_export_too_large_for_import_is_refused(bridge, node, monkeypatch):
+    import tau.webapi as webapi
+
+    _inbound_record(node)
+    monkeypatch.setattr(webapi, "MAX_IMPORT_BYTES", 10)
+    status, _, payload = _json(bridge, "/api/messages/export")
+    assert status == 400
+    assert "command line" in payload["error"]["message"]
+
+
+def test_messages_import_loopback_guard():
+    from tau.webapi import _is_loopback_client
+
+    assert _is_loopback_client("127.0.0.1") is True
+    assert _is_loopback_client("::1") is True
+    assert _is_loopback_client("192.168.1.5") is False
+    assert _is_loopback_client("not an address") is False

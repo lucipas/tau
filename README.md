@@ -135,6 +135,8 @@ The same bridge is the local integration point for scripts:
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/messages/export` | GET | stored DMs as the CLI's JSON export document |
+| `/api/messages/import` | POST | import a DM export document (localhost only) |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |

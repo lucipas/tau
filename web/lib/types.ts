@@ -238,3 +238,31 @@ export interface TanSyncResponse {
     errors: Array<{ peer: string; author: string; error: string }>;
   };
 }
+
+export interface MessagesResponse {
+  messages: TauMessage[];
+}
+
+export interface MessagesExportDocument {
+  format: string;
+  version: number;
+  exported_at: number;
+  messages: Array<Record<string, unknown>>;
+}
+
+export interface MessagesImportError {
+  id: string | null;
+  error: string;
+}
+
+export interface MessagesImportResult {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: MessagesImportError[];
+}
+
+export interface MessagesImportResponse {
+  ok: boolean;
+  import: MessagesImportResult;
+}

@@ -8,6 +8,10 @@ import type {
   CancelOutboxResponse,
   GroupsResponse,
   MarkReadResponse,
+  MessagesExportDocument,
+  MessagesImportResponse,
+  MessagesImportResult,
+  MessagesResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
@@ -57,6 +61,8 @@ export function useTau() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
   const [announcing, setAnnouncing] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
 
@@ -325,6 +331,75 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  // Re-read the console feed. The merge never drops a message: a live
+  // message that arrived after this GET started is already in state,
+  // and a stale response must not overwrite it — the SSE stream stays
+  // the live source, this only picks up entries the stream never
+  // announced (imported messages mirrored into the log).
+  const refreshMessages = useCallback(async () => {
+    const result = await apiGet<MessagesResponse>("/api/messages?limit=200");
+    setMessages((previous) => {
+      const byId = new Map(previous.map((entry) => [entry.id, entry]));
+      for (const entry of result.messages) byId.set(entry.id, entry);
+      const merged = [...byId.values()].sort((a, b) => a.id - b.id);
+      snapshotMax.current = Math.max(
+        snapshotMax.current,
+        merged.length > 0 ? merged[merged.length - 1].id : 0,
+      );
+      return merged;
+    });
+  }, []);
+
+  // Download the export document the bridge returns. The anchor
+  // click is the download: a blob URL keeps the file local, and the
+  // revoke is deferred a beat so the browser has started the save.
+  const exportMessages = useCallback(async () => {
+    setExporting(true);
+    try {
+      const doc =
+        await apiGet<MessagesExportDocument>("/api/messages/export");
+      const blob = new Blob([`${JSON.stringify(doc, null, 2)}\n`], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "tau-messages-export.json";
+        anchor.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      return doc;
+    } finally {
+      setExporting(false);
+    }
+  }, []);
+
+  const importMessages = useCallback(
+    async (doc: MessagesExportDocument): Promise<MessagesImportResult> => {
+      setImporting(true);
+      try {
+        const result = await apiPost<MessagesImportResponse>(
+          "/api/messages/import",
+          doc as unknown as Record<string, unknown>,
+        );
+        // The entries are already stored once the POST succeeds, so a
+        // feed refresh failure must not turn the import into a reported
+        // failure.
+        try {
+          await refreshMessages();
+        } catch {
+          // The next snapshot reconciles.
+        }
+        return result.import;
+      } finally {
+        setImporting(false);
+      }
+    },
+    [refreshMessages],
+  );
+
   return {
     node,
     peers,
@@ -337,12 +412,17 @@ export function useTau() {
     connection,
     pings,
     announcing,
+    exporting,
+    importing,
     send,
     ping,
     announce,
     markRead,
     refreshOutbox,
     refreshGroups,
+    refreshMessages,
     cancelOutbox,
+    exportMessages,
+    importMessages,
   };
 }

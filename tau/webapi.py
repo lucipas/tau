@@ -9,6 +9,8 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
+    GET  /api/messages/export export stored DMs as the CLI's JSON document
+    POST /api/messages/import import a DM export document (loopback only)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
@@ -33,6 +35,7 @@ who can reach this API can send messages as this node.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import logging
 import math
@@ -51,7 +54,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
-from .inbox import MAX_REACTIONS, merge_reaction
+from .inbox import MAX_REACTIONS, _dedupe_key, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
@@ -74,6 +77,13 @@ DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
+# An import carries a whole message history, so the 32 KiB action cap
+# would reject any real backup. The bridge binds to loopback only and
+# the document is validated entry by entry, so a 16 MiB cap is the
+# bound — and the export is held to the same cap, so the console never
+# hands out a backup it cannot import back (larger histories back up
+# with the CLI, which has no cap).
+MAX_IMPORT_BYTES = 16 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
@@ -189,6 +199,19 @@ def _is_local_origin(origin: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return host in _LOCAL_ORIGIN_HOSTS or host.endswith(".localhost")
+
+
+def _is_loopback_client(client: str) -> bool:
+    """True when the connected client is the local machine.
+
+    Bulk imports are accepted only from loopback, even when the bridge
+    is bound to a remote interface: an import writes many entries in
+    one request, so it stays a local-operator action.
+    """
+    try:
+        return ipaddress.ip_address(client).is_loopback
+    except ValueError:
+        return False
 
 
 class EventBus:
@@ -1107,6 +1130,132 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def messages_export(self) -> Dict[str, Any]:
+        """Return the portable backup document the CLI writes.
+
+        The same document ``tau messages export`` produces, so a
+        console backup restores with the CLI and vice versa.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        document = inbox.export_document()
+        # The console must never hand out a backup it cannot import
+        # back: the import route rejects bodies over MAX_IMPORT_BYTES,
+        # so an export past that size is refused here, with the CLI as
+        # the route for larger histories.
+        size = len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+        if size > MAX_IMPORT_BYTES:
+            raise ValueError(
+                "this export is larger than the console can import back "
+                f"({MAX_IMPORT_BYTES // (1024 * 1024)} MiB); back up with "
+                "`tau messages export` from the command line instead"
+            )
+        return document
+
+    def messages_import(self, document: Any) -> Dict[str, Any]:
+        """Merge an export document into the node inbox.
+
+        Returns the same ``{"imported", "present", "skipped",
+        "errors"}`` counts as the CLI import; a bad entry is skipped
+        with its error recorded and never aborts the rest. Newly
+        imported entries are also mirrored into the console feed, so
+        restored messages show up right away instead of landing in
+        the inbox only.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        before = {_dedupe_key(item) for item in inbox.export_document()["messages"]}
+        result = inbox.import_messages(document)
+        # An invalid entry's id comes from untrusted JSON and may hold
+        # a lone surrogate, which the UTF-8 response encoder cannot
+        # write. Replace unencodable characters so the counts still
+        # reach the console.
+        for error in result["errors"]:
+            for key in ("id", "error"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    error[key] = value.encode("utf-8", "replace").decode("utf-8")
+        new = [
+            item
+            for item in inbox.export_document()["messages"]
+            if _dedupe_key(item) not in before
+        ]
+        if new:
+            self._mirror_imported_messages(new)
+        return result
+
+    def _mirror_imported_messages(self, records: List[Dict[str, Any]]) -> None:
+        """Append newly imported inbox records to the console feed.
+
+        The feed is the console's own log, not a view of the inbox,
+        so without this a restore would land in ``inbox.json`` only
+        and the user would see nothing change. Records are mirrored
+        in stored (oldest-first) order with the same field mapping
+        live traffic uses in :meth:`record_inbound`; a disappearing
+        message whose deadline already passed is skipped — the feed
+        purges it on read anyway — and the log is saved once, not
+        once per entry.
+        """
+        names = {
+            item["destination"]: item["name"]
+            for item in self.peers()
+            if isinstance(item.get("destination"), str)
+            and isinstance(item.get("name"), str)
+            and item.get("name")
+        }
+        now = time.time()
+        for record in records:
+            expires_at = record.get("expires_at")
+            if (
+                isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and float(expires_at) <= now
+            ):
+                continue
+            direction = (
+                record.get("direction")
+                if record.get("direction") in ("in", "out")
+                else "in"
+            )
+            peer_hash = str(record.get("destination") or "")
+            if direction == "in":
+                peer_name = str(record.get("from") or "")
+                if not peer_name or peer_name == "unknown":
+                    peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+            else:
+                peer_name = names.get(peer_hash) or (
+                    short_hash(peer_hash) if peer_hash else "unknown"
+                )
+            group = record.get("group") if record.get("kind") == "group" else None
+            wire_id = record.get("id")
+            self._append_message(
+                direction=direction,
+                peer=peer_hash or None,
+                peer_name=sanitize_name(peer_name, fallback="unknown"),
+                text=str(record.get("text") or ""),
+                sent_at=_as_float(record.get("sent_at")),
+                received_at=_as_float(record.get("received_at"), default=time.time()),
+                status="received" if direction == "in" else "delivered",
+                group=group if isinstance(group, str) else None,
+                group_name=(
+                    str(record.get("group_name") or "")
+                    if isinstance(record.get("group_name"), str)
+                    else None
+                ),
+                expires_at=(
+                    float(expires_at)
+                    if isinstance(expires_at, (int, float))
+                    and not isinstance(expires_at, bool)
+                    else None
+                ),
+                wire_id=wire_id if isinstance(wire_id, str) else None,
+                in_reply_to=record.get("in_reply_to"),
+                save=False,
+            )
+        self._save_messages()
+
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
     ) -> Optional[Dict[str, Any]]:
@@ -1577,6 +1726,7 @@ class WebBridge:
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
+        save: bool = True,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -1615,7 +1765,10 @@ class WebBridge:
                 message["in_reply_to"] = reply_to
             self._next_message_id += 1
             self._messages.append(message)
-        self._save_messages()
+        # A bulk caller (import mirroring) passes save=False and saves
+        # once after the loop instead of once per entry.
+        if save:
+            self._save_messages()
         return message
 
     # -- static files ------------------------------------------------------
@@ -1778,6 +1931,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/messages/export":
+                try:
+                    document = self.bridge.messages_export()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(document, head_only)
+                return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
                 return
@@ -1809,7 +1973,28 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
-            body = self._read_body()
+            # Bulk imports write many entries with no per-request quota, so
+            # they are accepted only from the local machine, even when the
+            # bridge is bound to a remote interface.
+            if path == "/api/messages/import" and not _is_loopback_client(
+                self.client_address[0]
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "messages import is only accepted from localhost"
+                        }
+                    },
+                    head_only,
+                    403,
+                )
+                return
+            # An import carries a whole message history, so it gets a
+            # larger body cap than a chat message or a single action.
+            max_body = (
+                MAX_IMPORT_BYTES if path == "/api/messages/import" else MAX_BODY_BYTES
+            )
+            body = self._read_body(max_bytes=max_body)
             if path == "/api/messages":
                 self._handle_send(body, head_only)
                 return
@@ -1831,6 +2016,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                     peer.strip() if isinstance(peer, str) else None
                 )
                 self._send_json({"ok": True, "unread": counts}, head_only)
+                return
+            if path == "/api/messages/import":
+                try:
+                    result = self.bridge.messages_import(body)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "import": result}, head_only)
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
@@ -2216,7 +2412,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self) -> Dict[str, Any]:
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -2227,7 +2423,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             length = int(raw_length or 0)
         except ValueError:
             raise RequestError("invalid Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
             return {}
