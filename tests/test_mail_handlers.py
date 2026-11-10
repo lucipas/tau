@@ -1212,6 +1212,23 @@ def test_retract_is_idempotent_for_an_unknown_id(tmp_path):
     assert response["deleted"] is False
 
 
+def test_retract_requires_an_exact_target_id(tmp_path):
+    # resolve also matches unique prefixes: a retract for "msg-1"
+    # must not delete "msg-123" from the same sender.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-123")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert len(node.inbox.list_messages()) == 1
+
+
 def test_retract_rejects_a_non_sender(tmp_path):
     node = make_node(tmp_path)
     sender = RNS.Identity()

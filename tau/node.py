@@ -1577,7 +1577,9 @@ class TauNode:
         # copy's sender hash must match the caller.  An unknown id is
         # not an error — the message may already be deleted or never
         # have arrived — so a retried retract answers ok with
-        # deleted False instead of failing.
+        # deleted False instead of failing.  The match must be exact:
+        # resolve also matches unique prefixes, and a short target
+        # must never delete a different message from the same sender.
         # Reload first: another process (a one-shot CLI import) may have
         # persisted the target after this node's in-memory copy was read.
         try:
@@ -1589,6 +1591,8 @@ class TauNode:
         try:
             stored = self.inbox.resolve(retract["target"])
         except ValueError:
+            stored = None
+        if stored is None or stored.get("id") != retract["target"]:
             return response_ok(
                 target=retract["target"],
                 received_at=received_at,
