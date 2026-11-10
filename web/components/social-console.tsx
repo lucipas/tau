@@ -414,12 +414,20 @@ export function PostCard({
               in reply to{" "}
               {post.reply_to ? (
                 <>
-                  {post.reply_to.name || "anonymous"} ·{" "}
-                  {post.reply_to.deleted
-                    ? "a deleted post"
-                    : post.reply_to.text.length > 80
-                      ? `${post.reply_to.text.slice(0, 80)}…`
-                      : post.reply_to.text}
+                  {post.reply_to.blocked ? (
+                    "a blocked author's post"
+                  ) : (
+                    <>
+                      {post.reply_to.name || "anonymous"} ·{" "}
+                      {post.reply_to.deleted
+                        ? "a deleted post"
+                        : post.reply_to.muted
+                          ? "a muted post"
+                          : post.reply_to.text.length > 80
+                            ? `${post.reply_to.text.slice(0, 80)}…`
+                            : post.reply_to.text}
+                    </>
+                  )}
                 </>
               ) : (
                 shortHash(post.target ?? "", 16)
@@ -442,6 +450,19 @@ export function PostCard({
           {bodyText ? (
             <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
               {bodyText}
+            </p>
+          ) : null}
+          {post.kind === "quote" ? (
+            <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
+              quoting{" "}
+              {post.quoted ? (
+                <>
+                  {post.quoted.name || "anonymous"} ·{" "}
+                  {post.quoted.deleted ? "a deleted post" : post.quoted.text}
+                </>
+              ) : (
+                shortHash(post.target ?? "", 16)
+              )}
             </p>
           ) : null}
           <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-mist/60">
@@ -473,6 +494,14 @@ export function PostCard({
             >
               ↻ {post.reposts ?? 0}
             </span>
+            {(post.quotes ?? 0) > 0 ? (
+              <span
+                title="Quotes of this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5"
+              >
+                ❝ {post.quotes}
+              </span>
+            ) : null}
             {post.kind !== "repost" ? (
               <button
                 type="button"

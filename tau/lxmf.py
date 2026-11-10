@@ -1,4 +1,4 @@
-"""LXMF addressing for tau.
+"""LXMF addressing for tau, plus the LXMF router lifecycle.
 
 LXMF — Reticulum's messaging layer — addresses a node at a delivery
 destination derived from its Reticulum identity: app ``lxmf``, aspect
@@ -7,21 +7,39 @@ listens on, so the hash computed here is the address any LXMF client
 (including a future tau sender) uses to reach the node, and the address
 an LXMF propagation node holds mail for.
 
-This module is addressing only: it derives destination hashes with
-``RNS.Destination.hash`` and never starts a router, sends a message, or
-touches the network.  That keeps it usable from the CLI, the peer
-registry, and tests without a live Reticulum instance.
+Addressing never needs the ``lxmf`` package or a live Reticulum
+instance: it derives destination hashes with ``RNS.Destination.hash``,
+so it stays usable from the CLI, the peer registry, and tests.  The
+router itself is optional — :func:`start_lxmf_router` imports LXMF
+lazily, so a tau install without the ``lxmf`` extra keeps working and
+only fails, with a clear error, when the router is actually requested.
 """
 
 from __future__ import annotations
+
+import importlib
+import logging
+import signal
+import threading
+from pathlib import Path
+from typing import Any, Optional
 
 import RNS
 
 from .identity import load_public_key
 
+log = logging.getLogger(__name__)
+
 LXMF_APP_NAME = "lxmf"
 LXMF_DELIVERY_ASPECT = "delivery"
 LXMF_PROPAGATION_ASPECT = "propagation"
+
+#: Install hint shown when the router is requested without the extra.
+LXMF_INSTALL_HINT = 'pip install "tau-p2p[lxmf]"'
+
+
+class LXMFError(Exception):
+    """Raised when the LXMF router cannot start or stop cleanly."""
 
 
 def lxmf_delivery_hash(identity: RNS.Identity) -> bytes:
@@ -57,3 +75,117 @@ def lxmf_delivery_hash_for_key(public_key: bytes) -> bytes:
 def lxmf_propagation_hash_for_key(public_key: bytes) -> bytes:
     """Return the LXMF propagation destination hash for a raw public key."""
     return lxmf_propagation_hash(_identity_for_key(public_key))
+
+
+# -- router lifecycle ------------------------------------------------------
+
+def start_lxmf_router(
+    identity: RNS.Identity,
+    data_dir: Path,
+    *,
+    display_name: Optional[str] = None,
+) -> Any:
+    """Start an ``LXMRouter`` on *identity* and register its delivery identity.
+
+    Storage lives under ``<data_dir>/lxmf`` (LXMRouter appends ``/lxmf``
+    to the storage path it is given).  The router listens on the same
+    delivery destination :func:`lxmf_delivery_hash` derives, and that
+    destination is announced so other LXMF clients can find a path to it.
+
+    Raises :class:`LXMFError` when the ``lxmf`` package is not installed,
+    when called off the main thread (LXMRouter installs signal handlers),
+    or when the delivery identity cannot be registered.  The caller must
+    have a Reticulum instance running already.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        raise LXMFError(
+            "the LXMF router must start on the main thread "
+            "(LXMRouter installs signal handlers)"
+        )
+    try:
+        lxmf_module = importlib.import_module("LXMF")
+    except ImportError as exc:
+        raise LXMFError(
+            "LXMF is not installed; install it with "
+            f"{LXMF_INSTALL_HINT}"
+        ) from exc
+    previous = _signal_handlers()
+    router = lxmf_module.LXMRouter(identity=identity, storagepath=str(data_dir))
+    installed = _signal_handlers()
+    # Remember what LXMRouter replaced so shutdown can put it back.
+    setattr(router, _SIGNAL_STATE_ATTR, (previous, installed))
+    try:
+        delivery = router.register_delivery_identity(
+            identity, display_name=display_name
+        )
+        if delivery is None:
+            raise LXMFError("could not register the LXMF delivery identity")
+        router.announce(delivery.hash)
+    except BaseException:
+        _shutdown_router(router)
+        raise
+    return router
+
+
+def stop_lxmf_router(router: Optional[Any]) -> None:
+    """Tear a router down via its exit handler.
+
+    LXMRouter's exit handler is idempotent, so calling this twice — or
+    letting the handler it registers with ``atexit`` run at process exit
+    — is safe.  Signal handlers that LXMRouter replaced are restored,
+    unless the embedding application has installed its own since.
+    Passing ``None`` is a no-op.
+    """
+    if router is None:
+        return
+    _shutdown_router(router)
+
+
+_SIGNAL_STATE_ATTR = "_tau_signal_state"
+_MANAGED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _signal_handlers() -> dict:
+    """Return the current Python-level handler for each managed signal."""
+    return {signum: signal.getsignal(signum) for signum in _MANAGED_SIGNALS}
+
+
+def _shutdown_router(router: Any) -> None:
+    """Run the router's exit handler and restore the signals it replaced."""
+    try:
+        router.exit_handler()
+    finally:
+        state = getattr(router, _SIGNAL_STATE_ATTR, None)
+        if state is not None:
+            previous, installed = state
+            _restore_signal_handlers(previous, installed)
+            setattr(router, _SIGNAL_STATE_ATTR, None)
+
+
+def _restore_signal_handlers(previous: dict, installed: dict) -> None:
+    """Restore *previous* handlers for signals still owned by the router."""
+    for signum, prev in previous.items():
+        # signal.signal() rejects None (handler not set from Python).
+        if prev is None or installed.get(signum) is None:
+            continue
+        if signal.getsignal(signum) != installed[signum]:
+            # The embedding application installed its own handler since.
+            continue
+        try:
+            signal.signal(signum, prev)
+        except (ValueError, OSError, TypeError):  # pragma: no cover - defensive
+            log.debug("Could not restore handler for signal %s", signum, exc_info=True)
+
+
+def lxmf_router_delivery_hash(router: Optional[Any]) -> Optional[bytes]:
+    """Return the delivery destination hash a router listens on.
+
+    Returns ``None`` when the router is ``None`` or has no delivery
+    identity registered.
+    """
+    if router is None:
+        return None
+    destinations = getattr(router, "delivery_destinations", None) or {}
+    if not destinations:
+        return None
+    return next(iter(destinations))
