@@ -8,6 +8,8 @@ import type {
   TanFollowingResponse,
   TanPost,
   TanPostResponse,
+  TanSuggestResponse,
+  TanSuggestion,
   TanSyncResponse,
   TanTimelineResponse,
 } from "./types";
@@ -17,6 +19,7 @@ const POLL_INTERVAL_MS = 5000;
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  const [suggestions, setSuggestions] = useState<TanSuggestion[]>([]);
   const [all, setAll] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -59,13 +62,15 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
+      const [timeline, follows, suggested] = await Promise.all([
         apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
+        apiGet<TanSuggestResponse>("/api/tan/suggest"),
       ]);
       if (generationRef.current !== generation) return false;
       setPosts(timeline.posts);
       setFollowing(follows.following);
+      setSuggestions(suggested.suggestions);
       setError(null);
       return true;
     } finally {
@@ -184,6 +189,7 @@ export function useTan() {
   return {
     posts,
     following,
+    suggestions,
     all,
     setAll,
     loading,

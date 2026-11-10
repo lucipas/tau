@@ -1036,6 +1036,33 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_suggest(self, limit: int = 5) -> List[Dict[str, Any]]:
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import suggest_authors
+
+        # Same block-list snapshot as the timeline: a blocked author is
+        # never suggested, and a failed-closed list suggests nobody.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        if blocklist is not None and blocklist.block_all:
+            return []
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            suggestions = suggest_authors(conn, viewer=viewer, limit=limit)
+            return [
+                item for item in suggestions if item["author"] not in blocked
+            ]
+        finally:
+            conn.close()
+
     def tan_follow(self, target: str) -> Dict[str, Any]:
         from .tangents.tan import follow, resolve_author
 
@@ -1798,6 +1825,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                 records = self.bridge.tan_following()
                 self._send_json(
                     {"following": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/suggest":
+                limit = _int_param(query, "limit", default=5, minimum=1, maximum=50)
+                suggestions = self.bridge.tan_suggest(limit=limit)
+                self._send_json(
+                    {"suggestions": suggestions, "count": len(suggestions)}, head_only
                 )
                 return
             if path == "/api/tan/posts":

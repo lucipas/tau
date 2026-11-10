@@ -143,6 +143,7 @@ The same bridge is the local integration point for scripts:
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/following` | GET | followed authors and their post counts |
+| `/api/tan/suggest` | GET | suggested authors to follow (`?limit=5`) |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |

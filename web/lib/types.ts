@@ -223,6 +223,20 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanSuggestion {
+  author: string;
+  name: string;
+  posts: number;
+  likes: number;
+  reason: string;
+  last_post: number;
+}
+
+export interface TanSuggestResponse {
+  suggestions: TanSuggestion[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;
