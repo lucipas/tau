@@ -16,10 +16,13 @@ The creator can replace the roster with :meth:`GroupStore.update_members`
 same name, new id — replaces the old record, and the old id is retired,
 so a removed peer cannot restore the retired roster by replaying an old
 group message.  A roster learned from a message likewise supersedes a
-learned group from the same creator under the same name, so lookups by
-name keep pointing at the current roster; that predecessor is only
-deleted, not retired, because the old roster may still be live elsewhere
-and its messages should be able to pin it again.
+learned group from the same creator under the same name — but only when
+the message comes from the creator themself, since the creator field is
+only a claim in the payload: a successor carried by another member is
+pinned alongside instead of replacing the predecessor, so no member can
+forge a successor and hijack sends by group name.  The superseded
+predecessor is only deleted, not retired, because the old roster may
+still be live elsewhere and its messages should be able to pin it again.
 """
 
 from __future__ import annotations
@@ -342,6 +345,7 @@ class GroupStore:
         members: List[str],
         *,
         creator: str,
+        sender: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
@@ -354,6 +358,17 @@ class GroupStore:
         evicted to make room for one.  A roster the creator retired
         with a membership change is refused as well, so a removed peer
         cannot restore it by replaying an old group message.
+
+        ``sender`` is the authenticated sender of the message.  A new
+        roster supersedes a learned group from the same creator under
+        the same name only when the sender *is* the creator: the
+        creator field is only a claim in the payload, so a successor
+        carried by another member is pinned alongside the predecessor
+        instead of replacing it — otherwise any member could forge a
+        successor naming the real creator, drop other members from the
+        roster, and hijack sends by group name.  The message itself is
+        still accepted and pinned either way; only the replacement
+        needs the creator's proof.
         """
         candidate = _valid_group(
             {
@@ -368,33 +383,49 @@ class GroupStore:
         )
         if candidate is None:
             return None
+        creator_authorized = bool(sender) and sender.lower() == candidate["creator"]
         with self._transaction():
             existing = self._groups.get(candidate["id"])
             if existing is not None:
                 if existing["members"] != candidate["members"]:
                     return None
+            elif candidate["id"] in self._retired:
+                return None
+            superseded = []
+            if creator_authorized:
+                superseded = [
+                    other
+                    for other in self._groups.values()
+                    if (
+                        not other["local"]
+                        and other["creator"] == candidate["creator"]
+                        and other["name"] == candidate["name"]
+                        and other["id"] != candidate["id"]
+                    )
+                ]
+            if existing is None:
+                learned = sum(1 for g in self._groups.values() if not g["local"])
+                if learned - len(superseded) >= MAX_LEARNED_GROUPS:
+                    log.info(
+                        "Refusing to pin group %s: learned-group limit reached",
+                        group_id,
+                    )
+                    return None
+            for other in superseded:
+                del self._groups[other["id"]]
+            if existing is not None:
+                if superseded:
+                    try:
+                        self._save()
+                    except OSError as exc:
+                        # Reload restores the groups the reconcile above
+                        # deleted.
+                        self._load()
+                        log.warning(
+                            "Could not persist groups to %s: %s", self.path, exc
+                        )
+                        return None
                 return dict(existing)
-            if candidate["id"] in self._retired:
-                return None
-            learned = sum(1 for g in self._groups.values() if not g["local"])
-            if learned >= MAX_LEARNED_GROUPS:
-                log.info("Refusing to pin group %s: learned-group limit reached", group_id)
-                return None
-            # The new roster supersedes a learned group from the same
-            # creator under the same name, so lookups by name keep
-            # pointing at the current roster.  The predecessor is only
-            # deleted, not retired: the old roster may still be live
-            # elsewhere, and its messages should be able to pin it
-            # again.  Locally created groups are never replaced by a
-            # message — they belong to this node.
-            for other in list(self._groups.values()):
-                if (
-                    not other["local"]
-                    and other["creator"] == candidate["creator"]
-                    and other["name"] == candidate["name"]
-                    and other["id"] != candidate["id"]
-                ):
-                    del self._groups[other["id"]]
             self._groups[candidate["id"]] = candidate
             try:
                 self._save()

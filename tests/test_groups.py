@@ -407,7 +407,11 @@ def test_group_store_record_successor_retires_predecessor(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
     old = store.record(
-        old_id, "weekend", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
     )
     assert old is not None
     new_id = derive_group_id(
@@ -418,6 +422,7 @@ def test_group_store_record_successor_retires_predecessor(tmp_path):
         "weekend",
         [OTHER_HASH, THIRD_HASH, OWN_HASH],
         creator=OTHER_HASH,
+        sender=OTHER_HASH,
     )
     assert new is not None
     assert new["id"] == new_id
@@ -425,11 +430,15 @@ def test_group_store_record_successor_retires_predecessor(tmp_path):
     assert store.find("weekend")["id"] == new_id
     assert store.get(old_id) is None
     assert len(store) == 1
-    # The predecessor was only deleted, not retired: the latest roster
-    # learned wins, so its messages pin it again.
+    # The predecessor was only deleted, not retired: the latest
+    # creator-authorized roster wins, so its messages pin it again.
     assert (
         store.record(
-            old_id, "weekend", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
         )
         is not None
     )
@@ -437,6 +446,55 @@ def test_group_store_record_successor_retires_predecessor(tmp_path):
     assert repinned is not None
     assert repinned["members"] == [OTHER_HASH, THIRD_HASH]
     assert store.get(new_id) is None
+    assert len(store) == 1
+
+
+def test_group_store_record_successor_from_member_does_not_replace(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=THIRD_HASH,
+        )
+        is not None
+    )
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    # A member other than the creator carries the successor roster: it
+    # is pinned (the message is still accepted), but the predecessor
+    # stays — the creator field is only a claim, so any member could
+    # otherwise forge a successor and hijack sends by group name.
+    new = store.record(
+        new_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH, OWN_HASH],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    assert new is not None
+    assert new["id"] == new_id
+    assert store.get(old_id) is not None
+    assert len(store) == 2
+    with pytest.raises(ValueError, match="2 groups are named"):
+        store.find("weekend")
+    # The creator themself sending the same roster does replace it.
+    assert (
+        store.record(
+            new_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH, OWN_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.get(old_id) is None
+    assert store.find("weekend")["id"] == new_id
     assert len(store) == 1
 
 
@@ -720,6 +778,72 @@ def test_group_message_with_changed_roster_rejected(tmp_path):
     assert second["ok"] is False
     assert second["error"]["code"] == "invalid_message"
     assert len(received) == 1
+
+
+def test_group_message_successor_from_member_does_not_replace(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    first_members = [OWN_HASH, creator_hash, THIRD_HASH]
+    group_id = derive_group_id(creator_hash, "weekend", first_members)
+    first = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "first",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=first_members,
+        ),
+        remote_identity=creator,
+    )
+    assert first["ok"] is True
+    assert len(node.groups) == 1
+    # A member other than the creator claims a successor roster with
+    # the creator's name on it: the message is accepted and the new
+    # roster pinned, but the learned group stays — the creator field
+    # is only a claim, so the member must not be able to hijack sends
+    # by group name.
+    forged_members = [OWN_HASH, creator_hash, member_hash]
+    forged_id = derive_group_id(creator_hash, "weekend", forged_members)
+    forged = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "forged",
+            message_id="gm-2",
+            group_id=forged_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=forged_members,
+        ),
+        remote_identity=member,
+    )
+    assert forged["ok"] is True
+    assert len(received) == 2
+    assert len(node.groups) == 2
+    assert node.groups.get(group_id) is not None
+    assert node.groups.get(forged_id) is not None
+    # The creator themself sending the same successor roster does
+    # replace the predecessor.
+    confirmed = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "confirmed",
+            message_id="gm-3",
+            group_id=forged_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=forged_members,
+        ),
+        remote_identity=creator,
+    )
+    assert confirmed["ok"] is True
+    assert node.groups.get(group_id) is None
+    assert node.groups.get(forged_id) is not None
+    assert len(node.groups) == 1
+    assert node.groups.find("weekend")["id"] == forged_id
 
 
 def test_group_message_dedupes_by_id(tmp_path):

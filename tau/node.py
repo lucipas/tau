@@ -1242,6 +1242,10 @@ class TauNode:
         the sealed envelope's signature (relayed), never by the payload;
         the id derivation is what binds the roster to the id, so a
         member cannot fork an id onto a recipient that has not seen it.
+        The sender is also passed through, so a successor roster only
+        replaces a learned group when the creator themself sent it —
+        the creator field is only a claim, and any member could
+        otherwise forge a successor and hijack sends by group name.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -1254,7 +1258,11 @@ class TauNode:
         except (ProtocolError, ValueError):
             return None
         return self.groups.record(
-            group["id"], group.get("name") or "group", members, creator=creator
+            group["id"],
+            group.get("name") or "group",
+            members,
+            creator=creator,
+            sender=sender_hash or "",
         )
 
     def _handle_group_message(
