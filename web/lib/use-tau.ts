@@ -4,9 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
+  BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
+  GroupsResponse,
   MarkReadResponse,
+  MessagesSearchResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
@@ -14,6 +17,7 @@ import type {
   PingResult,
   SendResponse,
   Snapshot,
+  TauGroup,
   TauMessage,
   UnreadCounts,
 } from "./types";
@@ -28,6 +32,11 @@ export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 export interface PingState {
   pending?: boolean;
   rtt_ms?: number | null;
+  error?: string;
+}
+
+export interface BlockState {
+  pending?: boolean;
   error?: string;
 }
 
@@ -46,16 +55,38 @@ function readEventData<T>(event: Event): T | null {
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [groups, setGroups] = useState<TauGroup[]>([]);
   const [messages, setMessages] = useState<TauMessage[]>([]);
+  // The search the feed is showing, or null for the live traffic. Kept
+  // beside `messages` so a search result list is never mixed into the
+  // live feed: new arrivals keep updating `messages` underneath, and
+  // clearing the search returns to it.
+  const [searchResults, setSearchResults] = useState<TauMessage[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Ordering of authoritative peer state: each peer event or snapshot
+  // gets a sequence number. A block/unblock reply sent before a newer
+  // one must not overwrite the flag the event already delivered.
+  const peerEventSeq = useRef(0);
+  const peerRevision = useRef<Map<string, number>>(new Map());
+  const snapshotRevision = useRef(0);
+
+  const searchQueryRef = useRef(searchQuery);
+  const searchSeq = useRef(0);
+
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -87,7 +118,10 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
+      peerEventSeq.current += 1;
+      snapshotRevision.current = peerEventSeq.current;
       setPeers(sortPeers(snapshot.peers));
+      setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
       // revision baseline so a delayed event from the old connection
@@ -129,6 +163,23 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      // Ordering for block/unblock replies: a peer event that arrives
+      // after a block request was sent is newer than the reply, so the
+      // reply must not overwrite the flag it already delivered.
+      peerEventSeq.current += 1;
+      peerRevision.current.set(peer.destination, peerEventSeq.current);
+      // A blocked sender's inbound history is hidden by the server's
+      // message snapshots; drop it from the live feed too, so a block
+      // from any console takes effect at once. History stays stored
+      // and comes back with the next snapshot after an unblock.
+      if (peer.blocked) {
+        setMessages((previous) =>
+          previous.filter(
+            (entry) =>
+              !(entry.direction === "in" && entry.peer === peer.destination),
+          ),
+        );
+      }
       setPeers((previous) => {
         const next = previous.filter(
           (entry) => entry.destination !== peer.destination,
@@ -178,6 +229,7 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -188,6 +240,15 @@ export function useTau() {
     if (requestId !== refreshSeq.current) return;
     setOutbox(result.outbox);
     setHeldForOthers(result.held_for_others);
+  }, []);
+
+  const refreshGroups = useCallback(async () => {
+    // Same polling shape as the outbox: a group learned from an
+    // incoming message shows up here without waiting for a reload.
+    const requestId = ++groupsSeq.current;
+    const result = await apiGet<GroupsResponse>("/api/groups");
+    if (requestId !== groupsSeq.current) return;
+    setGroups(result.groups);
   }, []);
 
   useEffect(() => {
@@ -201,6 +262,11 @@ export function useTau() {
         // known entries in place instead of flashing an error.
         if (disposed) return;
       }
+      try {
+        await refreshGroups();
+      } catch {
+        if (disposed) return;
+      }
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
@@ -208,7 +274,7 @@ export function useTau() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox]);
+  }, [connection, refreshOutbox, refreshGroups]);
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -294,6 +360,73 @@ export function useTau() {
     }
   }, []);
 
+  const editBlock = useCallback(
+    async (destination: string, block: boolean) => {
+      setBlocks((previous) => ({
+        ...previous,
+        [destination]: { pending: true },
+      }));
+      const requestSeq = peerEventSeq.current;
+      try {
+        const result = await apiPost<BlockPeerResponse>(
+          block ? "/api/peers/block" : "/api/peers/unblock",
+          { target: destination },
+        );
+        // The bridge also publishes a peer event with the new flag, so
+        // this local update is only the immediate feedback; the event
+        // reconciles it for every open console. Skip it when a newer
+        // peer event or snapshot arrived after the request was sent.
+        const newestSeq = Math.max(
+          peerRevision.current.get(destination) ?? 0,
+          snapshotRevision.current,
+        );
+        if (newestSeq <= requestSeq) {
+          setPeers((previous) =>
+            previous.map((entry) =>
+              entry.destination === destination
+                ? { ...entry, blocked: result.block.blocked }
+                : entry,
+            ),
+          );
+          if (result.block.blocked) {
+            // Same reconciliation as the peer-event path, for the
+            // acting console before the event arrives.
+            setMessages((previous) =>
+              previous.filter(
+                (entry) =>
+                  !(entry.direction === "in" && entry.peer === destination),
+              ),
+            );
+          }
+        }
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {},
+        }));
+        return result.block;
+      } catch (error) {
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {
+            error: error instanceof Error ? error.message : "block failed",
+          },
+        }));
+        throw error;
+      }
+    },
+    [],
+  );
+
+  const blockPeer = useCallback(
+    (destination: string) => editBlock(destination, true),
+    [editBlock],
+  );
+
+  const unblockPeer = useCallback(
+    (destination: string) => editBlock(destination, false),
+    [editBlock],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -306,22 +439,85 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  // A search is a view switch, like the Tan search: setting the query
+  // fetches the search endpoint instead of showing the live feed.
+  // Clearing it returns to the live traffic the same way.
+  const runSearch = useCallback(async (trimmed: string) => {
+    // Each request takes a sequence number; a response only applies if it
+    // is still the latest request, so superseded or cleared searches
+    // cannot overwrite the active view.
+    const seq = ++searchSeq.current;
+    try {
+      const result = await apiGet<MessagesSearchResponse>(
+        `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
+      );
+      if (seq !== searchSeq.current) return;
+      setSearchResults(result.messages);
+      setSearchError(null);
+    } catch (caught) {
+      if (seq !== searchSeq.current) return;
+      setSearchError(
+        caught instanceof Error ? caught.message : "search failed",
+      );
+    }
+  }, []);
+
+  const search = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim();
+      if (!trimmed) return;
+      if (trimmed === searchQueryRef.current) {
+        // Resubmitting the current query: setting the same state would
+        // bail out without reloading, so refresh directly — and keep
+        // the current results instead of clearing them, or the feed
+        // would wrongly report no matches until the next message.
+        await runSearch(trimmed);
+        return;
+      }
+      // Drop hits from the previous query so they are not shown as matches
+      // for the new one while its request is in flight.
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchQuery(trimmed);
+      await runSearch(trimmed);
+    },
+    [runSearch],
+  );
+
+  const clearSearch = useCallback(() => {
+    // Invalidate any in-flight search so its late response is discarded.
+    searchSeq.current += 1;
+    setSearchQuery(null);
+    setSearchResults([]);
+    setSearchError(null);
+  }, []);
+
   return {
     node,
     peers,
+    groups,
     messages,
+    searchResults,
+    searchQuery,
+    searchError,
+    search,
+    clearSearch,
     unread,
     outbox,
     heldForOthers,
     bridge,
     connection,
     pings,
+    blocks,
     announcing,
     send,
     ping,
+    blockPeer,
+    unblockPeer,
     announce,
     markRead,
     refreshOutbox,
+    refreshGroups,
     cancelOutbox,
   };
 }
