@@ -15,6 +15,9 @@ import type {
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
+// Suggestion ranking scans the whole cache, so it refreshes on a slower
+// cadence than the feed and stays off the feed's poll critical path.
+const SUGGEST_INTERVAL_MS = 60000;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
@@ -62,15 +65,13 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows, suggested] = await Promise.all([
+      const [timeline, follows] = await Promise.all([
         apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
-        apiGet<TanSuggestResponse>("/api/tan/suggest"),
       ]);
       if (generationRef.current !== generation) return false;
       setPosts(timeline.posts);
       setFollowing(follows.following);
-      setSuggestions(suggested.suggestions);
       setError(null);
       return true;
     } finally {
@@ -106,6 +107,34 @@ export function useTan() {
     };
   }, [all, load]);
 
+  // Suggestions have their own generation so a slow ranking response cannot
+  // overwrite a newer one, and they never block the feed load.
+  const suggestGenerationRef = useRef(0);
+  const loadSuggestions = useCallback(async () => {
+    const generation = ++suggestGenerationRef.current;
+    const suggested = await apiGet<TanSuggestResponse>("/api/tan/suggest");
+    if (suggestGenerationRef.current !== generation) return;
+    setSuggestions(suggested.suggestions);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    async function tickSuggest() {
+      try {
+        await loadSuggestions();
+      } catch {
+        // Suggestions are optional; keep the last good list on failure.
+      }
+      if (disposed) return;
+    }
+    void tickSuggest();
+    const timer = setInterval(() => void tickSuggest(), SUGGEST_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [loadSuggestions]);
+
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
@@ -137,16 +166,18 @@ export function useTan() {
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
       await load();
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, loadSuggestions],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
       await load();
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, loadSuggestions],
   );
 
   const like = useCallback(
@@ -180,11 +211,12 @@ export function useTan() {
         explore: true,
       });
       await load();
+      void loadSuggestions().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load]);
+  }, [load, loadSuggestions]);
 
   return {
     posts,
