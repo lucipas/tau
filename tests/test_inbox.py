@@ -329,6 +329,28 @@ def test_import_skips_huge_timestamp_without_aborting(tmp_path):
     assert [entry["id"] for entry in inbox.list_messages()] == ["after", "before"]
 
 
+def test_duplicate_only_import_keeps_mixed_inbox_over_the_cap(tmp_path):
+    """Re-importing an export must not evict records to one 500 cap.
+
+    Retention is per direction (500 received + 500 sent), so a
+    duplicate-only import into a mixed inbox holding 600 records
+    keeps all of them instead of slicing to the newest 500.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(300):
+        inbox.append(_record(id=f"in-{index}", direction="in"))
+        inbox.append(_record(id=f"out-{index}", direction="out"))
+    assert len(inbox) == 600
+
+    result = inbox.import_messages(inbox.export_document())
+    assert result == {"imported": 0, "present": 600, "skipped": 0, "errors": []}
+    assert len(inbox) == 600
+    ids = {entry["id"] for entry in inbox.list_messages(direction=None)}
+    assert ids == {f"in-{index}" for index in range(300)} | {
+        f"out-{index}" for index in range(300)
+    }
+
+
 def test_load_skips_huge_timestamp_without_crashing(tmp_path):
     path = tmp_path / "inbox.json"
     path.write_text(

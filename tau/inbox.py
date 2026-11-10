@@ -960,8 +960,8 @@ class Inbox:
         error recorded; it never aborts the rest of the import, and
         entries already in the inbox are counted as present rather than
         stored twice.  The whole merge runs in one transaction, so a
-        concurrent ``tau serve`` cannot lose entries, and the 500-record
-        cap still applies.
+        concurrent ``tau serve`` cannot lose entries, and the
+        per-direction 500-record caps still apply.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -1002,7 +1002,7 @@ class Inbox:
                 seen.add(key)
                 self._messages.append(record)
                 imported += 1
-            self._messages = self._messages[-MAX_INBOX:]
+            self._messages = _retain(self._messages)
             self._save()
         return {
             "imported": imported,
