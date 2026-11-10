@@ -193,6 +193,98 @@ def test_append_rejects_record_without_text(tmp_path):
     assert len(inbox) == 0
 
 
+def test_delete_by_full_id(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a" * 32, text="one"))
+    inbox.append(_record(id="b" * 32, text="two"))
+
+    removed = inbox.delete("a" * 32)
+    assert removed["text"] == "one"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["b" * 32]
+
+
+def test_delete_by_unique_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="efgh" + "2" * 28, text="two"))
+
+    removed = inbox.delete("abcd")
+    assert removed["text"] == "one"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["efgh" + "2" * 28]
+
+
+def test_delete_unknown_and_ambiguous(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="abcd" + "2" * 28, text="two"))
+
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.delete("zzzz")
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.delete("abcd")
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.delete("  ")
+    assert len(inbox) == 2
+
+
+def test_delete_persists_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="keep", text="keep me"))
+    inbox.append(_record(id="drop", text="drop me"))
+    inbox.delete("drop")
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages()] == ["keep"]
+
+
+def test_delete_ignores_records_without_id(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id=None, text="old entry"))
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.delete("old")
+    assert len(inbox) == 1
+
+
+def test_delete_memory_only_inbox():
+    inbox = Inbox()
+    inbox.append(_record(id="gone", text="bye"))
+    assert inbox.delete("gone")["text"] == "bye"
+    assert len(inbox) == 0
+
+
+def test_delete_exact_match_wins_over_folded_prefix(tmp_path):
+    """An exact id wins even when a case-folded prefix would be ambiguous."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="A" * 32, text="upper"))
+    inbox.append(_record(id="a" * 32, text="lower"))
+
+    removed = inbox.delete("A" * 32)
+    assert removed["text"] == "upper"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["a" * 32]
+
+
+def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.inbox
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="keep", text="keep me"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _boom)
+    with pytest.raises(InboxError, match="could not persist inbox"):
+        inbox.delete("keep")
+    # The removal was rolled back: the message is still there.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
+
+
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))

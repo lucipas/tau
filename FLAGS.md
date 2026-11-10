@@ -30,6 +30,7 @@ Global options may appear before or after the command:
 | `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
+| `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
@@ -127,6 +128,9 @@ tau outbox
 tau messages
 tau messages --peer alice --limit 10 --json
 tau messages --search hello
+
+# Delete one stored message from the local inbox (sender keeps theirs)
+tau messages delete ab12cd34
 
 # Messages this node sent, with delivery/read state
 tau messages --sent

@@ -67,6 +67,10 @@ def _retain(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return kept
 
 
+class InboxError(ValueError):
+    """Raised when an inbox lookup or delete fails."""
+
+
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored record, or ``None`` when it is unusable.
 
@@ -491,14 +495,17 @@ class Inbox:
         highest += [cursor["last_read_seq"] for cursor in self._read_cursors.values()]
         return max(highest, default=0) + 1
 
-    def _save(self) -> bool:
+
+    def _save(self, *, strict: bool = False) -> bool:
         """Persist the inbox; ``True`` when the write landed.
 
         A path-less (in-memory) inbox has nothing to write and reports
         success.  A failed write is logged and reported — callers that
         must not acknowledge unstored state (reaction handling) raise
         on ``False``; callers that must never break delivery (DM
-        appends) ignore the return value.
+        appends) ignore the return value.  :meth:`delete` passes
+        ``strict=True`` so a failed persist raises instead of
+        claiming success.
         """
         if self.path is None:
             return True
@@ -513,6 +520,8 @@ class Inbox:
                 mode=0o600,
             )
         except OSError as exc:
+            if strict:
+                raise
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
             return False
         return True
@@ -559,6 +568,62 @@ class Inbox:
             self._messages = _retain(self._messages)
             self._save()
         return entry
+
+    def delete(self, ref: str) -> Dict[str, Any]:
+        """Remove one stored message by full id or unique prefix.
+
+        Same convention as :meth:`Mailbox.resolve_outbox`: a full
+        32-character id matches exactly, a shorter prefix must match
+        exactly one stored message.  The removal runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this delete runs.  Only this
+        node's copy is removed — the sender keeps theirs, and sealed
+        copies already held by relays are unaffected.  Records with no
+        id (older stores predate ids) cannot be addressed this way.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise InboxError("message reference must not be empty")
+        value = ref.strip()
+        with self._transaction():
+            entries = list(self._messages)
+            # Peer-supplied ids are case-sensitive: an exact match wins
+            # outright; only then fall back to a case-folded prefix.
+            matches = [
+                entry for entry in entries if str(entry.get("id") or "") == value
+            ]
+            if not matches:
+                folded = value.lower()
+                if len(folded) == 32:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower() == folded
+                    ]
+                else:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower().startswith(folded)
+                    ]
+            if not matches:
+                raise InboxError(f"unknown message: {ref!r}")
+            if len(matches) > 1:
+                raise InboxError(
+                    f"{len(matches)} messages match prefix {ref!r}"
+                )
+            removed = matches[0]
+            previous = self._messages
+            self._messages = [entry for entry in entries if entry is not removed]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous
+                raise InboxError(
+                    f"could not persist inbox; message was not deleted: {exc}"
+                ) from exc
+        return dict(removed)
+
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
