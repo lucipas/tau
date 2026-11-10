@@ -1056,10 +1056,9 @@ class WebBridge:
                 viewer = (
                     destination_hash(identity).hex() if identity is not None else None
                 )
-            suggestions = suggest_authors(conn, viewer=viewer, limit=limit)
-            return [
-                item for item in suggestions if item["author"] not in blocked
-            ]
+            return suggest_authors(
+                conn, viewer=viewer, limit=limit, exclude=blocked
+            )
         finally:
             conn.close()
 
