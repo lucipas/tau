@@ -289,6 +289,121 @@ def test_group_store_delete(tmp_path):
     assert store.delete("00" * 16) is False
 
 
+def test_group_store_update_members_adds_and_removes(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    created_at = group["created_at"]
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["id"] == derive_group_id(
+        OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    )
+    assert grown["id"] != group["id"]
+    assert grown["members"] == [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    assert grown["name"] == "weekend"
+    assert grown["created_at"] == created_at
+    assert grown["local"] is True
+    assert store.get(group["id"]) is None
+    assert store.get(grown["id"]) == grown
+    assert len(store) == 1
+    # The same roster again is a no-op: the same record comes back.
+    assert (
+        store.update_members(
+            grown["id"],
+            [THIRD_HASH, OWN_HASH, OTHER_HASH],
+            created_by=OWN_HASH,
+        )
+        == grown
+    )
+    shrunk = store.update_members(
+        grown["id"], [OWN_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert shrunk["id"] == derive_group_id(
+        OWN_HASH, "weekend", [OWN_HASH, THIRD_HASH]
+    )
+    assert shrunk["members"] == [OWN_HASH, THIRD_HASH]
+    assert len(store) == 1
+
+
+def test_group_store_update_members_refusals(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    learned = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert learned is not None
+    with pytest.raises(ValueError, match="unknown group"):
+        store.update_members(
+            "00" * 16, [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+        )
+    with pytest.raises(ValueError, match="only the creator"):
+        store.update_members(
+            learned["id"],
+            [OTHER_HASH, THIRD_HASH, OWN_HASH],
+            created_by=OWN_HASH,
+        )
+    with pytest.raises(ValueError, match="only the creator"):
+        store.update_members(
+            group["id"],
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            created_by=OTHER_HASH,
+        )
+    with pytest.raises(ValueError, match="at least 2 members"):
+        store.update_members(group["id"], [OWN_HASH], created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="creator must be a member"):
+        store.update_members(
+            group["id"], [OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+        )
+    # Refusals leave the store untouched.
+    assert store.get(group["id"]) == group
+    assert len(store) == 2
+
+
+def test_group_store_update_members_ignores_local_cap(tmp_path):
+    from tau.groups import MAX_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    first = store.create("g0", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    for i in range(1, MAX_GROUPS):
+        store.create(f"g{i}", [OWN_HASH, f"{i + 1:032x}"], created_by=OWN_HASH)
+    assert len(store) == MAX_GROUPS
+    # The swap is net-zero, so a full local cap must not block it.
+    grown = store.update_members(
+        first["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["members"] == [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    assert len(store) == MAX_GROUPS
+
+
+def test_group_store_update_members_save_failure_rolls_back(
+    tmp_path, monkeypatch
+):
+    import tau.groups as groups_module
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(groups_module, "atomic_write_json", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        store.update_members(
+            group["id"],
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            created_by=OWN_HASH,
+        )
+    # Neither the old record lost nor the successor kept.
+    assert store.get(group["id"]) == group
+    assert len(store) == 1
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
+
+
 def test_group_store_save_failure_rolls_back(tmp_path, monkeypatch):
     import tau.groups as groups_module
 
@@ -887,6 +1002,20 @@ def test_parser_group_arguments():
     assert delete_args.group_command == "delete"
     assert delete_args.group == "weekend"
 
+    add_args = parser.parse_args(
+        ["group", "add-member", "weekend", "--peer", "carol"]
+    )
+    assert add_args.group_command == "add-member"
+    assert add_args.group == "weekend"
+    assert add_args.peer == ["carol"]
+
+    remove_args = parser.parse_args(
+        ["group", "remove-member", "weekend", "--peer", "bob"]
+    )
+    assert remove_args.group_command == "remove-member"
+    assert remove_args.group == "weekend"
+    assert remove_args.peer == ["bob"]
+
     messages_args = parser.parse_args(["messages", "--group", "weekend"])
     assert messages_args.group == "weekend"
 
@@ -926,6 +1055,143 @@ def test_group_delete_via_cli(tmp_path, capsys):
         cli.main(["group", "delete", "weekend", "--data-dir", str(tmp_path / "node")])
         != 0
     )
+
+
+class _FakeGroupNode:
+    """Stub TauNode for `tau group add-member` / `remove-member`.
+
+    Resolves peers from the on-disk registry only — no network — and
+    answers as the group creator.
+    """
+
+    def __init__(self, config, **kwargs):
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.registry = PeerRegistry(config.peers_path)
+        self.started = False
+
+    @property
+    def destination_hexhash(self):
+        return OWN_HASH
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def resolve_peer(self, target, timeout=10.0):
+        peer = self.registry.resolve(target)
+        if peer is None:
+            raise NodeError(f"unknown peer: {target!r}")
+        return peer
+
+
+def _seed_group_cli(tmp_path, monkeypatch, members=(OWN_HASH, OTHER_HASH)):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.create("weekend", list(members), created_by=OWN_HASH)
+    registry = PeerRegistry(config.peers_path)
+    for hexhash, name in (
+        (OWN_HASH, "alice"),
+        (OTHER_HASH, "bob"),
+        (THIRD_HASH, "carol"),
+    ):
+        registry.upsert(bytes.fromhex(hexhash), b"\x00" * 64, name=name)
+    registry.save()
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupNode)
+    return config, group
+
+
+def test_group_add_member_via_cli(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    code = cli.main(
+        [
+            "group",
+            "add-member",
+            "weekend",
+            "--peer",
+            "carol",
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "carol added to group weekend" in out
+    assert group["id"][:8] in out
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+    grown = store.list_groups()[0]
+    assert grown["members"] == [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    assert grown["id"] == derive_group_id(
+        OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    )
+    assert store.get(group["id"]) is None
+
+
+def test_group_remove_member_json(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(
+        tmp_path, monkeypatch, members=(OWN_HASH, OTHER_HASH, THIRD_HASH)
+    )
+    code = cli.main(
+        [
+            "group",
+            "remove-member",
+            "weekend",
+            "--peer",
+            "carol",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["previous_id"] == group["id"]
+    assert [member["hash"] for member in payload["group"]["members"]] == [
+        OWN_HASH,
+        OTHER_HASH,
+    ]
+    assert payload["group"]["id"] == derive_group_id(
+        OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH]
+    )
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+
+
+def test_group_change_members_refusals(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    data_dir = str(tmp_path / "node")
+    store = GroupStore(config.groups_path)
+    learned_id = derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        learned_id, "theirs", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+    )
+
+    def _run(argv):
+        code = cli.main([*argv, "--data-dir", data_dir])
+        assert code != 0
+        return capsys.readouterr().err
+
+    assert "already a member" in _run(
+        ["group", "add-member", "weekend", "--peer", "bob"]
+    )
+    assert "unknown peer" in _run(
+        ["group", "add-member", "weekend", "--peer", "mallory"]
+    )
+    assert "only the creator" in _run(
+        ["group", "add-member", "theirs", "--peer", "carol"]
+    )
+    assert "not a member" in _run(
+        ["group", "remove-member", "weekend", "--peer", "carol"]
+    )
+    assert "cannot remove the creator" in _run(
+        ["group", "remove-member", "weekend", "--peer", "alice"]
+    )
+    # Refusals leave the store untouched.
+    assert store.list_groups() != []
+    assert store.get(group["id"]) == group
 
 
 def test_messages_group_filter(tmp_path, capsys):

@@ -808,6 +808,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_delete.set_defaults(func=cmd_group_delete)
 
+    group_add_member = group_sub.add_parser(
+        "add-member",
+        parents=[common],
+        help="add peers to a group you created",
+    )
+    group_add_member.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_add_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to add (repeatable)",
+    )
+    group_add_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_add_member.set_defaults(func=cmd_group_add_member)
+
+    group_remove_member = group_sub.add_parser(
+        "remove-member",
+        parents=[common],
+        help="remove peers from a group you created",
+    )
+    group_remove_member.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_remove_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to remove (repeatable)",
+    )
+    group_remove_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_remove_member.set_defaults(func=cmd_group_remove_member)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -4303,6 +4353,81 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
         return _EXIT_OK
     print(f"deleted group {group['name']} ({group['id'][:8]})")
     return _EXIT_OK
+
+
+def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
+    """Add peers to, or remove peers from, a group this node created.
+
+    The id derives from the roster, so the change is a successor group
+    (same name, new id); the store swaps the old record for the new one
+    in a single transaction.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can change a group's members")
+        peers: List[Peer] = []
+        for target in getattr(args, "peer", []):
+            peers.append(
+                node.resolve_peer(
+                    target,
+                    timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+            )
+        members = list(group["members"])
+        for peer in peers:
+            if adding:
+                if peer.hexhash == own_hash:
+                    raise NodeError(
+                        "the creator is already a member; drop --peer self"
+                    )
+                if peer.hexhash in members:
+                    raise NodeError(
+                        f"{peer.display_name} is already a member of"
+                        f" {group['name']!r}"
+                    )
+                members.append(peer.hexhash)
+            else:
+                if peer.hexhash == own_hash:
+                    raise NodeError("cannot remove the creator from the group")
+                if peer.hexhash not in members:
+                    raise NodeError(
+                        f"{peer.display_name} is not a member of"
+                        f" {group['name']!r}"
+                    )
+                members.remove(peer.hexhash)
+        new_group = node.groups.update_members(
+            group["id"], members, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described, "previous_id": group["id"]}, True)
+        return _EXIT_OK
+    action = "added to" if adding else "removed from"
+    names = ", ".join(peer.display_name for peer in peers)
+    print(
+        f"{names} {action} group {new_group['name']}"
+        f" ({group['id'][:8]} -> {new_group['id'][:8]})"
+    )
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the new roster from the next message sent to it.")
+    return _EXIT_OK
+
+
+def cmd_group_add_member(args: argparse.Namespace) -> int:
+    return _change_group_members(args, adding=True)
+
+
+def cmd_group_remove_member(args: argparse.Namespace) -> int:
+    return _change_group_members(args, adding=False)
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:

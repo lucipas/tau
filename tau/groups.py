@@ -233,6 +233,60 @@ class GroupStore:
                 raise
         return dict(group)
 
+    def update_members(
+        self, group_id: str, members: List[str], *, created_by: str
+    ) -> Dict[str, Any]:
+        """Replace the roster of a group this node created.
+
+        The group id derives from the roster, so a changed roster is a
+        new group: the successor (same name, new id, same ``created_at``)
+        is created and the old record deleted inside one transaction,
+        so the local cap cannot block a net-zero change and a failure
+        cannot leave both groups or neither.
+
+        Raises :class:`ValueError` when the group is unknown, was not
+        created by this node, or the new roster is invalid, and
+        :class:`OSError` when the write fails (the store is left as it
+        was on disk).
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can change a group's members")
+            try:
+                new_id = derive_group_id(
+                    existing["creator"], existing["name"], members
+                )
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
+            if new_id == existing["id"]:
+                return dict(existing)
+            if new_id in self._groups:  # pragma: no cover - hash collision
+                raise ValueError("group id already exists with another roster")
+            candidate = _valid_group(
+                {
+                    "id": new_id,
+                    "name": existing["name"],
+                    "members": members,
+                    "created_at": existing["created_at"],
+                    "creator": existing["creator"],
+                    "created_by": existing["creator"],
+                    "local": True,
+                }
+            )
+            if candidate is None:
+                raise ValueError("invalid group: the creator must be a member")
+            del self._groups[existing["id"]]
+            self._groups[new_id] = candidate
+            try:
+                self._save()
+            except OSError:
+                self._load()
+                raise
+        return dict(candidate)
+
     def record(
         self,
         group_id: str,
