@@ -672,6 +672,12 @@ class TauNode:
             )
             lock.acquire()
             self._instance_lock = lock
+            # The registry was loaded when this node was constructed,
+            # before the lock was held: a `tau peers forget` in between
+            # could have removed a peer this node would then restore on
+            # its next save. Reload under the lock so the in-memory
+            # snapshot is no older than the lock itself.
+            self.registry.load()
         try:
             self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
         except BaseException:
