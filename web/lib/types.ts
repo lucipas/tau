@@ -238,6 +238,19 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanAuthor {
+  author: string;
+  name: string;
+  posts: number;
+  last_post: number;
+  followed: boolean;
+}
+
+export interface TanAuthorsResponse {
+  authors: TanAuthor[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;

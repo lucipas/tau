@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type { TanAuthor, TanPost } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
@@ -57,6 +57,28 @@ export function SocialConsole() {
       setTarget("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not follow");
+    }
+  }
+
+  // Follow or unfollow an author from the directory. The hook reloads
+  // the feed after either, so the directory and the following list
+  // update together.
+  async function submitToggleFollowAuthor(author: TanAuthor) {
+    setError(null);
+    try {
+      if (author.followed) {
+        await tan.unfollow(author.author);
+      } else {
+        await tan.follow(author.author);
+      }
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : author.followed
+            ? "could not unfollow"
+            : "could not follow",
+      );
     }
   }
 
@@ -226,6 +248,57 @@ export function SocialConsole() {
                       title="unfollow"
                     >
                       remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>authors</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.authors.length}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Everyone with a post in the local store. Follow an author
+                to see their posts in your timeline.
+              </p>
+              <ul className="mt-3 space-y-1.5">
+                {tan.authors.length === 0 ? (
+                  <li className="rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                    No authors yet. Sync to pull posts from your peers.
+                  </li>
+                ) : null}
+                {tan.authors.map((record) => (
+                  <li
+                    key={record.author}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-zinc-200">
+                        {record.name || "unknown"}
+                      </p>
+                      <p className="font-mono text-[10px] text-mist/80">
+                        {shortHash(record.author, 10)} · {record.posts}{" "}
+                        post{record.posts === 1 ? "" : "s"} ·{" "}
+                        {record.last_post
+                          ? formatDateTime(record.last_post)
+                          : "never"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void submitToggleFollowAuthor(record)}
+                      className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                      title={
+                        record.followed
+                          ? "unfollow this author"
+                          : "follow this author"
+                      }
+                    >
+                      {record.followed ? "remove" : "follow"}
                     </button>
                   </li>
                 ))}

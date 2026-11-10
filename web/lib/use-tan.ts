@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
+  TanAuthor,
+  TanAuthorsResponse,
   TanFollow,
   TanFollowingResponse,
   TanPost,
@@ -20,6 +22,11 @@ export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  // Every known author in the local store, not just the followed ones:
+  // the directory the console uses to discover who to follow. It loads
+  // with the feed's poll tick, like `following`, so a follow or
+  // unfollow from anywhere refreshes it.
+  const [authors, setAuthors] = useState<TanAuthor[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -85,11 +92,12 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [feed, follows] = await Promise.all([
+      const [feed, follows, known] = await Promise.all([
         showMentionsRef.current
           ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
           : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
+        apiGet<TanAuthorsResponse>("/api/tan/authors"),
       ]);
       if (generationRef.current !== generation) return false;
       if (showMentionsRef.current) {
@@ -98,6 +106,7 @@ export function useTan() {
         setPosts(feed.posts);
       }
       setFollowing(follows.following);
+      setAuthors(known.authors);
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
       // like, or a delete) shows without reopening the thread. A
@@ -413,6 +422,7 @@ export function useTan() {
     posts,
     mentions,
     following,
+    authors,
     saved,
     savedLoading,
     savedHasMore,

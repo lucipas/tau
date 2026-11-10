@@ -245,6 +245,7 @@ describe("SocialConsole mentions view", () => {
       posts: [],
       mentions: [],
       following: [],
+      authors: [],
       all: false,
       setAll: vi.fn(),
       showMentions: false,
@@ -323,6 +324,108 @@ describe("SocialConsole mentions view", () => {
     render(<SocialConsole />);
     expect(screen.getByText("this node has no identity yet")).toBeTruthy();
     expect(screen.queryByText("No replies yet")).toBeNull();
+  });
+});
+
+describe("SocialConsole authors directory", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      mentions: [],
+      following: [],
+      authors: [],
+      all: false,
+      setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  function makeAuthor(overrides: Record<string, unknown> = {}) {
+    return {
+      author: "a".repeat(64),
+      name: "alice",
+      posts: 3,
+      last_post: 1000,
+      followed: false,
+      ...overrides,
+    };
+  }
+
+  it("lists known authors with a follow button for the unfollowed", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor(),
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    expect(screen.getByText("alice")).toBeTruthy();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText(/3 posts/)).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("follow this author"));
+    expect(state.follow).toHaveBeenCalledTimes(1);
+    expect(state.follow).toHaveBeenCalledWith("a".repeat(64));
+  });
+
+  it("offers to remove a followed author from the directory", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByTitle("unfollow this author"));
+    expect(state.unfollow).toHaveBeenCalledTimes(1);
+    expect(state.unfollow).toHaveBeenCalledWith("b".repeat(64));
+  });
+
+  it("says there are no authors yet when the store is empty", () => {
+    mockedUseTan.mockReturnValue(hookState());
+
+    render(<SocialConsole />);
+    expect(
+      screen.getByText("No authors yet. Sync to pull posts from your peers."),
+    ).toBeTruthy();
   });
 });
 

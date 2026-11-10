@@ -44,6 +44,16 @@ function makePost(overrides: Partial<TanPost> = {}): TanPost {
 }
 
 const emptyFollowing = { following: [], count: 0 };
+const emptyAuthors = { authors: [], count: 0 };
+
+// The feed load fetches the timeline, the following list and the
+// authors directory in parallel; the non-timeline responses come back
+// in their own shapes.
+function otherResponses(path: string) {
+  return path.startsWith("/api/tan/authors")
+    ? Promise.resolve(emptyAuthors)
+    : Promise.resolve(emptyFollowing);
+}
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -66,12 +76,14 @@ describe("useTan mentions view", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
     const { result } = renderHook(() => useTan());
     await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // The authors directory loads with the feed, like following.
+    expect(result.current.authors).toEqual([]);
     // Mentions are not part of the timeline's load: nothing loaded yet.
     expect(result.current.mentions).toEqual([]);
     expect(
@@ -105,7 +117,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -164,7 +176,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [], count: 0 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -199,7 +211,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -232,7 +244,7 @@ describe("useTan deletePost", () => {
     mockedGet.mockImplementation((path: string) =>
       path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing),
+        : otherResponses(path),
     );
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -257,21 +269,23 @@ describe("useTan deletePost", () => {
       const mine = makePost();
       const first = deferred();
       const firstFollowing = deferred();
-      const queue = [first, firstFollowing];
+      const firstAuthors = deferred();
+      const queue = [first, firstFollowing, firstAuthors];
       let next = 0;
       mockedGet.mockImplementation(() => queue[next++].promise);
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      expect(mockedGet.mock.calls.length).toBe(2);
+      expect(mockedGet.mock.calls.length).toBe(3);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(2);
+      expect(mockedGet.mock.calls.length).toBe(3);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
         firstFollowing.resolve(emptyFollowing);
+        firstAuthors.resolve(emptyAuthors);
       });
       expect(result.current.posts).toEqual([mine]);
 
@@ -279,7 +293,7 @@ describe("useTan deletePost", () => {
       mockedGet.mockImplementation((path: string) =>
         path.startsWith("/api/tan/timeline")
           ? Promise.resolve({ posts: [mine], count: 1 })
-          : Promise.resolve(emptyFollowing),
+          : otherResponses(path),
       );
       await act(async () => {
         vi.advanceTimersByTime(5000);
@@ -293,7 +307,17 @@ describe("useTan deletePost", () => {
   it("drops a stale feed response that resolves after a newer load", async () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
-    const queue = [deferred(), deferred(), deferred(), deferred()];
+    // Two loads in flight, three requests each (timeline, following,
+    // authors); the initial load takes the first three, the refresh
+    // the next three.
+    const queue = [
+      deferred(),
+      deferred(),
+      deferred(),
+      deferred(),
+      deferred(),
+      deferred(),
+    ];
     let next = 0;
     mockedGet.mockImplementation(() => queue[next++].promise);
 
@@ -305,12 +329,14 @@ describe("useTan deletePost", () => {
     });
     // Resolve the newer load first, then the older one.
     await act(async () => {
-      queue[2].resolve({ posts: [second], count: 1 });
-      queue[3].resolve(emptyFollowing);
+      queue[3].resolve({ posts: [second], count: 1 });
+      queue[4].resolve(emptyFollowing);
+      queue[5].resolve(emptyAuthors);
     });
     await act(async () => {
       queue[0].resolve({ posts: [first], count: 1 });
       queue[1].resolve(emptyFollowing);
+      queue[2].resolve(emptyAuthors);
     });
     await act(async () => {
       await refreshPromise;

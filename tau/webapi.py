@@ -1137,6 +1137,26 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_authors(self, *, sort: str = "recent", limit: int = 50) -> List[Dict[str, Any]]:
+        """Every author with a visible post in the local Tan store.
+
+        Mirrors :func:`tau.cli.cmd_tan_authors`: the same records and
+        sort orders, so the console shows exactly what the CLI shows
+        for the same store.  A read-only listing must not create the
+        store on a fresh data directory, so a missing database file
+        yields an empty list.  An unknown *sort* raises TanError (a
+        ValueError), which the HTTP layer reports as a 400.
+        """
+        from .tangents.tan import list_authors
+
+        if not self._tan_db_path().exists():
+            return []
+        conn = self._tan_conn()
+        try:
+            return list_authors(conn, sort=sort, limit=limit)
+        finally:
+            conn.close()
+
     def tan_follow(self, target: str) -> Dict[str, Any]:
         from .tangents.tan import follow, resolve_author
 
@@ -1982,6 +2002,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 records = self.bridge.tan_following()
                 self._send_json(
                     {"following": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/authors":
+                sort = (query.get("sort") or ["recent"])[0]
+                limit = _int_param(query, "limit", default=50, minimum=1, maximum=200)
+                try:
+                    records = self.bridge.tan_authors(sort=sort, limit=limit)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(
+                    {"authors": records, "count": len(records)}, head_only
                 )
                 return
             if path == "/api/tan/saved":

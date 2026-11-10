@@ -688,6 +688,70 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_authors_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "first", name="alice", now=1000)
+        create_post(conn, alice, "second", name="alice", now=1001)
+        create_post(conn, bob, "hello", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Default sort is most recent first; both authors listed with
+        # post counts, last-post times and followed state.
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload["count"] == 2
+        assert [item["name"] for item in payload["authors"]] == ["bob", "alice"]
+        assert payload["authors"][1]["posts"] == 2
+        assert payload["authors"][1]["last_post"] == 1001
+        assert payload["authors"][1]["followed"] is False
+
+        # Sort by post count puts the prolific author first.
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=posts")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice", "bob"]
+
+        # Limit clamps to the page size, and an unknown sort is a 400.
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=nope")
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_tan_authors_empty_store(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A read-only listing must not create the Tan store on a fresh
+        # data directory.
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload == {"authors": [], "count": 0}
+        assert not node.config.social_db_path.exists()
+    finally:
+        bridge.stop()
+
+
 def test_tan_mentions_via_api(tmp_path):
     import RNS
 
