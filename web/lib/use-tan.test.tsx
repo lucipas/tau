@@ -271,9 +271,9 @@ describe("useTan deletePost", () => {
       const first = deferred();
       const firstFollowing = deferred();
       const firstAuthors = deferred();
-      // Each load fires the authors request first, then the timeline
-      // and following requests it awaits.
-      const queue = [firstAuthors, first, firstFollowing];
+      // A feed load fires the timeline and following requests; the
+      // directory loads on its own beside it.
+      const queue = [first, firstFollowing, firstAuthors];
       let next = 0;
       mockedGet.mockImplementation(() => queue[next++].promise);
 
@@ -286,9 +286,9 @@ describe("useTan deletePost", () => {
       expect(mockedGet.mock.calls.length).toBe(3);
 
       await act(async () => {
-        firstAuthors.resolve(emptyAuthors);
         first.resolve({ posts: [mine], count: 1 });
         firstFollowing.resolve(emptyFollowing);
+        firstAuthors.resolve(emptyAuthors);
       });
       expect(result.current.posts).toEqual([mine]);
 
@@ -301,7 +301,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(2);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(3);
     } finally {
       vi.useRealTimers();
     }
@@ -310,12 +310,10 @@ describe("useTan deletePost", () => {
   it("drops a stale feed response that resolves after a newer load", async () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
-    // Two loads in flight, three requests each; each load fires the
-    // authors request first, then the timeline and following requests
-    // it awaits. The initial load takes the first three, the refresh
-    // the next three.
+    // Two feed loads in flight, two requests each, plus the directory
+    // load beside the first one: the initial load takes the first
+    // three deferreds, the refresh the next two.
     const queue = [
-      deferred(),
       deferred(),
       deferred(),
       deferred(),
@@ -333,14 +331,13 @@ describe("useTan deletePost", () => {
     });
     // Resolve the newer load first, then the older one.
     await act(async () => {
-      queue[3].resolve(emptyAuthors);
-      queue[4].resolve({ posts: [second], count: 1 });
-      queue[5].resolve(emptyFollowing);
+      queue[3].resolve({ posts: [second], count: 1 });
+      queue[4].resolve(emptyFollowing);
     });
     await act(async () => {
-      queue[0].resolve(emptyAuthors);
-      queue[1].resolve({ posts: [first], count: 1 });
-      queue[2].resolve(emptyFollowing);
+      queue[0].resolve({ posts: [first], count: 1 });
+      queue[1].resolve(emptyFollowing);
+      queue[2].resolve(emptyAuthors);
     });
     await act(async () => {
       await refreshPromise;
@@ -350,40 +347,14 @@ describe("useTan deletePost", () => {
     expect(result.current.posts).toEqual([second]);
   });
 
-  it("keeps the feed when the authors request fails", async () => {
+  it("keeps the feed when the authors directory fails to load", async () => {
     const mine = makePost();
-    // The authors directory loads on its own, so a failed or stalled
-    // authors request must not block the feed: the queue order is
-    // authors, timeline, following, as in the other load tests.
-    const queue = [deferred(), deferred(), deferred()];
-    let next = 0;
-    mockedGet.mockImplementation(() => queue[next++].promise);
-
-    const { result } = renderHook(() => useTan());
-    await act(async () => {
-      queue[0].reject(new Error("authors unavailable"));
-      queue[1].resolve({ posts: [mine], count: 1 });
-      queue[2].resolve(emptyFollowing);
-    });
-
-    expect(result.current.posts).toEqual([mine]);
-    expect(result.current.authors).toEqual([]);
-    expect(result.current.error).toBeNull();
-  });
-
-  it("pages the authors directory with show more", async () => {
-    const mine = makePost();
-    const author = {
-      author: "a".repeat(64),
-      name: "alice",
-      posts: 3,
-      last_post: 1000,
-      followed: false,
-    };
+    // The directory loads on its own generation, not the feed's, so a
+    // failed authors request must not fail the feed or clear the
+    // directory.
     mockedGet.mockImplementation((path: string) => {
       if (path.startsWith("/api/tan/authors")) {
-        // The directory holds 120 authors behind a 50-author page.
-        return Promise.resolve({ authors: [author], count: 1, total: 120 });
+        return Promise.reject(new Error("authors unavailable"));
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
@@ -393,14 +364,68 @@ describe("useTan deletePost", () => {
 
     const { result } = renderHook(() => useTan());
     await waitFor(() => expect(result.current.posts).toEqual([mine]));
-    expect(result.current.authors).toEqual([author]);
-    expect(result.current.authorsTotal).toBe(120);
-    expect(mockedGet).toHaveBeenCalledWith("/api/tan/authors?limit=50");
+    expect(result.current.authors).toEqual([]);
+    expect(result.current.authorsTotal).toBe(0);
+    expect(result.current.error).toBeNull();
+  });
 
-    // Show more grows the page by one page size, up to the total.
+  it("pages the authors directory with show more", async () => {
+    const mine = makePost();
+    function makeAuthorRecord(index: number) {
+      return {
+        author: `${index}`.padStart(64, "0"),
+        name: `author ${index}`,
+        posts: 1,
+        last_post: 1000 + index,
+        followed: false,
+      };
+    }
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/authors")) {
+        // The directory holds 120 authors; each page returns the
+        // requested offset slice, like the real API.
+        const params = new URL(path, "http://localhost").searchParams;
+        const offset = Number(params.get("offset") ?? 0);
+        const limit = Number(params.get("limit") ?? 50);
+        const page = Array.from(
+          { length: Math.max(0, Math.min(limit, 120 - offset)) },
+          (_, index) => makeAuthorRecord(offset + index),
+        );
+        return Promise.resolve({ authors: page, count: page.length, total: 120 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // The first page loads with the feed: 50 of 120 authors.
+    await waitFor(() => expect(result.current.authors).toHaveLength(50));
+    expect(result.current.authorsTotal).toBe(120);
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=0",
+    );
+
+    // Show more appends the next offset page instead of re-fetching
+    // the first rows with a larger limit.
     await act(async () => {
       await result.current.loadMoreAuthors();
     });
-    expect(mockedGet).toHaveBeenCalledWith("/api/tan/authors?limit=100");
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=50",
+    );
+    expect(result.current.authors).toHaveLength(100);
+    expect(result.current.authors[50].name).toBe("author 50");
+
+    // A third page reaches the total; the last page is short.
+    await act(async () => {
+      await result.current.loadMoreAuthors();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=100",
+    );
+    expect(result.current.authors).toHaveLength(120);
   });
 });

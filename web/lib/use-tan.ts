@@ -25,18 +25,20 @@ export function useTan() {
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   // Every known author in the local store, not just the followed ones:
-  // the directory the console uses to discover who to follow. It loads
-  // with the feed's poll tick, like `following`, so a follow or
-  // unfollow from anywhere refreshes it.
+  // the directory the console uses to discover who to follow.
   const [authors, setAuthors] = useState<TanAuthor[]>([]);
-  // How many authors the directory holds in total, behind the page
+  // How many authors the directory holds in total, behind the pages
   // currently shown; the console offers the next page while the shown
   // count is below this.
   const [authorsTotal, setAuthorsTotal] = useState(0);
-  // The page size the directory fetches with. Kept in a ref like `all`
-  // so a "show more" click loads the larger page without waiting for
-  // the state update, and the poll tick keeps fetching the same page.
-  const authorsLimitRef = useRef(AUTHORS_PAGE_SIZE);
+  // The shown authors, mirrored for refreshes that re-read the loaded
+  // pages, and a generation for the directory's own loads: a newer
+  // refresh supersedes an older one, as the feed's does.
+  const authorsRef = useRef(authors);
+  useEffect(() => {
+    authorsRef.current = authors;
+  }, [authors]);
+  const authorsGenerationRef = useRef(0);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -102,19 +104,6 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      // The directory loads on its own so a failed or stalled authors
-      // request cannot block the feed or following from updating; on
-      // failure the previous directory stays in place.
-      apiGet<TanAuthorsResponse>(
-        `/api/tan/authors?limit=${authorsLimitRef.current}`,
-      )
-        .then((known) => {
-          if (generationRef.current === generation) {
-            setAuthors(known.authors);
-            setAuthorsTotal(known.total);
-          }
-        })
-        .catch(() => {});
       const [feed, follows] = await Promise.all([
         showMentionsRef.current
           ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
@@ -177,6 +166,49 @@ export function useTan() {
     }
   }, []);
 
+  // Re-read the directory pages currently shown, in offset-sized
+  // pages, so a follow, unfollow or sync refreshes the followed flags
+  // without losing the user's place. The directory loads on its own
+  // generation, not the feed's: a failed or stalled authors request
+  // never blocks the feed, and on failure the previous directory
+  // stays in place.
+  const refreshAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    // Re-read at least one page, even before anything is shown.
+    const target = Math.max(authorsRef.current.length, AUTHORS_PAGE_SIZE);
+    const pages: TanAuthor[] = [];
+    let total = 0;
+    let offset = 0;
+    while (offset < target) {
+      const result = await apiGet<TanAuthorsResponse>(
+        `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+      );
+      if (authorsGenerationRef.current !== generation) return;
+      pages.push(...result.authors);
+      total = result.total;
+      offset += result.authors.length;
+      if (result.authors.length === 0) break;
+    }
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors(pages);
+    setAuthorsTotal(total);
+  }, []);
+
+  // Fetch the next directory page and append it. Offset paging, not a
+  // growing limit: the API caps a single request at 200 rows, so
+  // growing the limit would fetch the same first 200 rows forever and
+  // never reach author 201.
+  const loadMoreAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    const offset = authorsRef.current.length;
+    const result = await apiGet<TanAuthorsResponse>(
+      `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+    );
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors((previous) => [...previous, ...result.authors]);
+    setAuthorsTotal(result.total);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     async function tick(supersede: boolean) {
@@ -196,27 +228,20 @@ export function useTan() {
     // even if a poll for the old one is still in flight; routine polls
     // skip while a load is pending instead of invalidating it.
     void tick(true);
+    // The directory loads once with the feed; the poll tick does not
+    // re-read it (a follow, unfollow or sync refreshes it instead),
+    // so paging past the first page is never undone by a poll.
+    void refreshAuthors().catch(() => {});
     const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, showMentions, load]);
+  }, [all, showMentions, load, refreshAuthors]);
 
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
-
-  // Fetch the next directory page: grow the page by one page size (up
-  // to the total) and reload. The limit lives in a ref, so the reload
-  // fetches the larger page immediately.
-  const loadMoreAuthors = useCallback(async () => {
-    authorsLimitRef.current = Math.min(
-      authorsTotal,
-      authorsLimitRef.current + AUTHORS_PAGE_SIZE,
-    );
-    await load();
-  }, [load, authorsTotal]);
 
   // Saved posts change only through this client's save/unsave actions
   // (or the CLI), so they load on demand instead of on every poll tick.
@@ -400,17 +425,19 @@ export function useTan() {
   const follow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
-      await load();
+      // The directory's followed flags change too, so it refreshes
+      // alongside the feed.
+      await Promise.all([load(), refreshAuthors()]);
     },
-    [load],
+    [load, refreshAuthors],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
-      await load();
+      await Promise.all([load(), refreshAuthors()]);
     },
-    [load],
+    [load, refreshAuthors],
   );
 
   const like = useCallback(
@@ -443,12 +470,14 @@ export function useTan() {
       const result = await apiPost<TanSyncResponse>("/api/tan/sync", {
         explore: true,
       });
-      await load();
+      // A sync can bring in new authors, so the directory refreshes
+      // alongside the feed.
+      await Promise.all([load(), refreshAuthors()]);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load]);
+  }, [load, refreshAuthors]);
 
   return {
     posts,
