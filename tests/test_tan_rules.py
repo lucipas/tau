@@ -109,6 +109,19 @@ def test_ruleset_persistence_roundtrip(tmp_path, identities):
         load_ruleset(path)
 
 
+def test_save_ruleset_replaces_file_atomically(tmp_path, identities):
+    _, bob = identities
+    path = tmp_path / "tan-rules.json"
+    save_ruleset(path, Ruleset())
+    save_ruleset(
+        path,
+        Ruleset(default_allow=False, allow_authors=frozenset({author_of(bob)})),
+    )
+    # The rewrite leaves no temp file behind and the file always parses.
+    assert [entry.name for entry in tmp_path.iterdir()] == ["tan-rules.json"]
+    assert load_ruleset(path).default_allow is False
+
+
 def _push(app, entry):
     response = app._handle_post(
         TAN_POST_PATH,

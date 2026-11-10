@@ -3724,6 +3724,7 @@ class TanApp:
         self._gossip_slots = threading.BoundedSemaphore(4)
         self._closed = False
         self._ruleset = ruleset
+        self._ruleset_lock = threading.Lock()
         self._ruleset_path = getattr(config, "tan_rules_path", None)
 
     @property
@@ -3733,16 +3734,19 @@ class TanApp:
         A ruleset that cannot be parsed fails closed — remote entries
         are denied — rather than silently reverting to admit-all, but
         loading is lazy so a broken file never blocks local operations.
+        Loading holds ``_ruleset_lock`` so it cannot interleave with
+        ``reload_ruleset`` and install a pre-save value after it.
         """
-        if self._ruleset is None:
-            try:
-                self._ruleset = load_ruleset(self._ruleset_path)
-            except RulesError as exc:
-                log.error(
-                    "Tan ruleset unusable (%s); denying remote entries", exc
-                )
-                self._ruleset = Ruleset(default_allow=False)
-        return self._ruleset
+        with self._ruleset_lock:
+            if self._ruleset is None:
+                try:
+                    self._ruleset = load_ruleset(self._ruleset_path)
+                except RulesError as exc:
+                    log.error(
+                        "Tan ruleset unusable (%s); denying remote entries", exc
+                    )
+                    self._ruleset = Ruleset(default_allow=False)
+            return self._ruleset
 
     def reload_ruleset(self) -> None:
         """Drop the cached admission ruleset so the next access re-reads it.
@@ -3752,7 +3756,8 @@ class TanApp:
         for a restart. A rules file that cannot be parsed still fails
         closed on the next load, through the ``ruleset`` property.
         """
-        self._ruleset = None
+        with self._ruleset_lock:
+            self._ruleset = None
 
     def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
         ruleset = self.ruleset
