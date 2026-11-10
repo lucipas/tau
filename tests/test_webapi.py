@@ -1683,6 +1683,61 @@ def test_tan_repost_via_api(tmp_path):
     assert [entry["kind"] for entry in entries] == ["post"]
 
 
+def test_tan_repost_state_on_mentions_and_saved(tmp_path):
+    # Regression test for the repost-annotation gap Qodo's review caught:
+    # mentions and saved posts did not carry repost counts, so a card
+    # there kept offering Repost for a post already reposted.
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, create_reply, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "original thought", name="tester", now=1000
+        )
+        reply = create_reply(
+            conn, other, mine["hash"], "seconded", name="other", now=1001
+        )
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": foreign["hash"]}
+        )
+        assert status == 200
+
+        for target in (reply["hash"], foreign["hash"]):
+            status, _, payload = _json(
+                bridge, "/api/tan/repost", method="POST", body={"target": target}
+            )
+            assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+    finally:
+        bridge.stop()
+
+
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),
