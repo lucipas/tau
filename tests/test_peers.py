@@ -13,6 +13,7 @@ from tau.peers import (
     PeerError,
     PeerRegistry,
     PUBLIC_KEY_BYTES,
+    safety_number,
 )
 from tau.protocol import APP_NAME, ASPECT
 
@@ -37,6 +38,24 @@ def test_upsert_and_lookup(tmp_path):
     assert registry.get("ALICE") is peer
     assert "alice" in registry
     assert registry.resolve(peer.hexhash[:6]) is peer
+
+
+def test_remove_drops_peer_and_persists(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    make_peer(registry, 2, "bob", now=100.0)
+
+    removed = registry.remove(peer.destination_hash)
+    assert removed is peer
+    assert len(registry) == 1
+    assert registry.get(peer.destination_hash) is None
+    assert registry.remove(peer.destination_hash) is None
+
+    registry.save()
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    assert len(reloaded) == 1
+    assert reloaded.get(peer.destination_hash) is None
+    assert reloaded.get("bob") is not None
 
 
 def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
@@ -76,6 +95,30 @@ def test_from_dict_rejects_nonfinite_timestamps():
         recovered = Peer.from_dict(dict(raw, first_seen=bad))
         assert recovered.first_seen == peer.last_seen
         assert recovered.last_seen == peer.last_seen
+
+def test_record_delivered_tracks_history_and_persists(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    assert peer.delivered_count == 0
+    assert peer.last_delivered_at is None
+    assert registry.record_delivered(b"\x09" * 16) is False
+
+    assert registry.record_delivered(peer.destination_hash, now=150.0) is True
+    assert registry.record_delivered(peer.destination_hash, now=160.0) is True
+    assert peer.delivered_count == 2
+    assert peer.last_delivered_at == 160.0
+    registry.save()
+
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    stored = reloaded.get(peer.destination_hash)
+    assert stored.delivered_count == 2
+    assert stored.last_delivered_at == 160.0
+    # An upsert for the same peer keeps its delivered history.
+    reloaded.upsert(
+        peer.destination_hash, peer.public_key, name="carol", now=200.0
+    )
+    assert stored.delivered_count == 2
+    assert stored.last_delivered_at == 160.0
 
 
 def test_ambiguous_names_and_prefixes(tmp_path):
@@ -443,3 +486,451 @@ def test_merge_exchanged_exceeds_cap_rather_than_evicting_all_kept(tmp_path):
     assert summary["added"] == 1
     assert len(registry) == 3
     assert registry.get(destination) is not None
+
+
+# -- local aliases ----------------------------------------------------------
+
+
+def test_alias_roundtrip_persists(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.set_alias(peer.hexhash, "my laptop")
+
+    reloaded = PeerRegistry(path)
+    stored = reloaded.get(peer.destination_hash)
+    assert stored is not None
+    assert stored.alias == "my laptop"
+    assert stored.display_name == "my laptop"
+
+
+def test_display_name_prefers_alias_over_name(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 2, "bob", now=100.0)
+    assert peer.display_name == "bob"
+    registry.set_alias(peer.hexhash, "relay-berlin")
+    assert peer.display_name == "relay-berlin"
+
+
+def test_resolve_and_get_accept_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    registry.set_alias(peer.hexhash, "carol-laptop")
+    assert registry.resolve("carol-laptop") is peer
+    assert registry.resolve("CAROL-LAPTOP") is peer
+    assert registry.get("carol-laptop") is peer
+    # The asserted name still resolves too.
+    assert registry.resolve("carol") is peer
+
+
+def test_alias_wins_over_another_peers_name(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 4, "dave", now=100.0)
+    make_peer(registry, 5, "laptop", now=200.0)
+    registry.set_alias(peer.hexhash, "laptop")
+    assert registry.resolve("laptop") is peer
+
+
+def test_set_alias_rejects_duplicates_case_insensitively(tmp_path):
+    registry = PeerRegistry()
+    first = make_peer(registry, 6, "erin", now=100.0)
+    second = make_peer(registry, 7, "frank", now=200.0)
+    registry.set_alias(first.hexhash, "spare")
+    with pytest.raises(PeerError, match="already used"):
+        registry.set_alias(second.hexhash, "SPARE")
+    # Re-setting the same alias on the same peer is fine.
+    assert registry.set_alias(first.hexhash, "spare") is first
+
+
+def test_set_alias_rejects_empty_and_unknown_peer(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 8, "grace", now=100.0)
+    with pytest.raises(PeerError, match="must not be empty"):
+        registry.set_alias(peer.hexhash, "   ")
+    with pytest.raises(PeerError, match="unknown peer"):
+        registry.set_alias("missing", "spare")
+
+
+def test_set_alias_rejects_hash_like_values(tmp_path):
+    registry = PeerRegistry()
+    other = make_peer(registry, 10, "ivan", now=100.0)
+    peer = make_peer(registry, 11, "judy", now=200.0)
+    # A full hash and a hash prefix of another peer must not become aliases.
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash)
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash[:8])
+    assert peer.alias is None
+
+
+def test_clear_alias_and_clearing_without_one(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 9, "heidi", now=100.0)
+    with pytest.raises(PeerError, match="has no alias"):
+        registry.clear_alias(peer.hexhash)
+    registry.set_alias(peer.hexhash, "home")
+    assert registry.clear_alias("home") is peer
+    assert peer.alias is None
+    assert peer.display_name == "heidi"
+    assert registry.resolve("home") is None
+
+
+def test_upsert_preserves_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 10, "ivan", now=100.0)
+    registry.set_alias(peer.hexhash, "workstation")
+    registry.upsert(
+        peer.destination_hash,
+        peer.public_key,
+        name="ivan-new",
+        hops=1,
+        now=200.0,
+    )
+    assert peer.alias == "workstation"
+    assert peer.name == "ivan-new"
+
+
+def test_alias_never_leaves_the_local_registry(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 11, "judy", now=100.0)
+    registry.set_alias(peer.hexhash, "secret-label")
+    assert "alias" not in peer.public_dict()
+    assert "alias" not in peer.exchange_dict()
+    assert peer.to_dict()["alias"] == "secret-label"
+
+
+def test_from_dict_tolerates_bad_alias_values(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 12, "ken", now=100.0)
+    raw = peer.to_dict()
+    raw["alias"] = 42
+    assert Peer.from_dict(raw).alias is None
+    raw["alias"] = "   "
+    assert Peer.from_dict(raw).alias is None
+
+
+def test_set_alias_rejects_hash_like_aliases(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 13, "mia", now=100.0)
+    other = make_peer(registry, 14, "nick", now=200.0)
+    # Another peer's full destination hash, its hash prefix, and any
+    # hex-only string long enough to be read as a prefix are all refused.
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash)
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, other.hexhash[:8])
+    with pytest.raises(PeerError, match="looks like a destination hash"):
+        registry.set_alias(peer.hexhash, "deadbeef")
+    # A short hex string cannot be a prefix, so it is a fine alias.
+    assert registry.set_alias(peer.hexhash, "abc").alias == "abc"
+
+
+def test_from_dict_drops_hash_like_alias(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 15, "olive", now=100.0)
+    raw = peer.to_dict()
+    raw["alias"] = peer.hexhash[:8]
+    assert Peer.from_dict(raw).alias is None
+
+
+def test_refresh_aliases_picks_up_another_process(tmp_path):
+    path = tmp_path / "peers.json"
+    cli = PeerRegistry(path)
+    peer = make_peer(cli, 16, "pam", now=100.0)
+    cli.save()
+    # A second registry loaded earlier, as a running node's snapshot.
+    node_view = PeerRegistry(path)
+    assert node_view.get(peer.destination_hash).alias is None
+
+    cli.set_alias(peer.hexhash, "field-kit")
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).alias == "field-kit"
+    # The node's next save keeps the alias instead of erasing it.
+    node_view.save()
+    assert PeerRegistry(path).get(peer.destination_hash).alias == "field-kit"
+
+    cli.clear_alias(peer.hexhash)
+    assert node_view.refresh_aliases() == 1
+    assert node_view.get(peer.destination_hash).alias is None
+    assert node_view.refresh_aliases() == 0
+
+
+def test_refresh_aliases_ignores_unknown_peers_and_missing_keys(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 17, "quinn", now=100.0)
+    registry.save()
+
+    raw = json.loads(path.read_text())
+    raw["peers"].append(
+        {"destination": "00" * 16, "alias": "ghost", "name": "ghost"}
+    )
+    raw["peers"][0].pop("alias")
+    path.write_text(json.dumps(raw))
+
+    assert registry.refresh_aliases() == 0
+    assert registry.get(peer.destination_hash).alias is None
+
+
+def test_resolve_can_exclude_aliases(tmp_path):
+    registry = PeerRegistry()
+    named = make_peer(registry, 18, "laptop", now=100.0)
+    aliased = make_peer(registry, 19, "dave", now=200.0)
+    registry.set_alias(aliased.hexhash, "laptop")
+    # Aliases win by default...
+    assert registry.resolve("laptop") is aliased
+    # ...but a security boundary can ask for asserted names only.
+    assert registry.resolve("laptop", include_alias=False) is named
+    assert registry.resolve("LAPTOP", include_alias=False) is named
+    assert registry.resolve("dave", include_alias=False) is aliased
+    assert registry.resolve("laptop", include_alias=True) is aliased
+
+
+def test_load_drops_duplicate_aliases(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    first = make_peer(registry, 20, "rachel", now=100.0)
+    second = make_peer(registry, 21, "sam", now=200.0)
+    registry.set_alias(first.hexhash, "shared")
+    registry.set_alias(second.hexhash, "other")
+    registry.save()
+
+    # Two writers racing can leave the same alias on two peers; the
+    # file keeps the first occurrence and drops the second on load.
+    raw = json.loads(path.read_text())
+    raw["peers"][1]["alias"] = "SHARED"
+    path.write_text(json.dumps(raw))
+
+    reloaded = PeerRegistry(path)
+    assert reloaded.get(first.destination_hash).alias == "shared"
+    assert reloaded.get(second.destination_hash).alias is None
+    assert reloaded.resolve("shared") is reloaded.get(first.destination_hash)
+
+
+def test_refresh_aliases_never_creates_a_collision(tmp_path):
+    path = tmp_path / "peers.json"
+    node_view = PeerRegistry(path)
+    first = make_peer(node_view, 22, "tina", now=100.0)
+    second = make_peer(node_view, 23, "uma", now=200.0)
+    node_view.set_alias(first.hexhash, "field-kit")
+
+    # A stale one-shot snapshot that omits the first peer and gives its
+    # alias to the second one.
+    raw = json.loads(path.read_text())
+    raw["peers"] = [entry for entry in raw["peers"] if entry["destination"] != first.hexhash]
+    raw["peers"][0]["alias"] = "field-kit"
+    path.write_text(json.dumps(raw))
+
+    assert node_view.refresh_aliases() == 0
+    # The first peer kept its alias (it was absent from the file) and
+    # the colliding alias was not applied to the second peer.
+    assert node_view.get(first.destination_hash).alias == "field-kit"
+    assert node_view.get(second.destination_hash).alias is None
+    assert node_view.resolve("field-kit") is node_view.get(first.destination_hash)
+
+    # The node's next save heals the file instead of persisting the clash.
+    node_view.save()
+    healed = PeerRegistry(path)
+    assert healed.get(first.destination_hash).alias == "field-kit"
+    assert healed.get(second.destination_hash).alias is None
+
+
+def test_safety_number_is_grouped_symmetric_and_deterministic():
+    key_a = b"\x01" * PUBLIC_KEY_BYTES
+    key_b = b"\x02" * PUBLIC_KEY_BYTES
+
+    number = safety_number(key_a, key_b)
+    groups = number.split(" ")
+    assert len(groups) == 12
+    assert all(len(group) == 5 and group.isdigit() for group in groups)
+    # Same from either side of the pair, and stable across calls.
+    assert safety_number(key_b, key_a) == number
+    assert safety_number(key_a, key_b) == number
+    # A different key gives a different number.
+    assert safety_number(key_a, b"\x03" * PUBLIC_KEY_BYTES) != number
+    # A single key is that identity's own fingerprint.
+    fingerprint = safety_number(key_a)
+    assert len(fingerprint.split(" ")) == 12
+    assert fingerprint != number
+
+
+def test_safety_number_rejects_bad_keys():
+    with pytest.raises(ValueError):
+        safety_number()
+    with pytest.raises(ValueError):
+        safety_number(b"short")
+
+
+def test_mark_verified_records_fingerprint_and_survives_reload(tmp_path):
+    path = tmp_path / "peers.json"
+    registry = PeerRegistry(path)
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    assert not peer.is_verified
+
+    registry.mark_verified(peer.destination_hash, "00001 00002", now=500.0)
+    assert peer.is_verified
+    assert peer.verified_at == 500.0
+    assert peer.verified_fingerprint == "00001 00002"
+    assert registry.save() is True
+
+    loaded = PeerRegistry(path)
+    reloaded = loaded.get(peer.destination_hash)
+    assert reloaded is not None
+    assert reloaded.is_verified
+    assert reloaded.verified_at == 500.0
+    assert reloaded.verified_fingerprint == "00001 00002"
+
+
+def test_mark_verified_rejects_unknown_and_ambiguous_targets(tmp_path):
+    registry = PeerRegistry()
+    make_peer(registry, 1, "alice", now=100.0)
+    with pytest.raises(PeerError):
+        registry.mark_verified("missing", "00001", now=100.0)
+
+    make_peer(registry, 2, "duplicate", now=100.0)
+    make_peer(registry, 3, "duplicate", now=100.0)
+    with pytest.raises(PeerError):
+        registry.mark_verified("duplicate", "00001", now=100.0)
+
+
+def test_upsert_refuses_key_change_and_stamps_it(tmp_path, caplog):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    with caplog.at_level("WARNING", logger="tau.peers"):
+        updated = registry.upsert(
+            peer.destination_hash,
+            b"\x02" * PUBLIC_KEY_BYTES,
+            name="mallory",
+            hops=1,
+            now=200.0,
+        )
+
+    # The recorded key — and the verification hanging off it — is kept.
+    assert updated is peer
+    assert peer.public_key == b"\x01" * PUBLIC_KEY_BYTES
+    assert peer.name == "alice"
+    assert peer.last_seen == 100.0
+    assert peer.key_change_at == 200.0
+    assert any("different public key" in record.message for record in caplog.records)
+
+
+def test_upsert_key_change_keeps_verification(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.mark_verified(peer.destination_hash, "00001", now=150.0)
+
+    registry.upsert(
+        peer.destination_hash, b"\x02" * PUBLIC_KEY_BYTES, now=200.0
+    )
+    assert peer.is_verified
+    assert peer.verified_fingerprint == "00001"
+    assert peer.public_key == b"\x01" * PUBLIC_KEY_BYTES
+
+
+def test_prune_spares_verified_peers(tmp_path):
+    registry = PeerRegistry()
+    verified = make_peer(registry, 1, "alice", now=100.0)
+    registry.mark_verified(verified.destination_hash, "00001", now=150.0)
+    make_peer(registry, 2, "bob", now=100.0)
+
+    assert registry.prune(max_age=500.0, now=1100.0) == 1
+    assert registry.get(verified.destination_hash) is verified
+    assert len(registry) == 1
+
+
+def test_max_peers_spares_verified_peers(tmp_path):
+    registry = PeerRegistry(max_peers=2)
+    verified = make_peer(registry, 1, "one", now=1.0)
+    registry.mark_verified(verified.destination_hash, "00001", now=1.0)
+    make_peer(registry, 2, "two", now=2.0)
+    make_peer(registry, 3, "three", now=3.0)
+
+    names = {peer.name for peer in registry.all()}
+    assert names == {"one", "three"}
+
+
+def test_local_dict_includes_trust_state_public_dict_does_not(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.mark_verified(peer.destination_hash, "00001", now=150.0)
+
+    assert "verified" not in peer.public_dict(now=200.0)
+    assert "verified_at" not in peer.public_dict(now=200.0)
+    local = peer.local_dict(now=200.0)
+    assert local["verified"] is True
+    assert local["verified_at"] == 150.0
+    assert local["key_change_at"] is None
+
+
+def test_from_dict_tolerates_bad_verification_fields(tmp_path):
+    path = tmp_path / "peers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "peers": [
+                    {
+                        "destination": "00" * 16,
+                        "public_key": "00" * 64,
+                        "last_seen": 1,
+                        "verified_at": "not-a-time",
+                        "verified_fingerprint": 42,
+                        "key_change_at": float("nan"),
+                    }
+                ],
+            }
+        )
+    )
+    registry = PeerRegistry(path)
+    assert len(registry) == 1
+    peer = registry.all()[0]
+    assert not peer.is_verified
+    assert peer.verified_fingerprint is None
+    assert peer.key_change_at is None
+
+def test_mark_verified_clears_key_change_warning(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    registry.upsert(
+        peer.destination_hash, b"\x02" * PUBLIC_KEY_BYTES, now=200.0
+    )
+    assert peer.key_change_at == 200.0
+
+    registry.mark_verified(peer.destination_hash, "00001", now=300.0)
+    assert peer.is_verified
+    # Re-verifying answers the warning: it must not warn forever after.
+    assert peer.key_change_at is None
+
+
+def test_clear_verifications_drops_all_markers(tmp_path):
+    registry = PeerRegistry()
+    first = make_peer(registry, 1, "alice", now=100.0)
+    second = make_peer(registry, 2, "bob", now=100.0)
+    registry.mark_verified(first.destination_hash, "00001", now=150.0)
+    registry.mark_verified(second.destination_hash, "00002", now=150.0)
+
+    assert registry.clear_verifications() == 2
+    assert not first.is_verified
+    assert first.verified_fingerprint is None
+    assert not second.is_verified
+    assert registry.clear_verifications() == 0
+
+
+def test_forget_removes_peer_and_rejects_unknown(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    make_peer(registry, 2, "bob", now=100.0)
+
+    removed = registry.forget("alice")
+    assert removed is peer
+    assert len(registry) == 1
+    assert registry.get("alice") is None
+
+    with pytest.raises(PeerError):
+        registry.forget("alice")
+
+    make_peer(registry, 3, "duplicate", now=100.0)
+    make_peer(registry, 4, "duplicate", now=100.0)
+    with pytest.raises(PeerError):
+        registry.forget("duplicate")
