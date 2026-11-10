@@ -3298,35 +3298,60 @@ def cmd_peers_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_peers_forget(args: argparse.Namespace) -> int:
-    """Remove a peer from the local registry."""
+    """Remove one peer from the local registry.
+
+    A serving node keeps its own in-memory registry and rewrites the file
+    on its next save, so forgetting refuses while one is running on this
+    data directory.  The mailbox transaction is held across the fresh
+    safety checks and the registry removal, mirroring ``_save_peers``:
+    a one-shot send cannot queue mail for the peer between the check
+    and the removal.  Mail sweeps iterate registered peers, so forgetting
+    a peer with queued mail would strand those messages until it is
+    rediscovered (or they expire): refuse unless ``--force`` is passed.
+    """
     config = _make_config(args)
-    registry = PeerRegistry(config.peers_path)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
     try:
-        peer = registry.resolve(args.target)
-    except PeerError as exc:
-        raise NodeError(str(exc)) from exc
-    if peer is None:
-        raise NodeError(f"no peer matches {args.target!r}")
-    # Mail sweeps iterate registered peers: forgetting a peer with
-    # queued mail would strand those messages until it is rediscovered
-    # (or they expire).  Refuse unless the owner explicitly forces it.
-    mailbox = Mailbox(config.mailbox_path)
-    queued = mailbox.outbox_list(to=peer.destination_hash)
-    if queued and not getattr(args, "force", False):
+        lock.acquire()
+    except InstanceAlreadyRunning as exc:
         raise NodeError(
-            f"{peer.display_name} still has {len(queued)} queued "
-            "message(s); forgetting this peer would strand them until "
-            "it is rediscovered. Deliver or cancel the mail first, or "
-            "pass --force to forget anyway."
-        )
-    registry.forget(peer.destination_hash)
-    registry.save()
+            "a tau node is already serving on this data directory; "
+            "stop it before forgetting a peer"
+        ) from exc
+    try:
+        mailbox = Mailbox(config.mailbox_path)
+        with mailbox.transaction():
+            registry = PeerRegistry(config.peers_path)
+            try:
+                peer = registry.resolve(args.target)
+            except PeerError as exc:
+                raise NodeError(str(exc)) from exc
+            if peer is None:
+                raise NodeError(f"no peer matches {args.target!r}")
+            queued = mailbox.outbox_list(to=peer.destination_hash)
+            if queued and not getattr(args, "force", False):
+                raise NodeError(
+                    f"{peer.display_name} still has {len(queued)} queued "
+                    "message(s); forgetting this peer would strand them "
+                    "until it is rediscovered. Deliver or cancel the mail "
+                    "first, or pass --force to forget anyway."
+                )
+            if peer.hexhash in mailbox.pending_ack_holders():
+                raise NodeError(
+                    f"{peer.display_name} still has mail acknowledgements owed; "
+                    "wait for the next mail sweep to send them, then try again"
+                )
+            registry.remove(peer.destination_hash)
+            registry.save()
+    finally:
+        lock.release()
     if _json_mode(args):
         _emit(
             {
                 "peer": peer.hexhash,
                 "name": peer.display_name,
-                "forgotten": True,
+                "forgotten": peer.to_dict(),
                 "queued_messages": len(queued),
             },
             True,

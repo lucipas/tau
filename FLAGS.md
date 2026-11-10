@@ -26,7 +26,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
-| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
+| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`, and while mail acknowledgements are owed). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
 | `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |

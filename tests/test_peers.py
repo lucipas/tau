@@ -40,6 +40,24 @@ def test_upsert_and_lookup(tmp_path):
     assert registry.resolve(peer.hexhash[:6]) is peer
 
 
+def test_remove_drops_peer_and_persists(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+    make_peer(registry, 2, "bob", now=100.0)
+
+    removed = registry.remove(peer.destination_hash)
+    assert removed is peer
+    assert len(registry) == 1
+    assert registry.get(peer.destination_hash) is None
+    assert registry.remove(peer.destination_hash) is None
+
+    registry.save()
+    reloaded = PeerRegistry(tmp_path / "peers.json")
+    assert len(reloaded) == 1
+    assert reloaded.get(peer.destination_hash) is None
+    assert reloaded.get("bob") is not None
+
+
 def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     registry = PeerRegistry()
     peer = make_peer(registry, 2, "bob", now=100.0)

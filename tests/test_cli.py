@@ -2368,6 +2368,140 @@ def _seed_retry_outbox(data_dir):
     return config, box, first, second
 
 
+def test_parser_peers_forget_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "forget", "alice"])
+    assert args.command == "peers"
+    assert args.peers_command == "forget"
+    assert args.target == "alice"
+    assert args.func is cli.cmd_peers_forget
+
+    listing = parser.parse_args(["peers", "--max-age", "1"])
+    assert listing.func is cli.cmd_peers
+
+
+def _seed_forget_peers(data_dir):
+    from tau.config import TauConfig
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(b"\xbb" * 16, b"\x02" * 64, name="bob", now=100.0)
+    registry.upsert(b"\xcc" * 16, b"\x03" * 64, name="carol", now=100.0)
+    registry.save()
+    return config
+
+
+def test_peers_forget_removes_peer_and_keeps_others(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Forgot bob" in capsys.readouterr().out
+    registry = PeerRegistry(config.peers_path)
+    assert registry.get("bob") is None
+    assert registry.get("carol") is not None
+
+
+def test_peers_forget_json_and_prefix(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+
+    code = cli.main(
+        ["peers", "forget", "bb" * 4, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["forgotten"]["name"] == "bob"
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
+def test_peers_forget_unknown_peer(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    _seed_forget_peers(data_dir)
+
+    code = cli.main(["peers", "forget", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_forget_refuses_queued_mail(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=b"\xbb" * 16, text="for bob", message_id="aa" + "11" * 15)
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "queued" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_refuses_pending_acks(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.add_pending_acks("bb" * 16, ["aa" + "11" * 15])
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "acknowledgements" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_refuses_while_serving(tmp_path, capsys):
+    from tau.node import InstanceLock
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    finally:
+        lock.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_holds_mailbox_transaction(tmp_path, capsys, monkeypatch):
+    import fcntl
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock_path = config.mailbox_path.with_name(config.mailbox_path.name + ".lock")
+    blocked = {}
+
+    real_save = PeerRegistry.save
+
+    def save_and_probe(self):
+        # A non-blocking flock on the mailbox lock file must fail while
+        # forget holds the mailbox transaction across the registry save:
+        # a concurrent send could not enqueue between the safety check
+        # and the removal.
+        with open(lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked["held"] = True
+            else:
+                blocked["held"] = False
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return real_save(self)
+
+    monkeypatch.setattr(PeerRegistry, "save", save_and_probe)
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert blocked.get("held") is True
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
 def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
     from tau.mailbox import Mailbox
 

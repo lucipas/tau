@@ -523,6 +523,11 @@ class PeerRegistry:
                 del self._peers[key]
         return len(stale)
 
+    def remove(self, destination_hash: bytes) -> Optional[Peer]:
+        """Drop one peer from the registry. Returns the removed peer, or None."""
+        with self._lock:
+            return self._peers.pop(destination_hash, None)
+
     def clear(self) -> None:
         with self._lock:
             self._peers.clear()
