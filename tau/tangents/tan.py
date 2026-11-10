@@ -1112,6 +1112,82 @@ def like_counts(
     return result
 
 
+def likers(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Dict[str, Any]:
+    """Return the post *ref* names plus who currently likes it.
+
+    *ref* is a post or reply hash or unique prefix, resolved exactly as
+    :func:`resolve_post` does — an unknown, ambiguous or deleted
+    reference raises :class:`TanError`.  Like :func:`thread`, an
+    unlinked entry and a reply beneath a deleted ancestor are refused
+    the same way, so no likers are shown for a post the thread view
+    would hide.  The result carries the resolved post under ``"post"``
+    and the current likers under ``"likers"``: one ``{"author": ...,
+    "name": ...}`` record per reactor whose latest reaction for the
+    post is a like, sorted by name then author hash.  The name is the
+    one on the reactor's latest reaction entry for the post.  Only
+    linked reactions count, like :func:`reaction_states`.  Like
+    :func:`thread`, a post from a blocked author — or a reply beneath
+    one — is refused, and an unusable block list hides everything
+    (``exclude_all``), so the likers view never shows a post the
+    thread view would hide.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        # Like thread(): an unlinked entry is not shown, so its likers are not either.
+        raise TanError(f"post has not linked yet: {ref!r}")
+    excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show likers: the block-list is unusable")
+    if post.get("author") in excluded:
+        raise TanError(f"post is from a blocked author: {ref!r}")
+    # Like thread(): a reply beneath a deleted ancestor stays hidden.
+    current_entry = post
+    seen_ancestors = {current_entry["hash"]}
+    while current_entry.get("kind") == KIND_REPLY and current_entry.get("target"):
+        parent = get_post(conn, str(current_entry["target"]))
+        if parent is None or parent.get("kind") not in TIMELINE_KINDS:
+            break
+        if parent["hash"] in seen_ancestors:
+            break
+        if _is_deleted(conn, parent):
+            raise TanError(f"post has been deleted: {ref!r}")
+        if parent["author"] in excluded:
+            raise TanError(f"post is from a blocked author: {ref!r}")
+        seen_ancestors.add(parent["hash"])
+        current_entry = parent
+    target = str(post["hash"])
+    states = reaction_states(conn, [target]).get(target, {})
+    current = [a for a, kind in states.items() if kind == KIND_LIKE]
+    records: List[Dict[str, Any]] = []
+    if current:
+        # One target-scoped query, no author list expanded into
+        # placeholders: the name lookup cannot hit SQLite's host
+        # parameter limit no matter how many likers a post has.
+        rows = conn.execute(
+            "SELECT author, name FROM posts "
+            "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
+            "ORDER BY author, seq ASC",
+            (target,),
+        ).fetchall()
+        names: Dict[str, str] = {}
+        for row in rows:
+            # Rows arrive in chain order per reactor, so the last write
+            # wins — the name on the reactor's latest reaction.
+            names[str(row["author"])] = str(row["name"])
+        records = [
+            {"author": author, "name": names.get(author, "")}
+            for author in current
+        ]
+    records.sort(key=lambda record: (record["name"].lower(), record["author"]))
+    return {"post": _canonical_post(post), "likers": records}
+
+
 def annotate_reactions(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],

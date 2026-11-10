@@ -509,7 +509,13 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan likes 5c04c868         # names the authors whose like currently stands
 ```
+
+The timeline only shows counts. `tau tan likes` prints the post followed by
+one line per liker; an author who unliked, or whose like was superseded by a
+later unlike, does not appear. Like the thread view, it refuses a post your
+Tan display rules hide.
 
 The web console shows the same counts with a ♥ toggle on every post
 (`POST /api/tan/like` / `POST /api/tan/unlike`).

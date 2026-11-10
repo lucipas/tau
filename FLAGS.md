@@ -53,6 +53,7 @@ Global options may appear before or after the command:
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
+| `tau tan likes POST` | Show who currently likes a post |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan mentions` | Show replies to your own posts |
 | `tau tan follow PEER` | Follow a peer or destination hash |
