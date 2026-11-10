@@ -107,6 +107,44 @@ def test_direct_message_without_kind_is_chat(tmp_path):
     assert node.inbox.list_messages()[0]["kind"] == "chat"
 
 
+def test_direct_message_with_reserved_kind_is_rejected(tmp_path):
+    # "group" and "file" name inbox record types: a DM tagged with
+    # either would fail inbox validation and be silently lost (the
+    # sender already got success, and the seen-id blocks a retry).
+    # The wire parser rejects them instead, before anything is marked
+    # seen — so a retry with a real kind still lands.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    from tau.protocol import encode as encode_payload
+
+    for kind in ("group", "file"):
+        payload = encode_payload(
+            {
+                "type": "message",
+                "v": 1,
+                "text": "reserved kind",
+                "sent_at": 1.0,
+                "id": f"kind-{kind}",
+                "kind": kind,
+            }
+        )
+        response = call_handler(node._handle_message, payload)
+        assert response["ok"] is False
+        assert response["error"]["code"] == "invalid_message"
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+    # Nothing was marked seen: the same id with a valid kind delivers.
+    payload = encode_message("reserved kind", message_id="kind-group", kind="ping")
+    response = call_handler(node._handle_message, payload)
+    assert response["ok"] is True
+    assert node.inbox.list_messages()[0]["kind"] == "ping"
+
+
 def test_relayed_message_keeps_kind(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

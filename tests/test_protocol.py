@@ -196,6 +196,12 @@ def test_message_without_kind_parses_as_chat():
         "café",
         "１",
         "١",
+        # Reserved inbox record types, never a DM kind: a message
+        # tagged "group" or "file" could never be stored in the
+        # recipient's inbox.
+        "group",
+        "file",
+        "GROUP",
     ],
 )
 def test_message_kind_rejects_invalid(kind):

@@ -52,6 +52,14 @@ MAX_MESSAGE_KIND_LENGTH = 32
 # ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
 # would break the documented slug grammar for consumers that enforce it.
 _MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# ``group`` and ``file`` are inbox record types, not message kinds: a
+# direct message tagged with either would fail inbox validation (a
+# "group" text record needs a roster, a "file" one needs file fields)
+# and be silently lost — `_record_received` swallows the failure while
+# the sender already got success and the seen-id blocks a retry.  So
+# they are reserved here, at the one choke point every kind passes
+# through, and the wire parser rejects them the same way.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -148,7 +156,9 @@ def normalize_message_kind(kind: Any) -> str:
 
     A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
     at most 32 characters) so it is safe to print, compare and filter
-    on.  ``None`` — the local default — means plain chat.
+    on.  ``None`` — the local default — means plain chat.  ``group``
+    and ``file`` are reserved: they name inbox record types, and a
+    direct message carrying either could never be stored.
     """
     if kind is None:
         return DEFAULT_MESSAGE_KIND
@@ -159,6 +169,8 @@ def normalize_message_kind(kind: Any) -> str:
         raise ProtocolError(
             "message kind must match [a-z0-9][a-z0-9_-]{0,31}"
         )
+    if cleaned in _RESERVED_MESSAGE_KINDS:
+        raise ProtocolError(f"message kind {cleaned!r} is reserved")
     return cleaned
 
 
