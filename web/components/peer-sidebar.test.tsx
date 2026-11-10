@@ -102,7 +102,7 @@ describe("PeerSidebar peer info", () => {
 
     expect(
       screen.getByText(
-        "tau 0.2.0 · protocol 1 · up 1h 01m · 3 peers · lxmf on",
+        "tau 0.2.0 · RNS 0.9.3 · protocol 1 · up 1h 01m · 3 peers · lxmf on",
       ),
     ).toBeTruthy();
   });

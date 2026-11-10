@@ -165,6 +165,8 @@ export function PeerSidebar({
               if (info?.info) {
                 const reported = info.info;
                 if (reported.version) infoParts.push(`tau ${reported.version}`);
+                if (reported.rns_version)
+                  infoParts.push(`RNS ${reported.rns_version}`);
                 if (reported.protocol !== undefined)
                   infoParts.push(`protocol ${reported.protocol}`);
                 if (reported.uptime !== undefined)
