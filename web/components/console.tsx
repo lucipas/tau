@@ -101,18 +101,36 @@ export function Console() {
 
         <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
           <div className="flex min-w-0 flex-col gap-4">
-            <PeerSidebar
-              node={tau.node}
-              peers={tau.peers}
-              bridge={tau.bridge}
-              pings={tau.pings}
-              unread={tau.unread.per_peer}
-              selected={target}
-              onPing={(destination) => {
-                void tau.ping(destination);
-              }}
-              onSelectPeer={selectPeer}
-            />
+          <PeerSidebar
+            node={tau.node}
+            peers={tau.peers}
+            groups={tau.groups}
+            bridge={tau.bridge}
+            pings={tau.pings}
+            verifications={tau.verifications}
+            blocks={tau.blocks}
+            unread={tau.unread.per_peer}
+            selected={target}
+            onPing={(destination) => {
+              void tau.ping(destination);
+            }}
+            onVerify={(destination) => {
+              void tau.verifyPeer(destination).catch(() => undefined);
+            }}
+            onShowSafetyNumber={(destination) => {
+              void tau.showSafetyNumber(destination).catch(() => undefined);
+            }}
+            onDismissVerification={(destination) => {
+              tau.clearVerification(destination);
+            }}
+            onBlock={(destination) => {
+              void tau.blockPeer(destination).catch(() => undefined);
+            }}
+            onUnblock={(destination) => {
+              void tau.unblockPeer(destination).catch(() => undefined);
+            }}
+            onSelectPeer={selectPeer}
+          />
             <AllowlistSection
               allowlist={tau.allowlist}
               onAdd={(value) => tau.addAllowlistPeer(value)}
@@ -123,9 +141,17 @@ export function Console() {
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed
-              messages={tau.messages}
+              messages={
+                tau.searchQuery !== null ? tau.searchResults : tau.messages
+              }
               node={tau.node}
               live={tau.connection === "live"}
+              searching={tau.searchQuery !== null}
+              searchQuery={tau.searchQuery}
+              searchError={tau.searchError}
+              quoteContext={tau.messages}
+              onSearch={tau.search}
+              onClearSearch={tau.clearSearch}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {
