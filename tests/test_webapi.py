@@ -1764,6 +1764,97 @@ def test_tan_top_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_top_matches_timeline_annotations(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import (
+        create_edit,
+        create_post,
+        create_quote,
+        create_reaction,
+        create_reply,
+        create_repost,
+        init_db,
+        mute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        hit = create_post(conn, bob, "old hit", name="bob", now=1000)
+        draft = create_post(conn, alice, "rough draft", name="alice", now=1001)
+        create_reply(conn, alice, hit["hash"], "agreed", name="alice", now=1002)
+        create_post(conn, alice, "fresh flop", name="alice", now=1003)
+        create_reaction(conn, alice, hit["hash"], liked=True, name="alice", now=1004)
+        create_reaction(conn, carol, hit["hash"], liked=True, name="carol", now=1005)
+        create_reaction(conn, bob, draft["hash"], liked=True, name="bob", now=1006)
+        create_edit(conn, alice, draft["hash"], "polished post", name="alice", now=1007)
+        create_repost(conn, carol, hit["hash"], name="carol", now=1008)
+        create_quote(conn, carol, hit["hash"], "second this", name="carol", now=1009)
+        # An edit that introduces a muted keyword hides the post: the
+        # keyword test sees the edited text, as in the timeline.
+        bait = create_post(conn, alice, "clean post", name="alice", now=1010)
+        mute_keyword(conn, "crypto")
+        create_edit(conn, alice, bait["hash"], "crypto post", name="alice", now=1011)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "old hit",
+            "polished post",
+            "fresh flop",
+            "agreed",
+        ]
+        ranked = {item["text"]: item for item in payload["posts"]}
+        assert ranked["polished post"]["edited"] is True
+        assert ranked["old hit"]["reposts"] == 1
+        assert ranked["old hit"]["quotes"] == 1
+        # The edit that introduced the muted keyword hid the post.
+        assert "crypto post" not in ranked
+
+        # A blocked top-ranked author never takes a result slot: with
+        # limit=1 the next visible post ranks instead.
+        node.blocklist = BlockList(blocked=frozenset({destination_hash(bob).hex()}))
+        status, _, payload = _json(bridge, "/api/tan/top?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["polished post"]
+
+        # A visible reply to a blocked author's post keeps its parent
+        # redacted — no name, hash or text leaks through the preview.
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        reply = next(item for item in payload["posts"] if item["text"] == "agreed")
+        assert reply["reply_to"] == {
+            "hash": hit["hash"],
+            "author": "",
+            "name": "",
+            "text": "",
+            "deleted": False,
+            "blocked": True,
+        }
+
+        # An explicit lookup of a blocked author shows nothing, as in
+        # author_timeline.
+        status, _, payload = _json(
+            bridge, f"/api/tan/top?author={destination_hash(bob).hex()}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
 def test_messages_reconciles_cli_made_reactions(node, tmp_path):
     """A reaction written to the shared inbox by another process (the
     CLI) shows up on the next read of the console history.
