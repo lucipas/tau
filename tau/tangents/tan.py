@@ -2357,6 +2357,98 @@ def author_timeline(
     )
 
 
+MAX_TOP_POSTS = 100
+
+
+def top_posts(
+    conn: sqlite3.Connection,
+    *,
+    author: Optional[str] = None,
+    limit: int = 10,
+    viewer: Optional[str] = None,
+    ruleset: Optional[Ruleset] = None,
+) -> List[Dict[str, Any]]:
+    """Return the most-liked posts in the local store, best first.
+
+    When *ruleset* is given, kinds it hides are dropped before the limit
+    is applied, so hidden entries never take up result slots.  If it
+    hides both reaction kinds, hidden likes do not influence the order
+    and posts rank by recency.
+
+    Ranking is by derived like count, then newest first (the same
+    ``created_at DESC, hash DESC`` order as the timeline).  Posts with
+    no likes sort last by recency, so the ranking is still useful
+    before anything has been liked.  Only linked ``post`` and ``reply``
+    entries rank: reaction entries never appear as items, and posts
+    their author deleted never appear either.  Posts matching a muted
+    keyword (see :func:`muted_keywords`) are skipped, and a reply to
+    one keeps its ``reply_to`` preview text blanked, as in the
+    timeline.  Posts by muted authors never rank either, and a reply
+    to one keeps no parent preview at all, as in the timeline —
+    muting is display-only, so entries stay stored and unmuting
+    restores them.  An explicit *author* is an explicit lookup, like
+    ``timeline --author``: their posts rank even when they are muted,
+    but a reply of theirs to a muted author's post still keeps no
+    parent preview, so the mute never leaks through a preview.
+    Results carry the timeline's ``likes`` / ``liked`` / ``own``
+    annotations and ``reply_to`` parent summaries.
+
+    The ranking needs every candidate's like count before any
+    ordering is possible, so the scan reads the whole visible store
+    in one query — the same scale :func:`search_posts` already scans,
+    and a personal mesh feed keeps the local post table small.
+    """
+    count = max(1, min(int(limit), MAX_TOP_POSTS))
+    keywords = _muted_keyword_list(conn)
+    silenced = muted_author_set(conn)
+    params: List[Any] = []
+    where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
+    if silenced and author is None:
+        placeholders = ", ".join("?" for _ in silenced)
+        where += f" AND author NOT IN ({placeholders})"
+        params.extend(sorted(silenced))
+    if author is not None:
+        author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
+        where += " AND author = ?"
+        params.append(author)
+    rows = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
+        "ORDER BY created_at DESC, hash DESC",
+        params,
+    ).fetchall()
+    candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
+    if ruleset is not None:
+        candidates = [
+            post
+            for post in candidates
+            if ruleset.displays(str(post.get("kind") or KIND_POST))
+        ]
+    if ruleset is None or ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE):
+        # Batch the reaction lookup so large stores stay under the
+        # SQLite bound-parameter limit.
+        for batch in _thread_batches(candidates, _SQL_BATCH):
+            annotate_reactions(conn, batch, viewer=viewer)
+        candidates.sort(
+            key=lambda post: (
+                int(post.get("likes") or 0),
+                float(post.get("created_at") or 0),
+                str(post.get("hash") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        # Hidden reactions must not shape the order; the scan is already
+        # newest first, so keep that order and only attach ownership.
+        for post in candidates:
+            post["own"] = viewer is not None and post["author"] == viewer
+    return annotate_replies(
+        conn,
+        candidates[:count],
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+    )
+
+
 def _fill_unmuted(
     conn: sqlite3.Connection,
     keywords: List[str],

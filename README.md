@@ -195,6 +195,50 @@ tau tan timeline --json
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
 
+Useful flags:
+
+```bash
+# Store a post without starting Reticulum or contacting peers
+tau tan post --no-publish "draft"
+
+# Publish only to one peer
+tau tan post --to alice "direct delivery"
+
+# Show every cached post, or one author's chain
+tau tan timeline --all
+tau tan timeline --author alice
+
+# Search stored posts by keyword (local only, newest first)
+tau tan search mesh --limit 10
+tau tan search mesh --author alice
+
+# Show the most-liked stored posts (best first; unliked posts last, newest first)
+tau tan top --limit 10
+tau tan top --author alice
+
+# Follow by destination hash or by a unique hash prefix
+tau tan follow 5c04c868
+tau tan following
+
+# Hide a word or phrase from your local views (whole-word match,
+# case-insensitive; entries keep syncing, so unmuting restores them)
+tau tan mute-keyword crypto
+tau tan mute-keyword "climate change"
+tau tan muted-keywords
+tau tan unmute-keyword crypto
+
+# Mute an author: their posts leave your timeline, search and threads,
+# but keep syncing and storing — unmute to see them again
+tau tan mute alice
+tau tan muted
+
+# Back up your posts (or every cached author's) and restore them later —
+# every entry's signature and hash are re-verified on import
+tau tan export --output tan-backup.json
+tau tan export --all --output tan-backup.json
+tau tan import tan-backup.json
+```
+
 More Tan flags — drafts, direct delivery, search, keyword and author
 mutes, export/import: see [FLAGS.md](FLAGS.md#tan-flags).
 
@@ -277,6 +321,8 @@ Global options may appear before or after the command:
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan top` | Show the most-liked stored posts, best first |
+| `tau tan mentions` | Show replies to your own posts |
 | `tau tan verify` | Re-verify every stored post's signature and chain linkage |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
@@ -660,6 +706,7 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan top                    # ranks stored posts by ♥ count
 tau tan likes 5c04c868         # names the authors whose like currently stands
 ```
 
