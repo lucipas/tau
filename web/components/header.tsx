@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 
 import type { ConnectionState } from "@/lib/use-tau";
@@ -25,12 +26,57 @@ export function Header({
   connection,
   announcing,
   onAnnounce,
+  onRename,
 }: {
   node: NodeInfo | null;
   connection: ConnectionState;
   announcing: boolean;
   onAnnounce: () => void;
+  onRename: (name: string) => Promise<void>;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  function startEditing() {
+    if (!node) return;
+    setDraft(node.name);
+    setError(null);
+    setEditing(true);
+  }
+
+  function cancelEditing() {
+    setEditing(false);
+    setError(null);
+  }
+
+  async function submitRename(event: React.FormEvent) {
+    event.preventDefault();
+    if (!node || saving) return;
+    const name = draft.trim();
+    if (!name) {
+      // A blank name would only fail server-side; catch it here.
+      setError("name must not be empty");
+      return;
+    }
+    if (name === node.name) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await onRename(name);
+      setEditing(false);
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "could not rename",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
   return (
     <header className="sticky top-0 z-30 border-b border-line/60 bg-void/80 backdrop-blur-xl">
       <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-x-5 gap-y-3 px-4 py-3 lg:px-8">
@@ -79,10 +125,52 @@ export function Header({
 
           {node ? (
             <>
-              <span className="hidden items-center gap-2 rounded-full border border-line bg-panel/70 px-3 py-1 text-xs text-zinc-300 sm:inline-flex">
-                <SignalIcon className="h-3.5 w-3.5 text-signal" />
-                {node.name}
-              </span>
+              {editing ? (
+                <form
+                  className="hidden items-center gap-1.5 sm:flex"
+                  onSubmit={(event) => {
+                    void submitRename(event);
+                  }}
+                >
+                  <input
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") cancelEditing();
+                    }}
+                    disabled={saving}
+                    autoFocus
+                    aria-label="node name"
+                    spellCheck={false}
+                    className="h-7 w-32 rounded-full border border-signal/60 bg-void/70 px-3 font-mono text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-signal/20"
+                  />
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="rounded-full border border-signal/40 bg-signal/10 px-2.5 py-1 text-xs font-medium text-signal transition hover:border-signal/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {saving ? "saving…" : "save"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={cancelEditing}
+                    disabled={saving}
+                    className="rounded-full border border-line bg-panel/70 px-2.5 py-1 text-xs text-mist transition hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    cancel
+                  </button>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  onClick={startEditing}
+                  title="rename this node"
+                  className="hidden items-center gap-2 rounded-full border border-line bg-panel/70 px-3 py-1 text-xs text-zinc-300 transition hover:border-signal/50 hover:text-zinc-100 sm:inline-flex"
+                >
+                  <SignalIcon className="h-3.5 w-3.5 text-signal" />
+                  {node.name}
+                </button>
+              )}
               <span className="hidden items-center gap-2 rounded-full border border-line bg-panel/70 py-1 pl-3 pr-1 lg:flex">
                 <span className="font-mono text-[11px] text-mist">
                   {shortHash(node.destination, 12)}
@@ -90,6 +178,15 @@ export function Header({
                 <CopyButton value={node.destination} label="dest" />
               </span>
             </>
+          ) : null}
+
+          {error ? (
+            <span
+              role="alert"
+              className="font-mono text-[11px] text-rose-300"
+            >
+              {error}
+            </span>
           ) : null}
 
           <button

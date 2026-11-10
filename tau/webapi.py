@@ -15,6 +15,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
+    POST /api/id/rename    rename this node (live name + re-announce)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/search   search stored posts by keyword
@@ -63,7 +64,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
-from .config import MESSAGES_FILE_NAME
+from .config import MESSAGES_FILE_NAME, write_node_metadata
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
@@ -1682,6 +1683,49 @@ class WebBridge:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
 
+    def id_rename(self, name: str) -> Dict[str, Any]:
+        """Rename this node, applying the new name live.
+
+        The CLI refuses to rename while the node is serving because the
+        running node announces with its in-memory name. The console
+        runs inside that serving node, so it can update the live name
+        instead: the node and its Tan app take the new name, the stored
+        metadata is rewritten, and the node re-announces so peers learn
+        the new name at once. The identity itself never changes.
+        """
+        if not isinstance(name, str):
+            raise ValueError("field 'name' is required")
+        new_name = sanitize_name(name, fallback="")
+        if not new_name:
+            raise ValueError("new name must not be empty")
+        old_name = getattr(self.node, "name", None) or "anonymous"
+        if new_name == old_name:
+            return {
+                "ok": True,
+                "name": new_name,
+                "previous_name": old_name,
+                "changed": False,
+            }
+        # Persist first: a failed write leaves the live name untouched.
+        write_node_metadata(self.node.config.data_dir, new_name)
+        self.node.name = new_name
+        app = getattr(self.node, "app", None)
+        if app is not None and hasattr(app, "name"):
+            app.name = new_name
+        try:
+            self.node.announce()
+        except NodeError:
+            # The rename already landed; the periodic announce loop
+            # re-announces with the new name anyway.
+            log.debug("re-announce after rename failed", exc_info=True)
+        self.bus.publish({"type": "status", "action": "rename"})
+        return {
+            "ok": True,
+            "name": new_name,
+            "previous_name": old_name,
+            "changed": True,
+        }
+
     # -- snapshots ---------------------------------------------------------
 
     def peers(self) -> List[Dict[str, Any]]:
@@ -2312,6 +2356,29 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/id/rename":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.id_rename(name)
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except NodeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 502
+                    )
+                    return
+                self._send_json(result, head_only)
                 return
             if path == "/api/tan/posts":
                 text = body.get("text")

@@ -138,6 +138,13 @@ export interface PingResult {
   rtt_ms: number | null;
 }
 
+export interface RenameResponse {
+  ok: boolean;
+  name: string;
+  previous_name: string;
+  changed: boolean;
+}
+
 export interface SendResponse {
   ok: boolean;
   message: TauMessage;

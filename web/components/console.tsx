@@ -89,6 +89,9 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          onRename={async (name) => {
+            await tau.renameNode(name);
+          }}
         />
 
         {tau.connection === "reconnecting" ? (

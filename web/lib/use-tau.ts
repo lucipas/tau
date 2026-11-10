@@ -14,6 +14,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  RenameResponse,
   SendResponse,
   Snapshot,
   TauGroup,
@@ -86,6 +87,14 @@ export function useTau() {
     },
     [],
   );
+
+  // The node's identity and name live on the snapshot; a rename (or an
+  // announce) publishes a `status` event instead of a full snapshot, so
+  // a status event re-reads the snapshot's node record on its own.
+  const refreshNode = useCallback(async () => {
+    const snapshot = await apiGet<Snapshot>("/api/status");
+    setNode(snapshot.node);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -162,6 +171,13 @@ export function useTau() {
       applyUnread(payload.unread);
     };
 
+    const onStatus = () => {
+      // A rename or announce in another tab: re-read the node record
+      // rather than waiting for the next snapshot. A failed refresh
+      // leaves the last known name in place until the next one.
+      void refreshNode().catch(() => undefined);
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -172,6 +188,7 @@ export function useTau() {
     source.addEventListener("message_updated", onMessageUpdated);
     source.addEventListener("peer", onPeer);
     source.addEventListener("unread", onUnread);
+    source.addEventListener("status", onStatus);
     source.addEventListener("error", onError);
 
     return () => {
@@ -182,10 +199,11 @@ export function useTau() {
       source.removeEventListener("message_updated", onMessageUpdated);
       source.removeEventListener("peer", onPeer);
       source.removeEventListener("unread", onUnread);
+      source.removeEventListener("status", onStatus);
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread]);
+  }, [applyUnread, refreshNode]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -327,6 +345,27 @@ export function useTau() {
     }
   }, []);
 
+  const renameNode = useCallback(
+    async (name: string) => {
+      const result = await apiPost<RenameResponse>("/api/id/rename", {
+        name,
+      });
+      // The rename already succeeded: show the new name at once, and
+      // treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful rename look like a failure.
+      setNode((previous) =>
+        previous ? { ...previous, name: result.name } : previous,
+      );
+      try {
+        await refreshNode();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result;
+    },
+    [refreshNode],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -412,6 +451,7 @@ export function useTau() {
     send,
     ping,
     announce,
+    renameNode,
     markRead,
     refreshOutbox,
     refreshGroups,

@@ -620,6 +620,60 @@ def test_announce(bridge, node):
     assert node.announced == 1
 
 
+def test_id_rename_via_api(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    node.app = SimpleNamespace(name="tester")
+    status, _, payload = _json(
+        bridge, "/api/id/rename", method="POST", body={"name": "  renamed  "}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "name": "renamed",
+        "previous_name": "tester",
+        "changed": True,
+    }
+    # The live node takes the new name at once: announces, DMs and new
+    # Tan posts all read it from memory.
+    assert node.name == "renamed"
+    assert node.app.name == "renamed"
+    assert node.announced == 1
+    stored = json.loads((tmp_path / "node.json").read_text(encoding="utf-8"))
+    assert stored["name"] == "renamed"
+    status, _, payload = _json(bridge, "/api/status")
+    assert payload["node"]["name"] == "renamed"
+
+
+def test_id_rename_same_name_is_a_noop(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/id/rename", method="POST", body={"name": "tester"}
+    )
+    assert status == 200
+    assert payload["changed"] is False
+    assert payload["previous_name"] == "tester"
+    assert node.announced == 0
+    assert not (tmp_path / "node.json").exists()
+
+
+def test_id_rename_rejects_blank_and_missing_names(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    for body in ({"name": "   "}, {"name": ""}, {}, {"name": 42}):
+        status, _, payload = _json(
+            bridge, "/api/id/rename", method="POST", body=body
+        )
+        assert status == 400
+        assert "name" in payload["error"]["message"]
+    assert node.name == "tester"
+    assert node.announced == 0
+
+
 def test_static_console_and_assets(bridge):
     status, headers, body = _request(bridge, "/")
     assert status == 200

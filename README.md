@@ -142,6 +142,7 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/id/rename` | POST | rename this node `{"name": "..."}` (live name + re-announce) |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
 | `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
