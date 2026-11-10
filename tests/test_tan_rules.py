@@ -15,8 +15,10 @@ from tau.tangents.tan import (
     TAN_POST_PATH,
     TanApp,
     create_post,
+    create_quote,
     create_reaction,
     create_reply,
+    create_repost,
     feed,
     follow,
     init_db,
@@ -406,3 +408,85 @@ def test_display_kinds_cover_replies(identities, tmp_path):
     with pytest.raises(RulesError, match="unknown entry kinds"):
         Ruleset.from_dict({"kinds": ["post", "smash"]})
     assert Ruleset.from_dict({"kinds": ["reply"]}).displays("reply") is True
+
+
+def test_display_kinds_cover_reposts(identities, tmp_path):
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, alice, "hi", name="alice", now=1000)
+    repost = create_repost(scratch, bob, post["hash"], name="bob", now=1001)
+    alice_hash = author_of(alice)
+
+    def build(dirname, ruleset):
+        config = TauConfig.resolve(data_dir=tmp_path / dirname, name="bob")
+        app = TanApp(
+            config, bob, name="bob", gossip=False, ruleset=ruleset
+        )
+        assert _push(app, post)["ok"] is True
+        assert _push(app, repost)["ok"] is True
+        return app
+
+    # Reposts hidden: only the top-level post shows, but the repost is
+    # still admitted and stored, keeping the chain complete.
+    hidden = build("a", Ruleset(kinds=frozenset({"post"})))
+    assert [
+        entry["text"]
+        for entry in hidden.timeline(authors=[alice_hash, author_of(bob)])
+    ] == ["hi"]
+    conn = hidden.connect()
+    try:
+        assert max_seq(conn, author_of(bob)) == 1
+    finally:
+        conn.close()
+
+    # Reposts displayed alongside posts.
+    shown = build("b", Ruleset(kinds=frozenset({"post", "repost"})))
+    items = shown.timeline(authors=[alice_hash, author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"], post["hash"]]
+    assert items[0]["repost_of"]["text"] == "hi"
+
+    # "repost" is a known kind for ruleset files (regression: the
+    # rules module used to carry its own kind list without it, so
+    # `tau tan rules --kinds post,repost` failed to load).
+    assert Ruleset.from_dict({"kinds": ["repost"]}).displays("repost") is True
+
+
+def test_display_kinds_cover_quotes(identities, tmp_path):
+    alice, bob = identities
+    scratch = init_db(tmp_path / "scratch.sqlite3")
+    post = create_post(scratch, bob, "hi", name="bob", now=1000)
+    quote = create_quote(
+        scratch, bob, post["hash"], "worth sharing", name="bob", now=1001
+    )
+    bob_hash = author_of(bob)
+
+    def build(dirname, ruleset):
+        config = TauConfig.resolve(data_dir=tmp_path / dirname, name="alice")
+        app = TanApp(
+            config, alice, name="alice", gossip=False, ruleset=ruleset
+        )
+        assert _push(app, post)["ok"] is True
+        assert _push(app, quote)["ok"] is True
+        return app
+
+    # Quotes hidden: only the top-level post shows, without its quote
+    # count, but the quote is still admitted and stored, keeping the
+    # chain complete.
+    hidden = build("a", Ruleset(kinds=frozenset({"post"})))
+    shown = hidden.timeline(authors=[bob_hash])
+    assert [entry["text"] for entry in shown] == ["hi"]
+    assert "quotes" not in shown[0]
+    conn = hidden.connect()
+    try:
+        assert max_seq(conn, bob_hash) == 2
+    finally:
+        conn.close()
+
+    # Quotes displayed alongside posts, with the count annotated.
+    shown = build("b", Ruleset(kinds=frozenset({"post", "quote"})))
+    entries = shown.timeline(authors=[bob_hash])
+    assert [entry["text"] for entry in entries] == ["worth sharing", "hi"]
+    assert entries[1]["quotes"] == 1
+
+    # "quote" is a known kind for ruleset files.
+    assert Ruleset.from_dict({"kinds": ["quote"]}).displays("quote") is True
