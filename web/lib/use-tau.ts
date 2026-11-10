@@ -62,6 +62,10 @@ export function useTau() {
   // Bumped on every peer event per destination, so a slow alias response
   // cannot overwrite a newer event that arrived while it was in flight.
   const peerEventVersion = useRef<Record<string, number>>({});
+  // Bumped whenever a snapshot replaces the peer list: a reconnect
+  // snapshot is newer than any alias response that was already in
+  // flight, and peer events alone do not cover it.
+  const snapshotGeneration = useRef(0);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -94,6 +98,7 @@ export function useTau() {
           : 0;
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
+      snapshotGeneration.current += 1;
       setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
@@ -333,6 +338,7 @@ export function useTau() {
   const setPeerAlias = useCallback(
     async (destination: string, alias: string | null) => {
       const versionBefore = peerEventVersion.current[destination] ?? 0;
+      const snapshotBefore = snapshotGeneration.current;
       const result = await apiPost<{ ok: boolean; peer: Peer }>(
         "/api/peers/alias",
         { destination, alias },
@@ -340,8 +346,12 @@ export function useTau() {
       // The server also publishes a peer event, so other tabs learn at
       // once; apply the returned record now so this edit reflects
       // without waiting for it. Skip it if a peer event for this peer
-      // arrived meanwhile: that event is newer than this response.
-      if ((peerEventVersion.current[destination] ?? 0) === versionBefore) {
+      // arrived meanwhile, or a reconnect snapshot replaced the list:
+      // either one is newer than this response.
+      if (
+        (peerEventVersion.current[destination] ?? 0) === versionBefore &&
+        snapshotGeneration.current === snapshotBefore
+      ) {
         setPeers((previous) =>
           sortPeers([
             ...previous.filter((entry) => entry.destination !== destination),
