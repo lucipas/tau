@@ -114,6 +114,9 @@ def test_send_message_rejects_invalid_kind(tmp_path):
 def test_send_message_queues_kind_for_offline_peer(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough to queue
+    # The queue path spawns a background flush; stub it out so the
+    # entry is still queued when the test inspects it.
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
     peer = make_peer()
     node.registry.upsert(
         peer.destination_hash, peer.public_key, name=peer.name, now=1.0
@@ -134,6 +137,9 @@ def test_send_message_queues_kind_for_offline_peer(tmp_path, monkeypatch):
 def test_queued_kind_survives_retry_on_the_wire(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough to queue
+    # The queue path spawns a background flush; stub it out so the
+    # retry below is the only delivery attempt.
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
     peer = make_peer()
     node.registry.upsert(
         peer.destination_hash, peer.public_key, name=peer.name, now=1.0
