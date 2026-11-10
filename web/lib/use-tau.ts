@@ -65,6 +65,11 @@ export function useTau() {
   const [importing, setImporting] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Live (SSE) updates to feed entries, stamped with a rising epoch, so
+  // a feed refresh can tell which entries changed while its GET was in
+  // flight and keep those newer versions.
+  const liveEpoch = useRef(0);
+  const liveTouched = useRef(new Map<number, number>());
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -115,6 +120,7 @@ export function useTau() {
       if (!payload?.message) return;
       const message = payload.message;
       if (payload.unread) applyUnread(payload.unread);
+      liveTouched.current.set(message.id, ++liveEpoch.current);
       if (message.id <= snapshotMax.current) return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
@@ -127,6 +133,7 @@ export function useTau() {
       const payload = readEventData<{ message: TauMessage }>(event);
       if (!payload?.message) return;
       const message = payload.message;
+      liveTouched.current.set(message.id, ++liveEpoch.current);
       // A queued message that the mail sweep has since delivered: the
       // server re-sends the same console id with status "delivered".
       // Replace it in place rather than appending a duplicate.
@@ -337,10 +344,16 @@ export function useTau() {
   // the live source, this only picks up entries the stream never
   // announced (imported messages mirrored into the log).
   const refreshMessages = useCallback(async () => {
+    const startEpoch = liveEpoch.current;
     const result = await apiGet<MessagesResponse>("/api/messages?limit=200");
     setMessages((previous) => {
       const byId = new Map(previous.map((entry) => [entry.id, entry]));
-      for (const entry of result.messages) byId.set(entry.id, entry);
+      for (const entry of result.messages) {
+        // A live update that landed after this GET started is newer than
+        // the response, which may predate it: keep the live version.
+        if ((liveTouched.current.get(entry.id) ?? 0) > startEpoch) continue;
+        byId.set(entry.id, entry);
+      }
       const merged = [...byId.values()].sort((a, b) => a.id - b.id);
       snapshotMax.current = Math.max(
         snapshotMax.current,
@@ -387,6 +400,9 @@ export function useTau() {
         // The entries are already stored once the POST succeeds, so a
         // feed refresh failure must not turn the import into a reported
         // failure.
+        // Restored mail can advance unread counts; apply the fresh ones so
+        // the badge (and an open conversation's mark-read) follows.
+        if (result.import.unread) applyUnread(result.import.unread);
         try {
           await refreshMessages();
         } catch {
@@ -397,7 +413,7 @@ export function useTau() {
         setImporting(false);
       }
     },
-    [refreshMessages],
+    [refreshMessages, applyUnread],
   );
 
   return {

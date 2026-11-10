@@ -260,6 +260,8 @@ export interface MessagesImportResult {
   present: number;
   skipped: number;
   errors: MessagesImportError[];
+  // Fresh unread counts, present only when the import stored something.
+  unread?: UnreadCounts;
 }
 
 export interface MessagesImportResponse {

@@ -9,7 +9,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/messages     recent inbound/outbound messages
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
-    GET  /api/messages/export export stored DMs as the CLI's JSON document
+    GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .config import MESSAGES_FILE_NAME
-from .inbox import MAX_REACTIONS, _dedupe_key, merge_reaction
+from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError
@@ -1166,8 +1166,10 @@ class WebBridge:
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
             raise WebBridgeError("this node has no message inbox")
-        before = {_dedupe_key(item) for item in inbox.export_document()["messages"]}
-        result = inbox.import_messages(document)
+        # The inbox reports the records this call stored, so a concurrent
+        # import or live arrival can never make the same entry mirror twice.
+        inserted: List[Dict[str, Any]] = []
+        result = inbox.import_messages(document, inserted=inserted)
         # An invalid entry's id comes from untrusted JSON and may hold
         # a lone surrogate, which the UTF-8 response encoder cannot
         # write. Replace unencodable characters so the counts still
@@ -1177,13 +1179,13 @@ class WebBridge:
                 value = error.get(key)
                 if isinstance(value, str):
                     error[key] = value.encode("utf-8", "replace").decode("utf-8")
-        new = [
-            item
-            for item in inbox.export_document()["messages"]
-            if _dedupe_key(item) not in before
-        ]
-        if new:
-            self._mirror_imported_messages(new)
+        if inserted:
+            self._mirror_imported_messages(inserted)
+            # Other open consoles learn the new unread counts from SSE;
+            # the importing tab also gets them in the response.
+            unread = self.unread()
+            self.bus.publish({"type": "unread", "unread": unread})
+            result["unread"] = unread
         return result
 
     def _mirror_imported_messages(self, records: List[Dict[str, Any]]) -> None:
@@ -1206,6 +1208,7 @@ class WebBridge:
             and item.get("name")
         }
         now = time.time()
+        appended: List[Dict[str, Any]] = []
         for record in records:
             expires_at = record.get("expires_at")
             if (
@@ -1230,11 +1233,17 @@ class WebBridge:
                 )
             group = record.get("group") if record.get("kind") == "group" else None
             wire_id = record.get("id")
-            self._append_message(
+            # A file record has no text: describe it the way the live
+            # file arrival does, so the feed shows the same line.
+            if record.get("kind") == "file":
+                text = file_arrival_text(record)
+            else:
+                text = str(record.get("text") or "")
+            message = self._append_message(
                 direction=direction,
                 peer=peer_hash or None,
                 peer_name=sanitize_name(peer_name, fallback="unknown"),
-                text=str(record.get("text") or ""),
+                text=text,
                 sent_at=_as_float(record.get("sent_at")),
                 received_at=_as_float(record.get("received_at"), default=time.time()),
                 status="received" if direction == "in" else "delivered",
@@ -1254,7 +1263,12 @@ class WebBridge:
                 in_reply_to=record.get("in_reply_to"),
                 save=False,
             )
+            appended.append(message)
         self._save_messages()
+        # Live consoles show arrivals from their message events; publish
+        # the restored entries the same way, in feed order.
+        for message in appended:
+            self.bus.publish({"type": "message", "message": message})
 
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
@@ -1829,6 +1843,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def file_arrival_text(record: Dict[str, Any]) -> str:
+    """Feed line for a received file: name, size and short SHA-256.
+
+    Shared by live file delivery and backup restore so both show the
+    same entry for a file.
+    """
+    return (
+        f"Received file: {record.get('name')} "
+        f"({record.get('size')} bytes, "
+        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
+    )
+
+
 def _valid_expires_in(value: Any) -> bool:
     """True when ``value`` is a finite lifetime in (0, MAX_MAIL_TTL] seconds.
 
@@ -1932,6 +1959,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
             if path == "/api/messages/export":
+                # The full inbox backup goes only to the local machine,
+                # even when the bridge is bound to a remote interface.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "messages export is only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
                 try:
                     document = self.bridge.messages_export()
                 except WebBridgeError as exc:

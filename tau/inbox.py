@@ -91,6 +91,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     text = raw.get("text")
     if not isinstance(text, str) or not text:
         return None
+    # A lone surrogate passes the checks above but cannot be stored as
+    # UTF-8, so it is rejected per record instead of failing the save.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
@@ -380,6 +386,10 @@ def _record_error(raw: Any) -> Optional[str]:
     text = raw.get("text")
     if not isinstance(text, str) or not text:
         return "inbox record needs text"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "text is not valid UTF-8"
     try:
         float(raw.get("sent_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
@@ -1017,15 +1027,22 @@ class Inbox:
             "messages": entries,
         }
 
-    def import_messages(self, document: Any) -> Dict[str, Any]:
+    def import_messages(
+        self,
+        document: Any,
+        inserted: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
         Returns ``{"imported": n, "present": n, "skipped": n, "errors":
         [...]}``.  An entry that fails validation is skipped with its
         error recorded; it never aborts the rest of the import, and
         entries already in the inbox are counted as present rather than
-        stored twice.  The whole merge runs in one transaction, so a
-        concurrent ``tau serve`` cannot lose entries, and the
+        stored twice.  When *inserted* is given, the records this call
+        actually stored are appended to it, in arrival order, so a
+        caller mirrors exactly what this import added.  The whole merge
+        runs in one transaction, so a concurrent ``tau serve`` cannot
+        lose entries, and the
         per-direction 500-record caps still apply.  Imported records
         get local arrival sequences (an export carries the source
         node's, which mean nothing here), and a failed persist raises
@@ -1048,6 +1065,7 @@ class Inbox:
 
         imported = present = skipped = 0
         errors: List[Dict[str, Any]] = []
+        added: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._messages)
             seen = {_dedupe_key(item) for item in self._messages}
@@ -1071,6 +1089,7 @@ class Inbox:
                     continue
                 seen.add(key)
                 self._messages.append(record)
+                added.append(record)
                 imported += 1
             self._messages = _retain(self._messages)
             _number_sequence(self._messages)
@@ -1080,6 +1099,10 @@ class Inbox:
                 # never stored.
                 self._messages = previous
                 raise OSError(f"could not persist inbox to {self.path}")
+        if inserted is not None:
+            # Only records that survived the retention cap were stored.
+            kept = {id(item) for item in self._messages}
+            inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
             "present": present,
