@@ -2374,7 +2374,8 @@ def top_posts(
     Posts by *exclude_authors* (blocked) are dropped in the query, before
     the limit is applied, so they never take up result slots.  A reply
     to a blocked author's post keeps its parent preview redacted, as in
-    the timeline.
+    the timeline.  The exclusion is a single JSON parameter, so a large
+    block-list cannot exceed SQLite's bound-variable limit.
 
     When *ruleset* is given, kinds it hides are dropped before the limit
     is applied, so hidden entries never take up result slots.  If it
@@ -2411,13 +2412,14 @@ def top_posts(
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if silenced and author is None:
-        placeholders = ", ".join("?" for _ in silenced)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(sorted(silenced))
+        # One JSON parameter instead of one placeholder per author, so a
+        # large mute list cannot exceed SQLite's bound-variable limit —
+        # the same pattern feed() uses.
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(silenced)))
     if blocked:
-        placeholders = ", ".join("?" for _ in blocked)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(sorted(blocked))
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(blocked)))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
