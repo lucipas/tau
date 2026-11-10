@@ -488,6 +488,9 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Serialises concurrent renames so a second rename cannot read
+        # the old name, persist it, and leave disk and the live node split.
+        self._rename_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.

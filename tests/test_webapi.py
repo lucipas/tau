@@ -646,6 +646,34 @@ def test_id_rename_via_api(bridge, node, tmp_path):
     assert payload["node"]["name"] == "renamed"
 
 
+def test_id_rename_concurrent_renames_stay_consistent(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    errors = []
+
+    def rename(name):
+        try:
+            bridge.id_rename(name)
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=rename, args=(name,))
+        for name in ("alpha", "beta")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    # Both renames landed in some order; disk and the live node agree on
+    # whichever ran second. (Regression: the serialising lock must exist.)
+    assert node.name in ("alpha", "beta")
+    stored = json.loads((tmp_path / "node.json").read_text(encoding="utf-8"))
+    assert stored["name"] == node.name
+
+
 def test_id_rename_same_name_is_a_noop(bridge, node, tmp_path):
     from types import SimpleNamespace
 
