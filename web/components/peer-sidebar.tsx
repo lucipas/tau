@@ -44,6 +44,9 @@ export function PeerSidebar({
   const [aliasSaving, setAliasSaving] = useState(false);
 
   const startAliasEdit = (peer: Peer) => {
+    // A save is pending for another peer: opening a second editor now
+    // would let that save's completion close or mislabel this one.
+    if (aliasSaving) return;
     setEditingAlias(peer.destination);
     setAliasDraft(peer.alias ?? "");
     setAliasError(null);
@@ -302,9 +305,10 @@ export function PeerSidebar({
                       <button
                         type="button"
                         onClick={() => startAliasEdit(peer)}
+                        disabled={aliasSaving}
                         aria-label={`Set alias for ${displayName}`}
                         title="Set a local alias for this peer"
-                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal"
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
                       >
                         ✎
                       </button>
