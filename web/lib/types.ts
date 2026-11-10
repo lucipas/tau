@@ -23,6 +23,9 @@ export interface TauMessage {
   read_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Group DM context, present on inbound group messages.
+  group?: string;
+  group_name?: string;
   // Sender-set expiry (epoch seconds). Absent when the message never
   // expires; the console purges it once the deadline passes.
   expires_at?: number;
@@ -38,6 +41,23 @@ export interface TauMessage {
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.
   in_reply_to?: { id: string; excerpt: string | null } | null;
+}
+
+export interface TauGroupMember {
+  hash: string;
+  name: string;
+}
+
+export interface TauGroup {
+  id: string;
+  name: string;
+  members: TauGroupMember[];
+  created_at: number;
+}
+
+export interface GroupsResponse {
+  groups: TauGroup[];
+  count: number;
 }
 
 export interface Peer {
@@ -56,6 +76,17 @@ export interface Peer {
   // True when the peer is on this node's block-list: their DMs are
   // dropped and their Tan posts hidden.
   blocked?: boolean;
+}
+
+export interface BlockPeerResult {
+  peer: { destination: string; name: string };
+  blocked: boolean;
+  changed: boolean;
+}
+
+export interface BlockPeerResponse {
+  ok: boolean;
+  block: BlockPeerResult;
 }
 
 export interface InterfaceInfo {
@@ -104,6 +135,7 @@ export interface BridgeInfo {
 export interface Snapshot {
   node: NodeInfo;
   peers: Peer[];
+  groups: TauGroup[];
   messages: TauMessage[];
   counts: Counts;
   unread: UnreadCounts;
@@ -115,6 +147,19 @@ export interface PingResult {
   peer: Peer;
   server?: string;
   rtt_ms: number | null;
+}
+
+export interface SafetyNumberResult {
+  peer: string;
+  name: string;
+  // Pairwise safety number: compare it with the peer over another
+  // channel; showing it records nothing.
+  safety_number: string;
+}
+
+export interface SafetyNumberResponse {
+  ok: boolean;
+  safety_number: SafetyNumberResult;
 }
 
 export interface PeerVerifyResult {
@@ -135,6 +180,9 @@ export interface VerifyPeerResponse {
 
 export interface VerifyState {
   pending?: boolean;
+  // Number shown for comparison; present before the owner confirms
+  // it matches. Nothing is recorded while only this is set.
+  safetyNumber?: string;
   result?: PeerVerifyResult;
   error?: string;
 }
@@ -198,11 +246,20 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  reposts?: number;
+  reposted?: boolean;
   quotes?: number;
   own?: boolean;
+  saved?: boolean;
+  saved_at?: number;
+  deleted?: boolean;
+  // Thread entries carry their depth (the root is 0); timeline entries
+  // have no depth.
+  depth?: number;
 }
 
 export interface TanFollow {
@@ -214,13 +271,49 @@ export interface TanFollow {
   last_post?: number;
 }
 
+export interface MessagesSearchResponse {
+  messages: TauMessage[];
+  count: number;
+}
+
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;
 }
 
+export interface TanSavedResponse {
+  posts: TanPost[];
+  count: number;
+  next_offset: number | null;
+}
+
 export interface TanFollowingResponse {
   following: TanFollow[];
+  count: number;
+}
+
+export interface TanMutedAuthor {
+  author: string;
+  name: string;
+  muted_at: number;
+  posts?: number;
+  seq?: number;
+  last_post?: number;
+}
+
+export interface TanMutedKeyword {
+  keyword: string;
+  display: string;
+  added_at: number;
+}
+
+export interface TanMutedResponse {
+  muted: TanMutedAuthor[];
+  count: number;
+}
+
+export interface TanMutedKeywordsResponse {
+  muted_keywords: TanMutedKeyword[];
   count: number;
 }
 

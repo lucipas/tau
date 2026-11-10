@@ -102,9 +102,11 @@ export function Console() {
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
+            groups={tau.groups}
             bridge={tau.bridge}
             pings={tau.pings}
             verifications={tau.verifications}
+            blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
@@ -113,14 +115,34 @@ export function Console() {
             onVerify={(destination) => {
               void tau.verifyPeer(destination).catch(() => undefined);
             }}
+            onShowSafetyNumber={(destination) => {
+              void tau.showSafetyNumber(destination).catch(() => undefined);
+            }}
+            onDismissVerification={(destination) => {
+              tau.clearVerification(destination);
+            }}
+            onBlock={(destination) => {
+              void tau.blockPeer(destination).catch(() => undefined);
+            }}
+            onUnblock={(destination) => {
+              void tau.unblockPeer(destination).catch(() => undefined);
+            }}
             onSelectPeer={selectPeer}
           />
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed
-              messages={tau.messages}
+              messages={
+                tau.searchQuery !== null ? tau.searchResults : tau.messages
+              }
               node={tau.node}
               live={tau.connection === "live"}
+              searching={tau.searchQuery !== null}
+              searchQuery={tau.searchQuery}
+              searchError={tau.searchError}
+              quoteContext={tau.messages}
+              onSearch={tau.search}
+              onClearSearch={tau.clearSearch}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {

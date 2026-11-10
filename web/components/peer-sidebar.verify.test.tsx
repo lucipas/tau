@@ -21,22 +21,32 @@ function renderSidebar({
   peers = [makePeer()],
   verifications = {},
   onVerify = vi.fn(),
+  onShowSafetyNumber = vi.fn(),
+  onDismissVerification = vi.fn(),
 }: {
   peers?: Peer[];
   verifications?: Record<string, VerifyState>;
   onVerify?: (destination: string) => void;
+  onShowSafetyNumber?: (destination: string) => void;
+  onDismissVerification?: (destination: string) => void;
 } = {}) {
   return render(
     <PeerSidebar
       node={null}
       peers={peers}
+      groups={[]}
       bridge={null}
       pings={{}}
+      blocks={{}}
       verifications={verifications}
       unread={{}}
       selected=""
       onPing={() => {}}
+      onBlock={() => {}}
+      onUnblock={() => {}}
       onVerify={onVerify}
+      onShowSafetyNumber={onShowSafetyNumber}
+      onDismissVerification={onDismissVerification}
       onSelectPeer={() => {}}
     />,
   );
@@ -51,13 +61,68 @@ describe("PeerSidebar peer verification", () => {
     ).toBeTruthy();
   });
 
-  it("calls onVerify with the peer destination", () => {
-    const onVerify = vi.fn();
-    renderSidebar({ onVerify });
+  it("shows the safety number without recording a verification", () => {
+    const onShowSafetyNumber = vi.fn();
+    renderSidebar({ onShowSafetyNumber });
 
     fireEvent.click(screen.getByRole("button", { name: "Verify alice" }));
 
+    expect(onShowSafetyNumber).toHaveBeenCalledWith("ab".repeat(16));
+  });
+
+  it("shows the safety number to compare before anything is recorded", () => {
+    const number = "12345 67890 12345 67890 12345 67890";
+    renderSidebar({
+      verifications: {
+        ["ab".repeat(16)]: { safetyNumber: number },
+      },
+    });
+
+    expect(screen.getByText(number)).toBeTruthy();
+    expect(
+      screen.getByText(/compare it with alice over another channel/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/nothing is recorded until you confirm it matches/),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Numbers match — mark verified",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+  });
+
+  it("confirms the verification only after the numbers match", () => {
+    const onVerify = vi.fn();
+    renderSidebar({
+      verifications: {
+        ["ab".repeat(16)]: { safetyNumber: "12345 67890" },
+      },
+      onVerify,
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Numbers match — mark verified",
+      }),
+    );
+
     expect(onVerify).toHaveBeenCalledWith("ab".repeat(16));
+  });
+
+  it("dismisses a shown number without verifying", () => {
+    const onDismissVerification = vi.fn();
+    renderSidebar({
+      verifications: {
+        ["ab".repeat(16)]: { safetyNumber: "12345 67890" },
+      },
+      onDismissVerification,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onDismissVerification).toHaveBeenCalledWith("ab".repeat(16));
   });
 
   it("shows the safety number once a peer is verified", () => {
@@ -79,7 +144,7 @@ describe("PeerSidebar peer verification", () => {
 
     expect(screen.getByText(number)).toBeTruthy();
     expect(
-      screen.getByText(/compare it with alice over another channel/),
+      screen.getByText(/verified — safety number matched with alice/),
     ).toBeTruthy();
   });
 

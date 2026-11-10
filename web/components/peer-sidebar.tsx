@@ -1,7 +1,9 @@
 "use client";
 
-import type { BridgeInfo, NodeInfo, Peer, VerifyState } from "@/lib/types";
-import type { PingState } from "@/lib/use-tau";
+import { useState } from "react";
+
+import type { BridgeInfo, NodeInfo, Peer, TauGroup, VerifyState } from "@/lib/types";
+import type { BlockState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
   formatRtt,
@@ -15,27 +17,43 @@ import { CopyButton, PingIcon, SectionLabel, SignalIcon } from "./ui";
 export function PeerSidebar({
   node,
   peers,
+  groups,
   bridge,
   pings,
+  blocks,
   verifications,
   unread,
   selected,
   onPing,
+  onBlock,
+  onUnblock,
   onVerify,
+  onShowSafetyNumber,
+  onDismissVerification,
   onSelectPeer,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
+  groups: TauGroup[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
+  blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onBlock: (destination: string) => void;
+  onUnblock: (destination: string) => void;
   onVerify: (destination: string) => void;
+  onShowSafetyNumber: (destination: string) => void;
+  onDismissVerification: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
 }) {
   const now = useNow();
+  // Blocking is the one peer action that silences someone, so it takes
+  // two clicks: arm on the first, confirm on the second. Unblocking is
+  // directly reversible and needs only one.
+  const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -158,12 +176,14 @@ export function PeerSidebar({
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
             {peers.map((peer) => {
               const ping = pings[peer.destination];
+              const block = blocks[peer.destination];
               const verification = verifications[peer.destination];
               const age = now
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
               const unreadCount = unread[peer.destination] ?? 0;
+              const armingBlock = confirmBlock === peer.destination;
               return (
                 <li key={peer.destination}>
                   <div
@@ -235,38 +255,79 @@ export function PeerSidebar({
                           ) : null}
                         </span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => onPing(peer.destination)}
-                        disabled={ping?.pending}
-                        aria-label={`Ping ${peer.name}`}
-                        title="Ping peer"
-                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
-                      >
-                        <PingIcon
-                          className={`h-3.5 w-3.5 ${
-                            ping?.pending ? "animate-pulse" : ""
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => onPing(peer.destination)}
+                          disabled={ping?.pending}
+                          aria-label={`Ping ${peer.name}`}
+                          title="Ping peer"
+                          className="grid h-7 w-7 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          <PingIcon
+                            className={`h-3.5 w-3.5 ${
+                              ping?.pending ? "animate-pulse" : ""
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (peer.blocked) {
+                              onUnblock(peer.destination);
+                              return;
+                            }
+                            if (armingBlock) {
+                              setConfirmBlock(null);
+                              onBlock(peer.destination);
+                              return;
+                            }
+                            setConfirmBlock(peer.destination);
+                          }}
+                          disabled={block?.pending}
+                          aria-label={
+                            peer.blocked
+                              ? `Unblock ${peer.name}`
+                              : armingBlock
+                                ? `Confirm blocking ${peer.name}`
+                                : `Block ${peer.name}`
+                          }
+                          title={
+                            peer.blocked
+                              ? `Unblock ${peer.name} — their DMs and Tan posts come back`
+                              : armingBlock
+                                ? `Click again to block ${peer.name}`
+                                : `Block ${peer.name} — their DMs are dropped and their Tan posts hidden`
+                          }
+                          className={`grid h-7 w-7 place-items-center rounded-md border transition disabled:opacity-50 ${
+                            peer.blocked || armingBlock
+                              ? "border-rose-400/50 bg-rose-400/10 text-rose-300 hover:border-rose-400/70"
+                              : "border-line/70 text-mist hover:border-rose-400/50 hover:text-rose-300"
                           }`}
-                        />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onVerify(peer.destination)}
-                        disabled={verification?.pending}
-                        aria-label={`Verify ${peer.name}`}
-                        title={
-                          peer.key_change_at
-                            ? "Re-verify — this peer presented a different key"
-                            : "Verify this peer"
-                        }
-                        className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[10px] transition disabled:opacity-50 ${
-                          peer.key_change_at
-                            ? "border-amber-300/50 text-amber-300 hover:border-amber-300"
-                            : "border-line/70 text-mist hover:border-signal/50 hover:text-signal"
-                        }`}
-                      >
-                        {verification?.pending ? "verifying…" : "Verify"}
-                      </button>
+                        >
+                          <span aria-hidden="true" className="text-sm leading-none">
+                            ⊘
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onShowSafetyNumber(peer.destination)}
+                          disabled={verification?.pending}
+                          aria-label={`Verify ${peer.name}`}
+                          title={
+                            peer.key_change_at
+                              ? "Re-verify — this peer presented a different key"
+                              : "Verify this peer"
+                          }
+                          className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[10px] transition disabled:opacity-50 ${
+                            peer.key_change_at
+                              ? "border-amber-300/50 text-amber-300 hover:border-amber-300"
+                              : "border-line/70 text-mist hover:border-signal/50 hover:text-signal"
+                          }`}
+                        >
+                          {verification?.pending ? "verifying…" : "Verify"}
+                        </button>
+                      </div>
                     </div>
                     {ping ? (
                       <p
@@ -285,11 +346,45 @@ export function PeerSidebar({
                             : `pong ${formatRtt(ping.rtt_ms)}`}
                       </p>
                     ) : null}
-                    {verification?.result ? (
+                    {verification?.safetyNumber && !verification?.result ? (
                       <div className="mt-1 pl-[42px]">
                         <p className="font-mono text-[10px] leading-relaxed text-mist">
                           safety number — compare it with {peer.name} over
-                          another channel; if it matches, this key is theirs
+                          another channel; nothing is recorded until you
+                          confirm it matches
+                        </p>
+                        <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-zinc-200">
+                          {verification.safetyNumber}
+                        </p>
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          <CopyButton
+                            value={verification.safetyNumber}
+                            label="copy number"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => onVerify(peer.destination)}
+                            disabled={verification.pending}
+                            className="rounded-md border border-signal/50 px-2 py-1 font-mono text-[10px] text-signal transition hover:border-signal disabled:opacity-50"
+                          >
+                            Numbers match — mark verified
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onDismissVerification(peer.destination)
+                            }
+                            className="rounded-md border border-line/70 px-2 py-1 font-mono text-[10px] text-mist transition hover:border-line hover:text-zinc-200"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                    {verification?.result ? (
+                      <div className="mt-1 pl-[42px]">
+                        <p className="font-mono text-[10px] leading-relaxed text-mist">
+                          verified — safety number matched with {peer.name}
                         </p>
                         <p className="mt-0.5 break-all font-mono text-[11px] leading-relaxed text-zinc-200">
                           {verification.result.safety_number}
@@ -313,10 +408,60 @@ export function PeerSidebar({
                         {verification.error}
                       </p>
                     ) : null}
+                    {armingBlock && !peer.blocked ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        click again to block {peer.name} — their DMs will be
+                        dropped
+                      </p>
+                    ) : null}
+                    {block?.pending ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-mist">
+                        {peer.blocked ? "unblocking…" : "blocking…"}
+                      </p>
+                    ) : block?.error ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {block.error}
+                      </p>
+                    ) : null}
                   </div>
                 </li>
               );
             })}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl border border-line/80 bg-panel/60 p-4">
+        <div className="flex items-center justify-between">
+          <SectionLabel>groups</SectionLabel>
+          <span className="rounded-full border border-line bg-void/60 px-2 py-0.5 font-mono text-[10px] text-mist">
+            {groups.length}
+          </span>
+        </div>
+
+        {groups.length === 0 ? (
+          <p className="mt-3 text-[11px] leading-relaxed text-mist">
+            No group chats yet. Create one with{" "}
+            <code className="text-zinc-300">
+              tau group create NAME --peer ...
+            </code>
+            ; composing from the console comes later.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {groups.map((group) => (
+              <li
+                key={group.id}
+                className="rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
+              >
+                <p className="truncate text-xs font-medium text-zinc-200">
+                  {group.name}
+                </p>
+                <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
+                  {group.members.map((member) => member.name).join(", ")}
+                </p>
+              </li>
+            ))}
           </ul>
         )}
       </section>

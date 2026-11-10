@@ -68,6 +68,105 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert node.inbox.path.exists()
 
 
+def test_direct_message_keeps_kind(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    payload = encode_message("are you there?", message_id="kind-1", kind="ping")
+    response = call_handler(node._handle_message, payload)
+
+    assert response["ok"] is True
+    assert response["kind"] == "ping"
+    assert received[0]["kind"] == "ping"
+    assert node.inbox.list_messages()[0]["kind"] == "ping"
+
+
+def test_direct_message_without_kind_is_chat(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    # A peer that predates kinds sends no kind field at all: build the
+    # payload by hand instead of through encode_message, which always
+    # stamps the kind now.
+    from tau.protocol import encode as encode_payload
+
+    payload = encode_payload(
+        {"type": "message", "v": 1, "text": "old peer here", "sent_at": 1.0,
+         "id": "kind-2"}
+    )
+    response = call_handler(node._handle_message, payload)
+
+    assert response["ok"] is True
+    assert response["kind"] == "chat"
+    assert node.inbox.list_messages()[0]["kind"] == "chat"
+
+
+def test_direct_message_with_reserved_kind_is_rejected(tmp_path):
+    # "group" and "file" name inbox record types: a DM tagged with
+    # either would fail inbox validation and be silently lost (the
+    # sender already got success, and the seen-id blocks a retry).
+    # The wire parser rejects them instead, before anything is marked
+    # seen — so a retry with a real kind still lands.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+
+    from tau.protocol import encode as encode_payload
+
+    for kind in ("group", "file"):
+        payload = encode_payload(
+            {
+                "type": "message",
+                "v": 1,
+                "text": "reserved kind",
+                "sent_at": 1.0,
+                "id": f"kind-{kind}",
+                "kind": kind,
+            }
+        )
+        response = call_handler(node._handle_message, payload)
+        assert response["ok"] is False
+        assert response["error"]["code"] == "invalid_message"
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+    # Nothing was marked seen: the same id with a valid kind delivers.
+    payload = encode_message("reserved kind", message_id="kind-group", kind="ping")
+    response = call_handler(node._handle_message, payload)
+    assert response["ok"] is True
+    assert node.inbox.list_messages()[0]["kind"] == "ping"
+
+
+def test_relayed_message_keeps_kind(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+
+    message = {
+        "id": "relay-kind-1",
+        "from": destination_hash(sender).hex(),
+        "from_name": "alice",
+        "text": "doorbell rang",
+        "kind": "alert",
+        "sent_at": 42.0,
+    }
+    assert node._deliver_collected(message) is True
+    assert received[0]["kind"] == "alert"
+    assert received[0]["relayed"] is True
+    assert node.inbox.list_messages()[0]["kind"] == "alert"
+
+
 def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -503,7 +602,7 @@ def test_flush_outbox_prioritises_targets_and_caps_peers(tmp_path):
         "delivered": 0,
         "deposited": 0,
     }
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     node.flush_outbox(max_peers=2)
@@ -531,14 +630,14 @@ def test_flush_outbox_respects_delivery_backoff(tmp_path):
 
     attempted = []
 
-    def deliver(p, entry, timeout):
+    def deliver(p, entry, timeout, **kwargs):
         # Mirror the real _deliver_entry: success removes the entry.
         attempted.append(entry.id)
         node.mailbox.remove_outbox(entry.id)
         return True
 
     node._deliver_entry = deliver
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     # The periodic sweep only attempts entries whose backoff has elapsed.
@@ -582,13 +681,13 @@ def test_capped_sweep_prioritises_due_recipients(tmp_path):
 
     attempted = []
 
-    def deliver(p, entry, timeout):
+    def deliver(p, entry, timeout, **kwargs):
         attempted.append(entry.id)
         node.mailbox.remove_outbox(entry.id)
         return True
 
     node._deliver_entry = deliver
-    node._collect_mail = lambda peer, timeout: 0
+    node._collect_mail = lambda peer, timeout, **_kwargs: 0
     node._process_local_held = lambda: 0
 
     summary = node.flush_outbox(max_peers=16)
