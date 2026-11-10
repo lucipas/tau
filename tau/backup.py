@@ -36,7 +36,7 @@ from typing import Dict, List, Tuple
 from . import __version__
 from .config import FILES_DIR_NAME, TauConfig
 from .instance_lock import BackupError, InstanceLock
-from .util import ensure_dir
+from .util import atomic_write_json, ensure_dir, read_json
 
 BACKUP_FORMAT_VERSION = 1
 MANIFEST_NAME = "manifest.json"
@@ -120,6 +120,8 @@ def _received_files(config: TauConfig) -> List[str]:
     Symlinks are never followed: a symlinked ``files/`` directory, a
     symlinked sender directory, or a symlinked file is skipped, so a
     backup can never smuggle in a path outside the data directory.
+    A directory that cannot be listed is an error, never an empty
+    result, so a backup cannot silently omit received files.
     """
     files_dir = config.files_dir
     if files_dir.is_symlink() or not files_dir.is_dir():
@@ -127,15 +129,17 @@ def _received_files(config: TauConfig) -> List[str]:
     members: List[str] = []
     try:
         senders = sorted(files_dir.iterdir(), key=lambda path: path.name)
-    except OSError:
-        return []
+    except OSError as exc:
+        raise BackupError(f"could not list received files in {files_dir}: {exc}") from exc
     for sender_dir in senders:
         if sender_dir.is_symlink() or not sender_dir.is_dir():
             continue
         try:
             entries = sorted(sender_dir.iterdir(), key=lambda path: path.name)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise BackupError(
+                f"could not list received files in {sender_dir}: {exc}"
+            ) from exc
         for entry in entries:
             if entry.is_symlink() or not entry.is_file():
                 continue
@@ -231,6 +235,12 @@ def create_backup(
         manifest_bytes = (
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
+        # Refuse before writing anything a restore could not read back.
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise BackupError(
+                "too many files to back up: the manifest would exceed "
+                f"{MAX_MANIFEST_BYTES} bytes, the restore limit"
+            )
 
         parent = target.parent
         # A missing parent is created private (0o700); an existing one is
@@ -247,11 +257,22 @@ def create_backup(
                     info.mtime = int(datetime.now(timezone.utc).timestamp())
                     archive.addfile(info, io.BytesIO(manifest_bytes))
                     with tempfile.TemporaryDirectory() as scratch:
+                        expanded = 0
                         for name in files:
                             source = destinations[name]
                             if name == SOCIAL_DB_NAME:
                                 source = _snapshot_sqlite(
                                     source, Path(scratch) / SOCIAL_DB_NAME
+                                )
+                            # Restore bounds each member and the total
+                            # expanded payload; enforce the same bounds
+                            # here so a successful backup is restorable.
+                            size = Path(source).stat().st_size
+                            expanded += size
+                            if size > MAX_MEMBER_BYTES or expanded > MAX_TOTAL_BYTES:
+                                raise BackupError(
+                                    f"cannot back up {name!r}: the data directory "
+                                    "exceeds the restore size limit"
                                 )
                             archive.add(source, arcname=name)
                 handle.flush()
@@ -410,6 +431,52 @@ def _stage(
             os.fsync(handle.fileno())
 
 
+def _check_received_dirs(config: TauConfig, received: List[str]) -> None:
+    """Refuse received-file restores whose parent directories are not real.
+
+    Each ``files/<sender>`` member is written beneath ``files/`` and its
+    sender directory; a symlink there would redirect the write outside
+    the data directory.  Called under the instance lock, before staging.
+    """
+    files_dir = config.data_dir / FILES_DIR_NAME
+    if not received:
+        return
+    paths = [files_dir] + [files_dir / Path(name).parts[1] for name in received]
+    for path in dict.fromkeys(paths):
+        if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
+            raise BackupError(
+                f"refusing to restore received files: {path} is a symlink "
+                "or not a directory"
+            )
+
+
+def _rebase_inbox(staged: Path, destinations: Dict[str, Path], files: List[str]) -> None:
+    """Point restored received-file records at their new locations.
+
+    The staged ``inbox.json`` records each file's path from the machine
+    it came from.  A record is repointed only when its own member is in
+    the archive, so the rewritten path always names the installed file.
+    """
+    raw = read_json(staged, default=None)
+    if not isinstance(raw, dict) or not isinstance(raw.get("messages"), list):
+        return
+    members = set(files)
+    changed = False
+    for record in raw["messages"]:
+        if not isinstance(record, dict) or record.get("kind") != "file":
+            continue
+        sender = record.get("destination")
+        name = record.get("name")
+        if not isinstance(sender, str) or not isinstance(name, str):
+            continue
+        member = f"{FILES_DIR_NAME}/{sender}/{name}"
+        if member in members and _is_received_file_member(member):
+            record["path"] = str(destinations[member])
+            changed = True
+    if changed:
+        atomic_write_json(staged, raw, mode=0o600)
+
+
 def _verify_identity(path: Path) -> None:
     # Imported here: identity validation is the one step that needs RNS,
     # and the archive logic above must stay importable without it.
@@ -495,11 +562,6 @@ def restore_backup(
             config, [name for name in files if _is_received_file_member(name)]
         )
         state = _state_paths(destinations)
-        # Received files on disk that the archive does not hold are
-        # stale state too: a --force restore removes them, like any
-        # other included file.
-        for name in _received_files(config):
-            state.setdefault(name, config.data_dir / name)
         # Create the data directory before taking the lock: the lock
         # file lives inside it, so acquiring first would fail on a
         # fresh directory.
@@ -513,6 +575,15 @@ def restore_backup(
         lock = InstanceLock(config.instance_lock_path, config.data_dir)
         lock.acquire()
         try:
+            _check_received_dirs(
+                config, [name for name in files if _is_received_file_member(name)]
+            )
+            # Received files on disk that the archive does not hold are
+            # stale state too: a --force restore removes them, like any
+            # other included file.  Scanned under the lock so a file a
+            # serving node saves before the lock is taken cannot survive.
+            for name in _received_files(config):
+                state.setdefault(name, config.data_dir / name)
             with _identity_lock(config.identity_path):
                 existing = [
                     label for label, path in state.items() if os.path.lexists(path)
@@ -526,6 +597,12 @@ def restore_backup(
                 staged: Dict[Path, Path] = {}
                 try:
                     _stage(archive, files, destinations, staged)
+                    if "inbox.json" in files:
+                        _rebase_inbox(
+                            staged[destinations["inbox.json"]],
+                            destinations,
+                            files,
+                        )
                     _verify_identity(staged[destinations["identity"]])
                     removals = [
                         path
