@@ -803,6 +803,157 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_mute_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        theirs = create_post(conn, other, "bob's update", name="bob", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/muted")
+        assert status == 200
+        assert payload == {"muted": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": theirs["author"]},
+        )
+        assert status == 200
+        assert payload["mute"]["author"] == theirs["author"]
+        first_muted_at = payload["mute"]["muted_at"]
+
+        # The muted author's posts leave the timeline at once.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(bridge, "/api/tan/muted")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["muted"][0]["name"] == "bob"
+        assert payload["muted"][0]["posts"] == 1
+
+        # Re-muting is a no-op: the original mute time is kept.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": "bob"},
+        )
+        assert status == 200
+        assert payload["mute"]["muted_at"] == first_muted_at
+        status, _, relisted = _json(bridge, "/api/tan/muted")
+        assert relisted["muted"][0]["muted_at"] == first_muted_at
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute",
+            method="POST",
+            body={"target": "bob"},
+        )
+        assert status == 200
+        assert payload["mute"]["unmuted"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's update",
+            "hello from tan",
+        ]
+
+        # Unmuting again reports that nothing was muted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute",
+            method="POST",
+            body={"target": theirs["author"]},
+        )
+        assert payload["mute"]["unmuted"] is False
+
+        # Muting yourself is refused, like the CLI.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": mine["author"]},
+        )
+        assert status == 400
+        assert "cannot mute yourself" in payload["error"]["message"]
+
+        # Unknown authors and missing fields are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": "nobody-here"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/mute", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'target' is required" in payload["error"]["message"]
+
+        # Keyword mutes hide matching posts and list back.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-keyword",
+            method="POST",
+            body={"keyword": "hello"},
+        )
+        assert status == 200
+        assert payload["mute"]["keyword"] == "hello"
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == ["bob's update"]
+
+        status, _, payload = _json(bridge, "/api/tan/muted-keywords")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["muted_keywords"][0]["display"] == "hello"
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute-keyword",
+            method="POST",
+            body={"keyword": "HELLO"},
+        )
+        assert status == 200
+        assert payload["mute"]["unmuted"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's update",
+            "hello from tan",
+        ]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-keyword",
+            method="POST",
+            body={"keyword": "   "},
+        )
+        assert status == 400
+        assert "field 'keyword' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_search_via_api(tmp_path):
     import RNS
 
@@ -1496,6 +1647,8 @@ def test_tan_thread_unexpected_failure_is_500(tmp_path, monkeypatch):
         assert payload["error"]["message"] == "internal error"
     finally:
         bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

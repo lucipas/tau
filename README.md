@@ -154,6 +154,12 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
+| `/api/tan/muted` | GET | muted authors and their post counts |
+| `/api/tan/mute` | POST | mute `{"target": "alice"}` |
+| `/api/tan/unmute` | POST | unmute `{"target": "alice"}` |
+| `/api/tan/muted-keywords` | GET | muted keywords |
+| `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
+| `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
 | `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
 | `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |

@@ -1,17 +1,22 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
+import { shortHash } from "@/lib/format";
 import type { TanPost } from "@/lib/types";
 
 import { PostCard, SocialConsole } from "./social-console";
+
+const mockTan = vi.hoisted(() => ({
+  current: {} as Record<string, unknown>,
+}));
 
 // The search and mentions tests render the whole console, so the data
 // hook and the Next link are mocked; the PostCard tests above never
 // touch either.
 vi.mock("@/lib/use-tan", () => ({
-  useTan: vi.fn(),
+  useTan: vi.fn(() => mockTan.current),
 }));
 
 import { useTan } from "@/lib/use-tan";
@@ -34,7 +39,6 @@ vi.mock("next/link", () => ({
     </a>
   ),
 }));
-
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -269,6 +273,178 @@ describe("PostCard quote rendering", () => {
   });
 });
 
+describe("PostCard mute control", () => {
+  function renderCard(post: TanPost, onMute = vi.fn()) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+        onMute={onMute}
+      />,
+    );
+    return onMute;
+  }
+
+  it("shows a mute button on other authors' posts and calls onMute", () => {
+    const post = makePost({ own: false });
+    const onMute = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Mute this author"));
+    expect(onMute).toHaveBeenCalledTimes(1);
+    expect(onMute).toHaveBeenCalledWith(post);
+  });
+
+  it("hides the mute control on your own posts", () => {
+    renderCard(makePost({ own: true }));
+
+    expect(screen.queryByTitle("Mute this author")).toBeNull();
+  });
+
+  it("shows a disabled state while a mute is in flight", () => {
+    const post = makePost({ own: false });
+    const onMute = vi.fn();
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+        onMute={onMute}
+        muting
+      />,
+    );
+
+    expect(screen.getByText("muting…")).toBeTruthy();
+    expect(screen.queryByTitle("Mute this author")).toBeNull();
+    fireEvent.click(screen.getByText("muting…"));
+    expect(onMute).not.toHaveBeenCalled();
+  });
+});
+
+describe("SocialConsole muted sidebar", () => {
+  const authorHash = "a".repeat(64);
+
+  function setTan(overrides: Record<string, unknown>) {
+    mockTan.current = {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      all: false,
+      setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      ...overrides,
+    };
+    return mockTan.current;
+  }
+
+  it("shows the empty state when nothing is muted", () => {
+    setTan({});
+    render(<SocialConsole />);
+
+    expect(screen.getByText(/Nothing muted\./)).toBeTruthy();
+  });
+
+  it("lists muted authors and keywords and unmutes each by its key", () => {
+    const tan = setTan({
+      mutedAuthors: [
+        { author: authorHash, name: "bob", muted_at: 1, posts: 3, seq: 3, last_post: 1 },
+      ],
+      mutedKeywords: [
+        { keyword: "crypto", display: "Crypto", added_at: 1 },
+      ],
+    });
+    render(<SocialConsole />);
+
+    expect(screen.queryByText(/Nothing muted\./)).toBeNull();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText(`${shortHash(authorHash, 10)} · 3 posts`)).toBeTruthy();
+    expect(screen.getByText("“Crypto”")).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("unmute this author"));
+    expect(tan.unmuteAuthor).toHaveBeenCalledWith(authorHash);
+
+    fireEvent.click(screen.getByTitle("unmute this keyword"));
+    expect(tan.unmuteKeyword).toHaveBeenCalledWith("Crypto");
+  });
+
+  it("submits a typed keyword through muteKeyword", () => {
+    const tan = setTan({});
+    render(<SocialConsole />);
+
+    fireEvent.change(screen.getByPlaceholderText("mute a word or phrase"), {
+      target: { value: "bitcoin" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "mute" }));
+    expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
+  });
+
+  it("keeps text typed while a keyword mute is in flight", async () => {
+    let resolveMute!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      resolveMute = resolve;
+    });
+    const tan = setTan({ muteKeyword: vi.fn(() => pending) });
+    render(<SocialConsole />);
+
+    const input = screen.getByPlaceholderText("mute a word or phrase");
+    fireEvent.change(input, { target: { value: "bitcoin" } });
+    fireEvent.click(screen.getByRole("button", { name: "mute" }));
+    expect(tan.muteKeyword).toHaveBeenCalledWith("bitcoin");
+
+    // Typing continues while the request is in flight; the clear after
+    // success must only drop the text that was actually muted.
+    fireEvent.change(input, { target: { value: "bitcoin ethereum" } });
+    await act(async () => {
+      resolveMute({ ok: true });
+    });
+
+    expect(
+      (screen.getByPlaceholderText("mute a word or phrase") as HTMLInputElement)
+        .value,
+    ).toBe("bitcoin ethereum");
+  });
+});
+
 
 describe("SocialConsole search", () => {
   const mockSearch = vi.fn();
@@ -281,6 +457,8 @@ describe("SocialConsole search", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
       showMentions: false,
@@ -295,6 +473,10 @@ describe("SocialConsole search", () => {
       publish: vi.fn(),
       follow: vi.fn(),
       unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       deletePost: vi.fn(),
@@ -310,6 +492,8 @@ describe("SocialConsole search", () => {
       savedHasMore: false,
       loadSaved: vi.fn(),
       loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
       ...overrides,
     };
   }
@@ -372,6 +556,8 @@ describe("SocialConsole mentions view", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
       showMentions: false,
@@ -386,6 +572,10 @@ describe("SocialConsole mentions view", () => {
       publish: vi.fn(),
       follow: vi.fn(),
       unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
       deletePost: vi.fn(),
@@ -401,6 +591,8 @@ describe("SocialConsole mentions view", () => {
       savedHasMore: false,
       loadSaved: vi.fn(),
       loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
       ...overrides,
     };
   }

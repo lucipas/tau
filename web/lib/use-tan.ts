@@ -6,6 +6,10 @@ import { apiGet, apiPost } from "./api";
 import type {
   TanFollow,
   TanFollowingResponse,
+  TanMutedAuthor,
+  TanMutedKeyword,
+  TanMutedKeywordsResponse,
+  TanMutedResponse,
   TanPost,
   TanPostResponse,
   TanSavedResponse,
@@ -25,6 +29,8 @@ export function useTan() {
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
+  const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
@@ -95,7 +101,9 @@ export function useTan() {
     try {
       const activeSearch = searchQueryRef.current;
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [feed, follows] = await Promise.all([
+      // A failed mute list keeps its previous contents rather than blocking
+      // the timeline and following refresh.
+      const [feed, follows, muted, mutedKeywords] = await Promise.all([
         activeSearch !== null
           ? apiGet<TanTimelineResponse>(
               `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
@@ -104,6 +112,10 @@ export function useTan() {
             ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
           : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
+        apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
+        apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
+          () => null,
+        ),
       ]);
       if (generationRef.current !== generation) return false;
       if (activeSearch !== null) {
@@ -114,6 +126,10 @@ export function useTan() {
         setPosts(feed.posts);
       }
       setFollowing(follows.following);
+      if (muted !== null) setMutedAuthors(muted.muted ?? []);
+      if (mutedKeywords !== null) {
+        setMutedKeywords(mutedKeywords.muted_keywords ?? []);
+      }
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
       // like, or a delete) shows without reopening the thread. A
@@ -416,6 +432,38 @@ export function useTan() {
     [load],
   );
 
+  const muteAuthor = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/mute", { target });
+      await load();
+    },
+    [load],
+  );
+
+  const unmuteAuthor = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unmute", { target });
+      await load();
+    },
+    [load],
+  );
+
+  const muteKeyword = useCallback(
+    async (keyword: string) => {
+      await apiPost("/api/tan/mute-keyword", { keyword });
+      await load();
+    },
+    [load],
+  );
+
+  const unmuteKeyword = useCallback(
+    async (keyword: string) => {
+      await apiPost("/api/tan/unmute-keyword", { keyword });
+      await load();
+    },
+    [load],
+  );
+
   const like = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/like", { target });
@@ -459,6 +507,8 @@ export function useTan() {
     searchQuery,
     mentions,
     following,
+    mutedAuthors,
+    mutedKeywords,
     saved,
     savedLoading,
     savedHasMore,
@@ -486,6 +536,10 @@ export function useTan() {
     publish,
     follow,
     unfollow,
+    muteAuthor,
+    unmuteAuthor,
+    muteKeyword,
+    unmuteKeyword,
     like,
     unlike,
     deletePost,

@@ -3529,6 +3529,38 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
+def author_stats_many(
+    conn: sqlite3.Connection, authors: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """:func:`author_stats` for many authors, using two grouped queries.
+
+    Returns the same per-author values :func:`author_stats` would, keyed
+    by author hash; authors with no cached posts get zero values.
+    """
+    clean = [_require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors]
+    stats: Dict[str, Dict[str, Any]] = {
+        author: {"author": author, "posts": 0, "seq": 0, "last_post": 0.0}
+        for author in clean
+    }
+    if not clean:
+        return stats
+    placeholders = ",".join("?" for _ in clean)
+    for row in conn.execute(
+        "SELECT author, COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
+        f"FROM posts WHERE linked = 1 AND kind = 'post' AND {_NOT_DELETED} "
+        f"AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])].update(
+            posts=int(row["posts"]), last_post=float(row["last_post"])
+        )
+    for row in conn.execute(
+        "SELECT author, COALESCE(MAX(seq), 0) AS seq FROM posts "
+        f"WHERE linked = 1 AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])]["seq"] = int(row["seq"])
+    return stats
 def list_authors(
     conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
 ) -> List[Dict[str, Any]]:

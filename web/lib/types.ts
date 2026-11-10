@@ -243,6 +243,31 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanMutedAuthor {
+  author: string;
+  name: string;
+  muted_at: number;
+  posts?: number;
+  seq?: number;
+  last_post?: number;
+}
+
+export interface TanMutedKeyword {
+  keyword: string;
+  display: string;
+  added_at: number;
+}
+
+export interface TanMutedResponse {
+  muted: TanMutedAuthor[];
+  count: number;
+}
+
+export interface TanMutedKeywordsResponse {
+  muted_keywords: TanMutedKeyword[];
+  count: number;
+}
+
 export interface TanPostResponse {
   ok: boolean;
   post: TanPost;
