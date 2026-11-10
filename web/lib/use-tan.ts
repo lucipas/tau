@@ -432,6 +432,14 @@ export function useTan() {
     [load, refreshSavedIfLoaded],
   );
 
+  const repost = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/repost", { target });
+      await Promise.all([load(), refreshSavedIfLoaded()]);
+    },
+    [load, refreshSavedIfLoaded],
+  );
+
   const deletePost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/delete", { target });
@@ -488,6 +496,7 @@ export function useTan() {
     unfollow,
     like,
     unlike,
+    repost,
     deletePost,
     sync,
   };

@@ -62,6 +62,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
         deleting={false}
@@ -83,6 +84,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
         deleting={false}
@@ -101,6 +103,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost({ own: false })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -116,6 +119,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
         deleting
@@ -135,6 +139,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -249,6 +254,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 2 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -260,6 +266,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 0 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -297,6 +304,7 @@ describe("SocialConsole search", () => {
       unfollow: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -388,6 +396,7 @@ describe("SocialConsole mentions view", () => {
       unfollow: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -462,6 +471,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onToggleSave={onToggleSave}
         onReply={() => {}}
         onDelete={vi.fn()}
@@ -493,6 +503,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}

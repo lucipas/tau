@@ -151,6 +151,7 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/repost` | POST | repost `{"target": "<post hash>"}` |
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |

@@ -1596,6 +1596,93 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_repost_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, feed, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+        mine = create_post(conn, identity, "my own thought", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["repost"]["kind"] == "repost"
+        assert payload["repost"]["target"] == foreign["hash"]
+
+        # The timeline now carries the repost, and the original is
+        # marked as reposted by you.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["reposted"] is True
+        assert by_text["worth sharing"]["reposts"] == 1
+
+        # Reposting the same post again is refused while the first
+        # repost still stands.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"]},
+        )
+        assert status == 400
+        assert "already been reposted" in payload["error"]["message"]
+
+        # Your own post cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 400
+        assert "own post" in payload["error"]["message"]
+
+        # A post this node has never seen cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": "cd" * 32},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target is a bad request, not a server error.
+        status, _, payload = _json(
+            bridge, "/api/tan/repost", method="POST", body={}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+    conn = init_db(node.config.social_db_path)
+    try:
+        entries = feed(conn, author=foreign["author"])
+    finally:
+        conn.close()
+    assert [entry["kind"] for entry in entries] == ["post"]
+
+
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),

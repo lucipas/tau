@@ -89,6 +89,15 @@ export function SocialConsole() {
     }
   }
 
+  async function submitRepost(post: TanPost) {
+    setError(null);
+    try {
+      await tan.repost(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not repost");
+    }
+  }
+
   async function toggleSave(post: TanPost) {
     setError(null);
     try {
@@ -419,6 +428,7 @@ export function SocialConsole() {
                     loading={tan.threadLoading}
                     error={tan.threadError ?? tan.error}
                     onToggleLike={toggleLike}
+                    onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
@@ -440,6 +450,7 @@ export function SocialConsole() {
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
@@ -473,6 +484,7 @@ export function SocialConsole() {
                         key={post.hash}
                         post={post}
                         onToggleLike={toggleLike}
+                        onRepost={submitRepost}
                         onToggleSave={toggleSave}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
@@ -493,6 +505,7 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onRepost={submitRepost}
                       onToggleSave={toggleSave}
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
@@ -608,6 +621,7 @@ function ThreadView({
   loading,
   error,
   onToggleLike,
+  onRepost,
   onReply,
   onDelete,
   onOpenThread,
@@ -617,6 +631,7 @@ function ThreadView({
   loading: boolean;
   error: string | null;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
@@ -639,6 +654,7 @@ function ThreadView({
             key={post.hash}
             post={post}
             onToggleLike={onToggleLike}
+            onRepost={onRepost}
             onReply={onReply}
             onDelete={onDelete}
             deleting={deleting.has(post.hash)}
@@ -708,9 +724,22 @@ function SavedEmptyState() {
   );
 }
 
+// Whether the console offers a Repost button for this card. The store
+// only accepts posts and replies as repost targets (a missing kind reads
+// as a plain post, the same default the store uses), and refuses your own
+// posts, posts you already reposted, and deleted posts — so the button
+// stays hidden there and the count chip remains a plain display.
+function canRepost(post: TanPost): boolean {
+  if (post.deleted || post.own || post.reposted) return false;
+  return (
+    post.kind === undefined || post.kind === "post" || post.kind === "reply"
+  );
+}
+
 export function PostCard({
   post,
   onToggleLike,
+  onRepost,
   onToggleSave,
   onReply,
   onDelete,
@@ -719,6 +748,7 @@ export function PostCard({
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
   onToggleSave?: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
@@ -855,16 +885,27 @@ export function PostCard({
                 ♥ {post.likes ?? 0}
               </button>
             )}
-            <span
-              title={post.reposted ? "You reposted this" : "Reposts"}
-              className={`rounded border px-1.5 py-0.5 ${
-                post.reposted
-                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
-                  : "border-line/70 bg-panel/60"
-              }`}
-            >
-              ↻ {post.reposts ?? 0}
-            </span>
+            {canRepost(post) ? (
+              <button
+                type="button"
+                onClick={() => onRepost(post)}
+                title="Repost this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-emerald-300"
+              >
+                ↻ {post.reposts ?? 0}
+              </button>
+            ) : (
+              <span
+                title={post.reposted ? "You reposted this" : "Reposts"}
+                className={`rounded border px-1.5 py-0.5 ${
+                  post.reposted
+                    ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                    : "border-line/70 bg-panel/60"
+                }`}
+              >
+                ↻ {post.reposts ?? 0}
+              </span>
+            )}
             {(post.quotes ?? 0) > 0 ? (
               <span
                 title="Quotes of this post"

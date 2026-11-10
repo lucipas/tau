@@ -226,6 +226,33 @@ describe("useTan saved posts", () => {
 });
 
 
+describe("useTan repost", () => {
+  it("posts the hash to /api/tan/repost and reloads the feed", async () => {
+    const post = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [post], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([post]));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    await act(async () => {
+      await result.current.repost(post.hash);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/repost", {
+      target: post.hash,
+    });
+    // The feed is reloaded after the repost, so the card shows the
+    // reposted state and the repost itself appears in the timeline.
+    expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
+  });
+});
+
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
     const mine = makePost();
