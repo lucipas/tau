@@ -8,6 +8,7 @@ import type { TanPost } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
+import { RulesSection } from "./rules-section";
 
 export function SocialConsole() {
   const tan = useTan();
@@ -225,6 +226,15 @@ export function SocialConsole() {
                 </p>
               ) : null}
             </section>
+
+            <RulesSection
+              rules={tan.rules}
+              availableKinds={tan.availableKinds}
+              loading={tan.rulesLoading}
+              error={tan.rulesError}
+              onUpdate={tan.updateRules}
+              onRefresh={tan.refreshRules}
+            />
           </aside>
 
           <div className="flex min-w-0 flex-col">

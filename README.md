@@ -151,6 +151,8 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/rules` | GET | current Tan admission ruleset and the kinds that can be displayed |
+| `/api/tan/rules` | POST | replace the ruleset (applies to the running node at once) |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
@@ -741,8 +743,9 @@ author is always admitted, the block list denies, the allow list and
 default policy. Entries you create yourself are never filtered, and with
 no rules file everything is admitted, as before. A rules file that
 cannot be parsed fails closed (remote entries denied) rather than
-silently opening the node up. A running `serve` applies saved rules
-when it restarts.
+silently opening the node up. The web console's admission-rules section
+(`GET`/`POST /api/tan/rules`) applies a change to the running node at
+once; rules saved from the CLI apply when `serve` restarts.
 
 ### DM allow-list
 

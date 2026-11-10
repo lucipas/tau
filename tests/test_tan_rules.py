@@ -73,6 +73,20 @@ def test_decide_matrix(identities):
     assert followed_only.decide(bob_hash, followed=[bob_hash]) is True
 
 
+def test_reload_ruleset_rereads_file(identities, tmp_path):
+    alice, _bob = identities
+    config = TauConfig.resolve(data_dir=tmp_path, name="alice")
+    app = TanApp(config, alice, name="alice", gossip=False)
+
+    # The first access caches the default admit-all ruleset.
+    assert app.ruleset.default_allow is True
+    save_ruleset(config.tan_rules_path, Ruleset(default_allow=False))
+    # Still cached until reloaded: a file change alone is not enough.
+    assert app.ruleset.default_allow is True
+    app.reload_ruleset()
+    assert app.ruleset.default_allow is False
+
+
 def test_ruleset_persistence_roundtrip(tmp_path, identities):
     _, bob = identities
     path = tmp_path / "tan-rules.json"

@@ -45,6 +45,17 @@ function makePost(overrides: Partial<TanPost> = {}): TanPost {
 
 const emptyFollowing = { following: [], count: 0 };
 
+const emptyRules = {
+  rules: {
+    default: "allow",
+    allow_authors: [],
+    block_authors: [],
+    allow_followed: false,
+    kinds: null,
+  },
+  available_kinds: [],
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
 });
@@ -82,15 +93,20 @@ describe("useTan deletePost", () => {
       const firstFollowing = deferred();
       const queue = [first, firstFollowing];
       let next = 0;
-      mockedGet.mockImplementation(() => queue[next++].promise);
+      mockedGet.mockImplementation((path: string) =>
+        path === "/api/tan/rules"
+          ? Promise.resolve(emptyRules)
+          : queue[next++].promise,
+      );
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      expect(mockedGet.mock.calls.length).toBe(2);
+      // Two feed calls plus the one rules load.
+      expect(mockedGet.mock.calls.length).toBe(3);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(2);
+      expect(mockedGet.mock.calls.length).toBe(3);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
@@ -107,7 +123,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(2);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(3);
     } finally {
       vi.useRealTimers();
     }
@@ -118,7 +134,11 @@ describe("useTan deletePost", () => {
     const second = makePost({ hash: "b".repeat(64), text: "second" });
     const queue = [deferred(), deferred(), deferred(), deferred()];
     let next = 0;
-    mockedGet.mockImplementation(() => queue[next++].promise);
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/rules"
+        ? Promise.resolve(emptyRules)
+        : queue[next++].promise,
+    );
 
     const { result } = renderHook(() => useTan());
     // The initial load is in flight; start a newer one before it resolves.

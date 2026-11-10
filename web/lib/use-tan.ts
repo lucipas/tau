@@ -8,6 +8,9 @@ import type {
   TanFollowingResponse,
   TanPost,
   TanPostResponse,
+  TanRules,
+  TanRulesResponse,
+  TanRulesUpdateResponse,
   TanSyncResponse,
   TanTimelineResponse,
 } from "./types";
@@ -22,6 +25,10 @@ export function useTan() {
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rules, setRules] = useState<TanRules | null>(null);
+  const [availableKinds, setAvailableKinds] = useState<string[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(true);
+  const [rulesError, setRulesError] = useState<string | null>(null);
 
   // The filter the timeline is showing right now. Actions refresh through
   // this ref instead of a captured `all`, so a filter switch mid-action
@@ -104,6 +111,49 @@ export function useTan() {
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // Admission rules change rarely, so they load once and on demand
+  // rather than on the feed's poll: a rules edit on the CLI shows up
+  // after a manual refresh (or a page reload), not mid-scroll.
+  const refreshRules = useCallback(async () => {
+    try {
+      const result = await apiGet<TanRulesResponse>("/api/tan/rules");
+      if (!result || typeof result.rules !== "object" || result.rules === null) {
+        throw new Error("could not load rules");
+      }
+      setRules(result.rules);
+      setAvailableKinds(
+        Array.isArray(result.available_kinds) ? result.available_kinds : [],
+      );
+      setRulesError(null);
+    } catch (caught) {
+      setRulesError(
+        caught instanceof Error ? caught.message : "could not load rules",
+      );
+    } finally {
+      setRulesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshRules();
+  }, [refreshRules]);
+
+  const updateRules = useCallback(
+    async (next: TanRules) => {
+      const result = await apiPost<TanRulesUpdateResponse>(
+        "/api/tan/rules",
+        // apiPost takes a plain JSON object; a TanRules is exactly that.
+        { ...next } as Record<string, unknown>,
+      );
+      setRules(result.rules);
+      setRulesError(null);
+      // A kinds change re-filters the timeline; reload it at once.
+      await load();
+      return result.rules;
+    },
+    [load],
+  );
 
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
@@ -190,7 +240,13 @@ export function useTan() {
     posting,
     syncing,
     error,
+    rules,
+    availableKinds,
+    rulesLoading,
+    rulesError,
     refresh,
+    refreshRules,
+    updateRules,
     publish,
     follow,
     unfollow,

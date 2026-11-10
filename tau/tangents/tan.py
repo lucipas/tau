@@ -3744,6 +3744,16 @@ class TanApp:
                 self._ruleset = Ruleset(default_allow=False)
         return self._ruleset
 
+    def reload_ruleset(self) -> None:
+        """Drop the cached admission ruleset so the next access re-reads it.
+
+        Lets a ruleset change made in-process — for example from the web
+        console — apply to the running node at once instead of waiting
+        for a restart. A rules file that cannot be parsed still fails
+        closed on the next load, through the ``ruleset`` property.
+        """
+        self._ruleset = None
+
     def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
         ruleset = self.ruleset
         followed: Iterable[str] = ()
