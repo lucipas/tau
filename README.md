@@ -141,6 +141,8 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/settings` | GET | node settings (`accept_files`, `send_read_receipts`) |
+| `/api/settings` | POST | change one setting `{"setting": "accept_files", "value": true}` |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/following` | GET | followed authors and their post counts |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |

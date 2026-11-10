@@ -9,6 +9,7 @@ import type {
   GroupsResponse,
   MarkReadResponse,
   NodeInfo,
+  NodeSettings,
   OutboxEntry,
   OutboxResponse,
   Peer,
@@ -18,6 +19,7 @@ import type {
   TauGroup,
   TauMessage,
   UnreadCounts,
+  UpdateSettingsResponse,
 } from "./types";
 
 export type ConnectionState =
@@ -53,6 +55,7 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [settings, setSettings] = useState<NodeSettings | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
@@ -183,6 +186,16 @@ export function useTau() {
 
   const refreshSeq = useRef(0);
   const groupsSeq = useRef(0);
+  const settingsSeq = useRef(0);
+
+  const refreshSettings = useCallback(async () => {
+    // Same polling shape as the outbox: a setting changed on the CLI
+    // shows up here without waiting for a reload.
+    const requestId = ++settingsSeq.current;
+    const result = await apiGet<NodeSettings>("/api/settings");
+    if (requestId !== settingsSeq.current) return;
+    setSettings(result);
+  }, []);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -220,6 +233,13 @@ export function useTau() {
       } catch {
         if (disposed) return;
       }
+      try {
+        await refreshSettings();
+      } catch {
+        // Settings are a side panel like the outbox: a failed poll
+        // leaves the last known values in place.
+        if (disposed) return;
+      }
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
@@ -227,7 +247,7 @@ export function useTau() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshGroups]);
+  }, [connection, refreshOutbox, refreshGroups, refreshSettings]);
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -250,6 +270,26 @@ export function useTau() {
       return result.cancelled;
     },
     [refreshOutbox],
+  );
+
+  const updateSetting = useCallback(
+    async (setting: keyof NodeSettings, value: boolean) => {
+      const result = await apiPost<UpdateSettingsResponse>("/api/settings", {
+        setting,
+        value,
+      });
+      // The update already succeeded: apply the returned settings at
+      // once, and treat the follow-up refresh as best-effort so a
+      // failed GET cannot make a successful change look like a failure.
+      setSettings(result.settings);
+      try {
+        await refreshSettings();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.settings;
+    },
+    [refreshSettings],
   );
 
   const send = useCallback(
@@ -333,6 +373,7 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    settings,
     bridge,
     connection,
     pings,
@@ -343,6 +384,8 @@ export function useTau() {
     markRead,
     refreshOutbox,
     refreshGroups,
+    refreshSettings,
+    updateSetting,
     cancelOutbox,
   };
 }
