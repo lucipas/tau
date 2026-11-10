@@ -472,6 +472,10 @@ class WebBridge:
 
         self.bus = EventBus()
         self._lock = threading.Lock()
+        # A full-store audit verifies every signature, so only one runs
+        # at a time; a second caller is told the audit is busy instead
+        # of queuing behind it and stalling the console's worker threads.
+        self._verify_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
@@ -1112,6 +1116,9 @@ class WebBridge:
 
         Opens the store read-only, like ``tau tan verify``: verifying
         must never create a missing store or write to an existing one.
+        Only one audit runs at a time; a second caller gets a
+        ``WebBridgeError`` (answered 429) instead of queuing behind a
+        full-store signature check.
         """
         import sqlite3
 
@@ -1119,15 +1126,20 @@ class WebBridge:
 
         path = self._tan_db_path()
         if not path.is_file():
-            raise WebBridgeError(f"no Tan store at {path}")
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0
-        )
-        conn.row_factory = sqlite3.Row
+            raise FileNotFoundError(f"no Tan store at {path}")
+        if not self._verify_lock.acquire(blocking=False):
+            raise WebBridgeError("a store audit is already running")
         try:
-            return verify_store(conn)
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                return verify_store(conn)
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            self._verify_lock.release()
 
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
@@ -1830,7 +1842,11 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/tan/verify":
                 try:
                     report = self.bridge.tan_verify()
-                except Exception as exc:
+                except FileNotFoundError as exc:
+                    # Expected state (no store yet). Anything else
+                    # propagates to _handle, which logs the traceback
+                    # and answers 500 instead of dressing an audit
+                    # failure up as a client mistake.
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json(report, head_only)

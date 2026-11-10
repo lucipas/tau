@@ -755,6 +755,63 @@ def test_tan_verify_without_a_store_is_an_error(tmp_path):
         bridge.stop()
 
 
+def test_tan_verify_rejects_a_second_concurrent_audit(tmp_path, monkeypatch):
+    import threading
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents import tan as tan_module
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "first post", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    # Hold the first audit inside verify_store so a second request
+    # arrives while it is still running.
+    entered = threading.Event()
+    release = threading.Event()
+    real_verify = tan_module.verify_store
+
+    def blocking_verify(conn):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_verify(conn)
+
+    monkeypatch.setattr(tan_module, "verify_store", blocking_verify)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        results = {}
+
+        def first_audit():
+            results["first"] = _json(bridge, "/api/tan/verify")
+
+        worker = threading.Thread(target=first_audit, daemon=True)
+        worker.start()
+        assert entered.wait(timeout=10)
+
+        status, _, payload = _json(bridge, "/api/tan/verify")
+        assert status == 429
+        assert "already running" in payload["error"]["message"]
+
+        release.set()
+        worker.join(timeout=10)
+        status, _, payload = results["first"]
+        assert status == 200
+        assert payload["ok"] is True
+    finally:
+        release.set()
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

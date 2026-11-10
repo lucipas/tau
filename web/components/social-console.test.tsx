@@ -146,6 +146,37 @@ describe("VerifyResult", () => {
       screen.getByText("post hash does not match its contents"),
     ).toBeTruthy();
   });
+
+  it("renders two faults on one post as separate rows", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "sequence jumps from 1 to 3",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 2 problems in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+    expect(screen.getByText("sequence jumps from 1 to 3")).toBeTruthy();
+  });
 });
 
 describe("PostCard quote rendering", () => {

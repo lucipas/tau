@@ -16,11 +16,9 @@ export function SocialConsole() {
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // The last store audit, if one has run. Kept separate from `message`
-  // so a sync result never overwrites a verify result (or vice versa).
-  const [verifyReport, setVerifyReport] = useState<TanVerifyReport | null>(
-    null,
-  );
+  // Audit failures render beside the verify button, not under the
+  // post composer: the shared error state is too far from the action.
+  const [verifyError, setVerifyError] = useState<string | null>(null);
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -95,12 +93,13 @@ export function SocialConsole() {
   }
 
   async function submitVerify() {
-    setError(null);
+    setVerifyError(null);
     try {
-      setVerifyReport(await tan.verify());
+      await tan.verify();
     } catch (caught) {
-      setVerifyReport(null);
-      setError(caught instanceof Error ? caught.message : "verify failed");
+      setVerifyError(
+        caught instanceof Error ? caught.message : "verify failed",
+      );
     }
   }
 
@@ -259,7 +258,14 @@ export function SocialConsole() {
               >
                 {tan.verifying ? "verifying…" : "verify store"}
               </button>
-              {verifyReport ? <VerifyResult report={verifyReport} /> : null}
+              {verifyError ? (
+                <p className="mt-2 font-mono text-[10px] leading-relaxed text-rose-300">
+                  {verifyError}
+                </p>
+              ) : null}
+              {tan.verifyReport ? (
+                <VerifyResult report={tan.verifyReport} />
+              ) : null}
             </section>
           </aside>
 
@@ -423,9 +429,11 @@ export function VerifyResult({ report }: { report: TanVerifyReport }) {
         {report.problems.length === 1 ? "" : "s"} in {report.entries} entries
       </p>
       <ul className="space-y-1.5">
-        {report.problems.map((problem) => (
+        {report.problems.map((problem, index) => (
           <li
-            key={problem.hash}
+            // One entry can carry several faults (a bad hash and a
+            // chain fault, say), so the hash alone is not a unique key.
+            key={`${problem.hash}:${index}`}
             className="rounded-lg border border-rose-400/30 bg-rose-400/5 px-2.5 py-2"
           >
             <p className="font-mono text-[10px] text-rose-200">
