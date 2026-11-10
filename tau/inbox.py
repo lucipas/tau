@@ -961,7 +961,11 @@ class Inbox:
         entries already in the inbox are counted as present rather than
         stored twice.  The whole merge runs in one transaction, so a
         concurrent ``tau serve`` cannot lose entries, and the
-        per-direction 500-record caps still apply.
+        per-direction 500-record caps still apply.  Imported records
+        get local arrival sequences (an export carries the source
+        node's, which mean nothing here), and a failed persist raises
+        :class:`OSError` instead of reporting a restore that never
+        landed — the in-memory merge is rolled back with it.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -980,6 +984,7 @@ class Inbox:
         imported = present = skipped = 0
         errors: List[Dict[str, Any]] = []
         with self._transaction():
+            previous = list(self._messages)
             seen = {_dedupe_key(item) for item in self._messages}
             for entry in entries:
                 record = _valid_record(entry)
@@ -1003,7 +1008,13 @@ class Inbox:
                 self._messages.append(record)
                 imported += 1
             self._messages = _retain(self._messages)
-            self._save()
+            _number_sequence(self._messages)
+            if not self._save():
+                # The merge lives in memory only; restore the pre-merge
+                # state so a later read does not show messages that were
+                # never stored.
+                self._messages = previous
+                raise OSError(f"could not persist inbox to {self.path}")
         return {
             "imported": imported,
             "present": present,

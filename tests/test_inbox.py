@@ -351,6 +351,50 @@ def test_duplicate_only_import_keeps_mixed_inbox_over_the_cap(tmp_path):
     }
 
 
+def test_import_assigns_local_sequences(tmp_path):
+    """Imported records get a local seq so a later append works.
+
+    An export carries the source node's sequences (or none at all);
+    without renumbering, the next append's max() over a None seq
+    raises TypeError.
+    """
+    inbox = Inbox()  # in-memory: no load renumbers anything
+    result = inbox.import_messages(
+        {
+            "format": "tau-messages-export",
+            "version": 1,
+            "messages": [_record(id="imported")],
+        }
+    )
+    assert result["imported"] == 1
+    assert [entry["seq"] for entry in inbox.list_messages()] == [1]
+
+    appended = inbox.append(_record(id="local"))
+    assert appended["seq"] == 2
+    assert [entry["id"] for entry in inbox.list_messages()] == ["local", "imported"]
+
+
+def test_import_raises_when_the_save_fails(tmp_path, monkeypatch):
+    """A save failure raises instead of reporting a restore."""
+    import tau.inbox
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="kept"))
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _fail)
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id="new")],
+    }
+    with pytest.raises(OSError, match="could not persist inbox"):
+        inbox.import_messages(document)
+    # The unstored import is rolled back in memory too.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["kept"]
+
+
 def test_load_skips_huge_timestamp_without_crashing(tmp_path):
     path = tmp_path / "inbox.json"
     path.write_text(
