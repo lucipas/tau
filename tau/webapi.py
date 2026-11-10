@@ -12,7 +12,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
-    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
+    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -1317,6 +1319,24 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def doctor(self) -> Dict[str, Any]:
+        """Health verdicts for this node's data directory.
+
+        The same checks as the ``tau doctor`` CLI, run against the
+        running node's config.  Read-only: the checks never write
+        anything or take the instance lock, so they are safe to run
+        against the serving node.  The import is deferred because
+        ``tau.doctor`` imports this module for its message-cleaning
+        helpers.
+        """
+        from .doctor import all_ok, run_checks
+
+        checks = run_checks(self.node.config)
+        return {
+            "ok": all_ok(checks),
+            "checks": [check.to_dict() for check in checks],
+        }
+
     def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
         payload = entry.to_dict()
         peer = self.node.registry.get(entry.to)
@@ -1780,6 +1800,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
+                return
+            if path == "/api/doctor":
+                self._send_json(self.bridge.doctor(), head_only)
                 return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)

@@ -168,6 +168,17 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface DoctorCheck {
+  name: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+}
+
+export interface DoctorResponse {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
 export interface ApiErrorBody {
   error?: { message?: string };
 }

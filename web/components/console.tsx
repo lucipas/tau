@@ -6,6 +6,7 @@ import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
+import { DoctorSection } from "./doctor-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
 import { OutboxSection } from "./outbox-section";
@@ -135,6 +136,9 @@ export function Console() {
                 />
               </div>
             ) : null}
+            <div className="mt-4">
+              <DoctorSection onRun={tau.runDoctor} />
+            </div>
             <Composer
               peers={tau.peers}
               target={target}

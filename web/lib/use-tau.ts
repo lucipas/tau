@@ -6,6 +6,7 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  DoctorResponse,
   GroupsResponse,
   MarkReadResponse,
   NodeInfo,
@@ -313,6 +314,12 @@ export function useTau() {
     }
   }, []);
 
+  const runDoctor = useCallback(async () => {
+    // On demand only: the checks read the data directory, and a
+    // periodic run would re-read files the node is writing to.
+    return apiGet<DoctorResponse>("/api/doctor");
+  }, []);
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -340,6 +347,7 @@ export function useTau() {
     send,
     ping,
     announce,
+    runDoctor,
     markRead,
     refreshOutbox,
     refreshGroups,
