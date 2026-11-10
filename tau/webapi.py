@@ -614,21 +614,33 @@ class WebBridge:
         if path is None:
             return
         with self._save_lock:
-            with self._lock:
-                messages = list(self._messages)
-                next_id = self._next_message_id
-            try:
-                atomic_write_json(
-                    path,
-                    {"messages": messages, "next_message_id": next_id},
-                    mode=0o600,
-                )
-            except (OSError, ValueError) as exc:
-                if strict:
-                    raise
-                log.warning(
-                    "Could not persist message history to %s: %s", path, exc
-                )
+            self._save_messages_locked(strict=strict)
+
+    def _save_messages_locked(self, *, strict: bool = False) -> None:
+        """Write the current log; the caller holds ``_save_lock``.
+
+        Split out so a deletion can hold the save lock across removal,
+        strict persistence and failure rollback: no other save can
+        persist the transiently deleted deque in between.
+        """
+        path = self._messages_path
+        if path is None:
+            return
+        with self._lock:
+            messages = list(self._messages)
+            next_id = self._next_message_id
+        try:
+            atomic_write_json(
+                path,
+                {"messages": messages, "next_message_id": next_id},
+                mode=0o600,
+            )
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise
+            log.warning(
+                "Could not persist message history to %s: %s", path, exc
+            )
 
     @property
     def url(self) -> str:
@@ -1342,29 +1354,37 @@ class WebBridge:
                     # entry in place, so the delete can be retried.
                     if not str(exc).startswith("unknown message"):
                         raise
-        with self._lock:
-            kept = [
-                message for message in self._messages if message.get("id") != target
-            ]
-            self._messages.clear()
-            self._messages.extend(kept)
-        # Persist the console history strictly: a failed write restores
-        # the entry and reports an error, so success is never reported
-        # for a delete that a restart would undo.
-        try:
-            self._save_messages(strict=True)
-        except Exception:
+        # Hold the save lock across removal, strict persistence and
+        # failure rollback: no other history save can persist the
+        # transiently deleted deque between the failed write and the
+        # in-memory restore. (Appends may still interleave, but their
+        # saves wait on this lock and persist the restored log.)
+        with self._save_lock:
             with self._lock:
-                index = next(
-                    (
-                        i
-                        for i, message in enumerate(self._messages)
-                        if message.get("id", 0) > target
-                    ),
-                    len(self._messages),
-                )
-                self._messages.insert(index, removed)
-            raise
+                kept = [
+                    message
+                    for message in self._messages
+                    if message.get("id") != target
+                ]
+                self._messages.clear()
+                self._messages.extend(kept)
+            # Persist the console history strictly: a failed write
+            # restores the entry and reports an error, so success is
+            # never reported for a delete that a restart would undo.
+            try:
+                self._save_messages_locked(strict=True)
+            except Exception:
+                with self._lock:
+                    index = next(
+                        (
+                            i
+                            for i, message in enumerate(self._messages)
+                            if message.get("id", 0) > target
+                        ),
+                        len(self._messages),
+                    )
+                    self._messages.insert(index, removed)
+                raise
         # The bus stamps its own sequence into ``id``, so the deleted
         # console id rides under ``message_id`` instead: using ``id``
         # would make other tabs drop whichever bubble shares the
