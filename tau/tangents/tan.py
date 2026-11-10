@@ -1112,7 +1112,13 @@ def like_counts(
     return result
 
 
-def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+def likers(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Dict[str, Any]:
     """Return the post *ref* names plus who currently likes it.
 
     *ref* is a post or reply hash or unique prefix, resolved exactly as
@@ -1125,12 +1131,21 @@ def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
     "name": ...}`` record per reactor whose latest reaction for the
     post is a like, sorted by name then author hash.  The name is the
     one on the reactor's latest reaction entry for the post.  Only
-    linked reactions count, like :func:`reaction_states`.
+    linked reactions count, like :func:`reaction_states`.  Like
+    :func:`thread`, a post from a blocked author — or a reply beneath
+    one — is refused, and an unusable block list hides everything
+    (``exclude_all``), so the likers view never shows a post the
+    thread view would hide.
     """
     post = resolve_post(conn, ref)
     if not post.get("linked"):
         # Like thread(): an unlinked entry is not shown, so its likers are not either.
         raise TanError(f"post has not linked yet: {ref!r}")
+    excluded = set(_clean_excluded(exclude_authors))
+    if exclude_all:
+        raise TanError("cannot show likers: the block-list is unusable")
+    if post.get("author") in excluded:
+        raise TanError(f"post is from a blocked author: {ref!r}")
     # Like thread(): a reply beneath a deleted ancestor stays hidden.
     current_entry = post
     seen_ancestors = {current_entry["hash"]}
@@ -1142,6 +1157,8 @@ def likers(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
             break
         if _is_deleted(conn, parent):
             raise TanError(f"post has been deleted: {ref!r}")
+        if parent["author"] in excluded:
+            raise TanError(f"post is from a blocked author: {ref!r}")
         seen_ancestors.add(parent["hash"])
         current_entry = parent
     target = str(post["hash"])

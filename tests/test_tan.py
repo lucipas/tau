@@ -1232,6 +1232,38 @@ def test_likers_rejects_reply_beneath_deleted_ancestor(identities, tmp_path):
         likers(conn, nested["hash"])
 
 
+def test_likers_refuses_blocked_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "likeable", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "agreed", name="bob", now=1001)
+    create_reaction(conn, alice, reply["hash"], liked=True, name="alice", now=1002)
+
+    # Naming a blocked author's post refuses outright, like thread().
+    with pytest.raises(TanError, match="blocked author"):
+        likers(conn, post["hash"], exclude_authors=[post["author"]])
+
+    # Naming a reply beneath a blocked ancestor refuses outright too.
+    with pytest.raises(TanError, match="blocked author"):
+        likers(conn, reply["hash"], exclude_authors=[post["author"]])
+
+    # Anyone else's posts still show their likers.
+    assert likers(conn, reply["hash"])["likers"] == [
+        {"author": author_of(alice), "name": "alice"}
+    ]
+
+
+def test_likers_refuses_when_block_list_unusable(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "likeable", name="alice", now=1000)
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+
+    # Fail closed, like thread(): an unusable block list hides everything.
+    with pytest.raises(TanError, match="block-list is unusable"):
+        likers(conn, post["hash"], exclude_all=True)
+
+
 def test_reaction_rejects_tampering(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")

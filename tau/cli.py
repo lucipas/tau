@@ -2322,7 +2322,13 @@ def cmd_tan_likes(args: argparse.Namespace) -> int:
     json_output = _json_mode(args)
     conn = init_db(config.social_db_path)
     try:
-        result = likers(conn, args.ref)
+        blocked = load_blocked_set(config.blocklist_path)
+        result = likers(
+            conn,
+            args.ref,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
     finally:
         conn.close()
     try:
