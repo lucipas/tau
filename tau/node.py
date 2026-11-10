@@ -2799,11 +2799,21 @@ class TauNode:
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
             self.mailbox.record_delivered(message_id)
             if isinstance(response, dict):
-                # Always name the outbound wire message, never an id
-                # the peer supplied, so callers (console history, JSON
-                # output) match what was actually sent and recorded —
-                # delivery reports and reactions key off this id.
+                # Only this node's own outbox may report a message as
+                # queued, with a real local entry id. A peer that claims
+                # queued (with an arbitrary id, or none at all) must not
+                # be trusted: both consumers read response["queued"]/
+                # response["id"] verbatim, so a spoofed claim misreports
+                # delivery in the console and can make the CLI raise
+                # KeyError on the missing id. Always name the outbound
+                # wire message with the local id, never one the peer
+                # supplied, so callers (console history, JSON output)
+                # match what was actually sent and recorded — delivery
+                # reports and reactions key off this id.
                 response["id"] = message_id
+                response.pop("expires_at", None)
+                response.pop("to", None)
+                response["queued"] = False
             self._record_sent(
                 {
                     "from": self.name,

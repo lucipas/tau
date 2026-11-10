@@ -519,6 +519,112 @@ def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
     assert node.mailbox.get_outbox(entry.id) is None
 
 
+def test_send_message_distrusts_peer_queued_claim(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "queued": True,
+            "id": "spoofed-id",
+            "to": "00" * 16,
+            "expires_at": 9999999999.0,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    # The peer claimed the message was queued with an id it invented;
+    # the node reports a plain delivery, names the local wire
+    # message, and drops the peer's queue keys.
+    assert response["queued"] is False
+    # The spoofed id is discarded: the response names the local wire
+    # message instead, matching the sent message in the inbox.
+    assert response["id"] != "spoofed-id"
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["id"] == response["id"]
+    assert "to" not in response
+    assert "expires_at" not in response
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
+def test_send_message_distrusts_peer_queued_claim_without_id(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "queued": True, "echo": "hi"},
+    )
+
+    # A queued claim with no id used to make the CLI raise KeyError
+    # on response["id"] after the flush; the normalized response
+    # must not raise anywhere downstream.
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    # The response still names the local wire message, so downstream
+    # readers of response["id"] never see a peer-invented id.
+    assert response["id"]
+    assert response["echo"] == "hi"
+
+
+def test_send_message_keeps_well_behaved_delivery_response(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    # A well-behaved delivery still names the local wire message.
+    assert response["id"]
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["node"] == peer.hexhash
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
 def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
