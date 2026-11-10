@@ -193,6 +193,225 @@ def test_append_rejects_record_without_text(tmp_path):
     assert len(inbox) == 0
 
 
+def test_export_document_round_trips_through_import(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    source.append(_record(id="one", text="first"))
+    source.append(_record(id="two", text="second"))
+
+    document = source.export_document()
+    assert document["format"] == "tau-messages-export"
+    assert document["version"] == 1
+    assert [entry["id"] for entry in document["messages"]] == ["one", "two"]
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(document)
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    assert [entry["id"] for entry in target.list_messages()] == ["two", "one"]
+
+    # Re-importing the same export is a no-op, not a duplicate.
+    again = target.import_messages(document)
+    assert again["imported"] == 0
+    assert again["present"] == 2
+    assert len(target) == 2
+
+
+def test_export_document_filters_by_peer(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16))
+    inbox.append(_record(id="b1", destination="bb" * 16))
+
+    document = inbox.export_document(peer="aa" * 16)
+    assert [entry["id"] for entry in document["messages"]] == ["a1"]
+
+
+def test_import_dedupes_records_without_ids_by_content(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {"from": "alice", "destination": "ab" * 16, "text": "hi",
+             "sent_at": 5.0, "received_at": 6.0},
+        ],
+    }
+    first = inbox.import_messages(document)
+    assert first["imported"] == 1
+    second = inbox.import_messages(document)
+    assert second["imported"] == 0
+    assert second["present"] == 1
+    assert len(inbox) == 1
+
+
+def test_import_skips_invalid_entries_with_reasons(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="good"),
+            {"from": "bob", "text": ""},  # empty text
+            {"text": 42},  # non-string text
+            "not a record",
+            _record(id="bad-time", received_at="yesterday"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 1
+    assert result["present"] == 0
+    assert result["skipped"] == 4
+    assert [error["error"] for error in result["errors"]] == [
+        "inbox record needs text",
+        "inbox record needs text",
+        "entry is not an object",
+        "invalid received_at",
+    ]
+    assert len(inbox) == 1
+
+
+def test_import_rejects_bad_documents(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        inbox.import_messages(["not", "a", "dict"])
+    with pytest.raises(ValueError, match="unsupported export format"):
+        inbox.import_messages({"format": "other", "version": 1, "messages": []})
+    with pytest.raises(ValueError, match="unsupported export version"):
+        inbox.import_messages(
+            {"format": "tau-messages-export", "version": 99, "messages": []}
+        )
+    with pytest.raises(ValueError, match="no messages list"):
+        inbox.import_messages({"format": "tau-messages-export", "version": 1})
+    assert len(inbox) == 0
+
+
+def test_import_respects_the_cap(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 3)
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id=f"msg-{index}") for index in range(5)],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 5
+    assert [entry["id"] for entry in inbox.list_messages()] == [
+        "msg-4",
+        "msg-3",
+        "msg-2",
+    ]
+
+
+def test_import_skips_huge_timestamp_without_aborting(tmp_path):
+    """A JSON integer too large for float() is skipped, not fatal.
+
+    float() on a huge int raises OverflowError; an import must record
+    the entry as skipped and keep merging the entries around it.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="before"),
+            _record(id="huge-sent", sent_at=10**400),
+            _record(id="huge-received", received_at=10**400),
+            _record(id="after"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 2
+    assert result["skipped"] == 2
+    assert [error["error"] for error in result["errors"]] == [
+        "invalid sent_at",
+        "invalid received_at",
+    ]
+    assert [entry["id"] for entry in inbox.list_messages()] == ["after", "before"]
+
+
+def test_duplicate_only_import_keeps_mixed_inbox_over_the_cap(tmp_path):
+    """Re-importing an export must not evict records to one 500 cap.
+
+    Retention is per direction (500 received + 500 sent), so a
+    duplicate-only import into a mixed inbox holding 600 records
+    keeps all of them instead of slicing to the newest 500.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(300):
+        inbox.append(_record(id=f"in-{index}", direction="in"))
+        inbox.append(_record(id=f"out-{index}", direction="out"))
+    assert len(inbox) == 600
+
+    result = inbox.import_messages(inbox.export_document())
+    assert result == {"imported": 0, "present": 600, "skipped": 0, "errors": []}
+    assert len(inbox) == 600
+    ids = {entry["id"] for entry in inbox.list_messages(direction=None)}
+    assert ids == {f"in-{index}" for index in range(300)} | {
+        f"out-{index}" for index in range(300)
+    }
+
+
+def test_import_assigns_local_sequences(tmp_path):
+    """Imported records get a local seq so a later append works.
+
+    An export carries the source node's sequences (or none at all);
+    without renumbering, the next append's max() over a None seq
+    raises TypeError.
+    """
+    inbox = Inbox()  # in-memory: no load renumbers anything
+    result = inbox.import_messages(
+        {
+            "format": "tau-messages-export",
+            "version": 1,
+            "messages": [_record(id="imported")],
+        }
+    )
+    assert result["imported"] == 1
+    assert [entry["seq"] for entry in inbox.list_messages()] == [1]
+
+    appended = inbox.append(_record(id="local"))
+    assert appended["seq"] == 2
+    assert [entry["id"] for entry in inbox.list_messages()] == ["local", "imported"]
+
+
+def test_import_raises_when_the_save_fails(tmp_path, monkeypatch):
+    """A save failure raises instead of reporting a restore."""
+    import tau.inbox
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="kept"))
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _fail)
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id="new")],
+    }
+    with pytest.raises(OSError, match="could not persist inbox"):
+        inbox.import_messages(document)
+    # The unstored import is rolled back in memory too.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["kept"]
+
+
+def test_load_skips_huge_timestamp_without_crashing(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="huge", sent_at=10**400),
+                    _record(id="good"),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entries = Inbox(path).list_messages()
+    assert [entry["id"] for entry in entries] == ["good"]
+
+
 def test_new_messages_are_unread_until_marked_read(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))

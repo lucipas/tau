@@ -2482,6 +2482,104 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
     assert events == ["node.start", "bridge.start", "node.stop"]
 
 
+def test_parser_messages_export_import_arguments():
+    parser = cli.build_parser()
+    export = parser.parse_args(
+        ["messages", "export", "--peer", "alice", "--output", "/tmp/out.json"]
+    )
+    assert export.func is cli.cmd_messages_export
+    assert export.peer == "alice"
+    assert str(export.output) == "/tmp/out.json"
+
+    import_args = parser.parse_args(["messages", "import", "backup.json"])
+    assert import_args.func is cli.cmd_messages_import
+    assert str(import_args.file) == "backup.json"
+
+
+def test_messages_export_import_round_trip(tmp_path, capsys):
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    export_path = tmp_path / "messages-backup.json"
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--output", str(export_path)]
+    )
+    assert code == 0
+    assert "Exported 2 messages" in capsys.readouterr().out
+    document = json.loads(export_path.read_text(encoding="utf-8"))
+    assert document["format"] == "tau-messages-export"
+    assert [entry["id"] for entry in document["messages"]] == ["m-1", "m-2"]
+
+    target_dir = tmp_path / "other-node"
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Imported 2 messages (0 already present, 0 skipped)" in out
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+    # Re-importing the same file reports both as present, not as new.
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 0
+    assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
+
+
+def test_messages_export_to_stdout_and_peer_filter(tmp_path, capsys):
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    code = cli.main(["messages", "export", "--data-dir", str(source_dir)])
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert len(document["messages"]) == 2
+
+    code = cli.main(
+        [
+            "messages",
+            "export",
+            "--data-dir",
+            str(source_dir),
+            "--peer",
+            sender_hash.hex()[:8],
+        ]
+    )
+    assert code == 0
+    document = json.loads(capsys.readouterr().out)
+    assert len(document["messages"]) == 2
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--peer", "nobody"]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_messages_import_rejects_bad_files(tmp_path, capsys):
+    target_dir = tmp_path / "node"
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not json", encoding="utf-8")
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(bad_json)]
+    )
+    assert code == 1
+    assert "not valid JSON" in capsys.readouterr().err
+
+    wrong_format = tmp_path / "wrong.json"
+    wrong_format.write_text(
+        json.dumps({"format": "other", "version": 1, "messages": []}),
+        encoding="utf-8",
+    )
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(wrong_format)]
+    )
+    assert code == 1
+    assert "unsupported export format" in capsys.readouterr().err
+
+
 def _seed_reply_conversation(tmp_path):
     """One received message and one sent message from the same peer."""
     from tau.protocol import excerpt_hash
