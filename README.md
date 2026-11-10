@@ -115,7 +115,10 @@ tau serve --http          # console + JSON API on http://127.0.0.1:8787/
 ```
 
 Open <http://127.0.0.1:8787/>. The page streams inbound messages, peers and
-their latency in real time over server-sent events. Message history is kept
+their latency in real time over server-sent events. Each peer also has an
+info button that shows what the peer reports about itself — its tau version,
+protocol, uptime, and peer count — so you can see whether it understands
+newer entry kinds before sending it a reply or a quote. Message history is kept
 in `messages.json` in the data directory, so earlier conversations are still
 there after the node restarts.
 
@@ -140,6 +143,7 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
+| `/api/info` | POST | show a peer's reported info (`{"to": "alice"}`) — version, protocol, uptime, peer count, LXMF state |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |

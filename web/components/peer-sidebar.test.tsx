@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Peer } from "@/lib/types";
+import type { PeerInfoState } from "@/lib/use-tau";
 
 import { PeerSidebar } from "./peer-sidebar";
 
@@ -17,7 +18,12 @@ function makePeer(overrides: Partial<Peer> = {}): Peer {
   };
 }
 
-function renderSidebar(unread: Record<string, number>, onSelectPeer = vi.fn()) {
+function renderSidebar(
+  unread: Record<string, number>,
+  onSelectPeer = vi.fn(),
+  infos: Record<string, PeerInfoState> = {},
+  onInfo = vi.fn(),
+) {
   return render(
     <PeerSidebar
       node={null}
@@ -25,9 +31,11 @@ function renderSidebar(unread: Record<string, number>, onSelectPeer = vi.fn()) {
       groups={[]}
       bridge={null}
       pings={{}}
+      infos={infos}
       unread={unread}
       selected=""
       onPing={() => {}}
+      onInfo={onInfo}
       onSelectPeer={onSelectPeer}
     />,
   );
@@ -61,5 +69,61 @@ describe("PeerSidebar unread badges", () => {
     renderSidebar({ ["ab".repeat(16)]: 150 });
 
     expect(screen.getByTitle("150 unread messages").textContent).toBe("99+");
+  });
+});
+
+describe("PeerSidebar peer info", () => {
+  const aliceHash = "ab".repeat(16);
+
+  it("asks for info when the info button is clicked", () => {
+    const onInfo = vi.fn();
+    renderSidebar({}, vi.fn(), {}, onInfo);
+
+    fireEvent.click(screen.getByLabelText("Show info for alice"));
+    expect(onInfo).toHaveBeenCalledWith(aliceHash);
+  });
+
+  it("shows the reported version, protocol, uptime, peers and LXMF state", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        [aliceHash]: {
+          info: {
+            version: "0.2.0",
+            protocol: 1,
+            uptime: 3661,
+            peers: 3,
+            lxmf_enabled: true,
+          },
+        },
+      },
+    );
+
+    expect(
+      screen.getByText(
+        "tau 0.2.0 · protocol 1 · up 1h 01m · 3 peers · lxmf on",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("shows a pending line while asking the peer", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { pending: true } });
+
+    expect(screen.getByText("asking peer…")).toBeTruthy();
+  });
+
+  it("shows the error when the peer does not answer", () => {
+    renderSidebar({}, vi.fn(), {
+      [aliceHash]: { error: "peer did not answer" },
+    });
+
+    expect(screen.getByText("peer did not answer")).toBeTruthy();
+  });
+
+  it("says so when the peer answers with no usable info", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { info: {} } });
+
+    expect(screen.getByText("answered with no usable info")).toBeTruthy();
   });
 });

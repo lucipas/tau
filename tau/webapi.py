@@ -13,6 +13,7 @@ script) can read what arrives from the mesh and send messages back:
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    POST /api/info         show a peer's reported info (version, uptime, peers)
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -393,6 +394,27 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     # would raise instead of dropping the entry.
     message["excerpt_hash"] = excerpt_hash(text)
     return message
+
+
+def _public_peer_info(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only the peer-reported fields the console shows.
+
+    The response comes from a remote node, so a field with an unexpected
+    type is dropped instead of trusted.
+    """
+    info: Dict[str, Any] = {}
+    for key in ("name", "version", "rns_version"):
+        value = response.get(key)
+        if isinstance(value, str):
+            info[key] = value
+    for key in ("protocol", "uptime", "peers"):
+        value = response.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            info[key] = value
+    lxmf = response.get("lxmf")
+    if isinstance(lxmf, dict) and isinstance(lxmf.get("enabled"), bool):
+        info["lxmf_enabled"] = lxmf["enabled"]
+    return info
 
 
 class WebBridge:
@@ -1379,6 +1401,16 @@ class WebBridge:
             else None,
         }
 
+    def peer_info(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
+        """Ask a peer what it reports about itself (``tau info``)."""
+        peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        response = self.node.request_info(peer, timeout=timeout)
+        return {
+            "ok": True,
+            "peer": peer.public_dict(),
+            "info": _public_peer_info(response),
+        }
+
     def announce(self) -> None:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
@@ -1900,6 +1932,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
                 return
+            if path == "/api/info":
+                self._handle_info(body, head_only)
+                return
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
@@ -2147,6 +2182,27 @@ class _WebHandler(BaseHTTPRequestHandler):
         timeout = max(1.0, min(float(timeout), 120.0))
         try:
             result = self.bridge.ping(target, timeout=timeout)
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_info(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("to")
+        timeout = body.get("timeout", 15.0)
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'to' is required"}}, head_only, 400
+            )
+            return
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            timeout = 15.0
+        timeout = max(1.0, min(float(timeout), 120.0))
+        try:
+            result = self.bridge.peer_info(target, timeout=timeout)
         except PeerError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 404)
             return

@@ -105,10 +105,14 @@ export function Console() {
             groups={tau.groups}
             bridge={tau.bridge}
             pings={tau.pings}
+            infos={tau.infos}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
+            }}
+            onInfo={(destination) => {
+              void tau.fetchInfo(destination);
             }}
             onSelectPeer={selectPeer}
           />

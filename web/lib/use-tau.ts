@@ -12,6 +12,8 @@ import type {
   OutboxEntry,
   OutboxResponse,
   Peer,
+  PeerInfo,
+  PeerInfoResult,
   PingResult,
   SendResponse,
   Snapshot,
@@ -30,6 +32,12 @@ export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 export interface PingState {
   pending?: boolean;
   rtt_ms?: number | null;
+  error?: string;
+}
+
+export interface PeerInfoState {
+  pending?: boolean;
+  info?: PeerInfo;
   error?: string;
 }
 
@@ -56,6 +64,7 @@ export function useTau() {
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [infos, setInfos] = useState<Record<string, PeerInfoState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
@@ -304,6 +313,29 @@ export function useTau() {
     }
   }, []);
 
+  const fetchInfo = useCallback(async (destination: string) => {
+    setInfos((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<PeerInfoResult>("/api/info", {
+        to: destination,
+      });
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: { info: result.info },
+      }));
+    } catch (error) {
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "info failed",
+        },
+      }));
+    }
+  }, []);
+
   const announce = useCallback(async () => {
     setAnnouncing(true);
     try {
@@ -336,9 +368,11 @@ export function useTau() {
     bridge,
     connection,
     pings,
+    infos,
     announcing,
     send,
     ping,
+    fetchInfo,
     announce,
     markRead,
     refreshOutbox,
