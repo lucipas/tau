@@ -403,6 +403,102 @@ def test_group_store_update_members_ignores_local_cap(tmp_path):
     assert len(store) == MAX_GROUPS
 
 
+def test_group_store_record_successor_retires_predecessor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    old = store.record(
+        old_id, "weekend", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+    )
+    assert old is not None
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    new = store.record(
+        new_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH, OWN_HASH],
+        creator=OTHER_HASH,
+    )
+    assert new is not None
+    assert new["id"] == new_id
+    # Name lookup points at the current roster, not the old one.
+    assert store.find("weekend")["id"] == new_id
+    assert store.get(old_id) is None
+    assert len(store) == 1
+    # The predecessor was only deleted, not retired: the latest roster
+    # learned wins, so its messages pin it again.
+    assert (
+        store.record(
+            old_id, "weekend", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+        )
+        is not None
+    )
+    repinned = store.get(old_id)
+    assert repinned is not None
+    assert repinned["members"] == [OTHER_HASH, THIRD_HASH]
+    assert store.get(new_id) is None
+    assert len(store) == 1
+
+
+def test_group_store_record_never_replaces_local_group(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    mine = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    learned_id = derive_group_id(OWN_HASH, "weekend", [OWN_HASH, THIRD_HASH])
+    learned = store.record(
+        learned_id, "weekend", [OWN_HASH, THIRD_HASH], creator=OWN_HASH
+    )
+    assert learned is not None
+    assert store.get(mine["id"]) == mine
+    assert len(store) == 2
+
+
+def test_group_store_retirement_lifts_when_roster_returns(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    # The old roster is retired while the successor is live.
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is None
+    )
+    restored = store.update_members(
+        grown["id"], [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    assert restored["id"] == group["id"]
+    # The group is live again, so delete it and re-pin it from a message.
+    assert store.delete(restored["id"]) is True
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is not None
+    )
+
+
+def test_group_store_retired_list_is_capped(tmp_path):
+    from tau.groups import MAX_RETIRED_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    retired_ids = []
+    current = group
+    for i in range(MAX_RETIRED_GROUPS + 5):
+        member = f"{i + 1:032x}"
+        nxt = store.update_members(
+            current["id"], [OWN_HASH, member], created_by=OWN_HASH
+        )
+        retired_ids.append(current["id"])
+        current = nxt
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert len(raw["retired"]) == MAX_RETIRED_GROUPS
+    assert retired_ids[0] not in raw["retired"]
+    assert retired_ids[-1] in raw["retired"]
+
+
 def test_group_store_update_members_save_failure_rolls_back(
     tmp_path, monkeypatch
 ):
@@ -1182,6 +1278,37 @@ def test_group_remove_member_json(tmp_path, capsys, monkeypatch):
     )
     store = GroupStore(config.groups_path)
     assert len(store) == 1
+
+
+def test_group_remove_member_by_hash_without_registry(
+    tmp_path, capsys, monkeypatch
+):
+    config, group = _seed_group_cli(
+        tmp_path, monkeypatch, members=(OWN_HASH, OTHER_HASH, THIRD_HASH)
+    )
+    # Carol left the registry, but her hash is in the roster: resolving
+    # her would wait out discovery, so removal by hash must not need it.
+    # (The stub node raises for any peer it cannot resolve, so this test
+    # fails outright without the roster fast path.)
+    registry = PeerRegistry(config.peers_path)
+    registry.forget(THIRD_HASH)
+    registry.save()
+    code = cli.main(
+        [
+            "group",
+            "remove-member",
+            "weekend",
+            "--peer",
+            THIRD_HASH,
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "removed from group weekend" in out
+    store = GroupStore(config.groups_path)
+    assert store.list_groups()[0]["members"] == [OWN_HASH, OTHER_HASH]
 
 
 def test_group_change_members_refusals(tmp_path, capsys, monkeypatch):

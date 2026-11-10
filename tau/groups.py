@@ -10,6 +10,16 @@ it from the first message and pins it.  Locally created groups and
 remotely learned ones are capped separately and neither cap evicts, so
 a peer flooding group ids can never push out a group this node created;
 ``tau group delete`` frees capacity when a cap is reached.
+
+The creator can replace the roster with :meth:`GroupStore.update_members`
+(``tau group add-member`` / ``remove-member``): the successor group —
+same name, new id — replaces the old record, and the old id is retired,
+so a removed peer cannot restore the retired roster by replaying an old
+group message.  A roster learned from a message likewise supersedes a
+learned group from the same creator under the same name, so lookups by
+name keep pointing at the current roster; that predecessor is only
+deleted, not retired, because the old roster may still be live elsewhere
+and its messages should be able to pin it again.
 """
 
 from __future__ import annotations
@@ -45,6 +55,11 @@ GROUPS_FILE_NAME = "groups.json"
 # when a cap is reached.
 MAX_GROUPS = 100
 MAX_LEARNED_GROUPS = 50
+# Retired group ids (rosters replaced by their creator) are kept so a
+# removed peer cannot restore one by replaying an old group message.
+# The list is capped like the groups themselves; the oldest retirement
+# is forgotten first, so a very old roster can be pinned again.
+MAX_RETIRED_GROUPS = MAX_GROUPS + MAX_LEARNED_GROUPS
 
 
 def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
@@ -133,6 +148,7 @@ class GroupStore:
         self.path = Path(path).expanduser() if path is not None else None
         self._lock = threading.Lock()
         self._groups: Dict[str, Dict[str, Any]] = {}
+        self._retired: List[str] = []
         self._load()
 
     def _load(self) -> None:
@@ -150,13 +166,30 @@ class GroupStore:
             if group is not None:
                 loaded[group["id"]] = group
         self._groups = loaded
+        retired = raw.get("retired")
+        self._retired = []
+        if isinstance(retired, list):
+            seen = set()
+            for entry in retired:
+                if not isinstance(entry, str) or len(entry) != 32:
+                    continue
+                try:
+                    bytes.fromhex(entry)
+                except ValueError:
+                    continue
+                entry = entry.lower()
+                if entry not in seen:
+                    seen.add(entry)
+                    self._retired.append(entry)
 
     def _save(self) -> None:
         """Persist the store; raises :class:`OSError` when the write fails."""
         if self.path is None:
             return
         atomic_write_json(
-            self.path, {"groups": list(self._groups.values())}, mode=0o600
+            self.path,
+            {"groups": list(self._groups.values()), "retired": self._retired},
+            mode=0o600,
         )
 
     @contextmanager
@@ -224,12 +257,16 @@ class GroupStore:
                     " delete one with `tau group delete`)"
                 )
             self._groups[group["id"]] = group
+            if group["id"] in self._retired:
+                # The roster is live again (recreated after a roster
+                # change), so it must not stay retired.
+                self._retired.remove(group["id"])
             try:
                 self._save()
             except OSError:
-                # The id was not stored before (an existing id returns
-                # above), so dropping it restores the on-disk state.
-                del self._groups[group["id"]]
+                # Reload restores both the groups and the retired list
+                # to what is on disk.
+                self._load()
                 raise
         return dict(group)
 
@@ -242,7 +279,10 @@ class GroupStore:
         new group: the successor (same name, new id, same ``created_at``)
         is created and the old record deleted inside one transaction,
         so the local cap cannot block a net-zero change and a failure
-        cannot leave both groups or neither.
+        cannot leave both groups or neither.  The old id is retired
+        (persisted): a removed peer cannot restore the retired roster
+        by replaying an old group message, and the retirement is lifted
+        if the roster is ever changed back to it.
 
         Raises :class:`ValueError` when the group is unknown, was not
         created by this node, or the new roster is invalid, and
@@ -280,6 +320,14 @@ class GroupStore:
                 raise ValueError("invalid group: the creator must be a member")
             del self._groups[existing["id"]]
             self._groups[new_id] = candidate
+            if existing["id"] not in self._retired:
+                self._retired.append(existing["id"])
+                if len(self._retired) > MAX_RETIRED_GROUPS:
+                    del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+            if new_id in self._retired:
+                # The roster is live again (a member re-added restores
+                # the original roster), so it must not stay retired.
+                self._retired.remove(new_id)
             try:
                 self._save()
             except OSError:
@@ -303,7 +351,9 @@ class GroupStore:
         cannot fork an id onto a recipient that has not seen it.  A
         learned group is also refused when the learned cap is full
         (delete a group to make room); locally created groups are never
-        evicted to make room for one.
+        evicted to make room for one.  A roster the creator retired
+        with a membership change is refused as well, so a removed peer
+        cannot restore it by replaying an old group message.
         """
         candidate = _valid_group(
             {
@@ -324,16 +374,34 @@ class GroupStore:
                 if existing["members"] != candidate["members"]:
                     return None
                 return dict(existing)
+            if candidate["id"] in self._retired:
+                return None
             learned = sum(1 for g in self._groups.values() if not g["local"])
             if learned >= MAX_LEARNED_GROUPS:
                 log.info("Refusing to pin group %s: learned-group limit reached", group_id)
                 return None
+            # The new roster supersedes a learned group from the same
+            # creator under the same name, so lookups by name keep
+            # pointing at the current roster.  The predecessor is only
+            # deleted, not retired: the old roster may still be live
+            # elsewhere, and its messages should be able to pin it
+            # again.  Locally created groups are never replaced by a
+            # message — they belong to this node.
+            for other in list(self._groups.values()):
+                if (
+                    not other["local"]
+                    and other["creator"] == candidate["creator"]
+                    and other["name"] == candidate["name"]
+                    and other["id"] != candidate["id"]
+                ):
+                    del self._groups[other["id"]]
             self._groups[candidate["id"]] = candidate
             try:
                 self._save()
             except OSError as exc:
                 # Do not acknowledge a pin that would be lost on restart.
-                del self._groups[candidate["id"]]
+                # Reload restores the groups the reconcile above deleted.
+                self._load()
                 log.warning("Could not persist groups to %s: %s", self.path, exc)
                 return None
         return dict(candidate)

@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
@@ -4355,6 +4356,20 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _roster_hash(target: Any, members: List[str]) -> Optional[str]:
+    """A 32-hex target already in the roster, or ``None``."""
+    if not isinstance(target, str):
+        return None
+    cleaned = target.strip().lower()
+    if len(cleaned) != 32 or cleaned not in members:
+        return None
+    try:
+        bytes.fromhex(cleaned)
+    except ValueError:
+        return None
+    return cleaned
+
+
 def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
     """Add peers to, or remove peers from, a group this node created.
 
@@ -4370,15 +4385,34 @@ def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
         group = node.groups.find(args.group)
         if not group["local"] or group["creator"] != own_hash:
             raise NodeError("only the creator can change a group's members")
-        peers: List[Peer] = []
-        for target in getattr(args, "peer", []):
-            peers.append(
-                node.resolve_peer(
-                    target,
-                    timeout=float(getattr(args, "discover_timeout", 10.0)),
-                )
-            )
         members = list(group["members"])
+        peers: List[Any] = []
+        for target in getattr(args, "peer", []):
+            # Removing a member only needs the hash already in the
+            # roster: an offline member may have left the registry,
+            # and resolving it would wait out the whole discover
+            # timeout.  Adding still resolves, so a mistyped or
+            # unknown peer is refused before the roster changes.
+            fast = None if adding else _roster_hash(target, members)
+            if fast is not None:
+                known = node.registry.get(fast)
+                peers.append(
+                    SimpleNamespace(
+                        hexhash=fast,
+                        display_name=(
+                            known.display_name
+                            if known is not None
+                            else fast[:8]
+                        ),
+                    )
+                )
+            else:
+                peers.append(
+                    node.resolve_peer(
+                        target,
+                        timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    )
+                )
         for peer in peers:
             if adding:
                 if peer.hexhash == own_hash:
