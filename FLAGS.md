@@ -58,6 +58,7 @@ Global options may appear before or after the command:
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan suggest` | Suggest authors to follow, from who the authors you follow engage with |
 | `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
 | `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
 | `tau tan muted-keywords` | List muted keywords |
