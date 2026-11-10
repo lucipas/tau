@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiGet, apiPost, eventsUrl } from "./api";
+import { apiDownload, apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
@@ -57,6 +57,8 @@ export function useTau() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
   const [announcing, setAnnouncing] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupError, setBackupError] = useState<string | null>(null);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
 
@@ -313,6 +315,31 @@ export function useTau() {
     }
   }, []);
 
+  const backup = useCallback(async () => {
+    // A failed download leaves the error on the button until the next
+    // attempt; a success needs no confirmation — the file is in the
+    // browser's download folder.
+    setBackingUp(true);
+    setBackupError(null);
+    try {
+      const { blob, filename } = await apiDownload("/api/backup");
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setBackupError(
+        error instanceof Error ? error.message : "backup failed",
+      );
+    } finally {
+      setBackingUp(false);
+    }
+  }, []);
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -337,9 +364,12 @@ export function useTau() {
     connection,
     pings,
     announcing,
+    backingUp,
+    backupError,
     send,
     ping,
     announce,
+    backup,
     markRead,
     refreshOutbox,
     refreshGroups,

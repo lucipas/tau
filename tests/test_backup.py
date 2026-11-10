@@ -194,6 +194,33 @@ def test_backup_refuses_while_node_serving(tmp_path, capsys):
     assert "already serving" in capsys.readouterr().err
 
 
+def test_backup_live_runs_while_node_serving(tmp_path, capsys):
+    # The serving node's own backup: the instance lock is held (this
+    # process stands in for the serving node), so the plain path would
+    # refuse — but the live path skips the lock and still writes a
+    # valid archive, because the node's own writes are atomic.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node_a)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        archive = tmp_path / "backup.tar.gz"
+        target, manifest = create_backup(config, archive, live=True)
+    finally:
+        lock.release()
+    assert target == archive
+    assert manifest["format"] == 1
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+    assert (node_b / "mailbox.json").exists()
+    assert (node_b / "tan.sqlite3").exists()
+
+
 def test_backup_captures_uncheckpointed_wal_rows(tmp_path, capsys):
     # A row committed to the Tan database while the only writer holds
     # its connection open lives in tan.sqlite3-wal, not in the main

@@ -141,6 +141,7 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/backup` | GET | download a backup archive of the data directory |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/following` | GET | followed authors and their post counts |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
@@ -385,7 +386,12 @@ tau version, file list); the runtime lock file is never included. The Tan
 database is snapshotted with SQLite's backup API, so committed rows still
 sitting in the write-ahead log are included. Both
 commands refuse while a node is serving on the data directory, so a backup
-never catches the mailbox or the Tan database half-written. `restore`
+never catches the mailbox or the Tan database half-written. The web
+console's Back up button is the exception: the bridge builds the same
+archive from the live node, whose own writes are atomic, so a
+console-only user can back up without stopping the node. Restore stays a
+terminal operation — stop the node and run `tau restore` — because a
+restore replaces the state under the running node. `restore`
 validates the archive first — unknown format, unexpected members, absolute
 paths and `..` traversal are all rejected — and refuses to overwrite
 existing included node state unless `--force` is given; a `--force` restore

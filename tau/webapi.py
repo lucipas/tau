@@ -12,7 +12,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
-    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/backup       download a backup archive of the data directory
+    POST /api/ping         measure reachability of a peer
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
@@ -37,12 +39,16 @@ import json
 import logging
 import math
 import mimetypes
+import os
 import queue
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +56,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .backup import BackupError, create_backup
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
@@ -1342,6 +1349,44 @@ class WebBridge:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
 
+    def backup(self) -> Dict[str, Any]:
+        """Write a backup archive of the live data directory.
+
+        The bridge runs inside the serving node, so the archive is
+        built with the live backup path: the instance lock is skipped
+        (this process already holds it) and each state file is read as
+        a consistent snapshot, because the node's own writes are
+        atomic.  Returns the archive's temp path, download filename,
+        manifest file list and size; the caller streams the file and
+        removes it.  Raises :class:`WebBridgeError` when this node has
+        no data directory to back up.
+        """
+        config = getattr(self.node, "config", None)
+        if config is None or getattr(config, "data_dir", None) is None:
+            raise WebBridgeError("this node has no data directory to back up")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"tau-backup-{_backup_name(config.name)}-{stamp}.tar.gz"
+        fd, tmp_name = tempfile.mkstemp(prefix="tau-backup-", suffix=".tar.gz")
+        os.close(fd)
+        target = Path(tmp_name)
+        try:
+            # create_backup refuses an existing target without --force;
+            # the mkstemp file only reserved the name.
+            target.unlink()
+            _, manifest = create_backup(config, target, live=True)
+        except BaseException:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
+        return {
+            "path": str(target),
+            "filename": filename,
+            "files": manifest.get("files", []),
+            "size": target.stat().st_size,
+        }
+
     # -- snapshots ---------------------------------------------------------
 
     def peers(self) -> List[Dict[str, Any]]:
@@ -1670,6 +1715,19 @@ def _with_reaction(
     return kept
 
 
+def _backup_name(name: Any) -> str:
+    """Node name made safe for a download filename.
+
+    Keeps letters, digits and ``-_.``; anything else becomes ``-``.
+    A name with nothing keepable falls back to ``node``.
+    """
+    cleaned = "".join(
+        char if char.isascii() and (char.isalnum() or char in "-_.") else "-"
+        for char in str(name or "")
+    ).strip(".-")
+    return cleaned[:64] or "node"
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -1780,6 +1838,30 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
+                return
+            if path == "/api/backup":
+                try:
+                    result = self.bridge.backup()
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except BackupError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 500
+                    )
+                    return
+                archive = Path(result["path"])
+                try:
+                    self._send_file(archive, result["filename"], head_only)
+                finally:
+                    # The archive holds the node identity: never leave
+                    # the temp file behind after the download.
+                    try:
+                        archive.unlink()
+                    except OSError:
+                        pass
                 return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
@@ -2248,6 +2330,24 @@ class _WebHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Max-Age", "600")
+
+    def _send_file(
+        self, path: Path, filename: str, head_only: bool = False
+    ) -> None:
+        """Stream *path* as a download named *filename*."""
+        size = path.stat().st_size
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header(
+            "Content-Disposition", f'attachment; filename="{filename}"'
+        )
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if not head_only:
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile)
 
     def _send_json(
         self,

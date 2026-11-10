@@ -89,6 +89,11 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          backingUp={tau.backingUp}
+          backupError={tau.backupError}
+          onBackup={() => {
+            void tau.backup();
+          }}
         />
 
         {tau.connection === "reconnecting" ? (

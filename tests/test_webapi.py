@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import socket
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
@@ -11,10 +13,14 @@ import urllib.request
 
 import pytest
 
+from tau import cli
+from tau.backup import MANIFEST_NAME, restore_backup
+from tau.config import TauConfig
+from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import Peer
-from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
+from tau.webapi import WebBridge, WebBridgeError, _backup_name, check_web_console_bind
 
 PEER_HASH = "ab" * 16
 OTHER_HASH = "cd" * 16
@@ -503,6 +509,66 @@ def test_announce(bridge, node):
     assert status == 200
     assert payload["ok"] is True
     assert node.announced == 1
+
+
+def test_backup_name_is_filename_safe():
+    assert _backup_name("alice") == "alice"
+    assert _backup_name("al ice/x") == "al-ice-x"
+    assert _backup_name("") == "node"
+    assert _backup_name("a" * 100) == "a" * 64
+
+
+def test_backup_downloads_a_valid_archive(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    assert (
+        cli.main(["init", "--data-dir", str(data_dir), "--name", "alice", "--json"])
+        == 0
+    )
+    capsys.readouterr()
+    (data_dir / "peers.json").write_text('{"peers": []}\n', encoding="utf-8")
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=data_dir)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    try:
+        status, headers, body = _request(bridge, "/api/backup")
+    finally:
+        bridge.stop()
+    assert status == 200
+    assert headers["Content-Type"] == "application/gzip"
+    disposition = headers["Content-Disposition"]
+    assert disposition.startswith("attachment; ")
+    assert disposition.endswith('.tar.gz"')
+    assert "tau-backup-alice-" in disposition
+    assert headers["Content-Length"] == str(len(body))
+
+    archive = tarfile.open(fileobj=io.BytesIO(body), mode="r:gz")
+    with archive:
+        manifest = json.loads(archive.extractfile(MANIFEST_NAME).read())
+        assert manifest["format"] == 1
+        assert "identity" in manifest["files"]
+        assert "peers.json" in manifest["files"]
+
+    # The download restores as a working node with the same identity.
+    restored_dir = tmp_path / "restored"
+    archive_path = tmp_path / "downloaded.tar.gz"
+    archive_path.write_bytes(body)
+    manifest, _files = restore_backup(
+        TauConfig.resolve(data_dir=restored_dir), archive_path
+    )
+    assert manifest["format"] == 1
+    original = load_identity(data_dir / "identity")
+    restored = load_identity(restored_dir / "identity")
+    assert destination_hash(restored) == destination_hash(original)
+
+
+def test_backup_without_a_data_directory_is_unavailable(bridge):
+    status, _, payload = _json(bridge, "/api/backup")
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
 
 
 def test_static_console_and_assets(bridge):

@@ -85,3 +85,44 @@ export async function apiPost<T>(
 export function eventsUrl(since = 0): string {
   return `${API_BASE}/api/events?since=${since}`;
 }
+
+export interface DownloadResult {
+  blob: Blob;
+  filename: string;
+}
+
+function filenameFromDisposition(header: string | null): string {
+  if (!header) return "tau-backup.tar.gz";
+  const match = /filename\*?=(?:UTF-8''|")?([^";]+)"?/.exec(header);
+  if (!match) return "tau-backup.tar.gz";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+export async function apiDownload(path: string): Promise<DownloadResult> {
+  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+  if (!response.ok) {
+    // A failed download carries the usual JSON error body, not a blob.
+    const raw = await response.text();
+    let message = `request failed (${response.status})`;
+    if (raw) {
+      try {
+        const body = JSON.parse(raw) as ApiErrorBody | null;
+        if (body?.error?.message) message = body.error.message;
+      } catch {
+        // Non-JSON error body: keep the status fallback.
+      }
+    }
+    throw new ApiError(message, response.status);
+  }
+  const blob = await response.blob();
+  return {
+    blob,
+    filename: filenameFromDisposition(
+      response.headers.get("Content-Disposition"),
+    ),
+  };
+}
