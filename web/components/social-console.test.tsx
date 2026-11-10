@@ -161,6 +161,32 @@ describe("PostCard quote rendering", () => {
     ).toBeTruthy();
   });
 
+  it("reports a muted original without resurfacing its text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "still worth it",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "f".repeat(32),
+          name: "alice",
+          text: "",
+          deleted: false,
+          muted: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("still worth it")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting alice · a muted post",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows the quote count on the quoted post and hides it at zero", () => {
     const { rerender } = render(
       <PostCard
@@ -183,5 +209,64 @@ describe("PostCard quote rendering", () => {
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();
+  });
+});
+
+describe("PostCard save control", () => {
+  function renderCard(post: TanPost, onToggleSave = vi.fn()) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onToggleSave={onToggleSave}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+    return onToggleSave;
+  }
+
+  it("offers to save an unsaved post and calls back with the post", () => {
+    const post = makePost({ saved: false });
+    const onToggleSave = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Save this post to read later"));
+    expect(onToggleSave).toHaveBeenCalledTimes(1);
+    expect(onToggleSave).toHaveBeenCalledWith(post);
+  });
+
+  it("shows a saved post as saved, with when it was saved", () => {
+    renderCard(makePost({ saved: true, saved_at: 2000 }));
+
+    expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
+    expect(screen.getByText("★ saved")).toBeTruthy();
+    expect(screen.getByText(/saved /)).toBeTruthy();
+  });
+
+  it("hides the save control when no handler is given", () => {
+    render(
+      <PostCard
+        post={makePost()}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+
+    expect(screen.queryByTitle("Save this post to read later")).toBeNull();
+    expect(screen.queryByTitle("Remove from saved posts")).toBeNull();
+  });
+
+  it("shows a deleted saved post as deleted, keeping only unsave", () => {
+    renderCard(makePost({ deleted: true, text: "", saved: true }));
+
+    expect(screen.getByText("This post was deleted.")).toBeTruthy();
+    expect(screen.queryByTitle("Like this post")).toBeNull();
+    expect(screen.queryByTitle("Reply to this post")).toBeNull();
+    expect(screen.queryByTitle("Delete this post")).toBeNull();
+    // The save toggle stays so the post can still be removed from the list.
+    expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
   });
 });

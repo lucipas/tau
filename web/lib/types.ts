@@ -205,6 +205,9 @@ export interface TanPost {
   reposted?: boolean;
   quotes?: number;
   own?: boolean;
+  saved?: boolean;
+  saved_at?: number;
+  deleted?: boolean;
   // Thread entries carry their depth (the root is 0); timeline entries
   // have no depth.
   depth?: number;
@@ -222,6 +225,12 @@ export interface TanFollow {
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;
+}
+
+export interface TanSavedResponse {
+  posts: TanPost[];
+  count: number;
+  next_offset: number | null;
 }
 
 export interface TanFollowingResponse {

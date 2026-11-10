@@ -688,6 +688,274 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_saved_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "save me", name="tester", now=1000)
+        theirs = create_post(conn, other, "save me too", name="other", now=1001)
+        create_post(conn, other, "not saved", name="other", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline flags saved posts so the console can show save
+        # state on each card.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is False
+
+        # Saving requires a target, and an unknown hash cannot be saved.
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": "ff" * 32}
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["hash"] == mine["hash"]
+        assert payload["save"]["already_saved"] is False
+
+        # Saving again is a no-op that reports the original save.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["already_saved"] is True
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is True
+        assert by_text["save me too"]["saved"] is True
+        assert by_text["not saved"]["saved"] is False
+
+        # Saved posts come back newest save first, flagged as saved.
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "save me too",
+            "save me",
+        ]
+        assert all(item["saved"] is True for item in payload["posts"])
+        assert all("saved_at" in item for item in payload["posts"])
+
+        # The list pages through older saves instead of stopping at the
+        # first page. The resume offset comes from the response: it
+        # counts raw rows, so filtering never shifts it.
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["save me too"]
+        assert payload["next_offset"] == 1
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=1")
+        assert [item["text"] for item in payload["posts"]] == ["save me"]
+        assert payload["next_offset"] is None
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
+        assert payload["posts"] == []
+        assert payload["next_offset"] is None
+
+        # Unsaving removes it from the list; unsaving again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is False
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == ["save me"]
+
+        # A post deleted after being saved stays in the list with its
+        # text blanked, so the save is not silently lost.
+        node.app = TanApp(node.config, identity, name="tester", gossip=False)
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert len(payload["posts"]) == 1
+        assert payload["posts"][0]["text"] == ""
+        assert payload["posts"][0]["deleted"] is True
+        assert payload["posts"][0]["saved"] is True
+    finally:
+        bridge.stop()
+
+
+def test_tan_saved_annotations_and_muting(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_reply,
+        init_db,
+        mute,
+        mute_keyword,
+        save_post,
+        unmute,
+        unmute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        original = create_post(
+            conn, other, "original thought", name="other", now=1000
+        )
+        quote = create_quote(
+            conn, identity, original["hash"], "worth sharing", name="tester", now=1001
+        )
+        reply = create_reply(
+            conn, identity, original["hash"], "seconded", name="tester", now=1002
+        )
+        # Distinct save times keep the newest-first order deterministic.
+        save_post(conn, quote["hash"], now=2001)
+        save_post(conn, reply["hash"], now=2002)
+        save_post(conn, original["hash"], now=2003)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A saved quote carries its original, like the timeline does.
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["quoted"]["text"] == "original thought"
+        assert by_text["seconded"]["reply_to"]["text"] == "original thought"
+
+        # Muting the other author hides their saved post and redacts
+        # them from reply parents; unmuting restores both.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute(conn, original["author"], name="other")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded",
+            "worth sharing",
+        ]
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["seconded"]["reply_to"] is None
+        # A muted author's post never surfaces through a quote preview
+        # either — in the saved list or the timeline.
+        assert by_text["worth sharing"]["quoted"] is None
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        timeline_by_text = {item["text"]: item for item in payload["posts"]}
+        assert timeline_by_text["worth sharing"]["quoted"] is None
+        # Paging fills past the muted rows: the first page still holds
+        # one visible post, and the resume offset skips the muted row
+        # instead of re-fetching it.
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["next_offset"] == 2
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["next_offset"] is None
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute(conn, original["author"]) is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+
+        # A muted keyword hides matching saves; unmuting restores them.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute_keyword(conn, "sharing")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "original thought",
+            "seconded",
+        ]
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute_keyword(conn, "sharing") is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+
+        # A muted keyword blanks the quoted original (and the reply
+        # parent) instead of leaking its text through the preview.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute_keyword(conn, "thought")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded",
+            "worth sharing",
+        ]
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["quoted"]["text"] == ""
+        assert by_text["worth sharing"]["quoted"]["muted"] is True
+        assert by_text["seconded"]["reply_to"]["text"] == ""
+        assert by_text["seconded"]["reply_to"]["muted"] is True
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute_keyword(conn, "thought") is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+    finally:
+        bridge.stop()
+
+
 def test_tan_thread_via_api(tmp_path):
     import RNS
 

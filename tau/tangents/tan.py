@@ -1393,6 +1393,29 @@ def annotate_reactions(
     return posts
 
 
+def annotate_saved(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``saved`` flag to post dicts, in place.
+
+    A display surface uses it to show save state on each card without
+    a second request: the saved list itself is fetched separately.
+    """
+    hashes = [str(post["hash"]) for post in posts if post.get("hash")]
+    saved: Set[str] = set()
+    if hashes:
+        placeholders = ", ".join("?" for _ in hashes)
+        rows = conn.execute(
+            f"SELECT hash FROM saved_posts WHERE hash IN ({placeholders})",
+            hashes,
+        ).fetchall()
+        saved = {str(row["hash"]) for row in rows}
+    for post in posts:
+        post["saved"] = str(post.get("hash")) in saved
+    return posts
+
+
 def annotate_replies(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
@@ -1544,6 +1567,9 @@ def annotate_quote_counts(
 def annotate_quotes(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
+    *,
+    muted_keywords: Optional[Sequence[str]] = None,
+    exclude_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1552,7 +1578,12 @@ def annotate_quotes(
     original has not arrived yet — a quote is still shown on its own.
     A deleted original is reported as deleted with its text blanked,
     so the thread stays readable without resurfacing removed content.
-    Top-level posts and replies get no ``quoted`` key.
+    An original matching a muted keyword (see :func:`muted_keywords`)
+    is reported the same way, with its text blanked and ``muted`` set,
+    so the muted content does not leak through the preview.  An
+    original whose author is in *exclude_authors* (muted) is reported
+    as ``None`` so its name and text never surface.  Top-level posts
+    and replies get no ``quoted`` key.
 
     Parents are fetched in one query and their deletion status in a
     second, so a quote-heavy page does not issue one lookup per quote.
@@ -1586,21 +1617,32 @@ def annotate_quotes(
             list(parents),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
     for post in posts:
         if post.get("kind") != KIND_QUOTE:
             continue
         parent = parents.get(str(post.get("target") or ""))
-        if parent is None:
+        if parent is None or (
+            exclude_authors and parent["author"] in exclude_authors
+        ):
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
-        post["quoted"] = {
+        is_muted = _text_matches_muted_keywords(
+            str(parent.get("text") or ""), muted_pattern
+        )
+        summary = {
             "hash": parent["hash"],
             "author": parent["author"],
             "name": parent["name"],
-            "text": "" if is_deleted else parent["text"],
+            "text": "" if is_deleted or is_muted else parent["text"],
             "deleted": is_deleted,
         }
+        if is_muted:
+            # Only present when muted, so unmuted previews keep their
+            # established shape.
+            summary["muted"] = True
+        post["quoted"] = summary
     return posts
 
 
@@ -2216,6 +2258,8 @@ def timeline(
                             blocked_authors=blocked,
                         ),
                     ),
+                    muted_keywords=keywords,
+                    exclude_authors=silenced,
                 ),
                 viewer=viewer,
             ),
@@ -2273,6 +2317,8 @@ def timeline(
                         blocked_authors=blocked,
                     ),
                 ),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
             ),
             viewer=viewer,
         ),
@@ -2310,6 +2356,7 @@ def author_timeline(
     if author in blocked:
         return []
     keywords = _muted_keyword_list(conn)
+    silenced = muted_author_set(conn)
 
     def page(cursor: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
@@ -2346,9 +2393,12 @@ def author_timeline(
                             ),
                         ),
                         muted_keywords=keywords,
+                        exclude_authors=silenced,
                         blocked_authors=blocked,
                     ),
                 ),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
             ),
             viewer=viewer,
         ),
@@ -2533,7 +2583,8 @@ def thread(
     if start.get("author") in excluded:
         raise TanError(f"post is from a blocked author: {ref!r}")
     silenced = muted_author_set(conn)
-    muted_pattern = _muted_keyword_pattern(_muted_keyword_list(conn))
+    keywords = _muted_keyword_list(conn)
+    muted_pattern = _muted_keyword_pattern(keywords)
     root = start
     ancestors = {root["hash"]}
     # Once a muted entry is met (the named entry itself, or an ancestor),
@@ -2642,6 +2693,8 @@ def thread(
                     conn,
                     annotate_edits(conn, annotate_reactions(conn, batch, viewer=viewer)),
                 ),
+                muted_keywords=keywords,
+                exclude_authors=silenced,
             ),
             viewer=viewer,
         )
@@ -3294,19 +3347,25 @@ def unsave_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
 
 
 def saved_posts(
-    conn: sqlite3.Connection, *, limit: int = DEFAULT_FEED_LIMIT
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """Saved posts, newest save first.
 
     A post deleted after being saved stays in the list with its text
     blanked and ``deleted`` set, so the save is not silently lost.
+    *offset* pages through the list in save order, so a caller can
+    reach saves older than one page.
     """
     count = max(1, min(int(limit), MAX_SAVED_POSTS))
+    start = max(0, int(offset))
     rows = conn.execute(
         "SELECT p.*, s.saved_at FROM saved_posts s "
         "JOIN posts p ON p.hash = s.hash "
-        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ?",
-        (count,),
+        "ORDER BY s.saved_at DESC, s.hash DESC LIMIT ? OFFSET ?",
+        (count, start),
     ).fetchall()
     deleted = deleted_targets(conn)
     records: List[Dict[str, Any]] = []
@@ -3318,6 +3377,69 @@ def saved_posts(
             post["text"] = ""
         records.append(post)
     return records
+
+
+def annotated_saved_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+    viewer: Optional[str] = None,
+    ruleset: Optional[Ruleset] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Saved posts with the timeline's annotations and muting applied.
+
+    Reaction counts, reply parents, quote counts and quoted originals
+    are attached exactly as :func:`timeline` does: a reply parent or
+    quoted original from a muted author is redacted, and a parent
+    matching a muted keyword has its text blanked.  Posts by muted
+    authors or matching a muted keyword are dropped from the view —
+    muting is display-only, so the saves stay stored and unmuting
+    restores them.  Each returned post carries ``saved`` and
+    ``saved_at``.
+
+    Returns ``(posts, next_offset)``: up to *limit* visible posts
+    starting at raw offset *offset*, and the raw offset to resume
+    paging from, or ``None`` when the saved list is exhausted.  Muted
+    entries and entries hidden by *ruleset* never shrink a page: raw
+    rows are read until *limit* visible posts are collected or the
+    list is exhausted, so a caller must page with the returned
+    ``next_offset``, not with the number of posts it received.
+    """
+    silenced = muted_author_set(conn)
+    keywords = _muted_keyword_list(conn)
+    kept: List[Dict[str, Any]] = []
+    raw_offset = max(0, int(offset))
+    while len(kept) < limit:
+        batch = saved_posts(conn, limit=limit - len(kept), offset=raw_offset)
+        if not batch:
+            break
+        raw_offset += len(batch)
+        batch = annotate_quotes(
+            conn,
+            annotate_quote_counts(
+                conn,
+                annotate_replies(
+                    conn,
+                    annotate_reactions(conn, batch, viewer=viewer),
+                    muted_keywords=keywords,
+                    exclude_authors=silenced,
+                ),
+            ),
+            muted_keywords=keywords,
+            exclude_authors=silenced,
+        )
+        for post in batch:
+            post["saved"] = True
+        batch = [post for post in batch if post["author"] not in silenced]
+        batch = without_muted_keywords(conn, batch, keywords)
+        if ruleset is not None:
+            batch = apply_display_rules(batch, ruleset)
+        kept.extend(batch)
+    if len(kept) < limit:
+        return kept, None
+    total = conn.execute("SELECT COUNT(*) AS n FROM saved_posts").fetchone()["n"]
+    return kept, raw_offset if raw_offset < int(total) else None
 
 
 
