@@ -34,6 +34,7 @@ from tau.tangents.tan import (
     create_quote,
     create_reaction,
     create_reply,
+    create_repost,
     deleted_targets,
     edit_states,
     export_entries,
@@ -52,9 +53,9 @@ from tau.tangents.tan import (
     muted_keywords,
     quote_counts,
     reaction_states,
+    repost_counts,
     resolve_author,
     resolve_post,
-    resolve_author,
     resolve_muted_name,
     max_seq,
     mentions,
@@ -2153,8 +2154,8 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
     assert deleted_targets(conn) == set()
     assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
 
-    # Only posts, replies and quotes can be deleted, even by their own author.
-    with pytest.raises(TanError, match="only posts, replies and quotes can be deleted"):
+    # Only posts, replies, reposts and quotes can be deleted, even by their own author.
+    with pytest.raises(TanError, match="only posts, replies, reposts and quotes can be deleted"):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
@@ -3127,6 +3128,362 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
         create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
 
 
+def test_repost_chains_verifies_and_annotates(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost["kind"] == "repost"
+    assert repost["target"] == post["hash"]
+    assert repost["text"] == ""
+    assert verify_post(repost)["hash"] == repost["hash"]
+    assert head(conn, author_of(bob)) == repost["hash"]
+
+    # The sync feed carries the repost; display surfaces show it with
+    # the original attached and a repost count on the original.
+    chain = feed(conn, author=author_of(bob))
+    assert [entry["kind"] for entry in chain] == ["repost"]
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"], post["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "original thought",
+        "deleted": False,
+    }
+    assert "repost_of" not in items[1]
+    assert repost_counts(conn, [post["hash"]])[post["hash"]] == {
+        "reposts": 1,
+        "reposted": False,
+    }
+    assert repost_counts(conn, [post["hash"]], viewer=author_of(bob))[
+        post["hash"]
+    ] == {"reposts": 1, "reposted": True}
+    assert items[1]["reposts"] == 1
+    assert items[1]["reposted"] is False
+    assert items[0]["reposts"] == 0
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [
+        repost["hash"],
+        post["hash"],
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        repost["hash"],
+        post["hash"],
+    ]
+
+
+def test_repost_rejects_bad_targets(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        create_repost(conn, bob, "cd" * 32, name="bob", now=1002)
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_repost(conn, bob, like["hash"], name="bob", now=1002)
+    with pytest.raises(TanError, match="cannot repost your own post"):
+        create_repost(conn, alice, post["hash"], name="alice", now=1002)
+
+    # A repost of a repost is a repost of a repost, not of a post.
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1002)
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_repost(conn, alice, repost["hash"], name="alice", now=1003)
+    # And the same post cannot be reposted twice while it stands.
+    with pytest.raises(TanError, match="already been reposted"):
+        create_repost(conn, bob, post["hash"], name="bob", now=1003)
+
+
+def test_repost_to_unlinked_parent_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # reposting it would amplify a post with no chain context.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        create_repost(destination, bob, second["hash"], name="bob", now=1002)
+
+    # Once the chain links up, the same repost is accepted.
+    store_post(destination, first)
+    repost = create_repost(destination, bob, second["hash"], name="bob", now=1003)
+    assert repost["kind"] == "repost"
+
+
+def test_repost_of_uncached_original_shows_without_text(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "original thought", name="alice", now=1000)
+    repost = create_repost(source, bob, post["hash"], name="bob", now=1001)
+
+    # The repost arrives (via gossip or sync) before its original: the
+    # store path keeps it, and the timeline shows it without the
+    # original's text until the original is cached.
+    replica = init_db(tmp_path / "replica.sqlite3")
+    record, is_new = store_post(replica, repost)
+    assert is_new is True
+    items = timeline(replica, [author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] is None
+
+    store(replica, post)
+    items = timeline(replica, [author_of(bob)])
+    assert items[0]["repost_of"]["hash"] == post["hash"]
+    assert items[0]["repost_of"]["text"] == "original thought"
+
+
+def test_repost_of_deleted_original_blanks_the_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+
+    # The repost still stands — only the original was deleted — but
+    # its text is blanked, and reposting the deleted post is refused.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "",
+        "deleted": True,
+    }
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+    with pytest.raises(TanError, match="has been deleted"):
+        create_repost(conn, bob, post["hash"], name="bob", now=1003)
+
+
+def test_repost_of_a_reply(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    repost = create_repost(conn, alice, reply["hash"], name="alice", now=1002)
+    assert repost["kind"] == "repost"
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [
+        repost["hash"],
+        reply["hash"],
+        post["hash"],
+    ]
+    assert items[0]["repost_of"]["hash"] == reply["hash"]
+    assert items[0]["repost_of"]["text"] == "first reply"
+
+
+def test_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    # A repost carries no text of its own, so blocking the original's
+    # author hides the repost itself — its words must not leak
+    # through the reposter's timeline.
+    blocked = [author_of(bob)]
+    items = timeline(conn, [author_of(alice)], exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+    items = timeline(conn, include_all=True, exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+
+
+def test_timeline_drops_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    mute(conn, author_of(bob), name="bob")
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "muted words" not in json.dumps(items)
+
+
+def test_timeline_drops_repost_matching_muted_keyword(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto secrets", name="alice", now=1000)
+    create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    other = create_post(conn, bob, "clean post", name="bob", now=1002)
+    mute_keyword(conn, "crypto")
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "crypto secrets" not in json.dumps(items)
+
+
+def test_repost_of_edited_original_shows_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original draft", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_edit(conn, alice, post["hash"], "original, fixed", name="alice", now=1002)
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "original, fixed"
+    assert "original draft" not in json.dumps(items)
+
+
+def test_author_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    items = author_timeline(
+        conn, author_of(alice), exclude_authors=[author_of(bob)]
+    )
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+
+
+def test_author_timeline_keeps_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    repost = create_repost(conn, alice, post["hash"], name="alice", now=1001)
+
+    # An explicit author lookup still shows the repost, the same way
+    # it still shows a reply to a muted parent.
+    mute(conn, author_of(bob), name="bob")
+    items = author_timeline(conn, author_of(alice))
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "muted words"
+
+
+def test_repost_can_be_deleted_and_reposted_again(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+    # Deleting your own repost removes it from views and from the count.
+    create_delete(conn, bob, repost["hash"], name="bob", now=1002)
+    assert deleted_targets(conn) == {repost["hash"]}
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [post["hash"]]
+    assert items[0]["reposts"] == 0
+
+    # And reposting again after deleting is allowed.
+    again = create_repost(conn, bob, post["hash"], name="bob", now=1003)
+    assert again["kind"] == "repost"
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+
+def test_repost_counts_distinct_reposters(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    first = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+    # A second repost of the same target from the same author — stored
+    # past create_repost's duplicate guard, as a forked chain could
+    # deliver — still counts as one reposter, not two.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "",
+        "created_at": 1002.0,
+        "prev": first["hash"],
+        "kind": "repost",
+        "target": post["hash"],
+    }
+    digest = hash(body, previous=first["hash"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_post(conn, mesg)
+    assert is_new is True
+    assert repost_counts(conn, [post["hash"]])[post["hash"]] == {
+        "reposts": 1,
+        "reposted": False,
+    }
+    assert repost_counts(conn, [post["hash"]], viewer=author_of(bob))[
+        post["hash"]
+    ]["reposted"] is True
+
+
+def test_thread_resolves_a_repost_to_its_original(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1002)
+
+    # Naming the repost opens the original's thread; the repost itself
+    # is not a thread entry.
+    assert [item["hash"] for item in thread(conn, repost["hash"][:12])] == [
+        post["hash"],
+        reply["hash"],
+    ]
+    assert resolve_post(conn, repost["hash"][:12])["hash"] == repost["hash"]
+
+
+def test_cli_tan_repost(tmp_path, capsys):
+    bob = RNS.Identity()
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = create_post(conn, bob, "worth sharing", name="bob", now=1000)
+    finally:
+        conn.close()
+
+    # JSON output carries the signed repost entry.
+    assert (
+        main(
+            [
+                "tan", "repost", "--data-dir", str(data_dir),
+                "--no-publish", "--json", post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["repost"]["kind"] == "repost"
+    assert payload["repost"]["target"] == post["hash"]
+    assert payload["published"] is None
+
+    # Text timeline output shows who reposted and the original text.
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "reposted bob" in out
+    assert "worth sharing" in out
+    assert "↻ 1" in out
+
+    # Reposting the same post again is a clean CLI error, not a traceback.
+    assert (
+        main(
+            [
+                "tan", "repost", "--data-dir", str(data_dir),
+                "--no-publish", post["hash"][:16],
+            ]
+        )
+        != 0
+    )
+    assert "already been reposted" in capsys.readouterr().err
+
+
 def test_quote_chains_verifies_and_annotates(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
@@ -3334,7 +3691,9 @@ def test_quote_can_be_liked_deleted_and_replied_to(identities, tmp_path):
 
     # A reaction is not a timeline entry, so it cannot be deleted.
     like = create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1005)
-    with pytest.raises(TanError, match="only posts, replies and quotes"):
+    with pytest.raises(
+        TanError, match="only posts, replies, reposts and quotes can be deleted"
+    ):
         create_delete(conn, alice, like["hash"], name="alice", now=1006)
 
 

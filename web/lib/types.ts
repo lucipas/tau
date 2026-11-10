@@ -197,9 +197,12 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  reposts?: number;
+  reposted?: boolean;
   quotes?: number;
   own?: boolean;
 }

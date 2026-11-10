@@ -1087,6 +1087,34 @@ def build_parser() -> argparse.ArgumentParser:
         tan_react.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
         tan_react.set_defaults(func=cmd_tan_like if verb == "like" else cmd_tan_unlike)
 
+    tan_repost = tan_sub.add_parser(
+        "repost",
+        parents=[common],
+        help="repost a post (writes a signed repost entry to your chain)",
+    )
+    tan_repost.add_argument(
+        "target", metavar="POST", help="post hash or unique hash prefix"
+    )
+    tan_repost.add_argument(
+        "--to",
+        action="append",
+        default=None,
+        metavar="NAME|HASH",
+        help="publish only to these peers (repeatable)",
+    )
+    tan_repost.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="store locally without contacting peers",
+    )
+    tan_repost.add_argument(
+        "--ttl", type=int, default=MAX_GOSSIP_TTL, metavar="HOPS"
+    )
+    tan_repost.add_argument(
+        "--timeout", type=float, default=15.0, metavar="SECONDS"
+    )
+    tan_repost.set_defaults(func=cmd_tan_repost)
+
     tan_delete = tan_sub.add_parser(
         "delete",
         parents=[common],
@@ -1449,7 +1477,7 @@ def build_parser() -> argparse.ArgumentParser:
     tan_rules.add_argument(
         "--kinds",
         default=None,
-        metavar="post,like,unlike,delete,reply,quote",
+        metavar="post,reply,repost,quote,edit,like,unlike,delete",
         help="comma-separated entry kinds to display (display-only: "
         "every kind is still stored, so chains stay complete)",
     )
@@ -1865,8 +1893,26 @@ def _print_tan_posts(
                     )
             else:
                 print(f"  in reply to {short_hash(str(post.get('target', '')))}")
-        for line in str(post.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
+        if post.get("kind") == "repost":
+            original = post.get("repost_of")
+            if isinstance(original, dict):
+                if original.get("deleted"):
+                    print("  reposted a deleted post")
+                else:
+                    print(
+                        f"  reposted {original.get('name') or 'anonymous'} "
+                        f"({short_hash(str(original.get('author', '')))}):"
+                    )
+                    for line in str(original.get("text") or "").splitlines() or [""]:
+                        print(f"  {line}")
+            else:
+                print(
+                    f"  reposted {short_hash(str(post.get('target', '')))}"
+                    " (original not cached yet)"
+                )
+        else:
+            for line in str(post.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
         if post.get("kind") == "quote":
             quoted = post.get("quoted")
             if isinstance(quoted, dict):
@@ -1882,6 +1928,10 @@ def _print_tan_posts(
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"  ♥ {likes}{suffix}")
+        reposts = int(post.get("reposts") or 0)
+        if reposts or post.get("reposted"):
+            suffix = " (you reposted this)" if post.get("reposted") else ""
+            print(f"  ↻ {reposts}{suffix}")
         quotes = int(post.get("quotes") or 0)
         if quotes:
             print(f"  ❝ {quotes}")
@@ -1931,6 +1981,10 @@ def _print_tan_thread(
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
             print(f"{indent}  ♥ {likes}{suffix}")
+        reposts = int(post.get("reposts") or 0)
+        if reposts or post.get("reposted"):
+            suffix = " (you reposted this)" if post.get("reposted") else ""
+            print(f"{indent}  ↻ {reposts}{suffix}")
         quotes = int(post.get("quotes") or 0)
         if quotes:
             print(f"{indent}  ❝ {quotes}")
@@ -2222,6 +2276,58 @@ def cmd_tan_like(args: argparse.Namespace) -> int:
 
 def cmd_tan_unlike(args: argparse.Namespace) -> int:
     return _cmd_tan_react(args, liked=False)
+
+
+def cmd_tan_repost(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+
+    conn = init_db(config.social_db_path)
+    try:
+        target = resolve_post(conn, args.target)["hash"]
+    finally:
+        conn.close()
+
+    if getattr(args, "no_publish", False):
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        record = app.repost(target)
+        published = None
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            app = TanApp(
+                config,
+                node.identity,
+                name=config.name,
+                request_timeout=float(getattr(args, "timeout", 15.0)),
+            )
+            node.attach_app(app)
+            targets = None
+            if getattr(args, "to", None):
+                targets = [node.resolve_peer(target) for target in args.to]
+            record = app.repost(target)
+            published = app.publish(
+                record,
+                targets=targets,
+                ttl=max(0, min(int(getattr(args, "ttl", MAX_GOSSIP_TTL)), MAX_GOSSIP_TTL)),
+            )
+        finally:
+            node.stop()
+
+    if json_output:
+        _emit({"repost": record, "published": published}, True)
+    else:
+        print(f"reposted {short_hash(target)}")
+        if published is None:
+            print("  stored locally (not published)")
+        else:
+            print(
+                f"  published to {published['delivered']}/{published['peers']} peer(s)"
+            )
+            for error in published["errors"]:
+                print(f"  failed {short_hash(error['peer'])}: {error['error']}")
+    return _EXIT_OK
 
 
 def cmd_tan_delete(args: argparse.Namespace) -> int:
