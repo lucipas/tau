@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
-import type { TanPost } from "./types";
+import type { TanPost, TanRules } from "./types";
 import { useTan } from "./use-tan";
 
 vi.mock("./api", () => ({
@@ -164,7 +164,7 @@ describe("useTan deletePost", () => {
   });
 });
 
-const allowRules = {
+const allowRules: TanRules = {
   default: "allow",
   allow_authors: [],
   block_authors: [],
@@ -172,7 +172,7 @@ const allowRules = {
   kinds: null,
 };
 
-const denyRules = { ...allowRules, default: "deny" };
+const denyRules: TanRules = { ...allowRules, default: "deny" };
 
 function mockFeed(rulesImpl: (path: string) => Promise<unknown>) {
   mockedGet.mockImplementation((path: string) => {
