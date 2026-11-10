@@ -1949,7 +1949,9 @@ def _print_tan_posts(
         if post.get("kind") == "quote":
             quoted = post.get("quoted")
             if isinstance(quoted, dict):
-                if quoted.get("deleted"):
+                if quoted.get("blocked"):
+                    print("  quoting a blocked author's post")
+                elif quoted.get("deleted"):
                     print("  quoting a deleted post")
                 else:
                     print(f"  quoting {quoted.get('name') or 'anonymous'}:")
@@ -1999,7 +2001,9 @@ def _print_tan_thread(
         if post.get("kind") == "quote":
             quoted = post.get("quoted")
             if isinstance(quoted, dict):
-                if quoted.get("deleted"):
+                if quoted.get("blocked"):
+                    print(f"{indent}  quoting a blocked author's post")
+                elif quoted.get("deleted"):
                     print(f"{indent}  quoting a deleted post")
                 else:
                     print(f"{indent}  quoting {quoted.get('name') or 'anonymous'}:")

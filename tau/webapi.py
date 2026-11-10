@@ -16,6 +16,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/search   search stored posts by keyword
     GET  /api/tan/mentions replies to your own posts
     GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
@@ -1125,6 +1126,81 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_search(
+        self,
+        *,
+        query: str,
+        author: Optional[str] = None,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Return stored posts matching a keyword, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_search`: the same case-insensitive
+        substring match and visibility rules, so the console shows exactly
+        what the CLI shows for the same store.  The node's block-list is
+        applied as in :meth:`tan_timeline`, and display rules are applied
+        on top.  An empty query or an author that cannot be resolved
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            TanError,
+            apply_display_rules,
+            resolve_author,
+            search_posts,
+        )
+
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            target = None
+            if author:
+                try:
+                    target, _ = resolve_author(
+                        conn, author, registry=self.node.registry
+                    )
+                except TanError as exc:
+                    raise RequestError(str(exc)) from exc
+            try:
+                posts = search_posts(
+                    conn,
+                    query,
+                    author=target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
+            except TanError as exc:
+                raise RequestError(str(exc)) from exc
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
     def tan_following(self) -> List[Dict[str, Any]]:
         from .tangents.tan import author_stats, following
 
@@ -1944,6 +2020,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                         limit=limit, include_all=include_all, author=author
                     )
                 except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/search":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                author = (query.get("author") or [None])[0]
+                try:
+                    posts = self.bridge.tan_search(
+                        query=text, author=author, limit=limit
+                    )
+                except RequestError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)

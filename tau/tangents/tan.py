@@ -1570,6 +1570,7 @@ def annotate_quotes(
     *,
     muted_keywords: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
+    blocked_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1582,7 +1583,12 @@ def annotate_quotes(
     is reported the same way, with its text blanked and ``muted`` set,
     so the muted content does not leak through the preview.  An
     original whose author is in *exclude_authors* (muted) is reported
-    as ``None`` so its name and text never surface.  Top-level posts
+    as ``None`` so its name and text never surface.  An original whose
+    author is in *blocked_authors* is reported with its text blanked,
+    its author and name redacted, and ``blocked`` set, so blocking an
+    author never leaks their words — or their name — through a quote
+    preview, the same protection :func:`annotate_replies` gives reply
+    snippets.  Top-level posts
     and replies get no ``quoted`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -1628,6 +1634,18 @@ def annotate_quotes(
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
+        if blocked_authors and parent["author"] in blocked_authors:
+            # Redact identity too: a blocked author's name and hash must
+            # not leak through a quote preview, as in annotate_replies.
+            post["quoted"] = {
+                "hash": parent["hash"],
+                "author": "",
+                "name": "",
+                "text": "",
+                "deleted": is_deleted,
+                "blocked": True,
+            }
+            continue
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         )
@@ -2260,6 +2278,7 @@ def timeline(
                     ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
+                    blocked_authors=blocked,
                 ),
                 viewer=viewer,
             ),
@@ -2319,6 +2338,7 @@ def timeline(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=blocked,
             ),
             viewer=viewer,
         ),
@@ -2399,6 +2419,7 @@ def author_timeline(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=blocked,
             ),
             viewer=viewer,
         ),
@@ -2695,6 +2716,7 @@ def thread(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=excluded,
             ),
             viewer=viewer,
         )
@@ -2784,6 +2806,7 @@ def search_posts(
                     conn, annotate_reactions(conn, matches[:count], viewer=viewer)
                 ),
             ),
+            blocked_authors=excluded,
         ),
         viewer=viewer,
     )

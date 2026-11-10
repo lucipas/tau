@@ -18,6 +18,11 @@ const SAVED_PAGE_SIZE = 100;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  const [searchResults, setSearchResults] = useState<TanPost[]>([]);
+  // The search the feed is showing, or null for the timeline. Kept beside
+  // `all` so a search mid-action reloads the search, the same way `all`
+  // works — a like or delete on a search result refreshes the results.
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
@@ -47,6 +52,10 @@ export function useTan() {
     allRef.current = all;
   }, [all]);
 
+  const searchQueryRef = useRef(searchQuery);
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
   const showMentionsRef = useRef(showMentions);
   useEffect(() => {
     showMentionsRef.current = showMentions;
@@ -84,15 +93,22 @@ export function useTan() {
     const generation = ++generationRef.current;
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
+      const activeSearch = searchQueryRef.current;
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
       const [feed, follows] = await Promise.all([
-        showMentionsRef.current
-          ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+        activeSearch !== null
+          ? apiGet<TanTimelineResponse>(
+              `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
+            )
+          : showMentionsRef.current
+            ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
           : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
       ]);
       if (generationRef.current !== generation) return false;
-      if (showMentionsRef.current) {
+      if (activeSearch !== null) {
+        setSearchResults(feed.posts);
+      } else if (showMentionsRef.current) {
         setMentions(feed.posts);
       } else {
         setPosts(feed.posts);
@@ -171,11 +187,34 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, showMentions, load]);
+  }, [all, searchQuery, showMentions, load]);
 
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // A search is a view switch, like `all`: setting the query re-runs the
+  // load effect, which fetches the search endpoint instead of the
+  // timeline. Clearing it returns to the timeline the same way.
+  const search = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim();
+      if (!trimmed) return;
+      if (trimmed === searchQueryRef.current) {
+        // Resubmitting the current query: setting the same state would
+        // bail out without reloading, so refresh directly — and keep
+        // the current results instead of clearing them, or the feed
+        // would wrongly report no matches until the next poll.
+        await load();
+        return;
+      }
+      // Drop hits from the previous query so they are not shown as matches
+      // for the new one while its request is in flight.
+      setSearchResults([]);
+      setSearchQuery(trimmed);
+    },
+    [load],
+  );
 
   // Saved posts change only through this client's save/unsave actions
   // (or the CLI), so they load on demand instead of on every poll tick.
@@ -325,6 +364,11 @@ export function useTan() {
     [load],
   );
 
+  const clearSearch = useCallback(() => {
+    setSearchQuery(null);
+    setSearchResults([]);
+  }, []);
+
   const closeThread = useCallback(() => {
     openThreadRef.current = null;
     setThreadRef(null);
@@ -411,6 +455,8 @@ export function useTan() {
 
   return {
     posts,
+    searchResults,
+    searchQuery,
     mentions,
     following,
     saved,
@@ -435,6 +481,8 @@ export function useTan() {
     openThread,
     closeThread,
     refresh,
+    search,
+    clearSearch,
     publish,
     follow,
     unfollow,

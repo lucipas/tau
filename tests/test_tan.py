@@ -3741,6 +3741,37 @@ def test_quote_of_deleted_post_renders_blanked(identities, tmp_path):
     assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 1
 
 
+def test_quote_of_blocked_post_renders_redacted(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "secret plans", name="alice", now=1000)
+    quote = create_quote(
+        conn, bob, post["hash"], "worth quoting", name="bob", now=1001
+    )
+
+    # Blocking the original's author redacts the embedded original —
+    # name and text included — so the block never leaks through a
+    # quote preview, on the timeline or in search.
+    blocked = {post["author"]}
+    items = timeline(
+        conn, [post["author"], author_of(bob)], exclude_authors=blocked
+    )
+    assert [item["hash"] for item in items] == [quote["hash"]]
+    assert items[0]["quoted"] == {
+        "hash": post["hash"],
+        "author": "",
+        "name": "",
+        "text": "",
+        "deleted": False,
+        "blocked": True,
+    }
+    results = search_posts(conn, "quoting", exclude_authors=blocked)
+    assert [item["hash"] for item in results] == [quote["hash"]]
+    assert results[0]["quoted"]["blocked"] is True
+    assert results[0]["quoted"]["text"] == ""
+    assert results[0]["quoted"]["name"] == ""
+
+
 def test_search_includes_quotes(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")
