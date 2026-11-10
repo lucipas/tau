@@ -48,6 +48,7 @@ from .config import (
     write_node_metadata,
     write_rns_config,
 )
+from .doctor import all_ok, run_checks
 from .identity import (
     IdentityError,
     _identity_lock,
@@ -451,6 +452,13 @@ def build_parser() -> argparse.ArgumentParser:
     info.add_argument("--timeout", type=float, default=15.0, metavar="SECONDS")
     info.add_argument("--discover-timeout", type=float, default=10.0, metavar="SECONDS")
     info.set_defaults(func=cmd_info)
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        parents=[common],
+        help="check the local data directory's health (read-only)",
+    )
+    doctor.set_defaults(func=cmd_doctor)
 
     peers = subparsers.add_parser(
         "peers", parents=[common], help="list peers from the local registry"
@@ -5669,6 +5677,26 @@ def cmd_ping(args: argparse.Namespace) -> int:
         latency = f" ({rtt * 1000:.0f} ms)" if isinstance(rtt, (int, float)) else ""
         print(f"pong from {response.get('server', args.to)}{latency}")
     return _EXIT_OK
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report the local data directory's health without changing it."""
+    config = _make_config(args)
+    checks = run_checks(config)
+    if _json_mode(args):
+        _emit(
+            {"ok": all_ok(checks), "checks": [check.to_dict() for check in checks]},
+            True,
+        )
+    else:
+        for check in checks:
+            print(f"{check.status:<4} {check.name}: {check.detail}")
+        failed = [check for check in checks if check.failed]
+        if failed:
+            print(f"\n{len(failed)} check(s) failed")
+        else:
+            print("\ndata directory healthy")
+    return _EXIT_ERROR if not all_ok(checks) else _EXIT_OK
 
 
 def cmd_info(args: argparse.Namespace) -> int:
