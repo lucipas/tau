@@ -157,7 +157,7 @@ describe("useTan deletePost", () => {
     expect(result.current.posts).toEqual([second]);
   });
 
-  it("loads suggested authors with the feed and refreshes them after a follow", async () => {
+  it("loads suggested authors alongside the feed and refreshes them after a follow", async () => {
     const suggestion = {
       author: "e".repeat(64),
       name: "carol",
@@ -186,8 +186,8 @@ describe("useTan deletePost", () => {
     expect(mockedPost).toHaveBeenCalledWith("/api/tan/follow", {
       target: suggestion.author,
     });
-    // Following reloads the feed, so the followed author drops out of
-    // the suggestions on the same round trip.
+    // Following reloads the feed and refreshes the suggestions, so the
+    // followed author drops out of the list on the same round trip.
     expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
   });
 });
