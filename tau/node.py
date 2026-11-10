@@ -944,6 +944,10 @@ class TauNode:
             if not force and now - self._last_peer_save < _PEER_SAVE_INTERVAL:
                 return
             try:
+                # Pick up aliases set by one-shot commands while this
+                # node was serving, before the snapshot below rewrites
+                # the registry file — otherwise the save would erase them.
+                self.registry.refresh_aliases()
                 # Drop peers we have not heard from in a while, so the
                 # registry (and every sweep over it, e.g. mail flush) does
                 # not accumulate dead entries forever.  Peers with queued

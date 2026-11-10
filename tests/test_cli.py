@@ -2805,6 +2805,134 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
     assert events == ["node.start", "bridge.start", "node.stop"]
 
 
+# -- peers alias ------------------------------------------------------------
+
+
+def _seed_alias_peer(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(peer_hash, identity.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    return data_dir, peer_hash
+
+
+def test_peers_alias_sets_lists_and_unaliases(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", peer_hash.hex(), "my-laptop",
+         "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "alias 'my-laptop' set for alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "my-laptop (alice)" in capsys.readouterr().out
+
+    code = cli.main(
+        ["peers", "unalias", "my-laptop", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "removed alias for alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "my-laptop" not in capsys.readouterr().out
+
+
+def test_peers_alias_json_includes_alias(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", "alice", "my-laptop",
+         "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alias"] == "my-laptop"
+    assert payload["name"] == "alice"
+
+
+def test_peers_alias_unknown_peer_and_duplicates(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", "nobody", "spare", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    assert cli.main(
+        ["peers", "alias", peer_hash.hex(), "spare",
+         "--data-dir", str(data_dir)]
+    ) == 0
+    capsys.readouterr()
+
+    identity = RNS.Identity()
+    other_hash = destination_hash(identity)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(other_hash, identity.get_public_key(), name="carol", now=200.0)
+    registry.save()
+
+    code = cli.main(
+        ["peers", "alias", "carol", "SPARE", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "already used" in capsys.readouterr().err
+
+
+def test_parser_peers_alias_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "alias", "bob", "laptop"])
+    assert args.command == "peers"
+    assert args.peers_command == "alias"
+    assert args.peer == "bob"
+    assert args.alias == "laptop"
+
+    args = parser.parse_args(["peers", "unalias", "laptop"])
+    assert args.peers_command == "unalias"
+    assert args.peer == "laptop"
+
+    plain = parser.parse_args(["peers"])
+    assert plain.command == "peers"
+    assert plain.peers_command is None
+
+
+def test_allowlist_add_ignores_aliases_and_lists_asserted_names(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    # A second peer aliased "alice" must not be the one allow-listed when
+    # the operator names "alice".
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = RNS.Identity()
+    other_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(other_hash, identity.get_public_key(), name="carol", now=200.0)
+    registry.set_alias(other_hash, "alice")
+    registry.save()
+
+    code = cli.main(["allowlist", "add", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        ["allowlist", "list", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        peer_hash.hex()
+    ]
+    assert [entry["name"] for entry in payload["entries"]] == ["alice"]
+
+    code = cli.main(["allowlist", "list", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"{peer_hash.hex()} (alice)" in out
+    assert "carol" not in out
+
+
 def test_parser_messages_export_import_arguments():
     parser = cli.build_parser()
     export = parser.parse_args(

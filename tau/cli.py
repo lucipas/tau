@@ -478,7 +478,36 @@ def build_parser() -> argparse.ArgumentParser:
         "peer over another channel to confirm the key is theirs)",
     )
     peers.set_defaults(func=cmd_peers)
-    peers_sub = peers.add_subparsers(dest="peers_command", metavar="PEERS_COMMAND")
+    peers_sub = peers.add_subparsers(
+        dest="peers_command", metavar="PEERS_COMMAND"
+    )
+
+    peers_alias = peers_sub.add_parser(
+        "alias",
+        parents=[common],
+        help="give a known peer a local alias",
+    )
+    peers_alias.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, destination hash, or hash prefix",
+    )
+    peers_alias.add_argument(
+        "alias", metavar="ALIAS", help="local label for the peer"
+    )
+    peers_alias.set_defaults(func=cmd_peers_alias)
+
+    peers_unalias = peers_sub.add_parser(
+        "unalias",
+        parents=[common],
+        help="remove a peer's local alias",
+    )
+    peers_unalias.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, alias, destination hash, or hash prefix",
+    )
+    peers_unalias.set_defaults(func=cmd_peers_unalias)
     peers_verify = peers_sub.add_parser(
         "verify",
         parents=[common],
@@ -1581,10 +1610,13 @@ def _print_peer_table(
     header = ("DESTINATION", "NAME", "VERIFIED", "HOPS", "LAST SEEN", "LXMF")
     table: List[tuple] = [header]
     for peer in rows:
+        name = peer.display_name
+        if peer.alias and peer.alias != peer.name:
+            name = f"{peer.alias} ({peer.name})"
         table.append(
             (
                 peer.hexhash,
-                peer.display_name,
+                name,
                 "✓" if peer.is_verified else "",
                 str(peer.hops),
                 _ago(peer.age(timestamp)),
@@ -3523,6 +3555,28 @@ def cmd_peers_forget(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_peers_alias(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.set_alias(args.peer, args.alias)
+    if _json_mode(args):
+        _emit(peer.to_dict(), True)
+    else:
+        print(f"alias {peer.alias!r} set for {peer.name} ({peer.hexhash[:8]})")
+    return _EXIT_OK
+
+
+def cmd_peers_unalias(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    registry = PeerRegistry(config.peers_path)
+    peer = registry.clear_alias(args.peer)
+    if _json_mode(args):
+        _emit(peer.to_dict(), True)
+    else:
+        print(f"removed alias for {peer.name} ({peer.hexhash[:8]})")
+    return _EXIT_OK
+
+
 def cmd_peers_exchange(args: argparse.Namespace, config: TauConfig) -> int:
     """Exchange peer lists with known peers and report what was learned."""
     node = TauNode(config, name=config.name)
@@ -5299,8 +5353,13 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
 
 
 def _resolve_allowlist_peer(registry: PeerRegistry, value: str) -> str:
-    """Resolve a peer name, hash or prefix to a destination hash."""
-    peer = registry.resolve(value)
+    """Resolve a peer name, hash or prefix to a destination hash.
+
+    Aliases are excluded on purpose: the allow-list is a security
+    boundary, so a local label must never stand in for the peer's
+    asserted name.
+    """
+    peer = registry.resolve(value, include_alias=False)
     if peer is not None:
         return peer.hexhash
     try:
@@ -5397,7 +5456,13 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
         peer = registry.get(destination)
         return {
             "destination": destination,
-            "name": peer.display_name if peer is not None else "",
+            # The asserted name, not the local alias: the operator must
+            # see who was actually allowed, and an alias could mask that.
+            "name": (
+                (peer.name or short_hash(peer.hexhash))
+                if peer is not None
+                else ""
+            ),
         }
 
     if json_output:
@@ -5412,7 +5477,11 @@ def cmd_allowlist(args: argparse.Namespace) -> int:
             print("  no senders listed — when enforced, nobody may message this node")
         for entry in sorted(allowlist.allow):
             peer = registry.get(entry)
-            name = f" ({peer.display_name})" if peer is not None else ""
+            name = (
+                f" ({peer.name or short_hash(peer.hexhash)})"
+                if peer is not None
+                else ""
+            )
             print(f"  {entry}{name}")
         if changed:
             print("  (a running serve applies saved changes when it restarts)")
