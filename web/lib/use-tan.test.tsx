@@ -49,6 +49,52 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
+
+describe("useTan mentions view", () => {
+  it("loads mentions instead of the timeline when the view is selected", async () => {
+    const mine = makePost();
+    const reply = makePost({
+      hash: "e".repeat(64),
+      text: "seconded",
+      author: "f".repeat(64),
+      name: "bob",
+      own: false,
+    });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/mentions")) {
+        return Promise.resolve({ posts: [reply], count: 1 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Mentions are not part of the timeline's load: nothing loaded yet.
+    expect(result.current.mentions).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/mentions"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      result.current.setShowMentions(true);
+    });
+    await waitFor(() => expect(result.current.mentions).toEqual([reply]));
+    expect(mockedGet).toHaveBeenCalledWith("/api/tan/mentions?limit=100");
+
+    // Switching back reloads the timeline.
+    await act(async () => {
+      result.current.setShowMentions(false);
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+  });
+});
+
+
 describe("useTan saved posts", () => {
   it("loads saved posts on demand and posts save/unsave to the API", async () => {
     const mine = makePost();
@@ -178,6 +224,7 @@ describe("useTan saved posts", () => {
     expect(savedCalls).toBe(2);
   });
 });
+
 
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {

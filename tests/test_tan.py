@@ -2936,6 +2936,24 @@ def test_mentions_hides_replies_beneath_deleted_ancestor(identities, tmp_path):
     assert mentions(conn, author_of(alice)) == []
 
 
+def test_mentions_with_huge_mute_list_still_returns(identities, tmp_path):
+    # A mute list larger than SQLite's old 999-variable bound still
+    # loads mentions: hidden authors are bound as one JSON parameter,
+    # not one placeholder each.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1001)
+    with conn:
+        conn.executemany(
+            "INSERT INTO muted_authors(author, name, muted_at) VALUES(?, ?, ?)",
+            [(f"{index:032x}", "", 1000.0) for index in range(1200)],
+        )
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        reply["hash"]
+    ]
+
+
 def test_cli_mentions(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0

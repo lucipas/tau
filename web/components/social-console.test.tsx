@@ -1,9 +1,35 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import type { Mock } from "vitest";
+import type { ReactNode } from "react";
 
 import type { TanPost } from "@/lib/types";
 
-import { PostCard } from "./social-console";
+import { PostCard, SocialConsole } from "./social-console";
+
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+  }: {
+    href: string;
+    children: ReactNode;
+    className?: string;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}));
+
+vi.mock("@/lib/use-tan", () => ({
+  useTan: vi.fn(),
+}));
+
+import { useTan } from "@/lib/use-tan";
+
+const mockedUseTan = useTan as Mock;
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -212,6 +238,95 @@ describe("PostCard quote rendering", () => {
   });
 });
 
+
+describe("SocialConsole mentions view", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      mentions: [],
+      following: [],
+      all: false,
+      setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("switches the feed to mentions and back", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const mention = makePost({
+      hash: "e".repeat(64),
+      text: "seconded",
+      author: "f".repeat(64),
+      name: "bob",
+      own: false,
+    });
+    const state = hookState({ posts: [timelinePost], mentions: [mention] });
+    mockedUseTan.mockReturnValue(state);
+
+    const { rerender } = render(<SocialConsole />);
+    expect(screen.getByText("timeline post")).toBeTruthy();
+    expect(screen.queryByText("seconded")).toBeNull();
+
+    fireEvent.click(screen.getByText("mentions"));
+    expect(state.setShowMentions).toHaveBeenCalledWith(true);
+
+    mockedUseTan.mockReturnValue({ ...state, showMentions: true });
+    rerender(<SocialConsole />);
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("seconded")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "following" }));
+    expect(state.setShowMentions).toHaveBeenCalledWith(false);
+    expect(state.setAll).toHaveBeenCalledWith(false);
+  });
+
+  it("says there are no replies yet when the mentions list is empty", () => {
+    mockedUseTan.mockReturnValue(hookState({ showMentions: true }));
+
+    render(<SocialConsole />);
+    expect(screen.getByText("No replies yet")).toBeTruthy();
+  });
+
+  it("shows the load error instead of an empty state when the feed fails", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({
+        showMentions: true,
+        error: "this node has no identity yet",
+      }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.getByText("this node has no identity yet")).toBeTruthy();
+    expect(screen.queryByText("No replies yet")).toBeNull();
+  });
+});
+
+
 describe("PostCard save control", () => {
   function renderCard(post: TanPost, onToggleSave = vi.fn()) {
     render(
@@ -270,3 +385,4 @@ describe("PostCard save control", () => {
     expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
   });
 });
+

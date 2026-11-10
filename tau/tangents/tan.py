@@ -2821,6 +2821,8 @@ def mentions(
     viewer: str,
     *,
     limit: int = DEFAULT_FEED_LIMIT,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return stored replies to the viewer's own posts, newest first.
 
@@ -2830,34 +2832,74 @@ def mentions(
     you wrote to your own post is not a mention of you.  The same
     hiding rules as the thread view apply: a reply its author deleted
     never appears, and neither does a reply to a post you deleted.
-    Unlinked replies never appear either.  Results carry the same like
-    annotations and ``reply_to`` parent summary as the timeline, and
-    the query reads only the local store: it makes no network requests.
+    Unlinked replies never appear either.  The console's hiding rules
+    apply as in :func:`timeline`: replies by muted or blocked authors
+    (``exclude_authors``) and replies matching a muted keyword never
+    appear, and ``exclude_all`` hides every mention — the display side
+    of a block-list that failed closed.  Pages are read until *limit*
+    visible mentions are collected or the store is exhausted.  Results
+    carry the same like annotations and ``reply_to`` parent summary as
+    the timeline, and the query reads only the local store: it makes
+    no network requests.
     """
     viewer = _require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer")
+    if exclude_all:
+        return []
     count = max(1, min(int(limit), MAX_MENTIONS_POSTS))
-    rows = conn.execute(
-        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r "
-        "WHERE r.linked = 1 AND r.kind = 'reply' AND r.author != ? "
-        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
-        "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
-        "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
-        "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
-        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
-        "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
-        "ORDER BY r.created_at DESC, r.hash DESC",
-        (viewer, viewer),
-    ).fetchall()
-    # A reply beneath a deleted ancestor is hidden with that subtree, as
-    # the thread view hides it, so filter on the ancestor chain before
-    # applying the limit to keep the requested count of visible mentions.
-    visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
-    rows = visible[:count]
+    silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
+    hidden = sorted(silenced | blocked)
+    keywords = _muted_keyword_list(conn)
+    author_clause = ""
+    if hidden:
+        # One JSON parameter instead of one placeholder per author,
+        # so a large mute/block list cannot exceed SQLite's
+        # bound-variable limit — the same pattern :func:`feed` uses.
+        author_clause = "AND r.author NOT IN (SELECT value FROM json_each(?)) "
+    kept: List[Dict[str, Any]] = []
+    cursor: Optional[Tuple[float, str]] = None
+    while len(kept) < count:
+        where = "r.linked = 1 AND r.kind = 'reply' AND r.author != ? " + author_clause
+        params: List[Any] = [viewer]
+        if hidden:
+            params.append(json.dumps(hidden))
+        if cursor is not None:
+            where += "AND (r.created_at < ? OR (r.created_at = ? AND r.hash < ?)) "
+            params.extend([cursor[0], cursor[0], cursor[1]])
+        where += (
+            "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+            "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
+            "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
+            "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
+            "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+            "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
+        )
+        params.append(viewer)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r WHERE {where}"
+            "ORDER BY r.created_at DESC, r.hash DESC LIMIT ?",
+            [*params, MAX_FEED_POSTS],
+        ).fetchall()
+        if not rows:
+            break
+        # A reply beneath a deleted ancestor is hidden with that subtree, as
+        # the thread view hides it.  Hidden rows still advance the cursor so
+        # paging continues past them.
+        visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
+        kept.extend(without_muted_keywords(conn, _public_posts(visible), keywords))
+        if len(rows) < MAX_FEED_POSTS:
+            break
+        last = rows[-1]
+        cursor = (float(last["created_at"]), str(last["hash"]))
+    posts = kept[:count]
     return annotate_replies(
         conn,
         annotate_edits(
-            conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+            conn, annotate_reactions(conn, posts, viewer=viewer)
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
     )
 
 

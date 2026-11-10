@@ -18,11 +18,16 @@ const SAVED_PAGE_SIZE = 100;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
   const [all, setAll] = useState(false);
+  // Whether the feed shows replies to your own posts instead of the
+  // timeline. Kept beside `all` so a view switch mid-action reloads
+  // the view that is actually selected, the same way `all` works.
+  const [showMentions, setShowMentions] = useState(false);
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -41,6 +46,11 @@ export function useTan() {
   useEffect(() => {
     allRef.current = all;
   }, [all]);
+
+  const showMentionsRef = useRef(showMentions);
+  useEffect(() => {
+    showMentionsRef.current = showMentions;
+  }, [showMentions]);
 
   // The open thread's reference, kept alongside `threadRef` so a feed
   // load can reload the thread without waiting for the state update.
@@ -75,12 +85,18 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [timeline, follows] = await Promise.all([
-        apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+      const [feed, follows] = await Promise.all([
+        showMentionsRef.current
+          ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+          : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
       ]);
       if (generationRef.current !== generation) return false;
-      setPosts(timeline.posts);
+      if (showMentionsRef.current) {
+        setMentions(feed.posts);
+      } else {
+        setPosts(feed.posts);
+      }
       setFollowing(follows.following);
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
@@ -155,7 +171,7 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, load]);
+  }, [all, showMentions, load]);
 
   const refresh = useCallback(async () => {
     await load();
@@ -395,6 +411,7 @@ export function useTan() {
 
   return {
     posts,
+    mentions,
     following,
     saved,
     savedLoading,
@@ -405,6 +422,8 @@ export function useTan() {
     unsave,
     all,
     setAll,
+    showMentions,
+    setShowMentions,
     loading,
     posting,
     syncing,

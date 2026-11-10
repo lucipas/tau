@@ -33,6 +33,9 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // The feed shows the timeline or, when the mentions view is selected,
+  // the replies to your own posts instead.
+  const shown = tan.showMentions ? tan.mentions : tan.posts;
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -275,14 +278,18 @@ export function SocialConsole() {
                       <SectionLabel>
                         {showSaved
                           ? "saved"
-                          : tan.all
-                            ? "public cache"
-                            : "timeline"}
+                          : tan.showMentions
+                            ? "mentions"
+                            : tan.all
+                              ? "public cache"
+                              : "timeline"}
                       </SectionLabel>
                       <span className="font-mono text-[10px] text-mist">
                         {showSaved
                           ? `${tan.saved.length} post(s)`
-                          : `${tan.posts.length} post(s)`}
+                          : tan.showMentions
+                            ? `${shown.length} post(s)`
+                            : `${tan.posts.length} post(s)`}
                       </span>
                     </div>
                     <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
@@ -290,10 +297,11 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          tan.setShowMentions(false);
                           tan.setAll(false);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && !tan.all
+                          !showSaved && !tan.showMentions && !tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -304,10 +312,11 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          tan.setShowMentions(false);
                           tan.setAll(true);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && tan.all
+                          !showSaved && !tan.showMentions && tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -316,7 +325,22 @@ export function SocialConsole() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setShowSaved(true)}
+                        onClick={() => {
+                          setShowSaved(false);
+                          tan.setShowMentions(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        mentions
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          tan.setShowMentions(false);
+                          setShowSaved(true);
+                        }}
                         className={`rounded px-2 py-1 ${
                           showSaved ? "bg-signal/15 text-signal" : "text-mist"
                         }`}
@@ -375,6 +399,27 @@ export function SocialConsole() {
                         </button>
                       ) : null}
                     </>
+                  )
+                ) : tan.showMentions ? (
+                  shown.length === 0 && tan.error ? (
+                    <p className="px-4 py-10 text-center text-xs leading-relaxed text-rose-300">
+                      {tan.error}
+                    </p>
+                  ) : shown.length === 0 ? (
+                    <EmptyState mentions />
+                  ) : (
+                    shown.map((post) => (
+                      <PostCard
+                        key={post.hash}
+                        post={post}
+                        onToggleLike={toggleLike}
+                        onToggleSave={toggleSave}
+                        onReply={(target) => setReplyTarget(target)}
+                        onDelete={submitDelete}
+                        deleting={deleting.has(post.hash)}
+                        onOpenThread={(target) => void tan.openThread(target.hash)}
+                      />
+                    ))
                   )
                 ) : tan.posts.length === 0 ? (
                   <EmptyState />
@@ -531,19 +576,27 @@ function ThreadView({
   );
 }
 
-function EmptyState() {
+function EmptyState({ mentions = false }: { mentions?: boolean }) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
         τ
       </div>
-      <h3 className="mt-4 text-sm font-medium text-zinc-200">No posts yet</h3>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        {mentions ? "No replies yet" : "No posts yet"}
+      </h3>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
-        Start a node with{" "}
-        <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
-          tau serve --social --http
-        </code>
-        , publish a post, then sync or follow another author.
+        {mentions ? (
+          "When someone replies to one of your posts, it shows up here."
+        ) : (
+          <>
+            Start a node with{" "}
+            <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+              tau serve --social --http
+            </code>
+            , publish a post, then sync or follow another author.
+          </>
+        )}
       </p>
     </div>
   );
