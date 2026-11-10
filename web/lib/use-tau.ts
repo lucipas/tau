@@ -91,8 +91,13 @@ export function useTau() {
   // The node's identity and name live on the snapshot; a rename (or an
   // announce) publishes a `status` event instead of a full snapshot, so
   // a status event re-reads the snapshot's node record on its own.
+  // Only the newest node update may apply: a refresh issued before a
+  // rename or snapshot that resolves late must not restore an old name.
+  const nodeSeq = useRef(0);
   const refreshNode = useCallback(async () => {
+    const requestId = ++nodeSeq.current;
     const snapshot = await apiGet<Snapshot>("/api/status");
+    if (requestId !== nodeSeq.current) return;
     setNode(snapshot.node);
   }, []);
 
@@ -112,6 +117,7 @@ export function useTau() {
         snapshot.messages.length > 0
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
+      nodeSeq.current += 1;
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
       setGroups(snapshot.groups ?? []);
@@ -352,7 +358,9 @@ export function useTau() {
       });
       // The rename already succeeded: show the new name at once, and
       // treat the follow-up refresh as best-effort so a failed GET
-      // cannot make a successful rename look like a failure.
+      // cannot make a successful rename look like a failure. Invalidate
+      // any refresh still in flight so it cannot restore the old name.
+      nodeSeq.current += 1;
       setNode((previous) =>
         previous ? { ...previous, name: result.name } : previous,
       );
