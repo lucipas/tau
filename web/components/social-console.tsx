@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type { TanPost, TanVerifyReport } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
@@ -16,6 +16,11 @@ export function SocialConsole() {
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The last store audit, if one has run. Kept separate from `message`
+  // so a sync result never overwrites a verify result (or vice versa).
+  const [verifyReport, setVerifyReport] = useState<TanVerifyReport | null>(
+    null,
+  );
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -86,6 +91,16 @@ export function SocialConsole() {
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "sync failed");
+    }
+  }
+
+  async function submitVerify() {
+    setError(null);
+    try {
+      setVerifyReport(await tan.verify());
+    } catch (caught) {
+      setVerifyReport(null);
+      setError(caught instanceof Error ? caught.message : "verify failed");
     }
   }
 
@@ -224,6 +239,27 @@ export function SocialConsole() {
                   {message}
                 </p>
               ) : null}
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <SectionLabel>store health</SectionLabel>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Re-verify every stored post&apos;s signature and chain
+                linkage, the same audit{" "}
+                <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+                  tau tan verify
+                </code>{" "}
+                runs. Read-only: verifying never writes to the store.
+              </p>
+              <button
+                type="button"
+                onClick={() => void submitVerify()}
+                disabled={tan.verifying}
+                className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/15 disabled:opacity-50"
+              >
+                {tan.verifying ? "verifying…" : "verify store"}
+              </button>
+              {verifyReport ? <VerifyResult report={verifyReport} /> : null}
             </section>
           </aside>
 
@@ -364,6 +400,43 @@ function EmptyState() {
         </code>
         , publish a post, then sync or follow another author.
       </p>
+    </div>
+  );
+}
+
+export function VerifyResult({ report }: { report: TanVerifyReport }) {
+  if (report.ok) {
+    return (
+      <p className="mt-2 font-mono text-[10px] leading-relaxed text-signal/80">
+        store OK — {report.entries} entr{report.entries === 1 ? "y" : "ies"}{" "}
+        from {report.authors} author{report.authors === 1 ? "" : "s"}
+        {report.unlinked > 0
+          ? ` · ${report.unlinked} unlinked (partial sync)`
+          : ""}
+      </p>
+    );
+  }
+  return (
+    <div className="mt-2 space-y-1.5">
+      <p className="font-mono text-[10px] leading-relaxed text-rose-300">
+        store NOT OK — {report.problems.length} problem
+        {report.problems.length === 1 ? "" : "s"} in {report.entries} entries
+      </p>
+      <ul className="space-y-1.5">
+        {report.problems.map((problem) => (
+          <li
+            key={problem.hash}
+            className="rounded-lg border border-rose-400/30 bg-rose-400/5 px-2.5 py-2"
+          >
+            <p className="font-mono text-[10px] text-rose-200">
+              {shortHash(problem.hash, 16)} · {shortHash(problem.author, 10)}
+            </p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-zinc-300">
+              {problem.problem}
+            </p>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

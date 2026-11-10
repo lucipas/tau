@@ -1107,6 +1107,28 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def tan_verify(self) -> Dict[str, Any]:
+        """Audit the local Tan store, re-verifying every entry and its chain.
+
+        Opens the store read-only, like ``tau tan verify``: verifying
+        must never create a missing store or write to an existing one.
+        """
+        import sqlite3
+
+        from .tangents.tan import verify_store
+
+        path = self._tan_db_path()
+        if not path.is_file():
+            raise WebBridgeError(f"no Tan store at {path}")
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            return verify_store(conn)
+        finally:
+            conn.close()
+
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
     ) -> Optional[Dict[str, Any]]:
@@ -1804,6 +1826,14 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
                 posts = self.bridge.tan_posts(limit=limit)
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/verify":
+                try:
+                    report = self.bridge.tan_verify()
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(report, head_only)
                 return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return

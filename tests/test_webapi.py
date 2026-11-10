@@ -688,6 +688,73 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_verify_via_api(tmp_path):
+    import sqlite3
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "first post", name="tester", now=1000)
+        second = create_post(conn, identity, "second post", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/verify")
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["entries"] == 2
+        assert payload["authors"] == 1
+        assert payload["unlinked"] == 0
+        assert payload["problems"] == []
+
+        # Tampering with a stored post breaks its hash, which the audit
+        # must report without flagging the store's other entries.
+        conn = sqlite3.connect(node.config.social_db_path)
+        try:
+            conn.execute(
+                "UPDATE posts SET text = 'tampered' WHERE hash = ?",
+                (second["hash"],),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        status, _, payload = _json(bridge, "/api/tan/verify")
+        assert status == 200
+        assert payload["ok"] is False
+        assert payload["entries"] == 2
+        assert len(payload["problems"]) == 1
+        assert payload["problems"][0]["hash"] == second["hash"]
+        assert "hash does not match" in payload["problems"][0]["problem"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_verify_without_a_store_is_an_error(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/verify")
+        assert status == 400
+        assert "no Tan store" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_delete_via_api(tmp_path):
     import RNS
 

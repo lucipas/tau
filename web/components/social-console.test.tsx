@@ -1,9 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { TanPost } from "@/lib/types";
+import type { TanPost, TanVerifyReport } from "@/lib/types";
 
-import { PostCard } from "./social-console";
+import { PostCard, VerifyResult } from "./social-console";
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
   return {
@@ -95,6 +95,56 @@ describe("PostCard delete control", () => {
     expect(screen.queryByTitle("Delete this post")).toBeNull();
     fireEvent.click(screen.getByText("deleting…"));
     expect(onDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("VerifyResult", () => {
+  function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
+    return {
+      entries: 12,
+      authors: 3,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+      ...overrides,
+    };
+  }
+
+  it("reports a healthy store with its counts", () => {
+    render(<VerifyResult report={makeReport()} />);
+    expect(
+      screen.getByText("store OK — 12 entries from 3 authors"),
+    ).toBeTruthy();
+  });
+
+  it("notes unlinked entries as partial sync, not damage", () => {
+    render(<VerifyResult report={makeReport({ unlinked: 2 })} />);
+    expect(screen.getByText(/2 unlinked \(partial sync\)/)).toBeTruthy();
+  });
+
+  it("lists each problem with its post hash and message", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 1 problem in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
   });
 });
 

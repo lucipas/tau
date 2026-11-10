@@ -10,6 +10,7 @@ import type {
   TanPostResponse,
   TanSyncResponse,
   TanTimelineResponse,
+  TanVerifyReport,
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
@@ -21,6 +22,7 @@ export function useTan() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // The filter the timeline is showing right now. Actions refresh through
@@ -181,6 +183,17 @@ export function useTan() {
     }
   }, [load]);
 
+  // A read-only audit: verifying never writes to the store and never
+  // reloads the feed, so it stays independent of the poll cadence.
+  const verify = useCallback(async () => {
+    setVerifying(true);
+    try {
+      return await apiGet<TanVerifyReport>("/api/tan/verify");
+    } finally {
+      setVerifying(false);
+    }
+  }, []);
+
   return {
     posts,
     following,
@@ -189,6 +202,7 @@ export function useTan() {
     loading,
     posting,
     syncing,
+    verifying,
     error,
     refresh,
     publish,
@@ -198,5 +212,6 @@ export function useTan() {
     unlike,
     deletePost,
     sync,
+    verify,
   };
 }

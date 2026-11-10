@@ -238,3 +238,17 @@ export interface TanSyncResponse {
     errors: Array<{ peer: string; author: string; error: string }>;
   };
 }
+
+export interface TanVerifyProblem {
+  hash: string;
+  author: string;
+  problem: string;
+}
+
+export interface TanVerifyReport {
+  entries: number;
+  authors: number;
+  unlinked: number;
+  problems: TanVerifyProblem[];
+  ok: boolean;
+}

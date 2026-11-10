@@ -143,3 +143,39 @@ describe("useTan deletePost", () => {
     expect(result.current.posts).toEqual([second]);
   });
 });
+
+describe("useTan verify", () => {
+  it("fetches /api/tan/verify and returns the report without reloading the feed", async () => {
+    const report = {
+      entries: 2,
+      authors: 1,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+    };
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/verify"
+        ? Promise.resolve(report)
+        : path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [], count: 0 })
+          : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    let returned;
+    await act(async () => {
+      returned = await result.current.verify();
+    });
+
+    expect(returned).toEqual(report);
+    // Verifying is read-only: exactly one audit request, no feed reload.
+    const laterCalls = mockedGet.mock.calls
+      .slice(loadsBefore)
+      .map(([path]) => path);
+    expect(laterCalls).toEqual(["/api/tan/verify"]);
+  });
+});
