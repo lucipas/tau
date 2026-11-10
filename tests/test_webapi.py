@@ -1959,6 +1959,72 @@ def test_delete_message_survives_bridge_restart(node, tmp_path):
         bridge2.stop()
 
 
+def test_delete_message_rejects_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert len(feed["messages"]) == 1
+
+
+def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        node.inbox.append(
+            {
+                "id": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        # A directory in the history file's place makes the atomic
+        # replace fail, so the strict save raises.
+        messages_path = tmp_path / "messages.json"
+        messages_path.unlink()
+        messages_path.mkdir()
+        status, _, payload = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 500
+        _, _, feed = _json(bridge, "/api/messages")
+        assert len(feed["messages"]) == 1
+        # Console-first ordering: the inbox copy survives a failed
+        # delete, and a retry once the file is repaired completes it.
+        assert len(node.inbox.export_document()["messages"]) == 1
+        messages_path.rmdir()
+        status, _, payload = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 200
+        _, _, feed = _json(bridge, "/api/messages")
+        assert feed["messages"] == []
+        assert node.inbox.export_document()["messages"] == []
+    finally:
+        bridge.stop()
+
+
 def test_reaction_annotates_matching_history_entry(bridge):
     record = {
         "from": "alice",
