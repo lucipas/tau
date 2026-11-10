@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
+  BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
   GroupsResponse,
@@ -31,6 +32,11 @@ export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 export interface PingState {
   pending?: boolean;
   rtt_ms?: number | null;
+  error?: string;
+}
+
+export interface BlockState {
+  pending?: boolean;
   error?: string;
 }
 
@@ -64,9 +70,17 @@ export function useTau() {
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Ordering of authoritative peer state: each peer event or snapshot
+  // gets a sequence number. A block/unblock reply sent before a newer
+  // one must not overwrite the flag the event already delivered.
+  const peerEventSeq = useRef(0);
+  const peerRevision = useRef<Map<string, number>>(new Map());
+  const snapshotRevision = useRef(0);
+
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
 
@@ -104,6 +118,8 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
+      peerEventSeq.current += 1;
+      snapshotRevision.current = peerEventSeq.current;
       setPeers(sortPeers(snapshot.peers));
       setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
@@ -147,6 +163,23 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      // Ordering for block/unblock replies: a peer event that arrives
+      // after a block request was sent is newer than the reply, so the
+      // reply must not overwrite the flag it already delivered.
+      peerEventSeq.current += 1;
+      peerRevision.current.set(peer.destination, peerEventSeq.current);
+      // A blocked sender's inbound history is hidden by the server's
+      // message snapshots; drop it from the live feed too, so a block
+      // from any console takes effect at once. History stays stored
+      // and comes back with the next snapshot after an unblock.
+      if (peer.blocked) {
+        setMessages((previous) =>
+          previous.filter(
+            (entry) =>
+              !(entry.direction === "in" && entry.peer === peer.destination),
+          ),
+        );
+      }
       setPeers((previous) => {
         const next = previous.filter(
           (entry) => entry.destination !== peer.destination,
@@ -327,6 +360,73 @@ export function useTau() {
     }
   }, []);
 
+  const editBlock = useCallback(
+    async (destination: string, block: boolean) => {
+      setBlocks((previous) => ({
+        ...previous,
+        [destination]: { pending: true },
+      }));
+      const requestSeq = peerEventSeq.current;
+      try {
+        const result = await apiPost<BlockPeerResponse>(
+          block ? "/api/peers/block" : "/api/peers/unblock",
+          { target: destination },
+        );
+        // The bridge also publishes a peer event with the new flag, so
+        // this local update is only the immediate feedback; the event
+        // reconciles it for every open console. Skip it when a newer
+        // peer event or snapshot arrived after the request was sent.
+        const newestSeq = Math.max(
+          peerRevision.current.get(destination) ?? 0,
+          snapshotRevision.current,
+        );
+        if (newestSeq <= requestSeq) {
+          setPeers((previous) =>
+            previous.map((entry) =>
+              entry.destination === destination
+                ? { ...entry, blocked: result.block.blocked }
+                : entry,
+            ),
+          );
+          if (result.block.blocked) {
+            // Same reconciliation as the peer-event path, for the
+            // acting console before the event arrives.
+            setMessages((previous) =>
+              previous.filter(
+                (entry) =>
+                  !(entry.direction === "in" && entry.peer === destination),
+              ),
+            );
+          }
+        }
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {},
+        }));
+        return result.block;
+      } catch (error) {
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {
+            error: error instanceof Error ? error.message : "block failed",
+          },
+        }));
+        throw error;
+      }
+    },
+    [],
+  );
+
+  const blockPeer = useCallback(
+    (destination: string) => editBlock(destination, true),
+    [editBlock],
+  );
+
+  const unblockPeer = useCallback(
+    (destination: string) => editBlock(destination, false),
+    [editBlock],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -408,9 +508,12 @@ export function useTau() {
     bridge,
     connection,
     pings,
+    blocks,
     announcing,
     send,
     ping,
+    blockPeer,
+    unblockPeer,
     announce,
     markRead,
     refreshOutbox,

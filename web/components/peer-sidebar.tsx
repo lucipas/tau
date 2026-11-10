@@ -1,7 +1,9 @@
 "use client";
 
+import { useState } from "react";
+
 import type { BridgeInfo, NodeInfo, Peer, TauGroup } from "@/lib/types";
-import type { PingState } from "@/lib/use-tau";
+import type { BlockState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
   formatRtt,
@@ -18,9 +20,12 @@ export function PeerSidebar({
   groups,
   bridge,
   pings,
+  blocks,
   unread,
   selected,
   onPing,
+  onBlock,
+  onUnblock,
   onSelectPeer,
 }: {
   node: NodeInfo | null;
@@ -28,12 +33,19 @@ export function PeerSidebar({
   groups: TauGroup[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
+  blocks: Record<string, BlockState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onBlock: (destination: string) => void;
+  onUnblock: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
 }) {
   const now = useNow();
+  // Blocking is the one peer action that silences someone, so it takes
+  // two clicks: arm on the first, confirm on the second. Unblocking is
+  // directly reversible and needs only one.
+  const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -156,11 +168,13 @@ export function PeerSidebar({
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
             {peers.map((peer) => {
               const ping = pings[peer.destination];
+              const block = blocks[peer.destination];
               const age = now
                 ? Math.max(0, now / 1000 - peer.last_seen)
                 : peer.age;
               const isSelected = peer.destination === selected;
               const unreadCount = unread[peer.destination] ?? 0;
+              const armingBlock = confirmBlock === peer.destination;
               return (
                 <li key={peer.destination}>
                   <div
@@ -232,20 +246,61 @@ export function PeerSidebar({
                           ) : null}
                         </span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => onPing(peer.destination)}
-                        disabled={ping?.pending}
-                        aria-label={`Ping ${peer.name}`}
-                        title="Ping peer"
-                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
-                      >
-                        <PingIcon
-                          className={`h-3.5 w-3.5 ${
-                            ping?.pending ? "animate-pulse" : ""
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => onPing(peer.destination)}
+                          disabled={ping?.pending}
+                          aria-label={`Ping ${peer.name}`}
+                          title="Ping peer"
+                          className="grid h-7 w-7 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          <PingIcon
+                            className={`h-3.5 w-3.5 ${
+                              ping?.pending ? "animate-pulse" : ""
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (peer.blocked) {
+                              onUnblock(peer.destination);
+                              return;
+                            }
+                            if (armingBlock) {
+                              setConfirmBlock(null);
+                              onBlock(peer.destination);
+                              return;
+                            }
+                            setConfirmBlock(peer.destination);
+                          }}
+                          disabled={block?.pending}
+                          aria-label={
+                            peer.blocked
+                              ? `Unblock ${peer.name}`
+                              : armingBlock
+                                ? `Confirm blocking ${peer.name}`
+                                : `Block ${peer.name}`
+                          }
+                          title={
+                            peer.blocked
+                              ? `Unblock ${peer.name} — their DMs and Tan posts come back`
+                              : armingBlock
+                                ? `Click again to block ${peer.name}`
+                                : `Block ${peer.name} — their DMs are dropped and their Tan posts hidden`
+                          }
+                          className={`grid h-7 w-7 place-items-center rounded-md border transition disabled:opacity-50 ${
+                            peer.blocked || armingBlock
+                              ? "border-rose-400/50 bg-rose-400/10 text-rose-300 hover:border-rose-400/70"
+                              : "border-line/70 text-mist hover:border-rose-400/50 hover:text-rose-300"
                           }`}
-                        />
-                      </button>
+                        >
+                          <span aria-hidden="true" className="text-sm leading-none">
+                            ⊘
+                          </span>
+                        </button>
+                      </div>
                     </div>
                     {ping ? (
                       <p
@@ -262,6 +317,21 @@ export function PeerSidebar({
                           : ping.error
                             ? ping.error
                             : `pong ${formatRtt(ping.rtt_ms)}`}
+                      </p>
+                    ) : null}
+                    {armingBlock && !peer.blocked ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        click again to block {peer.name} — their DMs will be
+                        dropped
+                      </p>
+                    ) : null}
+                    {block?.pending ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-mist">
+                        {peer.blocked ? "unblocking…" : "blocking…"}
+                      </p>
+                    ) : block?.error ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        {block.error}
                       </p>
                     ) : null}
                   </div>

@@ -78,6 +78,17 @@ export interface Peer {
   blocked?: boolean;
 }
 
+export interface BlockPeerResult {
+  peer: { destination: string; name: string };
+  blocked: boolean;
+  changed: boolean;
+}
+
+export interface BlockPeerResponse {
+  ok: boolean;
+  block: BlockPeerResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;

@@ -496,6 +496,14 @@ class TauNode:
             )
         return self._blocklist
 
+    def set_blocklist(self, blocklist: BlockList) -> None:
+        """Replace the cached block-list (e.g. after the console edits it).
+
+        The next enforcement check reads the new list at once, so a
+        block or unblock from the console takes effect without a restart.
+        """
+        self._blocklist = blocklist
+
     # -- lifecycle ---------------------------------------------------------
 
     def __enter__(self) -> "TauNode":

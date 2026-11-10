@@ -132,6 +132,8 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/block` | POST | block `{"target": "alice"}` |
+| `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
