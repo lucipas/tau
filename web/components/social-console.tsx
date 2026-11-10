@@ -460,8 +460,9 @@ export function PostCard({
             <div className="mt-1.5">
               <textarea
                 value={editText}
-                onChange={(event) => setEditText(event.target.value)}
+                onChange={(event) => setEditText(event.target.value.slice(0, 2000))}
                 rows={3}
+                maxLength={2000}
                 aria-label="Edit post text"
                 className="w-full resize-y rounded-lg border border-line/70 bg-void/60 px-2.5 py-2 text-[13px] leading-relaxed text-zinc-200 outline-none focus:border-signal/50"
               />

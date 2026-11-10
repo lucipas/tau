@@ -121,6 +121,9 @@ describe("PostCard edit control", () => {
     fireEvent.click(screen.getByTitle("Edit this post"));
     const field = screen.getByLabelText("Edit post text");
     expect((field as HTMLTextAreaElement).value).toBe("regret this");
+    // The composer caps posts at 2000 characters and the backend rejects
+    // longer edits, so the edit box caps the same way.
+    expect((field as HTMLTextAreaElement).maxLength).toBe(2000);
 
     fireEvent.change(field, { target: { value: "meant this" } });
     await act(async () => {
@@ -165,6 +168,14 @@ describe("PostCard edit control", () => {
 
   it("hides the edit control on other authors' posts", () => {
     renderCard(makePost({ own: false }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+
+  it("hides the edit control on your own quotes", () => {
+    // Quotes are not editable: create_edit only permits posts and replies,
+    // so the console must not offer the button for them.
+    renderCard(makePost({ kind: "quote", own: true }));
 
     expect(screen.queryByTitle("Edit this post")).toBeNull();
   });
