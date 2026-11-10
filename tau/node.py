@@ -1578,6 +1578,14 @@ class TauNode:
         # not an error — the message may already be deleted or never
         # have arrived — so a retried retract answers ok with
         # deleted False instead of failing.
+        # Reload first: another process (a one-shot CLI import) may have
+        # persisted the target after this node's in-memory copy was read.
+        try:
+            self.inbox.reload()
+        except InboxError as exc:
+            return response_error(
+                "storage_failed", f"could not read inbox: {exc}"
+            )
         try:
             stored = self.inbox.resolve(retract["target"])
         except ValueError:
@@ -1586,9 +1594,19 @@ class TauNode:
                 received_at=received_at,
                 deleted=False,
             )
-        if stored.get("destination") != caller_hash:
+        # Only a received record counts: an outgoing record also has the
+        # caller's hash in ``destination`` (the recipient), so without the
+        # direction check a recipient could delete the sender's own copy.
+        if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
             return response_error(
                 "not_sender", "only the message's sender can retract it"
+            )
+        if stored.get("kind") == "file":
+            # A saved file lives on disk; Inbox.delete drops only the
+            # record, so retracting it would leave the file behind.
+            return response_error(
+                "not_supported",
+                "file transfers cannot be retracted",
             )
         if stored.get("kind") == "group":
             # A group message lives in every member's inbox; deleting
