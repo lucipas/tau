@@ -637,19 +637,21 @@ class WebBridge:
 
     # -- node callbacks ----------------------------------------------------
 
-    def record_peer(self, peer: Peer) -> None:
-        # local_dict: the console replaces its snapshot record with this
-        # event, so it must carry the same trust fields — a public_dict
-        # event would silently drop the verified badge and any key-change
-        # warning until the next snapshot load.
+    def _local_peer_payload(self, peer: Peer) -> Dict[str, Any]:
+        # local_dict: the console replaces its record with this payload, so
+        # it must carry the same trust fields — a public_dict payload would
+        # silently drop the verified badge and any key-change warning.
         payload = peer.local_dict()
-        # Annotate like the snapshot does, so a live update does not
-        # erase the frontend's blocked badge for this peer.
+        # Annotate like the snapshot does, so a live update or alias
+        # response does not erase the frontend's blocked badge.
         blocklist = getattr(self.node, "blocklist", None)
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
         )
-        self.bus.publish({"type": "peer", "peer": payload})
+        return payload
+
+    def record_peer(self, peer: Peer) -> None:
+        self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
