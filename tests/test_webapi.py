@@ -479,6 +479,17 @@ def test_send_validation(bridge):
     assert "to" in payload["error"]["message"]
 
 
+def test_send_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "hi", "timeout": 10**400},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+
+
 def test_invalid_json_is_a_bad_request(bridge):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _request(
@@ -496,6 +507,38 @@ def test_ping_peer(bridge):
     assert status == 200
     assert payload["rtt_ms"] == 4.0
     assert payload["peer"]["destination"] == PEER_HASH
+
+
+def test_ping_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge, "/api/ping", method="POST", body={"to": "alice", "timeout": 10**400}
+    )
+    assert status == 200
+    assert payload["rtt_ms"] == 4.0
+
+
+def test_ping_accepts_non_finite_timeout(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/ping",
+        method="POST",
+        body={"to": "alice", "timeout": float("nan")},
+    )
+    assert status == 200
+    assert payload["rtt_ms"] == 4.0
+
+
+def test_clamped_timeout():
+    from tau.webapi import _clamped_timeout
+
+    assert _clamped_timeout(5, 20.0) == 5.0
+    assert _clamped_timeout(0.5, 20.0) == 1.0
+    assert _clamped_timeout(10**400, 20.0) == 120.0
+    assert _clamped_timeout(10**6, 15.0) == 120.0
+    assert _clamped_timeout("soon", 20.0) == 20.0
+    assert _clamped_timeout(True, 20.0) == 20.0
+    assert _clamped_timeout(float("nan"), 20.0) == 20.0
+    assert _clamped_timeout(float("inf"), 20.0) == 20.0
 
 
 def test_announce(bridge, node):
@@ -2166,6 +2209,32 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     )
     assert status == 400
     assert "unknown message" in payload["error"]["message"]
+
+
+def test_react_accepts_oversized_timeout(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+
+    def send_reaction(peer, target, token, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "reaction": token, "target": target, "id": "react-1"}
+
+    node.send_reaction = send_reaction
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍", "timeout": 10**400},
+    )
+    assert status == 200
+    assert payload["reaction"] == "👍"
 
     bridge.record_inbound(
         {
