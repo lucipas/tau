@@ -28,18 +28,22 @@ class IdentityError(RuntimeError):
     """Raised when an identity cannot be loaded or created."""
 
 
-def load_identity(path: Path) -> Optional[RNS.Identity]:
-    """Load an existing identity, returning ``None`` when it does not exist."""
+def load_identity(path: Path, harden: bool = True) -> Optional[RNS.Identity]:
+    """Load an existing identity, returning ``None`` when it does not exist.
+
+    ``harden=False`` skips the owner-only chmod, for read-only callers.
+    """
     path = Path(path).expanduser()
     if not path.exists():
         return None
     identity = RNS.Identity.from_file(str(path))
     if identity is None:
         raise IdentityError(f"could not load identity from {path}")
-    try:
-        os.chmod(path, IDENTITY_FILE_MODE)
-    except OSError:  # pragma: no cover - best effort
-        pass
+    if harden:
+        try:
+            os.chmod(path, IDENTITY_FILE_MODE)
+        except OSError:  # pragma: no cover - best effort
+            pass
     return identity
 
 
