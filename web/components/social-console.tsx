@@ -230,36 +230,65 @@ export function SocialConsole() {
           <div className="flex min-w-0 flex-col">
             <section className="rounded-2xl border border-line/80 bg-panel/40">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
-                <div className="flex items-center gap-3">
-                  <SectionLabel>{tan.all ? "public cache" : "timeline"}</SectionLabel>
-                  <span className="font-mono text-[10px] text-mist">
-                    {tan.posts.length} post(s)
-                  </span>
-                </div>
-                <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
-                  <button
-                    type="button"
-                    onClick={() => tan.setAll(false)}
-                    className={`rounded px-2 py-1 ${
-                      tan.all ? "text-mist" : "bg-signal/15 text-signal"
-                    }`}
-                  >
-                    following
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => tan.setAll(true)}
-                    className={`rounded px-2 py-1 ${
-                      tan.all ? "bg-signal/15 text-signal" : "text-mist"
-                    }`}
-                  >
-                    everything
-                  </button>
-                </div>
+                {tan.threadRef !== null ? (
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => tan.closeThread()}
+                      className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+                    >
+                      ← timeline
+                    </button>
+                    <SectionLabel>thread</SectionLabel>
+                    <span className="font-mono text-[10px] text-mist">
+                      {tan.threadPosts?.length ?? 0} post(s)
+                    </span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-3">
+                      <SectionLabel>{tan.all ? "public cache" : "timeline"}</SectionLabel>
+                      <span className="font-mono text-[10px] text-mist">
+                        {tan.posts.length} post(s)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => tan.setAll(false)}
+                        className={`rounded px-2 py-1 ${
+                          tan.all ? "text-mist" : "bg-signal/15 text-signal"
+                        }`}
+                      >
+                        following
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => tan.setAll(true)}
+                        className={`rounded px-2 py-1 ${
+                          tan.all ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        everything
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
-                {tan.posts.length === 0 ? (
+                {tan.threadRef !== null ? (
+                  <ThreadView
+                    posts={tan.threadPosts}
+                    loading={tan.threadLoading}
+                    error={tan.threadError ?? tan.error}
+                    onToggleLike={toggleLike}
+                    onReply={(target) => setReplyTarget(target)}
+                    onDelete={submitDelete}
+                    onOpenThread={(target) => void tan.openThread(target.hash)}
+                    deleting={deleting}
+                  />
+                ) : tan.posts.length === 0 ? (
                   <EmptyState />
                 ) : (
                   tan.posts.map((post) => (
@@ -270,6 +299,7 @@ export function SocialConsole() {
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
+                      onOpenThread={(target) => void tan.openThread(target.hash)}
                     />
                   ))
                 )}
@@ -350,6 +380,68 @@ export function SocialConsole() {
   );
 }
 
+function ThreadView({
+  posts,
+  loading,
+  error,
+  onToggleLike,
+  onReply,
+  onDelete,
+  onOpenThread,
+  deleting,
+}: {
+  posts: TanPost[] | null;
+  loading: boolean;
+  error: string | null;
+  onToggleLike: (post: TanPost) => void;
+  onReply: (post: TanPost) => void;
+  onDelete: (post: TanPost) => void;
+  onOpenThread: (post: TanPost) => void;
+  deleting: ReadonlySet<string>;
+}) {
+  // Entries are already in depth-first order with their depth, so the
+  // thread reads as a conversation. A failed refresh keeps the previous
+  // entries and reports the error above them instead of blanking the
+  // view; with nothing to show, the error is the view.
+  if (posts !== null && posts.length > 0) {
+    return (
+      <>
+        {error ? (
+          <p className="rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-[11px] leading-relaxed text-rose-300">
+            {error}
+          </p>
+        ) : null}
+        {posts.map((post) => (
+          <PostCard
+            key={post.hash}
+            post={post}
+            onToggleLike={onToggleLike}
+            onReply={onReply}
+            onDelete={onDelete}
+            deleting={deleting.has(post.hash)}
+            onOpenThread={onOpenThread}
+          />
+        ))}
+      </>
+    );
+  }
+  if (loading) {
+    return (
+      <p className="py-8 text-center text-xs text-mist">Loading the thread…</p>
+    );
+  }
+  if (error) {
+    return (
+      <p className="py-8 text-center text-xs leading-relaxed text-rose-300">
+        {error}
+      </p>
+    );
+  }
+  return (
+    <p className="py-8 text-center text-xs text-mist">This thread is empty.</p>
+  );
+}
+
 function EmptyState() {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
@@ -374,15 +466,20 @@ export function PostCard({
   onReply,
   onDelete,
   deleting,
+  onOpenThread,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
+  onOpenThread?: (post: TanPost) => void;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  // Thread entries indent by depth (capped, so a deep reply chain does
+  // not squeeze the text away); timeline entries have no depth.
+  const depth = Math.min(Math.max(post.depth ?? 0, 0), 6);
   // A repost carries no text of its own: the card shows the original
   // post's text instead, or nothing when it has not arrived / was deleted.
   const bodyText =
@@ -392,7 +489,10 @@ export function PostCard({
         : ""
       : post.text;
   return (
-    <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
+    <article
+      className="rounded-xl border border-line/70 bg-void/40 p-3.5"
+      style={depth > 0 ? { marginLeft: `${depth * 14}px` } : undefined}
+    >
       <div className="flex items-start gap-3">
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-signal/25 bg-signal/10 font-mono text-sm text-signal">
           {initial}
@@ -510,6 +610,16 @@ export function PostCard({
                 className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
               >
                 reply
+              </button>
+            ) : null}
+            {onOpenThread ? (
+              <button
+                type="button"
+                onClick={() => onOpenThread(post)}
+                title="Open this thread"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                thread
               </button>
             ) : null}
             {post.own ? (

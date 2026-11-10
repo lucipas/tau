@@ -16,6 +16,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -1024,6 +1025,46 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_thread(self, ref: str) -> List[Dict[str, Any]]:
+        """Return the thread rooted at the post *ref* names, oldest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_thread`: the same resolution and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same reference.  A reference that names no post,
+        or a deleted or unlinked one, raises :class:`TanError` (via
+        :func:`tau.tangents.tan.thread`) and the HTTP layer reports it
+        as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, thread
+
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("field 'ref' is required")
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            posts = thread(conn, ref.strip(), viewer=viewer)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
     def tan_following(self) -> List[Dict[str, Any]]:
         from .tangents.tan import author_stats, following
 
@@ -1790,6 +1831,27 @@ class _WebHandler(BaseHTTPRequestHandler):
                         limit=limit, include_all=include_all, author=author
                     )
                 except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/thread":
+                ref = (query.get("ref") or [None])[0]
+                if not ref or not ref.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'ref' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    posts = self.bridge.tan_thread(ref.strip())
+                except ValueError as exc:
+                    # Only an invalid reference is a client error; an
+                    # unexpected failure (a database error, say) must
+                    # reach the server-error handler as a 500, so the
+                    # console does not mistake it for a deleted anchor
+                    # and close the thread.
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
