@@ -409,7 +409,12 @@ def _public_peer_info(response: Dict[str, Any]) -> Dict[str, Any]:
             info[key] = value
     for key in ("protocol", "uptime", "peers"):
         value = response.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, bool):
+            continue
+        # NaN and infinity are not valid JSON; drop them with other bad types.
+        if isinstance(value, int) or (
+            isinstance(value, float) and math.isfinite(value)
+        ):
             info[key] = value
     lxmf = response.get("lxmf")
     if isinstance(lxmf, dict) and isinstance(lxmf.get("enabled"), bool):
@@ -1403,7 +1408,12 @@ class WebBridge:
 
     def peer_info(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
         """Ask a peer what it reports about itself (``tau info``)."""
-        peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        try:
+            peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
+        except NodeError as exc:
+            # The resolver reports unknown names as NodeError; treat them
+            # as an unknown peer (404), not a failed request (502).
+            raise PeerError(str(exc)) from exc
         response = self.node.request_info(peer, timeout=timeout)
         return {
             "ok": True,
@@ -2200,7 +2210,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 15.0
-        timeout = max(1.0, min(float(timeout), 120.0))
+        try:
+            timeout = float(timeout)
+        except OverflowError:
+            # An integer too large for a float is far above the cap.
+            timeout = 120.0
+        timeout = max(1.0, min(timeout, 120.0))
         try:
             result = self.bridge.peer_info(target, timeout=timeout)
         except PeerError as exc:

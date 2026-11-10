@@ -538,6 +538,34 @@ def test_peer_info_missing_target(bridge):
     assert status == 400
 
 
+def test_peer_info_unknown_name_from_real_resolver(bridge, node, monkeypatch):
+    from tau.node import NodeError
+
+    def resolve(target, *, timeout=10.0):
+        raise NodeError(f"unknown peer: {target!r}")
+
+    monkeypatch.setattr(node, "resolve_peer", resolve)
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge, "/api/info", method="POST", body={"to": "alice", "timeout": 10**400}
+    )
+    assert status == 200
+    assert payload["info"]["version"] == "0.2.0"
+
+
+def test_public_peer_info_drops_non_finite_numbers():
+    from tau.webapi import _public_peer_info
+
+    info = _public_peer_info(
+        {"protocol": float("nan"), "uptime": float("inf"), "peers": 2}
+    )
+    assert info == {"peers": 2}
+
+
 def test_public_peer_info_drops_unexpected_types():
     from tau.webapi import _public_peer_info
 
