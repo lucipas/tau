@@ -206,7 +206,21 @@ def create_backup(
                                 source = _snapshot_sqlite(
                                     source, Path(scratch) / SOCIAL_DB_NAME
                                 )
-                            archive.add(source, arcname=name)
+                            # Size and bytes come from one open descriptor:
+                            # a live node may atomically replace the file
+                            # between a pathname stat and the open.
+                            try:
+                                handle_in = open(source, "rb")
+                            except FileNotFoundError as exc:
+                                raise BackupError(
+                                    f"{name} disappeared while the backup was "
+                                    "being written; try again"
+                                ) from exc
+                            with handle_in:
+                                info = archive.gettarinfo(
+                                    arcname=name, fileobj=handle_in
+                                )
+                                archive.addfile(info, handle_in)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(tmp_name, 0o600)
