@@ -2037,6 +2037,63 @@ def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
         bridge.stop()
 
 
+def test_delete_message_rollback_survives_append_to_full_log(
+    node, tmp_path, monkeypatch
+):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # Fill the bounded log (500 entries) with console-only messages.
+        for i in range(1, 501):
+            bridge._messages.append(
+                {
+                    "id": i,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": f"m{i}",
+                    "sent_at": float(i),
+                    "received_at": float(i),
+                    "status": "received",
+                }
+            )
+        bridge._next_message_id = 501
+
+        # A message arriving while the strict save is in flight refills
+        # the log, then the write fails. The rollback must restore the
+        # deleted entry instead of raising on the full deque.
+        def _append_then_fail(*args, **kwargs):
+            bridge._messages.append(
+                {
+                    "id": 501,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": "m501",
+                    "sent_at": 501.0,
+                    "received_at": 501.0,
+                    "status": "received",
+                }
+            )
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "tau.webapi.atomic_write_json", _append_then_fail
+        )
+        status, _, _ = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 250}
+        )
+        assert status == 500
+        # The feed API pages the log, so check the deque itself: the
+        # restore must have landed despite the full log.
+        assert len(bridge._messages) == 500
+        ids = [message["id"] for message in bridge._messages]
+        assert 250 in ids  # the deleted entry was restored
+        assert 501 in ids  # the interleaved append survived
+        assert ids == sorted(ids)  # the restore kept id order
+    finally:
+        bridge.stop()
+
+
 def test_reaction_annotates_matching_history_entry(bridge):
     record = {
         "from": "alice",

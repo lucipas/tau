@@ -1375,6 +1375,18 @@ class WebBridge:
                 self._save_messages_locked(strict=True)
             except Exception:
                 with self._lock:
+                    # A message can arrive while the strict write is in
+                    # flight (the save lock serialises saves, not
+                    # appends): with a full log the append refills the
+                    # deque, and insert() on a full bounded deque raises
+                    # instead of restoring the entry. Drop the oldest
+                    # first — the same eviction an append would have
+                    # caused — so the restore always lands.
+                    if (
+                        self._messages.maxlen is not None
+                        and len(self._messages) >= self._messages.maxlen
+                    ):
+                        self._messages.popleft()
                     index = next(
                         (
                             i
