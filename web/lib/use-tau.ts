@@ -389,6 +389,7 @@ export function useTau() {
     outbox,
     heldForOthers,
     settings,
+    settingsError,
     bridge,
     connection,
     pings,

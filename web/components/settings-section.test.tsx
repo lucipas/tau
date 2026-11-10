@@ -13,8 +13,15 @@ const SETTINGS: NodeSettings = {
 function renderSection(
   settings: NodeSettings | null = SETTINGS,
   onToggle = vi.fn().mockResolvedValue(undefined),
+  loadError: string | null = null,
 ) {
-  return render(<SettingsSection settings={settings} onToggle={onToggle} />);
+  return render(
+    <SettingsSection
+      settings={settings}
+      loadError={loadError}
+      onToggle={onToggle}
+    />,
+  );
 }
 
 describe("SettingsSection", () => {
@@ -62,6 +69,14 @@ describe("SettingsSection", () => {
     await waitFor(() =>
       expect(screen.getByText("no data directory")).not.toBeNull(),
     );
+  });
+
+  it("shows a load error inline when settings fail to load", () => {
+    renderSection(null, vi.fn(), "no data directory");
+
+    expect(
+      screen.getByText("couldn't load settings: no data directory"),
+    ).not.toBeNull();
   });
 
   it("disables the toggles while settings are still loading", () => {
