@@ -15,11 +15,14 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  SafetyNumberResponse,
   SendResponse,
   Snapshot,
   TauGroup,
   TauMessage,
   UnreadCounts,
+  VerifyPeerResponse,
+  VerifyState,
 } from "./types";
 
 export type ConnectionState =
@@ -70,10 +73,17 @@ export function useTau() {
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [verifications, setVerifications] = useState<
+    Record<string, VerifyState>
+  >({});
   const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Verification time the console last applied per peer. Peer events
+  // queued before a successful verify carry the older trust state and
+  // must not undo the badge.
+  const localVerifiedAt = useRef<Record<string, number | null>>({});
   // Ordering of authoritative peer state: each peer event or snapshot
   // gets a sequence number. A block/unblock reply sent before a newer
   // one must not overwrite the flag the event already delivered.
@@ -120,6 +130,7 @@ export function useTau() {
       setNode(snapshot.node);
       peerEventSeq.current += 1;
       snapshotRevision.current = peerEventSeq.current;
+      localVerifiedAt.current = {};
       setPeers(sortPeers(snapshot.peers));
       setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
@@ -180,11 +191,27 @@ export function useTau() {
           ),
         );
       }
+      // A peer event queued before a successful verify carries the
+      // older trust state; the local verification is newer, so keep
+      // it instead of letting the stale event undo the badge. A
+      // snapshot resets the record (see onSnapshot): it is
+      // authoritative, and any event after it is newer than the verify.
+      const localVerified = localVerifiedAt.current[peer.destination];
+      const currentPeer =
+        localVerified != null &&
+        (peer.verified_at == null || peer.verified_at < localVerified)
+          ? {
+              ...peer,
+              verified: true,
+              verified_at: localVerified,
+              key_change_at: null,
+            }
+          : peer;
       setPeers((previous) => {
         const next = previous.filter(
-          (entry) => entry.destination !== peer.destination,
+          (entry) => entry.destination !== currentPeer.destination,
         );
-        next.push(peer);
+        next.push(currentPeer);
         return sortPeers(next);
       });
     };
@@ -427,6 +454,94 @@ export function useTau() {
     [editBlock],
   );
 
+  // Showing the safety number records nothing: the peer stays
+  // unverified and any key-change warning stays up until the owner
+  // compares the number out of band and confirms it matches.
+  const showSafetyNumber = useCallback(async (destination: string) => {
+    setVerifications((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<SafetyNumberResponse>(
+        "/api/peers/safety-number",
+        { target: destination },
+      );
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          safetyNumber: result.safety_number.safety_number,
+        },
+      }));
+      return result.safety_number;
+    } catch (error) {
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "verify failed",
+        },
+      }));
+      throw error;
+    }
+  }, []);
+
+  // Confirm step: only call after the owner compared the shown number
+  // out of band and found it matches. This is what records the
+  // verification and clears any key-change warning.
+  const verifyPeer = useCallback(async (destination: string) => {
+    setVerifications((previous) => ({
+      ...previous,
+      [destination]: {
+        pending: true,
+        safetyNumber: previous[destination]?.safetyNumber,
+      },
+    }));
+    try {
+      const result = await apiPost<VerifyPeerResponse>("/api/peers/verify", {
+        target: destination,
+      });
+      const verify = result.verify;
+      localVerifiedAt.current[destination] = verify.verified_at;
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: { result: verify },
+      }));
+      // The badge and warning update at once instead of waiting for
+      // the next snapshot: the peer is verified now, and any earlier
+      // key-change warning about it is answered.
+      setPeers((previous) =>
+        previous.map((peer) =>
+          peer.destination === destination
+            ? {
+                ...peer,
+                verified: true,
+                verified_at: verify.verified_at,
+                key_change_at: null,
+              }
+            : peer,
+        ),
+      );
+      return verify;
+    } catch (error) {
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          safetyNumber: previous[destination]?.safetyNumber,
+          error: error instanceof Error ? error.message : "verify failed",
+        },
+      }));
+      throw error;
+    }
+  }, []);
+
+  const clearVerification = useCallback((destination: string) => {
+    setVerifications((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+  }, []);
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -508,10 +623,14 @@ export function useTau() {
     bridge,
     connection,
     pings,
+    verifications,
     blocks,
     announcing,
     send,
     ping,
+    showSafetyNumber,
+    verifyPeer,
+    clearVerification,
     blockPeer,
     unblockPeer,
     announce,

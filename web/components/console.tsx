@@ -105,11 +105,21 @@ export function Console() {
             groups={tau.groups}
             bridge={tau.bridge}
             pings={tau.pings}
+            verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
+            }}
+            onVerify={(destination) => {
+              void tau.verifyPeer(destination).catch(() => undefined);
+            }}
+            onShowSafetyNumber={(destination) => {
+              void tau.showSafetyNumber(destination).catch(() => undefined);
+            }}
+            onDismissVerification={(destination) => {
+              tau.clearVerification(destination);
             }}
             onBlock={(destination) => {
               void tau.blockPeer(destination).catch(() => undefined);

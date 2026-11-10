@@ -244,6 +244,140 @@ def test_record_peer_event_carries_trust_fields(bridge, node):
     assert peer_events[-1]["peer"]["key_change_at"] == 1600.0
 
 
+def test_peers_verify_via_api(tmp_path):
+    import RNS
+
+    from tau.peers import PeerRegistry, safety_number
+
+    identity = RNS.Identity()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.identity = identity
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer_key = b"\x03" * 64
+    registry.upsert(bytes.fromhex(PEER_HASH), peer_key, name="alice", hops=1)
+    node.registry = registry
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A key-change warning is answered by verifying, not left to warn.
+        peer = registry.get(PEER_HASH)
+        assert peer is not None
+        peer.key_change_at = 1500.0
+
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        verify = payload["verify"]
+        assert verify["peer"] == PEER_HASH
+        assert verify["name"] == "alice"
+        assert verify["safety_number"] == safety_number(
+            identity.get_public_key(), peer_key
+        )
+        assert verify["reverified"] is False
+        assert verify["fingerprint_changed"] is False
+
+        status, _, payload = _json(bridge, "/api/peers")
+        entry = [
+            item for item in payload["peers"] if item["destination"] == PEER_HASH
+        ][0]
+        assert entry["verified"] is True
+        assert entry["key_change_at"] is None
+
+        # Re-verifying under a different local identity changes the
+        # pairwise number, and the response says so.
+        node.identity = RNS.Identity()
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": PEER_HASH}
+        )
+        assert status == 200
+        assert payload["verify"]["reverified"] is True
+        assert payload["verify"]["fingerprint_changed"] is True
+
+        # Unknown and blank targets are rejected.
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "nobody"}
+        )
+        assert status == 400
+        assert "no peer matches" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "  "}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_peers_safety_number_shows_without_verifying(tmp_path):
+    import RNS
+
+    from tau.peers import PeerRegistry, safety_number
+
+    identity = RNS.Identity()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.identity = identity
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer_key = b"\x03" * 64
+    registry.upsert(bytes.fromhex(PEER_HASH), peer_key, name="alice", hops=1)
+    node.registry = registry
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A key-change warning is still open before the number is shown.
+        peer = registry.get(PEER_HASH)
+        assert peer is not None
+        peer.key_change_at = 1500.0
+
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        shown = payload["safety_number"]
+        assert shown["peer"] == PEER_HASH
+        assert shown["name"] == "alice"
+        assert shown["safety_number"] == safety_number(
+            identity.get_public_key(), peer_key
+        )
+
+        # Showing the number records nothing: the peer stays
+        # unverified and the warning stays up until the owner
+        # confirms the match.
+        status, _, payload = _json(bridge, "/api/peers")
+        entry = [
+            item for item in payload["peers"] if item["destination"] == PEER_HASH
+        ][0]
+        assert entry["verified"] is False
+        assert entry["key_change_at"] == 1500.0
+
+        # Unknown and blank targets are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "nobody"},
+        )
+        assert status == 400
+        assert "no peer matches" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "  "},
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_send_message_is_recorded_and_published(bridge, node):
     from tau.protocol import excerpt_hash
 

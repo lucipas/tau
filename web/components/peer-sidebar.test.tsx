@@ -40,11 +40,15 @@ function renderSidebar(
       bridge={null}
       pings={{}}
       blocks={overrides.blocks ?? {}}
+      verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
       onBlock={overrides.onBlock ?? (() => {})}
       onUnblock={overrides.onUnblock ?? (() => {})}
+      onVerify={() => {}}
+      onShowSafetyNumber={() => {}}
+      onDismissVerification={() => {}}
       onSelectPeer={onSelectPeer}
     />,
   );

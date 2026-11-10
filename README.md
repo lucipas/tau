@@ -132,6 +132,8 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/verify` | POST | mark a peer verified `{"target": "alice"}` — only after comparing the safety number out of band (returns it) |
+| `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |
 | `/api/peers/block` | POST | block `{"target": "alice"}` |
 | `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
 | `/api/groups` | GET | known group DMs with their member lists |
