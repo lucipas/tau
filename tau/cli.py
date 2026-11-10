@@ -121,6 +121,7 @@ from .tangents.tan import (
     unmute,
     unmute_keyword,
     unsave_post,
+    verify_store,
 )
 
 log = logging.getLogger(__name__)
@@ -1103,6 +1104,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts",
     )
     tan_search.set_defaults(func=cmd_tan_search)
+
+    tan_verify = tan_sub.add_parser(
+        "verify",
+        parents=[common],
+        help="re-verify every stored post's signature and chain linkage",
+    )
+    tan_verify.set_defaults(func=cmd_tan_verify)
 
     tan_mentions = tan_sub.add_parser(
         "mentions",
@@ -2326,6 +2334,56 @@ def cmd_tan_search(args: argparse.Namespace) -> int:
         empty_message=f"No stored posts match {args.query!r}.",
     )
     return _EXIT_OK
+
+
+def cmd_tan_verify(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    path = Path(config.social_db_path).expanduser()
+    # Audit a read-only connection to the existing file: opening through
+    # init_db would create a missing store, or migrate and rewrite an old one.
+    try:
+        if not path.is_file():
+            raise FileNotFoundError(f"no Tan store at {path}")
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10.0
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            report = verify_store(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        message = f"could not audit Tan store at {path}: {exc}"
+        if json_output:
+            _emit({"ok": False, "error": message}, True)
+        else:
+            print(f"tau: error: {message}", file=sys.stderr)
+        return _EXIT_ERROR
+    if json_output:
+        _emit(report, True)
+        return _EXIT_OK if report["ok"] else _EXIT_ERROR
+    if report["ok"]:
+        print(
+            f"Tan store OK: {report['entries']} entries from "
+            f"{report['authors']} authors verified."
+        )
+        if report["unlinked"]:
+            print(
+                f"{report['unlinked']} unlinked entries are waiting for "
+                "their parent to arrive."
+            )
+        return _EXIT_OK
+    for problem in report["problems"]:
+        print(
+            f"{_safe_id_prefix(problem['hash'])} "
+            f"({short_hash(problem['author'])}): {problem['problem']}"
+        )
+    print(
+        f"Tan store has {len(report['problems'])} problem(s) in "
+        f"{report['entries']} entries."
+    )
+    return _EXIT_ERROR
 
 
 def cmd_tan_thread(args: argparse.Namespace) -> int:

@@ -213,20 +213,122 @@ it, oldest first, and accepts a reply's hash to show the thread it belongs
 to. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
-(the entry itself stays stored, keeping chains verifiable). A word or
-phrase can be muted locally with `tau tan mute-keyword <word>` — matching
-posts disappear from your timeline and threads (a muted reply hides its
-whole subtree), while search still finds them and unmuting restores them.
-An author can also be muted with `tau tan mute <peer>` — their posts and
-replies leave your timeline, search results and threads, while their
-entries keep syncing and storing, so `tau tan unmute <peer>` brings the
-whole history back. Muting is display-only and never touches DMs.
+(the entry itself stays stored, keeping chains verifiable). Entries are
+verified when they are stored, but nothing re-checks the local copy
+afterwards: `tau tan verify` re-verifies every stored entry's signature
+and hash and checks each author's chain linkage, and exits non-zero
+listing any problem it finds — run it after a restore, or whenever you
+suspect the database was damaged. Entries whose parent has not arrived
+yet are counted, not reported. A word or phrase can be muted locally
+with `tau tan mute-keyword <word>` — matching posts disappear from your
+timeline and threads (a muted reply hides its whole subtree), while
+search still finds them and unmuting restores them. An author can also
+be muted with `tau tan mute <peer>` — their posts and replies leave your
+timeline, search results and threads, while their entries keep syncing
+and storing, so `tau tan unmute <peer>` brings the whole history back.
+Muting is display-only and never touches DMs.
 In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
 ## Command reference
 
+Global options may appear before or after the command:
+
+| Option | Description |
+| --- | --- |
+| `--data-dir DIR` | Data directory (default: `$TAU_HOME` or `~/.tau`) |
+| `--rns-config DIR` | Reticulum config directory (default: `<data-dir>/reticulum`) |
+| `--name NAME` | Node name announced to peers |
+| `--json` | Machine-readable output |
+| `-v`, `-vv` | Info / debug logging |
+| `-q` | Errors only |
+| `--rns-log-level 0-8` | Explicit Reticulum log level |
+
+| Command | Description |
+| --- | --- |
+| `tau init` | Create the data directory, identity and Reticulum config |
+| `tau serve` | Announce this node and answer requests until interrupted |
+| `tau discover` | Listen for announces for `--duration` seconds |
+| `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
+| `tau ping --to PEER` | Check reachability and measure round-trip time |
+| `tau info --to PEER` | Fetch a remote node's information |
+| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau messages` | List received direct messages kept in the node inbox |
+| `tau outbox` | List messages queued for offline peers |
+| `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
+| `tau outbox held` | List sealed messages held for other peers |
+| `tau outbox drop-held ID` | Drop a held message so it is never delivered |
+| `tau allowlist` | Show or change who may send this node direct messages |
+| `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
+| `tau id` | Show this node's name, destination hash, and LXMF delivery address |
+| `tau id export --to PATH` | Back up the node identity to a file |
+| `tau id import --from PATH` | Restore the node identity from a backup |
+| `tau tan post TEXT` | Sign, store and publish a social post |
+| `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
+| `tau tan like POST` | Like a post (signed reaction on your chain) |
+| `tau tan unlike POST` | Remove your like from a post |
+| `tau tan delete POST` | Delete one of your own posts |
+| `tau tan timeline` | Show your posts and the authors you follow |
+| `tau tan thread POST` | Show a post with its replies as a nested thread |
+| `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan verify` | Re-verify every stored post's signature and chain linkage |
+| `tau tan follow PEER` | Follow a peer or destination hash |
+| `tau tan unfollow PEER` | Stop following an author |
+| `tau tan following` | List followed authors |
+| `tau tan sync` | Pull missing posts from known peers |
+| `tau tan export` | Back up stored Tan posts as a JSON export |
+| `tau tan import FILE` | Restore Tan posts from a JSON export |
+| `tau tan rules` | Show or change which remote entries get committed |
+
+Useful flags:
+
+```bash
+# Don't overwrite an existing config, but add a TCP server alongside AutoInterface
+tau init --tcp-listen 0.0.0.0:4343 --init
+
+# Announce every 30 seconds, stop after one minute
+tau serve --announce-interval 30 --duration 60
+
+# Serve the web console and JSON API on loopback (port 8787)
+tau serve --http
+
+# Serve on a specific address (remote bind needs an explicit opt-in)
+tau serve --http 0.0.0.0:8787 --http-allow-remote
+
+# Enable the social feed and refresh it every minute
+tau serve --social --social-sync-interval 60
+
+# Pull the public feed from peers to discover new authors
+tau tan sync --explore
+
+# Read the message from a file or stdin
+tau send --to alice --file message.txt
+echo "piped message" | tau send --to alice
+
+# Fail fast instead of queueing when the peer is offline
+tau send --to alice "hi" --no-queue
+
+# See what is waiting on offline peers
+tau outbox
+
+# Read back messages this node received (newest first)
+tau messages
+tau messages --peer alice --limit 10 --json
+
+# Only show peers heard from in the last day
+tau peers --max-age 1
+
+# Everything as JSON
+tau discover --duration 10 --json
+tau send --to alice "hi" --json
+```
+
+`serve` emits one JSON object per line with `--json` (`ready`, `peer`,
+`message` events), which makes it easy to feed into another process.
+`discover`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
+
 Full command and flag reference: [FLAGS.md](FLAGS.md).
+
 
 ## Data directory
 
