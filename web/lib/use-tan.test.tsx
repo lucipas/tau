@@ -49,6 +49,183 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
+
+describe("useTan mentions view", () => {
+  it("loads mentions instead of the timeline when the view is selected", async () => {
+    const mine = makePost();
+    const reply = makePost({
+      hash: "e".repeat(64),
+      text: "seconded",
+      author: "f".repeat(64),
+      name: "bob",
+      own: false,
+    });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/mentions")) {
+        return Promise.resolve({ posts: [reply], count: 1 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Mentions are not part of the timeline's load: nothing loaded yet.
+    expect(result.current.mentions).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/mentions"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      result.current.setShowMentions(true);
+    });
+    await waitFor(() => expect(result.current.mentions).toEqual([reply]));
+    expect(mockedGet).toHaveBeenCalledWith("/api/tan/mentions?limit=100");
+
+    // Switching back reloads the timeline.
+    await act(async () => {
+      result.current.setShowMentions(false);
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+  });
+});
+
+
+describe("useTan saved posts", () => {
+  it("loads saved posts on demand and posts save/unsave to the API", async () => {
+    const mine = makePost();
+    const saved = makePost({ hash: "e".repeat(64), text: "keep me" });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        return Promise.resolve({ posts: [saved], count: 1, next_offset: null });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Saved posts are not part of the feed's poll: nothing loaded yet.
+    expect(result.current.saved).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/saved"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/saved?limit=100&offset=0",
+    );
+    expect(result.current.saved).toEqual([saved]);
+
+    await act(async () => {
+      await result.current.save(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/save", {
+      target: mine.hash,
+    });
+
+    await act(async () => {
+      await result.current.unsave(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unsave", {
+      target: mine.hash,
+    });
+  });
+
+  it("pages through older saves with load more", async () => {
+    const secondPage = [makePost({ hash: "f".repeat(64), text: "older" })];
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        // A non-null next_offset means there may be more: the first
+        // page is full, the second holds the one remaining save.
+        const page = path.endsWith("offset=0")
+          ? Array.from({ length: 100 }, (_, index) =>
+              makePost({
+                hash: `${index}`.padStart(64, "0"),
+                text: `saved ${index}`,
+              }),
+            )
+          : secondPage;
+        return Promise.resolve({
+          posts: page,
+          count: page.length,
+          next_offset: path.endsWith("offset=0") ? 100 : null,
+        });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [], count: 0 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([]));
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(result.current.saved).toHaveLength(100);
+    expect(result.current.savedHasMore).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMoreSaved();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/saved?limit=100&offset=100",
+    );
+    expect(result.current.saved).toHaveLength(101);
+    expect(result.current.saved[100]).toEqual(secondPage[0]);
+    expect(result.current.savedHasMore).toBe(false);
+  });
+
+  it("refreshes the saved list after liking from the saved view", async () => {
+    const mine = makePost();
+    const saved = makePost({ hash: "e".repeat(64), text: "keep me" });
+    let savedCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/saved")) {
+        savedCalls += 1;
+        return Promise.resolve({ posts: [saved], count: 1, next_offset: null });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+
+    // Liking before the saved list was ever opened does not fetch it.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(savedCalls).toBe(0);
+
+    await act(async () => {
+      await result.current.loadSaved();
+    });
+    expect(savedCalls).toBe(1);
+
+    // Once opened, a like refreshes the saved cards too.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(savedCalls).toBe(2);
+  });
+});
+
+
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
     const mine = makePost();

@@ -208,6 +208,11 @@ function MessageBubble({
           <span className="text-[11px] font-medium text-zinc-300">
             {outbound ? "you" : message.peer_name}
           </span>
+          {message.group ? (
+            <span className="rounded border border-signal/30 bg-signal/10 px-1.5 py-px font-mono text-[10px] text-signal">
+              {message.group_name ?? "group"}
+            </span>
+          ) : null}
           <span className="font-mono text-[10px] text-mist/80">
             {peerHash ? shortHash(peerHash, 8) : "anonymous"}
           </span>

@@ -6,6 +6,7 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  GroupsResponse,
   MarkReadResponse,
   NodeInfo,
   OutboxEntry,
@@ -14,6 +15,7 @@ import type {
   PingResult,
   SendResponse,
   Snapshot,
+  TauGroup,
   TauMessage,
   UnreadCounts,
 } from "./types";
@@ -46,6 +48,7 @@ function readEventData<T>(event: Event): T | null {
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [groups, setGroups] = useState<TauGroup[]>([]);
   const [messages, setMessages] = useState<TauMessage[]>([]);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
@@ -88,6 +91,7 @@ export function useTau() {
           : 0;
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
+      setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
       // revision baseline so a delayed event from the old connection
@@ -178,6 +182,7 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -188,6 +193,15 @@ export function useTau() {
     if (requestId !== refreshSeq.current) return;
     setOutbox(result.outbox);
     setHeldForOthers(result.held_for_others);
+  }, []);
+
+  const refreshGroups = useCallback(async () => {
+    // Same polling shape as the outbox: a group learned from an
+    // incoming message shows up here without waiting for a reload.
+    const requestId = ++groupsSeq.current;
+    const result = await apiGet<GroupsResponse>("/api/groups");
+    if (requestId !== groupsSeq.current) return;
+    setGroups(result.groups);
   }, []);
 
   useEffect(() => {
@@ -201,6 +215,11 @@ export function useTau() {
         // known entries in place instead of flashing an error.
         if (disposed) return;
       }
+      try {
+        await refreshGroups();
+      } catch {
+        if (disposed) return;
+      }
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
@@ -208,7 +227,7 @@ export function useTau() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox]);
+  }, [connection, refreshOutbox, refreshGroups]);
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -309,6 +328,7 @@ export function useTau() {
   return {
     node,
     peers,
+    groups,
     messages,
     unread,
     outbox,
@@ -322,6 +342,7 @@ export function useTau() {
     announce,
     markRead,
     refreshOutbox,
+    refreshGroups,
     cancelOutbox,
   };
 }

@@ -93,6 +93,63 @@ def test_list_filters_by_peer_and_limit(tmp_path):
     assert inbox.list_messages(limit=0) == []
 
 
+def test_records_default_to_chat_kind(tmp_path):
+    # Records written before kinds existed carry no kind field.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old"))
+    assert inbox.list_messages()[0]["kind"] == "chat"
+
+
+def test_list_filters_by_kind(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="c1", kind="chat", received_at=1.0))
+    inbox.append(_record(id="p1", kind="ping", received_at=2.0))
+    inbox.append(_record(id="p2", kind="ping", received_at=3.0))
+
+    assert [e["id"] for e in inbox.list_messages(kind="ping")] == ["p2", "p1"]
+    assert [e["id"] for e in inbox.list_messages(kind="chat")] == ["c1"]
+    assert inbox.list_messages(kind="alert") == []
+
+
+def test_list_filters_by_text_query(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, text="HELLO again", received_at=2.0))
+    inbox.append(_record(id="a2", destination="aa" * 16, text="unrelated", received_at=3.0))
+
+    # Case-insensitive substring match, newest first.
+    assert [e["id"] for e in inbox.list_messages(query="hello")] == ["b1", "a1"]
+    assert [e["id"] for e in inbox.list_messages(query="WORLD")] == ["a1"]
+    assert inbox.list_messages(query="missing") == []
+    # Query composes with the peer filter and the limit.
+    assert [e["id"] for e in inbox.list_messages(query="hello", peer="aa" * 16)] == ["a1"]
+    assert [e["id"] for e in inbox.list_messages(query="hello", limit=1)] == ["b1"]
+
+
+def test_list_search_skips_textless_file_records(tmp_path):
+    # A received file has no "text" key; searching must exclude it
+    # instead of raising KeyError.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+        }
+    )
+
+    assert [e["id"] for e in inbox.list_messages(query="hello")] == ["a1"]
+    assert inbox.list_messages(query="notes") == []
+
+
 def test_concurrent_writers_do_not_lose_entries(tmp_path):
     """Two Inbox handles on one file (serve + one-shot) keep each other's entries."""
     path = tmp_path / "inbox.json"
@@ -152,6 +209,317 @@ def test_append_rejects_record_without_text(tmp_path):
     with pytest.raises(ValueError):
         inbox.append({"from": "alice"})
     assert len(inbox) == 0
+
+
+def test_delete_by_full_id(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a" * 32, text="one"))
+    inbox.append(_record(id="b" * 32, text="two"))
+
+    removed = inbox.delete("a" * 32)
+    assert removed["text"] == "one"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["b" * 32]
+
+
+def test_delete_by_unique_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="efgh" + "2" * 28, text="two"))
+
+    removed = inbox.delete("abcd")
+    assert removed["text"] == "one"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["efgh" + "2" * 28]
+
+
+def test_delete_unknown_and_ambiguous(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="abcd" + "2" * 28, text="two"))
+
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.delete("zzzz")
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.delete("abcd")
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.delete("  ")
+    assert len(inbox) == 2
+
+
+def test_delete_persists_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="keep", text="keep me"))
+    inbox.append(_record(id="drop", text="drop me"))
+    inbox.delete("drop")
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages()] == ["keep"]
+
+
+def test_delete_ignores_records_without_id(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id=None, text="old entry"))
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.delete("old")
+    assert len(inbox) == 1
+
+
+def test_delete_memory_only_inbox():
+    inbox = Inbox()
+    inbox.append(_record(id="gone", text="bye"))
+    assert inbox.delete("gone")["text"] == "bye"
+    assert len(inbox) == 0
+
+
+def test_delete_exact_match_wins_over_folded_prefix(tmp_path):
+    """An exact id wins even when a case-folded prefix would be ambiguous."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="A" * 32, text="upper"))
+    inbox.append(_record(id="a" * 32, text="lower"))
+
+    removed = inbox.delete("A" * 32)
+    assert removed["text"] == "upper"
+    assert [entry["id"] for entry in inbox.list_messages()] == ["a" * 32]
+
+
+def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.inbox
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="keep", text="keep me"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _boom)
+    with pytest.raises(InboxError, match="could not persist inbox"):
+        inbox.delete("keep")
+    # The removal was rolled back: the message is still there.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
+
+
+def test_export_document_round_trips_through_import(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    source.append(_record(id="one", text="first"))
+    source.append(_record(id="two", text="second"))
+
+    document = source.export_document()
+    assert document["format"] == "tau-messages-export"
+    assert document["version"] == 1
+    assert [entry["id"] for entry in document["messages"]] == ["one", "two"]
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(document)
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    assert [entry["id"] for entry in target.list_messages()] == ["two", "one"]
+
+    # Re-importing the same export is a no-op, not a duplicate.
+    again = target.import_messages(document)
+    assert again["imported"] == 0
+    assert again["present"] == 2
+    assert len(target) == 2
+
+
+def test_export_document_filters_by_peer(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16))
+    inbox.append(_record(id="b1", destination="bb" * 16))
+
+    document = inbox.export_document(peer="aa" * 16)
+    assert [entry["id"] for entry in document["messages"]] == ["a1"]
+
+
+def test_import_dedupes_records_without_ids_by_content(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {"from": "alice", "destination": "ab" * 16, "text": "hi",
+             "sent_at": 5.0, "received_at": 6.0},
+        ],
+    }
+    first = inbox.import_messages(document)
+    assert first["imported"] == 1
+    second = inbox.import_messages(document)
+    assert second["imported"] == 0
+    assert second["present"] == 1
+    assert len(inbox) == 1
+
+
+def test_import_skips_invalid_entries_with_reasons(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="good"),
+            {"from": "bob", "text": ""},  # empty text
+            {"text": 42},  # non-string text
+            "not a record",
+            _record(id="bad-time", received_at="yesterday"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 1
+    assert result["present"] == 0
+    assert result["skipped"] == 4
+    assert [error["error"] for error in result["errors"]] == [
+        "inbox record needs text",
+        "inbox record needs text",
+        "entry is not an object",
+        "invalid received_at",
+    ]
+    assert len(inbox) == 1
+
+
+def test_import_rejects_bad_documents(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        inbox.import_messages(["not", "a", "dict"])
+    with pytest.raises(ValueError, match="unsupported export format"):
+        inbox.import_messages({"format": "other", "version": 1, "messages": []})
+    with pytest.raises(ValueError, match="unsupported export version"):
+        inbox.import_messages(
+            {"format": "tau-messages-export", "version": 99, "messages": []}
+        )
+    with pytest.raises(ValueError, match="no messages list"):
+        inbox.import_messages({"format": "tau-messages-export", "version": 1})
+    assert len(inbox) == 0
+
+
+def test_import_respects_the_cap(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 3)
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id=f"msg-{index}") for index in range(5)],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 5
+    assert [entry["id"] for entry in inbox.list_messages()] == [
+        "msg-4",
+        "msg-3",
+        "msg-2",
+    ]
+
+
+def test_import_skips_huge_timestamp_without_aborting(tmp_path):
+    """A JSON integer too large for float() is skipped, not fatal.
+
+    float() on a huge int raises OverflowError; an import must record
+    the entry as skipped and keep merging the entries around it.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="before"),
+            _record(id="huge-sent", sent_at=10**400),
+            _record(id="huge-received", received_at=10**400),
+            _record(id="after"),
+        ],
+    }
+    result = inbox.import_messages(document)
+    assert result["imported"] == 2
+    assert result["skipped"] == 2
+    assert [error["error"] for error in result["errors"]] == [
+        "invalid sent_at",
+        "invalid received_at",
+    ]
+    assert [entry["id"] for entry in inbox.list_messages()] == ["after", "before"]
+
+
+def test_duplicate_only_import_keeps_mixed_inbox_over_the_cap(tmp_path):
+    """Re-importing an export must not evict records to one 500 cap.
+
+    Retention is per direction (500 received + 500 sent), so a
+    duplicate-only import into a mixed inbox holding 600 records
+    keeps all of them instead of slicing to the newest 500.
+    """
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(300):
+        inbox.append(_record(id=f"in-{index}", direction="in"))
+        inbox.append(_record(id=f"out-{index}", direction="out"))
+    assert len(inbox) == 600
+
+    result = inbox.import_messages(inbox.export_document())
+    assert result == {"imported": 0, "present": 600, "skipped": 0, "errors": []}
+    assert len(inbox) == 600
+    ids = {entry["id"] for entry in inbox.list_messages(direction=None)}
+    assert ids == {f"in-{index}" for index in range(300)} | {
+        f"out-{index}" for index in range(300)
+    }
+
+
+def test_import_assigns_local_sequences(tmp_path):
+    """Imported records get a local seq so a later append works.
+
+    An export carries the source node's sequences (or none at all);
+    without renumbering, the next append's max() over a None seq
+    raises TypeError.
+    """
+    inbox = Inbox()  # in-memory: no load renumbers anything
+    result = inbox.import_messages(
+        {
+            "format": "tau-messages-export",
+            "version": 1,
+            "messages": [_record(id="imported")],
+        }
+    )
+    assert result["imported"] == 1
+    assert [entry["seq"] for entry in inbox.list_messages()] == [1]
+
+    appended = inbox.append(_record(id="local"))
+    assert appended["seq"] == 2
+    assert [entry["id"] for entry in inbox.list_messages()] == ["local", "imported"]
+
+
+def test_import_raises_when_the_save_fails(tmp_path, monkeypatch):
+    """A save failure raises instead of reporting a restore."""
+    import tau.inbox
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="kept"))
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _fail)
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [_record(id="new")],
+    }
+    with pytest.raises(OSError, match="could not persist inbox"):
+        inbox.import_messages(document)
+    # The unstored import is rolled back in memory too.
+    assert [entry["id"] for entry in inbox.list_messages()] == ["kept"]
+
+
+def test_load_skips_huge_timestamp_without_crashing(tmp_path):
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id="huge", sent_at=10**400),
+                    _record(id="good"),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entries = Inbox(path).list_messages()
+    assert [entry["id"] for entry in entries] == ["good"]
 
 
 def test_new_messages_are_unread_until_marked_read(tmp_path):
@@ -543,3 +911,99 @@ def test_message_without_expiry_has_none(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="plain-1"))
     assert inbox.list_messages()[0]["expires_at"] is None
+
+
+def test_records_default_to_received_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="legacy"))
+
+    entry = inbox.list_messages()[0]
+    assert entry["direction"] == "in"
+
+
+def test_list_filters_by_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="in-1", direction="in", received_at=1.0))
+    inbox.append(_record(id="out-1", direction="out", received_at=2.0))
+    inbox.append(_record(id="in-2", direction="in", received_at=3.0))
+
+    assert [e["id"] for e in inbox.list_messages(direction="out")] == ["out-1"]
+    assert [e["id"] for e in inbox.list_messages(direction="in")] == [
+        "in-2",
+        "in-1",
+    ]
+    assert [e["id"] for e in inbox.list_messages(direction=None)] == [
+        "in-2",
+        "out-1",
+        "in-1",
+    ]
+
+
+def test_list_rejects_unknown_direction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ValueError):
+        inbox.list_messages(direction="sideways")
+
+
+def test_sent_record_persists_direction(tmp_path):
+    path = tmp_path / "inbox.json"
+    Inbox(path).append(_record(id="sent-1", direction="out"))
+
+    reloaded = Inbox(path)
+    assert [e["id"] for e in reloaded.list_messages(direction="out")] == ["sent-1"]
+    assert reloaded.list_messages(direction="in") == []
+
+
+def test_cap_applies_per_direction(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 3)
+    inbox = Inbox(tmp_path / "inbox.json")
+    for index in range(4):
+        inbox.append(
+            _record(id=f"in-{index}", direction="in", received_at=float(index))
+        )
+    for index in range(2):
+        inbox.append(
+            _record(
+                id=f"out-{index}", direction="out", received_at=10.0 + index
+            )
+        )
+    inbox.append(_record(id="in-4", direction="in", received_at=20.0))
+
+    # Sends did not evict received history: each direction kept its own
+    # newest three.
+    entries = inbox.list_messages(direction=None)
+    assert [e["id"] for e in entries] == [
+        "in-4",
+        "out-1",
+        "out-0",
+        "in-3",
+        "in-2",
+    ]
+
+
+def test_reload_caps_each_direction(tmp_path, monkeypatch):
+    import tau.inbox
+
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX", 2)
+    monkeypatch.setattr(tau.inbox, "MAX_INBOX_SENT", 2)
+    path = tmp_path / "inbox.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    _record(id=f"in-{index}", direction="in")
+                    for index in range(4)
+                ]
+                + [
+                    _record(id=f"out-{index}", direction="out")
+                    for index in range(3)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = Inbox(path).list_messages(direction=None)
+    assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]

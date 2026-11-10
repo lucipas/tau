@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
 import type { TanPost } from "@/lib/types";
@@ -17,12 +17,26 @@ export function SocialConsole() {
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Whether the feed shows the saved list instead of the timeline.
+  // Saved posts load on demand, not on the feed's poll tick.
+  const [showSaved, setShowSaved] = useState(false);
+  useEffect(() => {
+    if (!showSaved) return;
+    tan.loadSaved().catch((caught) => {
+      setError(
+        caught instanceof Error ? caught.message : "could not load saved posts",
+      );
+    });
+  }, [showSaved, tan.loadSaved]);
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // The feed shows the timeline or, when the mentions view is selected,
+  // the replies to your own posts instead.
+  const shown = tan.showMentions ? tan.mentions : tan.posts;
 
   async function submitPost() {
     if (!text.trim()) return;
@@ -72,6 +86,19 @@ export function SocialConsole() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
+  async function toggleSave(post: TanPost) {
+    setError(null);
+    try {
+      if (post.saved) {
+        await tan.unsave(post.hash);
+      } else {
+        await tan.save(post.hash);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not save");
     }
   }
 
@@ -252,47 +279,112 @@ export function SocialConsole() {
           <div className="flex min-w-0 flex-col">
             <section className="rounded-2xl border border-line/80 bg-panel/40">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
-                <div className="flex items-center gap-3">
-                  <SectionLabel>
-                    {showingSearch
-                      ? "search results"
-                      : tan.all
-                        ? "public cache"
-                        : "timeline"}
-                  </SectionLabel>
-                  <span className="font-mono text-[10px] text-mist">
-                    {visiblePosts.length} post(s)
-                  </span>
-                </div>
-                {showingSearch ? (
-                  <button
-                    type="button"
-                    onClick={clearSearch}
-                    className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
-                  >
-                    clear search
-                  </button>
-                ) : (
-                  <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
+                {tan.threadRef !== null ? (
+                  <div className="flex items-center gap-3">
                     <button
                       type="button"
-                      onClick={() => tan.setAll(false)}
-                      className={`rounded px-2 py-1 ${
-                        tan.all ? "text-mist" : "bg-signal/15 text-signal"
-                      }`}
+                      onClick={() => tan.closeThread()}
+                      className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
                     >
-                      following
+                      ← timeline
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => tan.setAll(true)}
-                      className={`rounded px-2 py-1 ${
-                        tan.all ? "bg-signal/15 text-signal" : "text-mist"
-                      }`}
-                    >
-                      everything
-                    </button>
+                    <SectionLabel>thread</SectionLabel>
+                    <span className="font-mono text-[10px] text-mist">
+                      {tan.threadPosts?.length ?? 0} post(s)
+                    </span>
                   </div>
+
+                ) : (
+                  <>
+                    <div className="flex items-center gap-3">
+                      <SectionLabel>
+                        {showingSearch
+                          ? "search results"
+                          : showSaved
+                            ? "saved"
+                          : tan.showMentions
+                            ? "mentions"
+                            : tan.all
+                              ? "public cache"
+                              : "timeline"}
+                      </SectionLabel>
+                      <span className="font-mono text-[10px] text-mist">
+                        {showingSearch
+                          ? `${visiblePosts.length} post(s)`
+                          : showSaved
+                            ? `${tan.saved.length} post(s)`
+                          : tan.showMentions
+                            ? `${shown.length} post(s)`
+                            : `${tan.posts.length} post(s)`}
+                      </span>
+                    </div>
+                    {showingSearch ? (
+                    <button
+                      type="button"
+                      onClick={clearSearch}
+                      className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
+                    >
+                      clear search
+                    </button>
+                    ) : (
+                    <div className="flex items-center gap-1 rounded-lg border border-line/70 bg-void/50 p-1 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowSaved(false);
+                          tan.setShowMentions(false);
+                          tan.setAll(false);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          !showSaved && !tan.showMentions && !tan.all
+                            ? "bg-signal/15 text-signal"
+                            : "text-mist"
+                        }`}
+                      >
+                        following
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowSaved(false);
+                          tan.setShowMentions(false);
+                          tan.setAll(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          !showSaved && !tan.showMentions && tan.all
+                            ? "bg-signal/15 text-signal"
+                            : "text-mist"
+                        }`}
+                      >
+                        everything
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowSaved(false);
+                          tan.setShowMentions(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        mentions
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          tan.setShowMentions(false);
+                          setShowSaved(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          showSaved ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        saved
+                      </button>
+                    </div>
+                    )}
+                  </>
                 )}
               </div>
 
@@ -321,7 +413,75 @@ export function SocialConsole() {
               </form>
 
               <div className="thin-scroll min-h-[320px] space-y-3 px-4 py-4 lg:max-h-[calc(100dvh-370px)] lg:overflow-y-auto">
-                {visiblePosts.length === 0 ? (
+                {tan.threadRef !== null ? (
+                  <ThreadView
+                    posts={tan.threadPosts}
+                    loading={tan.threadLoading}
+                    error={tan.threadError ?? tan.error}
+                    onToggleLike={toggleLike}
+                    onReply={(target) => setReplyTarget(target)}
+                    onDelete={submitDelete}
+                    onOpenThread={(target) => void tan.openThread(target.hash)}
+                    deleting={deleting}
+                  />
+                ) : showSaved ? (
+                  tan.saved.length === 0 ? (
+                    tan.savedLoading ? (
+                      <p className="py-8 text-center font-mono text-[11px] text-mist">
+                        loading saved posts…
+                      </p>
+                    ) : (
+                      <SavedEmptyState />
+                    )
+                  ) : (
+                    <>
+                      {tan.saved.map((post) => (
+                        <PostCard
+                          key={post.hash}
+                          post={post}
+                          onToggleLike={toggleLike}
+                          onToggleSave={toggleSave}
+                          onReply={(target) => setReplyTarget(target)}
+                          onDelete={submitDelete}
+                          deleting={deleting.has(post.hash)}
+                        />
+                      ))}
+                      {tan.savedHasMore ? (
+                        <button
+                          type="button"
+                          onClick={() => void tan.loadMoreSaved()}
+                          disabled={tan.savedLoading}
+                          className="w-full rounded-xl border border-line/70 bg-void/40 px-3 py-2.5 text-xs text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          {tan.savedLoading
+                            ? "loading…"
+                            : "load more saved posts"}
+                        </button>
+                      ) : null}
+                    </>
+                  )
+                ) : tan.showMentions ? (
+                  shown.length === 0 && tan.error ? (
+                    <p className="px-4 py-10 text-center text-xs leading-relaxed text-rose-300">
+                      {tan.error}
+                    </p>
+                  ) : shown.length === 0 ? (
+                    <EmptyState mentions />
+                  ) : (
+                    shown.map((post) => (
+                      <PostCard
+                        key={post.hash}
+                        post={post}
+                        onToggleLike={toggleLike}
+                        onToggleSave={toggleSave}
+                        onReply={(target) => setReplyTarget(target)}
+                        onDelete={submitDelete}
+                        deleting={deleting.has(post.hash)}
+                        onOpenThread={(target) => void tan.openThread(target.hash)}
+                      />
+                    ))
+                  )
+                ) : visiblePosts.length === 0 ? (
                   showingSearch ? (
                     <SearchEmptyState query={tan.searchQuery ?? ""} />
                   ) : (
@@ -333,9 +493,11 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onToggleSave={toggleSave}
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
                       deleting={deleting.has(post.hash)}
+                      onOpenThread={(target) => void tan.openThread(target.hash)}
                     />
                   ))
                 )}
@@ -441,19 +603,106 @@ function SearchEmptyState({ query }: { query: string }) {
   );
 }
 
-function EmptyState() {
+function ThreadView({
+  posts,
+  loading,
+  error,
+  onToggleLike,
+  onReply,
+  onDelete,
+  onOpenThread,
+  deleting,
+}: {
+  posts: TanPost[] | null;
+  loading: boolean;
+  error: string | null;
+  onToggleLike: (post: TanPost) => void;
+  onReply: (post: TanPost) => void;
+  onDelete: (post: TanPost) => void;
+  onOpenThread: (post: TanPost) => void;
+  deleting: ReadonlySet<string>;
+}) {
+  // Entries are already in depth-first order with their depth, so the
+  // thread reads as a conversation. A failed refresh keeps the previous
+  // entries and reports the error above them instead of blanking the
+  // view; with nothing to show, the error is the view.
+  if (posts !== null && posts.length > 0) {
+    return (
+      <>
+        {error ? (
+          <p className="rounded-lg border border-rose-400/30 bg-rose-400/10 px-3 py-2 text-[11px] leading-relaxed text-rose-300">
+            {error}
+          </p>
+        ) : null}
+        {posts.map((post) => (
+          <PostCard
+            key={post.hash}
+            post={post}
+            onToggleLike={onToggleLike}
+            onReply={onReply}
+            onDelete={onDelete}
+            deleting={deleting.has(post.hash)}
+            onOpenThread={onOpenThread}
+          />
+        ))}
+      </>
+    );
+  }
+  if (loading) {
+    return (
+      <p className="py-8 text-center text-xs text-mist">Loading the thread…</p>
+    );
+  }
+  if (error) {
+    return (
+      <p className="py-8 text-center text-xs leading-relaxed text-rose-300">
+        {error}
+      </p>
+    );
+  }
+  return (
+    <p className="py-8 text-center text-xs text-mist">This thread is empty.</p>
+  );
+}
+
+function EmptyState({ mentions = false }: { mentions?: boolean }) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
         τ
       </div>
-      <h3 className="mt-4 text-sm font-medium text-zinc-200">No posts yet</h3>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        {mentions ? "No replies yet" : "No posts yet"}
+      </h3>
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
-        Start a node with{" "}
-        <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
-          tau serve --social --http
-        </code>
-        , publish a post, then sync or follow another author.
+        {mentions ? (
+          "When someone replies to one of your posts, it shows up here."
+        ) : (
+          <>
+            Start a node with{" "}
+            <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+              tau serve --social --http
+            </code>
+            , publish a post, then sync or follow another author.
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+function SavedEmptyState() {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        ☆
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No saved posts yet
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Save a post from the timeline to read it later. Saves stay on this
+        node — they are never published or shared with peers.
       </p>
     </div>
   );
@@ -462,20 +711,38 @@ function EmptyState() {
 export function PostCard({
   post,
   onToggleLike,
+  onToggleSave,
   onReply,
   onDelete,
   deleting,
+  onOpenThread,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onToggleSave?: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   deleting: boolean;
+  onOpenThread?: (post: TanPost) => void;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  // Thread entries indent by depth (capped, so a deep reply chain does
+  // not squeeze the text away); timeline entries have no depth.
+  const depth = Math.min(Math.max(post.depth ?? 0, 0), 6);
+  // A repost carries no text of its own: the card shows the original
+  // post's text instead, or nothing when it has not arrived / was deleted.
+  const bodyText =
+    post.kind === "repost"
+      ? post.repost_of && !post.repost_of.deleted
+        ? post.repost_of.text
+        : ""
+      : post.text;
   return (
-    <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
+    <article
+      className="rounded-xl border border-line/70 bg-void/40 p-3.5"
+      style={depth > 0 ? { marginLeft: `${depth * 14}px` } : undefined}
+    >
       <div className="flex items-start gap-3">
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-signal/25 bg-signal/10 font-mono text-sm text-signal">
           {initial}
@@ -491,6 +758,11 @@ export function PostCard({
             <span className="font-mono text-[10px] text-mist/60">
               {formatDateTime(post.created_at)}
             </span>
+            {post.saved_at ? (
+              <span className="font-mono text-[10px] text-mist/60">
+                saved {formatDateTime(post.saved_at)}
+              </span>
+            ) : null}
           </div>
           {post.kind === "reply" ? (
             <p className="mt-1 truncate text-[11px] text-mist/80">
@@ -517,9 +789,30 @@ export function PostCard({
               )}
             </p>
           ) : null}
-          <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-            {post.text}
-          </p>
+          {post.kind === "repost" ? (
+            <p className="mt-1 truncate text-[11px] text-mist/80">
+              reposted{" "}
+              {post.repost_of ? (
+                <>
+                  {post.repost_of.name || "anonymous"}
+                  {post.repost_of.deleted ? " · a deleted post" : ""}
+                </>
+              ) : (
+                `${shortHash(post.target ?? "", 16)} (original not cached yet)`
+              )}
+            </p>
+          ) : null}
+                      {post.deleted ? (
+              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+                <span className="italic text-mist/70">
+                  This post was deleted.
+                </span>
+              </p>
+            ) : bodyText ? (
+              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+                {bodyText}
+              </p>
+            ) : null}
           {post.kind === "quote" ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
               quoting{" "}
@@ -529,7 +822,11 @@ export function PostCard({
                 ) : (
                   <>
                     {post.quoted.name || "anonymous"} ·{" "}
-                    {post.quoted.deleted ? "a deleted post" : post.quoted.text}
+                    {post.quoted.deleted
+                      ? "a deleted post"
+                      : post.quoted.muted
+                        ? "a muted post"
+                        : post.quoted.text}
                   </>
                 )
               ) : (
@@ -543,19 +840,31 @@ export function PostCard({
             </span>
             <span>{shortHash(post.hash, 16)}</span>
             <CopyButton value={post.hash} label="hash" className="!px-1.5 !py-0.5" />
-            <button
-              type="button"
-              onClick={() => onToggleLike(post)}
-              aria-pressed={Boolean(post.liked)}
-              title={post.liked ? "Unlike this post" : "Like this post"}
-              className={`rounded border px-1.5 py-0.5 transition-colors ${
-                post.liked
-                  ? "border-rose-400/40 bg-rose-400/10 text-rose-300"
-                  : "border-line/70 bg-panel/60 text-mist/80 hover:text-rose-300"
+            {post.deleted ? null : (
+              <button
+                type="button"
+                onClick={() => onToggleLike(post)}
+                aria-pressed={Boolean(post.liked)}
+                title={post.liked ? "Unlike this post" : "Like this post"}
+                className={`rounded border px-1.5 py-0.5 transition-colors ${
+                  post.liked
+                    ? "border-rose-400/40 bg-rose-400/10 text-rose-300"
+                    : "border-line/70 bg-panel/60 text-mist/80 hover:text-rose-300"
+                }`}
+              >
+                ♥ {post.likes ?? 0}
+              </button>
+            )}
+            <span
+              title={post.reposted ? "You reposted this" : "Reposts"}
+              className={`rounded border px-1.5 py-0.5 ${
+                post.reposted
+                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                  : "border-line/70 bg-panel/60"
               }`}
             >
-              ♥ {post.likes ?? 0}
-            </button>
+              ↻ {post.reposts ?? 0}
+            </span>
             {(post.quotes ?? 0) > 0 ? (
               <span
                 title="Quotes of this post"
@@ -564,15 +873,46 @@ export function PostCard({
                 ❝ {post.quotes}
               </span>
             ) : null}
-            <button
-              type="button"
-              onClick={() => onReply(post)}
-              title="Reply to this post"
-              className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
-            >
-              reply
-            </button>
-            {post.own ? (
+            {onToggleSave ? (
+              <button
+                type="button"
+                onClick={() => onToggleSave(post)}
+                aria-pressed={Boolean(post.saved)}
+                title={
+                  post.saved
+                    ? "Remove from saved posts"
+                    : "Save this post to read later"
+                }
+                className={`rounded border px-1.5 py-0.5 transition-colors ${
+                  post.saved
+                    ? "border-amber-400/40 bg-amber-400/10 text-amber-300"
+                    : "border-line/70 bg-panel/60 text-mist/80 hover:text-amber-300"
+                }`}
+              >
+                {post.saved ? "★ saved" : "☆ save"}
+              </button>
+            ) : null}
+            {post.deleted || post.kind === "repost" ? null : (
+              <button
+                type="button"
+                onClick={() => onReply(post)}
+                title="Reply to this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                reply
+              </button>
+            )}
+            {onOpenThread ? (
+              <button
+                type="button"
+                onClick={() => onOpenThread(post)}
+                title="Open this thread"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                thread
+              </button>
+            ) : null}
+            {post.deleted || !post.own ? null : (
               deleting ? (
                 <button
                   type="button"
@@ -613,7 +953,7 @@ export function PostCard({
                   delete
                 </button>
               )
-            ) : null}
+            )}
           </div>
         </div>
       </div>
