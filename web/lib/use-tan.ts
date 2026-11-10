@@ -92,12 +92,21 @@ export function useTan() {
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
-      const [feed, follows, known] = await Promise.all([
+      // The directory loads on its own so a failed or stalled authors
+      // request cannot block the feed or following from updating; on
+      // failure the previous directory stays in place.
+      apiGet<TanAuthorsResponse>("/api/tan/authors")
+        .then((known) => {
+          if (generationRef.current === generation) {
+            setAuthors(known.authors);
+          }
+        })
+        .catch(() => {});
+      const [feed, follows] = await Promise.all([
         showMentionsRef.current
           ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
           : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
-        apiGet<TanAuthorsResponse>("/api/tan/authors"),
       ]);
       if (generationRef.current !== generation) return false;
       if (showMentionsRef.current) {
@@ -106,7 +115,6 @@ export function useTan() {
         setPosts(feed.posts);
       }
       setFollowing(follows.following);
-      setAuthors(known.authors);
       setError(null);
       // An open thread reloads with the feed, so a new reply (or a
       // like, or a delete) shows without reopening the thread. A
