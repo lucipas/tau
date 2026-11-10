@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -351,6 +352,167 @@ def test_restore_rejects_misplaced_files_member(tmp_path):
         with pytest.raises(Exception, match="unexpected member"):
             restore_backup(config, archive)
         assert not (node / "identity").exists()
+
+
+def test_backup_refuses_symlinked_state_file(tmp_path, capsys):
+    # A state file that is a symlink would be archived as a symlink
+    # member, which restore rejects — so the backup must refuse
+    # loudly instead of publishing an archive that can never restore.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    outside = tmp_path / "outside-groups.json"
+    outside.write_text('{"groups": []}\n', encoding="utf-8")
+    (node_a / "groups.json").symlink_to(outside)
+    archive = tmp_path / "backup.tar.gz"
+    code = cli.main(["backup", str(archive), "--data-dir", str(node_a)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not archive.exists()
+
+
+def test_backup_refuses_when_over_restore_size_limit(tmp_path, capsys, monkeypatch):
+    # The restore side enforces an 8 GiB expanded-size budget; a
+    # backup that would exceed it must fail up front instead of
+    # publishing an archive restore rejects on every attempt.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    monkeypatch.setattr("tau.backup.MAX_TOTAL_BYTES", 10)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "exceeds the restore size limit" in err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_backup_refuses_when_manifest_over_limit(tmp_path, capsys, monkeypatch):
+    # Same for the manifest: restore refuses a manifest over 1 MiB,
+    # so a backup whose member list would overflow it must fail here.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    monkeypatch.setattr("tau.backup.MAX_MANIFEST_BYTES", 10)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "manifest" in err
+    assert "restore limit" in err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_backup_fails_when_received_files_unreadable(
+    tmp_path, capsys, monkeypatch
+):
+    # An unreadable received-files directory must fail the backup,
+    # not silently publish an archive missing those files.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    files_dir = node_a / "files"
+    real_iterdir = Path.iterdir
+
+    def _failing_iterdir(self):
+        if self == files_dir:
+            raise OSError("permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _failing_iterdir)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    assert "could not list received files" in capsys.readouterr().err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_restore_rebases_inbox_file_paths(tmp_path, capsys):
+    # File records store the absolute path the file was saved to.  A
+    # restore into a different directory installs the file at the new
+    # location, so the record must be rebased to match.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    member = "files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report.pdf"
+    record = {
+        "kind": "file",
+        "from": "alice",
+        "destination": "a" * 32,
+        "name": "report.pdf",
+        "size": len(received[member]),
+        "sha256": "0" * 64,
+        "path": str(node_a / member),
+        "sent_at": 1000.0,
+        "received_at": 1000.0,
+        "id": "x" * 32,
+    }
+    (node_a / "inbox.json").write_text(
+        json.dumps({"messages": [record]}), encoding="utf-8"
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    restored = json.loads((node_b / "inbox.json").read_text(encoding="utf-8"))
+    assert restored["messages"][0]["path"] == str(node_b / member)
+    assert (node_b / member).read_bytes() == received[member]
+
+
+def test_restore_leaves_unparseable_inbox_untouched(tmp_path, capsys):
+    # Rebasing must never make an otherwise valid restore fail: an
+    # inbox that cannot be parsed is restored byte for byte.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    (node_a / "inbox.json").write_text("not json at all\n", encoding="utf-8")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    assert (node_b / "inbox.json").read_text(encoding="utf-8") == "not json at all\n"
+
+
+def test_restore_refuses_symlinked_received_file_dir(tmp_path, capsys):
+    # If files/ (or a sender directory under it) in the target is a
+    # symlink pointing outside the data directory, staging would write
+    # the archive contents there.  Restore refuses instead.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    outside = tmp_path / "outside-files"
+    outside.mkdir()
+    node_b = tmp_path / "b"
+    node_b.mkdir()
+    (node_b / "files").symlink_to(outside, target_is_directory=True)
+    code = cli.main(["restore", str(archive), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not (outside / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").exists()
+
+    # Same for a symlinked sender directory under a real files/.
+    (node_b / "files").unlink()
+    sender = node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    sender.mkdir(parents=True, exist_ok=True)
+    sender.rmdir()
+    sender.symlink_to(outside, target_is_directory=True)
+    capsys.readouterr()
+    code = cli.main(["restore", str(archive), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not list(outside.iterdir())
 
 
 def test_restore_rejects_archive_without_identity(tmp_path):

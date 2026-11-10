@@ -231,6 +231,17 @@ def create_backup(
         )
         files = [name for name in BACKUP_FILES if destinations[name].is_file()]
         files.extend(received)
+        # A symlinked state file would be archived as a symlink member,
+        # which restore rejects as not a regular file — so a backup of
+        # a node with linked state would succeed and then never
+        # restore.  Refuse loudly instead.  (The Tan database is the
+        # exception: it is snapshotted to a fresh regular file, so a
+        # link there is harmless.)
+        for name in files:
+            if name != SOCIAL_DB_NAME and destinations[name].is_symlink():
+                raise BackupError(
+                    f"cannot back up {destinations[name]}: it is a symlink"
+                )
         manifest = _manifest(config.data_dir, files, config.name)
         manifest_bytes = (
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
