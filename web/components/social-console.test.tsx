@@ -67,6 +67,7 @@ describe("PostCard delete control", () => {
         post={post}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={onDelete}
         deleting={false}
       />,
@@ -88,6 +89,7 @@ describe("PostCard delete control", () => {
         post={makePost()}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={onDelete}
         deleting={false}
       />,
@@ -106,6 +108,7 @@ describe("PostCard delete control", () => {
         post={makePost({ own: false })}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={vi.fn()}
         deleting={false}
       />,
@@ -121,6 +124,7 @@ describe("PostCard delete control", () => {
         post={makePost()}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={onDelete}
         deleting
       />,
@@ -140,6 +144,7 @@ describe("PostCard quote rendering", () => {
         post={post}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={vi.fn()}
         deleting={false}
       />,
@@ -254,6 +259,7 @@ describe("PostCard quote rendering", () => {
         post={makePost({ quotes: 2 })}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={vi.fn()}
         deleting={false}
       />,
@@ -265,6 +271,7 @@ describe("PostCard quote rendering", () => {
         post={makePost({ quotes: 0 })}
         onToggleLike={() => {}}
         onReply={() => {}}
+        onQuote={() => {}}
         onDelete={vi.fn()}
         deleting={false}
       />,

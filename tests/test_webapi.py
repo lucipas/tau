@@ -2767,6 +2767,92 @@ def test_tan_reply_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_quote_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"][:16], "text": "seconded, with notes"},
+        )
+        assert status == 200
+        quote = payload["post"]
+        assert quote["kind"] == "quote"
+        assert quote["target"] == post["hash"]
+        assert quote["text"] == "seconded, with notes"
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded, with notes",
+            "api quotable",
+        ]
+        assert payload["posts"][0]["quoted"] == {
+            "hash": post["hash"],
+            "author": post["author"],
+            "name": "tester",
+            "text": "api quotable",
+            "deleted": False,
+        }
+
+        # Quoting a quote is rejected: embeds stay one level deep.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": quote["hash"], "text": "nesting"},
+        )
+        assert status == 400
+        assert "only posts and replies can be quoted" in payload["error"]["message"]
+
+        # Quoting an unknown post fails.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": "cd" * 32, "text": "nowhere"},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target or comment is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"text": "no target"},
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"]},
+        )
+        assert status == 400
+        assert "text" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_peers_marks_blocked_peers(bridge, node):
     from tau.blocklist import BlockList
 
