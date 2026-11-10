@@ -76,6 +76,19 @@ export function SocialConsole() {
     }
   }
 
+  // Returns false when the edit failed, so the card keeps its form open
+  // instead of closing on an error the user has not seen yet.
+  async function submitEdit(post: TanPost, text: string): Promise<boolean> {
+    setError(null);
+    try {
+      await tan.editPost(post.hash, text);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not edit");
+      return false;
+    }
+  }
+
   async function submitSync() {
     setError(null);
     setMessage(null);
@@ -269,6 +282,7 @@ export function SocialConsole() {
                       onToggleLike={toggleLike}
                       onReply={(target) => setReplyTarget(target)}
                       onDelete={submitDelete}
+                      onEdit={submitEdit}
                       deleting={deleting.has(post.hash)}
                     />
                   ))
@@ -373,16 +387,32 @@ export function PostCard({
   onToggleLike,
   onReply,
   onDelete,
+  onEdit,
   deleting,
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  onEdit: (post: TanPost, text: string) => Promise<boolean>;
   deleting: boolean;
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submitEditForm() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const ok = await onEdit(post, editText.trim());
+      if (ok) setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
   return (
     <article className="rounded-xl border border-line/70 bg-void/40 p-3.5">
       <div className="flex items-start gap-3">
@@ -426,9 +456,45 @@ export function PostCard({
               )}
             </p>
           ) : null}
-          <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-            {post.text}
-          </p>
+          {editing ? (
+            <div className="mt-1.5">
+              <textarea
+                value={editText}
+                onChange={(event) => setEditText(event.target.value)}
+                rows={3}
+                aria-label="Edit post text"
+                className="w-full resize-y rounded-lg border border-line/70 bg-void/60 px-2.5 py-2 text-[13px] leading-relaxed text-zinc-200 outline-none focus:border-signal/50"
+              />
+              <div className="mt-2 flex gap-2 font-mono text-[10px]">
+                <button
+                  type="button"
+                  disabled={
+                    saving ||
+                    !editText.trim() ||
+                    editText.trim() === post.text
+                  }
+                  onClick={() => void submitEditForm()}
+                  title="Save this edit"
+                  className="rounded border border-signal/40 bg-signal/10 px-1.5 py-0.5 text-signal transition-colors hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {saving ? "saving…" : "save"}
+                </button>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => setEditing(false)}
+                  title="Discard this edit"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100 disabled:opacity-50"
+                >
+                  cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              {post.text}
+            </p>
+          )}
           {post.kind === "quote" ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
               quoting{" "}
@@ -477,6 +543,19 @@ export function PostCard({
             >
               reply
             </button>
+            {post.own && !editing && !deleting ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setEditText(post.text);
+                  setEditing(true);
+                }}
+                title="Edit this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-signal/40 hover:text-signal"
+              >
+                edit
+              </button>
+            ) : null}
             {post.own ? (
               deleting ? (
                 <button

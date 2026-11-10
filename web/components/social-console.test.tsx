@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { TanPost } from "@/lib/types";
@@ -33,7 +33,7 @@ describe("PostCard delete control", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -54,7 +54,7 @@ describe("PostCard delete control", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -72,7 +72,7 @@ describe("PostCard delete control", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -87,6 +87,7 @@ describe("PostCard delete control", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={onDelete}
+        onEdit={async () => true}
         deleting
       />,
     );
@@ -98,6 +99,77 @@ describe("PostCard delete control", () => {
   });
 });
 
+describe("PostCard edit control", () => {
+  function renderCard(post: TanPost, onEdit = vi.fn().mockResolvedValue(true)) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        onEdit={onEdit}
+        deleting={false}
+      />,
+    );
+    return onEdit;
+  }
+
+  it("opens a form prefilled with the post text and saves the edit", async () => {
+    const post = makePost();
+    const onEdit = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    expect((field as HTMLTextAreaElement).value).toBe("regret this");
+
+    fireEvent.change(field, { target: { value: "meant this" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledWith(post, "meant this");
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("keeps the form open when the save fails", async () => {
+    const onEdit = renderCard(makePost(), vi.fn().mockResolvedValue(false));
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    fireEvent.change(screen.getByLabelText("Edit post text"), {
+      target: { value: "new text" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("Edit post text")).toBeTruthy();
+  });
+
+  it("cancels without calling onEdit and disables save for empty text", () => {
+    const onEdit = renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    fireEvent.change(field, { target: { value: "   " } });
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText("cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("disables save while the text is unchanged", () => {
+    renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("hides the edit control on other authors' posts", () => {
+    renderCard(makePost({ own: false }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+});
+
 describe("PostCard quote rendering", () => {
   function renderCard(post: TanPost) {
     render(
@@ -106,7 +178,7 @@ describe("PostCard quote rendering", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
   }
@@ -168,7 +240,7 @@ describe("PostCard quote rendering", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.getByText("❝ 2")).toBeTruthy();
@@ -179,7 +251,7 @@ describe("PostCard quote rendering", () => {
         onToggleLike={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();

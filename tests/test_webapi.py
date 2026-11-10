@@ -788,6 +788,128 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_edit_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, feed, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "orginal typo", name="tester", now=1000)
+        create_post(conn, identity, "keeper via api", name="tester", now=1001)
+        doomed = create_post(conn, identity, "delete me first", name="tester", now=1002)
+        foreign = create_post(conn, other, "not yours", name="other", now=1003)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A short prefix resolves the same way the delete endpoint does.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": post["hash"][:16], "text": "original, fixed"},
+        )
+        assert status == 200
+        assert payload["edit"]["kind"] == "edit"
+        assert payload["edit"]["target"] == post["hash"]
+
+        # The timeline shows the replacement text and marks the edit.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["original, fixed"]["edited"] is True
+        assert by_text["original, fixed"]["own"] is True
+        assert "orginal typo" not in by_text
+
+        # A second edit replaces the first; the latest edit wins.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": post["hash"], "text": "original, fixed again"},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "not yours",
+            "delete me first",
+            "keeper via api",
+            "original, fixed again",
+        ]
+
+        # Someone else's post cannot be edited through the API.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": foreign["hash"], "text": "hijack"},
+        )
+        assert status == 400
+        assert "did not author" in payload["error"]["message"]
+
+        # Empty replacement text is a bad request.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": post["hash"], "text": "   "},
+        )
+        assert status == 400
+        assert "field 'text' is required" in payload["error"]["message"]
+
+        # A post this node has never seen cannot be edited.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": "cd" * 32, "text": "ghost"},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A deleted post cannot be edited either.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": doomed["hash"]},
+        )
+        assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/edit",
+            method="POST",
+            body={"target": doomed["hash"], "text": "too late"},
+        )
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+    conn = init_db(node.config.social_db_path)
+    try:
+        entries = feed(conn, author=post["author"])
+    finally:
+        conn.close()
+    assert [entry["kind"] for entry in entries] == [
+        "post",
+        "post",
+        "post",
+        "edit",
+        "edit",
+        "delete",
+    ]
+
+
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),

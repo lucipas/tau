@@ -168,6 +168,14 @@ export function useTan() {
     [load],
   );
 
+  const editPost = useCallback(
+    async (target: string, text: string) => {
+      await apiPost("/api/tan/edit", { target, text });
+      await load();
+    },
+    [load],
+  );
+
   const sync = useCallback(async () => {
     setSyncing(true);
     try {
@@ -197,6 +205,7 @@ export function useTan() {
     like,
     unlike,
     deletePost,
+    editPost,
     sync,
   };
 }
