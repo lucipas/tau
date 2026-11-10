@@ -325,6 +325,26 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const setPeerAlias = useCallback(
+    async (destination: string, alias: string | null) => {
+      const result = await apiPost<{ ok: boolean; peer: Peer }>(
+        "/api/peers/alias",
+        { destination, alias },
+      );
+      // The server also publishes a peer event, so other tabs learn at
+      // once; apply the returned record now so this edit reflects
+      // without waiting for it.
+      setPeers((previous) =>
+        sortPeers([
+          ...previous.filter((entry) => entry.destination !== destination),
+          result.peer,
+        ]),
+      );
+      return result.peer;
+    },
+    [],
+  );
+
   return {
     node,
     peers,
@@ -341,6 +361,7 @@ export function useTau() {
     ping,
     announce,
     markRead,
+    setPeerAlias,
     refreshOutbox,
     refreshGroups,
     cancelOutbox,

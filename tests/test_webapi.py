@@ -175,6 +175,104 @@ def test_peers_endpoint_includes_verification_state(bridge, node):
     assert "verified" not in peer.public_dict()
 
 
+def _seed_alias_registry(node, tmp_path):
+    """Swap the fake registry for a real one the alias endpoint can use."""
+    from tau.peers import PeerRegistry
+
+    registry = PeerRegistry(tmp_path / "peers.json")
+    registry.upsert(
+        bytes.fromhex(PEER_HASH), b"\x01" * 64, name="alice", hops=1
+    )
+    registry.upsert(
+        bytes.fromhex(OTHER_HASH), b"\x02" * 64, name="bob", hops=1
+    )
+    node.registry = registry
+    return registry
+
+
+def test_peers_alias_endpoint_sets_lists_and_clears(bridge, node, tmp_path):
+    _seed_alias_registry(node, tmp_path)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": "laptop"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["peer"]["alias"] == "laptop"
+    assert payload["peer"]["name"] == "alice"
+
+    # The alias is visible in the peer list, so the console can show it.
+    _, _, listed = _json(bridge, "/api/peers")
+    entry = next(
+        item
+        for item in listed["peers"]
+        if item["destination"] == PEER_HASH
+    )
+    assert entry["alias"] == "laptop"
+
+    # An empty alias clears it, restoring the announced name as the label.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": ""},
+    )
+    assert status == 200
+    assert payload["peer"]["alias"] is None
+
+
+def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):
+    registry = _seed_alias_registry(node, tmp_path)
+    registry.set_alias(bytes.fromhex(OTHER_HASH), "laptop")
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": "ff" * 16, "alias": "ghost"},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/peers/alias", method="POST", body={"alias": "laptop"}
+    )
+    assert status == 400
+    assert "destination" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": 7},
+    )
+    assert status == 400
+    assert "alias" in payload["error"]["message"]
+
+    # An alias another peer already uses is a clash, not a silent steal.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": "laptop"},
+    )
+    assert status == 400
+    assert "already used" in payload["error"]["message"]
+
+    # A hex-like alias could never reliably select its owner.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/alias",
+        method="POST",
+        body={"destination": PEER_HASH, "alias": "abcdef"},
+    )
+    assert status == 400
+    assert "looks like a destination hash" in payload["error"]["message"]
+
+
 def test_record_peer_event_carries_trust_fields(bridge, node):
     peer = node.registry.all()[0]
     peer.verified_at = 1500.0

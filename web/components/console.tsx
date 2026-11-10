@@ -110,6 +110,9 @@ export function Console() {
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onSetAlias={(destination, alias) =>
+              tau.setPeerAlias(destination, alias)
+            }
             onSelectPeer={selectPeer}
           />
 

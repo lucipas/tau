@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Peer } from "@/lib/types";
@@ -17,11 +17,26 @@ function makePeer(overrides: Partial<Peer> = {}): Peer {
   };
 }
 
-function renderSidebar(unread: Record<string, number>, onSelectPeer = vi.fn()) {
+function renderSidebar(
+  unread: Record<string, number>,
+  onSelectPeer = vi.fn(),
+  options: {
+    peers?: Peer[];
+    onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  } = {},
+) {
+  const onSetAlias =
+    options.onSetAlias ??
+    (async (destination: string) => makePeer({ destination }));
   return render(
     <PeerSidebar
       node={null}
-      peers={[makePeer(), makePeer({ destination: "cd".repeat(16), name: "bob" })]}
+      peers={
+        options.peers ?? [
+          makePeer(),
+          makePeer({ destination: "cd".repeat(16), name: "bob" }),
+        ]
+      }
       groups={[]}
       bridge={null}
       pings={{}}
@@ -29,6 +44,7 @@ function renderSidebar(unread: Record<string, number>, onSelectPeer = vi.fn()) {
       selected=""
       onPing={() => {}}
       onSelectPeer={onSelectPeer}
+      onSetAlias={onSetAlias}
     />,
   );
 }
@@ -61,5 +77,77 @@ describe("PeerSidebar unread badges", () => {
     renderSidebar({ ["ab".repeat(16)]: 150 });
 
     expect(screen.getByTitle("150 unread messages").textContent).toBe("99+");
+  });
+});
+
+describe("PeerSidebar aliases", () => {
+  it("shows the alias as the label and keeps the announced name visible", () => {
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ alias: "laptop" })],
+    });
+
+    expect(screen.getByText("laptop")).toBeTruthy();
+    expect(screen.getByText("announced as alice")).toBeTruthy();
+    expect(screen.getByTitle("Announced as alice")).toBeTruthy();
+  });
+
+  it("shows no alias badge for a peer without one", () => {
+    renderSidebar({});
+
+    expect(screen.queryByTitle(/Announced as/)).toBeNull();
+  });
+
+  it("saves a new alias through onSetAlias", async () => {
+    const onSetAlias = vi.fn(async (destination: string) =>
+      makePeer({ destination, alias: "laptop" }),
+    );
+    renderSidebar({}, vi.fn(), { onSetAlias });
+
+    fireEvent.click(screen.getByLabelText("Set alias for alice"));
+    fireEvent.change(screen.getByLabelText("Local alias for alice"), {
+      target: { value: "laptop" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    await waitFor(() =>
+      expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), "laptop"),
+    );
+  });
+
+  it("clears an alias through onSetAlias", async () => {
+    const onSetAlias = vi.fn(async (destination: string) =>
+      makePeer({ destination, alias: null }),
+    );
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ alias: "laptop" })],
+      onSetAlias,
+    });
+
+    fireEvent.click(screen.getByLabelText("Set alias for laptop"));
+    fireEvent.click(screen.getByText("clear alias"));
+
+    await waitFor(() =>
+      expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), null),
+    );
+  });
+
+  it("shows the server's message when saving fails", async () => {
+    const onSetAlias = vi.fn(async () => {
+      throw new Error("alias 'laptop' is already used by another peer");
+    });
+    renderSidebar({}, vi.fn(), { onSetAlias });
+
+    fireEvent.click(screen.getByLabelText("Set alias for alice"));
+    fireEvent.change(screen.getByLabelText("Local alias for alice"), {
+      target: { value: "laptop" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(
+      await screen.findByText(
+        "alias 'laptop' is already used by another peer",
+      ),
+    ).toBeTruthy();
+    expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), "laptop");
   });
 });

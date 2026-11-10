@@ -1364,6 +1364,23 @@ class WebBridge:
             )
         return items
 
+    def set_peer_alias(
+        self, destination: str, alias: Optional[str]
+    ) -> Dict[str, Any]:
+        """Set a peer's local alias, or clear it when *alias* is blank.
+
+        The alias rules stay in the registry — uniqueness, hex-like
+        rejection, never sent to peers — this only routes the console's
+        request through them.  A peer event goes out so every open
+        console updates its peer list at once.
+        """
+        if alias is not None and alias.strip():
+            peer = self.node.registry.set_alias(destination, alias)
+        else:
+            peer = self.node.registry.clear_alias(destination)
+        self.record_peer(peer)
+        return peer.local_dict()
+
     def groups(self) -> List[Dict[str, Any]]:
         try:
             groups = []
@@ -1841,6 +1858,34 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/peers/alias":
+                destination = body.get("destination") or body.get("target")
+                if not isinstance(destination, str) or not destination.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'destination' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                alias = body.get("alias")
+                if alias is not None and not isinstance(alias, str):
+                    self._send_json(
+                        {"error": {"message": "field 'alias' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    peer = self.bridge.set_peer_alias(
+                        destination.strip(), alias
+                    )
+                except PeerError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "peer": peer}, head_only)
                 return
             if path == "/api/tan/posts":
                 text = body.get("text")
