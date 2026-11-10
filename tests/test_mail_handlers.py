@@ -1317,6 +1317,98 @@ def test_retract_refuses_group_messages(tmp_path):
     assert len(node.inbox.list_messages()) == 1
 
 
+def test_retract_rejects_an_outgoing_record(tmp_path):
+    # Regression test for the CodeRabbit Major: a recipient knows the
+    # wire id of a message they received, and the sender's own sent
+    # copy carries the recipient's hash in ``destination`` — so without
+    # the direction check the recipient could delete the sender's
+    # sent-message history.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": recipient_hash,
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(recipient, "msg-1", "retract-1"),
+        remote_identity=recipient,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages(direction="out")) == 1
+
+
+def test_retract_refuses_file_records(tmp_path):
+    # A received file lives on disk; deleting only the inbox record
+    # would orphan it, so file records are not retractable.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "name": "photo.jpg",
+            "size": 123,
+            "sha256": "ab" * 32,
+            "path": "/tmp/tau-files/photo.jpg",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "file",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_supported"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_finds_a_message_imported_by_another_process(tmp_path):
+    # A one-shot CLI import can persist a message after this node's
+    # in-memory inbox was read; the handler reloads first, so the
+    # retract still finds and deletes it.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    other = Inbox(config.inbox_path)
+    other.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "imported hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+        }
+    )
+    assert node.inbox.list_messages() == []
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
 def test_send_retraction_validates_before_resolving(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(NodeError):

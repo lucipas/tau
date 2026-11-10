@@ -3805,6 +3805,26 @@ def test_retract_rejects_unknown_messages(tmp_path, capsys, monkeypatch):
     assert _FakeRetractNode.instances == []
 
 
+def test_retract_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
+    # A retract answered "not found" while the queued copy is still in
+    # the outbox would let that copy arrive later; refuse and point at
+    # outbox cancel instead.
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).enqueue(
+        to=recipient_hash, text="sent hello", message_id="m-9"
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "still queued" in err
+    assert "outbox cancel" in err
+    assert _FakeRetractNode.instances == []
+
+
 def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     data_dir, _ = _seed_sent_message(tmp_path)
 
