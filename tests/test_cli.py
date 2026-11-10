@@ -1178,6 +1178,157 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+# -- peers show ---------------------------------------------------------------
+
+def _seed_peer_show(tmp_path):
+    """One peer with inbox messages, a queued message and a held envelope."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        peer_hash,
+        identity.get_public_key(),
+        name="alice",
+        hops=2,
+        caps=("mail", "tan"),
+        now=1000.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    for index, text in enumerate(("first hello", "second hello")):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": peer_hash.hex(),
+                "text": text,
+                "sent_at": 10.0 + index,
+                "received_at": 20.0 + index,
+                "id": f"m-{index + 1}",
+            }
+        )
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=peer_hash, text="queued hello", to_name="alice", now=1000.0)
+    box.hold(
+        to=peer_hash,
+        blob=b"sealed-bytes",
+        message_id="held-1",
+        expires_at=time.time() + 3600,
+    )
+    return data_dir, identity, peer_hash
+
+
+def test_parser_peers_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "show", "alice"])
+    assert args.command == "peers"
+    assert args.peers_command == "show"
+    assert args.target == "alice"
+    assert args.func is cli.cmd_peers_show
+
+    plain = parser.parse_args(["peers"])
+    assert plain.peers_command is None
+    assert plain.func is cli.cmd_peers
+
+
+def test_peers_show_by_name(tmp_path, capsys):
+    data_dir, identity, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert peer_hash.hex() in out
+    assert lxmf_delivery_hash(identity).hex() in out
+    assert "first seen:" in out
+    assert "last seen:" in out
+    assert "hops:         2" in out
+    assert "protocol:     1" in out
+    assert "caps:         mail, tan" in out
+    assert "via exchange: no" in out
+    assert "queued mail:  1 message(s) waiting for this peer" in out
+    assert "held mail:    1 sealed message(s) held for this peer" in out
+    assert "received:     2 message(s) from this peer in the inbox" in out
+
+
+def test_peers_show_by_hash_prefix_and_full_hash(tmp_path, capsys):
+    data_dir, _, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(
+        ["peers", "show", peer_hash.hex()[:8], "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "show", peer_hash.hex(), "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+
+def test_peers_show_json(tmp_path, capsys):
+    data_dir, identity, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "alice"
+    assert payload["destination"] == peer_hash.hex()
+    assert payload["lxmf"] == lxmf_delivery_hash(identity).hex()
+    assert payload["public_key"] == identity.get_public_key().hex()
+    assert payload["first_seen"] == 1000.0
+    assert payload["last_seen"] == 1000.0
+    assert payload["hops"] == 2
+    assert payload["protocol"] == 1
+    assert payload["caps"] == ["mail", "tan"]
+    assert payload["via_exchange"] is False
+    assert payload["queued"] == 1
+    assert payload["held"] == 1
+    assert payload["received"] == 2
+
+
+def test_peers_show_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_peers_show_ambiguous_name(tmp_path, capsys):
+    data_dir, _, first_hash = _seed_peer_show(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    other = RNS.Identity()
+    registry.upsert(
+        destination_hash(other), other.get_public_key(), name="alice", now=1000.0
+    )
+    registry.save()
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "use a destination hash" in capsys.readouterr().err
+    # A full hash still resolves unambiguously.
+    code = cli.main(
+        ["peers", "show", first_hash.hex(), "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert first_hash.hex() in capsys.readouterr().out
+
+
+def test_peers_show_via_exchange(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    source = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    peer = source.upsert(peer_hash, identity.get_public_key(), name="carol")
+    registry = PeerRegistry(config.peers_path)
+    merged = registry.merge_exchanged([peer.exchange_dict()])
+    assert merged["added"] == 1
+    registry.save()
+    code = cli.main(["peers", "show", "carol", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "via exchange: yes — never heard directly" in out
+    assert "queued mail:  0 message(s)" in out
+    assert "received:     0 message(s)" in out
+
 def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
     """Init a node and register one peer built from a real identity."""
     data_dir = tmp_path / "node"
