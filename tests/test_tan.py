@@ -3279,6 +3279,91 @@ def test_repost_of_a_reply(identities, tmp_path):
     assert items[0]["repost_of"]["text"] == "first reply"
 
 
+def test_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    # A repost carries no text of its own, so blocking the original's
+    # author hides the repost itself — its words must not leak
+    # through the reposter's timeline.
+    blocked = [author_of(bob)]
+    items = timeline(conn, [author_of(alice)], exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+    items = timeline(conn, include_all=True, exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+
+
+def test_timeline_drops_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    mute(conn, author_of(bob), name="bob")
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "muted words" not in json.dumps(items)
+
+
+def test_timeline_drops_repost_matching_muted_keyword(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto secrets", name="alice", now=1000)
+    create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    other = create_post(conn, bob, "clean post", name="bob", now=1002)
+    mute_keyword(conn, "crypto")
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "crypto secrets" not in json.dumps(items)
+
+
+def test_repost_of_edited_original_shows_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original draft", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_edit(conn, alice, post["hash"], "original, fixed", name="alice", now=1002)
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "original, fixed"
+    assert "original draft" not in json.dumps(items)
+
+
+def test_author_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    items = author_timeline(
+        conn, author_of(alice), exclude_authors=[author_of(bob)]
+    )
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+
+
+def test_author_timeline_keeps_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    repost = create_repost(conn, alice, post["hash"], name="alice", now=1001)
+
+    # An explicit author lookup still shows the repost, the same way
+    # it still shows a reply to a muted parent.
+    mute(conn, author_of(bob), name="bob")
+    items = author_timeline(conn, author_of(alice))
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "muted words"
+
+
 def test_repost_can_be_deleted_and_reposted_again(identities, tmp_path):
     alice, bob = identities
     conn = init_db(tmp_path / "tan.sqlite3")

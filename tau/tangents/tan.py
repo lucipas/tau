@@ -1607,6 +1607,10 @@ def annotate_quotes(
 def annotate_reposts(
     conn: sqlite3.Connection,
     posts: List[Dict[str, Any]],
+    *,
+    muted_keywords: Optional[Sequence[str]] = None,
+    exclude_authors: Optional[Set[str]] = None,
+    blocked_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``repost_of`` original-post summary to repost entries, in place.
 
@@ -1622,6 +1626,17 @@ def annotate_reposts(
     repost.  Only linked posts and replies count as originals: a
     repost that points at a reaction, a delete or an unlinked entry is
     shown without the original's text, the same as an uncached one.
+
+    A repost carries no text of its own — the original's words are the
+    whole visible content — so the block, mute and muted-keyword rules
+    that hide a post hide its reposts too: a repost whose original is
+    by an author in *blocked_authors* or *exclude_authors* (muted), or
+    whose original text matches a muted keyword, is dropped from the
+    returned list instead of being kept with a redacted preview the
+    way a reply is.  Without the filter arguments nothing is dropped,
+    so an explicit lookup still shows the repost.  The summary shows
+    the original's current text: its author's latest edit is applied
+    first, the same way :func:`annotate_replies` edits its parents.
     """
     targets = [
         str(post["target"])
@@ -1648,12 +1663,28 @@ def annotate_reposts(
             list(originals),
         ).fetchall()
         deleted = {(str(row["target"]), str(row["author"])) for row in rows}
+    if originals:
+        # A repost's summary shows its original's current text, so
+        # apply its author's latest edit before the summary is built.
+        annotate_edits(conn, list(originals.values()))
+    muted_pattern = _muted_keyword_pattern(list(muted_keywords or []))
+    kept: List[Dict[str, Any]] = []
     for post in posts:
         if post.get("kind") != KIND_REPOST:
+            kept.append(post)
             continue
         original = originals.get(str(post.get("target") or ""))
         if original is None:
             post["repost_of"] = None
+            kept.append(post)
+            continue
+        if blocked_authors and original["author"] in blocked_authors:
+            continue
+        if exclude_authors and original["author"] in exclude_authors:
+            continue
+        if _text_matches_muted_keywords(
+            str(original.get("text") or ""), muted_pattern
+        ):
             continue
         is_deleted = (original["hash"], original["author"]) in deleted
         post["repost_of"] = {
@@ -1663,7 +1694,8 @@ def annotate_reposts(
             "text": "" if is_deleted else original["text"],
             "deleted": is_deleted,
         }
-    return posts
+        kept.append(post)
+    return kept
 
 
 def edit_states(
@@ -2134,7 +2166,10 @@ def timeline(
     and a reply to one keeps its ``reply_to`` preview text blanked —
     muting is display-only, so entries stay stored and unmuting
     restores them.  Posts by muted authors never appear either, for the
-    same reason.  Pages are read until ``limit`` unmuted posts are
+    same reason.  A repost of a post by a muted or blocked author, or
+    of a post matching a muted keyword, never appears either — a
+    repost carries no text of its own, so hiding the original hides
+    the repost.  Pages are read until ``limit`` unmuted posts are
     collected or the feed is exhausted, so muted posts never shrink the
     result below what is available.  ``exclude_authors`` hides posts
     from blocked authors — and blanks their words from reply
@@ -2184,6 +2219,9 @@ def timeline(
                 ),
                 viewer=viewer,
             ),
+            muted_keywords=keywords,
+            exclude_authors=silenced,
+            blocked_authors=blocked,
         )
     clean_authors = [
         _require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors or []
@@ -2238,6 +2276,9 @@ def timeline(
             ),
             viewer=viewer,
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
     )
 
 
@@ -2311,6 +2352,8 @@ def author_timeline(
             ),
             viewer=viewer,
         ),
+        muted_keywords=keywords,
+        blocked_authors=blocked,
     )
 
 
