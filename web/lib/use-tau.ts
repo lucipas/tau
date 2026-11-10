@@ -5,6 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
+  BundleDocument,
+  BundleExportResponse,
+  BundleImportResponse,
   CancelOutboxResponse,
   GroupsResponse,
   MarkReadResponse,
@@ -325,6 +328,16 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const exportBundle = useCallback(async (includeTan: boolean) => {
+    return apiPost<BundleExportResponse>("/api/bundle/export", {
+      include_tan: includeTan,
+    });
+  }, []);
+
+  const importBundle = useCallback(async (document: BundleDocument) => {
+    return apiPost<BundleImportResponse>("/api/bundle/import", document);
+  }, []);
+
   return {
     node,
     peers,
@@ -344,5 +357,7 @@ export function useTau() {
     refreshOutbox,
     refreshGroups,
     cancelOutbox,
+    exportBundle,
+    importBundle,
   };
 }

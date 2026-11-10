@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
+import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
@@ -135,6 +136,12 @@ export function Console() {
                 />
               </div>
             ) : null}
+            <div className="mt-4">
+              <BundleSection
+                onExport={tau.exportBundle}
+                onImport={tau.importBundle}
+              />
+            </div>
             <Composer
               peers={tau.peers}
               target={target}

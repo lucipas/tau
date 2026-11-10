@@ -139,6 +139,8 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
+| `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
@@ -603,6 +605,10 @@ default, `--max-bytes N` on either command) are refused. The import
 reports what was accepted, already present and skipped. No identity or
 private material is ever included, and there is no auto-import — a
 bundle only moves when someone carries the file and runs the command.
+The web console offers the same flow in its Sneakernet section
+(`POST /api/bundle/export`, `POST /api/bundle/import`): export downloads
+the signed bundle as a file, import takes a bundle file and reports the
+merge.
 
 ### Tan posts
 

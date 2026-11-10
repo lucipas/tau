@@ -8,8 +8,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import RNS
 
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
@@ -44,6 +47,13 @@ class FakeNode:
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
+        self.identity = RNS.Identity()
+        data_dir = Path(mailbox_path).parent if mailbox_path else Path(".")
+        self.config = SimpleNamespace(
+            identity_path=data_dir / "identity",
+            social_db_path=data_dir / "social.db",
+            tan_rules_path=data_dir / "tan-rules.json",
+        )
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -2062,3 +2072,151 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["expires_at"] == expires_at
+
+
+# -- sneakernet bundles ----------------------------------------------------
+
+
+def _bundle_with_held_mail(tmp_path):
+    """A signed bundle holding one sealed envelope for the fake peer."""
+    from tau.bundle import build_bundle
+    from tau.identity import destination_hash
+    from tau.mailbox import seal_message
+    from tau.peers import PeerRegistry
+
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    mailbox = Mailbox(tmp_path / "sender-mailbox.json")
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="held-1",
+        text="held hello",
+        sent_at=1000.0,
+    )
+    mailbox.hold(
+        to=destination_hash(recipient),
+        blob=blob,
+        message_id="held-1",
+        expires_at=time.time() + 7 * 24 * 3600,
+        now=time.time(),
+    )
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=PeerRegistry(),
+        tan_conn=None,
+        include_tan=False,
+    )
+    assert summary["mail"] == 1
+    return document
+
+
+def test_bundle_export_empty(bridge):
+    status, _, payload = _json(
+        bridge, "/api/bundle/export", method="POST", body={}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["bundle"]["format"] == "tau-bundle"
+    assert payload["bundle"]["sig"]
+    assert payload["summary"] == {
+        "mail": 0,
+        "tan": 0,
+        "skipped": [],
+        "bytes": payload["summary"]["bytes"],
+    }
+
+
+def test_bundle_export_rejects_non_boolean_include_tan(bridge):
+    status, _, payload = _json(
+        bridge, "/api/bundle/export", method="POST", body={"include_tan": "yes"}
+    )
+    assert status == 400
+    assert "include_tan" in payload["error"]["message"]
+
+
+def test_bundle_export_includes_held_mail(bridge, node, tmp_path):
+    from tau.identity import destination_hash
+
+    node.mailbox.hold(
+        to=bytes.fromhex(OTHER_HASH),
+        blob=b"sealed-bytes",
+        message_id="held-9",
+        expires_at=time.time() + 3600,
+        now=time.time(),
+    )
+    status, _, payload = _json(
+        bridge, "/api/bundle/export", method="POST", body={}
+    )
+    assert status == 200
+    assert payload["summary"]["mail"] == 1
+    assert payload["bundle"]["mail"][0]["id"] == "held-9"
+    assert payload["bundle"]["mail"][0]["to"] == OTHER_HASH
+
+
+def test_bundle_export_with_tan_reports_empty_store(bridge):
+    status, _, payload = _json(
+        bridge, "/api/bundle/export", method="POST", body={"include_tan": True}
+    )
+    assert status == 200
+    assert payload["summary"]["tan"] == 0
+    assert payload["bundle"]["tan"] is not None
+    assert payload["bundle"]["tan"]["entries"] == []
+
+
+def test_bundle_import_roundtrip_and_dedupe(bridge, node, tmp_path):
+    document = _bundle_with_held_mail(tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/bundle/import", method="POST", body=document
+    )
+    assert status == 200
+    report = payload["import"]
+    assert report["imported"] == 1
+    assert report["present"] == 0
+    assert report["skipped"] == 0
+    assert node.mailbox.counts()["held"] == 1
+
+    # A second import of the same bundle dedupes instead of duplicating.
+    status, _, payload = _json(
+        bridge, "/api/bundle/import", method="POST", body=document
+    )
+    assert status == 200
+    report = payload["import"]
+    assert report["imported"] == 0
+    assert report["present"] == 1
+    assert node.mailbox.counts()["held"] == 1
+
+
+def test_bundle_import_rejects_tampered_bundle(bridge, tmp_path):
+    document = _bundle_with_held_mail(tmp_path)
+    document["mail"][0]["blob"] = "AAAA" + document["mail"][0]["blob"][4:]
+    status, _, payload = _json(
+        bridge, "/api/bundle/import", method="POST", body=document
+    )
+    assert status == 400
+    assert "signature" in payload["error"]["message"]
+
+
+def test_bundle_import_rejects_garbage(bridge):
+    status, _, payload = _json(
+        bridge, "/api/bundle/import", method="POST", body={"format": "nope"}
+    )
+    assert status == 400
+    assert "invalid bundle" in payload["error"]["message"]
+
+
+def test_bundle_import_accepts_body_over_default_cap(bridge, tmp_path):
+    # A bundle import carries the whole signed document, so the route
+    # reads up to the 8 MiB bundle cap instead of the 32 KiB limit
+    # every other route uses. Pad past 32 KiB with an unknown key,
+    # which parse_bundle ignores and the signature still covers.
+    document = _bundle_with_held_mail(tmp_path)
+    document["padding"] = "x" * (40 * 1024)
+    status, _, payload = _json(
+        bridge, "/api/bundle/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
