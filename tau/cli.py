@@ -72,12 +72,14 @@ from .node import (
 from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
+    DEFAULT_MESSAGE_KIND,
     MAX_MAIL_TTL,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
+    normalize_message_kind,
     sanitize_name,
     short_hash,
 )
@@ -360,6 +362,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-queue",
         action="store_true",
         help="fail instead of queueing the message when the peer is offline",
+    )
+    send.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="tag the message with a kind (default chat); receivers can"
+        " filter their inbox by kind",
     )
     send.add_argument(
         "--wait",
@@ -859,6 +868,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ID|NAME",
         help="only show messages from this group (id, id prefix or name)",
+    )
+    messages.add_argument(
+        "--kind",
+        default=None,
+        metavar="SLUG",
+        help="only show messages of this kind (default: all kinds)",
     )
     messages.add_argument(
         "--sent",
@@ -4344,6 +4359,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 2
     text = _read_message(args)
     config = _make_config(args)
+    try:
+        kind = normalize_message_kind(getattr(args, "kind", None))
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
     expires_at = None
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
@@ -4394,6 +4413,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                     queue=not getattr(args, "no_queue", False),
                     in_reply_to=reply_to,
                     expires_at=expires_at,
+                    kind=kind,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -4639,7 +4659,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             print("Outbox is empty — nothing waiting on offline peers.")
         else:
             now = time.time()
-            header = ("ID", "TO", "NAME", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
+            header = ("ID", "TO", "NAME", "KIND", "AGE", "TRIES", "NEXT TRY", "EXPIRES IN")
             rows: List[tuple] = [header]
             for entry in entries:
                 peer = registry.get(entry.to)
@@ -4654,6 +4674,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                         entry.id[:8],
                         entry.to_hex,
                         name or "-",
+                        getattr(entry, "kind", None) or DEFAULT_MESSAGE_KIND,
                         _ago(now - entry.created_at),
                         str(entry.attempts),
                         next_try_text,
@@ -4934,6 +4955,12 @@ def cmd_messages(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
+    kind = getattr(args, "kind", None)
+    if kind is not None:
+        try:
+            kind = normalize_message_kind(kind)
+        except ProtocolError as exc:
+            raise NodeError(str(exc)) from exc
     query = getattr(args, "search", None)
     if query is not None and not query.strip():
         raise NodeError("--search must not be empty")
@@ -4944,7 +4971,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # hidden messages do not use up the requested count.  A block-list
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
-    entries = inbox.list_messages(limit=None, peer=peer_hash, group=group_id, query=query)
+    entries = inbox.list_messages(
+        limit=None, peer=peer_hash, group=group_id, query=query, kind=kind
+    )
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
         entries = []
@@ -4997,7 +5026,15 @@ def cmd_messages(args: argparse.Namespace) -> int:
             group_suffix = ""
             if entry.get("kind") == "group":
                 group_suffix = f" in {entry.get('group_name') or 'group'}"
-            print(f"{marker}[{when}] {name} ({sender}){id_suffix}{group_suffix}")
+            entry_kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
+            kind_tag = (
+                f" [{entry_kind}]"
+                if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
+                else ""
+            )
+            print(
+                f"{marker}[{when}] {name} ({sender}){id_suffix}{kind_tag}{group_suffix}"
+            )
             if entry.get("kind") == "file":
                 print(
                     f"  file: {entry.get('name')} "
