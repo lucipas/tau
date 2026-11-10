@@ -535,6 +535,19 @@ def init_db(path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
     return conn
 
 
+def open_db_readonly(path: Union[str, Path]) -> sqlite3.Connection:
+    """Open an existing Tan database read-only, without migrating it.
+
+    Unlike :func:`init_db` this never creates, chmods, migrates or writes
+    the file, so it is safe to use while a node is serving it.
+    """
+    uri = Path(path).expanduser().resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
 def _row_to_post(row: sqlite3.Row) -> Dict[str, Any]:
     return _canonical_post(dict(row))
 
