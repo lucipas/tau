@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import re
@@ -29,6 +30,29 @@ DEFAULT_MAX_AGE = 7 * 24 * 60 * 60
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
+def safety_number(*public_keys: bytes) -> str:
+    """A human-comparable safety number for one or more public keys.
+
+    The construction follows the Signal pattern: the keys are sorted so
+    the number is the same from either side of a pair, hashed together,
+    and rendered as 12 groups of 5 decimal digits (60 digits).  With a
+    single key it is that identity's fingerprint; with two keys it is
+    the pairwise safety number the two owners compare over another
+    channel to confirm neither side is talking to an impostor.
+    """
+    if not public_keys:
+        raise ValueError("at least one public key is required")
+    for key in public_keys:
+        if len(key) != PUBLIC_KEY_BYTES:
+            raise ValueError("public key must be 64 bytes")
+    digest = hashlib.sha512(b"".join(sorted(public_keys))).digest()
+    groups = [
+        f"{int.from_bytes(digest[5 * i : 5 * i + 5], 'big') % 100000:05d}"
+        for i in range(12)
+    ]
+    return " ".join(groups)
+
+
 class PeerError(RuntimeError):
     """Base class for peer lookup problems."""
 
@@ -53,10 +77,30 @@ class Peer:
     # never heard directly.  Its reported liveness is second-hand, so mail
     # sweeps rank directly heard peers ahead of it.
     via_exchange: bool = False
+    # When the owner compared safety numbers with this peer out of band
+    # and confirmed the key is theirs (``tau peers verify``).  The
+    # fingerprint is the pairwise safety number recorded at that moment.
+    verified_at: Optional[float] = None
+    verified_fingerprint: Optional[str] = None
+    # Last time this destination presented a different public key than the
+    # one recorded.  A destination hash is derived from its key, so a
+    # change here means tampering or corruption, never a re-key — the
+    # registry keeps the recorded key and the node warns instead.
+    key_change_at: Optional[float] = None
+    # Outbound delivery history: how many messages this node has
+    # successfully delivered directly to this peer, and when the last
+    # one landed.  A peer with a delivered history is a proven peer —
+    # the higher held-mail quota tier requires it.
+    delivered_count: int = 0
+    last_delivered_at: Optional[float] = None
 
     @property
     def hexhash(self) -> str:
         return self.destination_hash.hex()
+
+    @property
+    def is_verified(self) -> bool:
+        return self.verified_at is not None
 
     @property
     def lxmf_hash(self) -> Optional[str]:
@@ -80,7 +124,7 @@ class Peer:
         return max(0.0, (now if now is not None else time.time()) - self.last_seen)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "destination": self.hexhash,
             "name": self.name,
             "public_key": self.public_key.hex(),
@@ -91,7 +135,27 @@ class Peer:
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
             "lxmf": self.lxmf_hash,
+            "delivered_count": self.delivered_count,
+            "last_delivered_at": self.last_delivered_at,
         }
+        if self.verified_at is not None:
+            payload["verified_at"] = self.verified_at
+        if self.verified_fingerprint is not None:
+            payload["verified_fingerprint"] = self.verified_fingerprint
+        if self.key_change_at is not None:
+            payload["key_change_at"] = self.key_change_at
+        return payload
+
+    @staticmethod
+    def _optional_timestamp(raw: Dict[str, Any], key: str) -> Optional[float]:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)
+        except (OverflowError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Peer":
@@ -124,6 +188,15 @@ class Peer:
         caps = raw.get("caps")
         if not isinstance(caps, list):
             caps = []
+        verified_fingerprint = raw.get("verified_fingerprint")
+        if not isinstance(verified_fingerprint, str):
+            verified_fingerprint = None
+        delivered_count = raw.get("delivered_count")
+        if not isinstance(delivered_count, int) or delivered_count < 0:
+            delivered_count = 0
+        last_delivered_at = raw.get("last_delivered_at")
+        if not isinstance(last_delivered_at, (int, float)):
+            last_delivered_at = None
         return cls(
             destination_hash=destination_bytes,
             name=sanitize_name(raw.get("name"), fallback="unknown"),
@@ -134,6 +207,15 @@ class Peer:
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
+            verified_at=cls._optional_timestamp(raw, "verified_at"),
+            verified_fingerprint=verified_fingerprint,
+            key_change_at=cls._optional_timestamp(raw, "key_change_at"),
+            delivered_count=delivered_count,
+            last_delivered_at=(
+                float(last_delivered_at)
+                if last_delivered_at is not None
+                else None
+            ),
         )
 
     def public_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
@@ -147,6 +229,20 @@ class Peer:
             "protocol": self.protocol,
             "lxmf": self.lxmf_hash,
         }
+
+    def local_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """``public_dict`` plus this node's own trust state about the peer.
+
+        Verification is a local judgement, never shared with other peers:
+        it stays out of ``public_dict`` (and therefore out of exchange
+        payloads) and is only shown to this node's owner — the CLI, the
+        web console, and the persisted registry.
+        """
+        payload = self.public_dict(now)
+        payload["verified"] = self.is_verified
+        payload["verified_at"] = self.verified_at
+        payload["key_change_at"] = self.key_change_at
+        return payload
 
     def exchange_dict(self, now: Optional[float] = None) -> Dict[str, Any]:
         """A peer description for peer exchange: ``public_dict`` plus the key.
@@ -271,6 +367,24 @@ class PeerRegistry:
                 )
                 self._peers[destination_hash] = peer
             else:
+                if existing.public_key != public_key:
+                    # A destination hash is derived from its public key, so
+                    # a different key under the same destination cannot be
+                    # a re-key — it is tampering, a corrupt registry, or a
+                    # bug.  Never silently accept it: keep the recorded
+                    # key (and the verification that hangs off it), stamp
+                    # the attempt so the owner sees it, and leave the
+                    # record otherwise untouched.
+                    log.warning(
+                        "Peer %s (%s) presented a different public key "
+                        "under the same destination hash; keeping the "
+                        "recorded key and refusing the update — re-verify "
+                        "this peer out of band before trusting it",
+                        existing.display_name,
+                        existing.hexhash,
+                    )
+                    existing.key_change_at = timestamp
+                    return existing
                 if clean_name != "unknown" or existing.name == "unknown":
                     existing.name = clean_name
                 existing.public_key = public_key
@@ -284,6 +398,86 @@ class PeerRegistry:
                 peer = existing
             self._enforce_limit()
             return peer
+
+    def mark_verified(
+        self,
+        target: Union[bytes, str],
+        fingerprint: str,
+        *,
+        now: Optional[float] = None,
+    ) -> Peer:
+        """Record that the owner compared safety numbers with *target*.
+
+        The *fingerprint* is the pairwise safety number shown at verify
+        time; storing it lets a later verification notice if the local
+        identity (and therefore the number) changed since.  The caller
+        persists the registry.  Raises :class:`PeerError` for an unknown
+        or ambiguous target.
+        """
+        peer = self.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        timestamp = now if now is not None else time.time()
+        with self._lock:
+            peer.verified_fingerprint = fingerprint
+            peer.verified_at = timestamp
+            # The owner just checked this key out of band: any earlier
+            # key-change warning about it is answered, not left to warn
+            # on every subsequent view.
+            peer.key_change_at = None
+            return peer
+
+    def clear_verifications(self) -> int:
+        """Drop every peer's verification state, returning how many cleared.
+
+        Pairwise safety numbers are computed with the local key, so a
+        comparison made under a previous local identity says nothing
+        about the current one — importing a different identity must
+        invalidate them all rather than leave stale checkmarks behind.
+        """
+        with self._lock:
+            cleared = 0
+            for peer in self._peers.values():
+                if peer.is_verified:
+                    peer.verified_at = None
+                    peer.verified_fingerprint = None
+                    cleared += 1
+            return cleared
+
+    def forget(self, target: Union[bytes, str]) -> Peer:
+        """Remove a peer from the registry, returning the removed record.
+
+        The explicit owner-controlled recovery path for a record that
+        cannot repair itself — for example a stored key corrupted on
+        disk, which ``upsert`` rightly refuses to overwrite: forget the
+        peer and the next genuine announce re-adds a clean record.
+        Raises :class:`PeerError` for an unknown or ambiguous target.
+        """
+        peer = self.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        with self._lock:
+            del self._peers[peer.destination_hash]
+            return peer
+    def record_delivered(
+        self, destination_hash: bytes, *, now: Optional[float] = None
+    ) -> bool:
+        """Record a successful direct delivery to a peer.
+
+        Bumps the peer's delivered count and stamps the time, so the
+        registry carries the delivered history the held-mail quota tier
+        (and any future trust decision) needs.  Returns ``False`` when
+        the peer is not in the registry.  The caller owns persistence:
+        the serving node saves peers on its usual cadence and on stop.
+        """
+        timestamp = now if now is not None else time.time()
+        with self._lock:
+            peer = self._peers.get(destination_hash)
+            if peer is None:
+                return False
+            peer.delivered_count += 1
+            peer.last_delivered_at = timestamp
+            return True
 
     def all(
         self,
@@ -310,7 +504,10 @@ class PeerRegistry:
 
         Peers whose destination hash is in *keep* are spared, so a caller
         can hold on to a stale peer it still owes something (for example
-        queued mail).  Returns the number of peers dropped.
+        queued mail).  Verified peers are always spared: the owner has
+        confirmed that key out of band, and losing the record would
+        silently drop the verification.  Returns the number of peers
+        dropped.
         """
         timestamp = now if now is not None else time.time()
         keep_set = set(keep)
@@ -318,7 +515,9 @@ class PeerRegistry:
             stale = [
                 key
                 for key, peer in self._peers.items()
-                if timestamp - peer.last_seen > max_age and key not in keep_set
+                if timestamp - peer.last_seen > max_age
+                and key not in keep_set
+                and not peer.is_verified
             ]
             for key in stale:
                 del self._peers[key]
@@ -340,8 +539,13 @@ class PeerRegistry:
         excess = len(self._peers) - self.max_peers
         # Peers in *keep* (e.g. recipients of queued mail) are never evicted;
         # the registry may briefly exceed the cap rather than lose them.
+        # Verified peers are keepers too, for the same reason as in prune().
         candidates = sorted(
-            (p for p in self._peers.values() if p.destination_hash not in keep_set),
+            (
+                p
+                for p in self._peers.values()
+                if p.destination_hash not in keep_set and not p.is_verified
+            ),
             key=lambda p: p.last_seen,
         )
         for peer in candidates[:excess]:
