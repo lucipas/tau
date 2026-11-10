@@ -20,9 +20,13 @@ learned group from the same creator under the same name — but only when
 the message comes from the creator themself, since the creator field is
 only a claim in the payload: a successor carried by another member is
 pinned alongside instead of replacing the predecessor, so no member can
-forge a successor and hijack sends by group name.  The superseded
-predecessor is only deleted, not retired, because the old roster may
-still be live elsewhere and its messages should be able to pin it again.
+forge a successor and hijack sends by group name.  While both versions
+coexist, :meth:`GroupStore.find` keeps resolving the name to the roster
+this node has known longest (a locally created group first), so sends
+by name keep working until the creator themself sends the successor.
+The superseded predecessor is only deleted, not retired, because the
+old roster may still be live elsewhere and its messages should be able
+to pin it again.
 """
 
 from __future__ import annotations
@@ -195,6 +199,28 @@ class GroupStore:
             mode=0o600,
         )
 
+    def _snapshot(self) -> "tuple[Dict[str, Dict[str, Any]], List[str]]":
+        """In-memory state before a mutation, for rollback on a failed save.
+
+        A shallow copy is enough: mutations replace whole records, they
+        never edit a stored group dict in place.
+        """
+        return (dict(self._groups), list(self._retired))
+
+    def _restore(
+        self, snapshot: "tuple[Dict[str, Dict[str, Any]], List[str]]"
+    ) -> None:
+        """Restore the state captured by :meth:`_snapshot`.
+
+        Reloading from disk cannot do this when the file is missing or
+        unreadable — :meth:`_load` then leaves the mutated in-memory
+        state in place, so a group whose first write failed would stay
+        visible until restart.
+        """
+        groups, retired = snapshot
+        self._groups = dict(groups)
+        self._retired = list(retired)
+
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         """Serialise a read-modify-write of the store across processes.
@@ -259,6 +285,7 @@ class GroupStore:
                     f"group limit reached ({MAX_GROUPS} created groups;"
                     " delete one with `tau group delete`)"
                 )
+            snapshot = self._snapshot()
             self._groups[group["id"]] = group
             if group["id"] in self._retired:
                 # The roster is live again (recreated after a roster
@@ -267,9 +294,9 @@ class GroupStore:
             try:
                 self._save()
             except OSError:
-                # Reload restores both the groups and the retired list
-                # to what is on disk.
-                self._load()
+                # Restore the pre-mutation state: reloading cannot do
+                # this when the file is missing or unreadable yet.
+                self._restore(snapshot)
                 raise
         return dict(group)
 
@@ -321,6 +348,7 @@ class GroupStore:
             )
             if candidate is None:
                 raise ValueError("invalid group: the creator must be a member")
+            snapshot = self._snapshot()
             del self._groups[existing["id"]]
             self._groups[new_id] = candidate
             if existing["id"] not in self._retired:
@@ -334,7 +362,7 @@ class GroupStore:
             try:
                 self._save()
             except OSError:
-                self._load()
+                self._restore(snapshot)
                 raise
         return dict(candidate)
 
@@ -368,7 +396,10 @@ class GroupStore:
         successor naming the real creator, drop other members from the
         roster, and hijack sends by group name.  The message itself is
         still accepted and pinned either way; only the replacement
-        needs the creator's proof.
+        needs the creator's proof.  While both versions coexist,
+        :meth:`find` keeps resolving the name to the roster known
+        longest (a locally created group first), so sends by name keep
+        working until the creator sends the successor themself.
         """
         candidate = _valid_group(
             {
@@ -411,6 +442,7 @@ class GroupStore:
                         group_id,
                     )
                     return None
+            snapshot = self._snapshot()
             for other in superseded:
                 del self._groups[other["id"]]
             if existing is not None:
@@ -418,9 +450,8 @@ class GroupStore:
                     try:
                         self._save()
                     except OSError as exc:
-                        # Reload restores the groups the reconcile above
-                        # deleted.
-                        self._load()
+                        # Restore the groups the reconcile above deleted.
+                        self._restore(snapshot)
                         log.warning(
                             "Could not persist groups to %s: %s", self.path, exc
                         )
@@ -431,8 +462,8 @@ class GroupStore:
                 self._save()
             except OSError as exc:
                 # Do not acknowledge a pin that would be lost on restart.
-                # Reload restores the groups the reconcile above deleted.
-                self._load()
+                # Restore the groups the reconcile above deleted.
+                self._restore(snapshot)
                 log.warning("Could not persist groups to %s: %s", self.path, exc)
                 return None
         return dict(candidate)
@@ -447,11 +478,12 @@ class GroupStore:
             existing = self._groups.get(group_id.lower())
             if existing is None:
                 return False
+            snapshot = self._snapshot()
             del self._groups[group_id.lower()]
             try:
                 self._save()
             except OSError:
-                self._load()
+                self._restore(snapshot)
                 raise
         return True
 
@@ -465,7 +497,11 @@ class GroupStore:
         """Resolve a group by id, id prefix, or exact name.
 
         Raises :class:`ValueError` when the query is ambiguous or
-        matches nothing, so callers can report it plainly.
+        matches nothing, so callers can report it plainly.  Same-name
+        groups from one creator are not ambiguous: a locally created
+        group wins, otherwise the roster this node has known longest
+        wins, so a member-carried successor neither hijacks sends by
+        name nor blocks them until the creator sends it themself.
         """
         query = query.strip()
         with self._lock:
@@ -481,6 +517,15 @@ class GroupStore:
         if len(by_name) == 1:
             return dict(by_name[0])
         if len(by_name) > 1:
+            creators = {group["creator"] for group in by_name}
+            if len(creators) == 1:
+                local = [group for group in by_name if group["local"]]
+                if len(local) == 1:
+                    return dict(local[0])
+                if not local:
+                    return dict(
+                        sorted(by_name, key=lambda group: group["created_at"])[0]
+                    )
             raise ValueError(f"{len(by_name)} groups are named {query!r}")
         if len(query) >= 4:
             matches = [

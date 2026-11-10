@@ -480,8 +480,10 @@ def test_group_store_record_successor_from_member_does_not_replace(tmp_path):
     assert new["id"] == new_id
     assert store.get(old_id) is not None
     assert len(store) == 2
-    with pytest.raises(ValueError, match="2 groups are named"):
-        store.find("weekend")
+    # Name lookup keeps resolving to the roster known longest, so a
+    # member-carried successor neither hijacks sends by name nor
+    # blocks them until the creator sends it themself.
+    assert store.find("weekend")["id"] == old_id
     # The creator themself sending the same roster does replace it.
     assert (
         store.record(
@@ -496,6 +498,62 @@ def test_group_store_record_successor_from_member_does_not_replace(tmp_path):
     assert store.get(old_id) is None
     assert store.find("weekend")["id"] == new_id
     assert len(store) == 1
+
+
+def test_group_store_find_prefers_local_group(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    mine = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    learned_id = derive_group_id(OWN_HASH, "weekend", [OWN_HASH, THIRD_HASH])
+    assert (
+        store.record(
+            learned_id, "weekend", [OWN_HASH, THIRD_HASH], creator=OWN_HASH
+        )
+        is not None
+    )
+    # A locally created group is authoritative for its name, even when
+    # a learned group of the same name is pinned alongside it.
+    assert store.find("weekend")["id"] == mine["id"]
+
+
+def test_group_store_find_prefers_earliest_roster_after_reload(tmp_path):
+    path = tmp_path / "groups.json"
+    store = GroupStore(path)
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    store.record(
+        new_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH, OWN_HASH],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    assert store.find("weekend")["id"] == old_id
+    reloaded = GroupStore(path)
+    assert len(reloaded) == 2
+    assert reloaded.find("weekend")["id"] == old_id
+
+
+def test_group_store_find_still_ambiguous_across_creators(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    first_id = derive_group_id(OTHER_HASH, "same", [OTHER_HASH, THIRD_HASH])
+    second_id = derive_group_id(STRANGER_HASH, "same", [STRANGER_HASH, THIRD_HASH])
+    store.record(
+        first_id, "same", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+    )
+    store.record(
+        second_id, "same", [STRANGER_HASH, THIRD_HASH], creator=STRANGER_HASH
+    )
+    with pytest.raises(ValueError, match="2 groups are named"):
+        store.find("same")
 
 
 def test_group_store_record_never_replaces_local_group(tmp_path):
@@ -605,6 +663,82 @@ def test_group_store_save_failure_rolls_back(tmp_path, monkeypatch):
     assert store.get(group["id"]) is not None
     reloaded = GroupStore(tmp_path / "groups.json")
     assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
+
+
+def test_group_store_first_save_failure_leaves_no_phantom_group(
+    tmp_path, monkeypatch
+):
+    import tau.groups as groups_module
+
+    store = GroupStore(tmp_path / "groups.json")
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(groups_module, "atomic_write_json", _boom)
+    # The file does not exist yet, so reloading from disk cannot undo
+    # the mutation — a failed first write must not leave the group
+    # visible in memory.
+    with pytest.raises(OSError, match="disk full"):
+        store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert len(store) == 0
+    group_id = derive_group_id(OWN_HASH, "other", [OWN_HASH, THIRD_HASH])
+    assert (
+        store.record(group_id, "other", [OWN_HASH, THIRD_HASH], creator=OWN_HASH)
+        is None
+    )
+    assert len(store) == 0
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert len(reloaded) == 0
+
+
+def test_group_store_failed_save_restores_superseded_and_deleted(
+    tmp_path, monkeypatch
+):
+    import tau.groups as groups_module
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("local", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+    )
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(groups_module, "atomic_write_json", _boom)
+    # A creator-sent successor whose save fails must not delete the
+    # predecessor it was about to replace.
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    assert (
+        store.record(
+            new_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH, OWN_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+        )
+        is None
+    )
+    assert store.get(old_id) is not None
+    assert store.get(new_id) is None
+    assert store.find("weekend")["id"] == old_id
+    # A delete whose save fails must not drop the group either.
+    with pytest.raises(OSError, match="disk full"):
+        store.delete(group["id"])
+    assert store.get(group["id"]) == group
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert [item["id"] for item in reloaded.list_groups()] == [
+        group["id"],
+        old_id,
+    ]
 
 
 def test_group_store_survives_reload_and_drops_corrupt(tmp_path):
