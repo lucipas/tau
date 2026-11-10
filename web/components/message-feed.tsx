@@ -196,6 +196,10 @@ function MessageBubble({
   const quote = resolveQuote(messages, message);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [reactError, setReactError] = useState<string | null>(null);
+  const [reactPending, setReactPending] = useState(false);
+  // Synchronous guard so rapid clicks cannot start overlapping requests
+  // before the pending state has re-rendered.
+  const reactInFlight = useRef(false);
   // The node's own destination hash is what the bridge records as the
   // reactor, so this is how the console knows which reaction is mine.
   const ownReaction =
@@ -206,7 +210,9 @@ function MessageBubble({
         );
 
   async function handleReact(reaction: string) {
-    if (!onReact) return;
+    if (!onReact || reactInFlight.current) return;
+    reactInFlight.current = true;
+    setReactPending(true);
     setReactError(null);
     try {
       // Tapping the emoji already in use retracts it.
@@ -219,6 +225,9 @@ function MessageBubble({
       setReactError(
         error instanceof Error ? error.message : "reaction failed",
       );
+    } finally {
+      reactInFlight.current = false;
+      setReactPending(false);
     }
   }
 
@@ -372,6 +381,7 @@ function MessageBubble({
                       : `React with ${option}`
                   }
                   aria-pressed={active}
+                  disabled={reactPending}
                   onClick={() => void handleReact(option)}
                   className={`grid h-7 w-7 place-items-center rounded-lg border text-sm transition ${
                     active
