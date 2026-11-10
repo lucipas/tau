@@ -68,9 +68,6 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
-  // Bumped on every snapshot so info requests started before it cannot
-  // write results for a peer list that has since been replaced.
-  const infoGeneration = useRef(0);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -103,8 +100,6 @@ export function useTau() {
           : 0;
       setNode(snapshot.node);
       setPeers(sortPeers(snapshot.peers));
-      infoGeneration.current += 1;
-      setInfos({});
       setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
@@ -377,14 +372,6 @@ export function useTau() {
     announcing,
     send,
     ping,
-    fetchInfo,
-    announce,
-    markRead,
-    refreshOutbox,
-    refreshGroups,
-    cancelOutbox,
-  };
-}
     fetchInfo,
     announce,
     markRead,

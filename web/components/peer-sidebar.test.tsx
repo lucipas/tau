@@ -91,6 +91,7 @@ describe("PeerSidebar peer info", () => {
         [aliceHash]: {
           info: {
             version: "0.2.0",
+            rns_version: "0.9.3",
             protocol: 1,
             uptime: 3661,
             peers: 3,
