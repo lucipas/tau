@@ -28,9 +28,11 @@ const ROWS: {
 /** This node's own settings (`tau config`), changeable without a restart. */
 export function SettingsSection({
   settings,
+  loadError = null,
   onToggle,
 }: {
   settings: NodeSettings | null;
+  loadError?: string | null;
   onToggle: (setting: keyof NodeSettings, value: boolean) => Promise<unknown>;
 }) {
   const [pendingKey, setPendingKey] = useState<keyof NodeSettings | null>(null);
@@ -59,6 +61,12 @@ export function SettingsSection({
       <p className="mt-2 font-mono text-[11px] leading-relaxed text-mist/80">
         changes apply to the running node at once — no restart.
       </p>
+
+      {loadError ? (
+        <p className="mt-2 font-mono text-[11px] text-rose-400">
+          couldn&apos;t load settings: {loadError}
+        </p>
+      ) : null}
 
       {error ? (
         <p className="mt-2 font-mono text-[11px] text-rose-400">{error}</p>

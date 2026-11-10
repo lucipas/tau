@@ -149,6 +149,7 @@ export function Console() {
             <div className="mt-4">
               <SettingsSection
                 settings={tau.settings}
+                loadError={tau.settingsError}
                 onToggle={tau.updateSetting}
               />
             </div>

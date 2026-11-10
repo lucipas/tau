@@ -56,6 +56,7 @@ export function useTau() {
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [settings, setSettings] = useState<NodeSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
@@ -192,9 +193,23 @@ export function useTau() {
     // Same polling shape as the outbox: a setting changed on the CLI
     // shows up here without waiting for a reload.
     const requestId = ++settingsSeq.current;
-    const result = await apiGet<NodeSettings>("/api/settings");
-    if (requestId !== settingsSeq.current) return;
-    setSettings(result);
+    try {
+      const result = await apiGet<NodeSettings>("/api/settings");
+      if (requestId !== settingsSeq.current) return;
+      setSettings(result);
+      setSettingsError(null);
+    } catch (caught) {
+      // Record the failure so the section can explain why the switches
+      // are disabled, then rethrow for callers that care.
+      if (requestId === settingsSeq.current) {
+        setSettingsError(
+          caught instanceof Error && caught.message
+            ? caught.message
+            : "couldn't load settings",
+        );
+      }
+      throw caught;
+    }
   }, []);
 
   const refreshOutbox = useCallback(async () => {
