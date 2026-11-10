@@ -319,6 +319,121 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["text"] == "from the mesh"
 
 
+def test_messages_search_via_api(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello from the mesh",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "another MESH note",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "unrelated weather chat",
+            "sent_at": 104.0,
+            "received_at": 105.0,
+        }
+    )
+    # An outbound message matches too: search covers the whole traffic view.
+    _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "mesh reply from me"},
+    )
+
+    # Case-insensitive, newest first.
+    status, _, payload = _json(bridge, "/api/messages/search?q=MESH")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == [
+        "mesh reply from me",
+        "another MESH note",
+        "hello from the mesh",
+    ]
+    assert payload["count"] == 3
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&limit=1")
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["messages"][0]["text"] == "mesh reply from me"
+
+    # A peer filter narrows to one conversation, by name or hash prefix.
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&peer=alice")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == [
+        "mesh reply from me",
+        "hello from the mesh",
+    ]
+
+    status, _, payload = _json(
+        bridge, f"/api/messages/search?q=mesh&peer={OTHER_HASH[:8]}"
+    )
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == ["another MESH note"]
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&peer=nobody")
+    assert status == 200
+    assert payload["messages"] == []
+
+    # An empty query is a client error.
+    status, _, payload = _json(bridge, "/api/messages/search?q=%20%20")
+    assert status == 400
+    assert "must not be empty" in payload["error"]["message"]
+
+
+def test_messages_search_hides_blocked_and_expired(bridge, node):
+    from tau.blocklist import BlockList
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "mesh from alice",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "mallory",
+            "destination": OTHER_HASH,
+            "text": "mesh from mallory",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    # A disappearing message whose deadline passed never matches.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "mesh already gone",
+            "sent_at": 104.0,
+            "received_at": 105.0,
+            "expires_at": 106.0,
+        }
+    )
+
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == ["mesh from alice"]
+
+
 def test_inbound_group_message_keeps_group_fields(bridge):
     record = {
         "from": "bob",

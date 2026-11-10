@@ -7,6 +7,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/peers        peers from the local registry
     GET  /api/groups       known group DMs with their member lists
     GET  /api/messages     recent inbound/outbound messages
+    GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
@@ -1666,6 +1667,41 @@ class WebBridge:
             self._with_inbox_reactions(dict(item), by_target) for item in items
         ]
 
+    def messages_search(
+        self,
+        *,
+        query: str,
+        peer: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return stored messages matching a keyword, newest first.
+
+        A case-insensitive substring match over the message text, over
+        the same stored history the traffic view shows: :meth:`messages`
+        already purges expired disappearing messages, hides blocked
+        senders and annotates reactions, so search reuses it instead of
+        re-reading the log.  An optional *peer* narrows to one peer by
+        destination prefix or peer-name substring.  An empty query
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        needle = query.strip().casefold()
+        items = self.messages(limit=-1)
+        if peer is not None and peer.strip():
+            target = peer.strip().casefold()
+            items = [
+                item
+                for item in items
+                if (item.get("peer") or "").casefold().startswith(target)
+                or target in (item.get("peer_name") or "").casefold()
+            ]
+        matches = [
+            item for item in items if needle in (item.get("text") or "").casefold()
+        ]
+        return matches[::-1][:limit] if limit > 0 else []
+
     def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
         """Node inbox reactions grouped by target, reloaded once per read.
 
@@ -2007,6 +2043,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages":
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                return
+            if path == "/api/messages/search":
+                limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                peer = (query.get("peer") or [None])[0]
+                try:
+                    found = self.bridge.messages_search(
+                        query=text, peer=peer, limit=limit
+                    )
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"messages": found, "count": len(found)}, head_only)
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)

@@ -134,6 +134,7 @@ The same bridge is the local integration point for scripts:
 | `/api/peers` | GET | peer registry |
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
+| `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
