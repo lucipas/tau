@@ -144,6 +144,16 @@ export interface SendResponse {
   response: Record<string, unknown>;
 }
 
+// POST /api/react: the reaction token echoed back, or cleared when the
+// caller retracted their reaction. `id` is the reaction's wire id.
+export interface ReactResponse {
+  ok: boolean;
+  target: string;
+  reaction: string;
+  cleared: boolean;
+  id: string | null;
+}
+
 export interface OutboxEntry {
   id: string;
   to: string;

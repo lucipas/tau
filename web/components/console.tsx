@@ -125,6 +125,14 @@ export function Console() {
                   setMode("peer");
                 }
               }}
+              onReact={async (message, reaction) => {
+                if (!message.wire_id) return;
+                if (reaction === null) {
+                  await tau.clearReaction(message.wire_id);
+                } else {
+                  await tau.reactToMessage(message.wire_id, reaction);
+                }
+              }}
             />
             {tau.outbox.length > 0 ? (
               <div className="mt-4">

@@ -13,6 +13,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  ReactResponse,
   SendResponse,
   Snapshot,
   TauGroup,
@@ -325,6 +326,20 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const reactToMessage = useCallback(
+    async (target: string, reaction: string) => {
+      // The node records the outgoing reaction and the bridge re-sends
+      // the message as `message_updated`, so the bubble updates through
+      // the SSE stream — no local state change here.
+      return apiPost<ReactResponse>("/api/react", { target, reaction });
+    },
+    [],
+  );
+
+  const clearReaction = useCallback(async (target: string) => {
+    return apiPost<ReactResponse>("/api/react", { target, clear: true });
+  }, []);
+
   return {
     node,
     peers,
@@ -341,6 +356,8 @@ export function useTau() {
     ping,
     announce,
     markRead,
+    reactToMessage,
+    clearReaction,
     refreshOutbox,
     refreshGroups,
     cancelOutbox,
