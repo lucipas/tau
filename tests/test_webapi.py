@@ -29,6 +29,7 @@ class FakeRegistry:
     def __init__(self, peers):
         self._peers = list(peers)
         self.saved = False
+        self.fail_save = False
 
     def all(self, max_age=None):
         return list(self._peers)
@@ -64,7 +65,13 @@ class FakeRegistry:
     def refresh_aliases(self):
         return 0
 
+    def restore(self, peer):
+        if self.get(peer.destination_hash) is None:
+            self._peers.append(peer)
+
     def save(self):
+        if self.fail_save:
+            raise OSError("disk full")
         self.saved = True
         return True
 
@@ -562,6 +569,15 @@ def test_forget_peer_refuses_pending_acks(bridge, node):
     with pytest.raises(ValueError, match="acknowledgements owed"):
         bridge.forget_peer("alice")
     assert node.registry.all() != []
+
+
+def test_forget_peer_restores_record_when_save_fails(bridge, node):
+    node.registry.fail_save = True
+    with pytest.raises(OSError, match="disk full"):
+        bridge.forget_peer("alice")
+    # The removal did not persist, so the live record comes back and
+    # the serving node agrees with the file again.
+    assert [peer.name for peer in node.registry.all()] == ["alice"]
 
 
 def test_forget_peer_endpoint(bridge, node):

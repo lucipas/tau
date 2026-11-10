@@ -1395,8 +1395,14 @@ class WebBridge:
                     "owed; wait for the next mail sweep to send them, "
                     "then try again"
                 )
-            self.node.registry.forget(peer.destination_hash)
-            self.node.registry.save()
+            removed = self.node.registry.forget(peer.destination_hash)
+            try:
+                self.node.registry.save()
+            except Exception:
+                # The old record is still on disk: put the live copy back
+                # so the serving node and the file agree, then report it.
+                self.node.registry.restore(removed)
+                raise
         return {"ok": True, "peer": peer.public_dict()}
 
     def announce(self) -> None:

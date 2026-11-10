@@ -17,6 +17,13 @@ export function Console() {
   const [mode, setMode] = useState<"peer" | "custom">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
+  // The selection as it is now, for async completions that must not act
+  // on a conversation the user has since switched to.
+  const targetRef = useRef(target);
+
+  useEffect(() => {
+    targetRef.current = target;
+  }, [target]);
 
   useEffect(() => {
     if (tau.peers.length === 0) {
@@ -113,8 +120,11 @@ export function Console() {
             onForgetPeer={async (destination, force) => {
               const removed = await tau.forgetPeer(destination, force);
               // The forgotten peer's conversation is gone: clear the
-              // selection and let the auto-select pick the next peer.
-              if (target === removed.destination) {
+              // selection and let the auto-select pick the next peer. Only
+              // if it is still selected; the user may have picked another
+              // peer while the forget was pending.
+              if (targetRef.current === removed.destination) {
+                targetRef.current = "";
                 setTarget("");
                 setReplyTo(null);
               }

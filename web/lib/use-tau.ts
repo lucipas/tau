@@ -39,6 +39,17 @@ function sortPeers(peers: Peer[]): Peer[] {
   return [...peers].sort((a, b) => b.last_seen - a.last_seen);
 }
 
+// A peer removed by a forget carries the last_seen it had at that moment.
+// Snapshots or peer events queued before the forget are at or below that
+// cutoff and must not bring the peer back; a genuine re-announce is newer.
+function predatesForget(
+  forgotten: Map<string, number>,
+  peer: Peer,
+): boolean {
+  const cutoff = forgotten.get(peer.destination);
+  return cutoff !== undefined && peer.last_seen <= cutoff;
+}
+
 function readEventData<T>(event: Event): T | null {
   try {
     return JSON.parse((event as MessageEvent).data) as T;
@@ -92,7 +103,13 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
-      setPeers(sortPeers(snapshot.peers));
+      setPeers(
+        sortPeers(
+          snapshot.peers.filter(
+            (peer) => !predatesForget(forgottenPeers.current, peer),
+          ),
+        ),
+      );
       setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
@@ -135,6 +152,7 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      if (predatesForget(forgottenPeers.current, peer)) return;
       setPeers((previous) => {
         const next = previous.filter(
           (entry) => entry.destination !== peer.destination,
@@ -186,6 +204,7 @@ export function useTau() {
   const refreshSeq = useRef(0);
   const groupsSeq = useRef(0);
   const peersSeq = useRef(0);
+  const forgottenPeers = useRef(new Map<string, number>());
 
   const refreshPeers = useCallback(async () => {
     // Same polling shape as the outbox: only the newest issued request
@@ -336,6 +355,7 @@ export function useTau() {
       // and treat the follow-up refresh as best-effort so a failed GET
       // cannot make a successful forget look like a failure.
       const removed = result.peer.destination;
+      forgottenPeers.current.set(removed, result.peer.last_seen);
       setPeers((previous) =>
         previous.filter((entry) => entry.destination !== removed),
       );
