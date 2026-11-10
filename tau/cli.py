@@ -42,6 +42,7 @@ from .bundle import (
 from .config import (
     TauConfig,
     accept_files_enabled,
+    load_node_name,
     send_read_receipts_enabled,
     set_node_setting,
     write_node_metadata,
@@ -76,6 +77,7 @@ from .protocol import (
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
+    sanitize_name,
     short_hash,
 )
 from .util import atomic_write_bytes, atomic_write_text
@@ -590,6 +592,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing identity",
     )
     id_import.set_defaults(func=cmd_id_import)
+    id_rename = id_sub.add_parser(
+        "rename",
+        parents=[common],
+        help="change this node's display name",
+    )
+    id_rename.add_argument(
+        "new_name",
+        metavar="NEWNAME",
+        help="new node name",
+    )
+    id_rename.set_defaults(func=cmd_id_rename)
 
     backup = subparsers.add_parser(
         "backup",
@@ -3007,6 +3020,26 @@ def cmd_tan_import(args: argparse.Namespace) -> int:
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
 
 
+def _refresh_served_name(
+    config: TauConfig, node: Any, args: argparse.Namespace, *, no_announce: bool
+) -> None:
+    """Pick up a rename that landed between config resolution and the serve lock.
+
+    Once the serving lock is held no rename can write, so the stored name is
+    stable here. A hand-edited ``node.json`` bypasses ``init``'s validation,
+    so the re-read name is sanitised exactly as config resolution does.
+    An explicit ``--name`` override wins over the stored name.
+    """
+    if getattr(args, "name", None) is not None:
+        return
+    stored_name = load_node_name(config.data_dir)
+    if not stored_name:
+        return
+    stored_name = sanitize_name(stored_name)
+    if stored_name != node.name:
+        node.name = stored_name
+        if not no_announce:
+            node.announce()
 def cmd_bundle_export(args: argparse.Namespace) -> int:
     config = _make_config(args)
     identity = load_identity(config.identity_path)
@@ -3228,11 +3261,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             check_web_console_bind(host, port)
         except WebBridgeError as exc:
             raise NodeError(str(exc)) from exc
+    no_announce = bool(getattr(args, "no_announce", False))
     node.start(
-        announce=not getattr(args, "no_announce", False),
+        announce=not no_announce,
         exclusive=True,
         lxmf=bool(getattr(args, "lxmf", False)),
     )
+    _refresh_served_name(config, node, args, no_announce=no_announce)
 
     social_app = None
     if getattr(args, "social", False):
@@ -3260,7 +3295,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         social_app = TanApp(
             config,
             node.identity,
-            name=config.name,
+            # The node's name, not the resolved config name: a rename that
+            # landed during startup refreshes node.name (see
+            # _refresh_served_name), and posts must carry the same name the
+            # node announces with.
+            name=node.name,
             on_post=on_tan_post,
         )
         node.attach_app(social_app)
@@ -3948,6 +3987,52 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"destination: {payload['destination']}")
         print(f"data dir:    {payload['data_dir']}")
         print(f"files:       {len(payload['files'])}")
+    return _EXIT_OK
+
+
+def cmd_id_rename(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    raw_name = getattr(args, "new_name", None)
+    if not isinstance(raw_name, str):
+        raise NodeError("new name must not be empty")
+    # Empty fallback: a name that sanitises to nothing (blank, or control
+    # characters only) is rejected instead of silently becoming "anonymous".
+    new_name = sanitize_name(raw_name, fallback="")
+    if not new_name:
+        raise NodeError("new name must not be empty")
+    # Read the stored name, not the resolved one: a global --name flag
+    # would override the resolved name and misreport the rename.
+    old_name = load_node_name(config.data_dir) or config.name
+    payload = {
+        "name": new_name,
+        "previous_name": old_name,
+        "changed": new_name != old_name,
+        "destination": destination_hash(identity).hex(),
+    }
+    if new_name == old_name:
+        if _json_mode(args):
+            _emit(payload, True)
+        else:
+            print(f'Node is already named "{old_name}".')
+        return _EXIT_OK
+    # A running node announces with its in-memory name, so a rename under
+    # it would sit ignored on disk until restart. Probe the instance lock
+    # (same pattern as `tau serve`) and refuse while the node is serving.
+    # Hold the lock through the write so a serve starting now cannot read
+    # the old name and then start announcing it after the write lands.
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    probe.acquire()
+    try:
+        write_node_metadata(config.data_dir, new_name)
+    finally:
+        probe.release()
+    if _json_mode(args):
+        _emit(payload, True)
+    else:
+        print(f'Renamed node "{old_name}" to "{new_name}".')
     return _EXIT_OK
 
 
