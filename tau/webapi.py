@@ -599,7 +599,7 @@ class WebBridge:
         if purged:
             self._save_messages()
 
-    def _save_messages(self) -> None:
+    def _save_messages(self, *, strict: bool = False) -> None:
         """Persist the current message log to ``messages.json``.
 
         Saves are serialised through ``_save_lock`` and the snapshot is
@@ -607,7 +607,8 @@ class WebBridge:
         overwrite a newer one: the last save to finish always holds the
         newest log. A failed write only logs a warning: the messages are
         already in memory, and a full disk (or an unencodable record) must
-        never break sending or receiving.
+        never break sending or receiving. ``strict`` callers (deletion)
+        need the write to have landed, so they get the error instead.
         """
         path = self._messages_path
         if path is None:
@@ -623,6 +624,8 @@ class WebBridge:
                     mode=0o600,
                 )
             except (OSError, ValueError) as exc:
+                if strict:
+                    raise
                 log.warning(
                     "Could not persist message history to %s: %s", path, exc
                 )
@@ -1310,7 +1313,35 @@ class WebBridge:
             )
             if removed is None:
                 raise ValueError(f"unknown message: {target!r}")
+            if removed.get("status") == "queued":
+                # Deleting would hide the bubble while the outbox keeps
+                # delivering it, so cancellation has to go through there.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
             wire_id = removed.get("wire_id")
+            kept = [
+                message for message in self._messages if message.get("id") != target
+            ]
+            self._messages.clear()
+            self._messages.extend(kept)
+        # Persist the console history before touching the inbox: if the
+        # write fails, the inbox copy survives and the entry is restored,
+        # so a restart can never bring back a message reported as deleted.
+        try:
+            self._save_messages(strict=True)
+        except Exception:
+            with self._lock:
+                index = next(
+                    (
+                        i
+                        for i, message in enumerate(self._messages)
+                        if message.get("id", 0) > target
+                    ),
+                    len(self._messages),
+                )
+                self._messages.insert(index, removed)
+            raise
         inbox = None
         if isinstance(wire_id, str) and wire_id:
             inbox = getattr(self.node, "inbox", None)
@@ -1318,18 +1349,12 @@ class WebBridge:
                 try:
                     inbox.delete(wire_id)
                 except InboxError as exc:
-                    # Already gone from the inbox (a stale wire id):
-                    # the console entry is still removed below.  Any
-                    # other inbox failure leaves the entry in place.
+                    # Already gone from the inbox (a stale wire id) is
+                    # fine.  Any other inbox failure is raised; the
+                    # console copy is already gone, so a retry is
+                    # rejected as unknown rather than resurrecting it.
                     if not str(exc).startswith("unknown message"):
                         raise
-        with self._lock:
-            kept = [
-                message for message in self._messages if message.get("id") != target
-            ]
-            self._messages.clear()
-            self._messages.extend(kept)
-        self._save_messages()
         self.bus.publish({"type": "message_deleted", "id": target})
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": self.unread()})
