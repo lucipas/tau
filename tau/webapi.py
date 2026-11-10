@@ -1299,6 +1299,16 @@ class WebBridge:
         error: the console entry is still removed.  Other tabs learn
         through a ``message_deleted`` event, and the unread badge is
         re-published because deleting an unread message clears it.
+
+        Ordering keeps every failure retryable from the console: the
+        inbox goes first, so an inbox failure leaves the bubble in
+        place; the console log is then persisted strictly, and a
+        failed write restores the entry in memory and reports an
+        error instead of success.  A retry after either failure
+        completes the delete (the inbox delete of an already-removed
+        wire id is ignored), so no failure can leave a message the
+        console reports as deleted but a restart brings back, nor a
+        message deleted from the console but stuck in the inbox.
         """
         if not isinstance(target, int) or isinstance(target, bool) or target < 1:
             raise ValueError("message id is required")
@@ -1320,14 +1330,27 @@ class WebBridge:
                     f"message {target!r} is still queued; cancel it from the outbox first"
                 )
             wire_id = removed.get("wire_id")
+        inbox = None
+        if isinstance(wire_id, str) and wire_id:
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is not None:
+                try:
+                    inbox.delete(wire_id)
+                except InboxError as exc:
+                    # Already gone from the inbox (a stale wire id) is
+                    # fine.  Any other inbox failure leaves the console
+                    # entry in place, so the delete can be retried.
+                    if not str(exc).startswith("unknown message"):
+                        raise
+        with self._lock:
             kept = [
                 message for message in self._messages if message.get("id") != target
             ]
             self._messages.clear()
             self._messages.extend(kept)
-        # Persist the console history before touching the inbox: if the
-        # write fails, the inbox copy survives and the entry is restored,
-        # so a restart can never bring back a message reported as deleted.
+        # Persist the console history strictly: a failed write restores
+        # the entry and reports an error, so success is never reported
+        # for a delete that a restart would undo.
         try:
             self._save_messages(strict=True)
         except Exception:
@@ -1342,20 +1365,11 @@ class WebBridge:
                 )
                 self._messages.insert(index, removed)
             raise
-        inbox = None
-        if isinstance(wire_id, str) and wire_id:
-            inbox = getattr(self.node, "inbox", None)
-            if inbox is not None:
-                try:
-                    inbox.delete(wire_id)
-                except InboxError as exc:
-                    # Already gone from the inbox (a stale wire id) is
-                    # fine.  Any other inbox failure is raised; the
-                    # console copy is already gone, so a retry is
-                    # rejected as unknown rather than resurrecting it.
-                    if not str(exc).startswith("unknown message"):
-                        raise
-        self.bus.publish({"type": "message_deleted", "id": target})
+        # The bus stamps its own sequence into ``id``, so the deleted
+        # console id rides under ``message_id`` instead: using ``id``
+        # would make other tabs drop whichever bubble shares the
+        # event's sequence number.
+        self.bus.publish({"type": "message_deleted", "message_id": target})
         if inbox is not None:
             self.bus.publish({"type": "unread", "unread": self.unread()})
         return {

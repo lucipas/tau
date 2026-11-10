@@ -131,10 +131,12 @@ export function useTau() {
     };
 
     const onMessageDeleted = (event: Event) => {
-      const payload = readEventData<{ id: number }>(event);
-      if (!payload || typeof payload.id !== "number") return;
+      // The bus stamps its own sequence into `id`, so the deleted
+      // console id arrives under `message_id` instead.
+      const payload = readEventData<{ message_id: number }>(event);
+      if (!payload || typeof payload.message_id !== "number") return;
       setMessages((previous) =>
-        previous.filter((entry) => entry.id !== payload.id),
+        previous.filter((entry) => entry.id !== payload.message_id),
       );
     };
 

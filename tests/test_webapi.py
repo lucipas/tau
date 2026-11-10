@@ -1877,6 +1877,16 @@ def test_delete_message_endpoint_removes_history_and_inbox_entry(bridge, node):
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"] == []
     assert node.inbox.export_document()["messages"] == []
+    # The bus stamps its own sequence into `id`, so the deleted
+    # console id must ride under `message_id`: other tabs drop the
+    # deleted bubble, not whichever one shares the event sequence.
+    deleted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(deleted_events) == 1
+    assert deleted_events[0]["message_id"] == 1
 
 
 def test_delete_message_endpoint_removes_console_only_entry(bridge):
@@ -2010,9 +2020,11 @@ def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
         assert status == 500
         _, _, feed = _json(bridge, "/api/messages")
         assert len(feed["messages"]) == 1
-        # Console-first ordering: the inbox copy survives a failed
-        # delete, and a retry once the file is repaired completes it.
-        assert len(node.inbox.export_document()["messages"]) == 1
+        # Inbox-first ordering: the inbox copy is already gone, but the
+        # bubble stays visible, so a retry once the file is repaired
+        # completes the delete (the inbox delete of the already-removed
+        # wire id is ignored).
+        assert node.inbox.export_document()["messages"] == []
         messages_path.rmdir()
         status, _, payload = _json(
             bridge, "/api/messages/delete", method="POST", body={"id": 1}
