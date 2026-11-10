@@ -543,7 +543,7 @@ export function PostCard({
             >
               reply
             </button>
-            {post.own && !editing && !deleting ? (
+            {post.own && post.kind !== "quote" && !editing && !deleting ? (
               <button
                 type="button"
                 onClick={() => {
