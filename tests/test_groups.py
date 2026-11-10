@@ -326,6 +326,30 @@ def test_group_store_update_members_adds_and_removes(tmp_path):
     assert len(store) == 1
 
 
+def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    # A removed peer replaying the old roster must not re-pin the old id.
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Survives a restart.
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert (
+        reloaded.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is None
+    )
+
+
 def test_group_store_update_members_refusals(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
