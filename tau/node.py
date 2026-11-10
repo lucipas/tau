@@ -34,7 +34,7 @@ from .identity import (
     load_or_create_identity,
     load_public_key,
 )
-from .inbox import Inbox
+from .inbox import Inbox, InboxError
 from .instance_lock import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -80,6 +80,7 @@ from .protocol import (
     REQUEST_PING,
     REQUEST_READ,
     REQUEST_REACT,
+    REQUEST_RETRACT,
     ProtocolError,
     build_announce,
     build_file_offer,
@@ -104,8 +105,11 @@ from .protocol import (
     parse_message,
     parse_read_receipt,
     parse_reaction,
+    parse_retract,
     reaction_dict,
     reaction_unsigned_bytes,
+    retract_dict,
+    retract_unsigned_bytes,
     response_error,
     response_ok,
     sanitize_file_name,
@@ -622,6 +626,7 @@ class TauNode:
             REQUEST_FILE: self._handle_file,
             REQUEST_READ: self._handle_read,
             REQUEST_REACT: self._handle_reaction,
+            REQUEST_RETRACT: self._handle_retract,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -1509,6 +1514,105 @@ class TauNode:
             target=reaction["target"],
             received_at=received_at,
             duplicate=duplicate,
+        )
+
+    def _handle_retract(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            retract = parse_retract(data)
+        except ProtocolError as exc:
+            return response_error("invalid_retraction", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # A retract deletes someone else's stored copy: without an
+            # authenticated link identity there is no sender to check
+            # against the message, and an anonymous retract could
+            # delete anyone's message.
+            return response_error(
+                "unidentified", "identify on the link to retract"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Retracts are signed entries, like reactions: the signature
+        # covers the whole payload and is verified against the link
+        # identity, so attribution does not depend on trusting the
+        # transport — a relayed or replayed retract still has to prove
+        # its sender.  (parse_retract already checked the base64.)
+        signature_text = retract.get("sig")
+        if not signature_text:
+            return response_error(
+                "invalid_retraction", "retraction is missing its signature"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = retract_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_retraction", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_retraction", f"could not verify retraction: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_retraction", "retraction signature does not verify"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Retraction from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+
+        # Only the message's original sender may retract it: the stored
+        # copy's sender hash must match the caller.  An unknown id is
+        # not an error — the message may already be deleted or never
+        # have arrived — so a retried retract answers ok with
+        # deleted False instead of failing.
+        try:
+            stored = self.inbox.resolve(retract["target"])
+        except ValueError:
+            return response_ok(
+                target=retract["target"],
+                received_at=received_at,
+                deleted=False,
+            )
+        if stored.get("destination") != caller_hash:
+            return response_error(
+                "not_sender", "only the message's sender can retract it"
+            )
+        if stored.get("kind") == "group":
+            # A group message lives in every member's inbox; deleting
+            # it from one member alone would silently half-retract it.
+            # Group fan-out retract is a follow-up, not v1.
+            return response_error(
+                "not_supported",
+                "group messages cannot be retracted in v1",
+            )
+        try:
+            self.inbox.delete(str(stored["id"]))
+        except InboxError as exc:
+            return response_error(
+                "storage_failed", f"could not retract message: {exc}"
+            )
+        log.info(
+            "Retraction from %s deleted %s",
+            caller_hash[:8],
+            retract["target"][:8],
+        )
+        return response_ok(
+            target=retract["target"],
+            received_at=received_at,
+            deleted=True,
         )
 
     def _record_receipt(
@@ -3270,6 +3374,52 @@ class TauNode:
         }
         self._record_reaction(record)
         return dict(response, id=reaction_id)
+
+    def send_retraction(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Ask a peer to delete one of this node's sent DMs, and return
+        the decoded response.
+
+        ``message_id`` names the sent message.  The retract is its own
+        signed message kind: the payload is signed with this node's
+        Reticulum identity and verified by the receiver against the link
+        identity, exactly like a reaction — and the receiver only deletes
+        a message this node actually sent.  A retract for an unknown id
+        answers ok with ``deleted`` False, so retries are safe.
+
+        Retracts are delivered live in v1: unlike ``send_message``
+        there is no outbox queue, because the sealed-mail path is
+        text-shaped throughout.  An unreachable peer raises
+        :class:`NodeError`; queueing retracts for offline peers is a
+        follow-up once the mailbox can carry non-text kinds.
+        """
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("retract target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        retract_id = generate_message_id()
+        payload = retract_dict(target_id, message_id=retract_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign retraction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
+        return dict(response, id=retract_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""

@@ -22,9 +22,11 @@ from tau.protocol import (
     encode,
     encode_message,
     encode_reaction,
+    encode_retract,
     excerpt_hash,
     parse_message,
     reaction_dict,
+    retract_dict,
 )
 
 
@@ -1157,6 +1159,170 @@ def test_send_reaction_validates_before_resolving(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(ProtocolError):
         node.send_reaction("alice", "msg-1", "x" * 33)
+
+
+def signed_retract(sender, target, message_id, *, sent_at=None):
+    """A retract payload signed by *sender*, as send_retraction builds it."""
+    import base64
+
+    payload = retract_dict(target, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _store_received_message(node, sender, message_id):
+    """Store one DM from *sender* in the node's inbox, as _handle_message does."""
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    payload = encode_message("take this back", message_id=message_id)
+    response = call_handler(
+        node._handle_message, payload, remote_identity=sender
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_deletes_the_senders_own_message(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["target"] == "msg-1"
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_is_idempotent_for_an_unknown_id(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+
+
+def test_retract_rejects_a_non_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(other, "msg-1", "retract-1"),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+
+
+def test_retract_rejects_an_unsigned_payload(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    payload = encode_retract("msg-1", message_id="retract-1")
+    response = call_handler(
+        node._handle_retract, payload, remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_retraction"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_rejects_a_bad_signature(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    # Signed by someone else, presented as the sender: the link
+    # identity cannot verify it.
+    payload = signed_retract(other, "msg-1", "retract-1")
+    response = call_handler(
+        node._handle_retract, payload, remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_retraction"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+    # Enable an empty allow-list after the message arrived: the sender
+    # is no longer allowed, so the retract is refused.  The list loads
+    # lazily, so swap the cached value directly.
+    node._allowlist = AllowList(enabled=True, allow=frozenset())
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_refuses_group_messages(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "team",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_supported"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_send_retraction_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_retraction("alice", "")
+    with pytest.raises(NodeError):
+        node.send_retraction("alice", "x" * 65)
     with pytest.raises(NodeError):
         node.send_reaction("alice", "", "👍")
 

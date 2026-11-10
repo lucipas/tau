@@ -449,6 +449,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     react.set_defaults(func=cmd_react)
 
+    retract = subparsers.add_parser(
+        "retract",
+        parents=[common],
+        help="retract a sent message from the recipient's inbox",
+    )
+    retract.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    retract.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    retract.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    retract.set_defaults(func=cmd_retract)
+
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
     )
@@ -5389,6 +5409,85 @@ def cmd_react(args: argparse.Namespace) -> int:
         print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
     else:
         print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
+def cmd_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to retract")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be retracted"
+        )
+    if target.get("kind") == "group":
+        raise NodeError("group messages cannot be retracted in v1")
+    recipient = target.get("destination") or ""
+    if not recipient:
+        raise NodeError("that message has no known recipient to retract from")
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        try:
+            response = node.send_retraction(
+                recipient,
+                str(target["id"]),
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        except NodeError as exc:
+            # Retracts ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver retract: {exc} "
+                "(retracts need the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    # The peer confirmed (or already had it gone): drop this node's own
+    # sent copy too, so the message is gone on both sides.  A local
+    # delete failure is reported, not hidden — the retract itself
+    # already succeeded.
+    try:
+        inbox.delete(str(target["id"]))
+    except InboxError as exc:
+        raise NodeError(
+            "retract delivered but the local copy could not be deleted:"
+            f" {exc}"
+        ) from exc
+
+    peer = registry.get(recipient)
+    name = peer.display_name if peer is not None else short_hash(recipient)
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": recipient,
+                "to_name": name,
+                "deleted": bool(response.get("deleted")),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("deleted"):
+        print(
+            f"retracted your message {_safe_id_prefix(str(target['id']))}"
+            f" from {name}'s inbox"
+        )
+    else:
+        print(
+            f"{name} had no copy of {_safe_id_prefix(str(target['id']))}"
+            " to retract"
+        )
     return _EXIT_OK
 
 
