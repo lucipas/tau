@@ -121,9 +121,6 @@ describe("PostCard edit control", () => {
     fireEvent.click(screen.getByTitle("Edit this post"));
     const field = screen.getByLabelText("Edit post text");
     expect((field as HTMLTextAreaElement).value).toBe("regret this");
-    // The composer caps posts at 2000 characters and the backend rejects
-    // longer edits, so the edit box caps the same way.
-    expect((field as HTMLTextAreaElement).maxLength).toBe(2000);
 
     fireEvent.change(field, { target: { value: "meant this" } });
     await act(async () => {
@@ -170,6 +167,21 @@ describe("PostCard edit control", () => {
     renderCard(makePost({ own: false }));
 
     expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+
+  it("preserves emoji-heavy posts instead of truncating by UTF-16 units", () => {
+    // The backend counts code points, not UTF-16 units: 1,200 emoji are
+    // 1,200 code points but 2,400 UTF-16 units, so a plain slice(0, 2000)
+    // would silently drop 199 emoji from a valid post on first edit.
+    renderCard(makePost({ text: "😀".repeat(1200) }));
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText(
+      "Edit post text",
+    ) as HTMLTextAreaElement;
+    expect(field.value).toBe("😀".repeat(1200));
+
+    fireEvent.change(field, { target: { value: "😀".repeat(2001) } });
+    expect(field.value).toBe("😀".repeat(2000));
   });
 
   it("hides the edit control on your own quotes", () => {
