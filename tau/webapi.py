@@ -1800,8 +1800,10 @@ def _clamped_timeout(value: Any, default: float) -> float:
     try:
         seconds = float(value)
     except OverflowError:
-        # An integer too large for a float is far above the cap.
-        return 120.0
+        # An integer too large for a float is far above the cap — in
+        # either direction, so the overflow path follows the same
+        # bounds as the normal clamp.
+        return 120.0 if value > 0 else 1.0
     if not math.isfinite(seconds):
         return default
     return max(1.0, min(seconds, 120.0))

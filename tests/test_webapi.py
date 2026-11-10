@@ -534,6 +534,7 @@ def test_clamped_timeout():
     assert _clamped_timeout(5, 20.0) == 5.0
     assert _clamped_timeout(0.5, 20.0) == 1.0
     assert _clamped_timeout(10**400, 20.0) == 120.0
+    assert _clamped_timeout(-(10**400), 20.0) == 1.0
     assert _clamped_timeout(10**6, 15.0) == 120.0
     assert _clamped_timeout("soon", 20.0) == 20.0
     assert _clamped_timeout(True, 20.0) == 20.0
