@@ -13,8 +13,13 @@ import pytest
 
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.peers import Peer
-from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
+from tau.peers import Peer, PeerError
+from tau.webapi import (
+    PeerForgetBlocked,
+    WebBridge,
+    WebBridgeError,
+    check_web_console_bind,
+)
 
 PEER_HASH = "ab" * 16
 OTHER_HASH = "cd" * 16
@@ -23,6 +28,7 @@ OTHER_HASH = "cd" * 16
 class FakeRegistry:
     def __init__(self, peers):
         self._peers = list(peers)
+        self.saved = False
 
     def all(self, max_age=None):
         return list(self._peers)
@@ -37,6 +43,30 @@ class FakeRegistry:
             if peer.destination_hash == destination_hash:
                 return peer
         return None
+
+    def resolve(self, target, *, include_alias=True):
+        if isinstance(target, bytes):
+            return self.get(target)
+        for peer in self._peers:
+            if target in (peer.name, peer.hexhash) or peer.hexhash.startswith(
+                target
+            ):
+                return peer
+        return None
+
+    def forget(self, target):
+        peer = self.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        self._peers = [entry for entry in self._peers if entry is not peer]
+        return peer
+
+    def refresh_aliases(self):
+        return 0
+
+    def save(self):
+        self.saved = True
+        return True
 
 
 class FakeNode:
@@ -496,6 +526,72 @@ def test_ping_peer(bridge):
     assert status == 200
     assert payload["rtt_ms"] == 4.0
     assert payload["peer"]["destination"] == PEER_HASH
+
+
+def test_forget_peer(bridge, node):
+    result = bridge.forget_peer("alice")
+    assert result["ok"] is True
+    assert result["peer"]["destination"] == PEER_HASH
+    assert node.registry.all() == []
+    assert node.registry.saved is True
+
+
+def test_forget_peer_unknown(bridge):
+    with pytest.raises(ValueError, match="no peer matches"):
+        bridge.forget_peer("nobody")
+
+
+def test_forget_peer_refuses_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    with pytest.raises(PeerForgetBlocked) as excinfo:
+        bridge.forget_peer("alice")
+    assert excinfo.value.code == "queued_mail"
+    assert excinfo.value.queued == 1
+    assert node.registry.all() != []
+
+
+def test_forget_peer_force_strands_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    result = bridge.forget_peer("alice", force=True)
+    assert result["ok"] is True
+    assert node.registry.all() == []
+
+
+def test_forget_peer_refuses_pending_acks(bridge, node):
+    node.mailbox.add_pending_acks(PEER_HASH, ["mid-1"])
+    with pytest.raises(ValueError, match="acknowledgements owed"):
+        bridge.forget_peer("alice")
+    assert node.registry.all() != []
+
+
+def test_forget_peer_endpoint(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["peer"]["destination"] == PEER_HASH
+    assert node.registry.all() == []
+
+
+def test_forget_peer_endpoint_reports_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    status, _, payload = _json(
+        bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+    )
+    assert status == 400
+    assert payload["error"]["code"] == "queued_mail"
+    assert payload["error"]["queued"] == 1
+    assert node.registry.all() != []
+    # Forgetting anyway strands the queued mail, as the CLI's --force does.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/forget",
+        method="POST",
+        body={"target": "alice", "force": True},
+    )
+    assert status == 200
+    assert node.registry.all() == []
 
 
 def test_announce(bridge, node):

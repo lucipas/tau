@@ -110,6 +110,15 @@ export function Console() {
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onForgetPeer={async (destination, force) => {
+              const removed = await tau.forgetPeer(destination, force);
+              // The forgotten peer's conversation is gone: clear the
+              // selection and let the auto-select pick the next peer.
+              if (target === removed.destination) {
+                setTarget("");
+                setReplyTo(null);
+              }
+            }}
             onSelectPeer={selectPeer}
           />
 

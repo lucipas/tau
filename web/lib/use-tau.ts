@@ -6,12 +6,14 @@ import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
   BridgeInfo,
   CancelOutboxResponse,
+  ForgetPeerResponse,
   GroupsResponse,
   MarkReadResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
   Peer,
+  PeersResponse,
   PingResult,
   SendResponse,
   Snapshot,
@@ -183,6 +185,17 @@ export function useTau() {
 
   const refreshSeq = useRef(0);
   const groupsSeq = useRef(0);
+  const peersSeq = useRef(0);
+
+  const refreshPeers = useCallback(async () => {
+    // Same polling shape as the outbox: only the newest issued request
+    // may replace state, so a slow poll cannot restore a peer a forget
+    // already removed.
+    const requestId = ++peersSeq.current;
+    const result = await apiGet<PeersResponse>("/api/peers");
+    if (requestId !== peersSeq.current) return;
+    setPeers(sortPeers(result.peers));
+  }, []);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -313,6 +326,29 @@ export function useTau() {
     }
   }, []);
 
+  const forgetPeer = useCallback(
+    async (destination: string, force = false) => {
+      const result = await apiPost<ForgetPeerResponse>("/api/peers/forget", {
+        target: destination,
+        force,
+      });
+      // The forget already succeeded: drop the peer locally at once,
+      // and treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful forget look like a failure.
+      const removed = result.peer.destination;
+      setPeers((previous) =>
+        previous.filter((entry) => entry.destination !== removed),
+      );
+      try {
+        await refreshPeers();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result.peer;
+    },
+    [refreshPeers],
+  );
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -343,6 +379,8 @@ export function useTau() {
     markRead,
     refreshOutbox,
     refreshGroups,
+    refreshPeers,
     cancelOutbox,
+    forgetPeer,
   };
 }
