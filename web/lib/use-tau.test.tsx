@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
 import type { BlockPeerResponse, Peer, Snapshot, TauMessage } from "./types";
@@ -11,8 +11,9 @@ vi.mock("./api", () => ({
   eventsUrl: () => "/api/events",
 }));
 
-import { apiPost } from "./api";
+import { apiGet, apiPost } from "./api";
 
+const mockedGet = apiGet as Mock;
 const mockedPost = apiPost as Mock;
 
 // useTau opens an EventSource on mount; capture it so tests can push
@@ -43,7 +44,6 @@ class FakeEventSource {
   close() {}
 }
 
-vi.stubGlobal("EventSource", FakeEventSource);
 
 function makePeer(overrides: Partial<Peer> = {}): Peer {
   return {
@@ -71,6 +71,7 @@ function makeSnapshot(peers: Peer[], messages: TauMessage[] = []): Snapshot {
     },
     peers,
     messages,
+    groups: [],
     counts: { messages: messages.length, peers: peers.length },
     unread: { per_peer: {}, total: 0 },
     bridge: { version: "0.1.0", web: true, url: "http://127.0.0.1:8787" },
@@ -104,6 +105,11 @@ function deferred<T>() {
 beforeEach(() => {
   vi.resetAllMocks();
   FakeEventSource.instances.length = 0;
+  vi.stubGlobal("EventSource", FakeEventSource);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
@@ -260,5 +266,102 @@ describe("useTau blockPeer / unblockPeer", () => {
 
     expect(result.current.messages).toEqual([]);
     expect(result.current.peers[0].blocked).toBe(true);
+  });
+});
+
+describe("useTau search", () => {
+  it("fetches the search endpoint and shows the results", async () => {
+    const hit = makeMessage({ id: 2, text: "mesh hit" });
+    mockedGet.mockResolvedValue({ messages: [hit], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/messages/search?q=mesh&limit=100",
+    );
+    expect(result.current.searchQuery).toBe("mesh");
+    expect(result.current.searchResults).toEqual([hit]);
+    expect(result.current.searchError).toBeNull();
+  });
+
+  it("resubmitting the same query refreshes instead of clearing", async () => {
+    const first = makeMessage({ id: 2, text: "mesh hit" });
+    const refreshed = makeMessage({ id: 3, text: "mesh hit, again" });
+    mockedGet
+      .mockResolvedValueOnce({ messages: [first], count: 1 })
+      .mockResolvedValueOnce({ messages: [refreshed], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([first]);
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+
+    expect(mockedGet).toHaveBeenCalledTimes(2);
+    // The refresh replaces the results; it never flashes an empty list.
+    expect(result.current.searchResults).toEqual([refreshed]);
+    expect(result.current.searchQuery).toBe("mesh");
+  });
+
+  it("surfaces a search failure and keeps the previous results", async () => {
+    const hit = makeMessage({ id: 2, text: "mesh hit" });
+    mockedGet
+      .mockResolvedValueOnce({ messages: [hit], count: 1 })
+      .mockRejectedValueOnce(new Error("bridge unreachable"));
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([hit]);
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+
+    expect(result.current.searchError).toBe("bridge unreachable");
+    expect(result.current.searchResults).toEqual([hit]);
+    expect(result.current.searchQuery).toBe("mesh");
+  });
+
+  it("clearing the search returns to the live feed", async () => {
+    const hit = makeMessage({ id: 2, text: "mesh hit" });
+    mockedGet.mockResolvedValue({ messages: [hit], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchQuery).toBe("mesh");
+
+    act(() => {
+      result.current.clearSearch();
+    });
+
+    expect(result.current.searchQuery).toBeNull();
+    expect(result.current.searchResults).toEqual([]);
+    expect(result.current.searchError).toBeNull();
+  });
+
+  it("ignores a blank query", async () => {
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("   ");
+    });
+
+    expect(mockedGet).not.toHaveBeenCalled();
+    expect(result.current.searchQuery).toBeNull();
   });
 });

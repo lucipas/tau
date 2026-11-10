@@ -36,6 +36,7 @@ function renderSidebar(
           makePeer({ destination: "cd".repeat(16), name: "bob" }),
         ]
       }
+      groups={[]}
       bridge={null}
       pings={{}}
       blocks={overrides.blocks ?? {}}

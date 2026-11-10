@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import type { BridgeInfo, NodeInfo, Peer } from "@/lib/types";
+import type { BridgeInfo, NodeInfo, Peer, TauGroup } from "@/lib/types";
 import type { BlockState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
@@ -17,6 +17,7 @@ import { CopyButton, PingIcon, SectionLabel, SignalIcon } from "./ui";
 export function PeerSidebar({
   node,
   peers,
+  groups,
   bridge,
   pings,
   blocks,
@@ -29,6 +30,7 @@ export function PeerSidebar({
 }: {
   node: NodeInfo | null;
   peers: Peer[];
+  groups: TauGroup[];
   bridge: BridgeInfo | null;
   pings: Record<string, PingState>;
   blocks: Record<string, BlockState>;
@@ -336,6 +338,41 @@ export function PeerSidebar({
                 </li>
               );
             })}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl border border-line/80 bg-panel/60 p-4">
+        <div className="flex items-center justify-between">
+          <SectionLabel>groups</SectionLabel>
+          <span className="rounded-full border border-line bg-void/60 px-2 py-0.5 font-mono text-[10px] text-mist">
+            {groups.length}
+          </span>
+        </div>
+
+        {groups.length === 0 ? (
+          <p className="mt-3 text-[11px] leading-relaxed text-mist">
+            No group chats yet. Create one with{" "}
+            <code className="text-zinc-300">
+              tau group create NAME --peer ...
+            </code>
+            ; composing from the console comes later.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {groups.map((group) => (
+              <li
+                key={group.id}
+                className="rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
+              >
+                <p className="truncate text-xs font-medium text-zinc-200">
+                  {group.name}
+                </p>
+                <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
+                  {group.members.map((member) => member.name).join(", ")}
+                </p>
+              </li>
+            ))}
           </ul>
         )}
       </section>
