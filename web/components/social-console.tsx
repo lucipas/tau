@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
 import type { TanPost } from "@/lib/types";
@@ -34,6 +34,8 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Hashes with a repost request in flight; see submitRepost.
+  const repostingRef = useRef<Set<string>>(new Set());
   // The feed shows the timeline or, when the mentions view is selected,
   // the replies to your own posts instead.
   const shown = tan.showMentions ? tan.mentions : tan.posts;
@@ -90,11 +92,17 @@ export function SocialConsole() {
   }
 
   async function submitRepost(post: TanPost) {
+    // A ref, not state: two clicks before React re-renders must not both
+    // send a repost, or the second one reports the store's duplicate error.
+    if (repostingRef.current.has(post.hash)) return;
+    repostingRef.current.add(post.hash);
     setError(null);
     try {
       await tan.repost(post.hash);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not repost");
+    } finally {
+      repostingRef.current.delete(post.hash);
     }
   }
 
