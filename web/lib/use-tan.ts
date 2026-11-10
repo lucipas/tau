@@ -171,7 +171,15 @@ export function useTan() {
   const editPost = useCallback(
     async (target: string, text: string) => {
       await apiPost("/api/tan/edit", { target, text });
-      await load();
+      // The edit is already committed. A refresh failure must not make the
+      // caller treat the edit as failed, so report it as a feed error instead.
+      try {
+        await load();
+      } catch (caught) {
+        setError(
+          caught instanceof Error ? caught.message : "could not load the feed",
+        );
+      }
     },
     [load],
   );
