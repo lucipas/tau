@@ -27,6 +27,12 @@ export function useTan() {
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The thread currently open in the console, if any: the reference it
+  // was opened with and its entries (null while none is open).
+  const [threadPosts, setThreadPosts] = useState<TanPost[] | null>(null);
+  const [threadRef, setThreadRef] = useState<string | null>(null);
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [threadError, setThreadError] = useState<string | null>(null);
 
   // The filter the timeline is showing right now. Actions refresh through
   // this ref instead of a captured `all`, so a filter switch mid-action
@@ -35,6 +41,11 @@ export function useTan() {
   useEffect(() => {
     allRef.current = all;
   }, [all]);
+
+  // The open thread's reference, kept alongside `threadRef` so a feed
+  // load can reload the thread without waiting for the state update.
+  // Set directly in `openThread`/`closeThread` for the same reason.
+  const openThreadRef = useRef<string | null>(null);
 
   // Monotonic generation of feed loads. A newer load supersedes an older
   // one, so a slow response (for example a poll tick started before a
@@ -72,10 +83,50 @@ export function useTan() {
       setPosts(timeline.posts);
       setFollowing(follows.following);
       setError(null);
+      // An open thread reloads with the feed, so a new reply (or a
+      // like, or a delete) shows without reopening the thread. A
+      // failure here must not fail the feed load: a 400 means the
+      // anchor itself is gone (its root was deleted), so the thread
+      // closes and the timeline takes over; any other failure keeps
+      // the previous entries and reports the error instead.
+      const ref = openThreadRef.current;
+      if (ref !== null) {
+        try {
+          const thread = await apiGet<TanTimelineResponse>(
+            `/api/tan/thread?ref=${encodeURIComponent(ref)}`,
+          );
+          if (generationRef.current !== generation) return false;
+          setThreadPosts(thread.posts);
+          setThreadError(null);
+        } catch (caught) {
+          if (generationRef.current !== generation) return false;
+          const status = (caught as { status?: unknown } | null)?.status;
+          if (status === 400) {
+            openThreadRef.current = null;
+            setThreadRef(null);
+            setThreadPosts(null);
+            setThreadError(null);
+          } else {
+            setThreadError(
+              caught instanceof Error
+                ? caught.message
+                : "could not load the thread",
+            );
+          }
+        } finally {
+          if (generationRef.current === generation) setThreadLoading(false);
+        }
+      }
       return true;
     } finally {
       if (pendingRef.current?.generation === generation) {
         pendingRef.current = null;
+      }
+      // A feed load that fails before reaching the thread (or is the
+      // load that opened it) must not leave the thread spinner stuck;
+      // a superseded load leaves the flag to the load that replaced it.
+      if (generationRef.current === generation) {
+        setThreadLoading(false);
       }
     }
   }, []);
@@ -229,6 +280,42 @@ export function useTan() {
     },
     [load, reloadSaved],
   );
+  const openThread = useCallback(
+    async (ref: string) => {
+      // The ref goes in the ref first: `load` reads it synchronously,
+      // and the state update alone would arrive too late.
+      openThreadRef.current = ref;
+      setThreadRef(ref);
+      setThreadPosts(null);
+      setThreadLoading(true);
+      setThreadError(null);
+      try {
+        await load();
+      } catch (caught) {
+        // The feed load failed before the thread request ran, so the
+        // thread has no entries and no error of its own yet. Report
+        // the failure instead of leaving a thread view that claims
+        // to be empty. (A thread-fetch failure is caught inside
+        // `load` and never reaches this path.)
+        if (openThreadRef.current === ref) {
+          setThreadError(
+            caught instanceof Error
+              ? caught.message
+              : "could not load the thread",
+          );
+        }
+      }
+    },
+    [load],
+  );
+
+  const closeThread = useCallback(() => {
+    openThreadRef.current = null;
+    setThreadRef(null);
+    setThreadPosts(null);
+    setThreadLoading(false);
+    setThreadError(null);
+  }, []);
 
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
@@ -322,6 +409,12 @@ export function useTan() {
     posting,
     syncing,
     error,
+    threadPosts,
+    threadRef,
+    threadLoading,
+    threadError,
+    openThread,
+    closeThread,
     refresh,
     publish,
     follow,
