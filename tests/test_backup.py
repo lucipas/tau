@@ -40,17 +40,33 @@ def _id_destination(data_dir, capsys):
 
 
 def _seed_state(data_dir):
-    """Write one of every back-up file so the round-trip is meaningful."""
+    """Write one of every back-up file so the round-trip is meaningful.
+
+    Returns the received files seeded under ``files/``, as
+    ``{member name: bytes}``, for the caller to compare after restore.
+    """
     (data_dir / "peers.json").write_text('{"peers": []}\n', encoding="utf-8")
     (data_dir / "mailbox.json").write_text('{"outbox": []}\n', encoding="utf-8")
     (data_dir / "inbox.json").write_text('{"messages": []}\n', encoding="utf-8")
     (data_dir / "messages.json").write_text('{"messages": []}\n', encoding="utf-8")
     (data_dir / "tan-rules.json").write_text('{"kinds": ["post"]}\n', encoding="utf-8")
     (data_dir / "allowlist.json").write_text('{"allowed": []}\n', encoding="utf-8")
+    (data_dir / "groups.json").write_text('{"groups": []}\n', encoding="utf-8")
+    (data_dir / "blocklist.json").write_text('{"blocked": []}\n', encoding="utf-8")
     conn = init_db(data_dir / "tan.sqlite3")
     conn.close()
     # Runtime state that must never be archived.
     (data_dir / "node.lock").write_text("1234", encoding="utf-8")
+    # Received files, one per sender, as the node stores them.
+    received = {
+        "files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report.pdf": b"%PDF-1.4 fake\n",
+        "files/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/photo.png": b"\x89PNG fake\n",
+    }
+    for name, data in received.items():
+        path = data_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return received
 
 
 def test_parser_backup_restore_subcommands():
@@ -69,7 +85,7 @@ def test_parser_backup_restore_subcommands():
 
 def test_backup_restore_round_trip(tmp_path, capsys):
     node_a = _init_node(tmp_path, "a", "alice")
-    _seed_state(node_a)
+    received = _seed_state(node_a)
     capsys.readouterr()
     destination_a = _id_destination(node_a, capsys)
     contents_before = {
@@ -77,6 +93,7 @@ def test_backup_restore_round_trip(tmp_path, capsys):
         for name in BACKUP_FILES
         if (node_a / name).is_file()
     }
+    contents_before.update(received)
     assert "identity" in contents_before
     assert "tan.sqlite3" in contents_before
     assert "reticulum/config" in contents_before
@@ -253,6 +270,87 @@ def test_restore_force_removes_state_absent_from_archive(tmp_path, capsys):
     assert not (node_b / "tan.sqlite3").exists()
     assert not (node_b / "tan.sqlite3-wal").exists()
     assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_backup_skips_symlinks_under_files(tmp_path, capsys):
+    # A symlink under files/ — whether a symlinked file or a symlinked
+    # sender directory — must never be followed into the archive: the
+    # target could sit outside the data directory.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    sender = node_a / "files" / "cccccccccccccccccccccccccccccccc"
+    sender.mkdir(parents=True, exist_ok=True)
+    (sender / "link.bin").symlink_to(outside)
+    (node_a / "files" / "dddddddddddddddddddddddddddddddd").symlink_to(
+        sender, target_is_directory=True
+    )
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = tar.getnames()
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+        assert all(
+            tar.getmember(name).isreg()
+            for name in names
+            if name != MANIFEST_NAME
+        )
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+    assert not any(name.endswith("link.bin") for name in names)
+    assert not any("dddddddd" in name for name in names)
+
+
+def test_restore_force_removes_stale_groups_blocklist_files(tmp_path, capsys):
+    # A --force restore replaces the whole node state, including the
+    # newly backed-up files: groups, blocklist and received files the
+    # archive does not hold must not survive it.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "bob")
+    (node_b / "groups.json").write_text('{"groups": []}\n', encoding="utf-8")
+    (node_b / "blocklist.json").write_text('{"blocked": []}\n', encoding="utf-8")
+    stale = node_b / "files" / "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" / "stale.bin"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale\n")
+    capsys.readouterr()
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--force"])
+        == 0
+    )
+    capsys.readouterr()
+    assert not (node_b / "groups.json").exists()
+    assert not (node_b / "blocklist.json").exists()
+    assert not stale.exists()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_restore_rejects_misplaced_files_member(tmp_path):
+    # Received-file members are exactly files/<sender>/<name>: a file
+    # directly under files/, or nested any deeper, is not a member
+    # this module ever writes.
+    node = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=node)
+    for bad_name in ("files/evil", "files/a/b/c"):
+        archive = tmp_path / "bad.tar.gz"
+        _write_archive(
+            archive,
+            {"format": 1, "files": ["identity", bad_name]},
+            [("identity", b"x"), (bad_name, b"x")],
+        )
+        with pytest.raises(Exception, match="unexpected member"):
+            restore_backup(config, archive)
+        assert not (node / "identity").exists()
 
 
 def test_restore_rejects_archive_without_identity(tmp_path):

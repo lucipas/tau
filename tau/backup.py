@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from . import __version__
-from .config import TauConfig
+from .config import FILES_DIR_NAME, TauConfig
 from .instance_lock import BackupError, InstanceLock
 from .util import ensure_dir
 
@@ -46,6 +46,9 @@ RNS_CONFIG_MEMBER = "reticulum/config"
 # Archive member -> path relative to the data directory.  Only these
 # files are ever written to or read from a backup.  The Reticulum config
 # is read from, and restored to, the configured location (--rns-config).
+# Received files live under files/<sender>/<name> and are enumerated
+# separately: their member names are variable, so they are not listed
+# here but validated by _is_received_file_member().
 BACKUP_FILES = (
     "identity",
     "node.json",
@@ -56,6 +59,8 @@ BACKUP_FILES = (
     SOCIAL_DB_NAME,
     "tan-rules.json",
     "allowlist.json",
+    "groups.json",
+    "blocklist.json",
     RNS_CONFIG_MEMBER,
 )
 
@@ -92,9 +97,58 @@ def _is_within(path: Path, directory: Path) -> bool:
     return True
 
 
-def _destinations(config: TauConfig) -> Dict[str, Path]:
+def _is_received_file_member(name: str) -> bool:
+    """True when *name* is a received-file member: ``files/<sender>/<name>``.
+
+    Received files are always exactly two levels under ``files/`` — the
+    sender directory is the sender's destination hash and the file name
+    is a bare name (see ``parse_file_offer``) — so anything shallower,
+    deeper, or naming ``.`` / ``..`` is not a member this module ever
+    writes and is rejected as unexpected on restore.
+    """
+    parts = Path(name).parts
+    return (
+        len(parts) == 3
+        and parts[0] == FILES_DIR_NAME
+        and all(part not in ("", ".", "..") for part in parts[1:])
+    )
+
+
+def _received_files(config: TauConfig) -> List[str]:
+    """Member names of the regular files under the received-files directory.
+
+    Symlinks are never followed: a symlinked ``files/`` directory, a
+    symlinked sender directory, or a symlinked file is skipped, so a
+    backup can never smuggle in a path outside the data directory.
+    """
+    files_dir = config.files_dir
+    if files_dir.is_symlink() or not files_dir.is_dir():
+        return []
+    members: List[str] = []
+    try:
+        senders = sorted(files_dir.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    for sender_dir in senders:
+        if sender_dir.is_symlink() or not sender_dir.is_dir():
+            continue
+        try:
+            entries = sorted(sender_dir.iterdir(), key=lambda path: path.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            members.append(f"{FILES_DIR_NAME}/{sender_dir.name}/{entry.name}")
+    return members
+
+
+def _destinations(
+    config: TauConfig, received: List[str] = ()
+) -> Dict[str, Path]:
     """Live location of every allowlisted archive member."""
     paths = {name: config.data_dir / name for name in BACKUP_FILES}
+    paths.update({name: config.data_dir / name for name in received})
     paths[RNS_CONFIG_MEMBER] = config.rns_config_file
     return paths
 
@@ -165,7 +219,14 @@ def create_backup(
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
     lock.acquire()
     try:
+        # Enumerated under the lock, so the member list cannot drift
+        # from the files actually archived below.
+        received = _received_files(config)
+        destinations.update(
+            {name: config.data_dir / name for name in received}
+        )
         files = [name for name in BACKUP_FILES if destinations[name].is_file()]
+        files.extend(received)
         manifest = _manifest(config.data_dir, files, config.name)
         manifest_bytes = (
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -256,7 +317,7 @@ def _check_members(archive: tarfile.TarFile, manifest: Dict[str, object]) -> Lis
         name = member.name
         if name.startswith("/") or ".." in Path(name).parts:
             raise BackupError(f"not a tau backup: unsafe member path {name!r}")
-        if name not in allowed:
+        if name not in allowed and not _is_received_file_member(name):
             raise BackupError(f"not a tau backup: unexpected member {name!r}")
         if name not in expected:
             raise BackupError(f"not a tau backup: member {name!r} is not in the manifest")
@@ -430,8 +491,15 @@ def restore_backup(
             files = _check_members(archive, manifest)
         except _READ_ERRORS as exc:
             raise BackupError(f"not a valid tau backup: {exc}") from exc
-        destinations = _destinations(config)
+        destinations = _destinations(
+            config, [name for name in files if _is_received_file_member(name)]
+        )
         state = _state_paths(destinations)
+        # Received files on disk that the archive does not hold are
+        # stale state too: a --force restore removes them, like any
+        # other included file.
+        for name in _received_files(config):
+            state.setdefault(name, config.data_dir / name)
         # Create the data directory before taking the lock: the lock
         # file lives inside it, so acquiring first would fail on a
         # fresh directory.
