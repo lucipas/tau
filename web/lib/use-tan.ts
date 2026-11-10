@@ -16,6 +16,9 @@ const POLL_INTERVAL_MS = 5000;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  // The view that produced `posts`. After a switch the old posts belong to
+  // the previous ranking, so they are hidden until the new view loads.
+  const [postsView, setPostsView] = useState<"timeline" | "top" | null>(null);
   const [following, setFollowing] = useState<TanFollow[]>([]);
   const [all, setAll] = useState(false);
   // Which ranking the feed shows: the chronological timeline, or the
@@ -80,6 +83,7 @@ export function useTan() {
       ]);
       if (generationRef.current !== generation) return false;
       setPosts(feed.posts);
+      setPostsView(isTop ? "top" : "timeline");
       setFollowing(follows.following);
       setError(null);
       return true;
@@ -108,6 +112,7 @@ export function useTan() {
     // Re-running on a filter change must load the newly selected filter
     // even if a poll for the old one is still in flight; routine polls
     // skip while a load is pending instead of invalidating it.
+    setLoading(true);
     void tick(true);
     // The top ranking changes only when someone likes, unlikes, posts
     // or deletes, and every one of those actions reloads the current
@@ -206,7 +211,8 @@ export function useTan() {
   }, [load]);
 
   return {
-    posts,
+    // Posts from the other view are never shown under this view's label.
+    posts: postsView === view ? posts : [],
     following,
     all,
     setAll,
