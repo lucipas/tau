@@ -954,6 +954,11 @@ def test_bridge_mark_displayed_read_sends_once(tmp_path):
     while time.time() < deadline and not sent:
         time.sleep(0.05)
     assert sent == [("bb" * 16, ["msg-1"])]
+    # The receipt stamp is written by the sender thread after
+    # send_read_receipts returns, so wait for it instead of racing it.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and node.inbox.unreceipted():
+        time.sleep(0.05)
     assert node.inbox.unreceipted() == []
 
     # A second display does not re-send.
