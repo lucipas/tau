@@ -260,9 +260,12 @@ data directory. It prints the imported destination hash so you can verify it
 matches the old node. Anyone who reads the backup can impersonate the node
 and decrypt its traffic, so keep it private.
 
-To back up everything at once — identity, peer registry, queued outbox
+To back up identity, peer registry, queued outbox
 mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
-and the Reticulum config — use `tau backup`:
+and the Reticulum config, use `tau backup`:
+
+The backup does not include `groups.json`, `blocklist.json`, or received
+files in `files/`. Back up these paths separately if needed.
 
 ```bash
 tau backup ~/tau-backup.tar.gz
@@ -277,9 +280,9 @@ commands refuse while a node is serving on the data directory, so a backup
 never catches the mailbox or the Tan database half-written. `restore`
 validates the archive first — unknown format, unexpected members, absolute
 paths and `..` traversal are all rejected — and refuses to overwrite
-existing node state unless `--force` is given; a `--force` restore also
-removes node state the archive does not hold, so the result reflects only
-the backup. The archive holds the
+existing included node state unless `--force` is given; a `--force` restore
+also removes included node state the archive does not hold. It leaves
+excluded state unchanged. The archive holds the
 identity, so keep it as private as the identity file itself.
 
 ## How it works

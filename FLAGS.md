@@ -45,7 +45,7 @@ Global options may appear before or after the command:
 | `tau id` | Show this node's name, destination hash, LXMF delivery address, and safety number (fingerprint of this identity) |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
-| `tau backup FILE` | Back up the whole data directory (identity, peers, outbox, inbox, Tan) to one archive |
+| `tau backup FILE` | Back up the data directory (identity, peers, outbox, inbox, Tan) to one archive; excludes groups, the blocklist, and received files |
 | `tau restore FILE` | Restore a backup archive into a data directory |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
