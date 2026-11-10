@@ -1,5 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Mock } from "vitest";
 
 import { shortHash } from "@/lib/format";
 import type { TanPost } from "@/lib/types";
@@ -10,8 +12,32 @@ const mockTan = vi.hoisted(() => ({
   current: {} as Record<string, unknown>,
 }));
 
+// The search and mentions tests render the whole console, so the data
+// hook and the Next link are mocked; the PostCard tests above never
+// touch either.
 vi.mock("@/lib/use-tan", () => ({
-  useTan: () => mockTan.current,
+  useTan: vi.fn(() => mockTan.current),
+}));
+
+import { useTan } from "@/lib/use-tan";
+
+const mockedUseTan = useTan as Mock;
+// The search tests use this name for the same mock.
+const mockUseTan = mockedUseTan;
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+  }: {
+    href: string;
+    children: ReactNode;
+    className?: string;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
 }));
 
 function makePost(overrides: Partial<TanPost> = {}): TanPost {
@@ -170,6 +196,58 @@ describe("PostCard quote rendering", () => {
     ).toBeTruthy();
   });
 
+  it("reports a blocked original without resurfacing its name or text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "worth quoting",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "",
+          name: "",
+          text: "",
+          deleted: false,
+          blocked: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("worth quoting")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting a blocked author's post",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("reports a muted original without resurfacing its text", () => {
+    renderCard(
+      makePost({
+        kind: "quote",
+        text: "still worth it",
+        target: "e".repeat(64),
+        quoted: {
+          hash: "e".repeat(64),
+          author: "f".repeat(32),
+          name: "alice",
+          text: "",
+          deleted: false,
+          muted: true,
+        },
+      }),
+    );
+
+    expect(screen.getByText("still worth it")).toBeTruthy();
+    expect(
+      screen.getByText(
+        (_content, element) =>
+          element?.textContent === "quoting alice · a muted post",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows the quote count on the quoted post and hides it at zero", () => {
     const { rerender } = render(
       <PostCard
@@ -253,16 +331,36 @@ describe("SocialConsole muted sidebar", () => {
   function setTan(overrides: Record<string, unknown>) {
     mockTan.current = {
       posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
       following: [],
       mutedAuthors: [],
       mutedKeywords: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
       all: false,
       setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
       loading: false,
       posting: false,
       syncing: false,
       error: null,
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
       refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
       publish: vi.fn(),
       follow: vi.fn(),
       unfollow: vi.fn(),
@@ -344,5 +442,267 @@ describe("SocialConsole muted sidebar", () => {
       (screen.getByPlaceholderText("mute a word or phrase") as HTMLInputElement)
         .value,
     ).toBe("bitcoin ethereum");
+  });
+});
+
+
+describe("SocialConsole search", () => {
+  const mockSearch = vi.fn();
+  const mockClearSearch = vi.fn();
+
+  function makeTan(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: mockSearch,
+      clearSearch: mockClearSearch,
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it("submits the query to the search hook", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    mockUseTan.mockReturnValue(makeTan({ posts: [timelinePost] }));
+    render(<SocialConsole />);
+
+    fireEvent.change(screen.getByLabelText("Search stored posts"), {
+      target: { value: "mesh" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "search" }));
+
+    expect(mockSearch).toHaveBeenCalledTimes(1);
+    expect(mockSearch).toHaveBeenCalledWith("mesh");
+  });
+
+  it("shows search results instead of the timeline while searching", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const hit = makePost({ hash: "e".repeat(64), text: "mesh post" });
+    mockUseTan.mockReturnValue(
+      makeTan({
+        posts: [timelinePost],
+        searchResults: [hit],
+        searchQuery: "mesh",
+      }),
+    );
+    render(<SocialConsole />);
+
+    expect(screen.getByText("mesh post")).toBeTruthy();
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("search results")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "clear search" }));
+    expect(mockClearSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when nothing matches the search", () => {
+    mockUseTan.mockReturnValue(
+      makeTan({ posts: [makePost()], searchResults: [], searchQuery: "zzz" }),
+    );
+    render(<SocialConsole />);
+
+    expect(screen.getByText("No stored posts match “zzz”")).toBeTruthy();
+    expect(screen.queryByText("No posts yet")).toBeNull();
+  });
+});
+
+
+describe("SocialConsole mentions view", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("switches the feed to mentions and back", () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const mention = makePost({
+      hash: "e".repeat(64),
+      text: "seconded",
+      author: "f".repeat(64),
+      name: "bob",
+      own: false,
+    });
+    const state = hookState({ posts: [timelinePost], mentions: [mention] });
+    mockedUseTan.mockReturnValue(state);
+
+    const { rerender } = render(<SocialConsole />);
+    expect(screen.getByText("timeline post")).toBeTruthy();
+    expect(screen.queryByText("seconded")).toBeNull();
+
+    fireEvent.click(screen.getByText("mentions"));
+    expect(state.setShowMentions).toHaveBeenCalledWith(true);
+
+    mockedUseTan.mockReturnValue({ ...state, showMentions: true });
+    rerender(<SocialConsole />);
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("seconded")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "following" }));
+    expect(state.setShowMentions).toHaveBeenCalledWith(false);
+    expect(state.setAll).toHaveBeenCalledWith(false);
+  });
+
+  it("says there are no replies yet when the mentions list is empty", () => {
+    mockedUseTan.mockReturnValue(hookState({ showMentions: true }));
+
+    render(<SocialConsole />);
+    expect(screen.getByText("No replies yet")).toBeTruthy();
+  });
+
+  it("shows the load error instead of an empty state when the feed fails", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({
+        showMentions: true,
+        error: "this node has no identity yet",
+      }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.getByText("this node has no identity yet")).toBeTruthy();
+    expect(screen.queryByText("No replies yet")).toBeNull();
+  });
+});
+
+
+describe("PostCard save control", () => {
+  function renderCard(post: TanPost, onToggleSave = vi.fn()) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onToggleSave={onToggleSave}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+    return onToggleSave;
+  }
+
+  it("offers to save an unsaved post and calls back with the post", () => {
+    const post = makePost({ saved: false });
+    const onToggleSave = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Save this post to read later"));
+    expect(onToggleSave).toHaveBeenCalledTimes(1);
+    expect(onToggleSave).toHaveBeenCalledWith(post);
+  });
+
+  it("shows a saved post as saved, with when it was saved", () => {
+    renderCard(makePost({ saved: true, saved_at: 2000 }));
+
+    expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
+    expect(screen.getByText("★ saved")).toBeTruthy();
+    expect(screen.getByText(/saved /)).toBeTruthy();
+  });
+
+  it("hides the save control when no handler is given", () => {
+    render(
+      <PostCard
+        post={makePost()}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+
+    expect(screen.queryByTitle("Save this post to read later")).toBeNull();
+    expect(screen.queryByTitle("Remove from saved posts")).toBeNull();
+  });
+
+  it("shows a deleted saved post as deleted, keeping only unsave", () => {
+    renderCard(makePost({ deleted: true, text: "", saved: true }));
+
+    expect(screen.getByText("This post was deleted.")).toBeTruthy();
+    expect(screen.queryByTitle("Like this post")).toBeNull();
+    expect(screen.queryByTitle("Reply to this post")).toBeNull();
+    expect(screen.queryByTitle("Delete this post")).toBeNull();
+    // The save toggle stays so the post can still be removed from the list.
+    expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
   });
 });

@@ -23,6 +23,9 @@ export interface TauMessage {
   read_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
+  // Group DM context, present on inbound group messages.
+  group?: string;
+  group_name?: string;
   // Sender-set expiry (epoch seconds). Absent when the message never
   // expires; the console purges it once the deadline passes.
   expires_at?: number;
@@ -38,6 +41,23 @@ export interface TauMessage {
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.
   in_reply_to?: { id: string; excerpt: string | null } | null;
+}
+
+export interface TauGroupMember {
+  hash: string;
+  name: string;
+}
+
+export interface TauGroup {
+  id: string;
+  name: string;
+  members: TauGroupMember[];
+  created_at: number;
+}
+
+export interface GroupsResponse {
+  groups: TauGroup[];
+  count: number;
 }
 
 export interface Peer {
@@ -104,6 +124,7 @@ export interface BridgeInfo {
 export interface Snapshot {
   node: NodeInfo;
   peers: Peer[];
+  groups: TauGroup[];
   messages: TauMessage[];
   counts: Counts;
   unread: UnreadCounts;
@@ -176,11 +197,20 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  reposts?: number;
+  reposted?: boolean;
   quotes?: number;
   own?: boolean;
+  saved?: boolean;
+  saved_at?: number;
+  deleted?: boolean;
+  // Thread entries carry their depth (the root is 0); timeline entries
+  // have no depth.
+  depth?: number;
 }
 
 export interface TanFollow {
@@ -192,9 +222,20 @@ export interface TanFollow {
   last_post?: number;
 }
 
+export interface MessagesSearchResponse {
+  messages: TauMessage[];
+  count: number;
+}
+
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;
+}
+
+export interface TanSavedResponse {
+  posts: TanPost[];
+  count: number;
+  next_offset: number | null;
 }
 
 export interface TanFollowingResponse {

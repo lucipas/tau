@@ -102,6 +102,7 @@ export function Console() {
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
+            groups={tau.groups}
             bridge={tau.bridge}
             pings={tau.pings}
             unread={tau.unread.per_peer}
@@ -114,9 +115,17 @@ export function Console() {
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed
-              messages={tau.messages}
+              messages={
+                tau.searchQuery !== null ? tau.searchResults : tau.messages
+              }
               node={tau.node}
               live={tau.connection === "live"}
+              searching={tau.searchQuery !== null}
+              searchQuery={tau.searchQuery}
+              searchError={tau.searchError}
+              quoteContext={tau.messages}
+              onSearch={tau.search}
+              onClearSearch={tau.clearSearch}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {

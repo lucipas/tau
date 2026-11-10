@@ -5,7 +5,9 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    GET  /api/groups       known group DMs with their member lists
     GET  /api/messages     recent inbound/outbound messages
+    GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
@@ -15,6 +17,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/search   search stored posts by keyword
+    GET  /api/tan/mentions replies to your own posts
+    GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -29,6 +34,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/mute-keyword mute a keyword
     POST /api/tan/unmute-keyword unmute a keyword
     POST /api/tan/sync     pull missing posts from peers
+    GET  /api/tan/saved    saved posts, newest save first
+    POST /api/tan/save     save a post to read later
+    POST /api/tan/unsave   remove a post from the saved list
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -360,6 +368,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # Kept so a message still queued across a restart can be matched
         # when its delivery is reported.
         message["mail_id"] = mail_id
+    group = entry.get("group")
+    if isinstance(group, str):
+        message["group"] = group
+        group_name = entry.get("group_name")
+        if isinstance(group_name, str):
+            message["group_name"] = group_name
     wire_id = entry.get("wire_id")
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message, and
@@ -655,6 +669,7 @@ class WebBridge:
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        group = record.get("group") if record.get("kind") == "group" else None
         expires_at = record.get("expires_at")
         if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
             expires_at = None
@@ -667,6 +682,12 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            group=group if isinstance(group, str) else None,
+            group_name=(
+                str(record.get("group_name") or "")
+                if isinstance(record.get("group_name"), str)
+                else None
+            ),
             expires_at=float(expires_at) if expires_at is not None else None,
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
@@ -948,6 +969,7 @@ class WebBridge:
             annotate_quotes,
             annotate_reactions,
             annotate_replies,
+            annotate_saved,
             apply_display_rules,
             author_timeline,
             following,
@@ -1003,6 +1025,176 @@ class WebBridge:
                     exclude_authors=blocked,
                     exclude_all=exclude_all,
                 )
+            annotate_saved(conn, posts)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_thread(self, ref: str) -> List[Dict[str, Any]]:
+        """Return the thread rooted at the post *ref* names, oldest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_thread`: the same resolution and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same reference.  A reference that names no post,
+        or a deleted or unlinked one, raises :class:`TanError` (via
+        :func:`tau.tangents.tan.thread`) and the HTTP layer reports it
+        as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, thread
+
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("field 'ref' is required")
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            posts = thread(conn, ref.strip(), viewer=viewer)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_mentions(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+        """Return replies to this node's own posts, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_mentions`: the same selection
+        and visibility rules, so the console shows exactly what the
+        CLI shows for the same store, plus the console's display rules
+        (the thread view applies the same).  The node's block-list is
+        applied as in :meth:`tan_timeline`.  Without an identity there
+        is nothing of yours to be replied to, so this raises
+        :class:`RequestError`, which the HTTP layer reports as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, mentions
+
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if viewer is None:
+                raise RequestError(
+                    "this node has no identity, so there are no replies to show; "
+                    "run `tau init` to create one"
+                )
+            posts = mentions(
+                conn,
+                viewer,
+                limit=limit,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_search(
+        self,
+        *,
+        query: str,
+        author: Optional[str] = None,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Return stored posts matching a keyword, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_search`: the same case-insensitive
+        substring match and visibility rules, so the console shows exactly
+        what the CLI shows for the same store.  The node's block-list is
+        applied as in :meth:`tan_timeline`, and display rules are applied
+        on top.  An empty query or an author that cannot be resolved
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            TanError,
+            apply_display_rules,
+            resolve_author,
+            search_posts,
+        )
+
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            target = None
+            if author:
+                try:
+                    target, _ = resolve_author(
+                        conn, author, registry=self.node.registry
+                    )
+                except TanError as exc:
+                    raise RequestError(str(exc)) from exc
+            try:
+                posts = search_posts(
+                    conn,
+                    query,
+                    author=target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
+            except TanError as exc:
+                raise RequestError(str(exc)) from exc
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1195,6 +1387,59 @@ class WebBridge:
         finally:
             conn.close()
         return app.delete(post_hash, publish=True)
+
+    def tan_save(self, target: str) -> Dict[str, Any]:
+        # Saves are local-only: no signed entry and no gossip, so the
+        # social app is not needed — the same as `tau tan save`.
+        from .tangents.tan import save_post
+
+        conn = self._tan_conn()
+        try:
+            return save_post(conn, target)
+        finally:
+            conn.close()
+
+    def tan_unsave(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unsave_post
+
+        conn = self._tan_conn()
+        try:
+            return unsave_post(conn, target)
+        finally:
+            conn.close()
+
+    def tan_saved(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import annotated_saved_posts
+
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            posts, next_offset = annotated_saved_posts(
+                conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
+            )
+            return {"posts": posts, "next_offset": next_offset}
+        finally:
+            conn.close()
 
     def tan_sync(self, *, explore: bool = True) -> Dict[str, Any]:
         app = self._tan_app()
@@ -1459,6 +1704,36 @@ class WebBridge:
             )
         return items
 
+    def groups(self) -> List[Dict[str, Any]]:
+        try:
+            groups = []
+            for group in self.node.groups.list_groups():
+                members = []
+                for member_hash in group["members"]:
+                    peer = self.node.registry.get(member_hash)
+                    members.append(
+                        {
+                            "hash": member_hash,
+                            "name": (
+                                peer.display_name
+                                if peer is not None
+                                else member_hash[:8]
+                            ),
+                        }
+                    )
+                groups.append(
+                    {
+                        "id": group["id"],
+                        "name": group["name"],
+                        "members": members,
+                        "created_at": group["created_at"],
+                    }
+                )
+            return groups
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store", exc_info=True)
+            return []
+
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -1500,6 +1775,41 @@ class WebBridge:
         return [
             self._with_inbox_reactions(dict(item), by_target) for item in items
         ]
+
+    def messages_search(
+        self,
+        *,
+        query: str,
+        peer: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return stored messages matching a keyword, newest first.
+
+        A case-insensitive substring match over the message text, over
+        the same stored history the traffic view shows: :meth:`messages`
+        already purges expired disappearing messages, hides blocked
+        senders and annotates reactions, so search reuses it instead of
+        re-reading the log.  An optional *peer* narrows to one peer by
+        destination prefix or peer-name substring.  An empty query
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        needle = query.strip().casefold()
+        items = self.messages(limit=-1)
+        if peer is not None and peer.strip():
+            target = peer.strip().casefold()
+            items = [
+                item
+                for item in items
+                if (item.get("peer") or "").casefold().startswith(target)
+                or target in (item.get("peer_name") or "").casefold()
+            ]
+        matches = [
+            item for item in items if needle in (item.get("text") or "").casefold()
+        ]
+        return matches[::-1][:limit] if limit > 0 else []
 
     def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
         """Node inbox reactions grouped by target, reloaded once per read.
@@ -1610,6 +1920,7 @@ class WebBridge:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
+            "groups": self.groups(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
             "unread": self.unread(),
@@ -1636,6 +1947,8 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        group: Optional[str] = None,
+        group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
@@ -1656,6 +1969,10 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if group is not None:
+                message["group"] = group
+                if group_name:
+                    message["group_name"] = group_name
             if expires_at is not None:
                 message["expires_at"] = expires_at
             if wire_id is not None:
@@ -1828,9 +2145,26 @@ class _WebHandler(BaseHTTPRequestHandler):
                 peers = self.bridge.peers()
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
                 return
+            if path == "/api/groups":
+                groups = self.bridge.groups()
+                self._send_json({"groups": groups, "count": len(groups)}, head_only)
+                return
             if path == "/api/messages":
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                return
+            if path == "/api/messages/search":
+                limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                peer = (query.get("peer") or [None])[0]
+                try:
+                    found = self.bridge.messages_search(
+                        query=text, peer=peer, limit=limit
+                    )
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"messages": found, "count": len(found)}, head_only)
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
@@ -1844,6 +2178,49 @@ class _WebHandler(BaseHTTPRequestHandler):
                         limit=limit, include_all=include_all, author=author
                     )
                 except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/search":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                author = (query.get("author") or [None])[0]
+                try:
+                    posts = self.bridge.tan_search(
+                        query=text, author=author, limit=limit
+                    )
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/mentions":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                try:
+                    posts = self.bridge.tan_mentions(limit=limit)
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/thread":
+                ref = (query.get("ref") or [None])[0]
+                if not ref or not ref.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'ref' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    posts = self.bridge.tan_thread(ref.strip())
+                except ValueError as exc:
+                    # Only an invalid reference is a client error; an
+                    # unexpected failure (a database error, say) must
+                    # reach the server-error handler as a 500, so the
+                    # console does not mistake it for a deleted anchor
+                    # and close the thread.
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
@@ -1864,6 +2241,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                 records = self.bridge.tan_muted_keywords()
                 self._send_json(
                     {"muted_keywords": records, "count": len(records)},
+                    head_only,
+                )
+                return
+            if path == "/api/tan/saved":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
+                try:
+                    result = self.bridge.tan_saved(limit=limit, offset=offset)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load saved Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load saved posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
                     head_only,
                 )
                 return
@@ -2036,6 +2440,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "delete": record}, head_only)
+                return
+            if path in ("/api/tan/save", "/api/tan/unsave"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unsave"):
+                        result = self.bridge.tan_unsave(target.strip())
+                    else:
+                        result = self.bridge.tan_save(target.strip())
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a saved Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update saved posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json({"ok": True, "save": result}, head_only)
                 return
             if path == "/api/tan/sync":
                 try:
