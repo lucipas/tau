@@ -89,6 +89,12 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [groups, setGroups] = useState<TauGroup[]>([]);
+  // The latest roster swap: the console uses it to keep a selected old
+  // group id pointing at its successor.
+  const [groupSwap, setGroupSwap] = useState<{
+    from: string;
+    to: string;
+  } | null>(null);
   const [messages, setMessages] = useState<TauMessage[]>([]);
   // The search the feed is showing, or null for the live traffic. Kept
   // beside `messages` so a search result list is never mixed into the
@@ -712,13 +718,24 @@ export function useTau() {
       const updated = result.group;
       const previousId = result.previous_id;
       groupEdits.current += 1;
-      setGroups((previous) =>
-        previous.some((entry) => entry.id === previousId)
-          ? previous.map((entry) =>
-              entry.id === previousId ? updated : entry,
-            )
-          : [...previous, updated],
-      );
+      setGroups((previous) => {
+        // A snapshot may already list the successor: keep one entry per
+        // id, placed where the old group was.
+        const rest = previous.filter(
+          (entry) => entry.id !== previousId && entry.id !== updated.id,
+        );
+        const index = previous.findIndex((entry) => entry.id === previousId);
+        if (index === -1) return [...rest, updated];
+        const before = previous
+          .slice(0, index)
+          .filter(
+            (entry) => entry.id !== previousId && entry.id !== updated.id,
+          ).length;
+        return [...rest.slice(0, before), updated, ...rest.slice(before)];
+      });
+      // Same batch as the swap, so the console can move a selected old
+      // id to its successor before the missing-target fallback runs.
+      setGroupSwap({ from: previousId, to: updated.id });
       try {
         await refreshGroups();
       } catch {
@@ -1000,6 +1017,7 @@ export function useTau() {
     removeGroupMembers,
     refreshOutbox,
     refreshGroups,
+    groupSwap,
     cancelOutbox,
     retryOutbox,
     refreshHeldMail,
