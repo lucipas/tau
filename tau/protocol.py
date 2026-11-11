@@ -366,6 +366,7 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    expires_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -375,6 +376,10 @@ def encode_group_message(
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
     the id it claims.
+
+    ``expires_at`` is an optional sender-set expiry (epoch seconds),
+    exactly like a direct message: the receiver shows the deadline and
+    purges the message once it passes.
     """
     payload = {
         "type": "group_message",
@@ -389,6 +394,9 @@ def encode_group_message(
     }
     if message_id:
         payload["id"] = message_id
+    cleaned_expires_at = _clean_expires_at(expires_at)
+    if cleaned_expires_at is not None:
+        payload["expires_at"] = cleaned_expires_at
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -420,6 +428,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "expires_at": _clean_expires_at(payload.get("expires_at")),
     }
 
 

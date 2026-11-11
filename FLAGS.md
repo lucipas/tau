@@ -34,7 +34,7 @@ Global options may appear before or after the command:
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
-| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
+| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |

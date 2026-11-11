@@ -1067,6 +1067,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the message when a member is offline",
     )
+    group_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receivers' inboxes "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
     group_send.set_defaults(func=cmd_group_send)
 
     tan = subparsers.add_parser(
@@ -5736,6 +5742,10 @@ def cmd_group_remove_member(args: argparse.Namespace) -> int:
 def cmd_group_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        expires_at = time.time() + _parse_duration(expire_text)
     delivered_ids: Set[str] = set()
     node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start()
@@ -5747,6 +5757,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            expires_at=expires_at,
         )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.
@@ -5790,6 +5801,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             f"failed for {result.get('to_name') or result['to'][:8]}:"
             f" {result.get('error') or 'unknown error'}"
         )
+    if expires_at is not None:
+        print(f"disappears in {_ago(expires_at - time.time())}")
     return exit_code
 
 

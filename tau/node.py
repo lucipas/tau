@@ -1567,7 +1567,17 @@ class TauNode:
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
-        if not duplicate:
+        # A delayed group request past the sender's deadline is dropped
+        # unrecorded (and not marked seen), so it is never shown.
+        expires_at = message.get("expires_at")
+        expired = expires_at is not None and expires_at <= received_at
+        if expired:
+            log.info(
+                "Dropping expired group message %s from %s",
+                message_id,
+                caller_hash,
+            )
+        if not duplicate and not expired:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -1580,6 +1590,7 @@ class TauNode:
                 "kind": "group",
                 "group": group["id"],
                 "group_name": group["name"],
+                "expires_at": message.get("expires_at"),
             }
             log.info(
                 "Group message from %s (%s) in %s: %s",
@@ -1602,6 +1613,7 @@ class TauNode:
             node=self.destination_hexhash,
             group=group["id"],
             duplicate=duplicate,
+            expired=expired,
         )
 
     def _handle_file(
@@ -2285,6 +2297,7 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                expires_at=entry.message_expires_at,
             )
             if entry.group_id is not None
             else encode_message(
@@ -3309,6 +3322,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -3322,6 +3336,11 @@ class TauNode:
         queued the same way instead of dropped.  Returns a
         per-member result list: ``delivered``, ``queued``, or an
         ``error`` for that leg.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds),
+        exactly like a direct message: it travels in every leg's
+        payload, a queued leg expires at the same deadline, and the
+        receiver purges the message once it passes.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3352,6 +3371,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                expires_at=expires_at,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3367,6 +3387,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                expires_at=expires_at,
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:
@@ -3406,6 +3427,7 @@ class TauNode:
                         text=normalized,
                         to_name="",
                         message_id=message_id,
+                        expires_at=expires_at,
                         group=context,
                     )
                 except MailboxError as queue_exc:
@@ -3509,6 +3531,7 @@ class TauNode:
                         text=normalized,
                         to_name=peer.display_name if peer is not None else "",
                         message_id=message_id,
+                        expires_at=expires_at,
                         group=context,
                     )
                 except MailboxError as queue_exc:
