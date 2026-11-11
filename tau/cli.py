@@ -944,6 +944,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_import.set_defaults(func=cmd_messages_import)
 
+    messages_prune = messages_sub.add_parser(
+        "prune",
+        parents=[common],
+        help="delete stored messages older than a cutoff",
+    )
+    messages_prune.add_argument(
+        "--older-than",
+        required=True,
+        metavar="DURATION",
+        help="delete messages older than this (e.g. 30s, 5m, 2h, 7d, 90d; at most 10y)",
+    )
+    messages_prune.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only prune messages from this peer (name, hash or hash prefix)",
+    )
+    messages_prune.add_argument(
+        "--group",
+        default=None,
+        metavar="ID|NAME",
+        help="only prune messages from this group (id, id prefix or name)",
+    )
+    messages_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be pruned without deleting anything",
+    )
+    messages_prune.set_defaults(func=cmd_messages_prune)
+
     group = subparsers.add_parser(
         "group",
         parents=[common],
@@ -1734,20 +1764,52 @@ def _ago(seconds: float) -> str:
 
 
 
-_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 7 * 86400,
+    "y": 365 * 86400,
+}
+
+# A prune cutoff may reach years back; the 30-day mail TTL cap only
+# applies to disappearing messages, never to pruning old history.
+_PRUNE_MAX_SECONDS = 10 * 365 * 24 * 60 * 60
 
 
-def _parse_duration(value: str) -> float:
-    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _describe_duration(seconds: float) -> str:
+    """Shortest whole-unit rendering of a duration in seconds."""
+    for suffix, size in (
+        ("y", 365 * 86400),
+        ("w", 7 * 86400),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60),
+        ("s", 1),
+    ):
+        if seconds >= size and seconds % size == 0:
+            return f"{int(seconds // size)}{suffix}"
+    return f"{seconds:g}s"
+
+
+def _parse_duration(
+    value: str,
+    *,
+    max_seconds: float = MAX_MAIL_TTL,
+    label: str = "--expire",
+) -> float:
+    """Parse a duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
-    longer than the mail TTL (a disappearing message cannot outlive
-    the store-and-forward envelope that might carry it).
+    longer than *max_seconds* (the mail TTL by default: a disappearing
+    message cannot outlive the store-and-forward envelope that might
+    carry it).
     """
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{label} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -1756,13 +1818,15 @@ def _parse_duration(value: str) -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {label} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError("--expire duration must be positive")
-    if seconds > MAX_MAIL_TTL:
-        raise ValueError("--expire duration must be at most 30d")
+        raise ValueError(f"{label} duration must be positive")
+    if seconds > max_seconds:
+        raise ValueError(
+            f"{label} duration must be at most {_describe_duration(max_seconds)}"
+        )
     return seconds
 
 def _print_peer_table(
@@ -5536,6 +5600,54 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             ref = error["id"] if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
+
+
+def cmd_messages_prune(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    older_than = _parse_duration(
+        args.older_than,
+        max_seconds=_PRUNE_MAX_SECONDS,
+        label="--older-than",
+    )
+    peer_hash = None
+    group_id = None
+    scope_parts = []
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(peer_hash)
+        scope_parts.append(
+            "from "
+            + (peer.display_name if peer is not None else short_hash(peer_hash))
+        )
+    if getattr(args, "group", None):
+        group = GroupStore(config.groups_path).find(args.group)
+        group_id = group["id"]
+        scope_parts.append(f"in group {group['name']}")
+    result = inbox.prune(
+        older_than,
+        peer=peer_hash,
+        group=group_id,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    scope = " ".join(scope_parts) if scope_parts else "from all senders"
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        verb = "Would prune" if result["dry_run"] else "Pruned"
+        print(
+            f"{verb} {result['pruned']} messages older than {args.older_than} ({scope})"
+        )
+        if result["dry_run"]:
+            print("dry run — nothing was deleted.")
+        else:
+            print(
+                "note: only this node's copies were deleted; the senders keep"
+                " theirs, and sealed copies already held by relays are"
+                " unaffected."
+            )
+    return _EXIT_OK
 
 
 def _describe_group(

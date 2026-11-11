@@ -341,6 +341,7 @@ Global options may appear before or after the command:
 | `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
 | `tau peers unalias PEER` | Remove a peer's local alias |
 | `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |

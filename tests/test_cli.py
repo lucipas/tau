@@ -2057,6 +2057,139 @@ def test_messages_delete_json_and_errors(tmp_path, capsys):
     assert payload["deleted"]["text"] == "first hello"
 
 
+def test_parser_messages_prune_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "prune", "--older-than", "90d"])
+    assert args.command == "messages"
+    assert args.older_than == "90d"
+    assert args.func is cli.cmd_messages_prune
+    assert args.dry_run is False
+
+    args = parser.parse_args(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "alice",
+            "--dry-run",
+        ]
+    )
+    assert args.peer == "alice"
+    assert args.dry_run is True
+
+
+def test_messages_prune_dry_run_reports_without_deleting(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--dry-run",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Would prune 2 messages older than 90d" in out
+    assert "dry run" in out
+
+    # Nothing was deleted.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+
+def test_messages_prune_deletes_and_persists(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        ["messages", "prune", "--older-than", "90d", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Pruned 2 messages older than 90d" in out
+    assert "only this node's copies were deleted" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"] == []
+
+
+def test_messages_prune_scopes_to_peer(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "alice",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 2 messages older than 90d (from alice)" in capsys.readouterr().out
+
+
+def test_messages_prune_json_and_errors(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pruned"] == 2
+    assert payload["dry_run"] is False
+
+    # Unknown peer.
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "nope",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    # Bad duration, and a cutoff past the 10y cap.
+    code = cli.main(
+        ["messages", "prune", "--older-than", "bogus", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "invalid --older-than duration" in capsys.readouterr().err
+    code = cli.main(
+        ["messages", "prune", "--older-than", "20y", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "must be at most 10y" in capsys.readouterr().err
+
+
 def test_parser_messages_unread_and_count_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--unread", "--count"])
