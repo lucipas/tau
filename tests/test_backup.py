@@ -435,16 +435,18 @@ def test_backup_stores_hard_linked_received_files_as_regular_members(
 
 
 def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
-    # A `.tau-received-*.tmp` file directly under `files/` is a transfer
-    # interrupted before its content was linked into place — it was
-    # never a received file, so the backup leaves it out instead of
-    # archiving a partial file.  A *published* file whose name merely
-    # starts with the same prefix is a real received file and is
-    # backed up like any other.
+    # A `.tau-received-*.tmp` file under a sender's `.tau-tmp` staging
+    # directory is a transfer interrupted before its content was linked
+    # into place — it was never a received file, so the backup leaves
+    # it out instead of archiving a partial file.  A *published* file
+    # whose name merely starts with the same prefix is a real received
+    # file and is backed up like any other.
     node_a = _init_node(tmp_path, "a", "alice")
     received = _seed_state(node_a)
     capsys.readouterr()
-    (node_a / "files" / ".tau-received-abc123.tmp").write_bytes(b"half-written")
+    staging = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-tmp"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / ".tau-received-abc123.tmp").write_bytes(b"half-written")
     lookalike = (
         node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-received-report.pdf"
     )

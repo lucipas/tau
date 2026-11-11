@@ -121,12 +121,15 @@ def test_sanitize_file_name_drops_control_characters():
 
 def test_create_unique_file_publishes_complete_file(tmp_path):
     # The file appears under its final name only once its content is
-    # complete, and no temporary file is left behind.
+    # complete, and no temporary file is left behind (only the empty
+    # staging directory).
     target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
     assert target == tmp_path / "notes.txt"
     assert target.read_bytes() == b"hello file"
     assert target.stat().st_mode & 0o777 == 0o600
-    assert list(tmp_path.iterdir()) == [target]
+    assert [p for p in tmp_path.iterdir() if p.is_file()] == [target]
+    assert (tmp_path / ".tau-tmp").is_dir()
+    assert list((tmp_path / ".tau-tmp").iterdir()) == []
 
 
 def test_create_unique_file_numbers_suffixes_and_never_overwrites(tmp_path):
