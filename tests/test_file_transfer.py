@@ -121,15 +121,13 @@ def test_sanitize_file_name_drops_control_characters():
 
 def test_create_unique_file_publishes_complete_file(tmp_path):
     # The file appears under its final name only once its content is
-    # complete, and no temporary file is left behind (only the empty
-    # staging directory).
+    # complete, and no temporary file or staging directory is left
+    # behind.
     target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
     assert target == tmp_path / "notes.txt"
     assert target.read_bytes() == b"hello file"
     assert target.stat().st_mode & 0o777 == 0o600
-    assert [p for p in tmp_path.iterdir() if p.is_file()] == [target]
-    assert (tmp_path / ".tau-tmp").is_dir()
-    assert list((tmp_path / ".tau-tmp").iterdir()) == []
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_create_unique_file_numbers_suffixes_and_never_overwrites(tmp_path):
@@ -152,6 +150,16 @@ def test_create_unique_file_skips_symlink_names(tmp_path):
     assert target.name == "notes-2.txt"
     assert target.read_bytes() == b"hello file"
     assert outside.read_text(encoding="utf-8") == "secret\n"
+
+
+def test_create_unique_file_works_when_tau_tmp_is_a_received_file(tmp_path):
+    # `.tau-tmp` is itself a valid received filename: a file with that
+    # name must not break later transfers from the same sender.
+    (tmp_path / ".tau-tmp").write_bytes(b"a real received file")
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target == tmp_path / "notes.txt"
+    assert target.read_bytes() == b"hello file"
+    assert (tmp_path / ".tau-tmp").read_bytes() == b"a real received file"
 
 
 # -- signed offers ---------------------------------------------------------

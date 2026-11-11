@@ -375,20 +375,21 @@ def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     linked into place: a name appears only once its content is
     complete, so a concurrent reader — a live backup, the web console —
     never sees a half-written received file.  The temporary file lives
-    in a ``.tau-tmp`` directory inside the sender directory: that
+    in a fresh staging directory inside the sender directory: that
     keeps the staging file on the sender directory's own mount (a
     ``files/<sender>`` mount point would make a cross-device link
     fail) while keeping it out of backups, which only enumerate files
-    directly inside sender directories.  Each candidate is linked with
-    ``os.link``, so an existing name, including a symlink, is never
-    replaced; the next numbered name is tried instead.  The check and
-    the link are one syscall, so concurrent transfers cannot pick the
-    same destination.
+    directly inside sender directories.  The staging directory gets a
+    unique random suffix, so it can never collide with a received
+    file's name, and it is removed once the transfer is published.
+    Each candidate is linked with ``os.link``, so an existing name,
+    including a symlink, is never replaced; the next numbered name is
+    tried instead.  The check and the link are one syscall, so
+    concurrent transfers cannot pick the same destination.
     """
     stem = Path(name).stem
     suffix = Path(name).suffix
-    staging = directory / ".tau-tmp"
-    staging.mkdir(exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".tau-tmp-", dir=directory))
     fd, tmp_name = tempfile.mkstemp(dir=staging, prefix=".tau-received-", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -406,11 +407,15 @@ def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
                 continue
             return candidate
     finally:
-        # Best effort: a crash between link and unlink leaves a
-        # `.tau-received-*.tmp` file under `.tau-tmp`, which is never
-        # enumerated as a received file.
+        # Best effort: a crash between link and cleanup leaves a
+        # staging directory behind, which is never enumerated as a
+        # received file.
         try:
             os.unlink(tmp_name)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        try:
+            staging.rmdir()
         except OSError:  # pragma: no cover - best effort
             pass
 

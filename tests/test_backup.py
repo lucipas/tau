@@ -444,7 +444,9 @@ def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
     node_a = _init_node(tmp_path, "a", "alice")
     received = _seed_state(node_a)
     capsys.readouterr()
-    staging = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-tmp"
+    staging = (
+        node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-tmp-ab12cd34"
+    )
     staging.mkdir(parents=True, exist_ok=True)
     (staging / ".tau-received-abc123.tmp").write_bytes(b"half-written")
     lookalike = (
