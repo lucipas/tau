@@ -27,6 +27,7 @@ from .allowlist import (
 )
 from .archive import (
     ArchiveError,
+    archive_lock,
     load_archive,
     load_archived_set,
     save_archive,
@@ -5588,18 +5589,19 @@ def cmd_archive(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    try:
-        archive = load_archive(config.archived_path)
-    except ArchiveError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
-    destination = _resolve_inbox_peer(inbox, registry, args.peer)
-    peer = registry.get(destination)
-    name = peer.display_name if peer is not None else "unknown"
-    already = destination in archive.archived
-    if not already:
-        archive = archive.with_added(destination)
-        save_archive(config.archived_path, archive)
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        destination = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(destination)
+        name = peer.display_name if peer is not None else "unknown"
+        already = destination in archive.archived
+        if not already:
+            archive = archive.with_added(destination)
+            save_archive(config.archived_path, archive)
     if _json_mode(args):
         _emit(
             {
@@ -5628,18 +5630,19 @@ def cmd_unarchive(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    try:
-        archive = load_archive(config.archived_path)
-    except ArchiveError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
-    destination = _resolve_inbox_peer(inbox, registry, args.peer)
-    peer = registry.get(destination)
-    name = peer.display_name if peer is not None else "unknown"
-    was_archived = destination in archive.archived
-    if was_archived:
-        archive = archive.with_removed(destination)
-        save_archive(config.archived_path, archive)
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        destination = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(destination)
+        name = peer.display_name if peer is not None else "unknown"
+        was_archived = destination in archive.archived
+        if was_archived:
+            archive = archive.with_removed(destination)
+            save_archive(config.archived_path, archive)
     if _json_mode(args):
         _emit(
             {
@@ -5672,7 +5675,7 @@ def cmd_archived(args: argparse.Namespace) -> int:
     counts: Dict[str, int] = {}
     for entry in inbox.list_messages(limit=None):
         destination = str(entry.get("destination") or "")
-        if destination in archived:
+        if destination in archived and entry.get("kind") != "group":
             counts[destination] = counts.get(destination, 0) + 1
 
     def describe(destination: str) -> Dict[str, Any]:

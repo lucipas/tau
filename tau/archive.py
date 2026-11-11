@@ -20,16 +20,44 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Optional, Union
+from typing import Any, Dict, FrozenSet, Iterator, Optional, Union
 
 from .allowlist import AllowListError, clean_destination
 from .util import atomic_write_json
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
 log = logging.getLogger(__name__)
 
 ARCHIVE_FILE_MODE = 0o600
+
+
+@contextmanager
+def archive_lock(path: Union[str, Path]) -> Iterator[None]:
+    """Serialize load-modify-save cycles of the archive-list across processes.
+
+    An atomic file replace protects each write, not the whole update:
+    without this lock two concurrent archive/unarchive commands can each
+    load the same list and the later save drops the other's change.
+    """
+    if fcntl is None:  # pragma: no cover - non-POSIX
+        yield
+        return
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 class ArchiveError(ValueError):
