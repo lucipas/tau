@@ -173,6 +173,7 @@ class _FakeLXMRouter:
         self.storagepath = storagepath
         self.delivery_destinations = {}
         self.display_name = None
+        self.delivery_callback = None
         self.announced: list = []
         self.exit_handler_calls = 0
         type(self).created.append(self)
@@ -184,6 +185,9 @@ class _FakeLXMRouter:
         )
         self.delivery_destinations[destination.hash] = destination
         return destination
+
+    def register_delivery_callback(self, callback):
+        self.delivery_callback = callback
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
@@ -277,3 +281,160 @@ def test_node_lxmf_router_missing_package_is_node_error(monkeypatch, tmp_path):
     with pytest.raises(NodeError, match="not installed"):
         node._start_lxmf_router()
     assert node.lxmf_router is None
+
+
+# -- incoming LXMF delivery -------------------------------------------------
+
+class _FakeLXMessage:
+    """Stand-in for an unpacked LXMF.LXMessage."""
+
+    def __init__(
+        self,
+        sender,
+        *,
+        content=b"hello over lxmf",
+        timestamp=1234.5,
+        signature_validated=True,
+        message_hash=None,
+    ) -> None:
+        self.source_hash = lxmf.lxmf_delivery_hash(sender)
+        self.content = content
+        self.timestamp = timestamp
+        self.signature_validated = signature_validated
+        self.hash = (
+            message_hash if message_hash is not None else bytes(32)
+        )
+
+
+def _node_with_sender(tmp_path, *, on_message=None):
+    """A node whose registry knows one sender, ``alice``."""
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path),
+                   on_message=on_message)
+    sender = RNS.Identity()
+    node.registry.upsert(
+        destination_hash(sender), sender.get_public_key(), name="alice"
+    )
+    return node, sender
+
+
+def test_registry_get_by_lxmf(tmp_path):
+    node, sender = _node_with_sender(tmp_path)
+    delivery = lxmf.lxmf_delivery_hash(sender)
+    assert node.registry.get_by_lxmf(delivery).name == "alice"
+    assert node.registry.get_by_lxmf(delivery.hex()).name == "alice"
+    assert node.registry.get_by_lxmf(delivery.hex().upper()).name == "alice"
+    assert node.registry.get_by_lxmf(bytes(16)) is None
+    assert node.registry.get_by_lxmf("not a hash") is None
+    assert node.registry.get_by_lxmf(None) is None
+
+
+def test_node_registers_lxmf_delivery_callback(fake_lxmf, tmp_path):
+    node, _sender = _node_with_sender(tmp_path)
+    node.identity = RNS.Identity()
+    node._start_lxmf_router()
+    router = node.lxmf_router
+    assert router.delivery_callback == node._deliver_lxmf_message
+    node.stop()
+    assert node.lxmf_router is None
+
+
+def test_deliver_lxmf_message_stores_in_inbox(tmp_path):
+    seen = []
+    node, sender = _node_with_sender(tmp_path, on_message=seen.append)
+    message = _FakeLXMessage(sender, message_hash=b"\x01" * 32)
+    node._deliver_lxmf_message(message)
+    entries = node.inbox.list_messages()
+    assert len(entries) == 1
+    record = entries[0]
+    assert record["text"] == "hello over lxmf"
+    assert record["from"] == "alice"
+    assert record["destination"] == destination_hash(sender).hex()
+    assert record["kind"] == "chat"
+    assert record["sent_at"] == 1234.5
+    assert record["direction"] == "in"
+    assert record["id"] == "lxmf:" + (b"\x01" * 32).hex()
+    assert node.mailbox.is_seen(record["id"])
+    # on_message fires with the same message (the stored copy carries
+    # the inbox's normalized fields, so compare by id, not by dict).
+    assert len(seen) == 1
+    assert seen[0]["id"] == record["id"]
+    assert seen[0]["text"] == "hello over lxmf"
+
+
+def test_deliver_lxmf_message_drops_unverified(tmp_path):
+    node, sender = _node_with_sender(tmp_path)
+    node._deliver_lxmf_message(
+        _FakeLXMessage(sender, signature_validated=False)
+    )
+    assert node.inbox.list_messages() == []
+
+
+def test_deliver_lxmf_message_drops_unknown_sender(tmp_path):
+    node, _sender = _node_with_sender(tmp_path)
+    stranger = RNS.Identity()
+    node._deliver_lxmf_message(_FakeLXMessage(stranger))
+    assert node.inbox.list_messages() == []
+
+
+def test_deliver_lxmf_message_blocklist_wins(tmp_path):
+    from tau.blocklist import BlockList
+
+    node, sender = _node_with_sender(tmp_path)
+    node.set_blocklist(
+        BlockList(blocked=frozenset({destination_hash(sender).hex()}))
+    )
+    node._deliver_lxmf_message(_FakeLXMessage(sender))
+    assert node.inbox.list_messages() == []
+
+
+def test_deliver_lxmf_message_allowlist_gate(tmp_path):
+    from tau.allowlist import AllowList
+
+    node, sender = _node_with_sender(tmp_path)
+    node.set_allowlist(AllowList(enabled=True, allow=frozenset()))
+    node._deliver_lxmf_message(_FakeLXMessage(sender))
+    assert node.inbox.list_messages() == []
+    node.set_allowlist(
+        AllowList(
+            enabled=True,
+            allow=frozenset({destination_hash(sender).hex()}),
+        )
+    )
+    node._deliver_lxmf_message(_FakeLXMessage(sender))
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_deliver_lxmf_message_drops_bad_content(tmp_path):
+    node, sender = _node_with_sender(tmp_path)
+    node._deliver_lxmf_message(_FakeLXMessage(sender, content=b"\xff\xfe"))
+    node._deliver_lxmf_message(_FakeLXMessage(sender, content=b""))
+    node._deliver_lxmf_message(_FakeLXMessage(sender, content=b"   "))
+    node._deliver_lxmf_message(_FakeLXMessage(sender, content=None))
+    assert node.inbox.list_messages() == []
+
+
+def test_deliver_lxmf_message_dedupes_redelivery(tmp_path):
+    seen = []
+    node, sender = _node_with_sender(tmp_path, on_message=seen.append)
+    message = _FakeLXMessage(sender, message_hash=b"\x02" * 32)
+    node._deliver_lxmf_message(message)
+    node._deliver_lxmf_message(message)
+    assert len(node.inbox.list_messages()) == 1
+    assert len(seen) == 1
+
+
+def test_deliver_lxmf_message_never_raises(tmp_path):
+    node, sender = _node_with_sender(tmp_path)
+    # A bare object: every attribute lookup falls back to a drop.
+    node._deliver_lxmf_message(object())
+    # A message whose content access explodes mid-delivery.
+    broken = _FakeLXMessage(sender)
+
+    @property
+    def _boom(self):
+        raise RuntimeError("boom")
+
+    type(broken).content = _boom
+    node._deliver_lxmf_message(broken)
+    assert node.inbox.list_messages() == []

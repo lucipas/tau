@@ -708,10 +708,11 @@ class TauNode:
         The router listens on the LXMF delivery destination derived from
         the node's identity (the address ``tau id`` and ``tau peers``
         already show) and announces it, so LXMF clients can find a path
-        to this node.  Storage lives under the data directory.  This is
-        the router lifecycle only — nothing is sent over LXMF yet; that
-        follows under the migration tracked in issue #67.  A failure here
-        is a node-start failure: the caller cleans up via :meth:`stop`.
+        to this node.  Storage lives under the data directory.  Incoming
+        LXMF mail is handed to :meth:`_deliver_lxmf_message`, which
+        lands it in the DM inbox.  Sending over LXMF follows under the
+        migration tracked in issue #67.  A failure here is a node-start
+        failure: the caller cleans up via :meth:`stop`.
         """
         assert self.identity is not None  # set above, before this runs
         try:
@@ -722,11 +723,109 @@ class TauNode:
             )
         except LXMFError as exc:
             raise NodeError(str(exc)) from exc
+        self.lxmf_router.register_delivery_callback(self._deliver_lxmf_message)
         delivery = lxmf_router_delivery_hash(self.lxmf_router)
         log.info(
             "LXMF router running, delivery %s",
             delivery.hex() if delivery is not None else "unknown",
         )
+
+    def _deliver_lxmf_message(self, message: Any) -> None:
+        """Deliver one incoming LXMF message into the DM inbox.
+
+        The router calls this for every message addressed to this
+        node's LXMF delivery destination, on the router's thread.  The
+        message is accepted only when it clears every gate a
+        tau-protocol DM clears: the router must have validated its
+        signature against the recalled source identity, the sender must
+        resolve to a known peer by LXMF delivery hash (first contact
+        still needs a tau announce), the block-list wins over the
+        allow-list, and the body must decode as non-empty UTF-8 text.
+
+        An accepted message is stored with the same record shape as
+        :meth:`_handle_message` (``direction: "in"``, ``sent_at`` from
+        the LXMF timestamp) and id ``lxmf:<message hash hex>``, so a
+        redelivery after a router restart is deduped through the
+        mailbox seen-set exactly like a relayed tau copy, and
+        ``on_message`` fires so the console and live views see it.
+
+        Nothing here ever raises back into the router: a bad message
+        is dropped with a log line, and an unexpected failure is
+        caught and logged.
+        """
+        received_at = time.time()
+        try:
+            if not getattr(message, "signature_validated", False):
+                log.info("Dropping LXMF message with an unverified signature")
+                return
+            source_hash = getattr(message, "source_hash", None)
+            sender = self.registry.get_by_lxmf(source_hash)
+            if sender is None:
+                log.info("Dropping LXMF message from an unknown sender")
+                return
+            sender_hash = sender.hexhash
+            if self.blocklist.is_blocked(sender_hash):
+                log.info(
+                    "LXMF message from %s denied by the block-list",
+                    sender_hash,
+                )
+                return
+            if not self.allowlist.is_allowed(sender_hash):
+                log.info(
+                    "LXMF message from %s denied by the DM allow-list",
+                    sender_hash,
+                )
+                return
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                text = content.strip()
+            elif isinstance(content, (bytes, bytearray, memoryview)):
+                try:
+                    text = bytes(content).decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    log.info("Dropping LXMF message with non-UTF-8 content")
+                    return
+            else:
+                log.info("Dropping LXMF message with no content")
+                return
+            if not text:
+                log.info("Dropping LXMF message with an empty body")
+                return
+            message_hash = getattr(message, "hash", None)
+            if not isinstance(message_hash, (bytes, bytearray, memoryview)):
+                log.info("Dropping LXMF message without a hash")
+                return
+            message_id = f"lxmf:{bytes(message_hash).hex()}"
+            if self.mailbox.is_seen(message_id):
+                return
+            sent_at = getattr(message, "timestamp", None)
+            if not isinstance(sent_at, (int, float)):
+                sent_at = received_at
+            self.mailbox.mark_seen(message_id)
+            record = {
+                "from": sender.display_name,
+                "destination": sender_hash,
+                "text": text,
+                "kind": DEFAULT_MESSAGE_KIND,
+                "sent_at": sent_at,
+                "received_at": received_at,
+                "id": message_id,
+                "direction": "in",
+            }
+            log.info(
+                "LXMF message from %s (%s): %s",
+                sender.display_name,
+                sender_hash,
+                text,
+            )
+            self._record_received(record)
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+        except Exception:  # never raise back into LXMRouter
+            log.warning("LXMF delivery failed", exc_info=True)
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""

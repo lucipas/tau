@@ -342,6 +342,32 @@ class PeerRegistry:
                     return peer
             return None
 
+    def get_by_lxmf(self, lxmf_hash: Union[bytes, str]) -> Optional[Peer]:
+        """Return the peer whose LXMF delivery address is *lxmf_hash*.
+
+        LXMF messages arrive keyed by the sender's delivery hash, not
+        their tau destination hash, so the receive path resolves the
+        sender here: the hash is derived from the peer's advertised
+        public key, so no extra announcement is needed.  Accepts the
+        raw 16-byte hash or its hex form; anything else returns
+        ``None``.  An unknown sender stays unresolvable — first
+        contact still needs a tau announce.
+        """
+        if isinstance(lxmf_hash, (bytes, bytearray)):
+            wanted = bytes(lxmf_hash).hex()
+        elif isinstance(lxmf_hash, str):
+            wanted = lxmf_hash.strip().lower()
+        else:
+            return None
+        if not _HEX32.match(wanted):
+            return None
+        with self._lock:
+            peers = list(self._peers.values())
+        for peer in peers:
+            if peer.lxmf_hash == wanted:
+                return peer
+        return None
+
     def resolve(
         self, target: Union[bytes, str], *, include_alias: bool = True
     ) -> Optional[Peer]:
