@@ -1550,6 +1550,29 @@ def test_refused_retract_records_no_marker(tmp_path):
     assert node.mailbox.counts()["retracted"] == 0
 
 
+def test_retract_marks_a_deleted_message_confirmed(tmp_path, monkeypatch):
+    # A marker for a message the node actually deleted is confirmed:
+    # a flood of unknown-ID markers from another sender cannot evict
+    # it at the cap.
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 2)
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["deleted"] is True
+
+    other_hash = destination_hash(RNS.Identity()).hex()
+    for target in ("junk-1", "junk-2", "junk-3"):
+        node.mailbox.record_retraction(other_hash, target)
+    assert node.mailbox.counts()["retracted"] == 2
+    assert node.mailbox.is_retracted(destination_hash(sender).hex(), "msg-1") is True
+
+
 def test_collected_message_drops_expired_arrival(tmp_path):
     import time as _time
 

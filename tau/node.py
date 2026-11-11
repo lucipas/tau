@@ -1041,14 +1041,19 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
-    def _record_retraction(self, sender_hash: str, message_id: str) -> None:
+    def _record_retraction(
+        self, sender_hash: str, message_id: str, *, confirmed: bool = False
+    ) -> None:
         """Persist a retraction marker.
 
         The marker is the durable half of a retract, so a failure to
         persist it propagates: the caller must report the retract as
         failed rather than confirm one a relayed copy could undo.
+        With ``confirmed=True`` the retract deleted a stored copy, so
+        the marker is confirmed — a flood of unknown-ID markers cannot
+        evict it at the cap.
         """
-        self.mailbox.record_retraction(sender_hash, message_id)
+        self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
 
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
@@ -1674,9 +1679,13 @@ class TauNode:
             # Record the marker before deleting the copy: if it cannot be
             # persisted, nothing is deleted and the retract fails cleanly.
             # (A refused retract records nothing: the message stays, so it
-            # must stay deliverable.)
+            # must stay deliverable.)  The marker is confirmed: the
+            # retract was honoured against a stored copy, so a flood of
+            # unknown-ID markers must not evict it at the cap.
             try:
-                self._record_retraction(caller_hash, retract["target"])
+                self._record_retraction(
+                    caller_hash, retract["target"], confirmed=True
+                )
             except Exception as exc:
                 log.warning(
                     "Could not record retraction marker for %s",

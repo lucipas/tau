@@ -748,6 +748,49 @@ def test_retraction_markers_are_capped(tmp_path, monkeypatch):
     assert box.counts()["retracted"] == 3
 
 
+def test_confirmed_markers_survive_unknown_flood(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    other = "bb" * 32
+    box.record_retraction(sender, "real", confirmed=True, now=1000.0)
+    box.record_retraction(other, "junk-1", now=1001.0)
+    box.record_retraction(other, "junk-2", now=1002.0)
+    assert box.counts()["retracted"] == 3
+    # A flood of unknown-ID markers evicts unknown markers, never the
+    # confirmed one — capacity pressure must not invalidate a
+    # retraction the sender saw succeed.
+    box.record_retraction(other, "junk-3", now=1003.0)
+    box.record_retraction(other, "junk-4", now=1004.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_retracted(sender, "real", now=1004.0) is True
+    # A retried retract refreshes a confirmed marker, never downgrades
+    # it: it still survives the next flood.
+    box.record_retraction(sender, "real", now=2000.0)
+    box.record_retraction(other, "junk-5", now=2001.0)
+    box.record_retraction(other, "junk-6", now=2002.0)
+    box.record_retraction(other, "junk-7", now=2003.0)
+    assert box.is_retracted(sender, "real", now=2003.0) is True
+
+
+def test_confirmed_markers_evict_oldest_when_all_confirmed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_retraction(sender, "m-1", confirmed=True, now=1000.0)
+    box.record_retraction(sender, "m-2", confirmed=True, now=1001.0)
+    assert box.counts()["retracted"] == 2
+    # With no unknown marker left to spend, the cap still holds: the
+    # earliest-expiry confirmed marker gives way.
+    box.record_retraction(sender, "m-3", confirmed=True, now=1002.0)
+    assert box.counts()["retracted"] == 2
+    assert box.is_retracted(sender, "m-1", now=1002.0) is False
+    assert box.is_retracted(sender, "m-2", now=1002.0) is True
+    assert box.is_retracted(sender, "m-3", now=1002.0) is True
+
+
 # -- sealed envelopes -------------------------------------------------------------
 
 

@@ -113,6 +113,30 @@ def _retraction_key(sender_hash: str, message_id: str) -> str:
     return f"{sender_hash}:{message_id}"
 
 
+def _parse_retraction_markers(raw_value: Any) -> Dict[str, float]:
+    """Parse one retraction-marker map from a mailbox document.
+
+    A marker is written as now + RETRACTED_RETENTION, so any expiry
+    beyond that (or non-finite, or too large to convert) is malformed:
+    drop it rather than let it suppress a message indefinitely or
+    abort the load.
+    """
+    markers: Dict[str, float] = {}
+    if not isinstance(raw_value, dict):
+        return markers
+    latest = time.time() + RETRACTED_RETENTION
+    for key, value in raw_value.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        try:
+            until = float(value)
+        except OverflowError:
+            continue
+        if math.isfinite(until) and until <= latest:
+            markers[str(key)] = until
+    return markers
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an integer quota override from the environment, or *default*."""
     raw = os.environ.get(name)
@@ -598,7 +622,12 @@ class Mailbox:
         self._dropped_held: Dict[str, float] = {}
         # Retraction markers, keyed by (sender hash, message id), with
         # the time the marker expires (see RETRACTED_RETENTION).
+        # Confirmed markers guard a retraction that deleted a stored
+        # copy; unknown markers guard a retract for an id the node never
+        # held.  They are separate pools so a flood of unknown markers
+        # cannot evict a confirmed retraction (see _evict_retracted).
         self._retracted: Dict[str, float] = {}
+        self._retracted_unknown: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -713,6 +742,7 @@ class Mailbox:
             self._pending_acks = state["pending_acks"]
             self._dropped_held = state["dropped_held"]
             self._retracted = state["retracted"]
+            self._retracted_unknown = state["retracted_unknown"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -856,23 +886,8 @@ class Mailbox:
                 if isinstance(v, (int, float))
             }
 
-        retracted: Dict[str, float] = {}
-        raw_retracted = raw.get("retracted")
-        if isinstance(raw_retracted, dict):
-            # A marker is written as now + RETRACTED_RETENTION, so any
-            # expiry beyond that (or non-finite, or too large to convert)
-            # is malformed: drop it rather than let it suppress a message
-            # indefinitely or abort the load.
-            latest = time.time() + RETRACTED_RETENTION
-            for k, v in raw_retracted.items():
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                    continue
-                try:
-                    until = float(v)
-                except OverflowError:
-                    continue
-                if math.isfinite(until) and until <= latest:
-                    retracted[str(k)] = until
+        retracted = _parse_retraction_markers(raw.get("retracted"))
+        retracted_unknown = _parse_retraction_markers(raw.get("retracted_unknown"))
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
@@ -927,6 +942,7 @@ class Mailbox:
             "pending_acks": acks,
             "dropped_held": dropped_held,
             "retracted": retracted,
+            "retracted_unknown": retracted_unknown,
             "sent": sent,
             "receipts": receipts,
         }
@@ -951,6 +967,7 @@ class Mailbox:
                 ],
                 "dropped_held": dict(self._dropped_held),
                 "retracted": dict(self._retracted),
+                "retracted_unknown": dict(self._retracted_unknown),
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -968,7 +985,8 @@ class Mailbox:
                 "seen": len(self._seen),
                 "sent": len(self._sent),
                 "receipts": len(self._receipts),
-                "retracted": len(self._retracted),
+                "retracted": len(self._retracted)
+                + len(self._retracted_unknown),
             }
 
     # -- outbox ------------------------------------------------------------
@@ -1622,7 +1640,12 @@ class Mailbox:
     # -- retraction markers -------------------------------------------------
 
     def record_retraction(
-        self, sender_hash: str, message_id: str, *, now: Optional[float] = None
+        self,
+        sender_hash: str,
+        message_id: str,
+        *,
+        confirmed: bool = False,
+        now: Optional[float] = None,
     ) -> None:
         """Remember that *sender_hash* retracted *message_id*.
 
@@ -1631,20 +1654,48 @@ class Mailbox:
         seen-id cache, so a relayed copy arriving after the retract —
         or after the id leaves the seen cache — is still dropped.
         Recording the same retraction again refreshes the marker.
+
+        With ``confirmed=True`` the retract deleted a stored copy, so
+        the marker goes in the confirmed pool; otherwise it guards an
+        id the node never held.  A confirmed marker is never
+        downgraded by a later unconfirmed record for the same message
+        (a retried retract), and eviction at the cap spends unknown
+        markers first (see :meth:`_evict_retracted`).
         """
         timestamp = now if now is not None else time.time()
+        key = _retraction_key(sender_hash, message_id)
         with self._transaction():
-            self._retracted[_retraction_key(sender_hash, message_id)] = (
-                timestamp + RETRACTED_RETENTION
-            )
-            if len(self._retracted) > MAX_RETRACTED:
-                # A peer can retract ids it never sent (the unknown-id
-                # branch), so the collection must stay bounded: evict
-                # the markers expiring soonest, as mark_seen does.
-                oldest = sorted(self._retracted.items(), key=lambda kv: kv[1])
-                for key, _ in oldest[: len(self._retracted) - MAX_RETRACTED]:
-                    del self._retracted[key]
+            if confirmed:
+                self._retracted_unknown.pop(key, None)
+                self._retracted[key] = timestamp + RETRACTED_RETENTION
+            elif key in self._retracted:
+                # Already confirmed (e.g. a retried retract): refresh
+                # the confirmed marker, never downgrade it.
+                self._retracted[key] = timestamp + RETRACTED_RETENTION
+            else:
+                self._retracted_unknown[key] = timestamp + RETRACTED_RETENTION
+            self._evict_retracted()
             self.save()
+
+    def _evict_retracted(self) -> None:
+        """Drop earliest-expiry markers until the pools fit the cap.
+
+        Unknown-ID markers go first: they guard messages the node
+        never held, while confirmed markers guard retractions the
+        sender saw succeed.  Only when no unknown marker remains does
+        a confirmed marker give way.  Call with the transaction held.
+        """
+        while (
+            len(self._retracted) + len(self._retracted_unknown) > MAX_RETRACTED
+        ):
+            if self._retracted_unknown:
+                oldest = min(
+                    self._retracted_unknown.items(), key=lambda kv: kv[1]
+                )
+                del self._retracted_unknown[oldest[0]]
+            else:
+                oldest = min(self._retracted.items(), key=lambda kv: kv[1])
+                del self._retracted[oldest[0]]
 
     def is_retracted(
         self, sender_hash: str, message_id: str, *, now: Optional[float] = None
@@ -1655,11 +1706,12 @@ class Mailbox:
         sweeps it away; a marker for another sender never matches.
         """
         with self._lock:
-            until = self._retracted.get(_retraction_key(sender_hash, message_id))
-            if until is None:
-                return False
             timestamp = now if now is not None else time.time()
-            return timestamp < until
+            for pool in (self._retracted, self._retracted_unknown):
+                until = pool.get(_retraction_key(sender_hash, message_id))
+                if until is not None and timestamp < until:
+                    return True
+            return False
 
     # -- pending fetch acknowledgements --------------------------------------
 
@@ -1748,6 +1800,13 @@ class Mailbox:
             ]
             for key in dead_retracted:
                 del self._retracted[key]
+            dead_retracted_unknown = [
+                key
+                for key, until in self._retracted_unknown.items()
+                if until <= timestamp
+            ]
+            for key in dead_retracted_unknown:
+                del self._retracted_unknown[key]
             if (
                 dead_outbox
                 or dead_held
@@ -1756,6 +1815,7 @@ class Mailbox:
                 or dead_receipts
                 or dead_dropped
                 or dead_retracted
+                or dead_retracted_unknown
             ):
                 self.save()
             return {
@@ -1765,7 +1825,7 @@ class Mailbox:
                 "sent": len(dead_sent),
                 "receipts": len(dead_receipts),
                 "dropped_held": len(dead_dropped),
-                "retracted": len(dead_retracted),
+                "retracted": len(dead_retracted) + len(dead_retracted_unknown),
             }
 
 
