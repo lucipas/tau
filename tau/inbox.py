@@ -978,14 +978,15 @@ class Inbox:
 
         ``tau messages`` marks what it shows as read, so a read DM the
         owner has not answered yet disappears from the unread view.
-        This is the way back: by default the newest message for the
-        peer becomes unread again; ``all=True`` clears the cursor so
+        This is the way back: by default the newest received message for
+        the peer becomes unread again; ``all=True`` clears the cursor so
         the whole conversation shows unread.  Only the local display
         state moves — a read receipt already sent for a message stays
         sent, and a delayed ``mark_read`` still cannot move a cursor
         backward on its own.  A peer with no stored messages is left
         alone and the return is ``None``; otherwise the unread counts
-        after the mark.
+        after the mark.  Raises ``OSError`` when the moved cursor
+        cannot be persisted, leaving the in-memory cursor untouched.
         """
         with self._transaction():
             # Only received messages count: a reply we sent must neither
