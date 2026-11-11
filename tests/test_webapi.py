@@ -1487,6 +1487,75 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_suggest_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        bob_post = create_post(conn, bob, "bob posts", name="bob", now=1000)
+        carol_post = create_post(conn, carol, "carol posts", name="carol", now=1001)
+        dave_post = create_post(conn, dave, "dave posts", name="dave", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # No follows yet and no likes: equal scores, newest post first.
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert status == 200
+        assert [item["author"] for item in payload["suggestions"]] == [
+            dave_post["author"],
+            carol_post["author"],
+            bob_post["author"],
+        ]
+        assert payload["count"] == 3
+        assert payload["suggestions"][0]["name"] == "dave"
+        assert payload["suggestions"][0]["posts"] == 1
+
+        status, _, payload = _json(bridge, "/api/tan/suggest?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["suggestions"][0]["author"] == dave_post["author"]
+
+        # Following bob removes him from the suggestions.
+        status, _, _ = _json(
+            bridge,
+            "/api/tan/follow",
+            method="POST",
+            body={"target": bob_post["author"]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert [item["author"] for item in payload["suggestions"]] == [
+            dave_post["author"],
+            carol_post["author"],
+        ]
+
+        # A blocked author is never suggested; a failed-closed list
+        # suggests nobody at all.
+        node.blocklist = BlockList(blocked=frozenset({dave_post["author"]}))
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert [item["author"] for item in payload["suggestions"]] == [
+            carol_post["author"]
+        ]
+        node.blocklist = BlockList(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert payload["suggestions"] == []
+        assert payload["count"] == 0
+    finally:
+        bridge.stop()
+
+
 def test_snapshot_counts_tan_posts_from_the_store(tmp_path):
     """Regression test for the Codex P2 on PR #180: snapshot
     ``social.posts`` counted the session-scoped post-event buffer, so

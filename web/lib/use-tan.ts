@@ -17,11 +17,16 @@ import type {
   TanPost,
   TanPostResponse,
   TanSavedResponse,
+  TanSuggestResponse,
+  TanSuggestion,
   TanSyncResponse,
   TanTimelineResponse,
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
+// Suggestion ranking scans the whole cache, so it refreshes on a slower
+// cadence than the feed and stays off the feed's poll critical path.
+const SUGGEST_INTERVAL_MS = 60000;
 const SAVED_PAGE_SIZE = 100;
 
 export function useTan() {
@@ -33,6 +38,7 @@ export function useTan() {
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  const [suggestions, setSuggestions] = useState<TanSuggestion[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
@@ -210,6 +216,34 @@ export function useTan() {
       clearInterval(timer);
     };
   }, [all, searchQuery, showMentions, load]);
+
+  // Suggestions have their own generation so a slow ranking response cannot
+  // overwrite a newer one, and they never block the feed load.
+  const suggestGenerationRef = useRef(0);
+  const loadSuggestions = useCallback(async () => {
+    const generation = ++suggestGenerationRef.current;
+    const suggested = await apiGet<TanSuggestResponse>("/api/tan/suggest");
+    if (suggestGenerationRef.current !== generation) return;
+    setSuggestions(suggested.suggestions);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    async function tickSuggest() {
+      try {
+        await loadSuggestions();
+      } catch {
+        // Suggestions are optional; keep the last good list on failure.
+      }
+      if (disposed) return;
+    }
+    void tickSuggest();
+    const timer = setInterval(() => void tickSuggest(), SUGGEST_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [loadSuggestions]);
 
   const refresh = useCallback(async () => {
     await load();
@@ -454,16 +488,18 @@ export function useTan() {
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
       await load();
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, loadSuggestions],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
       await load();
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, loadSuggestions],
   );
 
   const muteAuthor = useCallback(
@@ -555,11 +591,12 @@ export function useTan() {
         explore: true,
       });
       await load();
+      void loadSuggestions().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load]);
+  }, [load, loadSuggestions]);
 
   // Download the signed export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
@@ -620,6 +657,7 @@ export function useTan() {
     searchQuery,
     mentions,
     following,
+    suggestions,
     mutedAuthors,
     mutedKeywords,
     saved,

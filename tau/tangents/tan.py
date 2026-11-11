@@ -3009,11 +3009,14 @@ def suggest_authors(
     *,
     viewer: Optional[str] = None,
     limit: int = DEFAULT_SUGGEST_LIMIT,
+    exclude: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rank cached authors the viewer does not follow yet.
 
     Candidates are authors with at least one linked, non-deleted post or
-    reply in the local store, excluding followed authors and the viewer.
+    reply in the local store, excluding followed authors, the viewer, and
+    any authors in ``exclude`` (for example blocked authors). Excluded
+    authors are dropped before ``limit`` is applied.
     Each candidate scores ``SUGGEST_FOLLOWED_WEIGHT`` per distinct author
     the viewer follows who liked or replied to one of the candidate's
     posts or replies, plus one per like on the candidate's posts (so a
@@ -3023,6 +3026,8 @@ def suggest_authors(
     """
     followed = {record["author"]: record["name"] for record in following(conn)}
     excluded = set(followed)
+    if exclude is not None:
+        excluded.update(exclude)
     if viewer is not None:
         excluded.add(_require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer"))
     limit = max(0, int(limit))
