@@ -17,7 +17,7 @@ import pytest
 from tau import cli
 from tau.config import TauConfig
 from tau.groups import GroupStore
-from tau.identity import destination_hash
+from tau.identity import destination_hash, save_identity
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, open_message, seal_message
 from tau.node import NodeError, TauNode
@@ -348,6 +348,129 @@ def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
         )
         is None
     )
+
+
+def test_group_store_leave_removes_and_refuses_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert store.leave(group["id"]) is True
+    assert store.get(group["id"]) is None
+    assert store.list_groups() == []
+    # A later message for the left group must not re-pin it — unlike
+    # delete, whose removal the next message undoes.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Survives a restart.
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.is_left(group["id"]) is True
+    assert (
+        reloaded.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    left = reloaded.left_groups()
+    assert [entry["id"] for entry in left] == [group["id"]]
+    assert isinstance(left[0]["left_at"], float)
+
+
+def test_group_store_leave_unknown_and_rejoin_never_left(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    assert store.leave("00" * 16) is False
+    assert store.rejoin("00" * 16) is False
+    assert store.is_left("00" * 16) is False
+    assert store.left_groups() == []
+    # Leaving twice reports nothing left to do, but stays left.
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) is True
+    assert store.leave(group["id"]) is False
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_rejoin_allows_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) is True
+    assert store.rejoin(group["id"]) is True
+    assert store.is_left(group["id"]) is False
+    assert store.left_groups() == []
+    assert store.rejoin(group["id"]) is False
+    # The next message pins the group again.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.get(group["id"]) is not None
+    # A re-invite under a changed roster is a new id and pins without
+    # a rejoin, even while the old id stays left.
+    assert store.leave(group["id"]) is True
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    assert (
+        store.record(
+            grown_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_left_list_is_capped(tmp_path):
+    from tau.groups import MAX_LEFT_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    left_ids = []
+    for i in range(MAX_LEFT_GROUPS + 5):
+        group = store.record(
+            derive_group_id(
+                OTHER_HASH, f"g{i}", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+            ),
+            f"g{i}",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        assert store.leave(group["id"]) is True
+        left_ids.append(group["id"])
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert len(raw["left"]) == MAX_LEFT_GROUPS
+    assert left_ids[0] not in [entry["id"] for entry in raw["left"]]
+    assert left_ids[-1] in [entry["id"] for entry in raw["left"]]
 
 
 def test_group_store_update_members_refusals(tmp_path):
@@ -951,6 +1074,50 @@ def test_group_message_from_non_member_rejected(tmp_path):
     assert received == []
     assert len(node.inbox) == 0
     assert len(node.groups) == 0
+
+
+def test_group_message_after_leave_is_rejected(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    first = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "hi all",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert first["ok"] is True
+    assert len(received) == 1
+    assert node.groups.leave(group_id) is True
+    # A later message for the left group is rejected, never stored,
+    # and does not re-pin the group — unlike delete, whose removal the
+    # next message undoes.
+    second = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "are you still there?",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert second["ok"] is False
+    assert second["error"]["code"] == "not_a_member"
+    assert len(received) == 1
+    assert len(node.inbox) == 1
+    assert node.groups.get(group_id) is None
+    assert node.groups.is_left(group_id) is True
 
 
 def test_group_message_from_blocked_sender_dropped_silently(tmp_path):
@@ -1721,6 +1888,100 @@ def test_group_delete_via_cli(tmp_path, capsys):
         cli.main(["group", "delete", "weekend", "--data-dir", str(tmp_path / "node")])
         != 0
     )
+
+
+def _seed_learned_group(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    return config, store, group
+
+
+def test_group_leave_via_cli(tmp_path, capsys):
+    _, store, group = _seed_learned_group(tmp_path)
+    code = cli.main(
+        ["group", "leave", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "left group theirs" in capsys.readouterr().out
+    assert store.list_groups() == []
+    # list_groups/left_groups reload from disk, so they see the CLI's
+    # leave; is_left alone reads the in-memory list.
+    assert [entry["id"] for entry in store.left_groups()] == [group["id"]]
+    # Leaving twice is not an error.
+    code = cli.main(
+        ["group", "leave", group["id"], "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "already left" in capsys.readouterr().out
+    # `group left` lists it, in text and JSON.
+    code = cli.main(["group", "left", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    assert group["id"][:8] in capsys.readouterr().out
+    code = cli.main(
+        ["group", "left", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["left"][0]["id"] == group["id"]
+    # `group rejoin` restores it, and the next message pins it again.
+    code = cli.main(
+        ["group", "rejoin", group["id"], "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "rejoined" in capsys.readouterr().out
+    assert store.left_groups() == []
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    # --json leave round-trips.
+    code = cli.main(
+        ["group", "leave", "--json", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"left": group["id"], "name": "theirs"}
+    # Unknown groups and never-left ids still error.
+    assert (
+        cli.main(["group", "leave", "nope", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert (
+        cli.main(
+            ["group", "rejoin", "00" * 16, "--data-dir", str(tmp_path / "node")]
+        )
+        != 0
+    )
+    assert (
+        cli.main(["group", "rejoin", "xyz", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert "invalid group id" in capsys.readouterr().err
+
+
+def test_group_leave_refuses_group_this_node_created(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    identity = RNS.Identity()
+    save_identity(identity, config.identity_path)
+    own_hash = destination_hash(identity).hex()
+    store = GroupStore(config.groups_path)
+    store.create("mine", [own_hash, OTHER_HASH], created_by=own_hash)
+    code = cli.main(["group", "leave", "mine", "--data-dir", str(tmp_path / "node")])
+    assert code == 1
+    assert "delete your own group" in capsys.readouterr().err
+    assert len(store.list_groups()) == 1
 
 
 class _FakeGroupNode:

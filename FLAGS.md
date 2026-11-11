@@ -34,6 +34,9 @@ Global options may appear before or after the command:
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
+| `tau group leave GROUP` | Leave a group you joined: drop it and remember the id, so the next message for it is rejected instead of re-pinning the group (refuses groups this node created — delete those instead) |
+| `tau group rejoin ID` | Undo a leave so the next message pins the group again (full group id) |
+| `tau group left` | List groups this node has left |
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
