@@ -780,19 +780,21 @@ class WebBridge:
 
     # -- node callbacks ----------------------------------------------------
 
-    def record_peer(self, peer: Peer) -> None:
-        # local_dict: the console replaces its snapshot record with this
-        # event, so it must carry the same trust fields — a public_dict
-        # event would silently drop the verified badge and any key-change
-        # warning until the next snapshot load.
+    def _local_peer_payload(self, peer: Peer) -> Dict[str, Any]:
+        # local_dict: the console replaces its record with this payload, so
+        # it must carry the same trust fields — a public_dict payload would
+        # silently drop the verified badge and any key-change warning.
         payload = peer.local_dict()
-        # Annotate like the snapshot does, so a live update does not
-        # erase the frontend's blocked badge for this peer.
+        # Annotate like the snapshot does, so a live update or alias
+        # response does not erase the frontend's blocked badge.
         blocklist = getattr(self.node, "blocklist", None)
         payload["blocked"] = bool(
             blocklist is not None and blocklist.is_blocked(payload.get("destination"))
         )
-        self.bus.publish({"type": "peer", "peer": payload})
+        return payload
+
+    def record_peer(self, peer: Peer) -> None:
+        self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
 
     def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
         peer_hash = str(record.get("destination") or "")
@@ -2744,6 +2746,34 @@ class WebBridge:
             )
         return items
 
+    def set_peer_alias(
+        self, destination: str, alias: Optional[str]
+    ) -> Dict[str, Any]:
+        """Set a peer's local alias, or clear it when *alias* is blank.
+
+        The alias rules stay in the registry — uniqueness, hex-like
+        rejection, never sent to peers — this only routes the console's
+        request through them.  A peer event goes out so every open
+        console updates its peer list at once.
+        """
+        # Hold the node's peer-save lock across the edit and its save:
+        # an announce can otherwise trigger _save_peers mid-request,
+        # whose refresh_aliases() would copy the old disk alias back
+        # over the new in-memory one before either save completes.
+        # Mirrors peers_verify; a node-like without the lock (e.g. in
+        # tests) simply edits.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            if alias is not None and alias.strip():
+                peer = self.node.registry.set_alias(destination, alias)
+            else:
+                peer = self.node.registry.clear_alias(destination)
+        self.record_peer(peer)
+        # The annotated payload, not bare local_dict: the hook replaces
+        # its peer record with this response, and a bare dict would drop
+        # the blocked badge until the next snapshot.
+        return self._local_peer_payload(peer)
+
     def peers_safety_number(self, target: str) -> Dict[str, Any]:
         """Show a peer's pairwise safety number without recording anything.
 
@@ -3896,6 +3926,34 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/peers/alias":
+                destination = body.get("destination") or body.get("target")
+                if not isinstance(destination, str) or not destination.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'destination' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                alias = body.get("alias")
+                if alias is not None and not isinstance(alias, str):
+                    self._send_json(
+                        {"error": {"message": "field 'alias' must be a string"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    peer = self.bridge.set_peer_alias(
+                        destination.strip(), alias
+                    )
+                except PeerError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "peer": peer}, head_only)
                 return
             if path == "/api/tan/posts":
                 text = body.get("text")

@@ -120,6 +120,13 @@ export function useTau() {
   const [importing, setImporting] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Bumped on every peer event per destination, so a slow alias response
+  // cannot overwrite a newer event that arrived while it was in flight.
+  const peerEventVersion = useRef<Record<string, number>>({});
+  // Bumped whenever a snapshot replaces the peer list: a reconnect
+  // snapshot is newer than any alias response that was already in
+  // flight, and peer events alone do not cover it.
+  const snapshotGeneration = useRef(0);
   // Live (SSE) updates to feed entries, stamped with a rising epoch, so
   // a feed refresh can tell which entries changed while its GET was in
   // flight and keep those newer versions.
@@ -195,6 +202,7 @@ export function useTau() {
       snapshotRevision.current = peerEventSeq.current;
       localVerifiedAt.current = {};
       setPeers(sortPeers(snapshot.peers));
+      snapshotGeneration.current += 1;
       if (groupEdits.current !== editsAtOpen) {
         // A group edit completed after this connection opened, so the
         // snapshot's roster may predate it. Re-fetch instead.
@@ -258,6 +266,8 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      peerEventVersion.current[peer.destination] =
+        (peerEventVersion.current[peer.destination] ?? 0) + 1;
       // Ordering for block/unblock replies: a peer event that arrives
       // after a block request was sent is newer than the reply, so the
       // reply must not overwrite the flag it already delivered.
@@ -905,6 +915,35 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const setPeerAlias = useCallback(
+    async (destination: string, alias: string | null) => {
+      const versionBefore = peerEventVersion.current[destination] ?? 0;
+      const snapshotBefore = snapshotGeneration.current;
+      const result = await apiPost<{ ok: boolean; peer: Peer }>(
+        "/api/peers/alias",
+        { destination, alias },
+      );
+      // The server also publishes a peer event, so other tabs learn at
+      // once; apply the returned record now so this edit reflects
+      // without waiting for it. Skip it if a peer event for this peer
+      // arrived meanwhile, or a reconnect snapshot replaced the list:
+      // either one is newer than this response.
+      if (
+        (peerEventVersion.current[destination] ?? 0) === versionBefore &&
+        snapshotGeneration.current === snapshotBefore
+      ) {
+        setPeers((previous) =>
+          sortPeers([
+            ...previous.filter((entry) => entry.destination !== destination),
+            result.peer,
+          ]),
+        );
+      }
+      return result.peer;
+    },
+    [],
+  );
+
   // Re-read the console feed. The merge never drops a message: a live
   // message that arrived after this GET started is already in state,
   // and a stale response must not overwrite it — the SSE stream stays
@@ -1086,6 +1125,7 @@ export function useTau() {
     unblockPeer,
     announce,
     markRead,
+    setPeerAlias,
     reactToMessage,
     clearReaction,
     createGroup,

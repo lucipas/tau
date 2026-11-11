@@ -149,6 +149,9 @@ export function Console() {
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onSetAlias={(destination, alias) =>
+              tau.setPeerAlias(destination, alias)
+            }
             onVerify={(destination) => {
               void tau.verifyPeer(destination).catch(() => undefined);
             }}

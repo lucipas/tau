@@ -82,6 +82,9 @@ export interface Peer {
   age: number;
   hops: number;
   protocol: number;
+  // Local-only label for this peer, set with `tau peers alias` or from
+  // the console. Never sent to peers.
+  alias?: string | null;
   // LXMF delivery destination hash, derived from the peer's public key.
   lxmf?: string | null;
   // Local trust state, shown only to this node's owner (never sent to peers).

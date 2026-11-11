@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import type { BridgeInfo, NodeInfo, Peer, SocialInfo, TauGroup, VerifyState } from "@/lib/types";
 import type { BlockState, PingState } from "@/lib/use-tau";
@@ -32,6 +32,7 @@ export function PeerSidebar({
   onShowSafetyNumber,
   onDismissVerification,
   onSelectPeer,
+  onSetAlias,
   onCreateGroup,
   onDeleteGroup,
 }: {
@@ -52,10 +53,65 @@ export function PeerSidebar({
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
+  onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
 }) {
   const now = useNow();
+  const [editingAlias, setEditingAlias] = useState<string | null>(null);
+  const [aliasDraft, setAliasDraft] = useState("");
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [aliasSaving, setAliasSaving] = useState(false);
+
+  const startAliasEdit = (peer: Peer) => {
+    // A save is pending for another peer: opening a second editor now
+    // would let that save's completion close or mislabel this one.
+    if (aliasSaving) return;
+    setEditingAlias(peer.destination);
+    setAliasDraft(peer.alias ?? "");
+    setAliasError(null);
+  };
+
+  const saveAlias = async (event: FormEvent, peer: Peer) => {
+    event.preventDefault();
+    if (!onSetAlias) return;
+    const alias = aliasDraft.trim();
+    // Saving a blank label for a peer with no alias is a no-op, not a
+    // trip to the server (which would 400: nothing to clear).
+    if (alias === "" && !peer.alias) {
+      setEditingAlias(null);
+      return;
+    }
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      await onSetAlias(peer.destination, alias === "" ? null : alias);
+      setEditingAlias(null);
+    } catch (error) {
+      setAliasError(
+        error instanceof Error ? error.message : "could not save alias",
+      );
+    } finally {
+      setAliasSaving(false);
+    }
+  };
+
+  const clearAlias = async (peer: Peer) => {
+    if (!onSetAlias) return;
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      await onSetAlias(peer.destination, null);
+      setEditingAlias(null);
+    } catch (error) {
+      setAliasError(
+        error instanceof Error ? error.message : "could not clear alias",
+      );
+    } finally {
+      setAliasSaving(false);
+    }
+  };
+
   const [showCreate, setShowCreate] = useState(false);
   const [groupName, setGroupName] = useState("");
   const [pickedMembers, setPickedMembers] = useState<string[]>([]);
@@ -284,6 +340,8 @@ export function PeerSidebar({
                 : peer.age;
               const isSelected = peer.destination === selected;
               const unreadCount = unread[peer.destination] ?? 0;
+              const displayName = peer.alias || peer.name || "unknown";
+              const isEditingAlias = editingAlias === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
               return (
                 <li key={peer.destination}>
@@ -299,16 +357,24 @@ export function PeerSidebar({
                         type="button"
                         onClick={() => onSelectPeer(peer.destination)}
                         className="flex min-w-0 flex-1 items-center gap-2.5 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60"
-                        title={`Message ${peer.name} (${peer.destination})`}
+                        title={`Message ${displayName} (${peer.destination})`}
                       >
                         <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-void/60 font-mono text-xs uppercase text-signal">
-                          {peer.name.slice(0, 1) || "?"}
+                          {displayName.slice(0, 1) || "?"}
                         </span>
                         <span className="min-w-0">
                           <span className="flex items-center gap-1.5">
                             <span className="block truncate text-xs font-medium text-zinc-200">
-                              {peer.name || "unknown"}
+                              {displayName}
                             </span>
+                            {peer.alias ? (
+                              <span
+                                className="ml-1.5 shrink-0 rounded-full border border-line/70 bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist"
+                                title={`Announced as ${peer.name}`}
+                              >
+                                alias
+                              </span>
+                            ) : null}
                             {peer.verified ? (
                               <span
                                 className="ml-1.5 rounded-full border border-signal/40 bg-signal/10 px-1.5 py-px text-[10px] text-signal"
@@ -338,6 +404,11 @@ export function PeerSidebar({
                             {shortHash(peer.destination, 10)} · {peer.hops} hop
                             {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
                           </span>
+                          {peer.alias ? (
+                            <span className="block truncate font-mono text-[10px] text-mist">
+                              announced as {peer.name}
+                            </span>
+                          ) : null}
                           {peer.key_change_at ? (
                             <span
                               className="block truncate font-mono text-[10px] text-amber-300"
@@ -356,6 +427,18 @@ export function PeerSidebar({
                           ) : null}
                         </span>
                       </button>
+                      {onSetAlias ? (
+                        <button
+                          type="button"
+                          onClick={() => startAliasEdit(peer)}
+                          disabled={aliasSaving}
+                          aria-label={`Set alias for ${displayName}`}
+                          title="Set a local alias for this peer"
+                          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          ✎
+                        </button>
+                      ) : null}
                       <div className="flex shrink-0 items-center gap-1">
                         <button
                           type="button"
@@ -430,6 +513,60 @@ export function PeerSidebar({
                         </button>
                       </div>
                     </div>
+                    {isEditingAlias ? (
+                      <form
+                        className="mt-2 pl-[42px]"
+                        onSubmit={(event) => void saveAlias(event, peer)}
+                      >
+                        <label className="sr-only" htmlFor={`alias-${peer.destination}`}>
+                          Local alias for {displayName}
+                        </label>
+                        <input
+                          id={`alias-${peer.destination}`}
+                          type="text"
+                          value={aliasDraft}
+                          maxLength={48}
+                          autoFocus
+                          placeholder={peer.name || "alias"}
+                          onChange={(event) =>
+                            setAliasDraft(event.target.value)
+                          }
+                          className="w-full rounded-md border border-line bg-void/60 px-2 py-1 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+                        />
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="submit"
+                            disabled={aliasSaving}
+                            className="rounded-md border border-signal/50 bg-signal/10 px-2 py-0.5 text-[11px] font-medium text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                          >
+                            {aliasSaving ? "saving…" : "save"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={aliasSaving}
+                            onClick={() => setEditingAlias(null)}
+                            className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-zinc-200 disabled:opacity-50"
+                          >
+                            cancel
+                          </button>
+                          {peer.alias ? (
+                            <button
+                              type="button"
+                              disabled={aliasSaving}
+                              onClick={() => void clearAlias(peer)}
+                              className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
+                            >
+                              clear alias
+                            </button>
+                          ) : null}
+                        </div>
+                        {aliasError ? (
+                          <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300">
+                            {aliasError}
+                          </p>
+                        ) : null}
+                      </form>
+                    ) : null}
                     {ping ? (
                       <p
                         className={`mt-1 pl-[42px] font-mono text-[10px] ${

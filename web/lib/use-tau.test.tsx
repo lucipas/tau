@@ -62,6 +62,7 @@ function makePeer(overrides: Partial<Peer> = {}): Peer {
     age: 5,
     hops: 1,
     protocol: 1,
+    alias: null,
     ...overrides,
   };
 }
@@ -144,6 +145,109 @@ beforeEach(() => {
       ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
       : Promise.resolve({ groups: [], count: 0 }),
   );
+});
+
+function snapshotInto(source: FakeEventSource, peers: Peer[]) {
+  act(() => {
+    source.emit("snapshot", { snapshot: makeSnapshot(peers) });
+  });
+}
+
+describe("useTau setPeerAlias", () => {
+  it("applies the returned peer when nothing newer arrived", async () => {
+    const peer = makePeer();
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: makePeer({ alias: "laptop" }),
+    });
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+
+    let updated: Peer | undefined;
+    await act(async () => {
+      updated = await result.current.setPeerAlias(peer.destination, "laptop");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/peers/alias", {
+      destination: peer.destination,
+      alias: "laptop",
+    });
+    expect(updated?.alias).toBe("laptop");
+    expect(result.current.peers[0].alias).toBe("laptop");
+  });
+
+  it("drops a delayed response when a newer snapshot landed meanwhile", async () => {
+    const peer = makePeer();
+    const pending = deferred<{ ok: boolean; peer: Peer }>();
+    mockedPost.mockReturnValue(pending.promise);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+
+    let settled: Promise<Peer>;
+    act(() => {
+      settled = result.current.setPeerAlias(peer.destination, "laptop");
+    });
+    // A reconnect snapshot arrives while the save is in flight, with a
+    // fresher last_seen and no alias yet.
+    snapshotInto(source, [makePeer({ last_seen: 200 })]);
+    await waitFor(() => expect(result.current.peers[0].last_seen).toBe(200));
+
+    // The stale response carries the old last_seen: it must not
+    // overwrite the snapshot.
+    await act(async () => {
+      pending.resolve({ ok: true, peer: makePeer({ alias: "laptop" }) });
+      await settled;
+    });
+
+    expect(result.current.peers[0].last_seen).toBe(200);
+    expect(result.current.peers[0].alias).toBeNull();
+  });
+
+  it("drops a delayed response when a newer peer event landed meanwhile", async () => {
+    const peer = makePeer();
+    const pending = deferred<{ ok: boolean; peer: Peer }>();
+    mockedPost.mockReturnValue(pending.promise);
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    snapshotInto(source, [peer]);
+    await waitFor(() => expect(result.current.peers).toEqual([peer]));
+
+    let settled: Promise<Peer>;
+    act(() => {
+      settled = result.current.setPeerAlias(peer.destination, "laptop");
+    });
+    // The server's peer event for this alias change arrives first.
+    act(() => {
+      source.emit("peer", { peer: makePeer({ alias: "laptop" }) });
+    });
+    await waitFor(() =>
+      expect(result.current.peers[0].alias).toBe("laptop"),
+    );
+    // A further event lands with fresher data before the save responds.
+    act(() => {
+      source.emit("peer", { peer: makePeer({ alias: "laptop", last_seen: 300 }) });
+    });
+    await waitFor(() =>
+      expect(result.current.peers[0].last_seen).toBe(300),
+    );
+
+    // The late response carries the older last_seen: resolving it must
+    // not rewind the event's record.
+    await act(async () => {
+      pending.resolve({ ok: true, peer: makePeer({ alias: "laptop" }) });
+      await settled;
+    });
+
+    expect(result.current.peers[0].last_seen).toBe(300);
+    expect(result.current.peers[0].alias).toBe("laptop");
+  });
 });
 
 afterEach(() => {
