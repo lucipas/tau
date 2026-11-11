@@ -35,8 +35,11 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     ProtocolError,
     clean_in_reply_to,
+    generate_message_id,
+    normalize_message,
     normalize_message_kind,
 )
 from .util import atomic_write_json, read_json
@@ -170,7 +173,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
     kind = raw.get("kind")
-    if kind == "group":
+    if kind == NOTE_KIND:
+        # A note to self (``tau note``): local-only, written straight
+        # into the inbox, never received from a peer — the wire parser
+        # rejects it, so a stored ``note`` record is always our own.
+        record["kind"] = NOTE_KIND
+    elif kind == "group":
         group_id = raw.get("group")
         if not isinstance(group_id, str) or len(group_id) != 32:
             return None
@@ -590,6 +598,38 @@ class Inbox:
             self._messages.append(entry)
             self._messages = _retain(self._messages)
             self._save()
+        return entry
+
+    def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
+        """Store a private note to self in the inbox and return it.
+
+        A note is an inbox record with kind ``note``, from this node to
+        itself: it shows in the received-message listing, is found by
+        search and the ``note`` kind filter, and is deleted, pruned,
+        exported and imported like any other stored message.  It never
+        touches the wire — no send, no queue, no announce.  The text
+        is validated like a message body (empty and over-long notes are
+        refused).  The note is read the moment it is written: the read
+        cursor for this node's own destination is advanced past it, so
+        it never counts as unread and never shows the unread marker.
+        The cursor is keyed by destination, and no peer message ever
+        carries our own hash, so the advance touches notes only.
+        """
+        cleaned = normalize_message(text)
+        now = time.time()
+        entry = self.append(
+            {
+                "from": sender_name,
+                "destination": destination,
+                "text": cleaned,
+                "sent_at": now,
+                "received_at": now,
+                "id": generate_message_id(),
+                "direction": "in",
+                "kind": NOTE_KIND,
+            }
+        )
+        self.mark_read(peer=destination, up_to_seq=entry["seq"])
         return entry
 
     def delete(self, ref: str) -> Dict[str, Any]:

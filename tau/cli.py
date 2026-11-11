@@ -74,12 +74,14 @@ from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     MAX_MAIL_TTL,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
+    normalize_message,
     normalize_message_kind,
     sanitize_name,
     short_hash,
@@ -427,6 +429,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     send_file.set_defaults(func=cmd_send_file)
+
+    # A note is a message to self that never leaves the machine, so it
+    # gets its own subcommand instead of overloading `send --to <self>`
+    # (which would queue forever: the send path has no self case).
+    note = subparsers.add_parser(
+        "note",
+        parents=[common],
+        help="save a private note to self in the local inbox",
+    )
+    note.add_argument(
+        "message", nargs="?", help="note text (reads stdin when omitted)"
+    )
+    note.add_argument("--file", type=Path, help="read the note from a file")
+    note.set_defaults(func=cmd_note)
 
     react = subparsers.add_parser(
         "react",
@@ -5133,6 +5149,10 @@ def _send_displayed_receipts(
         if isinstance(entry.get("id"), str)
         and entry.get("id")
         and entry.get("receipt_sent_at") is None
+        # Notes are local-only: no peer is owed a receipt for one, and
+        # receipting our own destination would make the node try to
+        # discover itself.
+        and entry.get("kind") != NOTE_KIND
     ]
     if not unreceipted:
         return {"sent": 0, "queued": 0}
@@ -5321,10 +5341,16 @@ def cmd_messages(args: argparse.Namespace) -> int:
         raise NodeError("--limit must not be negative")
     kind = getattr(args, "kind", None)
     if kind is not None:
-        try:
-            kind = normalize_message_kind(kind)
-        except ProtocolError as exc:
-            raise NodeError(str(exc)) from exc
+        # ``note`` is a reserved record kind, not a wire kind, so the
+        # normalizer would refuse it — but it is exactly the filter a
+        # user needs to list their own notes.
+        if isinstance(kind, str) and kind.strip().lower() == NOTE_KIND:
+            kind = NOTE_KIND
+        else:
+            try:
+                kind = normalize_message_kind(kind)
+            except ProtocolError as exc:
+                raise NodeError(str(exc)) from exc
     query = getattr(args, "search", None)
     if query is not None and not query.strip():
         raise NodeError("--search must not be empty")
@@ -5791,6 +5817,35 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             f" {result.get('error') or 'unknown error'}"
         )
     return exit_code
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """Save a private note to self in the local inbox.
+
+    Local-only: no network, no announce, nothing queued.  The note is
+    an inbox record with kind ``note`` from this node to itself, so it
+    shows in `tau messages`, is found by `--search` and `--kind note`,
+    and is deleted and pruned like any other stored message.  It is
+    read the moment it is written, so it never counts as unread.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    text = normalize_message(_read_message(args))
+    inbox = Inbox(config.inbox_path)
+    entry = inbox.add_note(
+        text,
+        sender_name=config.name,
+        destination=destination_hash(identity).hex(),
+    )
+    if _json_mode(args):
+        _emit({"note": entry}, True)
+    else:
+        print(f"note saved #{_safe_id_prefix(str(entry['id']))} [note]")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
 
 
 def cmd_react(args: argparse.Namespace) -> int:
