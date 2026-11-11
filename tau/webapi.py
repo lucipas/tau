@@ -5,25 +5,53 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    POST /api/peers/verify mark a peer verified ``{"target": "alice"}`` —
+    call only after comparing the safety number out of band
+    POST /api/peers/safety-number show a peer's safety number
+    ``{"target": "alice"}`` without recording anything
+    POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
+    POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
+    GET  /api/groups       known group DMs with their member lists
     GET  /api/messages     recent inbound/outbound messages
+    GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
-    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/outbox/held   sealed mail held for other peers
+    POST /api/outbox/drop-held drop ``{"target": "<message id or prefix>"}``
+    POST /api/ping         measure reachability of a peer
+    GET  /api/allowlist    DM allow-list: whether enforced, and who is on it
+    POST /api/allowlist/add add ``{"target": "<name, hash or prefix>"}``
+    POST /api/allowlist/remove remove ``{"target": "<name, hash or prefix>"}``
+    POST /api/allowlist/set-enabled turn enforcement ``{"enabled": true}`` on/off
     POST /api/announce     announce this node immediately
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
+    GET  /api/tan/search   search stored posts by keyword
+    GET  /api/tan/mentions replies to your own posts
+    GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
     GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post
+    POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/follow   follow an author
     POST /api/tan/unfollow stop following an author
+    GET  /api/tan/muted    muted authors
+    POST /api/tan/mute     mute an author
+    POST /api/tan/unmute   unmute an author
+    GET  /api/tan/muted-keywords muted keywords
+    POST /api/tan/mute-keyword mute a keyword
+    POST /api/tan/unmute-keyword unmute a keyword
     POST /api/tan/sync     pull missing posts from peers
+    GET  /api/tan/saved    saved posts, newest save first
+    POST /api/tan/save     save a post to read later
+    POST /api/tan/unsave   remove a post from the saved list
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -43,6 +71,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import nullcontext
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,11 +79,13 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
+from .allowlist import AllowListError, clean_destination
+from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
-from .peers import Peer, PeerError
+from .peers import Peer, PeerError, safety_number
 from .protocol import (
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
@@ -359,6 +390,12 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # Kept so a message still queued across a restart can be matched
         # when its delivery is reported.
         message["mail_id"] = mail_id
+    group = entry.get("group")
+    if isinstance(group, str):
+        message["group"] = group
+        group_name = entry.get("group_name")
+        if isinstance(group_name, str):
+            message["group_name"] = group_name
     wire_id = entry.get("wire_id")
     if isinstance(wire_id, str) and wire_id:
         # The Reticulum message id: how replies name this message, and
@@ -472,6 +509,9 @@ class WebBridge:
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Serializes block/unblock read-modify-write cycles so concurrent
+        # console requests cannot overwrite each other's changes.
+        self._blocklist_lock = threading.Lock()
         # Latest reaction per (target, reactor), kept even when the target
         # is not in history yet: a reaction can beat the console append of
         # its target, and the append seeds the message from this state.
@@ -654,6 +694,7 @@ class WebBridge:
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
             peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+        group = record.get("group") if record.get("kind") == "group" else None
         expires_at = record.get("expires_at")
         if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
             expires_at = None
@@ -666,6 +707,12 @@ class WebBridge:
             sent_at=_as_float(record.get("sent_at")),
             received_at=_as_float(record.get("received_at"), default=time.time()),
             status="received",
+            group=group if isinstance(group, str) else None,
+            group_name=(
+                str(record.get("group_name") or "")
+                if isinstance(record.get("group_name"), str)
+                else None
+            ),
             expires_at=float(expires_at) if expires_at is not None else None,
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
@@ -947,6 +994,7 @@ class WebBridge:
             annotate_quotes,
             annotate_reactions,
             annotate_replies,
+            annotate_saved,
             apply_display_rules,
             author_timeline,
             following,
@@ -1002,6 +1050,176 @@ class WebBridge:
                     exclude_authors=blocked,
                     exclude_all=exclude_all,
                 )
+            annotate_saved(conn, posts)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_thread(self, ref: str) -> List[Dict[str, Any]]:
+        """Return the thread rooted at the post *ref* names, oldest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_thread`: the same resolution and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same reference.  A reference that names no post,
+        or a deleted or unlinked one, raises :class:`TanError` (via
+        :func:`tau.tangents.tan.thread`) and the HTTP layer reports it
+        as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, thread
+
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("field 'ref' is required")
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            posts = thread(conn, ref.strip(), viewer=viewer)
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_mentions(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+        """Return replies to this node's own posts, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_mentions`: the same selection
+        and visibility rules, so the console shows exactly what the
+        CLI shows for the same store, plus the console's display rules
+        (the thread view applies the same).  The node's block-list is
+        applied as in :meth:`tan_timeline`.  Without an identity there
+        is nothing of yours to be replied to, so this raises
+        :class:`RequestError`, which the HTTP layer reports as a 400.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import apply_display_rules, mentions
+
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if viewer is None:
+                raise RequestError(
+                    "this node has no identity, so there are no replies to show; "
+                    "run `tau init` to create one"
+                )
+            posts = mentions(
+                conn,
+                viewer,
+                limit=limit,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            return apply_display_rules(posts, ruleset)
+        finally:
+            conn.close()
+
+    def tan_search(
+        self,
+        *,
+        query: str,
+        author: Optional[str] = None,
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Return stored posts matching a keyword, newest first.
+
+        Mirrors :func:`tau.cli.cmd_tan_search`: the same case-insensitive
+        substring match and visibility rules, so the console shows exactly
+        what the CLI shows for the same store.  The node's block-list is
+        applied as in :meth:`tan_timeline`, and display rules are applied
+        on top.  An empty query or an author that cannot be resolved
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            TanError,
+            apply_display_rules,
+            resolve_author,
+            search_posts,
+        )
+
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        # One snapshot for every console surface, as in tan_timeline.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            target = None
+            if author:
+                try:
+                    target, _ = resolve_author(
+                        conn, author, registry=self.node.registry
+                    )
+                except TanError as exc:
+                    raise RequestError(str(exc)) from exc
+            try:
+                posts = search_posts(
+                    conn,
+                    query,
+                    author=target,
+                    limit=limit,
+                    viewer=viewer,
+                    exclude_authors=blocked,
+                    exclude_all=exclude_all,
+                )
+            except TanError as exc:
+                raise RequestError(str(exc)) from exc
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1169,6 +1387,109 @@ class WebBridge:
         finally:
             conn.close()
 
+    def _resolve_mute_target(self, conn, target: str):
+        """Resolve a mute/unmute target the way the CLI does.
+
+        The peer registry does not know authors whose posts are only
+        cached, and a muted author may have no cached posts at all — so
+        after the registry/hash/prefix lookup fails, try the name stored
+        with the mute, then the name on the author's cached posts.
+        """
+        from .tangents.tan import (
+            TanError,
+            resolve_author,
+            resolve_cached_author,
+            resolve_muted_name,
+        )
+
+        try:
+            return resolve_author(conn, target, registry=self.node.registry)
+        except TanError as exc:
+            match = resolve_muted_name(conn, target)
+            if match is not None:
+                return match
+            try:
+                return resolve_cached_author(conn, target)
+            except TanError:
+                raise exc from None
+
+    def _tan_viewer(self) -> Optional[str]:
+        """This node's author hash, or None when no identity is loaded."""
+        from .identity import destination_hash, load_identity
+
+        app = self._tan_app()
+        if app is not None:
+            return app.author
+        identity = load_identity(self.node.config.identity_path)
+        return destination_hash(identity).hex() if identity is not None else None
+
+    def tan_mute(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import TanError, mute
+
+        conn = self._tan_conn()
+        try:
+            author, name = self._resolve_mute_target(conn, target)
+            viewer = self._tan_viewer()
+            if viewer is not None and author == viewer:
+                raise TanError("cannot mute yourself")
+            return mute(conn, author, name=name)
+        finally:
+            conn.close()
+
+    def tan_unmute(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unmute
+
+        conn = self._tan_conn()
+        try:
+            author, name = self._resolve_mute_target(conn, target)
+            return {"author": author, "name": name, "unmuted": unmute(conn, author)}
+        finally:
+            conn.close()
+
+    def tan_muted(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import author_stats_many, muted
+
+        conn = self._tan_conn()
+        try:
+            records = muted(conn)
+            stats = author_stats_many(conn, [record["author"] for record in records])
+            for record in records:
+                record.update(stats[record["author"]])
+            return records
+        finally:
+            conn.close()
+
+    def tan_mute_keyword(self, keyword: str) -> Dict[str, Any]:
+        from .tangents.tan import mute_keyword
+
+        conn = self._tan_conn()
+        try:
+            return mute_keyword(conn, keyword)
+        finally:
+            conn.close()
+
+    def tan_unmute_keyword(self, keyword: str) -> Dict[str, Any]:
+        from .tangents.tan import unmute_keyword
+
+        conn = self._tan_conn()
+        try:
+            removed = unmute_keyword(conn, keyword)
+            return {
+                "keyword": " ".join(str(keyword).split()).casefold(),
+                "unmuted": removed,
+            }
+        finally:
+            conn.close()
+
+    def tan_muted_keywords(self) -> List[Dict[str, Any]]:
+        from .tangents.tan import muted_keywords
+
+        conn = self._tan_conn()
+        try:
+            return muted_keywords(conn)
+        finally:
+            conn.close()
+
     def tan_posts(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._tan_posts)
@@ -1201,6 +1522,19 @@ class WebBridge:
             conn.close()
         return app.react(post_hash, liked=liked, publish=True)
 
+    def tan_quote(self, target: str, text: str) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_post
+
+            post_hash = resolve_post(conn, target)["hash"]
+        finally:
+            conn.close()
+        return app.quote(post_hash, text, publish=True)
+
     def tan_delete(self, target: str) -> Dict[str, Any]:
         app = self._tan_app()
         if app is None:
@@ -1213,6 +1547,59 @@ class WebBridge:
         finally:
             conn.close()
         return app.delete(post_hash, publish=True)
+
+    def tan_save(self, target: str) -> Dict[str, Any]:
+        # Saves are local-only: no signed entry and no gossip, so the
+        # social app is not needed — the same as `tau tan save`.
+        from .tangents.tan import save_post
+
+        conn = self._tan_conn()
+        try:
+            return save_post(conn, target)
+        finally:
+            conn.close()
+
+    def tan_unsave(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unsave_post
+
+        conn = self._tan_conn()
+        try:
+            return unsave_post(conn, target)
+        finally:
+            conn.close()
+
+    def tan_saved(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import annotated_saved_posts
+
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            posts, next_offset = annotated_saved_posts(
+                conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
+            )
+            return {"posts": posts, "next_offset": next_offset}
+        finally:
+            conn.close()
 
     def tan_sync(self, *, explore: bool = True) -> Dict[str, Any]:
         app = self._tan_app()
@@ -1430,6 +1817,65 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def held_mail(self) -> Dict[str, Any]:
+        """Sealed mail held for other peers, with recipient names.
+
+        Read under the mailbox transaction so envelopes deposited by a
+        separate process are visible instead of the serving process's
+        cached snapshot.  Only metadata is exposed: the sealed blobs
+        stay unreadable through this API.
+        """
+        with self.node.mailbox.transaction():
+            held = [
+                self._describe_held_envelope(envelope)
+                for envelope in self.node.mailbox.held_list()
+            ]
+        return {"held": held, "count": len(held)}
+
+    def drop_held_mail(self, target: str) -> Dict[str, Any]:
+        """Drop one held envelope so it is never delivered again.
+
+        Resolve and remove happen inside one mailbox transaction, so a
+        drop cannot miss an envelope another process just stored, and a
+        fetch that lands in between is reported instead of silently
+        claimed as dropped.  The tombstone stops a sender retry from
+        resurrecting the envelope; a copy the recipient already fetched
+        may still be delivered, and the result says so.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        with self.node.mailbox.transaction():
+            envelope = self.node.mailbox.resolve_held(target.strip())
+            if not self.node.mailbox.drop_held(envelope.id, tombstone=True):
+                # Fetched or expired between resolve and drop.
+                raise MailboxError(
+                    f"held message {target.strip()!r} is no longer present"
+                )
+            dropped = self._describe_held_envelope(envelope)
+        dropped["note"] = (
+            "a copy already fetched by the recipient may still be"
+            " delivered; dropping stops this node handing it out again"
+        )
+        return dropped
+
+    def _describe_held_envelope(self, envelope: Any) -> Dict[str, Any]:
+        peer = self.node.registry.get(envelope.to)
+        sender = (
+            self.node.registry.get(bytes.fromhex(envelope.depositor))
+            if envelope.depositor
+            else None
+        )
+        return {
+            "id": envelope.id,
+            "to": envelope.to_hex,
+            "to_name": peer.display_name if peer is not None else "",
+            "from": envelope.depositor,
+            "from_name": sender.display_name if sender is not None else "",
+            "stored_at": envelope.stored_at,
+            "expires_at": envelope.expires_at,
+            "blob_bytes": len(envelope.blob),
+        }
+
     def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
         payload = entry.to_dict()
         peer = self.node.registry.get(entry.to)
@@ -1450,6 +1896,69 @@ class WebBridge:
             if isinstance(rtt, (int, float))
             else None,
         }
+
+    def allowlist(self) -> Dict[str, Any]:
+        """The DM allow-list: whether it is enforced, and who is on it."""
+        return self._describe_allowlist(self.node.allowlist)
+
+    def _describe_allowlist(self, current: Any) -> Dict[str, Any]:
+        entries = []
+        for destination in sorted(current.allow):
+            peer = self.node.registry.get(destination)
+            entries.append(
+                {
+                    "destination": destination,
+                    "name": peer.display_name if peer is not None else "",
+                }
+            )
+        return {"enabled": current.enabled, "entries": entries}
+
+    def _resolve_allowlist_target(self, target: Any) -> str:
+        """Resolve a console allow-list target to a destination hash.
+
+        Mirrors the CLI's resolution: a registry name, hash or prefix
+        first, else a raw 32-hex destination hash.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise AllowListError("peer is required")
+        value = target.strip()
+        try:
+            peer = self.node.registry.resolve(value, include_alias=False)
+        except PeerError as exc:
+            raise AllowListError(str(exc)) from exc
+        if peer is not None:
+            return peer.hexhash
+        try:
+            return clean_destination(value)
+        except AllowListError:
+            raise AllowListError(
+                f"unknown peer or destination: {value!r}"
+            ) from None
+
+    def allowlist_add(self, target: Any) -> Dict[str, Any]:
+        """Allow DMs from *target* and return the updated list."""
+        destination = self._resolve_allowlist_target(target)
+        updated = self.node.update_allowlist(
+            lambda current: current.with_added(destination)
+        )
+        return self._describe_allowlist(updated)
+
+    def allowlist_remove(self, target: Any) -> Dict[str, Any]:
+        """Stop allowing DMs from *target* and return the updated list."""
+        destination = self._resolve_allowlist_target(target)
+        updated = self.node.update_allowlist(
+            lambda current: current.with_removed(destination)
+        )
+        return self._describe_allowlist(updated)
+
+    def allowlist_set_enabled(self, enabled: Any) -> Dict[str, Any]:
+        """Turn allow-list enforcement on or off; return the updated list."""
+        if not isinstance(enabled, bool):
+            raise AllowListError("field 'enabled' must be a boolean")
+        updated = self.node.update_allowlist(
+            lambda current: current.with_enabled(enabled)
+        )
+        return self._describe_allowlist(updated)
 
     def announce(self) -> None:
         self.node.announce()
@@ -1477,7 +1986,187 @@ class WebBridge:
             )
         return items
 
+    def peers_safety_number(self, target: str) -> Dict[str, Any]:
+        """Show a peer's pairwise safety number without recording anything.
+
+        Showing the number must not mark the peer verified or clear a
+        key-change warning: the owner still has to compare the number
+        with the peer over another channel first, and only then confirm
+        with :meth:`peers_verify`.
+        """
+        identity = getattr(self.node, "identity", None)
+        if identity is None:
+            raise WebBridgeError("no local identity; run `tau init` first")
+        peer = self.node.registry.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        return {
+            "peer": peer.hexhash,
+            "name": peer.display_name,
+            "safety_number": safety_number(
+                identity.get_public_key(), peer.public_key
+            ),
+        }
+
+    def peers_verify(self, target: str) -> Dict[str, Any]:
+        """Mark a peer verified after comparing safety numbers out of band.
+
+        Call only once the owner has compared the number shown by
+        :meth:`peers_safety_number` with the peer over another channel
+        and found it matches. Mirrors ``tau peers verify``: resolves
+        *target* in the local registry, computes the pairwise safety
+        number from this node's identity and the peer's public key,
+        records the verification (clearing any key-change warning) and
+        persists the registry. Verification itself stays a local
+        judgement, never sent to peers.
+        """
+        identity = getattr(self.node, "identity", None)
+        if identity is None:
+            raise WebBridgeError("no local identity; run `tau init` first")
+        peer = self.node.registry.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        number = safety_number(identity.get_public_key(), peer.public_key)
+        previously_verified = peer.is_verified
+        previous_fingerprint = peer.verified_fingerprint
+        # Hold the node's peer-save lock across the mark and the write
+        # when the node has one: a concurrent node save could otherwise
+        # snapshot the unverified registry first and replace our file
+        # after ours, silently dropping the verification.  A node-like
+        # without the lock (e.g. in tests) simply marks and saves.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            self.node.registry.mark_verified(peer.destination_hash, number)
+            self.node.registry.save()
+        return {
+            "peer": peer.hexhash,
+            "name": peer.display_name,
+            "safety_number": number,
+            "verified_at": peer.verified_at,
+            "reverified": previously_verified,
+            "fingerprint_changed": previously_verified
+            and previous_fingerprint != number,
+        }
+
+    def _resolve_block_target(self, target: str) -> str:
+        """Resolve a block/unblock target the way the CLI does.
+
+        Registry name, destination hash or hash prefix first, then a
+        bare destination hash; anything else is an unknown peer.
+        """
+        try:
+            peer = self.node.registry.resolve(target)
+        except PeerError as exc:
+            raise ValueError(str(exc)) from exc
+        if peer is not None:
+            return peer.hexhash
+        try:
+            return clean_destination(target)
+        except AllowListError:
+            raise ValueError(f"unknown peer or destination: {target!r}") from None
+
+    def _describe_blocked(self, destination: str) -> Dict[str, Any]:
+        peer = self.node.registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+        }
+
+    def _edit_blocklist(self, target: str, *, block: bool) -> Dict[str, Any]:
+        """Block or unblock a peer and persist the change.
+
+        The running node's cached list is refreshed so the DM gate and
+        the Tan display rules enforce the change at once, and a ``peer``
+        event carries the new blocked flag to every console client.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        destination = self._resolve_block_target(target.strip())
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "blocklist_path", None)
+        setter = getattr(self.node, "set_blocklist", None)
+        # Hold the lock across load, modify, save, cache update and publish
+        # so a concurrent edit cannot derive its change from the same stale list.
+        with self._blocklist_lock:
+            try:
+                # Always re-read the file: the cached list may predate CLI
+                # edits or a corruption that appeared since it was loaded.
+                current = load_blocklist(path)
+            except BlockListError as exc:
+                if callable(setter):
+                    # Fail closed in the running node until the owner
+                    # repairs or removes the file.
+                    setter(BlockList(block_all=True))
+                raise WebBridgeError(
+                    "block-list on disk is unusable; fix or remove it "
+                    f"before editing ({exc})"
+                ) from exc
+            updated = (
+                current.with_added(destination)
+                if block
+                else current.with_removed(destination)
+            )
+            changed = updated.blocked != current.blocked
+            if changed:
+                if path is None:
+                    raise WebBridgeError("this node has no block-list path")
+                save_blocklist(path, updated)
+            if callable(setter):
+                # Refresh the cache from the freshly loaded list, even on a
+                # no-op, so a repaired file clears a previous fail-closed state.
+                setter(updated)
+            if changed:
+                peer = self.node.registry.get(destination)
+                if peer is not None:
+                    # The cached list is refreshed, so the published event
+                    # carries the new blocked flag at once.
+                    self.record_peer(peer)
+        return {
+            "peer": self._describe_blocked(destination),
+            "blocked": destination in updated.blocked,
+            "changed": changed,
+        }
+
+    def block_peer(self, target: str) -> Dict[str, Any]:
+        """Block a peer: drop their DMs and hide their Tan posts."""
+        return self._edit_blocklist(target, block=True)
+
+    def unblock_peer(self, target: str) -> Dict[str, Any]:
+        """Unblock a peer."""
+        return self._edit_blocklist(target, block=False)
+
+    def groups(self) -> List[Dict[str, Any]]:
+        try:
+            groups = []
+            for group in self.node.groups.list_groups():
+                members = []
+                for member_hash in group["members"]:
+                    peer = self.node.registry.get(member_hash)
+                    members.append(
+                        {
+                            "hash": member_hash,
+                            "name": (
+                                peer.display_name
+                                if peer is not None
+                                else member_hash[:8]
+                            ),
+                        }
+                    )
+                groups.append(
+                    {
+                        "id": group["id"],
+                        "name": group["name"],
+                        "members": members,
+                        "created_at": group["created_at"],
+                    }
+                )
+            return groups
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not read group store", exc_info=True)
+            return []
+
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+        # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
         # live feed never show an expired entry.
@@ -1518,6 +2207,41 @@ class WebBridge:
         return [
             self._with_inbox_reactions(dict(item), by_target) for item in items
         ]
+
+    def messages_search(
+        self,
+        *,
+        query: str,
+        peer: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return stored messages matching a keyword, newest first.
+
+        A case-insensitive substring match over the message text, over
+        the same stored history the traffic view shows: :meth:`messages`
+        already purges expired disappearing messages, hides blocked
+        senders and annotates reactions, so search reuses it instead of
+        re-reading the log.  An optional *peer* narrows to one peer by
+        destination prefix or peer-name substring.  An empty query
+        raises :class:`RequestError`, which the HTTP layer reports as a
+        400; anything unexpected stays an exception and becomes a 500.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise RequestError("search text must not be empty")
+        needle = query.strip().casefold()
+        items = self.messages(limit=-1)
+        if peer is not None and peer.strip():
+            target = peer.strip().casefold()
+            items = [
+                item
+                for item in items
+                if (item.get("peer") or "").casefold().startswith(target)
+                or target in (item.get("peer_name") or "").casefold()
+            ]
+        matches = [
+            item for item in items if needle in (item.get("text") or "").casefold()
+        ]
+        return matches[::-1][:limit] if limit > 0 else []
 
     def _inbox_reactions_by_target(self) -> Dict[str, List[Dict[str, Any]]]:
         """Node inbox reactions grouped by target, reloaded once per read.
@@ -1628,6 +2352,7 @@ class WebBridge:
         return {
             "node": self.node.info(),
             "peers": self.peers(),
+            "groups": self.groups(),
             "messages": self.messages(limit=200),
             "counts": self.counts(),
             "unread": self.unread(),
@@ -1654,6 +2379,8 @@ class WebBridge:
         status: str,
         rtt: Optional[float] = None,
         mail_id: Optional[str] = None,
+        group: Optional[str] = None,
+        group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
@@ -1674,6 +2401,10 @@ class WebBridge:
                 message["rtt_ms"] = round(rtt * 1000.0, 2)
             if mail_id is not None:
                 message["mail_id"] = mail_id
+            if group is not None:
+                message["group"] = group
+                if group_name:
+                    message["group_name"] = group_name
             if expires_at is not None:
                 message["expires_at"] = expires_at
             if wire_id is not None:
@@ -1846,12 +2577,35 @@ class _WebHandler(BaseHTTPRequestHandler):
                 peers = self.bridge.peers()
                 self._send_json({"peers": peers, "count": len(peers)}, head_only)
                 return
+            if path == "/api/groups":
+                groups = self.bridge.groups()
+                self._send_json({"groups": groups, "count": len(groups)}, head_only)
+                return
             if path == "/api/messages":
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/messages/search":
+                limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                peer = (query.get("peer") or [None])[0]
+                try:
+                    found = self.bridge.messages_search(
+                        query=text, peer=peer, limit=limit
+                    )
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"messages": found, "count": len(found)}, head_only)
+                return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
+                return
+            if path == "/api/outbox/held":
+                self._send_json(self.bridge.held_mail(), head_only)
+                return
+            if path == "/api/allowlist":
+                self._send_json(self.bridge.allowlist(), head_only)
                 return
             if path == "/api/tan/timeline":
                 limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
@@ -1862,6 +2616,49 @@ class _WebHandler(BaseHTTPRequestHandler):
                         limit=limit, include_all=include_all, author=author
                     )
                 except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/search":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                text = (query.get("q") or [""])[0]
+                author = (query.get("author") or [None])[0]
+                try:
+                    posts = self.bridge.tan_search(
+                        query=text, author=author, limit=limit
+                    )
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/mentions":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                try:
+                    posts = self.bridge.tan_mentions(limit=limit)
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"posts": posts, "count": len(posts)}, head_only)
+                return
+            if path == "/api/tan/thread":
+                ref = (query.get("ref") or [None])[0]
+                if not ref or not ref.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'ref' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    posts = self.bridge.tan_thread(ref.strip())
+                except ValueError as exc:
+                    # Only an invalid reference is a client error; an
+                    # unexpected failure (a database error, say) must
+                    # reach the server-error handler as a 500, so the
+                    # console does not mistake it for a deleted anchor
+                    # and close the thread.
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
@@ -1885,6 +2682,46 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json(payload, head_only)
+                return
+            if path == "/api/tan/muted":
+                records = self.bridge.tan_muted()
+                self._send_json(
+                    {"muted": records, "count": len(records)}, head_only
+                )
+                return
+            if path == "/api/tan/muted-keywords":
+                records = self.bridge.tan_muted_keywords()
+                self._send_json(
+                    {"muted_keywords": records, "count": len(records)},
+                    head_only,
+                )
+                return
+            if path == "/api/tan/saved":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
+                try:
+                    result = self.bridge.tan_saved(limit=limit, offset=offset)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load saved Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load saved posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
+                    head_only,
+                )
                 return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
@@ -1921,8 +2758,78 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
+            if path == "/api/outbox/drop-held":
+                self._handle_outbox_drop_held(body, head_only)
+                return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
+                return
+            if path in (
+                "/api/allowlist/add",
+                "/api/allowlist/remove",
+                "/api/allowlist/set-enabled",
+            ):
+                self._handle_allowlist(body, head_only, path.rsplit("/", 1)[1])
+                return
+            if path == "/api/peers/safety-number":
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.peers_safety_number(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except PeerError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "safety_number": result}, head_only)
+                return
+            if path == "/api/peers/verify":
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.peers_verify(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except PeerError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "verify": result}, head_only)
+                return
+            if path in ("/api/peers/block", "/api/peers/unblock"):
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unblock"):
+                        result = self.bridge.unblock_peer(target.strip())
+                    else:
+                        result = self.bridge.block_peer(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "block": result}, head_only)
                 return
             if path == "/api/announce":
                 self.bridge.announce()
@@ -1957,6 +2864,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "post": post}, head_only)
                 return
+            if path == "/api/tan/quote":
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'text' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    quote = self.bridge.tan_quote(target.strip(), text)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "post": quote}, head_only)
+                return
             if path in ("/api/tan/follow", "/api/tan/unfollow"):
                 target = body.get("target") or body.get("author")
                 if not isinstance(target, str) or not target.strip():
@@ -1975,6 +2909,46 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "follow": result}, head_only)
+                return
+            if path in ("/api/tan/mute", "/api/tan/unmute"):
+                target = body.get("target") or body.get("author")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                from .tangents.tan import TanError
+
+                try:
+                    if path.endswith("unmute"):
+                        result = self.bridge.tan_unmute(target.strip())
+                    else:
+                        result = self.bridge.tan_mute(target.strip())
+                except TanError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
+                return
+            if path in ("/api/tan/mute-keyword", "/api/tan/unmute-keyword"):
+                keyword = body.get("keyword")
+                if not isinstance(keyword, str) or not keyword.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'keyword' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unmute-keyword"):
+                        result = self.bridge.tan_unmute_keyword(keyword)
+                    else:
+                        result = self.bridge.tan_mute_keyword(keyword)
+                except Exception as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "mute": result}, head_only)
                 return
             if path in ("/api/tan/like", "/api/tan/unlike"):
                 target = body.get("target") or body.get("hash")
@@ -2015,6 +2989,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "delete": record}, head_only)
+                return
+            if path in ("/api/tan/save", "/api/tan/unsave"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unsave"):
+                        result = self.bridge.tan_unsave(target.strip())
+                    else:
+                        result = self.bridge.tan_save(target.strip())
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a saved Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update saved posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json({"ok": True, "save": result}, head_only)
                 return
             if path == "/api/tan/sync":
                 try:
@@ -2158,6 +3159,25 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
+    def _handle_outbox_drop_held(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            dropped = self.bridge.drop_held_mail(target.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json({"ok": True, "dropped": dropped}, head_only)
+
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")
         timeout = body.get("timeout", 15.0)
@@ -2176,6 +3196,30 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_allowlist(
+        self, body: Dict[str, Any], head_only: bool, action: str
+    ) -> None:
+        try:
+            if action == "set-enabled":
+                result = self.bridge.allowlist_set_enabled(body.get("enabled"))
+            else:
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                if action == "add":
+                    result = self.bridge.allowlist_add(target)
+                else:
+                    result = self.bridge.allowlist_remove(target)
+        except (AllowListError, PeerError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
 

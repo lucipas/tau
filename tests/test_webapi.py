@@ -8,12 +8,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
+from tau.allowlist import AllowList, load_allowlist, save_allowlist
+from tau.blocklist import BlockList
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
-from tau.peers import Peer
+from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
 
 PEER_HASH = "ab" * 16
@@ -28,16 +31,75 @@ class FakeRegistry:
         return list(self._peers)
 
     def get(self, destination_hash):
-        # Mirror the real Registry: a hex string resolves to the peer
-        # whose 16-byte destination hash it names.
         if isinstance(destination_hash, str):
+            value = destination_hash.strip()
+            if len(value) == 32 and all(
+                char in "0123456789abcdefABCDEF" for char in value
+            ):
+                for peer in self._peers:
+                    if peer.hexhash == value.casefold():
+                        return peer
+                return None
+            for peer in self._peers:
+                if peer.name.casefold() == value.casefold():
+                    return peer
+            # Any other hex string (e.g. a full-length destination hash)
+            # falls back to main's byte comparison below.
             try:
-                destination_hash = bytes.fromhex(destination_hash)
+                destination_hash = bytes.fromhex(value)
             except ValueError:
                 return None
         for peer in self._peers:
             if peer.destination_hash == destination_hash:
                 return peer
+        return None
+
+    def resolve(self, target, *, include_alias=True):
+        # Mirror PeerRegistry.resolve for the single-peer fixture: name,
+        # alias (only when include_alias), destination hash or hash
+        # prefix, with ambiguity rejected. A test may set an alias on
+        # the fixture peer to prove a security boundary never resolves
+        # by alias; tan.resolve_author calls
+        # registry.resolve(value, include_alias=False).
+        if not isinstance(target, str):
+            raise PeerError("peer target must be a string or bytes")
+        value = target.strip()
+        if not value:
+            return None
+        if len(value) == 32 and all(
+            char in "0123456789abcdefABCDEF" for char in value
+        ):
+            return self.get(value)
+        if include_alias:
+            by_alias = [
+                p
+                for p in self._peers
+                if getattr(p, "alias", None)
+                and p.alias.casefold() == value.casefold()
+            ]
+            if len(by_alias) == 1:
+                return by_alias[0]
+            if len(by_alias) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_alias)} peers share the alias {value!r}; use a destination hash"
+                )
+        by_name = [p for p in self._peers if p.name.casefold() == value.casefold()]
+        if len(by_name) == 1:
+            return by_name[0]
+        if len(by_name) > 1:
+            raise AmbiguousPeer(
+                f"{len(by_name)} peers are named {value!r}; use a destination hash"
+            )
+        if len(value) >= 4:
+            by_prefix = [
+                p for p in self._peers if p.hexhash.startswith(value.casefold())
+            ]
+            if len(by_prefix) == 1:
+                return by_prefix[0]
+            if len(by_prefix) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_prefix)} peers match the hash prefix {value!r}"
+                )
         return None
 
 
@@ -46,6 +108,13 @@ class FakeNode:
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
+        self._allowlist = AllowList()
+        self._allowlist_lock = threading.RLock()
+        self.allowlist_path = (
+            Path(mailbox_path).with_name("allowlist.json")
+            if mailbox_path is not None
+            else None
+        )
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -60,6 +129,32 @@ class FakeNode:
         )
         self.sent = []
         self.announced = 0
+        self.blocklist = None
+        self.config = None
+
+    def set_blocklist(self, blocklist):
+        self.blocklist = blocklist
+
+    @property
+    def allowlist(self):
+        return self._allowlist
+
+    def set_allowlist(self, allowlist):
+        # Mirrors TauNode.set_allowlist: the running node's in-memory
+        # list and the file change together, persist first.
+        with self._allowlist_lock:
+            save_allowlist(self.allowlist_path, allowlist)
+            self._allowlist = allowlist
+
+    def update_allowlist(self, transform):
+        # Mirrors TauNode.update_allowlist: re-read the saved list so a
+        # change another process saved is preserved, refuse a corrupt
+        # file, and serialise the whole read-modify-write.
+        with self._allowlist_lock:
+            current = load_allowlist(self.allowlist_path)
+            updated = transform(current)
+            self.set_allowlist(updated)
+            return updated
 
     def info(self):
         return {
@@ -193,6 +288,140 @@ def test_record_peer_event_carries_trust_fields(bridge, node):
     assert peer_events[-1]["peer"]["key_change_at"] == 1600.0
 
 
+def test_peers_verify_via_api(tmp_path):
+    import RNS
+
+    from tau.peers import PeerRegistry, safety_number
+
+    identity = RNS.Identity()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.identity = identity
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer_key = b"\x03" * 64
+    registry.upsert(bytes.fromhex(PEER_HASH), peer_key, name="alice", hops=1)
+    node.registry = registry
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A key-change warning is answered by verifying, not left to warn.
+        peer = registry.get(PEER_HASH)
+        assert peer is not None
+        peer.key_change_at = 1500.0
+
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        verify = payload["verify"]
+        assert verify["peer"] == PEER_HASH
+        assert verify["name"] == "alice"
+        assert verify["safety_number"] == safety_number(
+            identity.get_public_key(), peer_key
+        )
+        assert verify["reverified"] is False
+        assert verify["fingerprint_changed"] is False
+
+        status, _, payload = _json(bridge, "/api/peers")
+        entry = [
+            item for item in payload["peers"] if item["destination"] == PEER_HASH
+        ][0]
+        assert entry["verified"] is True
+        assert entry["key_change_at"] is None
+
+        # Re-verifying under a different local identity changes the
+        # pairwise number, and the response says so.
+        node.identity = RNS.Identity()
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": PEER_HASH}
+        )
+        assert status == 200
+        assert payload["verify"]["reverified"] is True
+        assert payload["verify"]["fingerprint_changed"] is True
+
+        # Unknown and blank targets are rejected.
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "nobody"}
+        )
+        assert status == 400
+        assert "no peer matches" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge, "/api/peers/verify", method="POST", body={"target": "  "}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_peers_safety_number_shows_without_verifying(tmp_path):
+    import RNS
+
+    from tau.peers import PeerRegistry, safety_number
+
+    identity = RNS.Identity()
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.identity = identity
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer_key = b"\x03" * 64
+    registry.upsert(bytes.fromhex(PEER_HASH), peer_key, name="alice", hops=1)
+    node.registry = registry
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A key-change warning is still open before the number is shown.
+        peer = registry.get(PEER_HASH)
+        assert peer is not None
+        peer.key_change_at = 1500.0
+
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "alice"},
+        )
+        assert status == 200
+        shown = payload["safety_number"]
+        assert shown["peer"] == PEER_HASH
+        assert shown["name"] == "alice"
+        assert shown["safety_number"] == safety_number(
+            identity.get_public_key(), peer_key
+        )
+
+        # Showing the number records nothing: the peer stays
+        # unverified and the warning stays up until the owner
+        # confirms the match.
+        status, _, payload = _json(bridge, "/api/peers")
+        entry = [
+            item for item in payload["peers"] if item["destination"] == PEER_HASH
+        ][0]
+        assert entry["verified"] is False
+        assert entry["key_change_at"] == 1500.0
+
+        # Unknown and blank targets are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "nobody"},
+        )
+        assert status == 400
+        assert "no peer matches" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/safety-number",
+            method="POST",
+            body={"target": "  "},
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_send_message_is_recorded_and_published(bridge, node):
     from tau.protocol import excerpt_hash
 
@@ -319,6 +548,171 @@ def test_inbound_message_comes_back_over_the_api(bridge):
     assert feed["messages"][0]["direction"] == "in"
     assert feed["messages"][0]["peer_name"] == "bob"
     assert feed["messages"][0]["text"] == "from the mesh"
+
+
+def test_messages_search_via_api(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello from the mesh",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "another MESH note",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "unrelated weather chat",
+            "sent_at": 104.0,
+            "received_at": 105.0,
+        }
+    )
+    # An outbound message matches too: search covers the whole traffic view.
+    _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "mesh reply from me"},
+    )
+
+    # Case-insensitive, newest first.
+    status, _, payload = _json(bridge, "/api/messages/search?q=MESH")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == [
+        "mesh reply from me",
+        "another MESH note",
+        "hello from the mesh",
+    ]
+    assert payload["count"] == 3
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&limit=1")
+    assert status == 200
+    assert payload["count"] == 1
+    assert payload["messages"][0]["text"] == "mesh reply from me"
+
+    # A peer filter narrows to one conversation, by name or hash prefix.
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&peer=alice")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == [
+        "mesh reply from me",
+        "hello from the mesh",
+    ]
+
+    status, _, payload = _json(
+        bridge, f"/api/messages/search?q=mesh&peer={OTHER_HASH[:8]}"
+    )
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == ["another MESH note"]
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh&peer=nobody")
+    assert status == 200
+    assert payload["messages"] == []
+
+    # An empty query is a client error.
+    status, _, payload = _json(bridge, "/api/messages/search?q=%20%20")
+    assert status == 400
+    assert "must not be empty" in payload["error"]["message"]
+
+
+def test_messages_search_hides_blocked_and_expired(bridge, node):
+    from tau.blocklist import BlockList
+
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "mesh from alice",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "mallory",
+            "destination": OTHER_HASH,
+            "text": "mesh from mallory",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    # A disappearing message whose deadline passed never matches.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "mesh already gone",
+            "sent_at": 104.0,
+            "received_at": 105.0,
+            "expires_at": 106.0,
+        }
+    )
+
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+
+    status, _, payload = _json(bridge, "/api/messages/search?q=mesh")
+    assert status == 200
+    assert [item["text"] for item in payload["messages"]] == ["mesh from alice"]
+
+
+def test_inbound_group_message_keeps_group_fields(bridge):
+    record = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "hello group",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "kind": "group",
+        "group": "aa" * 16,
+        "group_name": "weekend",
+    }
+    bridge.record_inbound(record)
+
+    _, _, feed = _json(bridge, "/api/messages")
+    message = feed["messages"][0]
+    assert message["group"] == "aa" * 16
+    assert message["group_name"] == "weekend"
+
+    plain = {
+        "from": "bob",
+        "destination": "ef" * 16,
+        "text": "plain",
+        "sent_at": 102.0,
+        "received_at": 103.0,
+    }
+    bridge.record_inbound(plain)
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "group" not in feed["messages"][1]
+
+
+def test_api_groups_lists_known_groups(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    node.groups.create(
+        "weekend", [PEER_HASH, OTHER_HASH], created_by=PEER_HASH
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["count"] == 1
+    group = payload["groups"][0]
+    assert group["name"] == "weekend"
+    assert [member["hash"] for member in group["members"]] == [
+        PEER_HASH,
+        OTHER_HASH,
+    ]
+    # The registry resolves the first member's display name.
+    assert group["members"][0]["name"] == "alice"
 
 
 def _inbound_record(node, **overrides):
@@ -636,6 +1030,994 @@ def test_tan_timeline_and_follow(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_unblock_via_api(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Block by name; the file and the node's cached list both update,
+        # and the peers snapshot carries the new blocked flag.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["peer"]["destination"] == PEER_HASH
+        assert payload["block"]["peer"]["name"] == "alice"
+        assert payload["block"]["blocked"] is True
+        assert payload["block"]["changed"] is True
+        assert node.blocklist is not None
+        assert node.blocklist.is_blocked(PEER_HASH)
+        assert json.loads((tmp_path / "blocklist.json").read_text()) == {
+            "blocked": [PEER_HASH]
+        }
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"][0]["blocked"] is True
+
+        # Re-blocking is a no-op.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["changed"] is False
+        assert payload["block"]["blocked"] is True
+
+        # Unblock by hash prefix.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/unblock",
+            method="POST",
+            body={"target": PEER_HASH[:8]},
+        )
+        assert status == 200
+        assert payload["block"]["blocked"] is False
+        assert payload["block"]["changed"] is True
+        assert not node.blocklist.is_blocked(PEER_HASH)
+        status, _, payload = _json(bridge, "/api/peers")
+        assert payload["peers"][0]["blocked"] is False
+
+        # Unblocking again is a no-op.
+        status, _, payload = _json(
+            bridge, "/api/peers/unblock", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["changed"] is False
+
+        # Unknown peers and missing targets are rejected.
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "nobody"}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={}
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_tan_mute_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "hello from tan", name="tester", now=1000)
+        theirs = create_post(conn, other, "bob's update", name="bob", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/muted")
+        assert status == 200
+        assert payload == {"muted": [], "count": 0}
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": theirs["author"]},
+        )
+        assert status == 200
+        assert payload["mute"]["author"] == theirs["author"]
+        first_muted_at = payload["mute"]["muted_at"]
+
+        # The muted author's posts leave the timeline at once.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["hello from tan"]
+
+        status, _, payload = _json(bridge, "/api/tan/muted")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["muted"][0]["name"] == "bob"
+        assert payload["muted"][0]["posts"] == 1
+
+        # Re-muting is a no-op: the original mute time is kept.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": "bob"},
+        )
+        assert status == 200
+        assert payload["mute"]["muted_at"] == first_muted_at
+        status, _, relisted = _json(bridge, "/api/tan/muted")
+        assert relisted["muted"][0]["muted_at"] == first_muted_at
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute",
+            method="POST",
+            body={"target": "bob"},
+        )
+        assert status == 200
+        assert payload["mute"]["unmuted"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's update",
+            "hello from tan",
+        ]
+
+        # Unmuting again reports that nothing was muted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute",
+            method="POST",
+            body={"target": theirs["author"]},
+        )
+        assert payload["mute"]["unmuted"] is False
+
+        # Muting yourself is refused, like the CLI.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": mine["author"]},
+        )
+        assert status == 400
+        assert "cannot mute yourself" in payload["error"]["message"]
+
+        # Unknown authors and missing fields are rejected.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute",
+            method="POST",
+            body={"target": "nobody-here"},
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/mute", method="POST", body={}
+        )
+        assert status == 400
+        assert "field 'target' is required" in payload["error"]["message"]
+
+        # Keyword mutes hide matching posts and list back.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-keyword",
+            method="POST",
+            body={"keyword": "hello"},
+        )
+        assert status == 200
+        assert payload["mute"]["keyword"] == "hello"
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == ["bob's update"]
+
+        status, _, payload = _json(bridge, "/api/tan/muted-keywords")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["muted_keywords"][0]["display"] == "hello"
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unmute-keyword",
+            method="POST",
+            body={"keyword": "HELLO"},
+        )
+        assert status == 200
+        assert payload["mute"]["unmuted"] is True
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert [item["text"] for item in payload["posts"]] == [
+            "bob's update",
+            "hello from tan",
+        ]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/mute-keyword",
+            method="POST",
+            body={"keyword": "   "},
+        )
+        assert status == 400
+        assert "field 'keyword' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_corrupt_list_refuses(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    (tmp_path / "blocklist.json").write_text("{not json", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 503
+        assert "unusable" in payload["error"]["message"]
+        # Nothing was persisted over the corrupt file, and the running
+        # node fails closed until the owner repairs it.
+        assert (tmp_path / "blocklist.json").read_text() == "{not json"
+        assert node.blocklist is not None
+        assert node.blocklist.block_all
+
+        # A node still fail-closed in memory accepts edits again once the
+        # owner repairs the file — and the repair clears the cached
+        # block-all, so enforcement matches the file.
+        node.blocklist = BlockList(block_all=True)
+        (tmp_path / "blocklist.json").write_text(
+            '{"blocked": []}', encoding="utf-8"
+        )
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["block"]["blocked"] is True
+        assert node.blocklist is not None
+        assert not node.blocklist.block_all
+        assert node.blocklist.is_blocked(PEER_HASH)
+        # The saved file holds the new entry, not just the cache.
+        assert json.loads((tmp_path / "blocklist.json").read_text()) == {
+            "blocked": [PEER_HASH]
+        }
+    finally:
+        bridge.stop()
+
+
+def test_peers_block_keeps_cli_edits(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    # The CLI blocked someone else while this node was running; the
+    # node's cached list predates that edit.
+    (tmp_path / "blocklist.json").write_text(
+        json.dumps({"blocked": [OTHER_HASH]}), encoding="utf-8"
+    )
+    node.blocklist = BlockList()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/peers/block", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        # The CLI's entry survives: the edit is derived from the file,
+        # not from the stale cache.
+        assert json.loads((tmp_path / "blocklist.json").read_text()) == {
+            "blocked": sorted([OTHER_HASH, PEER_HASH])
+        }
+        assert node.blocklist is not None
+        assert node.blocklist.is_blocked(OTHER_HASH)
+        assert node.blocklist.is_blocked(PEER_HASH)
+    finally:
+        bridge.stop()
+
+
+def test_tan_search_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        create_delete,
+        create_post,
+        create_reply,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "hello from the mesh", name="tester", now=1000
+        )
+        create_post(conn, identity, "another MESH note", name="tester", now=1001)
+        create_post(conn, other, "unrelated weather chat", name="other", now=1002)
+        # A reply is not a post: its text never matches, even on keyword.
+        create_reply(
+            conn, other, mine["hash"], "mesh reply", name="other", now=1003
+        )
+        # A deleted post never matches either.
+        doomed = create_post(
+            conn, other, "mesh post to delete", name="other", now=1004
+        )
+        create_delete(conn, other, doomed["hash"], name="other", now=1005)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Case-insensitive, newest first.
+        status, _, payload = _json(bridge, "/api/tan/search?q=MESH")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "another MESH note",
+            "hello from the mesh",
+        ]
+        assert payload["count"] == 2
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh&limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["posts"][0]["text"] == "another MESH note"
+
+        # An explicit author narrows the search to their posts.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={mine['author']}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "another MESH note",
+            "hello from the mesh",
+        ]
+
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=weather&author={mine['author']}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+
+        # An empty query and an unknown author are client errors.
+        status, _, payload = _json(bridge, "/api/tan/search?q=%20%20")
+        assert status == 400
+        assert "must not be empty" in payload["error"]["message"]
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh&author=nobody")
+        assert status == 400
+        assert "unknown author" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_search_hides_blocked_and_muted(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        init_db,
+        mute,
+        mute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    blocked_id = RNS.Identity()
+    muted_id = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "mesh from me", name="tester", now=1000)
+        blocked_author = create_post(
+            conn, blocked_id, "mesh from blocked", name="blocked", now=1001
+        )["author"]
+        muted_author = create_post(
+            conn, muted_id, "mesh from muted", name="muted", now=1002
+        )["author"]
+        mute(conn, muted_author, name="muted", now=1003)
+        # Searching for a muted keyword still finds it: search is explicit.
+        create_post(conn, identity, "weather report", name="tester", now=1004)
+        mute_keyword(conn, "weather", now=1005)
+        # A quote of a blocked author's post still matches on its own
+        # text, but the embedded original must stay redacted.
+        blocked_original = create_post(
+            conn, blocked_id, "blocked original words", name="blocked", now=1006
+        )
+        create_quote(
+            conn,
+            identity,
+            blocked_original["hash"],
+            "mesh quote",
+            name="tester",
+            now=1007,
+        )
+    finally:
+        conn.close()
+
+    node.blocklist = SimpleNamespace(
+        blocked=frozenset({blocked_author}), block_all=False
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "mesh quote",
+            "mesh from me",
+        ]
+        # The quote matches on its own text, but its blocked original
+        # stays redacted: no name, no words.
+        quoted = payload["posts"][0]["quoted"]
+        assert quoted["blocked"] is True
+        assert quoted["name"] == ""
+        assert quoted["text"] == ""
+        assert "blocked original" not in json.dumps(payload)
+
+        # An explicit author search still cannot surface a blocked author.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={blocked_author}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+
+        # ... but it can surface a muted one: that is a direct lookup.
+        status, _, payload = _json(
+            bridge, f"/api/tan/search?q=mesh&author={muted_author}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["mesh from muted"]
+
+        status, _, payload = _json(bridge, "/api/tan/search?q=weather")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["weather report"]
+
+        # A block-list that failed closed hides every result.
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/search?q=mesh")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
+def test_tan_mentions_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        TanApp,
+        create_delete,
+        create_post,
+        create_reply,
+        init_db,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "original thought", name="tester", now=1000
+        )
+        reply = create_reply(
+            conn, other, mine["hash"], "seconded", name="other", now=1001
+        )
+        # A reply to my own post from myself is not a mention of me.
+        create_reply(
+            conn, identity, mine["hash"], "talking to myself", name="tester", now=1002
+        )
+        # A reply to someone else's post mentions them, not me.
+        theirs = create_post(conn, other, "bob's own post", name="other", now=1003)
+        create_reply(
+            conn, identity, theirs["hash"], "not a mention", name="tester", now=1004
+        )
+        # A reply its author deleted never appears.
+        doomed = create_reply(
+            conn, other, mine["hash"], "take it back", name="other", now=1005
+        )
+        create_delete(conn, other, doomed["hash"], name="other", now=1006)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["count"] == 1
+        # Each mention carries its parent, so the reader sees what was answered.
+        assert payload["posts"][0]["reply_to"]["hash"] == mine["hash"]
+        assert payload["posts"][0]["reply_to"]["text"] == "original thought"
+        assert reply["hash"] == payload["posts"][0]["hash"]
+
+        status, _, payload = _json(bridge, "/api/tan/mentions?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+    finally:
+        bridge.stop()
+
+    # Without an identity there is nothing of yours to be replied to.
+    node.app = None
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_tan_mentions_hide_blocked_and_muted(tmp_path):
+    from types import SimpleNamespace
+
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        MAX_FEED_POSTS,
+        TanApp,
+        create_post,
+        create_reply,
+        init_db,
+        mute,
+        mute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    blocked_id = RNS.Identity()
+    muted_id = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "my post", name="tester", now=1000)
+        # Older visible reply: it must still fill the limit after the
+        # newer hidden replies below are paged past.
+        create_reply(conn, other, mine["hash"], "friendly reply", name="other", now=1001)
+        blocked_author = create_reply(
+            conn, blocked_id, mine["hash"], "blocked reply", name="blocked", now=1002
+        )["author"]
+        # Newer keyword-muted filler spans more than one page, so the
+        # older visible reply is reached only by paging past it.
+        for index in range(MAX_FEED_POSTS + 5):
+            create_reply(
+                conn,
+                other,
+                mine["hash"],
+                f"spam filler {index}",
+                name="other",
+                now=2000 + index,
+            )
+        muted_author = create_reply(
+            conn, muted_id, mine["hash"], "muted author reply", name="muted", now=1003
+        )["author"]
+        create_reply(conn, other, mine["hash"], "spam keyword reply", name="other", now=1004)
+        mute(conn, muted_author, name="muted", now=1005)
+        mute_keyword(conn, "spam", now=1006)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    node.blocklist = SimpleNamespace(
+        blocked=frozenset({blocked_author}), block_all=False
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/mentions?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["friendly reply"]
+
+        # A block-list that failed closed hides every mention.
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
+def test_tan_mentions_unexpected_failure_is_500(tmp_path, monkeypatch):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "original thought", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        import tau.tangents.tan as tan_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("database exploded")
+
+        monkeypatch.setattr(tan_module, "mentions", _boom)
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 500
+        assert payload["error"]["message"] == "internal error"
+    finally:
+        bridge.stop()
+
+
+def test_tan_saved_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "save me", name="tester", now=1000)
+        theirs = create_post(conn, other, "save me too", name="other", now=1001)
+        create_post(conn, other, "not saved", name="other", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline flags saved posts so the console can show save
+        # state on each card.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is False
+
+        # Saving requires a target, and an unknown hash cannot be saved.
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": "ff" * 32}
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["hash"] == mine["hash"]
+        assert payload["save"]["already_saved"] is False
+
+        # Saving again is a no-op that reports the original save.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["already_saved"] is True
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["save me"]["saved"] is True
+        assert by_text["save me too"]["saved"] is True
+        assert by_text["not saved"]["saved"] is False
+
+        # Saved posts come back newest save first, flagged as saved.
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "save me too",
+            "save me",
+        ]
+        assert all(item["saved"] is True for item in payload["posts"])
+        assert all("saved_at" in item for item in payload["posts"])
+
+        # The list pages through older saves instead of stopping at the
+        # first page. The resume offset comes from the response: it
+        # counts raw rows, so filtering never shifts it.
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["save me too"]
+        assert payload["next_offset"] == 1
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=1")
+        assert [item["text"] for item in payload["posts"]] == ["save me"]
+        assert payload["next_offset"] is None
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
+        assert payload["posts"] == []
+        assert payload["next_offset"] is None
+
+        # Unsaving removes it from the list; unsaving again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unsave",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 200
+        assert payload["save"]["unsaved"] is False
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == ["save me"]
+
+        # A post deleted after being saved stays in the list with its
+        # text blanked, so the save is not silently lost.
+        node.app = TanApp(node.config, identity, name="tester", gossip=False)
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert len(payload["posts"]) == 1
+        assert payload["posts"][0]["text"] == ""
+        assert payload["posts"][0]["deleted"] is True
+        assert payload["posts"][0]["saved"] is True
+    finally:
+        bridge.stop()
+
+
+def test_tan_saved_annotations_and_muting(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import (
+        create_post,
+        create_quote,
+        create_reply,
+        init_db,
+        mute,
+        mute_keyword,
+        save_post,
+        unmute,
+        unmute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        original = create_post(
+            conn, other, "original thought", name="other", now=1000
+        )
+        quote = create_quote(
+            conn, identity, original["hash"], "worth sharing", name="tester", now=1001
+        )
+        reply = create_reply(
+            conn, identity, original["hash"], "seconded", name="tester", now=1002
+        )
+        # Distinct save times keep the newest-first order deterministic.
+        save_post(conn, quote["hash"], now=2001)
+        save_post(conn, reply["hash"], now=2002)
+        save_post(conn, original["hash"], now=2003)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A saved quote carries its original, like the timeline does.
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["quoted"]["text"] == "original thought"
+        assert by_text["seconded"]["reply_to"]["text"] == "original thought"
+
+        # Muting the other author hides their saved post and redacts
+        # them from reply parents; unmuting restores both.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute(conn, original["author"], name="other")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded",
+            "worth sharing",
+        ]
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["seconded"]["reply_to"] is None
+        # A muted author's post never surfaces through a quote preview
+        # either — in the saved list or the timeline.
+        assert by_text["worth sharing"]["quoted"] is None
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        timeline_by_text = {item["text"]: item for item in payload["posts"]}
+        assert timeline_by_text["worth sharing"]["quoted"] is None
+        # Paging fills past the muted rows: the first page still holds
+        # one visible post, and the resume offset skips the muted row
+        # instead of re-fetching it.
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["next_offset"] == 2
+        status, _, payload = _json(bridge, "/api/tan/saved?limit=1&offset=2")
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["next_offset"] is None
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute(conn, original["author"]) is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+
+        # A muted keyword hides matching saves; unmuting restores them.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute_keyword(conn, "sharing")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "original thought",
+            "seconded",
+        ]
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute_keyword(conn, "sharing") is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+
+        # A muted keyword blanks the quoted original (and the reply
+        # parent) instead of leaking its text through the preview.
+        conn = init_db(node.config.social_db_path)
+        try:
+            mute_keyword(conn, "thought")
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded",
+            "worth sharing",
+        ]
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["quoted"]["text"] == ""
+        assert by_text["worth sharing"]["quoted"]["muted"] is True
+        assert by_text["seconded"]["reply_to"]["text"] == ""
+        assert by_text["seconded"]["reply_to"]["muted"] is True
+        conn = init_db(node.config.social_db_path)
+        try:
+            assert unmute_keyword(conn, "thought") is True
+        finally:
+            conn.close()
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert len(payload["posts"]) == 3
+    finally:
+        bridge.stop()
+
+
+def test_tan_thread_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, create_reply, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        root = create_post(conn, identity, "root post", name="tester", now=1000)
+        reply = create_reply(
+            conn, other, root["hash"], "first reply", name="other", now=1001
+        )
+        nested = create_reply(
+            conn, identity, reply["hash"], "reply to the reply", name="tester", now=1002
+        )
+        create_post(conn, other, "unrelated post", name="other", now=1003)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A hash prefix names the thread; entries come back oldest first
+        # with their depth, and the unrelated post stays out.
+        status, _, payload = _json(bridge, f"/api/tan/thread?ref={root['hash'][:16]}")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "root post",
+            "first reply",
+            "reply to the reply",
+        ]
+        assert [item["depth"] for item in payload["posts"]] == [0, 1, 2]
+        assert payload["count"] == 3
+
+        # Naming a reply resolves to the same thread, rooted at its post.
+        status, _, payload = _json(bridge, f"/api/tan/thread?ref={nested['hash']}")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "root post",
+            "first reply",
+            "reply to the reply",
+        ]
+
+        # Unknown references and a missing ref fail the way the CLI does.
+        status, _, payload = _json(bridge, "/api/tan/thread?ref=ab" * 16)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        status, _, payload = _json(bridge, "/api/tan/thread")
+        assert status == 400
+        assert "field 'ref' is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_thread_unexpected_failure_is_500(tmp_path, monkeypatch):
+    node = FakeNode()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # An unexpected failure inside tan_thread is a server error,
+        # not a bad reference: the console must not read it as a
+        # deleted anchor and close the thread.
+        monkeypatch.setattr(
+            bridge,
+            "tan_thread",
+            lambda ref: (_ for _ in ()).throw(RuntimeError("database is locked")),
+        )
+        status, _, payload = _json(bridge, "/api/tan/thread?ref=abc12345")
+        assert status == 500
+        assert payload["error"]["message"] == "internal error"
     finally:
         bridge.stop()
 
@@ -1087,6 +2469,116 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def _hold(node, to_hex, message_id, blob=b"sealed-bytes", expires_at=None,
+          depositor=None, now=None):
+    return node.mailbox.hold(
+        to=bytes.fromhex(to_hex),
+        blob=blob,
+        message_id=message_id,
+        expires_at=expires_at if expires_at is not None else time.time() + 3600,
+        now=now,
+        depositor=bytes.fromhex(depositor) if depositor else None,
+    )
+
+
+def test_outbox_held_lists_envelopes_with_names(bridge, node):
+    first = "cc" + "11" * 15
+    second = "dd" + "22" * 15
+    assert _hold(
+        node, PEER_HASH, first, blob=b"sealed-one",
+        expires_at=5000.0, depositor=OTHER_HASH, now=100.0,
+    )
+    assert _hold(
+        node, OTHER_HASH, second, blob=b"sealed-two!",
+        expires_at=6000.0, depositor=PEER_HASH, now=200.0,
+    )
+
+    status, _, payload = _json(bridge, "/api/outbox/held")
+    assert status == 200
+    assert payload["count"] == 2
+    by_id = {entry["id"]: entry for entry in payload["held"]}
+    assert by_id[first]["to"] == PEER_HASH
+    assert by_id[first]["to_name"] == "alice"
+    # Unknown depositor: no name, but the hash is still shown.
+    assert by_id[first]["from"] == OTHER_HASH
+    assert by_id[first]["from_name"] == ""
+    assert by_id[first]["stored_at"] == 100.0
+    assert by_id[first]["expires_at"] == 5000.0
+    assert by_id[first]["blob_bytes"] == len(b"sealed-one")
+    # Unknown recipient: falls back to the hash, while the known
+    # depositor resolves to a name.
+    assert by_id[second]["to"] == OTHER_HASH
+    assert by_id[second]["to_name"] == ""
+    assert by_id[second]["from"] == PEER_HASH
+    assert by_id[second]["from_name"] == "alice"
+    assert by_id[second]["blob_bytes"] == len(b"sealed-two!")
+    # Oldest first.
+    assert [entry["id"] for entry in payload["held"]] == [first, second]
+
+
+def test_outbox_drop_held_by_id_and_prefix(bridge, node):
+    first = "cc" + "11" * 15
+    second = "dd" + "22" * 15
+    _hold(node, PEER_HASH, first)
+    _hold(node, PEER_HASH, second)
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": first}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["dropped"]["id"] == first
+    assert payload["dropped"]["to_name"] == "alice"
+    assert "already fetched" in payload["dropped"]["note"]
+    # The tombstone stops a sender retry resurrecting the envelope.
+    assert _hold(node, PEER_HASH, first) is False
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": second[:8]}
+    )
+    assert status == 200
+    assert payload["dropped"]["id"] == second
+
+    status, _, payload = _json(bridge, "/api/outbox/held")
+    assert payload == {"held": [], "count": 0}
+
+
+def test_outbox_drop_held_errors(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": "ff" * 16}
+    )
+    assert status == 400
+    assert "unknown held message" in payload["error"]["message"]
+
+    # Two envelopes sharing a prefix make the prefix ambiguous.
+    _hold(node, PEER_HASH, "aa" + "11" * 15)
+    _hold(node, PEER_HASH, "aa" + "22" * 15)
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": "aa"}
+    )
+    assert status == 400
+    assert "match prefix" in payload["error"]["message"]
+
+    # Dropping an envelope that is already gone is a 404 too.
+    gone = "bb" + "33" * 15
+    _hold(node, PEER_HASH, gone)
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": gone}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge, "/api/outbox/drop-held", method="POST", body={"target": gone}
+    )
+    assert status == 400
+    assert "unknown held message" in payload["error"]["message"]
+
+
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
     from tau.mailbox import Mailbox
 
@@ -1107,6 +2599,210 @@ def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
     assert payload["cancelled"]["id"] == entry.id
     # A fresh view of the file agrees the entry is gone.
     assert Mailbox(tmp_path / "mailbox.json").get_outbox(entry.id) is None
+
+
+def test_allowlist_get_empty(bridge):
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_name_and_remove(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    # The entry survives a fresh GET, with its registry name attached.
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/remove", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_raw_hash_has_no_name(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": OTHER_HASH}
+    )
+    assert status == 200
+    assert payload["entries"] == [{"destination": OTHER_HASH, "name": ""}]
+
+
+def test_allowlist_add_by_prefix(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "abab"}
+    )
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+
+def test_allowlist_add_rejects_alias(bridge, node):
+    # The allow-list is a security boundary: a local alias must never
+    # stand in for the peer's asserted name, so the fixture peer's
+    # alias "ally" does not resolve here even though the registry
+    # would resolve it with include_alias=True.
+    node.registry.get(PEER_HASH).alias = "ally"
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "ally"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+
+def test_allowlist_set_enabled_applies_immediately(bridge, node, tmp_path):
+    _json(bridge, "/api/allowlist/add", method="POST", body={"target": "alice"})
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    assert payload["enabled"] is True
+    assert [entry["destination"] for entry in payload["entries"]] == [PEER_HASH]
+
+    # The running node's in-memory gate changed too — no restart needed.
+    assert node.allowlist.is_allowed(PEER_HASH) is True
+    assert node.allowlist.is_allowed(OTHER_HASH) is False
+    # And the file agrees, so a restart keeps the same state.
+    from tau.allowlist import load_allowlist
+
+    saved = load_allowlist(tmp_path / "allowlist.json")
+    assert saved.enabled is True
+    assert saved.allow == frozenset({PEER_HASH})
+
+
+def test_allowlist_errors(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "  "}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "nobody"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/remove",
+        method="POST",
+        body={"target": "nobody"},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": "yes"},
+    )
+    assert status == 400
+    assert "boolean" in payload["error"]["message"]
+
+
+def test_allowlist_concurrent_adds_keep_every_entry(bridge):
+    # Overlapping mutations must not lose each other's changes: each
+    # add derives from the latest saved list, not a stale snapshot.
+    hashes = [f"{n:02x}" * 16 for n in range(1, 11)]
+    errors = []
+
+    def add_one(destination):
+        try:
+            status, _, _ = _json(
+                bridge,
+                "/api/allowlist/add",
+                method="POST",
+                body={"target": destination},
+            )
+            assert status == 200
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=add_one, args=(destination,))
+        for destination in hashes
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert [entry["destination"] for entry in payload["entries"]] == sorted(
+        hashes
+    )
+
+
+def test_allowlist_toggle_keeps_cli_saved_entries(bridge, node, tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    # The CLI saved a change while this node runs; the running node's
+    # in-memory list does not know about it yet.
+    save_allowlist(
+        tmp_path / "allowlist.json",
+        AllowList(enabled=False, allow=frozenset({OTHER_HASH})),
+    )
+    assert node.allowlist.is_allowed(OTHER_HASH) is True  # not enforced yet
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    # The console toggle reconciled with the saved file instead of
+    # overwriting it with the stale in-memory list.
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        OTHER_HASH
+    ]
+    assert node.allowlist.is_allowed(OTHER_HASH) is True
+    assert node.allowlist.is_allowed(PEER_HASH) is False
+
+
+def test_allowlist_refuses_to_overwrite_corrupt_file(bridge, node, tmp_path):
+    path = tmp_path / "allowlist.json"
+    path.write_text("{not json", encoding="utf-8")
+    before = path.read_bytes()
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 400
+    assert "allow-list" in payload["error"]["message"]
+    # The file is untouched and the running node's in-memory list is
+    # unchanged by the failed edit.
+    assert path.read_bytes() == before
+    assert node.allowlist.enabled is False
+    assert node.allowlist.allow == frozenset()
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -1780,6 +3476,7 @@ def test_tan_reply_via_api(tmp_path):
             "name": "tester",
             "text": "api thread starter",
             "deleted": False,
+            "edited": False,
         }
 
         # Replying to an unknown post fails.
@@ -1811,6 +3508,92 @@ def test_tan_reply_via_api(tmp_path):
         )
         assert status == 200
         assert payload["post"]["kind"] == "post"
+    finally:
+        bridge.stop()
+
+
+def test_tan_quote_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, identity, "api quotable", name="tester", now=1000)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"][:16], "text": "seconded, with notes"},
+        )
+        assert status == 200
+        quote = payload["post"]
+        assert quote["kind"] == "quote"
+        assert quote["target"] == post["hash"]
+        assert quote["text"] == "seconded, with notes"
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "seconded, with notes",
+            "api quotable",
+        ]
+        assert payload["posts"][0]["quoted"] == {
+            "hash": post["hash"],
+            "author": post["author"],
+            "name": "tester",
+            "text": "api quotable",
+            "deleted": False,
+        }
+
+        # Quoting a quote is rejected: embeds stay one level deep.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": quote["hash"], "text": "nesting"},
+        )
+        assert status == 400
+        assert "only posts and replies can be quoted" in payload["error"]["message"]
+
+        # Quoting an unknown post fails.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": "cd" * 32, "text": "nowhere"},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target or comment is a bad request, not a crash.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"text": "no target"},
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/quote",
+            method="POST",
+            body={"target": post["hash"]},
+        )
+        assert status == 400
+        assert "text" in payload["error"]["message"]
     finally:
         bridge.stop()
 
