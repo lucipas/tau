@@ -36,18 +36,38 @@ function makePeer(overrides: Partial<Peer> = {}): Peer {
 function renderSidebar(
   unread: Record<string, number>,
   onSelectPeer = vi.fn(),
-  options: { node?: NodeInfo | null; social?: SocialInfo | null } = {},
+  options: {
+    node?: NodeInfo | null;
+    social?: SocialInfo | null;
+    peers?: Peer[];
+    blocks?: Record<string, { pending?: boolean; error?: string }>;
+    onBlock?: (destination: string) => void;
+    onUnblock?: (destination: string) => void;
+  } = {},
 ) {
   return render(
     <PeerSidebar
       node={options.node ?? null}
-      peers={[makePeer(), makePeer({ destination: "cd".repeat(16), name: "bob" })]}
+      peers={
+        options.peers ?? [
+          makePeer(),
+          makePeer({ destination: "cd".repeat(16), name: "bob" }),
+        ]
+      }
+      groups={[]}
       bridge={null}
       social={options.social ?? null}
       pings={{}}
+      blocks={options.blocks ?? {}}
+      verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
+      onBlock={options.onBlock ?? (() => {})}
+      onUnblock={options.onUnblock ?? (() => {})}
+      onVerify={() => {}}
+      onShowSafetyNumber={() => {}}
+      onDismissVerification={() => {}}
       onSelectPeer={onSelectPeer}
     />,
   );
@@ -134,5 +154,61 @@ describe("PeerSidebar node stores", () => {
 
     expect(screen.queryByText("stores")).toBeNull();
     expect(screen.getByText("mynode")).toBeTruthy();
+  });
+});
+
+describe("PeerSidebar block and unblock", () => {
+  it("asks twice before blocking: arm, then confirm", () => {
+    const onBlock = vi.fn();
+    renderSidebar({}, vi.fn(), { onBlock });
+
+    const button = screen.getByRole("button", { name: "Block alice" });
+    fireEvent.click(button);
+    expect(onBlock).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/click again to block alice/),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm blocking alice" }));
+    expect(onBlock).toHaveBeenCalledWith("ab".repeat(16));
+  });
+
+  it("unblocks a blocked peer with one click and shows the badge", () => {
+    const onUnblock = vi.fn();
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        peers: [makePeer({ blocked: true })],
+        onUnblock,
+      },
+    );
+
+    expect(screen.getByText("blocked")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unblock alice" }));
+    expect(onUnblock).toHaveBeenCalledWith("ab".repeat(16));
+  });
+
+  it("shows a block error under the peer", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      { blocks: { ["ab".repeat(16)]: { error: "unknown peer" } } },
+    );
+
+    expect(screen.getByText("unknown peer")).toBeTruthy();
+  });
+
+  it("disables the block button while a block is pending", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      { blocks: { ["ab".repeat(16)]: { pending: true } } },
+    );
+
+    expect(screen.getByText("blocking…")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Block alice" }),
+    ).toHaveProperty("disabled", true);
   });
 });
