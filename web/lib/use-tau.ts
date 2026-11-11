@@ -4,21 +4,29 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost, eventsUrl } from "./api";
 import type {
+  AllowlistResponse,
+  BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
   DropHeldResponse,
+  GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
   MarkReadResponse,
+  MessagesSearchResponse,
   NodeInfo,
   OutboxEntry,
   OutboxResponse,
   Peer,
   PingResult,
+  SafetyNumberResponse,
   SendResponse,
   Snapshot,
+  TauGroup,
   TauMessage,
   UnreadCounts,
+  VerifyPeerResponse,
+  VerifyState,
 } from "./types";
 
 export type ConnectionState =
@@ -31,6 +39,11 @@ export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 export interface PingState {
   pending?: boolean;
   rtt_ms?: number | null;
+  error?: string;
+}
+
+export interface BlockState {
+  pending?: boolean;
   error?: string;
 }
 
@@ -49,17 +62,47 @@ function readEventData<T>(event: Event): T | null {
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [groups, setGroups] = useState<TauGroup[]>([]);
   const [messages, setMessages] = useState<TauMessage[]>([]);
+  // The search the feed is showing, or null for the live traffic. Kept
+  // beside `messages` so a search result list is never mixed into the
+  // live feed: new arrivals keep updating `messages` underneath, and
+  // clearing the search returns to it.
+  const [searchResults, setSearchResults] = useState<TauMessage[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
+  const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [verifications, setVerifications] = useState<
+    Record<string, VerifyState>
+  >({});
+  const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Verification time the console last applied per peer. Peer events
+  // queued before a successful verify carry the older trust state and
+  // must not undo the badge.
+  const localVerifiedAt = useRef<Record<string, number | null>>({});
+  // Ordering of authoritative peer state: each peer event or snapshot
+  // gets a sequence number. A block/unblock reply sent before a newer
+  // one must not overwrite the flag the event already delivered.
+  const peerEventSeq = useRef(0);
+  const peerRevision = useRef<Map<string, number>>(new Map());
+  const snapshotRevision = useRef(0);
+
+  const searchQueryRef = useRef(searchQuery);
+  const searchSeq = useRef(0);
+
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
 
   // Unread counts can arrive out of order: an SSE event queued before a
   // snapshot, or an HTTP response delayed past a newer event. Only a
@@ -91,7 +134,11 @@ export function useTau() {
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
       setNode(snapshot.node);
+      peerEventSeq.current += 1;
+      snapshotRevision.current = peerEventSeq.current;
+      localVerifiedAt.current = {};
       setPeers(sortPeers(snapshot.peers));
+      setGroups(snapshot.groups ?? []);
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
       // revision baseline so a delayed event from the old connection
@@ -133,11 +180,44 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      // Ordering for block/unblock replies: a peer event that arrives
+      // after a block request was sent is newer than the reply, so the
+      // reply must not overwrite the flag it already delivered.
+      peerEventSeq.current += 1;
+      peerRevision.current.set(peer.destination, peerEventSeq.current);
+      // A blocked sender's inbound history is hidden by the server's
+      // message snapshots; drop it from the live feed too, so a block
+      // from any console takes effect at once. History stays stored
+      // and comes back with the next snapshot after an unblock.
+      if (peer.blocked) {
+        setMessages((previous) =>
+          previous.filter(
+            (entry) =>
+              !(entry.direction === "in" && entry.peer === peer.destination),
+          ),
+        );
+      }
+      // A peer event queued before a successful verify carries the
+      // older trust state; the local verification is newer, so keep
+      // it instead of letting the stale event undo the badge. A
+      // snapshot resets the record (see onSnapshot): it is
+      // authoritative, and any event after it is newer than the verify.
+      const localVerified = localVerifiedAt.current[peer.destination];
+      const currentPeer =
+        localVerified != null &&
+        (peer.verified_at == null || peer.verified_at < localVerified)
+          ? {
+              ...peer,
+              verified: true,
+              verified_at: localVerified,
+              key_change_at: null,
+            }
+          : peer;
       setPeers((previous) => {
         const next = previous.filter(
-          (entry) => entry.destination !== peer.destination,
+          (entry) => entry.destination !== currentPeer.destination,
         );
-        next.push(peer);
+        next.push(currentPeer);
         return sortPeers(next);
       });
     };
@@ -183,6 +263,7 @@ export function useTau() {
 
   const refreshSeq = useRef(0);
   const refreshHeldSeq = useRef(0);
+  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -204,21 +285,111 @@ export function useTau() {
     setHeldMail(result.held);
   }, []);
 
+  const refreshGroups = useCallback(async () => {
+    // Same polling shape as the outbox: a group learned from an
+    // incoming message shows up here without waiting for a reload.
+    const requestId = ++groupsSeq.current;
+    const result = await apiGet<GroupsResponse>("/api/groups");
+    if (requestId !== groupsSeq.current) return;
+    setGroups(result.groups);
+  }, []);
+
   useEffect(() => {
     if (connection !== "live") return;
     async function tick() {
-      // The two endpoints are independent: a failure on one must not
-      // stop the other from updating its state. The outbox is a side
+      // The three endpoints are independent: a failure on one must not
+      // stop the others from updating their state. The outbox is a side
       // panel: a failed poll leaves the last known entries in place
       // instead of flashing an error.
-      await Promise.allSettled([refreshOutbox(), refreshHeldMail()]);
+      await Promise.allSettled([
+        refreshOutbox(),
+        refreshHeldMail(),
+        refreshGroups(),
+      ]);
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups]);
+
+  const allowlistSeq = useRef(0);
+
+  // Allow-list requests can resolve out of order: only the newest
+  // issued request may replace state, so a slow add cannot restore
+  // the list a later remove already changed — the same pattern as
+  // refreshOutbox and the unread revision guard.
+  const applyAllowlist = useCallback(
+    (requestId: number, result: AllowlistResponse) => {
+      if (requestId !== allowlistSeq.current) return;
+      setAllowlist(result);
+    },
+    [],
+  );
+
+  const refreshAllowlist = useCallback(async () => {
+    const requestId = ++allowlistSeq.current;
+    const result = await apiGet<AllowlistResponse>("/api/allowlist");
+    applyAllowlist(requestId, result);
+  }, [applyAllowlist]);
+
+  // The allow-list only changes through this console or the CLI, and
+  // CLI changes do not apply to the running node until it restarts —
+  // so a load on connect plus a refresh after each action is enough;
+  // no polling interval like the outbox needs.
+  useEffect(() => {
+    if (connection !== "live") return;
+    let disposed = false;
+    async function load() {
+      try {
+        await refreshAllowlist();
+      } catch {
+        if (disposed) return;
+      }
+    }
+    void load();
+    return () => {
+      disposed = true;
+    };
+  }, [connection, refreshAllowlist]);
+
+  const addAllowlistPeer = useCallback(
+    async (target: string) => {
+      const requestId = ++allowlistSeq.current;
+      const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
+        target,
+      });
+      applyAllowlist(requestId, result);
+      return result;
+    },
+    [applyAllowlist],
+  );
+
+  const removeAllowlistPeer = useCallback(
+    async (target: string) => {
+      const requestId = ++allowlistSeq.current;
+      const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
+        target,
+      });
+      applyAllowlist(requestId, result);
+      return result;
+    },
+    [applyAllowlist],
+  );
+
+  const setAllowlistEnabled = useCallback(
+    async (enabled: boolean) => {
+      const requestId = ++allowlistSeq.current;
+      const result = await apiPost<AllowlistResponse>(
+        "/api/allowlist/set-enabled",
+        { enabled },
+      );
+      applyAllowlist(requestId, result);
+      return result;
+    },
+    [applyAllowlist],
+  );
 
   const cancelOutbox = useCallback(
     async (id: string) => {
@@ -328,6 +499,161 @@ export function useTau() {
     }
   }, []);
 
+  const editBlock = useCallback(
+    async (destination: string, block: boolean) => {
+      setBlocks((previous) => ({
+        ...previous,
+        [destination]: { pending: true },
+      }));
+      const requestSeq = peerEventSeq.current;
+      try {
+        const result = await apiPost<BlockPeerResponse>(
+          block ? "/api/peers/block" : "/api/peers/unblock",
+          { target: destination },
+        );
+        // The bridge also publishes a peer event with the new flag, so
+        // this local update is only the immediate feedback; the event
+        // reconciles it for every open console. Skip it when a newer
+        // peer event or snapshot arrived after the request was sent.
+        const newestSeq = Math.max(
+          peerRevision.current.get(destination) ?? 0,
+          snapshotRevision.current,
+        );
+        if (newestSeq <= requestSeq) {
+          setPeers((previous) =>
+            previous.map((entry) =>
+              entry.destination === destination
+                ? { ...entry, blocked: result.block.blocked }
+                : entry,
+            ),
+          );
+          if (result.block.blocked) {
+            // Same reconciliation as the peer-event path, for the
+            // acting console before the event arrives.
+            setMessages((previous) =>
+              previous.filter(
+                (entry) =>
+                  !(entry.direction === "in" && entry.peer === destination),
+              ),
+            );
+          }
+        }
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {},
+        }));
+        return result.block;
+      } catch (error) {
+        setBlocks((previous) => ({
+          ...previous,
+          [destination]: {
+            error: error instanceof Error ? error.message : "block failed",
+          },
+        }));
+        throw error;
+      }
+    },
+    [],
+  );
+
+  const blockPeer = useCallback(
+    (destination: string) => editBlock(destination, true),
+    [editBlock],
+  );
+
+  const unblockPeer = useCallback(
+    (destination: string) => editBlock(destination, false),
+    [editBlock],
+  );
+
+  // Showing the safety number records nothing: the peer stays
+  // unverified and any key-change warning stays up until the owner
+  // compares the number out of band and confirms it matches.
+  const showSafetyNumber = useCallback(async (destination: string) => {
+    setVerifications((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<SafetyNumberResponse>(
+        "/api/peers/safety-number",
+        { target: destination },
+      );
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          safetyNumber: result.safety_number.safety_number,
+        },
+      }));
+      return result.safety_number;
+    } catch (error) {
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "verify failed",
+        },
+      }));
+      throw error;
+    }
+  }, []);
+
+  // Confirm step: only call after the owner compared the shown number
+  // out of band and found it matches. This is what records the
+  // verification and clears any key-change warning.
+  const verifyPeer = useCallback(async (destination: string) => {
+    setVerifications((previous) => ({
+      ...previous,
+      [destination]: {
+        pending: true,
+        safetyNumber: previous[destination]?.safetyNumber,
+      },
+    }));
+    try {
+      const result = await apiPost<VerifyPeerResponse>("/api/peers/verify", {
+        target: destination,
+      });
+      const verify = result.verify;
+      localVerifiedAt.current[destination] = verify.verified_at;
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: { result: verify },
+      }));
+      // The badge and warning update at once instead of waiting for
+      // the next snapshot: the peer is verified now, and any earlier
+      // key-change warning about it is answered.
+      setPeers((previous) =>
+        previous.map((peer) =>
+          peer.destination === destination
+            ? {
+                ...peer,
+                verified: true,
+                verified_at: verify.verified_at,
+                key_change_at: null,
+              }
+            : peer,
+        ),
+      );
+      return verify;
+    } catch (error) {
+      setVerifications((previous) => ({
+        ...previous,
+        [destination]: {
+          safetyNumber: previous[destination]?.safetyNumber,
+          error: error instanceof Error ? error.message : "verify failed",
+        },
+      }));
+      throw error;
+    }
+  }, []);
+
+  const clearVerification = useCallback((destination: string) => {
+    setVerifications((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+  }, []);
+
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -340,25 +666,97 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  // A search is a view switch, like the Tan search: setting the query
+  // fetches the search endpoint instead of showing the live feed.
+  // Clearing it returns to the live traffic the same way.
+  const runSearch = useCallback(async (trimmed: string) => {
+    // Each request takes a sequence number; a response only applies if it
+    // is still the latest request, so superseded or cleared searches
+    // cannot overwrite the active view.
+    const seq = ++searchSeq.current;
+    try {
+      const result = await apiGet<MessagesSearchResponse>(
+        `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
+      );
+      if (seq !== searchSeq.current) return;
+      setSearchResults(result.messages);
+      setSearchError(null);
+    } catch (caught) {
+      if (seq !== searchSeq.current) return;
+      setSearchError(
+        caught instanceof Error ? caught.message : "search failed",
+      );
+    }
+  }, []);
+
+  const search = useCallback(
+    async (query: string) => {
+      const trimmed = query.trim();
+      if (!trimmed) return;
+      if (trimmed === searchQueryRef.current) {
+        // Resubmitting the current query: setting the same state would
+        // bail out without reloading, so refresh directly — and keep
+        // the current results instead of clearing them, or the feed
+        // would wrongly report no matches until the next message.
+        await runSearch(trimmed);
+        return;
+      }
+      // Drop hits from the previous query so they are not shown as matches
+      // for the new one while its request is in flight.
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchQuery(trimmed);
+      await runSearch(trimmed);
+    },
+    [runSearch],
+  );
+
+  const clearSearch = useCallback(() => {
+    // Invalidate any in-flight search so its late response is discarded.
+    searchSeq.current += 1;
+    setSearchQuery(null);
+    setSearchResults([]);
+    setSearchError(null);
+  }, []);
+
   return {
     node,
     peers,
+    groups,
     messages,
+    searchResults,
+    searchQuery,
+    searchError,
+    search,
+    clearSearch,
     unread,
     outbox,
     heldForOthers,
     heldMail,
+    allowlist,
     bridge,
     connection,
     pings,
+    verifications,
+    blocks,
     announcing,
     send,
     ping,
+    showSafetyNumber,
+    verifyPeer,
+    clearVerification,
+    blockPeer,
+    unblockPeer,
     announce,
     markRead,
     refreshOutbox,
+    refreshGroups,
     cancelOutbox,
     refreshHeldMail,
     dropHeldMail,
+    refreshAllowlist,
+    addAllowlistPeer,
+    removeAllowlistPeer,
+    setAllowlistEnabled,
   };
 }
