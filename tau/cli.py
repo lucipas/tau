@@ -5563,7 +5563,11 @@ def cmd_pinned(args: argparse.Namespace) -> int:
     registry = PeerRegistry(config.peers_path)
     peer_hash = None
     if getattr(args, "peer", None):
-        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+        # The listing covers sent pins too, so the lookup must search
+        # recipients as well as senders.
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None
+        )
     limit = getattr(args, "limit", 30)
     if limit is not None and limit < 0:
         raise NodeError("--limit must not be negative")
@@ -5571,13 +5575,20 @@ def cmd_pinned(args: argparse.Namespace) -> int:
         limit=None, peer=peer_hash, pinned_only=True, direction=None
     )
     # Blocked senders' history stays stored but is hidden locally,
-    # like `tau messages`; unblocking restores the view.
+    # like `tau messages`; unblocking restores the view.  The filter
+    # applies to received pins only: sent pins are this node's own
+    # messages, not a blocked sender's, so blocking the recipient
+    # never hides them — and an unreadable list hides received pins
+    # (fail closed) while leaving sent ones visible.
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
-        entries = []
+        entries = [entry for entry in entries if entry.get("direction") == "out"]
     elif blocked:
         entries = [
-            entry for entry in entries if entry.get("destination") not in blocked
+            entry
+            for entry in entries
+            if entry.get("direction") == "out"
+            or entry.get("destination") not in blocked
         ]
     shown = entries if limit is None else entries[:limit]
     if _json_mode(args):

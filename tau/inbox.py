@@ -435,12 +435,15 @@ def _dedupe_key(record: Dict[str, Any]) -> Any:
 def _match_ref(entries: List[Dict[str, Any]], ref: str) -> Dict[str, Any]:
     """The stored entry addressed by *ref*, or raise :class:`InboxError`.
 
-    Same convention as :meth:`Mailbox.resolve_outbox`: a full
-    32-character id matches exactly, a shorter prefix must match
-    exactly one stored message.  Peer-supplied ids are case-sensitive:
-    an exact match wins outright; only then fall back to a case-folded
-    prefix.  Records with no id (older stores predate ids) cannot be
-    addressed this way.
+    Same convention as :meth:`Mailbox.resolve_outbox`: a full id
+    matches exactly, a shorter prefix must match exactly one stored
+    message.  Peer-supplied ids are case-sensitive: an exact match
+    wins outright; only then fall back to a case-folded full match,
+    and then to a case-folded prefix match.  The prefix step runs
+    whatever the reference length — a 32-character prefix of a
+    64-character LXMF id still resolves when no full id matches.
+    Records with no id (older stores predate ids) cannot be addressed
+    this way.
     """
     if not isinstance(ref, str) or not ref.strip():
         raise InboxError("message reference must not be empty")
@@ -450,18 +453,18 @@ def _match_ref(entries: List[Dict[str, Any]], ref: str) -> Dict[str, Any]:
     ]
     if not matches:
         folded = value.lower()
-        if len(folded) == 32:
-            matches = [
-                entry
-                for entry in entries
-                if str(entry.get("id") or "").lower() == folded
-            ]
-        else:
-            matches = [
-                entry
-                for entry in entries
-                if str(entry.get("id") or "").lower().startswith(folded)
-            ]
+        matches = [
+            entry
+            for entry in entries
+            if str(entry.get("id") or "").lower() == folded
+        ]
+    if not matches:
+        folded = value.lower()
+        matches = [
+            entry
+            for entry in entries
+            if str(entry.get("id") or "").lower().startswith(folded)
+        ]
     if not matches:
         raise InboxError(f"unknown message: {ref!r}")
     if len(matches) > 1:
@@ -913,6 +916,9 @@ class Inbox:
         Each entry carries ``unread``: whether it arrived after its
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
+        Sent messages are never unread: the cursor belongs to the
+        conversation's received side, so comparing a sent record's
+        sequence against it would flag it arbitrarily.
         """
         if direction is not None and direction not in ("in", "out"):
             raise ValueError('direction must be "in" or "out"')
@@ -952,12 +958,13 @@ class Inbox:
             entries = entries[: max(0, limit)]
         annotated = []
         for item in entries:
-            copy = dict(
-                item,
-                unread=_is_unread(
-                    item, cursors.get(item.get("destination") or "")
-                ),
+            # Unread is a received-message state: a message this node
+            # sent is never unread, whatever the conversation's read
+            # cursor says about its arrival sequence.
+            unread = item.get("direction") != "out" and _is_unread(
+                item, cursors.get(item.get("destination") or "")
             )
+            copy = dict(item, unread=unread)
             reactions = by_target.get(str(item.get("id") or ""))
             if reactions:
                 reactions.sort(key=lambda entry: entry["received_at"])

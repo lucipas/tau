@@ -2168,6 +2168,95 @@ def test_pinned_peer_filter_and_json(tmp_path, capsys):
     assert payload["messages"][0]["pinned"] is True
 
 
+def test_pinned_peer_prefix_finds_sent_pin(tmp_path, capsys):
+    """A pinned sent message is findable by its recipient's hash prefix.
+
+    The recipient is not in the registry and never sent anything, so
+    only the sent record names them — the peer lookup must search
+    sent pins too.
+    """
+    data_dir, _ = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    code = cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(["pinned", "--peer", "cdcdcdcd", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "sent pinned note" in out
+    # Sent pins render as from you, never as unread.
+    assert "you →" in out
+    assert "●" not in out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    sent = [item for item in payload["messages"] if item["id"] == "s-1"]
+    assert sent and sent[0]["unread"] is False
+
+
+def test_pinned_blocked_filter_applies_to_received_only(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    cli.main(["pin", "m-1", "--data-dir", str(data_dir)])
+    cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    def _pinned_text():
+        code = cli.main(["pinned", "--data-dir", str(data_dir)])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received pin, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [sender_hash.hex()]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+    # Blocking the recipient hides nothing: sent pins are your own.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [recipient]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" in out
+    assert "sent pinned note" in out
+
+    # An unreadable list hides received pins (fail closed) but keeps sent ones.
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+
 def test_parser_messages_unread_and_count_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--unread", "--count"])

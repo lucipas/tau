@@ -323,6 +323,61 @@ def test_pin_by_full_id_and_unique_prefix(tmp_path):
     assert len(inbox.list_messages()) == 2
 
 
+def test_pin_32_char_prefix_of_64_char_lxmf_id(tmp_path):
+    """A 32-char prefix of a 64-char LXMF id pins when no full id matches."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 32, text="lxmf copy"))
+
+    entry, changed = inbox.pin("ab" * 16)
+    assert changed is True
+    assert entry["id"] == "ab" * 32
+    entry, changed = inbox.unpin("ab" * 16)
+    assert changed is True
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pin_32_char_prefix_ambiguous_across_lxmf_ids(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 16 + "11" * 16, text="first"))
+    inbox.append(_record(id="ab" * 16 + "22" * 16, text="second"))
+
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.pin("ab" * 16)
+
+
+def test_pin_exact_full_id_wins_over_lxmf_prefix(tmp_path):
+    """A full 32-char id still wins over a 64-char id sharing its prefix."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 16, text="short id"))
+    inbox.append(_record(id="ab" * 16 + "cd" * 16, text="long id"))
+
+    entry, _ = inbox.pin("ab" * 16)
+    assert entry["text"] == "short id"
+
+
+def test_delete_32_char_prefix_of_64_char_id(tmp_path):
+    """The shared matcher fixes delete the same way it fixes pin."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 32, text="lxmf copy"))
+
+    removed = inbox.delete("ab" * 16)
+    assert removed["text"] == "lxmf copy"
+    assert len(inbox) == 0
+
+
+def test_sent_messages_are_never_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="sent-one", text="sent", direction="out"))
+    inbox.append(_record(id="recv-one", text="received"))
+
+    entries = inbox.list_messages(direction=None)
+    by_id = {entry["id"]: entry for entry in entries}
+    assert by_id["sent-one"]["unread"] is False
+    assert by_id["recv-one"]["unread"] is True
+
+
 def test_pin_unknown_and_ambiguous(tmp_path):
     from tau.inbox import InboxError
 
