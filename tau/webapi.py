@@ -3999,6 +3999,27 @@ def _valid_expires_in(value: Any) -> bool:
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL
 
 
+def _clamped_timeout(value: Any, default: float) -> float:
+    """Clamp a request ``timeout`` to [1.0, 120.0] seconds.
+
+    Non-numeric, boolean, and non-finite values fall back to ``default``.
+    Huge JSON integers overflow ``float()``, so the conversion is guarded
+    here instead of raising past the handler.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except OverflowError:
+        # An integer too large for a float is far above the cap — in
+        # either direction, so the overflow path follows the same
+        # bounds as the normal clamp.
+        return 120.0 if value > 0 else 1.0
+    if not math.isfinite(seconds):
+        return default
+    return max(1.0, min(seconds, 120.0))
+
+
 class _WebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -4950,9 +4971,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 {"error": {"message": "field 'text' is required"}}, head_only, 400
             )
             return
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
-            timeout = 20.0
-        timeout = max(1.0, min(float(timeout), 120.0))
+        timeout = _clamped_timeout(timeout, 20.0)
         expires_at = None
         if expires_in is not None:
             if (
@@ -5159,9 +5178,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
-            timeout = 20.0
-        timeout = max(1.0, min(float(timeout), 120.0))
+        timeout = _clamped_timeout(timeout, 20.0)
         try:
             result = self.bridge.react(
                 target.strip(), reaction, clear=clear, timeout=timeout
@@ -5361,9 +5378,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                 {"error": {"message": "field 'to' is required"}}, head_only, 400
             )
             return
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
-            timeout = 15.0
-        timeout = max(1.0, min(float(timeout), 120.0))
+        timeout = _clamped_timeout(timeout, 15.0)
         try:
             result = self.bridge.ping(target, timeout=timeout)
         except PeerError as exc:
