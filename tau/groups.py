@@ -653,6 +653,17 @@ class GroupStore:
                         candidate["topic_sent_at"] = (
                             None if best_at == float("-inf") else best_at
                         )
+                        # The same reconciled topic governs the
+                        # existing branch below: a successor pinned
+                        # earlier by a member message carries no topic
+                        # of its own, so without this the branch would
+                        # keep the incoming older (or empty) topic
+                        # while the predecessor holding the newer one
+                        # is deleted.
+                        topic = best_topic
+                        topic_sent_at = (
+                            None if best_at == float("-inf") else best_at
+                        )
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
                 if learned - len(superseded) >= MAX_LEARNED_GROUPS:

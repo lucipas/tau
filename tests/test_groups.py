@@ -691,6 +691,70 @@ def test_group_store_record_successor_keeps_its_newer_topic(tmp_path):
     assert cleared is not None and cleared["topic"] == ""
 
 
+def test_group_store_record_existing_successor_keeps_predecessor_topic(
+    tmp_path,
+):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # A member message pins the successor first; members cannot set a
+    # topic, so it starts empty.
+    member_pinned = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OTHER_HASH,
+        sent_at=120.0,
+    )
+    assert member_pinned is not None and member_pinned["topic"] == ""
+    # The creator's message carries an older topic: the predecessor's
+    # newer one must win, and the predecessor is retired.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="older plan",
+        topic_sent_at=100.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_existing_successor_adopts_missing_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    member_pinned = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OTHER_HASH,
+        sent_at=120.0,
+    )
+    assert member_pinned is not None and member_pinned["topic"] == ""
+    # The creator's message omits the topic entirely: the predecessor's
+    # newer one must still survive the replacement.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
 def test_group_store_record_same_topic_skips_write(tmp_path):
     path = tmp_path / "groups.json"
     store = GroupStore(path)
