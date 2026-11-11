@@ -48,7 +48,9 @@ from .instance_lock import (
 )
 from .lxmf import (
     LXMFError,
+    build_lxmf_message,
     lxmf_router_delivery_hash,
+    send_lxmf_message,
     start_lxmf_router,
     stop_lxmf_router,
 )
@@ -188,7 +190,16 @@ _FILE_TRANSFER_TIMEOUT = 300.0
 _FILE_METADATA_OVERHEAD = 64
 
 
-class NotAllowedError(NodeError):
+class PeerRefusedError(NodeError):
+    """Raised when a peer explicitly refuses a request.
+
+    Distinct from transport failures: a refusal must never be retried
+    over another route (such as LXMF), since that bypasses the peer's
+    policy.
+    """
+
+
+class NotAllowedError(PeerRefusedError):
     """Raised when a peer explicitly rejects a request (allow-list denial).
 
     Distinct from other :class:`NodeError` failures so callers can tell
@@ -2238,6 +2249,7 @@ class TauNode:
         )
         if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
+        via_lxmf = False
         try:
             self._request(
                 peer,
@@ -2255,17 +2267,39 @@ class TauNode:
             self.mailbox.remove_outbox(entry.id)
             return False
         except NodeError as exc:
-            try:
-                self.mailbox.record_attempt(
-                    entry.id, error=str(exc), timeout=_remaining(deadline)
-                )
-            except TimeoutError:
-                log.debug(
-                    "Could not record failed delivery attempt for %s: "
-                    "mailbox lock busy",
-                    entry.id,
-                )
-            return False
+            # An explicit refusal (allow-list, block-list) is final: falling
+            # back to LXMF would deliver to the peer's separate destination
+            # and bypass the policy that refused it.  Only transport
+            # failures may try LXMF.
+            if isinstance(exc, PeerRefusedError) or not self._still_queued(
+                entry.id, timeout=_remaining(deadline)
+            ):
+                # A cancel may have landed while the direct request was in
+                # flight; do not start a fresh send for a cancelled entry.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            if not self._deliver_via_lxmf(entry, timeout):
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            via_lxmf = True
         # Record the confirmed delivery before the entry leaves the outbox,
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)
@@ -2281,7 +2315,12 @@ class TauNode:
                 "busy; leaving it queued for a later round",
                 entry.id,
             )
-        log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        log.info(
+            "Delivered queued message %s to %s%s",
+            entry.id,
+            peer.hexhash,
+            " over LXMF" if via_lxmf else "",
+        )
         self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
@@ -2289,6 +2328,54 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
+
+    def _deliver_via_lxmf(self, entry: Any, timeout: float) -> bool:
+        """Try one queued entry over LXMF; True only on confirmation.
+
+        The LXMF router must be running and the recipient must have a
+        registered public key — without it no LXMF address can be
+        derived.  Delivery is confirmed by the router's callback (the
+        peer received it, or a propagation node accepted it); anything
+        else leaves the entry queued for the next sweep.
+        """
+        if self.lxmf_router is None or self.identity is None:
+            return False
+        if getattr(entry, "group_id", None) is not None:
+            # LXMF carries only plain text: a group message sent this
+            # way would land in the recipient's DM inbox, not the
+            # group.  Leave it queued for a direct retry instead.
+            return False
+        if entry.expires_at <= time.time() or (
+            entry.message_expires_at is not None
+            and entry.message_expires_at <= time.time()
+        ):
+            # The deadline passed while the direct request was in
+            # flight. The LXMF receiver carries no deadline, so an
+            # expired message must not go out over LXMF.
+            log.debug(
+                "Skipping LXMF send for expired queued message %s",
+                entry.id,
+            )
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None or not recipient.public_key:
+            log.debug(
+                "No public key for %s; cannot address an LXMF message",
+                entry.to_hex,
+            )
+            return False
+        try:
+            message = build_lxmf_message(
+                self.identity, recipient.public_key, entry.text
+            )
+            return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
+        except (LXMFError, ValueError) as exc:
+            log.debug(
+                "Could not send queued message %s over LXMF: %s",
+                entry.id,
+                exc,
+            )
+            return False
 
     def _deposit_entry(
         self,
@@ -3984,6 +4071,10 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "unavailable":
+                # The block-list drops silently with this generic code;
+                # it is still the peer's explicit refusal, not transport.
+                raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
