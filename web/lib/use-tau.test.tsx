@@ -485,4 +485,53 @@ describe("useTau sendGroup", () => {
 
     expect(result.current.messages).toEqual(legs);
   });
+
+  it("warns about a queued leg when another leg fails", async () => {
+    const legs = [
+      makeMessage({
+        id: 1,
+        peer: PEER_HASH,
+        peer_name: "alice",
+        status: "queued",
+        mail_id: "mail-alice-1",
+      }),
+      makeMessage({
+        id: 2,
+        peer: BOB_HASH,
+        peer_name: "bob",
+        status: "failed",
+      }),
+    ];
+    mockedPost.mockResolvedValue({
+      ok: false,
+      messages: legs,
+      response: {
+        ok: false,
+        group: GROUP_ID,
+        name: "crew",
+        results: [
+          { to: PEER_HASH, to_name: "alice", queued: true, id: "mail-alice-1" },
+          { to: BOB_HASH, to_name: "bob", ok: false, error: "not_allowed" },
+        ],
+      },
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot(),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(1));
+
+    // The queued copy will still reach alice, so the error must say so:
+    // retrying without that warning would send her a duplicate.
+    await act(async () => {
+      await expect(result.current.sendGroup(GROUP_ID, "hi all")).rejects.toThrow(
+        /could not send to bob — alice have a copy queued/,
+      );
+    });
+
+    expect(result.current.messages).toEqual(legs);
+  });
 });
