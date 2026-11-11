@@ -2,8 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 
+<<<<<<< HEAD
 import type { Peer, TauGroup, TauMessage } from "@/lib/types";
 import { MAX_MESSAGE_CHARS } from "@/lib/constants";
+=======
+import type { Peer, TauMessage } from "@/lib/types";
+import { MAX_FILE_BYTES, MAX_MESSAGE_CHARS } from "@/lib/constants";
+import { formatFileSize } from "@/lib/format";
+>>>>>>> origin/main
 
 import { SendIcon } from "./ui";
 
@@ -15,7 +21,11 @@ export function Composer({
   onTargetChange,
   onModeChange,
   onSend,
+<<<<<<< HEAD
   onSendGroup,
+=======
+  onSendFile,
+>>>>>>> origin/main
   replyTo,
   onCancelReply,
 }: {
@@ -31,7 +41,11 @@ export function Composer({
     expiresIn?: number,
     replyTo?: string,
   ) => Promise<TauMessage>;
+<<<<<<< HEAD
   onSendGroup: (group: string, text: string) => Promise<TauMessage[]>;
+=======
+  onSendFile?: (to: string, file: File) => Promise<TauMessage>;
+>>>>>>> origin/main
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
 }) {
@@ -39,7 +53,9 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
+  const [file, setFile] = useState<File | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const custom = mode === "custom" || (peers.length === 0 && mode !== "group");
   const groupMode = mode === "group";
@@ -51,7 +67,6 @@ export function Composer({
 
   async function submit() {
     const trimmedTarget = target.trim();
-    const trimmedText = text.trim();
     if (!trimmedTarget) {
       setError(
         groupMode
@@ -60,6 +75,28 @@ export function Composer({
       );
       return;
     }
+    if (file) {
+      if (!onSendFile) return;
+      if (file.size > MAX_FILE_BYTES) {
+        setError("File is larger than 10 MiB.");
+        return;
+      }
+      setSending(true);
+      setError(null);
+      try {
+        await onSendFile(trimmedTarget, file);
+        setFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        onCancelReply?.();
+        textareaRef.current?.focus();
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "send failed");
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+    const trimmedText = text.trim();
     if (!trimmedText) {
       setError("Write a message first.");
       return;
@@ -213,6 +250,26 @@ export function Composer({
         </div>
       ) : null}
 
+      {file ? (
+        <div className="mt-2 flex items-center gap-2 rounded-lg border border-signal/30 bg-signal/[0.06] px-3 py-2 text-[11px] text-zinc-300">
+          <span className="min-w-0 flex-1 truncate font-mono">
+            📎 {file.name} · {formatFileSize(file.size)}
+          </span>
+          <button
+            type="button"
+            title="Remove file"
+            onClick={() => {
+              setFile(null);
+              if (fileInputRef.current) fileInputRef.current.value = "";
+              setError(null);
+            }}
+            className="shrink-0 rounded px-1.5 py-0.5 font-mono text-mist transition hover:bg-void/60 hover:text-zinc-100"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
+
       <div className="mt-2 flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -234,15 +291,45 @@ export function Composer({
           }
           className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
         />
+        {onSendFile ? (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              aria-label="Attach a file"
+              onChange={(event) => {
+                const picked = event.target.files?.[0] ?? null;
+                if (picked && picked.size > MAX_FILE_BYTES) {
+                  setError("File is larger than 10 MiB.");
+                  setFile(null);
+                  event.target.value = "";
+                  return;
+                }
+                setFile(picked);
+                setError(null);
+              }}
+            />
+            <button
+              type="button"
+              title="Attach a file (up to 10 MiB)"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending}
+              className="inline-flex h-[52px] shrink-0 items-center rounded-xl border border-line bg-void/60 px-3 text-xs font-medium text-mist transition hover:border-signal/40 hover:text-zinc-200 disabled:cursor-not-allowed disabled:text-mist/60"
+            >
+              📎 <span className="hidden sm:inline">&nbsp;attach</span>
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           onClick={() => void submit()}
-          disabled={sending || !text.trim() || !target.trim()}
+          disabled={sending || (!text.trim() && !file) || !target.trim()}
           className="inline-flex h-[52px] shrink-0 items-center gap-2 rounded-xl border border-signal/40 bg-signal/15 px-4 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/25 disabled:cursor-not-allowed disabled:border-line disabled:bg-void/60 disabled:text-mist/60"
         >
           <SendIcon className="h-4 w-4" />
           <span className="hidden sm:inline">
-            {sending ? "sending…" : "send"}
+            {sending ? "sending…" : file ? "send file" : "send"}
           </span>
         </button>
       </div>
