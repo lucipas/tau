@@ -5060,7 +5060,12 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
-def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> str:
+def _resolve_inbox_peer(
+    inbox: Inbox,
+    registry: PeerRegistry,
+    target: str,
+    direction: Optional[str] = "in",
+) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
@@ -5069,6 +5074,8 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
     prefix shared by two distinct senders is ambiguous, even when one
     of them is registered and the other is not (pruned, or never
     discovered — a direct message needs no prior announce).
+    ``direction`` picks which inbox records are searched: ``"in"`` for
+    received messages (the default), ``None`` for both directions.
     """
     target = target.strip()
     if _is_hex32(target):
@@ -5086,7 +5093,7 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
         senders = {peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)}
         senders |= {
             str(entry.get("destination") or "").casefold()
-            for entry in inbox.list_messages(limit=None)
+            for entry in inbox.list_messages(limit=None, direction=direction)
             if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
         if len(senders) == 1:
@@ -5300,7 +5307,8 @@ def _print_message_entry(
         name = peer.display_name if peer is not None else entry.get("from") or "unknown"
         who = f"{name} ({sender})"
     when = _format_message_time(float(entry.get("received_at", 0)))
-    marker = "● " if entry.get("unread") else ""
+    # Unread is a received-message state; a sent message is never unread.
+    marker = "● " if entry.get("unread") and entry.get("direction") != "out" else ""
     pin_marker = "📌 " if entry.get("pinned") else ""
     # The short id is what `tau react` takes: without it the
     # listing gives the user no way to name a message to react to.
