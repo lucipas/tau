@@ -17,7 +17,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
-                           (one outbound entry per member; replies and expiry are peer-DM-only)
+                           (one outbound entry per member; replies are peer-DM-only,
+                           ``expires_in`` works for DM and group sends)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
