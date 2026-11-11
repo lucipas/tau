@@ -1031,9 +1031,12 @@ class Inbox:
         Messages are in stored (oldest-first) order so an import replays
         them in order; ``peer`` restricts the export to one sender
         destination hash.  The document is the same shape
-        :meth:`import_messages` accepts.
+        :meth:`import_messages` accepts.  The snapshot is read through
+        the cross-process transaction, so messages another process
+        committed since this inbox last loaded are included instead of
+        silently omitted from the backup.
         """
-        with self._lock:
+        with self.transaction():
             entries = [dict(item) for item in self._messages]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1116,10 +1119,15 @@ class Inbox:
                 # never stored.
                 self._messages = previous
                 raise OSError(f"could not persist inbox to {self.path}")
-        if inserted is not None:
-            # Only records that survived the retention cap were stored.
-            kept = {id(item) for item in self._messages}
-            inserted.extend(item for item in added if id(item) in kept)
+            if inserted is not None:
+                # Only records that survived the retention cap were
+                # stored. Collect them while the transaction still holds
+                # the lock: a concurrent reload replaces the record
+                # objects in self._messages, so an identity check after
+                # the transaction would find none of them and the caller
+                # would mirror nothing.
+                kept = {id(item) for item in self._messages}
+                inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
             "present": present,
