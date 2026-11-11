@@ -106,6 +106,7 @@ export function Console() {
             peers={tau.peers}
             groups={tau.groups}
             bridge={tau.bridge}
+            social={tau.social}
             pings={tau.pings}
             verifications={tau.verifications}
             blocks={tau.blocks}

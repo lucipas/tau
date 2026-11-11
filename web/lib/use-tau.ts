@@ -23,6 +23,7 @@ import type {
   SafetyNumberResponse,
   SendResponse,
   Snapshot,
+  SocialInfo,
   TauGroup,
   TauMessage,
   UnreadCounts,
@@ -78,6 +79,7 @@ export function useTau() {
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
+  const [social, setSocial] = useState<SocialInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
   const [verifications, setVerifications] = useState<
@@ -146,6 +148,7 @@ export function useTau() {
       // cannot overwrite it.
       applyUnread(snapshot.unread ?? EMPTY_UNREAD, true);
       setBridge(snapshot.bridge);
+      setSocial(snapshot.social ?? null);
       setConnection("live");
     };
 
@@ -767,6 +770,7 @@ export function useTau() {
     heldMail,
     allowlist,
     bridge,
+    social,
     connection,
     pings,
     verifications,

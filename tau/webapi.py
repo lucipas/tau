@@ -1390,6 +1390,35 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_post_count(self) -> int:
+        """Number of readable posts in the local Tan store.
+
+        Counts linked timeline-kind entries their author has not
+        deleted — the same set the timeline shows — instead of the
+        session-scoped post-event buffer, which misses posts already
+        on disk when the bridge starts, posts pulled in by sync, and
+        posts this node created itself.  Falls back to the buffer
+        when the store cannot be read.
+        """
+        if self._tan_app() is None:
+            return 0
+        try:
+            from .tangents.tan import TIMELINE_KINDS_SQL, _NOT_DELETED
+
+            conn = self._tan_conn()
+            try:
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM posts "
+                    f"WHERE kind IN ({TIMELINE_KINDS_SQL}) AND linked = 1 "
+                    f"AND {_NOT_DELETED}"
+                ).fetchone()
+                return int(row["n"])
+            finally:
+                conn.close()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not count Tan posts", exc_info=True)
+            return len(self.tan_posts(limit=0))
+
     def _resolve_mute_target(self, conn, target: str):
         """Resolve a mute/unmute target the way the CLI does.
 
@@ -2437,7 +2466,7 @@ class WebBridge:
             },
             "social": {
                 "enabled": self._tan_app() is not None,
-                "posts": len(self.tan_posts(limit=0)),
+                "posts": self.tan_post_count(),
             },
         }
 

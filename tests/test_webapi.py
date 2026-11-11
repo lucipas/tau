@@ -1097,6 +1097,43 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_snapshot_counts_tan_posts_from_the_store(tmp_path):
+    """Regression test for the Codex P2 on PR #180: snapshot
+    ``social.posts`` counted the session-scoped post-event buffer, so
+    a node with posts already on disk reported 0. It must count the
+    store instead."""
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        keeper = create_post(conn, identity, "keeper", name="tester", now=1000)
+        doomed = create_post(conn, identity, "doomed", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    # A like entry and an author delete land in the same table; neither
+    # is a readable post.
+    node.app.react(keeper["hash"], liked=True)
+    node.app.delete(doomed["hash"])
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Nothing arrived over the wire this session: the event buffer
+        # is empty, so a buffer count would say 0.
+        assert len(bridge.tan_posts(limit=0)) == 0
+        assert bridge.snapshot()["social"] == {"enabled": True, "posts": 1}
+    finally:
+        bridge.stop()
+
+
 def test_peers_block_unblock_via_api(tmp_path):
     from tau.config import TauConfig
 
@@ -2083,6 +2120,8 @@ def test_tan_thread_unexpected_failure_is_500(tmp_path, monkeypatch):
         assert payload["error"]["message"] == "internal error"
     finally:
         bridge.stop()
+
+
 
 
 def test_tan_delete_via_api(tmp_path):
