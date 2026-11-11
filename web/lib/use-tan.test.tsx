@@ -970,3 +970,212 @@ describe("useTan rules", () => {
     expect(result.current.rules).toEqual(denyRules);
   });
 });
+
+describe("useTan top view", () => {
+  it("loads /api/tan/top when the view switches to top", async () => {
+    const top = makePost({ text: "most liked", likes: 5 });
+    const latest = makePost({ text: "newest", hash: "e".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/top")) {
+        return Promise.resolve({ posts: [top], count: 1 });
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [latest], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+    expect(result.current.view).toBe("timeline");
+
+    await act(async () => {
+      result.current.setView("top");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([top]));
+    expect(result.current.view).toBe("top");
+    const topCalls = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    );
+    expect(topCalls.length).toBeGreaterThan(0);
+    expect(topCalls[0][0]).toBe("/api/tan/top?limit=10");
+
+    // Switching back reloads the timeline.
+    await act(async () => {
+      result.current.setView("timeline");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+  });
+
+  it("does not poll while the top view is selected", async () => {
+    vi.useFakeTimers();
+    try {
+      const top = makePost({ text: "most liked", likes: 5 });
+      // Five queued calls for the initial load (feed, following, muted,
+      // muted keywords, suggestions) plus the rules load, then four
+      // more for the top load (feed, following, muted, muted keywords).
+      const queue = [
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+        deferred(),
+      ];
+      let next = 0;
+      mockedGet.mockImplementation((path: string) =>
+        path === "/api/tan/rules"
+          ? Promise.resolve(emptyRules)
+          : queue[next++].promise,
+      );
+
+      const { result } = renderHook(() => useTan());
+      // The initial timeline load is in flight; switch to top, which
+      // supersedes it with a top load.
+      expect(mockedGet.mock.calls.length).toBe(6);
+      act(() => {
+        result.current.setView("top");
+      });
+      expect(mockedGet.mock.calls.length).toBe(10);
+
+      await act(async () => {
+        queue[5].resolve({ posts: [top], count: 1 });
+        queue[6].resolve(emptyFollowing);
+        queue[7].resolve({ muted: [], count: 0 });
+        queue[8].resolve({ muted_keywords: [], count: 0 });
+      });
+      expect(result.current.posts).toEqual([top]);
+
+      await act(async () => {
+        vi.advanceTimersByTime(15000);
+      });
+      expect(mockedGet.mock.calls.length).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hides the timeline posts while the top view is pending", async () => {
+    const latest = makePost({ text: "newest", hash: "e".repeat(64) });
+    const top = makePost({ text: "most liked", likes: 5 });
+    const topLoad = deferred<{ posts: TanPost[]; count: number }>();
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/top")) return topLoad.promise;
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [latest], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+
+    act(() => {
+      result.current.setView("top");
+    });
+    // Chronological posts must not appear under the top label.
+    expect(result.current.posts).toEqual([]);
+    expect(result.current.loading).toBe(true);
+
+    await act(async () => {
+      topLoad.resolve({ posts: [top], count: 1 });
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([top]));
+  });
+
+  it("hides the timeline posts when the top view fails to load", async () => {
+    const latest = makePost({ text: "newest", hash: "e".repeat(64) });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/top")) {
+        return Promise.reject(new Error("top unavailable"));
+      }
+      if (path.startsWith("/api/tan/timeline")) {
+        return Promise.resolve({ posts: [latest], count: 1 });
+      }
+      return Promise.resolve(emptyFollowing);
+    });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([latest]));
+
+    await act(async () => {
+      result.current.setView("top");
+    });
+    await waitFor(() => expect(result.current.error).toBe("top unavailable"));
+    expect(result.current.posts).toEqual([]);
+  });
+
+  it("likes and unlikes from the top view, then reloads the top ranking", async () => {
+    const top = makePost({ text: "most liked", likes: 5, liked: false, own: false });
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/top")
+        ? Promise.resolve({ posts: [top], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await act(async () => {
+      result.current.setView("top");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([top]));
+
+    const topLoadsBefore = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    ).length;
+    await act(async () => {
+      await result.current.like(top.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/like", {
+      target: top.hash,
+    });
+    const topLoadsAfterLike = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    ).length;
+    expect(topLoadsAfterLike).toBeGreaterThan(topLoadsBefore);
+
+    await act(async () => {
+      await result.current.unlike(top.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unlike", {
+      target: top.hash,
+    });
+    const topLoadsAfterUnlike = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    ).length;
+    expect(topLoadsAfterUnlike).toBeGreaterThan(topLoadsAfterLike);
+  });
+
+  it("deletes from the top view, then reloads the top ranking", async () => {
+    const mine = makePost({ text: "mine and liked", likes: 3, own: true });
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/top")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await act(async () => {
+      result.current.setView("top");
+    });
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    const topLoadsBefore = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    ).length;
+
+    await act(async () => {
+      await result.current.deletePost(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/delete", {
+      target: mine.hash,
+    });
+    const topLoadsAfter = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/top"),
+    ).length;
+    expect(topLoadsAfter).toBeGreaterThan(topLoadsBefore);
+  });
+});

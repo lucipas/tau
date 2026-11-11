@@ -5151,6 +5151,23 @@ def test_top_posts_hides_muted_authors(identities, tmp_path):
     assert by_alice[0]["reply_to"] is None
 
 
+def test_top_posts_survives_a_large_block_list(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    loved = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    create_reaction(conn, bob, loved["hash"], liked=True, name="bob", now=1001)
+    # A block-list far above SQLite's bound-parameter limit (999 on most
+    # builds) must not break the query: the exclusion is a single JSON
+    # parameter, not one placeholder per author.
+    blocked = [f"{i:032x}" for i in range(1500)]
+    assert [post["text"] for post in top_posts(conn, exclude_authors=blocked)] == [
+        "everyone loves this"
+    ]
+    # A blocked author inside that list still never ranks.
+    blocked.append(author_of(alice))
+    assert top_posts(conn, exclude_authors=blocked) == []
+
+
 
 # -- blocked authors are hidden from display surfaces ----------------------
 

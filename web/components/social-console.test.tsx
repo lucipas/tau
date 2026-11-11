@@ -669,6 +669,8 @@ describe("SocialConsole muted sidebar", () => {
       unsave: vi.fn(),
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -785,6 +787,8 @@ describe("SocialConsole search", () => {
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -885,6 +889,8 @@ describe("SocialConsole mentions view", () => {
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -948,6 +954,7 @@ describe("SocialConsole mentions view", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "following" }));
     expect(state.setShowMentions).toHaveBeenCalledWith(false);
+    expect(state.setView).toHaveBeenCalledWith("timeline");
     expect(state.setAll).toHaveBeenCalledWith(false);
   });
 

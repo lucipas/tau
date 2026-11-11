@@ -165,6 +165,7 @@ The same bridge is the local integration point for scripts:
 | `/api/backup` | GET | download a backup archive of the data directory |
 | `/api/doctor` | GET | health verdicts for the data directory (`tau doctor`) |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/top` | GET | most-liked stored posts (`?limit=10`, `?author=<name or hash>`) |
 | `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
 | `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
 | `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |

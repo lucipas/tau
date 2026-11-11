@@ -35,6 +35,9 @@ const SAVED_PAGE_SIZE = 100;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  // The view that produced `posts`. After a switch the old posts belong to
+  // the previous ranking, so they are hidden until the new view loads.
+  const [postsView, setPostsView] = useState<"timeline" | "top" | null>(null);
   const [searchResults, setSearchResults] = useState<TanPost[]>([]);
   // The search the feed is showing, or null for the timeline. Kept beside
   // `all` so a search mid-action reloads the search, the same way `all`
@@ -49,6 +52,10 @@ export function useTan() {
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
   const [all, setAll] = useState(false);
+  // Which ranking the feed shows: the chronological timeline, or the
+  // most-liked posts. The top view ignores the following/everything
+  // filter — it ranks the whole visible store, like `tau tan top`.
+  const [view, setView] = useState<"timeline" | "top">("timeline");
   // Whether the feed shows replies to your own posts instead of the
   // timeline. Kept beside `all` so a view switch mid-action reloads
   // the view that is actually selected, the same way `all` works.
@@ -97,6 +104,10 @@ export function useTan() {
     allRef.current = all;
   }, [all]);
 
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
   const searchQueryRef = useRef(searchQuery);
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -138,8 +149,12 @@ export function useTan() {
     const generation = ++generationRef.current;
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
+      const isTop = viewRef.current === "top";
       const activeSearch = searchQueryRef.current;
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
+      // A search stays a search even from the top view: the search form
+      // is always visible, so a search submitted there must fetch the
+      // search endpoint, not the top ranking.
       // A failed mute list keeps its previous contents rather than blocking
       // the timeline and following refresh.
       const [feed, follows, muted, mutedKeywords] = await Promise.all([
@@ -147,9 +162,11 @@ export function useTan() {
           ? apiGet<TanTimelineResponse>(
               `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
             )
-          : showMentionsRef.current
-            ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
-          : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+          : isTop
+            ? apiGet<TanTimelineResponse>("/api/tan/top?limit=10")
+            : showMentionsRef.current
+              ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+              : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
         apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
         apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
@@ -159,10 +176,14 @@ export function useTan() {
       if (generationRef.current !== generation) return false;
       if (activeSearch !== null) {
         setSearchResults(feed.posts);
+      } else if (isTop) {
+        setPosts(feed.posts);
+        setPostsView("top");
       } else if (showMentionsRef.current) {
         setMentions(feed.posts);
       } else {
         setPosts(feed.posts);
+        setPostsView("timeline");
       }
       setFollowing(follows.following);
       if (muted !== null) setMutedAuthors(muted.muted ?? []);
@@ -236,13 +257,24 @@ export function useTan() {
     // Re-running on a filter change must load the newly selected filter
     // even if a poll for the old one is still in flight; routine polls
     // skip while a load is pending instead of invalidating it.
+    setLoading(true);
     void tick(true);
+    // The top ranking changes only when someone likes, unlikes, posts
+    // or deletes, and every one of those actions reloads the current
+    // view — so the top view loads on demand and on manual refresh,
+    // and never joins the timeline's 5s poll. A search submitted from
+    // the top view still polls like any other search.
+    if (view === "top" && searchQuery === null) {
+      return () => {
+        disposed = true;
+      };
+    }
     const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, searchQuery, showMentions, load]);
+  }, [all, view, searchQuery, showMentions, load]);
 
   // Suggestions have their own generation so a slow ranking response cannot
   // overwrite a newer one, and they never block the feed load.
@@ -767,7 +799,8 @@ export function useTan() {
   );
 
   return {
-    posts,
+    // Posts from the other view are never shown under this view's label.
+    posts: postsView === view ? posts : [],
     searchResults,
     searchQuery,
     mentions,
@@ -784,6 +817,8 @@ export function useTan() {
     unsave,
     all,
     setAll,
+    view,
+    setView,
     showMentions,
     setShowMentions,
     loading,

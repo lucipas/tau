@@ -621,9 +621,11 @@ export function SocialConsole() {
                             ? "saved"
                           : tan.showMentions
                             ? "mentions"
-                            : tan.all
-                              ? "public cache"
-                              : "timeline"}
+                            : tan.view === "top"
+                              ? "top posts"
+                              : tan.all
+                                ? "public cache"
+                                : "timeline"}
                       </SectionLabel>
                       <span className="font-mono text-[10px] text-mist">
                         {showingSearch
@@ -650,10 +652,14 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           tan.setAll(false);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && !tan.showMentions && !tan.all
+                          tan.view === "timeline" &&
+                          !showSaved &&
+                          !tan.showMentions &&
+                          !tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -665,10 +671,14 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           tan.setAll(true);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && !tan.showMentions && tan.all
+                          tan.view === "timeline" &&
+                          !showSaved &&
+                          !tan.showMentions &&
+                          tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -679,7 +689,25 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          tan.setShowMentions(false);
+                          tan.setView("top");
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          tan.view === "top" &&
+                          !showSaved &&
+                          !tan.showMentions
+                            ? "bg-signal/15 text-signal"
+                            : "text-mist"
+                        }`}
+                      >
+                        top
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowSaved(false);
                           tan.setShowMentions(true);
+                          tan.setView("timeline");
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
@@ -691,6 +719,7 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           setShowSaved(true);
                         }}
                         className={`rounded px-2 py-1 ${
@@ -802,7 +831,7 @@ export function SocialConsole() {
                   showingSearch ? (
                     <SearchEmptyState query={tan.searchQuery ?? ""} />
                   ) : (
-                    <EmptyState />
+                    <EmptyState top={tan.view === "top"} />
                   )
                 ) : (
                   visiblePosts.map((post) => (
@@ -1184,7 +1213,13 @@ function ThreadView({
   );
 }
 
-function EmptyState({ mentions = false }: { mentions?: boolean }) {
+function EmptyState({
+  mentions = false,
+  top = false,
+}: {
+  mentions?: boolean;
+  top?: boolean;
+}) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
@@ -1196,6 +1231,11 @@ function EmptyState({ mentions = false }: { mentions?: boolean }) {
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
         {mentions ? (
           "When someone replies to one of your posts, it shows up here."
+        ) : top ? (
+          <>
+            Once posts arrive, the most-liked rank first here. Like a post
+            to move it up.
+          </>
         ) : (
           <>
             Start a node with{" "}
