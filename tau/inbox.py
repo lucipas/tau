@@ -911,9 +911,16 @@ class Inbox:
         return annotated
 
     def _unread_counts_locked(self) -> Dict[str, Any]:
-        """Per-conversation unread counts from the in-memory state."""
+        """Per-conversation unread counts from the in-memory state.
+
+        Received messages only: a sent record is your own mail, never
+        unread for you, and the ``--unread`` listing already excludes
+        it — the counts match what that listing shows.
+        """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
+            if entry.get("direction") != "in":
+                continue
             if _is_unread(
                 entry, self._read_cursors.get(entry.get("destination") or "")
             ):

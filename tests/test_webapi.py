@@ -6408,11 +6408,11 @@ def test_messages_export_import_via_api(bridge, node):
         assert payload["import"]["present"] == 0
         assert payload["import"]["skipped"] == 0
         assert payload["import"]["errors"] == []
-        # Restored mail advances the unread counts: both entries sit
-        # after the (absent) read cursor, so the fresh counts ride
-        # along with the import result.
-        assert payload["import"]["unread"]["total"] == 2
-        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 2}
+        # Restored mail advances the unread counts: the received entry
+        # sits after the (absent) read cursor; the sent reply is your
+        # own mail, never unread for you, so it does not count.
+        assert payload["import"]["unread"]["total"] == 1
+        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 1}
         _, _, feed = _json(bridge2, "/api/messages")
         assert [m["text"] for m in feed["messages"]] == ["hello", "reply back"]
         assert feed["messages"][0]["direction"] == "in"
