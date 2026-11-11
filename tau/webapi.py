@@ -52,6 +52,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/mute-keyword mute a keyword
     POST /api/tan/unmute-keyword unmute a keyword
     POST /api/tan/sync     pull missing posts from peers
+    GET  /api/tan/export   export stored posts (``?scope=mine|all``)
+    POST /api/tan/import   import an export document (every entry verified)
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
@@ -64,6 +66,7 @@ who can reach this API can send messages as this node.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import logging
 import math
@@ -108,6 +111,13 @@ DEFAULT_WEB_PORT = 8787
 DEFAULT_WEB_HOST = "127.0.0.1"
 
 MAX_BODY_BYTES = 32 * 1024
+# An import carries a whole signed chain, so the 32 KiB action cap would
+# reject any real backup. The bridge binds to loopback only and the
+# document is validated entry by entry, so a 16 MiB cap is the bound —
+# and the export is held to the same cap, so the console never hands
+# out a backup it cannot import back (larger caches back up with the
+# CLI, which has no cap).
+MAX_IMPORT_BYTES = 16 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
@@ -227,6 +237,19 @@ def _is_local_origin(origin: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return host in _LOCAL_ORIGIN_HOSTS or host.endswith(".localhost")
+
+
+def _is_loopback_client(client: str) -> bool:
+    """True when the connected client is the local machine.
+
+    Bulk imports are accepted only from loopback, even when the bridge
+    is bound to a remote interface: an import writes many entries in
+    one request, so it stays a local-operator action.
+    """
+    try:
+        return ipaddress.ip_address(client).is_loopback
+    except ValueError:
+        return False
 
 
 class EventBus:
@@ -1639,6 +1662,65 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
+        """Return the portable backup document the CLI writes.
+
+        The node's own chain by default, every cached author with
+        *all_authors* — the same document :func:`tau tan export`
+        produces, so a console backup restores with the CLI and
+        vice versa.
+        """
+        from .tangents.tan import export_entries
+
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            if all_authors:
+                document = export_entries(conn, all_authors=True)
+            else:
+                document = export_entries(conn, author=app.author)
+        finally:
+            conn.close()
+        # The console must never hand out a backup it cannot import
+        # back: the import route rejects bodies over MAX_IMPORT_BYTES,
+        # so an export past that size is refused here, with the CLI as
+        # the route for larger caches.
+        size = len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+        if size > MAX_IMPORT_BYTES:
+            raise ValueError(
+                "this export is larger than the console can import back "
+                f"({MAX_IMPORT_BYTES // (1024 * 1024)} MiB); back up with "
+                "`tau tan export` from the command line instead"
+            )
+        return document
+
+    def tan_import(self, document: Any) -> Dict[str, Any]:
+        """Store every entry in an export document, verifying each one.
+
+        Returns the same ``{\"imported\", \"present\", \"skipped\",
+        \"errors\"}`` counts as the CLI import; a bad entry is skipped
+        with its error recorded and never aborts the rest.
+        """
+        from .tangents.tan import import_entries
+
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            result = import_entries(conn, document)
+        finally:
+            conn.close()
+        # An invalid entry's hash comes from untrusted JSON and may hold a
+        # lone surrogate, which the UTF-8 response encoder cannot write.
+        # Replace unencodable characters so the counts still reach the console.
+        for error in result["errors"]:
+            error["hash"] = error["hash"].encode("utf-8", "replace").decode("utf-8")
+            error["error"] = error["error"].encode("utf-8", "replace").decode("utf-8")
+        return result
+
     def _resolve_console_reply(
         self, peer_hash: str, reply_to: Optional[str]
     ) -> Optional[Dict[str, Any]]:
@@ -2772,6 +2854,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"following": records, "count": len(records)}, head_only
                 )
                 return
+            if path == "/api/tan/export":
+                scope = (query.get("scope") or ["mine"])[0]
+                if scope not in ("mine", "all"):
+                    self._send_json(
+                        {"error": {"message": "query 'scope' must be 'mine' or 'all'"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    document = self.bridge.tan_export(all_authors=(scope == "all"))
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(document, head_only)
+                return
             if path == "/api/tan/likes":
                 from .tangents.tan import TanError
 
@@ -2835,7 +2936,24 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
 
         if self.command == "POST":
-            body = self._read_body()
+            # Bulk imports write many entries with no per-request quota, so
+            # they are accepted only from the local machine, even when the
+            # bridge is bound to a remote interface.
+            if path == "/api/tan/import" and not _is_loopback_client(
+                self.client_address[0]
+            ):
+                self._send_json(
+                    {"error": {"message": "tan import is only accepted from localhost"}},
+                    head_only,
+                    403,
+                )
+                return
+            # An import carries a whole signed chain, so it gets a larger
+            # body cap than a chat message or a single action.
+            max_body = (
+                MAX_IMPORT_BYTES if path == "/api/tan/import" else MAX_BODY_BYTES
+            )
+            body = self._read_body(max_bytes=max_body)
             if path == "/api/messages":
                 self._handle_send(body, head_only)
                 return
@@ -3135,6 +3253,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 502)
                     return
                 self._send_json({"ok": True, "sync": result}, head_only)
+                return
+            if path == "/api/tan/import":
+                try:
+                    result = self.bridge.tan_import(body)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "import": result}, head_only)
                 return
             self._send_json({"error": {"message": "not found"}}, head_only, 404)
             return
@@ -3489,7 +3618,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self) -> Dict[str, Any]:
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -3500,7 +3629,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             length = int(raw_length or 0)
         except ValueError:
             raise RequestError("invalid Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
             return {}

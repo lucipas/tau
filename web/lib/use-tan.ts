@@ -4,8 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
+  TanExportDocument,
   TanFollow,
   TanFollowingResponse,
+  TanImportResponse,
+  TanImportResult,
   TanLikesResponse,
   TanMutedAuthor,
   TanMutedKeyword,
@@ -43,6 +46,8 @@ export function useTan() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The thread currently open in the console, if any: the reference it
   // was opened with and its entries (null while none is open).
@@ -540,6 +545,59 @@ export function useTan() {
     }
   }, [load]);
 
+  // Download the signed export document the bridge returns. The anchor
+  // click is the download: a blob URL keeps the file local, and the
+  // revoke is deferred a beat so the browser has started the save.
+  const exportTan = useCallback(async (allAuthors: boolean) => {
+    setExporting(true);
+    try {
+      const scope = allAuthors ? "all" : "mine";
+      const doc = await apiGet<TanExportDocument>(
+        `/api/tan/export?scope=${scope}`,
+      );
+      const blob = new Blob([`${JSON.stringify(doc, null, 2)}\n`], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "tau-tan-export.json";
+        anchor.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      return doc;
+    } finally {
+      setExporting(false);
+    }
+  }, []);
+
+  const importTan = useCallback(
+    async (doc: TanExportDocument): Promise<TanImportResult> => {
+      setImporting(true);
+      try {
+        const result = await apiPost<TanImportResponse>(
+          "/api/tan/import",
+          doc as unknown as Record<string, unknown>,
+        );
+        // The entries are already stored once the POST succeeds, so a feed
+        // refresh failure must not turn the import into a reported failure.
+        try {
+          await load();
+        } catch (caught) {
+          setError(
+            caught instanceof Error ? caught.message : "could not load the feed",
+          );
+        }
+        return result.import;
+      } finally {
+        setImporting(false);
+      }
+    },
+    [load],
+  );
+
   return {
     posts,
     searchResults,
@@ -562,6 +620,8 @@ export function useTan() {
     loading,
     posting,
     syncing,
+    exporting,
+    importing,
     error,
     threadPosts,
     threadRef,
@@ -585,5 +645,7 @@ export function useTan() {
     fetchLikers,
     deletePost,
     sync,
+    exportTan,
+    importTan,
   };
 }

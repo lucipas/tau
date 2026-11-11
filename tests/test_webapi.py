@@ -2224,6 +2224,123 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_export_import_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path / "one", name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "mine one", name="tester", now=1000)
+        create_post(conn, identity, "mine two", name="tester", now=1001)
+        create_post(conn, other, "not mine", name="other", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The default scope is the node's own chain only.
+        status, _, payload = _json(bridge, "/api/tan/export")
+        assert status == 200
+        assert payload["format"] == "tau-tan-export"
+        assert payload["version"] == 1
+        assert [entry["text"] for entry in payload["entries"]] == [
+            "mine one",
+            "mine two",
+        ]
+        assert payload["authors"] == [mine["author"]]
+
+        status, _, payload = _json(bridge, "/api/tan/export?scope=all")
+        assert status == 200
+        assert len(payload["entries"]) == 3
+        assert len(payload["authors"]) == 2
+        assert mine["author"] in payload["authors"]
+
+        status, _, payload = _json(bridge, "/api/tan/export?scope=bogus")
+        assert status == 400
+        assert "scope" in payload["error"]["message"]
+
+        # A fresh node restores the whole document, then reports the
+        # same entries as already present on a second import.
+        node2 = FakeNode()
+        node2.config = TauConfig.resolve(data_dir=tmp_path / "two", name="tester2")
+        node2.app = TanApp(node2.config, RNS.Identity(), name="tester2", gossip=False)
+        bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+        bridge2.start()
+        try:
+            _, _, document = _json(bridge, "/api/tan/export?scope=all")
+            status, _, payload = _json(
+                bridge2, "/api/tan/import", method="POST", body=document
+            )
+            assert status == 200
+            assert payload["import"] == {
+                "imported": 3,
+                "present": 0,
+                "skipped": 0,
+                "errors": [],
+            }
+
+            status, _, payload = _json(
+                bridge2, "/api/tan/import", method="POST", body=document
+            )
+            assert status == 200
+            assert payload["import"]["imported"] == 0
+            assert payload["import"]["present"] == 3
+
+            # A document with the wrong format is rejected, not stored.
+            status, _, payload = _json(
+                bridge2, "/api/tan/import", method="POST", body={"format": "nope"}
+            )
+            assert status == 400
+            assert "unsupported export format" in payload["error"]["message"]
+
+            # One entry with a tampered body fails verification and is
+            # skipped; the rest of the document still imports. Drop the
+            # store's copy of the tampered entry first so it is new here
+            # rather than already present.
+            tampered = json.loads(json.dumps(document))
+            tampered["entries"][0]["text"] = "forged"
+            conn2 = init_db(node2.config.social_db_path)
+            try:
+                conn2.execute(
+                    "DELETE FROM posts WHERE hash = ?",
+                    (tampered["entries"][0]["hash"],),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+            status, _, payload = _json(
+                bridge2, "/api/tan/import", method="POST", body=tampered
+            )
+            assert status == 200
+            assert payload["import"]["imported"] == 0
+            assert payload["import"]["present"] == 2
+            assert payload["import"]["skipped"] == 1
+            assert len(payload["import"]["errors"]) == 1
+
+            # An export document is bigger than the 32 KiB cap for
+            # ordinary actions; the import route accepts it.
+            big = json.loads(json.dumps(document))
+            big["entries"] = big["entries"] * 100
+            assert len(json.dumps(big).encode("utf-8")) > 32 * 1024
+            status, _, payload = _json(
+                bridge2, "/api/tan/import", method="POST", body=big
+            )
+            assert status == 200
+            assert payload["import"]["skipped"] == 0
+        finally:
+            bridge2.stop()
+    finally:
+        bridge.stop()
+
+
 def _likers_setup(tmp_path):
     """A node with one post by bob, liked by alice, carol and dave.
 
@@ -2322,6 +2439,41 @@ def test_tan_likers_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_export_import_requires_social(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, RNS.Identity(), "cached", name="other", now=1000)
+    finally:
+        conn.close()
+
+    # No TanApp: the node never enabled the social feed, even though a
+    # post is cached on disk.
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/export")
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/import",
+            method="POST",
+            body={"format": "tau-tan-export", "version": 1, "entries": []},
+        )
+        assert status == 503
+        assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_likers_excludes_muted_and_blocked(tmp_path):
     from tau.blocklist import BlockList
     from tau.config import TauConfig
@@ -2356,6 +2508,36 @@ def test_tan_likers_excludes_muted_and_blocked(tmp_path):
         status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
         assert status == 400
         assert "unknown post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_export_too_large_for_import_is_refused(tmp_path, monkeypatch):
+    import RNS
+
+    import tau.webapi as webapi
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, identity, "one post", name="tester", now=1000)
+    finally:
+        conn.close()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A cache the console could not import back must not be
+        # exported either: shrink the bound to prove the check.
+        monkeypatch.setattr(webapi, "MAX_IMPORT_BYTES", 10)
+        status, _, payload = _json(bridge, "/api/tan/export")
+        assert status == 400
+        assert "larger than the console can import" in payload["error"]["message"]
+        assert "tau tan export" in payload["error"]["message"]
     finally:
         bridge.stop()
 
@@ -2411,6 +2593,41 @@ def test_tan_likers_rejects_deleted_post(tmp_path):
         bridge.stop()
 
 
+def test_tan_import_sanitizes_unencodable_error_hash(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_db(node.config.social_db_path)
+    conn.close()
+    node.app = TanApp(node.config, RNS.Identity(), name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A hash with a lone surrogate comes from untrusted JSON; the
+        # response encoder (ensure_ascii=False + UTF-8) cannot write it,
+        # so the bridge must replace it instead of failing the request.
+        document = {
+            "format": "tau-tan-export",
+            "version": 1,
+            "exported_at": 1000,
+            "authors": [],
+            "entries": [{"hash": "\ud800", "text": "bogus"}],
+        }
+        status, _, payload = _json(
+            bridge, "/api/tan/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["skipped"] == 1
+        # The UTF-8 "replace" handler turns the lone surrogate into "?".
+        assert payload["import"]["errors"][0]["hash"] == "?"
+    finally:
+        bridge.stop()
+
+
 def test_tan_likers_hides_reactions_per_ruleset(tmp_path):
     import RNS
 
@@ -2438,6 +2655,15 @@ def test_tan_likers_hides_reactions_per_ruleset(tmp_path):
         assert payload["total"] == 0
     finally:
         bridge.stop()
+
+
+def test_is_loopback_client():
+    from tau.webapi import _is_loopback_client
+
+    assert _is_loopback_client("127.0.0.1") is True
+    assert _is_loopback_client("::1") is True
+    assert _is_loopback_client("192.168.1.5") is False
+    assert _is_loopback_client("not an address") is False
 
 
 def test_tan_likers_caps_at_max_likers(tmp_path, monkeypatch):
