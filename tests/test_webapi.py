@@ -56,9 +56,10 @@ class FakeRegistry:
 
     def resolve(self, target, *, include_alias=True):
         # Mirror PeerRegistry.resolve for the single-peer fixture: name,
-        # destination hash or hash prefix, with ambiguity rejected.
-        # The fixture has no aliases, so include_alias changes nothing,
-        # but the keyword must exist: tan.resolve_author calls
+        # alias (only when include_alias), destination hash or hash
+        # prefix, with ambiguity rejected. A test may set an alias on
+        # the fixture peer to prove a security boundary never resolves
+        # by alias; tan.resolve_author calls
         # registry.resolve(value, include_alias=False).
         if not isinstance(target, str):
             raise PeerError("peer target must be a string or bytes")
@@ -69,6 +70,19 @@ class FakeRegistry:
             char in "0123456789abcdefABCDEF" for char in value
         ):
             return self.get(value)
+        if include_alias:
+            by_alias = [
+                p
+                for p in self._peers
+                if getattr(p, "alias", None)
+                and p.alias.casefold() == value.casefold()
+            ]
+            if len(by_alias) == 1:
+                return by_alias[0]
+            if len(by_alias) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_alias)} peers share the alias {value!r}; use a destination hash"
+                )
         by_name = [p for p in self._peers if p.name.casefold() == value.casefold()]
         if len(by_name) == 1:
             return by_name[0]
@@ -2270,6 +2284,19 @@ def test_allowlist_add_by_prefix(bridge):
     assert payload["entries"] == [
         {"destination": PEER_HASH, "name": "alice"}
     ]
+
+
+def test_allowlist_add_rejects_alias(bridge, node):
+    # The allow-list is a security boundary: a local alias must never
+    # stand in for the peer's asserted name, so the fixture peer's
+    # alias "ally" does not resolve here even though the registry
+    # would resolve it with include_alias=True.
+    node.registry.get(PEER_HASH).alias = "ally"
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "ally"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
 
 
 def test_allowlist_set_enabled_applies_immediately(bridge, node, tmp_path):

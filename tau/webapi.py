@@ -1733,7 +1733,10 @@ class WebBridge:
         if not isinstance(target, str) or not target.strip():
             raise AllowListError("peer is required")
         value = target.strip()
-        peer = self.node.registry.resolve(value)
+        try:
+            peer = self.node.registry.resolve(value, include_alias=False)
+        except PeerError as exc:
+            raise AllowListError(str(exc)) from exc
         if peer is not None:
             return peer.hexhash
         try:
