@@ -459,9 +459,15 @@ class GroupStore:
                     # The successor remembers the whole lineage, newest
                     # first, so a member that missed an intermediate
                     # rename still retires every predecessor, and group
-                    # history can span the renames.
+                    # history can span the renames.  The lineage never
+                    # names the successor itself: renaming back to an
+                    # earlier name drops that name from the chain.
                     "renamed_from": [existing["id"]]
-                    + list(existing.get("renamed_from") or []),
+                    + [
+                        pred
+                        for pred in (existing.get("renamed_from") or [])
+                        if pred != new_id
+                    ],
                 }
             )
             if candidate is None:
@@ -570,11 +576,36 @@ class GroupStore:
             candidate["roster_sent_at"] = sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
+            restored = False
             if existing is not None:
                 if existing["members"] != candidate["members"]:
                     return None
             elif candidate["id"] in self._retired:
-                return None
+                # A retired id stays refused — except a creator restore:
+                # the creator renamed back to this name, so their
+                # message carries the lineage naming the successor this
+                # node currently holds, sent after that successor was
+                # pinned.  A queued copy of an old message carries no
+                # lineage, and a stale successor copy predates the
+                # successor's pin, so neither can pass this gate.
+                restored = (
+                    creator_authorized
+                    and sent_at is not None
+                    and any(
+                        (other := self._groups.get(pred_id)) is not None
+                        and not other["local"]
+                        and other["creator"] == candidate["creator"]
+                        and (
+                            other.get("roster_sent_at") is None
+                            or sent_at >= other["roster_sent_at"]
+                        )
+                        for pred_id in dict.fromkeys(
+                            candidate.get("renamed_from") or []
+                        )
+                    )
+                )
+                if not restored:
+                    return None
             superseded = []
             predecessors = []
             if creator_authorized:
@@ -637,22 +668,25 @@ class GroupStore:
                             for other in predecessors
                             if other not in stale_for
                         ]
+            # A group named in both lists is replaced once: a
+            # predecessor that also shares the successor's name
+            # (a rename back) must not be deleted twice or counted
+            # twice against the learned cap.
+            replaced = {other["id"]: other for other in superseded}
+            for other in predecessors:
+                replaced.setdefault(other["id"], other)
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
-                if (
-                    learned - len(superseded) - len(predecessors)
-                    >= MAX_LEARNED_GROUPS
-                ):
+                if learned - len(replaced) >= MAX_LEARNED_GROUPS:
                     log.info(
                         "Refusing to pin group %s: learned-group limit reached",
                         group_id,
                     )
                     return None
             snapshot = self._snapshot()
-            for other in superseded:
+            for other in replaced.values():
                 del self._groups[other["id"]]
             for other in predecessors:
-                del self._groups[other["id"]]
                 if other["id"] not in self._retired:
                     self._retired.append(other["id"])
                     if len(self._retired) > MAX_RETIRED_GROUPS:
@@ -696,7 +730,7 @@ class GroupStore:
                             "renamed_from": merged,
                         }
                         refreshed = True
-                if superseded or predecessors or refreshed:
+                if replaced or refreshed:
                     try:
                         self._save()
                     except OSError as exc:
@@ -708,6 +742,9 @@ class GroupStore:
                         return None
                 return dict(self._groups[existing["id"]])
             self._groups[candidate["id"]] = candidate
+            if restored and candidate["id"] in self._retired:
+                # A creator restore brings the id back to life.
+                self._retired.remove(candidate["id"])
             try:
                 self._save()
             except OSError as exc:

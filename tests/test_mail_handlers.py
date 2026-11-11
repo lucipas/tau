@@ -11,7 +11,7 @@ import pytest
 import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
-from tau.mailbox import open_message, seal_message
+from tau.mailbox import MailboxError, open_message, seal_message
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
@@ -19,6 +19,7 @@ from tau.protocol import (
     build_mail_fetch,
     build_mail_store,
     decode,
+    derive_group_id,
     encode,
     encode_message,
     encode_reaction,
@@ -165,6 +166,102 @@ def test_relayed_message_keeps_kind(tmp_path):
     assert received[0]["kind"] == "alert"
     assert received[0]["relayed"] is True
     assert node.inbox.list_messages()[0]["kind"] == "alert"
+
+
+def test_sealed_group_message_carries_rename_lineage(tmp_path):
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    creator_hash = destination_hash(sender).hex()
+    members = [creator_hash, "ab" * 16, "cd" * 16]
+    old_id = derive_group_id(creator_hash, "weekend", members)
+    new_id = derive_group_id(creator_hash, "road trip", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="seal-group-1",
+        text="after the rename",
+        sent_at=55.0,
+        group={
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+            "renamed_from": [old_id],
+        },
+    )
+    opened = open_message(recipient, blob)
+    assert opened["group"]["renamed_from"] == [old_id]
+    # A sealed envelope without lineage opens with no lineage key.
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="seal-group-2",
+        text="plain",
+        sent_at=56.0,
+        group={
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+        },
+    )
+    assert "renamed_from" not in open_message(recipient, plain)["group"]
+    # A malformed lineage is refused at seal time.
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="seal-group-3",
+            text="bad",
+            sent_at=57.0,
+            group={
+                "id": new_id,
+                "name": "road trip",
+                "creator": creator_hash,
+                "members": members,
+                "renamed_from": ["not-a-hash"],
+            },
+        )
+
+
+def test_relayed_group_message_retires_rename_predecessor(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node_hash = "ab" * 16
+    node.destination = SimpleNamespace(
+        hexhash=node_hash, hash=bytes.fromhex(node_hash)
+    )
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    members = [creator_hash, node_hash, "ef" * 16]
+    old_id = derive_group_id(creator_hash, "weekend", members)
+    old = node.groups.record(
+        old_id, "weekend", members, creator=creator_hash, sender="ef" * 16
+    )
+    assert old is not None
+    new_id = derive_group_id(creator_hash, "road trip", members)
+    message = {
+        "id": "relay-group-1",
+        "from": creator_hash,
+        "from_name": "alice",
+        "text": "after the rename",
+        "sent_at": 100.0,
+        "group": {
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+            "renamed_from": [old_id],
+        },
+    }
+    assert node._deliver_collected(message) is True
+    assert node.groups.get(old_id) is None
+    assert node.groups.get(new_id) is not None
+    assert received[0]["kind"] == "group"
+    assert received[0]["group"] == new_id
 
 
 def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):

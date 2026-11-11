@@ -867,6 +867,105 @@ def test_group_store_record_stale_predecessor_not_retired(tmp_path):
     assert store.get(old_id) is not None
 
 
+def test_group_store_record_creator_restore_of_retired_id(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # The creator renames: the member retires the predecessor.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert store.get(old_id) is None
+    # A queued copy of an old message (no lineage) cannot restore it.
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=50.0,
+        )
+        is None
+    )
+    # The creator renames back: the restore message carries the lineage
+    # naming the successor, sent after the successor was pinned.
+    restored = store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+        renamed_from=[new_id],
+    )
+    assert restored is not None
+    assert restored["renamed_from"] == [new_id]
+    assert store.get(new_id) is None
+    assert store.find("weekend") == restored
+    # A stale copy of the successor message (sent before the restore)
+    # cannot flip it back.
+    assert (
+        store.record(
+            new_id,
+            "road trip",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=100.0,
+            renamed_from=[old_id],
+        )
+        is None
+    )
+    assert store.get(new_id) is None
+
+
+def test_group_store_record_dedupes_superseded_predecessor(tmp_path):
+    members = [OTHER_HASH, OWN_HASH, THIRD_HASH]
+    store = GroupStore(tmp_path / "groups.json")
+    mid_id = derive_group_id(OTHER_HASH, "road trip", members)
+    # The member learned the renamed group B ("road trip", roster R1).
+    mid = store.record(
+        mid_id, "road trip", members, creator=OTHER_HASH, sender=THIRD_HASH
+    )
+    assert mid is not None
+    # The creator then changed the roster: C ("road trip", R2) carries
+    # the lineage naming B, which also shares C's name — B is both a
+    # same-name supersede and a lineage predecessor, and must be
+    # replaced exactly once.
+    new_members = [OTHER_HASH, OWN_HASH, STRANGER_HASH]
+    new_id = derive_group_id(OTHER_HASH, "road trip", new_members)
+    successor = store.record(
+        new_id,
+        "road trip",
+        new_members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[mid_id],
+    )
+    assert successor is not None
+    assert store.get(mid_id) is None
+    assert store.get(new_id) == successor
+    assert len(store) == 1
+    # B was retired as a predecessor, not just superseded: replay refused.
+    assert (
+        store.record(
+            mid_id,
+            "road trip",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+        )
+        is None
+    )
+
+
 def test_group_store_retired_list_is_capped(tmp_path):
     from tau.groups import MAX_RETIRED_GROUPS
 
@@ -981,6 +1080,8 @@ def test_group_store_rename_retires_old_name(tmp_path):
     # Renaming back lifts the retirement.
     restored = store.rename(renamed["id"], "weekend", created_by=OWN_HASH)
     assert restored["id"] == group["id"]
+    # The lineage names only the successor, never the restored id itself.
+    assert restored["renamed_from"] == [renamed["id"]]
     assert store.delete(restored["id"]) is True
     assert (
         store.record(

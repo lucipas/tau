@@ -2508,6 +2508,18 @@ class TauNode:
                         "name": entry.group_name,
                         "creator": entry.group_creator,
                         "members": entry.group_members,
+                        # The lineage rides in the sealed envelope, so
+                        # an offline member that receives this copy
+                        # through store-and-forward retires the
+                        # predecessor exactly as a direct recipient
+                        # would; the current record is read at deposit
+                        # time, like the direct re-send path.
+                        "renamed_from": (
+                            (self.groups.get(entry.group_id) or {}).get(
+                                "renamed_from"
+                            )
+                            or None
+                        ),
                     }
                     if entry.group_id is not None
                     else None
