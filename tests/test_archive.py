@@ -302,3 +302,108 @@ def test_archive_unknown_peer_errors(tmp_path, capsys):
     code = cli.main(["archive", "--data-dir", str(data_dir), "nobody"])
     assert code == 1
     assert "unknown peer" in capsys.readouterr().err
+
+
+def _seed_group_message(data_dir, senders, sender, text):
+    from tau.groups import GroupStore
+
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    group = GroupStore(config.groups_path).create(
+        "weekend",
+        [senders["alice"], senders["carol"]],
+        created_by=senders["alice"],
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": sender,
+            "destination": senders[sender],
+            "text": text,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-group",
+        }
+    )
+    return group["id"]
+
+
+def test_archived_sender_group_posts_stay_listed(tmp_path, capsys):
+    data_dir, senders = _seed_two_peers(tmp_path)
+    _seed_group_message(data_dir, senders, "alice", "group hello")
+    cli.main(["archive", "--data-dir", str(data_dir), "alice"])
+    capsys.readouterr()
+
+    # The group post still shows in the default listing, and only the
+    # DM counts toward the archived unread footer.  (The group post
+    # shares its sender's read cursor — pre-existing inbox semantics —
+    # so displaying it marks the older DM read too; the footer below
+    # is from the listing before that mark.)
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "group hello" in out
+    assert "hi from carol" in out
+    assert "1 unread in archived conversations" in out
+
+    # --archived is DM-only: the group post is not an archived thread,
+    # and the archived list does not count it.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--archived"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "first hello" in out
+    assert "group hello" not in out
+
+    code = cli.main(["archived", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "1 message(s)" in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--archived", "--group", "weekend"]
+    )
+    assert code == 0
+    assert "group hello" not in capsys.readouterr().out
+
+
+def test_archived_search_excludes_unarchived_matches(tmp_path, capsys):
+    data_dir, senders = _seed_two_peers(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": senders["carol"],
+            "text": "hello again",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-carol-2",
+        }
+    )
+    cli.main(["archive", "--data-dir", str(data_dir), "alice"])
+    capsys.readouterr()
+
+    # A plain search is an explicit lookup: it still finds archived mail.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--search", "hello"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "first hello" in out
+    assert "hello again" in out
+
+    # --archived narrows the same search to archived conversations.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--archived", "--search", "hello"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "first hello" in out
+    assert "hello again" not in out
+
+
+def test_archive_takes_the_lock(tmp_path, capsys):
+    data_dir, _ = _seed_two_peers(tmp_path)
+    code = cli.main(["archive", "--data-dir", str(data_dir), "alice"])
+    assert code == 0
+    capsys.readouterr()
+    assert (data_dir / ".archived.json.lock").exists()

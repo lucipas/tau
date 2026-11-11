@@ -27,6 +27,7 @@ from .allowlist import (
 )
 from .archive import (
     ArchiveError,
+    archive_lock,
     load_archive,
     load_archived_set,
     save_archive,
@@ -5360,28 +5361,35 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
-    # Archived conversations stay stored but are hidden from the
-    # default listing; unarchiving restores the view.  Filter before
-    # applying the limit so hidden messages do not use up the
-    # requested count.  A search is an explicit lookup and still
-    # finds archived messages; a group listing is a different view
-    # and is unaffected.
+    # Archive membership is a direct-message concern only: a group
+    # post from an archived sender is still that group's mail, and
+    # groups keep their current listing.  --archived is an explicit
+    # archived-only view, so it applies even to searches and group
+    # listings; the default hiding (and its unread count) stays
+    # limited to plain listings, where a search is an explicit
+    # lookup that still finds archived mail.
     archived_unread = 0
-    if query is None and group_id is None:
-        if show_archived:
-            entries = [
-                entry for entry in entries if entry.get("destination") in archived
-            ]
-        elif archived:
-            hidden = [
-                entry for entry in entries if entry.get("destination") in archived
-            ]
-            archived_unread = sum(1 for entry in hidden if entry.get("unread"))
-            entries = [
-                entry
-                for entry in entries
-                if entry.get("destination") not in archived
-            ]
+    if show_archived:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+    elif query is None and group_id is None and archived:
+        hidden = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+        archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") == "group"
+            or entry.get("destination") not in archived
+        ]
     # Filter before limiting, so --unread finds older unread mail even
     # when newer messages from the same listing are already read.
     unread_only = getattr(args, "unread", False)
@@ -5588,18 +5596,21 @@ def cmd_archive(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    try:
-        archive = load_archive(config.archived_path)
-    except ArchiveError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
     destination = _resolve_inbox_peer(inbox, registry, args.peer)
     peer = registry.get(destination)
     name = peer.display_name if peer is not None else "unknown"
-    already = destination in archive.archived
-    if not already:
-        archive = archive.with_added(destination)
-        save_archive(config.archived_path, archive)
+    # Reload inside the lock: two archive commands racing must not
+    # discard each other's change to a different peer.
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        already = destination in archive.archived
+        if not already:
+            archive = archive.with_added(destination)
+            save_archive(config.archived_path, archive)
     if _json_mode(args):
         _emit(
             {
@@ -5628,18 +5639,21 @@ def cmd_unarchive(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
     registry = PeerRegistry(config.peers_path)
-    try:
-        archive = load_archive(config.archived_path)
-    except ArchiveError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return _EXIT_ERROR
     destination = _resolve_inbox_peer(inbox, registry, args.peer)
     peer = registry.get(destination)
     name = peer.display_name if peer is not None else "unknown"
-    was_archived = destination in archive.archived
-    if was_archived:
-        archive = archive.with_removed(destination)
-        save_archive(config.archived_path, archive)
+    # Reload inside the lock: two archive commands racing must not
+    # discard each other's change to a different peer.
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        was_archived = destination in archive.archived
+        if was_archived:
+            archive = archive.with_removed(destination)
+            save_archive(config.archived_path, archive)
     if _json_mode(args):
         _emit(
             {
@@ -5672,7 +5686,8 @@ def cmd_archived(args: argparse.Namespace) -> int:
     counts: Dict[str, int] = {}
     for entry in inbox.list_messages(limit=None):
         destination = str(entry.get("destination") or "")
-        if destination in archived:
+        # Group posts are never part of an archived conversation.
+        if entry.get("kind") != "group" and destination in archived:
             counts[destination] = counts.get(destination, 0) + 1
 
     def describe(destination: str) -> Dict[str, Any]:
