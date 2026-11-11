@@ -559,6 +559,56 @@ def test_mark_read_advances_only_to_up_to(tmp_path):
     assert [entry["unread"] for entry in listed] == [True, False, False]
 
 
+def test_mark_unread_marks_newest_message_unread_again(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_all_marks_whole_conversation_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert all(entry["unread"] for entry in inbox.list_messages())
+
+
+def test_mark_unread_is_noop_when_nothing_was_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    assert inbox.mark_unread(peer="bb" * 16) is None
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_leaves_other_peers_alone(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    inbox.mark_unread(peer="aa" * 16)
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
 def test_mark_read_never_moves_a_cursor_backward(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))

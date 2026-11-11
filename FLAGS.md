@@ -31,6 +31,7 @@ Global options may appear before or after the command:
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
+| `tau messages unread PEER` | Mark a conversation unread again so it shows in the unread view (newest message only; `--all` for the whole conversation) |
 | `tau group create NAME --peer PEER --peer PEER` | Create a private group DM with a fixed member list (the creator is always a member) |
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |

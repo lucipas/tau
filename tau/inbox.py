@@ -971,6 +971,48 @@ class Inbox:
             self._save()
             return self._unread_counts_locked()
 
+    def mark_unread(
+        self, peer: str, *, all: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Move a conversation's read cursor back so mail shows unread again.
+
+        ``tau messages`` marks what it shows as read, so a read DM the
+        owner has not answered yet disappears from the unread view.
+        This is the way back: by default the newest message for the
+        peer becomes unread again; ``all=True`` clears the cursor so
+        the whole conversation shows unread.  Only the local display
+        state moves — a read receipt already sent for a message stays
+        sent, and a delayed ``mark_read`` still cannot move a cursor
+        backward on its own.  A peer with no stored messages is left
+        alone and the return is ``None``; otherwise the unread counts
+        after the mark.
+        """
+        with self._transaction():
+            entries = [
+                entry
+                for entry in self._messages
+                if (entry.get("destination") or "") == peer
+            ]
+            if not entries:
+                return None
+            if all:
+                self._read_cursors.pop(peer, None)
+            else:
+                newest = max(entries, key=lambda entry: entry["seq"])
+                earlier = [
+                    entry for entry in entries if entry["seq"] < newest["seq"]
+                ]
+                if not earlier:
+                    self._read_cursors.pop(peer, None)
+                else:
+                    previous = max(earlier, key=lambda entry: entry["seq"])
+                    self._read_cursors[peer] = {
+                        "last_read_seq": previous["seq"],
+                        "last_read_id": previous.get("id"),
+                    }
+            self._save()
+            return self._unread_counts_locked()
+
     def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
 
