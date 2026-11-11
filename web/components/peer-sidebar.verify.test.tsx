@@ -36,6 +36,7 @@ function renderSidebar({
       peers={peers}
       groups={[]}
       bridge={null}
+      social={null}
       pings={{}}
       blocks={{}}
       verifications={verifications}
