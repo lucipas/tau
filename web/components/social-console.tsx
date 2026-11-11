@@ -1234,6 +1234,7 @@ export function PostCard({
             <div className="mt-1.5">
               <textarea
                 value={editText}
+                disabled={saving}
                 // Code-point-aware cap: the backend counts Python code
                 // points (len), while slice/maxLength count UTF-16 units,
                 // so a plain slice would silently drop emoji from a valid
