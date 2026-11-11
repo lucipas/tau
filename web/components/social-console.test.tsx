@@ -71,6 +71,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -93,6 +94,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -112,6 +114,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost({ own: false })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -128,6 +131,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -230,6 +234,7 @@ describe("PostCard edit control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         onEdit={onEdit}
@@ -324,6 +329,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -439,6 +445,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 2 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -451,6 +458,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 0 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -601,6 +609,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -632,6 +641,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -813,6 +823,7 @@ describe("SocialConsole search", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -918,6 +929,7 @@ describe("SocialConsole mentions view", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -1136,6 +1148,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onToggleSave={onToggleSave}
         onReply={() => {}}
         onDelete={vi.fn()}
@@ -1167,6 +1180,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}

@@ -742,6 +742,13 @@ export function useTan() {
     [load, invalidateVerify, refreshSavedIfLoaded],
   );
 
+  const repost = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/repost", { target });
+      await Promise.all([load(), refreshSavedIfLoaded()]);
+    },
+    [load, refreshSavedIfLoaded],
+  );
   // Who liked one post, newest like first. Fetched on demand when the
   // liker list is opened, not with the timeline, so the feed payload
   // stays small. Returns the whole response so the caller can tell a
@@ -924,6 +931,7 @@ export function useTan() {
     unmuteKeyword,
     like,
     unlike,
+    repost,
     fetchLikers,
     deletePost,
     editPost,

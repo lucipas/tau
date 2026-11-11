@@ -3573,6 +3573,148 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_repost_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, feed, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+        mine = create_post(conn, identity, "my own thought", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["repost"]["kind"] == "repost"
+        assert payload["repost"]["target"] == foreign["hash"]
+
+        # The timeline now carries the repost, and the original is
+        # marked as reposted by you.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["reposted"] is True
+        assert by_text["worth sharing"]["reposts"] == 1
+
+        # Reposting the same post again is refused while the first
+        # repost still stands.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"]},
+        )
+        assert status == 400
+        assert "already been reposted" in payload["error"]["message"]
+
+        # Your own post cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 400
+        assert "own post" in payload["error"]["message"]
+
+        # A post this node has never seen cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": "cd" * 32},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target is a bad request, not a server error.
+        status, _, payload = _json(
+            bridge, "/api/tan/repost", method="POST", body={}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+    conn = init_db(node.config.social_db_path)
+    try:
+        entries = feed(conn, author=foreign["author"])
+    finally:
+        conn.close()
+    assert [entry["kind"] for entry in entries] == ["post"]
+
+
+def test_tan_repost_state_on_mentions_and_saved(tmp_path):
+    # Regression test for the repost-annotation gap Qodo's review caught:
+    # mentions and saved posts did not carry repost counts, so a card
+    # there kept offering Repost for a post already reposted.
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, create_reply, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "original thought", name="tester", now=1000
+        )
+        reply = create_reply(
+            conn, other, mine["hash"], "seconded", name="other", now=1001
+        )
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": foreign["hash"]}
+        )
+        assert status == 200
+
+        for target in (reply["hash"], foreign["hash"]):
+            status, _, payload = _json(
+                bridge, "/api/tan/repost", method="POST", body={"target": target}
+            )
+            assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+    finally:
+        bridge.stop()
+
+
 def test_tan_rules_via_api(tmp_path):
     import RNS
 
@@ -4048,7 +4190,6 @@ def test_tan_rules_without_data_dir(tmp_path):
     finally:
         bridge.stop()
 
-
 def test_tan_export_import_requires_social(tmp_path):
     import RNS
 
@@ -4311,8 +4452,6 @@ def test_tan_likers_server_error_is_500(tmp_path, monkeypatch):
         assert payload["error"]["message"] == "internal error"
     finally:
         bridge.stop()
-
-
 
 
 def _queue(node, to_hex, text, message_id=None):

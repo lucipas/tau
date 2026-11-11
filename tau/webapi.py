@@ -64,6 +64,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
     POST /api/tan/unlike   remove your like from a post
+    POST /api/tan/repost   repost a post (signed repost entry on your chain)
     POST /api/tan/delete   delete one of your own posts
     POST /api/tan/edit     edit one of your own posts
     POST /api/tan/follow   follow an author
@@ -1935,6 +1936,19 @@ class WebBridge:
         finally:
             conn.close()
         return app.react(post_hash, liked=liked, publish=True)
+
+    def tan_repost(self, target: str) -> Dict[str, Any]:
+        app = self._tan_app()
+        if app is None:
+            raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
+        conn = self._tan_conn()
+        try:
+            from .tangents.tan import resolve_post
+
+            post_hash = resolve_post(conn, target)["hash"]
+        finally:
+            conn.close()
+        return app.repost(post_hash, publish=True)
 
     def tan_quote(self, target: str, text: str) -> Dict[str, Any]:
         app = self._tan_app()
@@ -4868,6 +4882,25 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "reaction": record}, head_only)
+                return
+            if path == "/api/tan/repost":
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    record = self.bridge.tan_repost(target.strip())
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "repost": record}, head_only)
                 return
             if path == "/api/tan/delete":
                 target = body.get("target") or body.get("hash")
