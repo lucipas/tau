@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiGet, apiPost, eventsUrl } from "./api";
+import { apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
   AllowlistResponse,
   BlockPeerResponse,
   BridgeInfo,
+  BundleExportResponse,
+  BundleImportResponse,
   CancelOutboxResponse,
   CreateGroupResponse,
   DeleteGroupResponse,
@@ -915,6 +917,19 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const exportBundle = useCallback(async (includeTan: boolean) => {
+    return apiPost<BundleExportResponse>("/api/bundle/export", {
+      include_tan: includeTan,
+    });
+  }, []);
+
+  const importBundle = useCallback(async (documentText: string) => {
+    // The file's text goes to the server verbatim: the bundle is
+    // signed, and a JSON parse/stringify round trip here can rewrite
+    // a number the signature covers.
+    return apiPostText<BundleImportResponse>("/api/bundle/import", documentText);
+  }, []);
+
   const setPeerAlias = useCallback(
     async (destination: string, alias: string | null) => {
       const versionBefore = peerEventVersion.current[destination] ?? 0;
@@ -1134,6 +1149,8 @@ export function useTau() {
     refreshGroups,
     refreshMessages,
     cancelOutbox,
+    exportBundle,
+    importBundle,
     exportMessages,
     importMessages,
     retryOutbox,

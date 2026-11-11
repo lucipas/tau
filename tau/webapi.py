@@ -32,6 +32,10 @@ script) can read what arrives from the mesh and send messages back:
                            message carries a wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    POST /api/bundle/export build a signed sneakernet bundle
+                           ``{"include_tan": true}`` for Tan posts too
+    POST /api/bundle/import merge a bundle document (the signed JSON
+                           itself) into this node's mailbox and Tan store
     POST /api/outbox/retry  retry queued mail now, ignoring backoff
                            (``{"target": "<message id or prefix>"}`` for one
                            entry; omit it to retry everything queued)
@@ -103,6 +107,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from . import __version__
 from .allowlist import AllowListError, clean_destination
 from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
+from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import MESSAGES_FILE_NAME
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
@@ -2644,6 +2649,110 @@ class WebBridge:
         payload["read_at"] = self.node.mailbox.read_at(entry.id)
         return payload
 
+    def bundle_export(self, *, include_tan: bool = False) -> Dict[str, Any]:
+        """Build a signed sneakernet bundle from this node's mail.
+
+        Reuses :func:`tau.bundle.build_bundle`, so the console export
+        is the same signed document ``tau bundle export`` writes: held
+        envelopes verbatim, outbox entries sealed fresh to the
+        recipient's key, and — when asked — recent Tan posts.  No
+        identity or private material is included.
+        """
+        from .bundle import build_bundle
+
+        identity = getattr(self.node, "identity", None)
+        if identity is None:
+            from .identity import load_identity
+
+            identity = load_identity(self.node.config.identity_path)
+        if identity is None:
+            raise WebBridgeError("this node has no identity yet")
+        tan_conn = None
+        try:
+            if include_tan:
+                tan_conn = self._tan_conn()
+            # Read under the mailbox transaction, as the outbox API
+            # does: a separate process (e.g. a one-shot `tau send`)
+            # may have queued mail since this process loaded its
+            # snapshot, and the export must not silently omit it.
+            with self.node.mailbox.transaction():
+                document, summary = build_bundle(
+                    identity=identity,
+                    sender_name=self.node.name,
+                    mailbox=self.node.mailbox,
+                    registry=self.node.registry,
+                    tan_conn=tan_conn,
+                    include_tan=include_tan,
+                )
+        finally:
+            if tan_conn is not None:
+                tan_conn.close()
+        return {"document": document, "summary": summary}
+
+    def bundle_import(self, document: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge a verified sneakernet bundle document into this node.
+
+        *document* must already have passed
+        :func:`tau.bundle.parse_bundle` — the HTTP handler verifies the
+        container signature and size cap on the request's original bytes
+        before calling here — so this only runs
+        :func:`tau.bundle.apply_bundle`: every envelope and Tan post
+        meets the same checks as the network path.  Returns the merge
+        report (imported / already present / skipped).
+        """
+        from .bundle import apply_bundle
+
+        tan_conn = None
+        try:
+            if document.get("tan") is not None:
+                tan_conn = self._tan_conn()
+            admit = None
+            if tan_conn is not None:
+                admit = self._bundle_tan_admit(tan_conn)
+            return apply_bundle(
+                mailbox=self.node.mailbox,
+                tan_conn=tan_conn,
+                document=document,
+                admit=admit,
+            )
+        finally:
+            if tan_conn is not None:
+                tan_conn.close()
+
+    def _bundle_tan_admit(self, tan_conn: Any) -> Any:
+        """Admission check for Tan posts carried in a bundle.
+
+        The same ruleset the network path applies: the running Tan
+        app's ruleset when the feed is enabled, else the ruleset file
+        from the data directory.  A ruleset that cannot be parsed
+        fails closed, denying remote posts, as ``TanApp`` does.
+        """
+        from .identity import destination_hash
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import following
+
+        app = self._tan_app()
+        if app is not None:
+            ruleset = app.ruleset
+            own_author = app.author
+        else:
+            try:
+                ruleset = load_ruleset(
+                    getattr(self.node.config, "tan_rules_path", None)
+                )
+            except RulesError:
+                ruleset = Ruleset(default_allow=False)
+            identity = getattr(self.node, "identity", None)
+            own_author = (
+                destination_hash(identity).hex() if identity is not None else None
+            )
+        followed: List[str] = []
+        if ruleset.allow_followed:
+            followed = [record["author"] for record in following(tan_conn)]
+        return lambda author: ruleset.decide(
+            author, own_author=own_author, followed=followed
+        )
+
     def ping(self, target: str, *, timeout: float = 15.0) -> Dict[str, Any]:
         peer = self.node.resolve_peer(target.strip(), timeout=min(timeout, 10.0))
         response = self.node.ping(peer, timeout=timeout)
@@ -3763,6 +3872,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                     403,
                 )
                 return
+            if path == "/api/bundle/import":
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {"error": {"message": "bundle import is only accepted from localhost"}},
+                        head_only,
+                        403,
+                    )
+                    return
+                self._handle_bundle_import(head_only)
+                return
             # A file send carries base64 bytes and an import carries a whole
             # message history or a whole signed chain, so each gets a larger
             # body cap than a chat message or a single action.
@@ -4109,6 +4228,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "delete": record}, head_only)
+                return
+            if path == "/api/bundle/export":
+                self._handle_bundle_export(body, head_only)
                 return
             if path == "/api/tan/edit":
                 target = body.get("target") or body.get("hash")
@@ -4482,6 +4604,64 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json(result, head_only)
 
+    def _handle_bundle_export(self, body: Dict[str, Any], head_only: bool) -> None:
+        include_tan = body.get("include_tan", False)
+        if not isinstance(include_tan, bool):
+            self._send_json(
+                {"error": {"message": "field 'include_tan' must be a boolean"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.bundle_export(include_tan=include_tan)
+        except BundleError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        from .bundle import serialize_bundle
+
+        # Return the server's serialised bundle text, not a re-encoded
+        # object: the bundle is signed, and a client that parses and
+        # re-stringifies it can rewrite a number the signature covers
+        # (an integral float such as 1700000000.0 becomes 1700000000)
+        # and break verification of the file it downloads.
+        self._send_json(
+            {
+                "ok": True,
+                "bundle": serialize_bundle(result["document"]).decode("utf-8"),
+                "summary": result["summary"],
+            },
+            head_only,
+        )
+
+    def _handle_bundle_import(self, head_only: bool) -> None:
+        # A bundle import carries the whole signed document, up to the
+        # 8 MiB bundle cap — far past the 32 KiB limit every other
+        # route uses. Verify the submitted bytes themselves: measuring
+        # a pretty-printed reconstruction instead would reject a
+        # compact, correctly signed document near the cap, and parsing
+        # through JavaScript numbers on the way in can rewrite a float
+        # the signature covers.
+        raw = self._read_raw_body(max_bytes=DEFAULT_MAX_BUNDLE_BYTES)
+        from .bundle import parse_bundle
+
+        try:
+            document = parse_bundle(raw)
+        except BundleError as exc:
+            self._send_json(
+                {"error": {"message": f"invalid bundle: {exc}"}}, head_only, 400
+            )
+            return
+        try:
+            result = self.bridge.bundle_import(document)
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, "import": result}, head_only)
+
     def _handle_delete_message(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("id")
         if target is None:
@@ -4743,7 +4923,14 @@ class _WebHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         return not origin or _is_local_origin(origin)
 
-    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
+    def _read_raw_body(self, *, max_bytes: int) -> bytes:
+        """Read the request body as bytes, enforcing a size cap.
+
+        The JSON parsing lives in :meth:`_read_body`; routes that must
+        verify the submitted bytes themselves (a signed bundle) read
+        them here instead, so no re-serialisation can change what the
+        signature covers or how large it measures.
+        """
         content_type = (
             (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
@@ -4757,8 +4944,13 @@ class _WebHandler(BaseHTTPRequestHandler):
         if length > max_bytes:
             raise RequestError("request body is too large")
         if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    def _read_body(self, *, max_bytes: int = MAX_BODY_BYTES) -> Dict[str, Any]:
+        raw = self._read_raw_body(max_bytes=max_bytes)
+        if not raw:
             return {}
-        raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):

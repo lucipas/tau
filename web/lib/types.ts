@@ -337,6 +337,61 @@ export interface ApiErrorBody {
   error?: { message?: string };
 }
 
+// Sneakernet bundle: a signed JSON file carrying sealed mail (and
+// optionally Tan posts) between nodes with no live path between them.
+export interface BundleSkipped {
+  id: string;
+  reason: string;
+}
+
+export interface BundleSummary {
+  mail: number;
+  tan: number;
+  skipped: BundleSkipped[];
+  bytes: number;
+}
+
+export interface BundleExportResponse {
+  ok: boolean;
+  // The server's serialised bundle text, verbatim: the bundle is
+  // signed, so the console downloads this string as-is instead of
+  // parsing and re-stringifying it (a client round trip can rewrite
+  // a number the signature covers, e.g. 1700000000.0 to 1700000000).
+  bundle: string;
+  summary: BundleSummary;
+}
+
+export interface BundleImportError {
+  id: string;
+  error: string;
+}
+
+// Tan import errors name the post by its hash, not a mail id.
+export interface BundleTanError {
+  hash: string;
+  error: string;
+}
+
+export interface BundleTanReport {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: BundleTanError[];
+}
+
+export interface BundleImportReport {
+  imported: number;
+  present: number;
+  skipped: number;
+  tan: BundleTanReport | null;
+  errors: BundleImportError[];
+}
+
+export interface BundleImportResponse {
+  ok: boolean;
+  import: BundleImportReport;
+}
+
 
 export interface TanReplyParent {
   hash: string;

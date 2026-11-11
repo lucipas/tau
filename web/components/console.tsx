@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
+import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { Header } from "./header";
@@ -222,6 +223,12 @@ export function Console() {
                 onCancel={tau.cancelOutbox}
                 onRetry={tau.retryOutbox}
                 onDropHeld={tau.dropHeldMail}
+              />
+            </div>
+            <div className="mt-4">
+              <BundleSection
+                onExport={tau.exportBundle}
+                onImport={tau.importBundle}
               />
             </div>
             <Composer
