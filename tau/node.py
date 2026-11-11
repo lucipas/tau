@@ -1595,6 +1595,11 @@ class TauNode:
 
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
+        # Known gap: this live path still consults the node-wide seen
+        # store, so a pinned-group member can learn whether an arbitrary
+        # id was seen (including ids from other groups or DMs), and the
+        # probe marks unseen ids as seen. Only the expired path above is
+        # closed; scoping seen entries per group/sender is still open.
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
             if message_id:
