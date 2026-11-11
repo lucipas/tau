@@ -1545,9 +1545,15 @@ class TauNode:
         # A delayed group request past the sender's deadline is dropped
         # before the roster is pinned: an expired request must not add an
         # unseen group or replace a saved roster, and it is never shown.
-        # The duplicate flag is still reported: a retry of a message
-        # already seen counts as delivered on the sender's side, even
-        # though the deadline has since passed.
+        # The duplicate flag is NOT reported here: consulting the seen
+        # store before membership is established would let any
+        # allow-listed caller probe whether this node has seen an
+        # arbitrary id — including ids from groups they do not belong
+        # to, or direct messages — by sending a well-formed expired
+        # payload carrying it.  An expired retry of a message the
+        # receiver already saw therefore reports as undelivered on the
+        # sender's side; the deadline has passed, so no retry can
+        # succeed and the sender drops the leg (see _deliver_entry).
         message_id = message.get("id")
         expires_at = message.get("expires_at")
         if expires_at is not None and expires_at <= received_at:
@@ -1562,7 +1568,7 @@ class TauNode:
                 server=self.name,
                 node=self.destination_hexhash,
                 group=message["group"],
-                duplicate=bool(message_id and self.mailbox.is_seen(message_id)),
+                duplicate=False,
                 expired=True,
             )
 
