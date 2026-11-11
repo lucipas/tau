@@ -34,6 +34,7 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/mentions replies to your own posts
     GET  /api/tan/thread    thread rooted at a post (``?ref=<hash-or-prefix>``)
     GET  /api/tan/following followed authors
+    GET  /api/tan/likes    who liked a Tan post (?target=<post hash>)
     POST /api/tan/posts    publish a Tan post
     POST /api/tan/quote    quote a post with your own comment
     POST /api/tan/like     like a post (signed reaction on your chain)
@@ -109,6 +110,10 @@ MAX_MESSAGE_LOG = 500
 # yet (the flush can deliver before send_message records the send).
 MAX_EARLY_DELIVERIES = 128
 MAX_EVENT_LOG = 500
+
+# Most likers one /api/tan/likes response carries. The full count is
+# reported as ``total`` so the console can say when a list is truncated.
+MAX_LIKERS = 100
 MAX_SUBSCRIBERS = 32
 SUBSCRIBER_QUEUE_SIZE = 256
 SSE_HEARTBEAT_SECONDS = 15.0
@@ -1239,6 +1244,128 @@ class WebBridge:
             return records
         finally:
             conn.close()
+
+    def tan_likers(self, target: Any) -> Dict[str, Any]:
+        """List who liked one Tan post, newest like first.
+
+        Visibility matches the timeline: only a linked timeline-kind
+        post whose author is neither muted nor blocked discloses
+        anything, and when the owner's ruleset hides both reaction kinds
+        no likers are disclosed at all. A post its author deleted is
+        reported as deleted, not unknown, matching the like endpoint.
+        Names resolve from the peer registry first, then from the name on
+        the liker's latest stored post; an author with no known name keeps
+        an empty name and the console falls back to the short hash. Only
+        author identities are exposed, never reaction contents. At most
+        ``MAX_LIKERS`` entries are returned; ``total`` is the full count
+        before that cap.
+        """
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import (
+            _NOT_DELETED,
+            KIND_LIKE,
+            KIND_UNLIKE,
+            TIMELINE_KINDS_SQL,
+            TanError,
+            deleted_targets,
+            muted_author_set,
+            post_likers,
+        )
+
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target is required")
+        # Hashes are stored lowercase; normalize before any lookup.
+        clean = target.strip().lower()
+        # Same author exclusions as tan_timeline, including fail-closed
+        # block-all, so a liker list never shows hidden identities.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = set(blocklist.blocked) if blocklist is not None else set()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            if clean in deleted_targets(conn):
+                raise TanError(f"post has been deleted: {clean!r}")
+            # A target is visible only when the timeline would show it:
+            # linked, a timeline kind, not deleted by its author, and by
+            # an author who is neither muted nor blocked.
+            row = conn.execute(
+                "SELECT author FROM posts WHERE hash = ? AND linked = 1 "
+                f"AND kind IN ({TIMELINE_KINDS_SQL}) AND {_NOT_DELETED}",
+                (clean,),
+            ).fetchone()
+            hidden = muted_author_set(conn) | blocked
+            if row is None or exclude_all or str(row["author"]) in hidden:
+                raise TanError(f"unknown post: {clean!r}")
+            app = self._tan_app()
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            if not (ruleset.displays(KIND_LIKE) or ruleset.displays(KIND_UNLIKE)):
+                # Reactions are hidden for this viewer, so the timeline
+                # shows no like annotations; disclose no likers either.
+                return {"target": clean, "likers": [], "count": 0, "total": 0}
+            entries = [
+                entry
+                for entry in post_likers(conn, clean)
+                if entry["author"] not in hidden
+            ]
+            total = len(entries)
+            shown = entries[:MAX_LIKERS]
+            names = self._tan_author_names(
+                conn, [entry["author"] for entry in shown]
+            )
+            likers = []
+            for entry in shown:
+                author = entry["author"]
+                name = ""
+                peer = self.node.registry.get(author)
+                if peer is not None:
+                    name = peer.display_name
+                if not name:
+                    name = names.get(author, "")
+                likers.append(
+                    {
+                        "author": author,
+                        "name": name,
+                        "liked_at": entry["liked_at"],
+                    }
+                )
+            return {
+                "target": clean,
+                "likers": likers,
+                "count": len(likers),
+                "total": total,
+            }
+        finally:
+            conn.close()
+
+    def _tan_author_names(
+        self, conn: Any, authors: List[str]
+    ) -> Dict[str, str]:
+        """Latest stored display name per author, in one query.
+
+        Rows arrive newest first, so the first name seen for an author
+        is their latest. Registry names take precedence and are resolved
+        by the caller.
+        """
+        if not authors:
+            return {}
+        placeholders = ", ".join("?" for _ in authors)
+        rows = conn.execute(
+            "SELECT author, name FROM posts WHERE author IN "
+            f"({placeholders}) AND name != '' ORDER BY created_at DESC",
+            list(authors),
+        ).fetchall()
+        names: Dict[str, str] = {}
+        for row in rows:
+            names.setdefault(str(row["author"]), str(row["name"]))
+        return names
 
     def tan_follow(self, target: str) -> Dict[str, Any]:
         from .tangents.tan import follow, resolve_author
@@ -2541,6 +2668,20 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"following": records, "count": len(records)}, head_only
                 )
+                return
+            if path == "/api/tan/likes":
+                from .tangents.tan import TanError
+
+                target = (query.get("target") or [None])[0]
+                try:
+                    payload = self.bridge.tan_likers(target)
+                except (TanError, ValueError) as exc:
+                    # Only target validation is a client error; a
+                    # database or storage failure falls through to
+                    # _handle, which logs the traceback and answers 500.
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(payload, head_only)
                 return
             if path == "/api/tan/muted":
                 records = self.bridge.tan_muted()

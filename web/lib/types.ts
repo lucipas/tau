@@ -323,6 +323,19 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanLiker {
+  author: string;
+  name: string;
+  liked_at: number;
+}
+
+export interface TanLikesResponse {
+  target: string;
+  likers: TanLiker[];
+  count: number;
+  total: number;
+}
+
 export interface TanMutedAuthor {
   author: string;
   name: string;

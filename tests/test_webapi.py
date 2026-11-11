@@ -2122,6 +2122,259 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def _likers_setup(tmp_path):
+    """A node with one post by bob, liked by alice, carol and dave.
+
+    Returns (node, post, authors) where authors maps a label to the
+    liker's author hex. Carol unlikes at the end, so the visible likers
+    are dave (1003) then alice (1001).
+    """
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, create_reaction, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    # A liker the node knows as a peer resolves to the registry name,
+    # not the name on their stored posts.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=destination_hash(alice),
+            name="alice-on-record",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    conn = init_db(node.config.social_db_path)
+    try:
+        post = create_post(conn, bob, "likeable via api", name="bob", now=1000)
+        create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1001)
+        create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1002)
+        create_reaction(conn, dave, post["hash"], liked=True, name="dave", now=1003)
+        # Carol's unlike supersedes her like.
+        create_reaction(conn, carol, post["hash"], liked=False, name="carol", now=1004)
+    finally:
+        conn.close()
+    authors = {
+        label: destination_hash(identity).hex()
+        for label, identity in (
+            ("alice", alice),
+            ("bob", bob),
+            ("carol", carol),
+            ("dave", dave),
+        )
+    }
+    return node, post, authors
+
+
+def test_tan_likers_via_api(tmp_path):
+    node, post, authors = _likers_setup(tmp_path)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+        assert payload["total"] == 2
+        assert payload["likers"] == [
+            {
+                "author": authors["dave"],
+                "name": "dave",
+                "liked_at": 1003.0,
+            },
+            {
+                "author": authors["alice"],
+                "name": "alice-on-record",
+                "liked_at": 1001.0,
+            },
+        ]
+
+        # An uppercase spelling of the same hash resolves, and the
+        # response carries the canonical lowercase hash.
+        status, _, payload = _json(
+            bridge, f"/api/tan/likes?target={post['hash'].upper()}"
+        )
+        assert status == 200
+        assert payload["target"] == post["hash"]
+        assert payload["count"] == 2
+
+        # Unknown post hash -> 400, per the issue spec.
+        status, _, payload = _json(bridge, "/api/tan/likes?target=" + "cd" * 32)
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target -> 400.
+        status, _, payload = _json(bridge, "/api/tan/likes")
+        assert status == 400
+        assert "target is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_excludes_muted_and_blocked(tmp_path):
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import init_db, mute
+
+    node, post, authors = _likers_setup(tmp_path)
+    conn = init_db(node.config.social_db_path)
+    try:
+        mute(conn, authors["dave"], name="dave")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The muted liker is hidden, as in the timeline.
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert [entry["author"] for entry in payload["likers"]] == [authors["alice"]]
+        assert payload["total"] == 1
+
+        # A blocked liker is hidden too.
+        node.blocklist = BlockList(blocked=frozenset({authors["alice"]}))
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert payload["likers"] == []
+        assert payload["total"] == 0
+
+        # A fail-closed block-all list hides the post entirely,
+        # matching the timeline and the DM gate.
+        node.blocklist = BlockList(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_hides_post_by_hidden_author(tmp_path):
+    from tau.config import TauConfig
+    from tau.tangents.tan import init_db, mute
+
+    node, post, authors = _likers_setup(tmp_path)
+    conn = init_db(node.config.social_db_path)
+    try:
+        mute(conn, authors["bob"], name="bob")
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline would not show a muted author's post at all, so
+        # the endpoint does not admit the post exists.
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_rejects_deleted_post(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_delete, create_post, create_reaction, init_db
+
+    node, _, _ = _likers_setup(tmp_path)
+    # A post deleted by its own author: build one with an identity held
+    # in this test, like it, then delete it.
+    identity = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        own = create_post(conn, identity, "delete me", name="me", now=2000)
+        create_reaction(conn, identity, own["hash"], liked=True, name="me", now=2001)
+        create_delete(conn, identity, own["hash"], name="me", now=2002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={own['hash']}")
+        assert status == 400
+        assert "has been deleted" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_hides_reactions_per_ruleset(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.rules import Ruleset
+    from tau.tangents.tan import TanApp
+
+    node, post, authors = _likers_setup(tmp_path)
+    identity = RNS.Identity()
+    # A ruleset that displays no reaction kind: the timeline strips its
+    # like annotations, so the likers endpoint must disclose nothing.
+    node.app = TanApp(
+        node.config,
+        identity,
+        name="tester",
+        gossip=False,
+        ruleset=Ruleset(kinds=frozenset({"post"})),
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert payload["likers"] == []
+        assert payload["total"] == 0
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_caps_at_max_likers(tmp_path, monkeypatch):
+    import tau.webapi
+
+    node, post, authors = _likers_setup(tmp_path)
+    monkeypatch.setattr(tau.webapi, "MAX_LIKERS", 1)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["total"] == 2
+        # The cap keeps the newest liker.
+        assert payload["likers"][0]["author"] == authors["dave"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_likers_server_error_is_500(tmp_path, monkeypatch):
+    import sqlite3
+
+    node, post, authors = _likers_setup(tmp_path)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A storage failure is a server error, not a bad target.
+        def _boom():
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(bridge, "_tan_conn", _boom)
+        status, _, payload = _json(bridge, f"/api/tan/likes?target={post['hash']}")
+        assert status == 500
+        assert payload["error"]["message"] == "internal error"
+    finally:
+        bridge.stop()
+
+
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),

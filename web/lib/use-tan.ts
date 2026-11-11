@@ -6,6 +6,7 @@ import { apiGet, apiPost } from "./api";
 import type {
   TanFollow,
   TanFollowingResponse,
+  TanLikesResponse,
   TanMutedAuthor,
   TanMutedKeyword,
   TanMutedKeywordsResponse,
@@ -508,6 +509,16 @@ export function useTan() {
     [load, refreshSavedIfLoaded],
   );
 
+  // Who liked one post, newest like first. Fetched on demand when the
+  // liker list is opened, not with the timeline, so the feed payload
+  // stays small. Returns the whole response so the caller can tell a
+  // truncated list (count < total) from a complete one.
+  const fetchLikers = useCallback(async (target: string) => {
+    return apiGet<TanLikesResponse>(
+      `/api/tan/likes?target=${encodeURIComponent(target)}`,
+    );
+  }, []);
+
   const deletePost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/delete", { target });
@@ -571,6 +582,7 @@ export function useTan() {
     unmuteKeyword,
     like,
     unlike,
+    fetchLikers,
     deletePost,
     sync,
   };
