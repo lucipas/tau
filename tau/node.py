@@ -1042,21 +1042,13 @@ class TauNode:
             log.warning("Could not record received message", exc_info=True)
 
     def _record_retraction(self, sender_hash: str, message_id: str) -> None:
-        """Persist a retraction marker; never break the retract itself.
+        """Persist a retraction marker.
 
-        The marker is the durable half of a retract: the inbox copy is
-        already gone (or never arrived), and a marker that failed to
-        persist only risks a relayed copy resurfacing — worth a log
-        line, not a failed retract.
+        The marker is the durable half of a retract, so a failure to
+        persist it propagates: the caller must report the retract as
+        failed rather than confirm one a relayed copy could undo.
         """
-        try:
-            self.mailbox.record_retraction(sender_hash, message_id)
-        except Exception:  # pragma: no cover - storage failure
-            log.warning(
-                "Could not record retraction marker for %s",
-                message_id[:8],
-                exc_info=True,
-            )
+        self.mailbox.record_retraction(sender_hash, message_id)
 
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
@@ -1153,51 +1145,57 @@ class TauNode:
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
-        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         # A delayed direct request past the sender's deadline is dropped
         # unrecorded (and not marked seen), so it is never shown.
         expires_at = message.get("expires_at")
         expired = expires_at is not None and expires_at <= received_at
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
-        # A message its sender retracted is dropped the same way: the
-        # marker outlives the seen cache, so a copy that arrives after
-        # the id was evicted still loses to the retract.
-        retracted = bool(
-            message_id
-            and caller_hash
-            and self.mailbox.is_retracted(caller_hash, message_id)
-        )
-        if retracted:
-            log.info("Dropping retracted message %s from %s", message_id, caller_hash)
-        if not duplicate and not expired and not retracted:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
-            record = {
-                "from": caller_name,
-                "destination": caller_hash,
-                "text": message["text"],
-                "kind": message["kind"],
-                "sent_at": message["sent_at"],
-                "received_at": received_at,
-                "id": message_id,
-                "expires_at": message.get("expires_at"),
-                "direction": "in",
-            }
-            if message.get("in_reply_to") is not None:
-                record["in_reply_to"] = message["in_reply_to"]
-            log.info(
-                "Message from %s (%s): %s",
-                caller_name,
-                caller_hash or "anonymous",
-                message["text"],
+        stored_record: Optional[Dict[str, Any]] = None
+        # The seen and retraction checks and the insert run under one
+        # mailbox transaction, so a concurrent retract cannot land
+        # between the marker check and the append.
+        with self.mailbox.transaction():
+            duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+            # A message its sender retracted is dropped the same way: the
+            # marker outlives the seen cache, so a copy that arrives after
+            # the id was evicted still loses to the retract.
+            retracted = bool(
+                message_id
+                and caller_hash
+                and self.mailbox.is_retracted(caller_hash, message_id)
             )
-            self._record_received(record)
-            if self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            if retracted:
+                log.info("Dropping retracted message %s from %s", message_id, caller_hash)
+            if not duplicate and not expired and not retracted:
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                record = {
+                    "from": caller_name,
+                    "destination": caller_hash,
+                    "text": message["text"],
+                    "kind": message["kind"],
+                    "sent_at": message["sent_at"],
+                    "received_at": received_at,
+                    "id": message_id,
+                    "expires_at": message.get("expires_at"),
+                    "direction": "in",
+                }
+                if message.get("in_reply_to") is not None:
+                    record["in_reply_to"] = message["in_reply_to"]
+                log.info(
+                    "Message from %s (%s): %s",
+                    caller_name,
+                    caller_hash or "anonymous",
+                    message["text"],
+                )
+                self._record_received(record)
+                stored_record = record
+        if stored_record is not None and self.on_message is not None:
+            try:
+                self.on_message(stored_record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
 
         return response_ok(
             echo=message["text"],
@@ -1608,75 +1606,102 @@ class TauNode:
         # deleted False instead of failing.  The match must be exact:
         # resolve also matches unique prefixes, and a short target
         # must never delete a different message from the same sender.
-        # Reload first: another process (a one-shot CLI import) may have
-        # persisted the target after this node's in-memory copy was read.
-        try:
-            self.inbox.reload()
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not read inbox: {exc}"
+        # The mailbox transaction is held across the marker decision and
+        # the inbox mutation, so a concurrent delivery or import cannot
+        # check for the marker, miss this retract, and insert afterwards.
+        # Lock order is mailbox, then inbox, everywhere.
+        with self.mailbox.transaction():
+            # Reload first: another process (a one-shot CLI import) may
+            # have persisted the target after this node's in-memory copy
+            # was read.
+            try:
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            try:
+                stored = self.inbox.resolve(retract["target"])
+            except ValueError:
+                stored = None
+            if stored is None or stored.get("id") != retract["target"]:
+                # No stored copy to check the sender against — the message
+                # may already be deleted or never have arrived.  Record the
+                # marker anyway: the retract is authenticated, and a copy
+                # arriving later (a relayed copy, or one that outlives the
+                # seen cache) must still lose to it.  The key carries the
+                # caller's own hash, so a sender can only ever suppress
+                # their own messages this way.  If the marker cannot be
+                # persisted the retract is not confirmed.
+                try:
+                    self._record_retraction(caller_hash, retract["target"])
+                except Exception as exc:
+                    log.warning(
+                        "Could not record retraction marker for %s",
+                        retract["target"][:8],
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed", f"could not record retraction: {exc}"
+                    )
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # Only a received record counts: an outgoing record also has the
+            # caller's hash in ``destination`` (the recipient), so without the
+            # direction check a recipient could delete the sender's own copy.
+            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+                return response_error(
+                    "not_sender", "only the message's sender can retract it"
+                )
+            if stored.get("kind") == "file":
+                # A saved file lives on disk; Inbox.delete drops only the
+                # record, so retracting it would leave the file behind.
+                return response_error(
+                    "not_supported",
+                    "file transfers cannot be retracted",
+                )
+            if stored.get("kind") == "group":
+                # A group message lives in every member's inbox; deleting
+                # it from one member alone would silently half-retract it.
+                # Group fan-out retract is a follow-up, not v1.
+                return response_error(
+                    "not_supported",
+                    "group messages cannot be retracted in v1",
+                )
+            # Record the marker before deleting the copy: if it cannot be
+            # persisted, nothing is deleted and the retract fails cleanly.
+            # (A refused retract records nothing: the message stays, so it
+            # must stay deliverable.)
+            try:
+                self._record_retraction(caller_hash, retract["target"])
+            except Exception as exc:
+                log.warning(
+                    "Could not record retraction marker for %s",
+                    retract["target"][:8],
+                    exc_info=True,
+                )
+                return response_error(
+                    "storage_failed", f"could not record retraction: {exc}"
+                )
+            try:
+                self.inbox.delete(str(stored["id"]))
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not retract message: {exc}"
+                )
+            log.info(
+                "Retraction from %s deleted %s",
+                caller_hash[:8],
+                retract["target"][:8],
             )
-        try:
-            stored = self.inbox.resolve(retract["target"])
-        except ValueError:
-            stored = None
-        if stored is None or stored.get("id") != retract["target"]:
-            # No stored copy to check the sender against — the message
-            # may already be deleted or never have arrived.  Record the
-            # marker anyway: the retract is authenticated, and a copy
-            # arriving later (a relayed copy, or one that outlives the
-            # seen cache) must still lose to it.  The key carries the
-            # caller's own hash, so a sender can only ever suppress
-            # their own messages this way.
-            self._record_retraction(caller_hash, retract["target"])
             return response_ok(
                 target=retract["target"],
                 received_at=received_at,
-                deleted=False,
+                deleted=True,
             )
-        # Only a received record counts: an outgoing record also has the
-        # caller's hash in ``destination`` (the recipient), so without the
-        # direction check a recipient could delete the sender's own copy.
-        if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
-            return response_error(
-                "not_sender", "only the message's sender can retract it"
-            )
-        if stored.get("kind") == "file":
-            # A saved file lives on disk; Inbox.delete drops only the
-            # record, so retracting it would leave the file behind.
-            return response_error(
-                "not_supported",
-                "file transfers cannot be retracted",
-            )
-        if stored.get("kind") == "group":
-            # A group message lives in every member's inbox; deleting
-            # it from one member alone would silently half-retract it.
-            # Group fan-out retract is a follow-up, not v1.
-            return response_error(
-                "not_supported",
-                "group messages cannot be retracted in v1",
-            )
-        try:
-            self.inbox.delete(str(stored["id"]))
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not retract message: {exc}"
-            )
-        # The copy is gone, but a sealed relay copy can still arrive —
-        # and the seen cache can evict the id — so leave a marker that
-        # outlives both.  (A refused retract records nothing: the
-        # message stays, so it must stay deliverable.)
-        self._record_retraction(caller_hash, retract["target"])
-        log.info(
-            "Retraction from %s deleted %s",
-            caller_hash[:8],
-            retract["target"][:8],
-        )
-        return response_ok(
-            target=retract["target"],
-            received_at=received_at,
-            deleted=True,
-        )
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -2619,62 +2644,66 @@ class TauNode:
                 sender or "unknown",
             )
             return False
-        if self.mailbox.is_seen(message["id"]):
-            return False
-        expires_at = message.get("expires_at")
-        if expires_at is not None and expires_at <= time.time():
-            # Past the sender's deadline: do not record or show it.
-            log.info("Dropping expired relayed message %s", message["id"])
-            return False
-        if message.get("group") is None and self.mailbox.is_retracted(
-            sender if isinstance(sender, str) else "", message["id"]
-        ):
-            # A retract the sender issued after this copy was sealed
-            # still wins: the marker outlives the seen cache, so a
-            # relayed copy is dropped, never stored.  Group messages
-            # are not retractable in v1, so they never match a marker.
-            log.info("Dropping retracted relayed message %s", message["id"])
-            return False
-        group = message.get("group")
-        pinned: Optional[Dict[str, Any]] = None
-        if group is not None:
-            sender = message.get("from")
-            pinned = self._accept_group_message(
-                sender if isinstance(sender, str) else "", group
-            )
-            if pinned is None:
-                log.info(
-                    "Relayed group message from %s rejected: sender or "
-                    "node not on the roster, or the roster changed",
-                    sender or "unknown",
-                )
+        # The seen and retraction checks and the insert run under one
+        # mailbox transaction, so a concurrent retract cannot land
+        # between the marker check and the append.
+        with self.mailbox.transaction():
+            if self.mailbox.is_seen(message["id"]):
                 return False
-        self.mailbox.mark_seen(message["id"])
-        record = {
-            "from": message["from_name"],
-            "destination": message["from"],
-            "text": message["text"],
-            "kind": message.get("kind") or DEFAULT_MESSAGE_KIND,
-            "sent_at": message["sent_at"],
-            "received_at": time.time(),
-            "id": message["id"],
-            "relayed": True,
-            "expires_at": message.get("expires_at"),
-            "direction": "in",
-        }
-        if pinned is not None:
-            record["kind"] = "group"
-            record["group"] = pinned["id"]
-            record["group_name"] = pinned["name"]
-        if message.get("in_reply_to") is not None:
-            record["in_reply_to"] = message["in_reply_to"]
-        log.info(
-            "Message from %s (%s) via store-and-forward: %s",
-            message["from_name"],
-            message["from"],
-            message["text"],
-        )
-        self._record_received(record)
+            expires_at = message.get("expires_at")
+            if expires_at is not None and expires_at <= time.time():
+                # Past the sender's deadline: do not record or show it.
+                log.info("Dropping expired relayed message %s", message["id"])
+                return False
+            if message.get("group") is None and self.mailbox.is_retracted(
+                sender if isinstance(sender, str) else "", message["id"]
+            ):
+                # A retract the sender issued after this copy was sealed
+                # still wins: the marker outlives the seen cache, so a
+                # relayed copy is dropped, never stored.  Group messages
+                # are not retractable in v1, so they never match a marker.
+                log.info("Dropping retracted relayed message %s", message["id"])
+                return False
+            group = message.get("group")
+            pinned: Optional[Dict[str, Any]] = None
+            if group is not None:
+                sender = message.get("from")
+                pinned = self._accept_group_message(
+                    sender if isinstance(sender, str) else "", group
+                )
+                if pinned is None:
+                    log.info(
+                        "Relayed group message from %s rejected: sender or "
+                        "node not on the roster, or the roster changed",
+                        sender or "unknown",
+                    )
+                    return False
+            self.mailbox.mark_seen(message["id"])
+            record = {
+                "from": message["from_name"],
+                "destination": message["from"],
+                "text": message["text"],
+                "kind": message.get("kind") or DEFAULT_MESSAGE_KIND,
+                "sent_at": message["sent_at"],
+                "received_at": time.time(),
+                "id": message["id"],
+                "relayed": True,
+                "expires_at": message.get("expires_at"),
+                "direction": "in",
+            }
+            if pinned is not None:
+                record["kind"] = "group"
+                record["group"] = pinned["id"]
+                record["group_name"] = pinned["name"]
+            if message.get("in_reply_to") is not None:
+                record["in_reply_to"] = message["in_reply_to"]
+            log.info(
+                "Message from %s (%s) via store-and-forward: %s",
+                message["from_name"],
+                message["from"],
+                message["text"],
+            )
+            self._record_received(record)
         if self.on_message is not None:
             try:
                 self.on_message(record)
