@@ -132,26 +132,53 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/verify` | POST | mark a peer verified `{"target": "alice"}` — only after comparing the safety number out of band (returns it) |
+| `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |
+| `/api/peers/block` | POST | block `{"target": "alice"}` |
+| `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
+| `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
+| `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
+| `/api/outbox/held` | GET | sealed mail held for other peers |
+| `/api/outbox/drop-held` | POST | drop `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
+| `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
+| `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |
+| `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
+| `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
+| `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
+| `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
+| `/api/tan/quote` | POST | quote `{"target": "<post hash>", "text": "…"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/likes` | GET | who liked a post (`?target=<post hash>`) |
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
+| `/api/tan/muted` | GET | muted authors and their post counts |
+| `/api/tan/mute` | POST | mute `{"target": "alice"}` |
+| `/api/tan/unmute` | POST | unmute `{"target": "alice"}` |
+| `/api/tan/muted-keywords` | GET | muted keywords |
+| `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
+| `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
 | `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
 | `/api/tan/import` | POST | import an export document (every entry verified) |
+| `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
+| `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |
+| `/api/tan/unsave` | POST | unsave `{"target": "<post hash>"}` |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
@@ -213,6 +240,10 @@ tau tan timeline --author alice
 tau tan search mesh --limit 10
 tau tan search mesh --author alice
 
+# Show the most-liked stored posts (best first; unliked posts last, newest first)
+tau tan top --limit 10
+tau tan top --author alice
+
 # Follow by destination hash or by a unique hash prefix
 tau tan follow 5c04c868
 tau tan following
@@ -236,6 +267,9 @@ tau tan export --all --output tan-backup.json
 tau tan import tan-backup.json
 ```
 
+More Tan flags — drafts, direct delivery, search, keyword and author
+mutes, export/import: see [FLAGS.md](FLAGS.md#tan-flags).
+
 Posts are limited to 2,000 characters and 20 posts per feed response. A
 long-running node stores only posts it created, received or synced. Tan is
 public-feed oriented: there are no private posts or media yet. Posts can be
@@ -251,14 +285,20 @@ it, oldest first, and accepts a reply's hash to show the thread it belongs
 to. An author can delete one of their own posts with
 `tau tan delete <post>` — the delete is a signed entry on the author's
 chain, so it propagates to peers and the post disappears from timelines
-(the entry itself stays stored, keeping chains verifiable). A word or
-phrase can be muted locally with `tau tan mute-keyword <word>` — matching
-posts disappear from your timeline and threads (a muted reply hides its
-whole subtree), while search still finds them and unmuting restores them.
-An author can also be muted with `tau tan mute <peer>` — their posts and
-replies leave your timeline, search results and threads, while their
-entries keep syncing and storing, so `tau tan unmute <peer>` brings the
-whole history back. Muting is display-only and never touches DMs.
+(the entry itself stays stored, keeping chains verifiable). Entries are
+verified when they are stored, but nothing re-checks the local copy
+afterwards: `tau tan verify` re-verifies every stored entry's signature
+and hash and checks each author's chain linkage, and exits non-zero
+listing any problem it finds — run it after a restore, or whenever you
+suspect the database was damaged. Entries whose parent has not arrived
+yet are counted, not reported. A word or phrase can be muted locally
+with `tau tan mute-keyword <word>` — matching posts disappear from your
+timeline and threads (a muted reply hides its whole subtree), while
+search still finds them and unmuting restores them. An author can also
+be muted with `tau tan mute <peer>` — their posts and replies leave your
+timeline, search results and threads, while their entries keep syncing
+and storing, so `tau tan unmute <peer>` brings the whole history back.
+Muting is display-only and never touches DMs.
 In the web console your own posts show a delete button that calls the same endpoint.
 The local database is `<data-dir>/tan.sqlite3`.
 
@@ -281,53 +321,45 @@ Global options may appear before or after the command:
 | `tau init` | Create the data directory, identity and Reticulum config |
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
-| `tau send --to PEER [--to PEER ...] TEXT` | Send a message over an encrypted link (queued if the peer is offline; `--to` is repeatable) |
-| `tau send --to PEER --reply-to ID TEXT` | Reply to an earlier message in the conversation, quoting it |
-| `tau react MESSAGE-ID EMOJI` | React to a received message (one emoji or short token; `--clear` retracts) |
+| `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
-| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
-| `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
-| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
-| `tau messages` | List received direct messages kept in the node inbox (`--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
+| `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
+| `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers show NAME\|HASH` | Show what this node knows about one peer (offline, read-only) |
+| `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
+| `tau peers unalias PEER` | Remove a peer's local alias |
+| `tau messages` | List received direct messages kept in the node inbox |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
 | `tau outbox drop-held ID` | Drop a held message so it is never delivered |
 | `tau allowlist` | Show or change who may send this node direct messages |
-| `tau block` | Silence a peer: drop their DMs and hide their Tan posts |
 | `tau outbox cancel ID` | Cancel a queued message (full id or unique prefix) |
-| `tau id` | Show this node's name, destination hash, LXMF delivery address, and safety number (fingerprint of this identity) |
+| `tau id` | Show this node's name, destination hash, and LXMF delivery address |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
+| `tau id rename NEWNAME` | Change this node's display name (identity and destination unchanged) |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
-| `tau tan quote POST TEXT` | Quote a post with your own comment (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
+| `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan top` | Show the most-liked stored posts, best first |
 | `tau tan mentions` | Show replies to your own posts |
+| `tau tan verify` | Re-verify every stored post's signature and chain linkage |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
-| `tau tan mute-keyword WORD` | Hide posts containing a word or phrase from local views |
-| `tau tan unmute-keyword WORD` | Stop hiding posts containing a word or phrase |
-| `tau tan muted-keywords` | List muted keywords |
-| `tau tan mute PEER` | Hide an author's posts from local views |
-| `tau tan unmute PEER` | Show a muted author's posts again |
-| `tau tan muted` | List muted authors |
-| `tau tan save POST` | Save a post to read later (local only, never published) |
-| `tau tan unsave POST` | Remove a post from your saved list |
-| `tau tan saved` | List your saved posts, newest first |
+| `tau tan authors` | List every author in the local Tan store |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
 | `tau tan rules` | Show or change which remote entries get committed |
-| `tau bundle export FILE [--tan]` | Write sealed mail (and optionally Tan posts) to a signed bundle file for offline carrying |
-| `tau bundle import FILE` | Merge a bundle file into this node's mailbox and Tan store |
 
 Useful flags:
 
@@ -357,8 +389,9 @@ echo "piped message" | tau send --to alice
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
 
-# Send the same message to several peers (one message id per recipient)
-tau send --to alice --to bob "hi"
+# Tag a message with a kind (default chat); the receiver can filter by it
+tau send --to alice --kind ping "are you there?"
+tau messages --kind ping
 
 # See what is waiting on offline peers
 tau outbox
@@ -367,30 +400,8 @@ tau outbox
 tau messages
 tau messages --peer alice --limit 10 --json
 
-# Reply to an earlier message in the conversation (message id or prefix)
-tau send --to alice --reply-to a1b2c3d4 "seconded"
-
-# Only what arrived since you last read, and per-peer unread counts
-tau messages --unread
-tau messages --count            # read-only, for scripts; does not mark read
-
-# React to a received message (id or unique prefix from `tau messages`)
-tau react a1b2c3d4 👍
-tau react a1b2c3d4 +1
-tau react a1b2c3d4 --clear
-
 # Only show peers heard from in the last day
 tau peers --max-age 1
-
-# Compare safety numbers with a peer over another channel (a call, in
-# person), then record the match — verified peers show a ✓ in `tau peers`
-# and the console, and are never pruned away
-tau peers --safety-number
-tau peers verify alice
-
-# Importing a different identity clears every verification: the numbers
-# were compared under the old identity, so they mean nothing under the
-# new one — re-verify each peer
 
 # Everything as JSON
 tau discover --duration 10 --json
@@ -400,6 +411,9 @@ tau send --to alice "hi" --json
 `serve` emits one JSON object per line with `--json` (`ready`, `peer`,
 `message` events), which makes it easy to feed into another process.
 `discover`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
+
+Full command and flag reference: [FLAGS.md](FLAGS.md).
+
 
 ## Data directory
 
@@ -432,6 +446,31 @@ unless `--force` is given, and refuses while a node is serving on the same
 data directory. It prints the imported destination hash so you can verify it
 matches the old node. Anyone who reads the backup can impersonate the node
 and decrypt its traffic, so keep it private.
+
+To back up identity, peer registry, queued outbox
+mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
+and the Reticulum config, use `tau backup`:
+
+The backup does not include `groups.json`, `blocklist.json`, or received
+files in `files/`. Back up these paths separately if needed.
+
+```bash
+tau backup ~/tau-backup.tar.gz
+tau restore ~/tau-backup.tar.gz   # into a fresh data directory
+```
+
+The archive is a gzipped tar with a manifest (format version, node name,
+tau version, file list); the runtime lock file is never included. The Tan
+database is snapshotted with SQLite's backup API, so committed rows still
+sitting in the write-ahead log are included. Both
+commands refuse while a node is serving on the data directory, so a backup
+never catches the mailbox or the Tan database half-written. `restore`
+validates the archive first — unknown format, unexpected members, absolute
+paths and `..` traversal are all rejected — and refuses to overwrite
+existing included node state unless `--force` is given; a `--force` restore
+also removes included node state the archive does not hold. It leaves
+excluded state unchanged. The archive holds the
+identity, so keep it as private as the identity file itself.
 
 ## How it works
 
@@ -477,6 +516,23 @@ and the background sweep asks a few quiet known peers for their lists every 15
 minutes, so discovery does not depend on announces alone. Peers owed mail or
 pending acks are never evicted by the registry cap to make room for gossip.
 `tau peers --exchange [--to NAME|HASH]` runs the same exchange on demand.
+A peer can also be given a local alias with `tau peers alias PEER ALIAS`:
+the alias is shown by `tau peers` (with the peer's asserted name alongside
+when they differ), works as a target for `send`, `ping`, `info` and
+`--to`, and is never sent to other peers or overwritten when the peer
+re-announces. Aliases are unique across the registry, so one alias always
+resolves to exactly one peer; an alias that looks like a destination hash
+or hash prefix (four or more hex characters) is rejected, so an alias can
+never be mistaken for a hash target. A running node picks up aliases set
+while it serves at its next registry save. Remove one with
+`tau peers unalias PEER`. The DM allow-list and Tan author resolution are the exceptions to alias
+resolution: `tau allowlist add` matches asserted names, hashes, and hash
+prefixes only, and lists asserted names, and `tau tan follow`/`unfollow`
+resolve authors the same way, so a local label can never stand in for
+who was actually allowed or followed. If a registry file ever holds
+the same alias twice (two writers racing), the first peer keeps it and
+the other is dropped on load, so an alias always resolves to exactly
+one peer.
 
 ### Messaging
 
@@ -682,10 +738,20 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan top                    # ranks stored posts by ♥ count
+tau tan likes 5c04c868         # names the authors whose like currently stands
 ```
 
+The timeline only shows counts. `tau tan likes` prints the post followed by
+one line per liker; an author who unliked, or whose like was superseded by a
+later unlike, does not appear. Like the thread view, it refuses a post your
+Tan display rules hide.
+
 The web console shows the same counts with a ♥ toggle on every post
-(`POST /api/tan/like` / `POST /api/tan/unlike`).
+(`POST /api/tan/like` / `POST /api/tan/unlike`). Saved posts work the
+same way: `tau tan save` keeps a post to read later (local only, never
+published), and the console has a Saved view with a save toggle on every
+post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
 
 ### Admission rules
 
@@ -718,7 +784,8 @@ when it restarts.
 Direct messages are open by default, like Tan posts. The owner can
 restrict them to known senders with an allow-list, stored as
 `allowlist.json` in the data directory (mode `0600`) and managed via
-the CLI:
+the CLI or the web console's allow-list section (console changes apply
+to the running node immediately; CLI changes apply when it restarts):
 
 ```bash
 tau allowlist list             # show whether the list is enforced and who is on it
@@ -824,14 +891,25 @@ unlinked, and stall sync at the gap.
   sender next hears from the recipient or from a peer holding a sealed
   copy, and it expires after 7 days undelivered. There is no guarantee a
   holder will ever meet the recipient.
-- Request/response messaging, not streaming or group chat.
+- Request/response messaging, not streaming. Group DMs fan one message out
+  per member over the existing encrypted links (no MLS or group ratcheting);
+  membership is fixed at creation, a changed roster is a new group, and a
+  peer running a version that predates groups rejects `/tau/group` requests.
+  The group id is derived from the creator, name and roster, so a roster
+  cannot be forked under an existing id; a peer can still invent a fresh
+  group that includes you, gated by the DM allow-list like a direct message.
+  Members learn a group from the first message sent to it, and the console
+  is read-only for groups — composing from the console comes later.
 - Tan is a public timeline: no private posts or media yet.
-  Authors can reply to posts and delete their own posts. It is not a full ActivityPub-style
+  Authors can reply to posts, edit their own posts, and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
 - Replies are a new entry kind: a peer running a version that predates
   replies rejects them, and — because entries are hash-chained — a
   rejected reply also leaves that author's later entries (including
   deletes) unlinked on the old peer until it upgrades and resyncs.
+  Edits are a new entry kind with the same caveat: an old peer rejects
+  an edit and leaves the author's later entries unlinked until it
+  upgrades, so it keeps showing the pre-edit text meanwhile.
 - Quotes are a new entry kind too: a peer running a version that predates
   quotes rejects them, and the same hash-chain effect applies — the rejected
   quote leaves that author's later entries (including deletes) unlinked on the
@@ -849,10 +927,16 @@ unlinked, and stall sync at the gap.
   in `tau peers` and the console until you re-verify it out of band
   (`tau peers verify`).
 - No NAT traversal beyond what the configured Reticulum interfaces provide.
-- Natural extensions: group destinations, file transfer using Reticulum
-  resources, allow-lists, typed messages, LXMF interop, a shared-instance mode
+- File transfer is direct links only: a file goes over an RNS Resource
+  after a signed offer, at most 10 MiB, and only to a node that opted
+  in (or allow-listed the sender). There is no store-and-forward for
+  files yet — the recipient must be online — and no resume: a failed
+  transfer restarts from the beginning.
+- Natural extensions: group destinations, allow-lists, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (media, moderation, follow recommendations).
+  (media, moderation, follow recommendations). Direct messages can already
+  carry a kind (`tau send --kind`, default `chat`); every kind is
+  delivered, queued and stored exactly like chat.
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
   console); `tau id` shows this node's own address. `tau serve --lxmf`
@@ -901,7 +985,7 @@ web/            Next.js + Tailwind console (static export served by tau)
 | `another tau node is already serving on data directory ...` | A `tau serve` already holds that data directory's `node.lock`; two serving nodes on one directory would corrupt the shared peer registry, mailbox and Tan database. Stop the running serve (the message names its pid) or use a different `--data-dir`. One-shot commands (`send`, `tan post`, …) are unaffected — they share the directory briefly by design. |
 | `no path to ...` | Reticulum has not learned a route yet. Keep the peer announcing (`tau serve --announce-interval 5`) or wait for a path request to resolve. |
 | Noisy output | Reticulum logs go to stderr. Use `-q`, `--rns-log-level 1`, or `--json` for clean stdout. |
-| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail and verified peers are kept). `tau peers --max-age 1` lists only peers seen in the last day. |
+| Stale peers | Peers unseen for over 7 days are pruned automatically when the registry is saved (peers with queued mail and verified peers are kept). `tau peers --max-age 1` lists only peers seen in the last day. Remove one now with `tau peers forget PEER` — it refuses while mail or acknowledgements are owed, or while a node is serving on the data directory. |
 
 ## License
 
