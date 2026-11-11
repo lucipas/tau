@@ -959,7 +959,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--peer",
         default=None,
         metavar="NAME|HASH",
-        help="only prune messages from this peer (name, hash or hash prefix)",
+        help="only prune messages exchanged with this peer (name, hash or hash prefix)",
     )
     messages_prune.add_argument(
         "--group",
@@ -5604,7 +5604,9 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
 
 def cmd_messages_prune(args: argparse.Namespace) -> int:
     config = _make_config(args)
-    inbox = Inbox(config.inbox_path)
+    dry_run = bool(getattr(args, "dry_run", False))
+    # A dry run must not persist an expiry purge: open the inbox read-only.
+    inbox = Inbox(config.inbox_path, read_only=dry_run)
     registry = PeerRegistry(config.peers_path)
     older_than = _parse_duration(
         args.older_than,
@@ -5618,7 +5620,7 @@ def cmd_messages_prune(args: argparse.Namespace) -> int:
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
         peer = registry.get(peer_hash)
         scope_parts.append(
-            "from "
+            "with "
             + (peer.display_name if peer is not None else short_hash(peer_hash))
         )
     if getattr(args, "group", None):
@@ -5629,7 +5631,7 @@ def cmd_messages_prune(args: argparse.Namespace) -> int:
         older_than,
         peer=peer_hash,
         group=group_id,
-        dry_run=bool(getattr(args, "dry_run", False)),
+        dry_run=dry_run,
     )
     scope = " ".join(scope_parts) if scope_parts else "from all senders"
     if _json_mode(args):
@@ -5643,9 +5645,9 @@ def cmd_messages_prune(args: argparse.Namespace) -> int:
             print("dry run — nothing was deleted.")
         else:
             print(
-                "note: only this node's copies were deleted; the senders keep"
-                " theirs, and sealed copies already held by relays are"
-                " unaffected."
+                "note: only this node's stored copies were deleted (received"
+                " and sent); the other parties keep theirs, and sealed copies"
+                " already held by relays are unaffected."
             )
     return _EXIT_OK
 
@@ -6728,5 +6730,8 @@ def _cmd_messages_sent(
             state = entry["state"]
         print(f"[{when}] to {name} — {state}")
         for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+ine in str(entry.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
     return _EXIT_OK

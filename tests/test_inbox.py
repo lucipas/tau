@@ -1061,6 +1061,32 @@ def test_expired_messages_are_purged_on_load(tmp_path):
     assert "gone" not in path.read_text(encoding="utf-8")
 
 
+def test_read_only_prune_dry_run_does_not_persist_expiry_purge(tmp_path):
+    import json as _json
+    import time as _time
+
+    now = _time.time()
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="gone", received_at=10.0, expires_at=now + 3600))
+    inbox.append(_record(id="kept", received_at=10.0))
+    # Expire "gone" on disk without the instance noticing.
+    raw = _json.loads(path.read_text(encoding="utf-8"))
+    for entry in raw["messages"]:
+        if entry["id"] == "gone":
+            entry["expires_at"] = now - 10
+    path.write_text(_json.dumps(raw), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+
+    preview = Inbox(path, read_only=True)
+    result = preview.prune(1000.0, dry_run=True, now=now)
+    assert result["pruned"] == 1
+    assert result["dry_run"] is True
+    # The expired record is not in the preview and nothing was written.
+    assert [entry["id"] for entry in preview.list_messages()] == ["kept"]
+    assert path.read_text(encoding="utf-8") == before
+
+
 def test_expiry_is_recorded(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="exp-1", expires_at=9999999999.0))

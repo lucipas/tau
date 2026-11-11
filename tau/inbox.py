@@ -445,8 +445,16 @@ class Inbox:
     peer registry and mailbox; a failed write only logs a warning.
     """
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else None
+        # A read-only inbox (dry runs) filters expired messages in memory
+        # but never persists the automatic expiry purge.
+        self._read_only = read_only
         self._lock = threading.Lock()
         self._messages: List[Dict[str, Any]] = []
         self._reactions: List[Dict[str, Any]] = []
@@ -503,7 +511,7 @@ class Inbox:
                         "last_read_id": entry.get("id"),
                     }
         self._read_cursors = cursors
-        if purged:
+        if purged and not self._read_only:
             # Disappearing messages whose deadline passed are gone for
             # good: persist the purge so a later load does not resurrect
             # them, and so `tau messages` never shows an expired entry.

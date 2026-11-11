@@ -2139,7 +2139,7 @@ def test_messages_prune_scopes_to_peer(tmp_path, capsys):
         ]
     )
     assert code == 0
-    assert "Pruned 2 messages older than 90d (from alice)" in capsys.readouterr().out
+    assert "Pruned 2 messages older than 90d (with alice)" in capsys.readouterr().out
 
 
 def test_messages_prune_json_and_errors(tmp_path, capsys):
