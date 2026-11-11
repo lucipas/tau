@@ -52,6 +52,7 @@ from tau.tangents.tan import (
     list_authors,
     mute_keyword,
     muted_keywords,
+    post_likers,
     quote_counts,
     reaction_states,
     repost_counts,
@@ -1570,6 +1571,45 @@ def test_reaction_chains_verifies_and_counts(identities, tmp_path):
     counts = like_counts(conn, [post["hash"]], viewer=bob_author)
     assert counts[post["hash"]] == {"likes": 0, "liked": False}
     assert reaction_states(conn, [post["hash"]])[post["hash"]] == {bob_author: "unlike"}
+
+
+def test_post_likers_lists_newest_first_and_drops_unlikes(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "likeable", name="alice", now=1000)
+
+    # No reactions yet: an empty list, not an error.
+    assert post_likers(conn, post["hash"]) == []
+
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+    create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1002)
+    likers = post_likers(conn, post["hash"])
+    assert [entry["author"] for entry in likers] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert [entry["liked_at"] for entry in likers] == [1002, 1001]
+
+    # An unlike supersedes the like (latest chain entry wins).
+    create_reaction(conn, bob, post["hash"], liked=False, name="bob", now=1003)
+    assert [entry["author"] for entry in post_likers(conn, post["hash"])] == [
+        author_of(carol)
+    ]
+
+    # Liking again puts the author back, at the newer timestamp.
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
+    assert [entry["author"] for entry in post_likers(conn, post["hash"])] == [
+        author_of(bob),
+        author_of(carol),
+    ]
+
+    # A well-formed hash with no reactions is an empty list.
+    assert post_likers(conn, "cd" * 32) == []
+
+    # A malformed target is rejected, not silently empty.
+    with pytest.raises(PostError):
+        post_likers(conn, "not-a-hash")
 
 
 def test_likers_names_current_likers(identities, tmp_path):
@@ -5109,6 +5149,23 @@ def test_top_posts_hides_muted_authors(identities, tmp_path):
     by_alice = top_posts(conn, author=author_of(alice))
     assert [post["text"] for post in by_alice] == ["agreed", "everyone loves this"]
     assert by_alice[0]["reply_to"] is None
+
+
+def test_top_posts_survives_a_large_block_list(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    loved = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    create_reaction(conn, bob, loved["hash"], liked=True, name="bob", now=1001)
+    # A block-list far above SQLite's bound-parameter limit (999 on most
+    # builds) must not break the query: the exclusion is a single JSON
+    # parameter, not one placeholder per author.
+    blocked = [f"{i:032x}" for i in range(1500)]
+    assert [post["text"] for post in top_posts(conn, exclude_authors=blocked)] == [
+        "everyone loves this"
+    ]
+    # A blocked author inside that list still never ranks.
+    blocked.append(author_of(alice))
+    assert top_posts(conn, exclude_authors=blocked) == []
 
 
 

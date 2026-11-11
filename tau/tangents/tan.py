@@ -1231,6 +1231,36 @@ def like_counts(
     return result
 
 
+def post_likers(
+    conn: sqlite3.Connection, target: str
+) -> List[Dict[str, Any]]:
+    """Return the likers of one post, newest like first.
+
+    Each entry is ``{"author": <hex>, "liked_at": <created_at>}``. Only
+    linked reactions count and the latest entry per reactor wins, so an
+    ``unlike`` after a ``like`` removes that author. A target with no
+    reactions (or no stored post at all) yields an empty list.
+    """
+    clean = _require_hex(target, HASH_HEX_LENGTH, "target")
+    rows = conn.execute(
+        "SELECT author, kind, created_at FROM posts "
+        "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
+        "ORDER BY author, seq ASC",
+        (clean,),
+    ).fetchall()
+    latest: Dict[str, Tuple[str, float]] = {}
+    for row in rows:
+        # Rows arrive in chain order per reactor, so the last write wins.
+        latest[str(row["author"])] = (str(row["kind"]), float(row["created_at"]))
+    likers = [
+        {"author": author, "liked_at": liked_at}
+        for author, (kind, liked_at) in latest.items()
+        if kind == KIND_LIKE
+    ]
+    likers.sort(key=lambda entry: entry["liked_at"], reverse=True)
+    return likers
+
+
 def repost_counts(
     conn: sqlite3.Connection,
     targets: Sequence[str],
@@ -2438,8 +2468,15 @@ def top_posts(
     limit: int = 10,
     viewer: Optional[str] = None,
     ruleset: Optional[Ruleset] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the most-liked posts in the local store, best first.
+
+    Posts by *exclude_authors* (blocked) are dropped in the query, before
+    the limit is applied, so they never take up result slots.  A reply
+    to a blocked author's post keeps its parent preview redacted, as in
+    the timeline.  The exclusion is a single JSON parameter, so a large
+    block-list cannot exceed SQLite's bound-variable limit.
 
     When *ruleset* is given, kinds it hides are dropped before the limit
     is applied, so hidden entries never take up result slots.  If it
@@ -2472,12 +2509,18 @@ def top_posts(
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if silenced and author is None:
-        placeholders = ", ".join("?" for _ in silenced)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(sorted(silenced))
+        # One JSON parameter instead of one placeholder per author, so a
+        # large mute list cannot exceed SQLite's bound-variable limit —
+        # the same pattern feed() uses.
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(silenced)))
+    if blocked:
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(blocked)))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
@@ -2487,7 +2530,10 @@ def top_posts(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
+    # Edits first, so keyword muting and the ruleset see the text that
+    # is actually displayed.
+    candidates = annotate_edits(conn, _public_posts(rows))
+    candidates = without_muted_keywords(conn, candidates, keywords)
     if ruleset is not None:
         candidates = [
             post
@@ -2512,11 +2558,17 @@ def top_posts(
         # newest first, so keep that order and only attach ownership.
         for post in candidates:
             post["own"] = viewer is not None and post["author"] == viewer
-    return annotate_replies(
+    shown = annotate_replies(
         conn,
         candidates[:count],
         muted_keywords=keywords,
         exclude_authors=silenced,
+        blocked_authors=blocked,
+    )
+    return annotate_repost_counts(
+        conn,
+        annotate_quote_counts(conn, shown),
+        viewer=viewer,
     )
 
 
@@ -2979,11 +3031,14 @@ def suggest_authors(
     *,
     viewer: Optional[str] = None,
     limit: int = DEFAULT_SUGGEST_LIMIT,
+    exclude: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rank cached authors the viewer does not follow yet.
 
     Candidates are authors with at least one linked, non-deleted post or
-    reply in the local store, excluding followed authors and the viewer.
+    reply in the local store, excluding followed authors, the viewer, and
+    any authors in ``exclude`` (for example blocked authors). Excluded
+    authors are dropped before ``limit`` is applied.
     Each candidate scores ``SUGGEST_FOLLOWED_WEIGHT`` per distinct author
     the viewer follows who liked or replied to one of the candidate's
     posts or replies, plus one per like on the candidate's posts (so a
@@ -2993,6 +3048,8 @@ def suggest_authors(
     """
     followed = {record["author"]: record["name"] for record in following(conn)}
     excluded = set(followed)
+    if exclude is not None:
+        excluded.update(exclude)
     if viewer is not None:
         excluded.add(_require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer"))
     limit = max(0, int(limit))
@@ -3530,22 +3587,23 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
-def list_authors(
-    conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
-) -> List[Dict[str, Any]]:
-    """Every author with at least one linked entry in the local store.
+def _author_stats_query(
+    exclude_authors: Optional[Sequence[str]] = None,
+) -> Tuple[str, List[str]]:
+    """The per-author stats query shared by ``list_authors`` and
+    ``count_authors``, with the block-list applied the same way.
 
-    Each record carries the display name from the author's most recent
-    linked entry, the count of visible posts (linked, kind ``post`` and
-    not deleted — the same visibility ``author_stats`` uses), the time
-    of the most recent visible post (0 when the author has none, e.g.
-    only a delete entry has arrived so far), and whether the author is
-    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    Returns the SQL and its parameters.  Callers short-circuit a
+    block-list that failed closed before reaching this helper.
     """
-    if sort not in ("recent", "posts", "name"):
-        raise TanError(f"unknown author sort: {sort!r}")
-    if limit < 0:
-        raise TanError("--limit must not be negative")
+    excluded = _clean_excluded(exclude_authors)
+    excluded_sql = ""
+    excluded_params: List[str] = []
+    if excluded:
+        excluded_sql = (
+            f" AND posts.author NOT IN ({', '.join('?' for _ in excluded)})"
+        )
+        excluded_params = list(excluded)
     # Only authors with at least one visible post are listed.
     stats = (
         "SELECT posts.author AS author, "
@@ -3556,9 +3614,78 @@ def list_authors(
         f"MAX(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN posts.created_at ELSE 0 END) AS last_post, "
         "CASE WHEN follows.author IS NULL THEN 0 ELSE 1 END AS followed "
         "FROM posts LEFT JOIN follows ON follows.author = posts.author "
-        "WHERE posts.linked = 1 GROUP BY posts.author "
+        f"WHERE posts.linked = 1{excluded_sql} GROUP BY posts.author "
         f"HAVING SUM(CASE WHEN posts.kind = 'post' AND {_NOT_DELETED} THEN 1 ELSE 0 END) > 0"
     )
+    return stats, excluded_params
+
+
+def author_stats_many(
+    conn: sqlite3.Connection, authors: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """:func:`author_stats` for many authors, using two grouped queries.
+
+    Returns the same per-author values :func:`author_stats` would, keyed
+    by author hash; authors with no cached posts get zero values.
+    """
+    clean = [_require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors]
+    stats: Dict[str, Dict[str, Any]] = {
+        author: {"author": author, "posts": 0, "seq": 0, "last_post": 0.0}
+        for author in clean
+    }
+    if not clean:
+        return stats
+    placeholders = ",".join("?" for _ in clean)
+    for row in conn.execute(
+        "SELECT author, COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
+        f"FROM posts WHERE linked = 1 AND kind = 'post' AND {_NOT_DELETED} "
+        f"AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])].update(
+            posts=int(row["posts"]), last_post=float(row["last_post"])
+        )
+    for row in conn.execute(
+        "SELECT author, COALESCE(MAX(seq), 0) AS seq FROM posts "
+        f"WHERE linked = 1 AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])]["seq"] = int(row["seq"])
+    return stats
+
+
+def list_authors(
+    conn: sqlite3.Connection,
+    *,
+    sort: str = "recent",
+    limit: int = 50,
+    offset: int = 0,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> List[Dict[str, Any]]:
+    """Every author with at least one linked entry in the local store.
+
+    Each record carries the display name from the author's most recent
+    linked entry, the count of visible posts (linked, kind ``post`` and
+    not deleted — the same visibility ``author_stats`` uses), the time
+    of the most recent visible post (0 when the author has none, e.g.
+    only a delete entry has arrived so far), and whether the author is
+    followed. ``sort`` is ``recent`` (default), ``posts`` or ``name``.
+    ``exclude_authors`` hides blocked authors entirely and ``exclude_all``
+    hides every author (a block-list that failed closed), as the display
+    surfaces do for posts. ``offset`` pages past the first ``limit``
+    authors in the same sort order; pair it with :func:`count_authors`
+    for the total.
+    """
+    if sort not in ("recent", "posts", "name"):
+        raise TanError(f"unknown author sort: {sort!r}")
+    if limit < 0:
+        raise TanError("--limit must not be negative")
+    if offset < 0:
+        raise TanError("--offset must not be negative")
+    if exclude_all:
+        return []
+    stats, excluded_params = _author_stats_query(exclude_authors)
     order_by = {
         "recent": "last_post DESC, author ASC",
         "posts": "posts DESC, last_post DESC, author ASC",
@@ -3567,11 +3694,11 @@ def list_authors(
         # Ordering and limiting happen in SQL so only the page is materialised.
         rows = conn.execute(
             f"SELECT author, name, posts, last_post, followed FROM ({stats}) "
-            f"ORDER BY {order_by} LIMIT ?",
-            (limit,),
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (*excluded_params, limit, offset),
         ).fetchall()
     else:
-        rows = conn.execute(stats).fetchall()
+        rows = conn.execute(stats, excluded_params).fetchall()
     records = [
         {
             "author": str(row["author"]),
@@ -3587,8 +3714,24 @@ def list_authors(
         records.sort(
             key=lambda record: ((record["name"] or "").casefold(), record["author"])
         )
-        return records[:limit]
+        return records[offset : offset + limit]
     return records
+
+
+def count_authors(
+    conn: sqlite3.Connection,
+    *,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> int:
+    """How many authors :func:`list_authors` would list with the same
+    block-list applied — the directory total behind a page.
+    """
+    if exclude_all:
+        return 0
+    stats, params = _author_stats_query(exclude_authors)
+    row = conn.execute(f"SELECT COUNT(*) FROM ({stats})", params).fetchone()
+    return int(row[0])
 
 
 def _int_or_none(value: Any) -> Optional[int]:
@@ -3912,6 +4055,7 @@ class TanApp:
         self._gossip_slots = threading.BoundedSemaphore(4)
         self._closed = False
         self._ruleset = ruleset
+        self._ruleset_lock = threading.Lock()
         self._ruleset_path = getattr(config, "tan_rules_path", None)
 
     @property
@@ -3921,16 +4065,30 @@ class TanApp:
         A ruleset that cannot be parsed fails closed — remote entries
         are denied — rather than silently reverting to admit-all, but
         loading is lazy so a broken file never blocks local operations.
+        Loading holds ``_ruleset_lock`` so it cannot interleave with
+        ``reload_ruleset`` and install a pre-save value after it.
         """
-        if self._ruleset is None:
-            try:
-                self._ruleset = load_ruleset(self._ruleset_path)
-            except RulesError as exc:
-                log.error(
-                    "Tan ruleset unusable (%s); denying remote entries", exc
-                )
-                self._ruleset = Ruleset(default_allow=False)
-        return self._ruleset
+        with self._ruleset_lock:
+            if self._ruleset is None:
+                try:
+                    self._ruleset = load_ruleset(self._ruleset_path)
+                except RulesError as exc:
+                    log.error(
+                        "Tan ruleset unusable (%s); denying remote entries", exc
+                    )
+                    self._ruleset = Ruleset(default_allow=False)
+            return self._ruleset
+
+    def reload_ruleset(self) -> None:
+        """Drop the cached admission ruleset so the next access re-reads it.
+
+        Lets a ruleset change made in-process — for example from the web
+        console — apply to the running node at once instead of waiting
+        for a restart. A rules file that cannot be parsed still fails
+        closed on the next load, through the ``ruleset`` property.
+        """
+        with self._ruleset_lock:
+            self._ruleset = None
 
     def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
         ruleset = self.ruleset
