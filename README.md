@@ -132,6 +132,7 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/forget` | POST | forget a peer `{"target": "<name or hash>", "force": true}` |
 | `/api/peers/alias` | POST | set a peer's local alias `{"destination": "<hash>", "alias": "name"}` (empty alias clears it) |
 | `/api/peers/verify` | POST | mark a peer verified `{"target": "alice"}` — only after comparing the safety number out of band (returns it) |
 | `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |

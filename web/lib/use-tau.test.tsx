@@ -141,9 +141,11 @@ beforeEach(() => {
   // Default answers for the hook's background reads: the outbox poll
   // and any other GET the hook issues on mount.
   mockedGet.mockImplementation((path: string) =>
-    path === "/api/outbox"
-      ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
-      : Promise.resolve({ groups: [], count: 0 }),
+    path === "/api/peers"
+      ? Promise.resolve({ peers: [], count: 0 })
+      : path === "/api/outbox"
+        ? Promise.resolve({ outbox: [], count: 0, held_for_others: 0 })
+        : Promise.resolve({ groups: [], count: 0 }),
   );
 });
 
@@ -254,6 +256,53 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("useTau forgetPeer", () => {
+  it("ignores pre-forget snapshots and peer events, but not a genuine re-announce", async () => {
+    const alice = makePeer({ last_seen: 1000 });
+    const { result, unmount } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    expect(source).toBeTruthy();
+
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([alice]) });
+    });
+    await waitFor(() =>
+      expect(result.current.peers.map((peer) => peer.name)).toEqual(["alice"]),
+    );
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      peer: alice,
+    });
+    await act(async () => {
+      await result.current.forgetPeer(alice.destination, false);
+    });
+    expect(result.current.peers).toEqual([]);
+
+    // A snapshot queued before the forget still carries alice: it must
+    // not bring her back.
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot([alice]) });
+    });
+    expect(result.current.peers).toEqual([]);
+
+    // A peer event for the pre-forget record is stale too.
+    await act(async () => {
+      source.emit("peer", { peer: alice });
+    });
+    expect(result.current.peers).toEqual([]);
+
+    // A genuine re-announce carries a newer last_seen and is admitted.
+    const reannounced = makePeer({ last_seen: 2000 });
+    await act(async () => {
+      source.emit("peer", { peer: reannounced });
+    });
+    expect(result.current.peers.map((peer) => peer.name)).toEqual(["alice"]);
+    expect(result.current.peers[0].last_seen).toBe(2000);
+
+    unmount();
+  });
+});
 describe("useTau group management", () => {
   it("shows a created group even when the follow-up refresh fails", async () => {
     const created = makeGroup();

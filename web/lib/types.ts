@@ -189,6 +189,16 @@ export interface Snapshot {
   social?: SocialInfo;
 }
 
+export interface PeersResponse {
+  peers: Peer[];
+  count: number;
+}
+
+export interface ForgetPeerResponse {
+  ok: boolean;
+  peer: Peer;
+}
+
 export interface PingResult {
   ok: boolean;
   peer: Peer;
@@ -345,7 +355,9 @@ export interface AllowlistResponse {
 }
 
 export interface ApiErrorBody {
-  error?: { message?: string };
+  // A refusal the console can act on carries a machine-readable code
+  // (e.g. "queued_mail" from /api/peers/forget, with the queued count).
+  error?: { message?: string; code?: string; queued?: number };
 }
 
 // Sneakernet bundle: a signed JSON file carrying sealed mail (and

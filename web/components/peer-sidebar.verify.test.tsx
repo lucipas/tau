@@ -43,6 +43,7 @@ function renderSidebar({
       unread={{}}
       selected=""
       onPing={() => {}}
+      onForgetPeer={async () => {}}
       onBlock={() => {}}
       onUnblock={() => {}}
       onVerify={onVerify}

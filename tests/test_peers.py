@@ -58,6 +58,29 @@ def test_remove_drops_peer_and_persists(tmp_path):
     assert reloaded.get("bob") is not None
 
 
+def test_restore_puts_back_a_forgotten_peer(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    removed = registry.forget(peer.destination_hash)
+    assert removed is peer
+    assert registry.get(peer.destination_hash) is None
+
+    registry.restore(removed)
+    assert registry.get(peer.destination_hash) is peer
+
+
+def test_restore_does_not_overwrite_a_reannounced_peer(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    removed = registry.forget(peer.destination_hash)
+    fresh = make_peer(registry, 1, "alice", now=200.0)
+
+    registry.restore(removed)
+    assert registry.get(peer.destination_hash) is fresh
+
+
 def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     registry = PeerRegistry()
     peer = make_peer(registry, 2, "bob", now=100.0)

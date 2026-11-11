@@ -2,7 +2,15 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-import type { BridgeInfo, NodeInfo, Peer, SocialInfo, TauGroup, VerifyState } from "@/lib/types";
+import { ApiError } from "@/lib/api";
+import type {
+  BridgeInfo,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+  VerifyState,
+} from "@/lib/types";
 import type { BlockState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
@@ -26,6 +34,7 @@ export function PeerSidebar({
   unread,
   selected,
   onPing,
+  onForgetPeer,
   onBlock,
   onUnblock,
   onVerify,
@@ -47,6 +56,7 @@ export function PeerSidebar({
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onForgetPeer: (destination: string, force: boolean) => Promise<void>;
   onBlock: (destination: string) => void;
   onUnblock: (destination: string) => void;
   onVerify: (destination: string) => void;
@@ -58,6 +68,59 @@ export function PeerSidebar({
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
 }) {
   const now = useNow();
+  const [confirmingForget, setConfirmingForget] = useState<string | null>(
+    null,
+  );
+  const [forgettingId, setForgettingId] = useState<string | null>(null);
+  const [forgetErrors, setForgetErrors] = useState<
+    Record<string, { message: string; code?: string; queued?: number }>
+  >({});
+  const forgetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    };
+  }, []);
+
+  function armForget(destination: string) {
+    setForgetErrors((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+    setConfirmingForget(destination);
+    if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    forgetTimer.current = setTimeout(() => setConfirmingForget(null), 5000);
+  }
+
+  async function confirmForget(destination: string, force: boolean) {
+    if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    setConfirmingForget(null);
+    setForgettingId(destination);
+    try {
+      await onForgetPeer(destination, force);
+      setForgetErrors((previous) => {
+        const next = { ...previous };
+        delete next[destination];
+        return next;
+      });
+    } catch (caught) {
+      const apiError = caught instanceof ApiError ? caught : null;
+      setForgetErrors((previous) => ({
+        ...previous,
+        [destination]: {
+          message:
+            caught instanceof Error ? caught.message : "could not forget peer",
+          code: apiError?.code,
+          queued: apiError?.queued,
+        },
+      }));
+    } finally {
+      setForgettingId(null);
+    }
+  }
+
   const [editingAlias, setEditingAlias] = useState<string | null>(null);
   const [aliasDraft, setAliasDraft] = useState("");
   const [aliasError, setAliasError] = useState<string | null>(null);
@@ -171,6 +234,7 @@ export function PeerSidebar({
   // two clicks: arm on the first, confirm on the second. Unblocking is
   // directly reversible and needs only one.
   const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
+
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -511,6 +575,30 @@ export function PeerSidebar({
                         >
                           {verification?.pending ? "verifying…" : "Verify"}
                         </button>
+                      <button
+                        type="button"
+                        disabled={forgettingId === peer.destination}
+                        onClick={() => {
+                          if (confirmingForget === peer.destination) {
+                            void confirmForget(peer.destination, false);
+                          } else {
+                            armForget(peer.destination);
+                          }
+                        }}
+                        aria-label={`Forget ${peer.name}`}
+                        title="Forget this peer — removes it from the registry; the next genuine announce re-adds it"
+                        className={`shrink-0 rounded-md border px-1.5 py-1 font-mono text-[10px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                          confirmingForget === peer.destination
+                            ? "border-amber/60 bg-amber/10 text-amber"
+                            : "border-line/70 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                        }`}
+                      >
+                        {forgettingId === peer.destination
+                          ? "forgetting…"
+                          : confirmingForget === peer.destination
+                            ? "confirm forget"
+                            : "forget"}
+                      </button>
                       </div>
                     </div>
                     {isEditingAlias ? (
@@ -583,6 +671,31 @@ export function PeerSidebar({
                             ? ping.error
                             : `pong ${formatRtt(ping.rtt_ms)}`}
                       </p>
+                    ) : null}
+                    {forgetErrors[peer.destination] ? (
+                      <div className="mt-1 pl-[42px]">
+                        <p className="font-mono text-[10px] leading-relaxed text-rose-300">
+                          {forgetErrors[peer.destination].message}
+                        </p>
+                        {forgetErrors[peer.destination].code ===
+                        "queued_mail" ? (
+                          <button
+                            type="button"
+                            disabled={forgettingId === peer.destination}
+                            onClick={() =>
+                              void confirmForget(peer.destination, true)
+                            }
+                            className="mt-1 rounded-md border border-amber/60 bg-amber/10 px-1.5 py-1 font-mono text-[10px] text-amber transition hover:bg-amber/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                          >
+                            forget anyway — strand{" "}
+                            {forgetErrors[peer.destination].queued ?? 0}{" "}
+                            queued message
+                            {(forgetErrors[peer.destination].queued ?? 0) === 1
+                              ? ""
+                              : "s"}
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
                     {verification?.safetyNumber && !verification?.result ? (
                       <div className="mt-1 pl-[42px]">

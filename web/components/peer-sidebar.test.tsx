@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "@/lib/api";
 import type { NodeInfo, Peer, SocialInfo, TauGroup } from "@/lib/types";
 
 import { PeerSidebar } from "./peer-sidebar";
@@ -46,22 +47,38 @@ function makeGroup(overrides: Partial<TauGroup> = {}): TauGroup {
   };
 }
 
+
 function renderSidebar(
   unread: Record<string, number>,
   onSelectPeer = vi.fn(),
-  options: {
-    peers?: Peer[];
-    onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
-    groups?: TauGroup[];
-    onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
-    onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
-    node?: NodeInfo | null;
-    social?: SocialInfo | null;
-    blocks?: Record<string, { pending?: boolean; error?: string }>;
-    onBlock?: (destination: string) => void;
-    onUnblock?: (destination: string) => void;
-  } = {},
+  third:
+    | ((destination: string, force: boolean) => Promise<void>)
+    | {
+        peers?: Peer[];
+        onSetAlias?: (
+          destination: string,
+          alias: string | null,
+        ) => Promise<Peer>;
+        groups?: TauGroup[];
+        onCreateGroup?: (
+          name: string,
+          members: string[],
+        ) => Promise<TauGroup>;
+        onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+        node?: NodeInfo | null;
+        social?: SocialInfo | null;
+        blocks?: Record<string, { pending?: boolean; error?: string }>;
+        onBlock?: (destination: string) => void;
+        onUnblock?: (destination: string) => void;
+        onForgetPeer?: (
+          destination: string,
+          force: boolean,
+        ) => Promise<void>;
+      } = {},
 ) {
+  const options = typeof third === "function" ? {} : third;
+  const onForgetPeer =
+    typeof third === "function" ? third : (options.onForgetPeer ?? vi.fn());
   const onSetAlias =
     options.onSetAlias ??
     (async (destination: string) => makePeer({ destination }));
@@ -83,6 +100,7 @@ function renderSidebar(
       unread={unread}
       selected=""
       onPing={() => {}}
+      onForgetPeer={onForgetPeer}
       onBlock={options.onBlock ?? (() => {})}
       onUnblock={options.onUnblock ?? (() => {})}
       onVerify={() => {}}
@@ -127,6 +145,64 @@ describe("PeerSidebar unread badges", () => {
   });
 });
 
+describe("PeerSidebar forget", () => {
+  it("asks for confirmation before forgetting a peer", async () => {
+    const onForgetPeer = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    const forget = screen.getByRole("button", { name: "Forget alice" });
+    fireEvent.click(forget);
+    expect(onForgetPeer).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Forget alice" }).textContent,
+    ).toBe("confirm forget");
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    expect(onForgetPeer).toHaveBeenCalledWith("ab".repeat(16), false);
+  });
+
+  it("offers to forget anyway when mail is still queued", async () => {
+    const onForgetPeer = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError("alice still has 2 queued message(s)", 400, "queued_mail", 2),
+      )
+      .mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+
+    expect(
+      await screen.findByText(/still has 2 queued message/),
+    ).toBeTruthy();
+    const anyway = screen.getByRole("button", {
+      name: /forget anyway — strand 2 queued messages/,
+    });
+    fireEvent.click(anyway);
+    expect(onForgetPeer).toHaveBeenCalledTimes(2);
+    expect(onForgetPeer).toHaveBeenLastCalledWith("ab".repeat(16), true);
+  });
+
+  it("shows a plain error with no force option for other refusals", async () => {
+    const onForgetPeer = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError("alice still has mail acknowledgements owed", 400),
+      );
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+
+    expect(
+      await screen.findByText(/acknowledgements owed/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /forget anyway/ }),
+    ).toBeNull();
+  });
+});
 describe("PeerSidebar aliases", () => {
   it("shows the alias as the label and keeps the announced name visible", () => {
     renderSidebar({}, vi.fn(), {

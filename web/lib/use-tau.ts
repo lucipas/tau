@@ -15,6 +15,7 @@ import type {
   DeleteMessageResponse,
   DoctorResponse,
   DropHeldResponse,
+  ForgetPeerResponse,
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
@@ -28,6 +29,7 @@ import type {
   OutboxEntry,
   OutboxResponse,
   Peer,
+  PeersResponse,
   PingResult,
   ReactResponse,
   RetryOutboxResponse,
@@ -64,6 +66,17 @@ export interface BlockState {
 
 function sortPeers(peers: Peer[]): Peer[] {
   return [...peers].sort((a, b) => b.last_seen - a.last_seen);
+}
+
+// A peer removed by a forget carries the last_seen it had at that moment.
+// Snapshots or peer events queued before the forget are at or below that
+// cutoff and must not bring the peer back; a genuine re-announce is newer.
+function predatesForget(
+  forgotten: Map<string, number>,
+  peer: Peer,
+): boolean {
+  const cutoff = forgotten.get(peer.destination);
+  return cutoff !== undefined && peer.last_seen <= cutoff;
 }
 
 function readEventData<T>(event: Event): T | null {
@@ -204,7 +217,13 @@ export function useTau() {
       peerEventSeq.current += 1;
       snapshotRevision.current = peerEventSeq.current;
       localVerifiedAt.current = {};
-      setPeers(sortPeers(snapshot.peers));
+      setPeers(
+        sortPeers(
+          snapshot.peers.filter(
+            (peer) => !predatesForget(forgottenPeers.current, peer),
+          ),
+        ),
+      );
       snapshotGeneration.current += 1;
       if (groupEdits.current !== editsAtOpen) {
         // A group edit completed after this connection opened, so the
@@ -269,6 +288,7 @@ export function useTau() {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      if (predatesForget(forgottenPeers.current, peer)) return;
       peerEventVersion.current[peer.destination] =
         (peerEventVersion.current[peer.destination] ?? 0) + 1;
       // Ordering for block/unblock replies: a peer event that arrives
@@ -355,7 +375,21 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const peersSeq = useRef(0);
+  const forgottenPeers = useRef(new Map<string, number>());
+
+  const refreshPeers = useCallback(async () => {
+    // Same polling shape as the outbox: only the newest issued request
+    // may replace state, so a slow poll cannot restore a peer a forget
+    // already removed.
+    const requestId = ++peersSeq.current;
+    const result = await apiGet<PeersResponse>("/api/peers");
+    if (requestId !== peersSeq.current) return;
+    setPeers(sortPeers(result.peers));
+  }, []);
+
   const refreshHeldSeq = useRef(0);
+
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -705,6 +739,30 @@ export function useTau() {
       setAnnouncing(false);
     }
   }, []);
+
+  const forgetPeer = useCallback(
+    async (destination: string, force = false) => {
+      const result = await apiPost<ForgetPeerResponse>("/api/peers/forget", {
+        target: destination,
+        force,
+      });
+      // The forget already succeeded: drop the peer locally at once,
+      // and treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful forget look like a failure.
+      const removed = result.peer.destination;
+      forgottenPeers.current.set(removed, result.peer.last_seen);
+      setPeers((previous) =>
+        previous.filter((entry) => entry.destination !== removed),
+      );
+      try {
+        await refreshPeers();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result.peer;
+    },
+    [refreshPeers],
+  );
 
   const runDoctor = useCallback(async () => {
     // On demand only: the checks read the data directory, and a
@@ -1155,8 +1213,10 @@ export function useTau() {
     deleteGroup,
     refreshOutbox,
     refreshGroups,
+    refreshPeers,
     refreshMessages,
     cancelOutbox,
+    forgetPeer,
     exportBundle,
     importBundle,
     exportMessages,

@@ -22,7 +22,12 @@ from tau.groups import GroupStore
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import AmbiguousPeer, Peer, PeerError
-from tau.webapi import WebBridge, WebBridgeError, check_web_console_bind
+from tau.webapi import (
+    PeerForgetBlocked,
+    WebBridge,
+    WebBridgeError,
+    check_web_console_bind,
+)
 
 PEER_HASH = "ab" * 16
 OTHER_HASH = "cd" * 16
@@ -32,6 +37,8 @@ BOB_HASH = "ef" * 16
 class FakeRegistry:
     def __init__(self, peers):
         self._peers = list(peers)
+        self.saved = False
+        self.fail_save = False
 
     def all(self, max_age=None):
         return list(self._peers)
@@ -67,6 +74,8 @@ class FakeRegistry:
         # the fixture peer to prove a security boundary never resolves
         # by alias; tan.resolve_author calls
         # registry.resolve(value, include_alias=False).
+        if isinstance(target, bytes):
+            return self.get(target)
         if not isinstance(target, str):
             raise PeerError("peer target must be a string or bytes")
         value = target.strip()
@@ -108,6 +117,25 @@ class FakeRegistry:
                 )
         return None
 
+    def forget(self, target):
+        peer = self.resolve(target)
+        if peer is None:
+            raise PeerError(f"no peer matches {target!r}")
+        self._peers = [entry for entry in self._peers if entry is not peer]
+        return peer
+
+    def refresh_aliases(self):
+        return 0
+
+    def restore(self, peer):
+        if self.get(peer.destination_hash) is None:
+            self._peers.append(peer)
+
+    def save(self):
+        if self.fail_save:
+            raise OSError("disk full")
+        self.saved = True
+        return True
 
 class FakeNode:
     def __init__(self, mailbox_path=None, groups_path=None):
@@ -1456,6 +1484,99 @@ def test_ping_peer(bridge):
     assert status == 200
     assert payload["rtt_ms"] == 4.0
     assert payload["peer"]["destination"] == PEER_HASH
+
+
+def test_forget_peer(bridge, node):
+    result = bridge.forget_peer("alice")
+    assert result["ok"] is True
+    assert result["peer"]["destination"] == PEER_HASH
+    assert node.registry.all() == []
+    assert node.registry.saved is True
+
+
+def test_forget_peer_holds_save_lock(bridge, node):
+    # A concurrent alias, verification or node save must not snapshot
+    # the peer and write it back over the removal: forget_peer holds
+    # the node's peer-save lock across the removal and its save.
+    node._save_lock = threading.Lock()
+    held_during_save = []
+    original_save = node.registry.save
+
+    def save():
+        held_during_save.append(node._save_lock.locked())
+        return original_save()
+
+    node.registry.save = save
+    result = bridge.forget_peer("alice")
+    assert result["ok"] is True
+    assert held_during_save == [True]
+
+
+def test_forget_peer_unknown(bridge):
+    with pytest.raises(ValueError, match="no peer matches"):
+        bridge.forget_peer("nobody")
+
+
+def test_forget_peer_refuses_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    with pytest.raises(PeerForgetBlocked) as excinfo:
+        bridge.forget_peer("alice")
+    assert excinfo.value.code == "queued_mail"
+    assert excinfo.value.queued == 1
+    assert node.registry.all() != []
+
+
+def test_forget_peer_force_strands_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    result = bridge.forget_peer("alice", force=True)
+    assert result["ok"] is True
+    assert node.registry.all() == []
+
+
+def test_forget_peer_refuses_pending_acks(bridge, node):
+    node.mailbox.add_pending_acks(PEER_HASH, ["mid-1"])
+    with pytest.raises(ValueError, match="acknowledgements owed"):
+        bridge.forget_peer("alice")
+    assert node.registry.all() != []
+
+
+def test_forget_peer_restores_record_when_save_fails(bridge, node):
+    node.registry.fail_save = True
+    with pytest.raises(OSError, match="disk full"):
+        bridge.forget_peer("alice")
+    # The removal did not persist, so the live record comes back and
+    # the serving node agrees with the file again.
+    assert [peer.name for peer in node.registry.all()] == ["alice"]
+
+
+def test_forget_peer_endpoint(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["peer"]["destination"] == PEER_HASH
+    assert node.registry.all() == []
+
+
+def test_forget_peer_endpoint_reports_queued_mail(bridge, node):
+    node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="hello")
+    status, _, payload = _json(
+        bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+    )
+    assert status == 400
+    assert payload["error"]["code"] == "queued_mail"
+    assert payload["error"]["queued"] == 1
+    assert node.registry.all() != []
+    # Forgetting anyway strands the queued mail, as the CLI's --force does.
+    status, _, payload = _json(
+        bridge,
+        "/api/peers/forget",
+        method="POST",
+        body={"target": "alice", "force": True},
+    )
+    assert status == 200
+    assert node.registry.all() == []
 
 
 def test_announce(bridge, node):

@@ -5,6 +5,8 @@ script) can read what arrives from the mesh and send messages back:
 
     GET  /api/status       node identity, interfaces and counters
     GET  /api/peers        peers from the local registry
+    POST /api/peers/forget  forget a peer ``{"target": "<name or hash>"}``
+                           (optional ``"force": true`` strands queued mail)
     POST /api/peers/verify mark a peer verified ``{"target": "alice"}`` —
     call only after comparing the safety number out of band
     POST /api/peers/safety-number show a peer's safety number
@@ -165,6 +167,20 @@ _LOCAL_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 class WebBridgeError(RuntimeError):
     """Raised when the web bridge cannot start or process a request."""
+
+
+class PeerForgetBlocked(ValueError):
+    """Forgetting a peer was refused for a reason the caller can act on.
+
+    Carries a machine-readable ``code`` so the console can offer the
+    matching next step (``queued_mail`` means the peer still has queued
+    mail and the user may forget anyway) instead of parsing the message.
+    """
+
+    def __init__(self, message: str, *, code: str, queued: int = 0) -> None:
+        super().__init__(message)
+        self.code = code
+        self.queued = queued
 
 
 class RequestError(WebBridgeError):
@@ -2799,6 +2815,63 @@ class WebBridge:
             else None,
         }
 
+    def forget_peer(self, target: str, *, force: bool = False) -> Dict[str, Any]:
+        """Remove one peer from the serving node's registry.
+
+        The CLI's ``tau peers forget`` refuses while a node is serving,
+        so the console — which *is* the serving node — needs this bridge
+        path to offer the same recovery for a corrupt peer record (a
+        stored key ``upsert`` refuses to overwrite, so only forgetting
+        lets the next genuine announce re-add a clean record). The
+        mailbox transaction is held across the safety checks and the
+        removal, mirroring ``cmd_peers_forget``: a one-shot send cannot
+        queue mail for the peer between the check and the removal.
+        Aliases are picked up first, so the save does not erase ones a
+        one-shot command set while this node was serving — the same
+        reason ``TauNode._save_peers`` refreshes before saving. The
+        node's peer-save lock is held across the whole removal, before
+        the mailbox transaction (the same order ``_save_peers`` uses):
+        a concurrent alias, verification or node save could otherwise
+        snapshot the peer first and write it back over our removal.
+        A node-like without the lock (e.g. in tests) simply forgets.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("peer is required")
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock, self.node.mailbox.transaction():
+            self.node.registry.refresh_aliases()
+            try:
+                peer = self.node.registry.resolve(target.strip())
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if peer is None:
+                raise ValueError(f"no peer matches {target.strip()!r}")
+            queued = self.node.mailbox.outbox_list(to=peer.destination_hash)
+            if queued and not force:
+                raise PeerForgetBlocked(
+                    f"{peer.display_name} still has {len(queued)} queued "
+                    "message(s); forgetting this peer would strand them "
+                    "until it is rediscovered. Deliver or cancel the mail "
+                    "first, or forget anyway.",
+                    code="queued_mail",
+                    queued=len(queued),
+                )
+            if peer.hexhash in self.node.mailbox.pending_ack_holders():
+                raise ValueError(
+                    f"{peer.display_name} still has mail acknowledgements "
+                    "owed; wait for the next mail sweep to send them, "
+                    "then try again"
+                )
+            removed = self.node.registry.forget(peer.destination_hash)
+            try:
+                self.node.registry.save()
+            except Exception:
+                # The old record is still on disk: put the live copy back
+                # so the serving node and the file agree, then report it.
+                self.node.registry.restore(removed)
+                raise
+        return {"ok": True, "peer": peer.public_dict()}
+
     def allowlist(self) -> Dict[str, Any]:
         """The DM allow-list: whether it is enforced, and who is on it."""
         return self._describe_allowlist(self.node.allowlist)
@@ -2861,6 +2934,7 @@ class WebBridge:
             lambda current: current.with_enabled(enabled)
         )
         return self._describe_allowlist(updated)
+
 
     def announce(self) -> None:
         self.node.announce()
@@ -4018,6 +4092,39 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
+                return
+            if path == "/api/peers/forget":
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.forget_peer(
+                        target.strip(), force=body.get("force") is True
+                    )
+                except PeerForgetBlocked as exc:
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": str(exc),
+                                "code": exc.code,
+                                "queued": exc.queued,
+                            }
+                        },
+                        head_only,
+                        400,
+                    )
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json(result, head_only)
                 return
             if path in (
                 "/api/allowlist/add",
