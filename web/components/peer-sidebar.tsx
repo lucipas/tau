@@ -85,6 +85,9 @@ export function PeerSidebar({
   const [pickedRemove, setPickedRemove] = useState<string[]>([]);
   const [changingId, setChangingId] = useState<string | null>(null);
   const [groupError, setGroupError] = useState<string | null>(null);
+  // Bumped whenever the member editor switches, so a change that
+  // finishes later only touches the editor it was started from.
+  const memberEditSession = useRef(0);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -116,6 +119,7 @@ export function PeerSidebar({
   }
 
   function toggleEditMembers(id: string) {
+    memberEditSession.current += 1;
     setGroupError(null);
     setPickedAdd([]);
     setPickedRemove([]);
@@ -126,19 +130,27 @@ export function PeerSidebar({
     const apply = adding ? onAddGroupMembers : onRemoveGroupMembers;
     const picked = adding ? pickedAdd : pickedRemove;
     if (!apply || picked.length === 0) return;
+    const session = memberEditSession.current;
     setChangingId(groupId);
     setGroupError(null);
     try {
       await apply(groupId, picked);
       // A roster change is a successor group with a new id, so the
-      // panel belongs to the old id: close it on success.
-      setPickedAdd([]);
-      setPickedRemove([]);
-      setEditingId(null);
+      // panel belongs to the old id: close it on success, unless the
+      // user has already moved on to another group's editor.
+      if (memberEditSession.current === session) {
+        setPickedAdd([]);
+        setPickedRemove([]);
+        setEditingId(null);
+      }
     } catch (caught) {
-      setGroupError(caught instanceof Error ? caught.message : "change failed");
+      if (memberEditSession.current === session) {
+        setGroupError(
+          caught instanceof Error ? caught.message : "change failed",
+        );
+      }
     } finally {
-      setChangingId(null);
+      setChangingId((current) => (current === groupId ? null : current));
     }
   }
 
