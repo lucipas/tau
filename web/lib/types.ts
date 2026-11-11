@@ -286,6 +286,17 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface DoctorCheck {
+  name: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+}
+
+export interface DoctorResponse {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
 export interface DeleteMessageResponse {
   ok: boolean;
   deleted: { id: number; wire_id?: string | null };

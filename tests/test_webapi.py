@@ -17,6 +17,7 @@ import RNS
 
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.blocklist import BlockList
+from tau.config import TauConfig
 from tau.groups import GroupStore
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
@@ -3575,6 +3576,67 @@ def _queue(node, to_hex, text, message_id=None):
         text=text,
         message_id=message_id,
     )
+
+
+def test_doctor_endpoint_lists_all_checks(bridge, node, tmp_path):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+
+    status, _, payload = _json(bridge, "/api/doctor")
+    assert status == 200
+    # A fresh directory has no identity, so the verdict is not ok.
+    assert payload["ok"] is False
+    assert [check["name"] for check in payload["checks"]] == [
+        "identity",
+        "node metadata",
+        "peers",
+        "mailbox",
+        "inbox",
+        "messages",
+        "tan",
+        "tan rules",
+        "allowlist",
+        "instance lock",
+    ]
+    for check in payload["checks"]:
+        assert check["status"] in ("ok", "warn", "fail")
+        assert isinstance(check["detail"], str)
+    by_name = {check["name"]: check for check in payload["checks"]}
+    assert by_name["identity"]["status"] == "fail"
+    assert by_name["peers"]["status"] == "ok"  # no peers yet is healthy
+
+
+def test_doctor_reports_a_corrupt_store(bridge, node, tmp_path):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+    (tmp_path / "peers.json").write_text("{not json", encoding="utf-8")
+
+    result = bridge.doctor()
+    assert result["ok"] is False
+    by_name = {check["name"]: check for check in result["checks"]}
+    assert by_name["peers"]["status"] == "fail"
+    assert "peers.json" in by_name["peers"]["detail"]
+
+
+def test_doctor_rejects_a_concurrent_run(bridge, node, tmp_path):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+    assert bridge._doctor_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(WebBridgeError, match="already running"):
+            bridge.doctor()
+    finally:
+        bridge._doctor_lock.release()
+
+
+def test_doctor_endpoint_reports_busy_when_a_check_is_running(
+    bridge, node, tmp_path
+):
+    node.config = TauConfig.resolve(data_dir=tmp_path)
+    assert bridge._doctor_lock.acquire(blocking=False)
+    try:
+        status, _, payload = _json(bridge, "/api/doctor")
+    finally:
+        bridge._doctor_lock.release()
+    assert status == 503
+    assert payload["error"]["message"] == "a health check is already running"
 
 
 def test_outbox_empty(bridge):

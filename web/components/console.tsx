@@ -8,6 +8,7 @@ import type { TauMessage } from "@/lib/types";
 import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
+import { DoctorSection } from "./doctor-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
 import { MessagesBackupSection } from "./messages-backup-section";
@@ -230,6 +231,9 @@ export function Console() {
                 onExport={tau.exportBundle}
                 onImport={tau.importBundle}
               />
+            </div>
+            <div className="mt-4">
+              <DoctorSection onRun={tau.runDoctor} />
             </div>
             <Composer
               peers={tau.peers}

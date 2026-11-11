@@ -159,6 +159,7 @@ The same bridge is the local integration point for scripts:
 | `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
 | `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/doctor` | GET | health verdicts for the data directory (`tau doctor`) |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
 | `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
 | `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |

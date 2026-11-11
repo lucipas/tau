@@ -32,6 +32,7 @@ script) can read what arrives from the mesh and send messages back:
                            message carries a wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
                            ``{"include_tan": true}`` for Tan posts too
     POST /api/bundle/import merge a bundle document (the signed JSON
@@ -604,6 +605,10 @@ class WebBridge:
         self._verify_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # One health check at a time: run_checks reads whole store files
+        # and runs a SQLite integrity check, so concurrent scans would
+        # contend with the serving node for threads, disk and CPU.
+        self._doctor_lock = threading.Lock()
         # Serializes block/unblock read-modify-write cycles so concurrent
         # console requests cannot overwrite each other's changes.
         self._blocklist_lock = threading.Lock()
@@ -2511,6 +2516,34 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def doctor(self) -> Dict[str, Any]:
+        """Health verdicts for this node's data directory.
+
+        The same checks as the ``tau doctor`` CLI, run against the
+        running node's config.  Read-only: the checks never write
+        anything or take the instance lock, so they are safe to run
+        against the serving node.  The import is deferred because
+        ``tau.doctor`` imports this module for its message-cleaning
+        helpers.
+
+        One check runs at a time: a second request while a scan is in
+        progress gets a ``WebBridgeError`` (the route maps it to 503)
+        instead of starting another full scan.  The lock is taken here,
+        not in the route, so a HEAD request cannot bypass it.
+        """
+        from .doctor import all_ok, run_checks
+
+        if not self._doctor_lock.acquire(blocking=False):
+            raise WebBridgeError("a health check is already running")
+        try:
+            checks = run_checks(self.node.config)
+        finally:
+            self._doctor_lock.release()
+        return {
+            "ok": all_ok(checks),
+            "checks": [check.to_dict() for check in checks],
+        }
+
     def _was_delivered(self, mail_id: str) -> bool:
         """True if this bridge recorded a delivery for *mail_id*.
 
@@ -3677,6 +3710,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
+                return
+            if path == "/api/doctor":
+                try:
+                    self._send_json(self.bridge.doctor(), head_only)
+                except WebBridgeError as exc:
+                    # A check already in progress: 503, like the other
+                    # bridge errors, so the caller retries instead of
+                    # queueing another full scan.
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
                 return
             if path == "/api/outbox/held":
                 self._send_json(self.bridge.held_mail(), head_only)

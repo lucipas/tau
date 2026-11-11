@@ -13,6 +13,7 @@ import type {
   CreateGroupResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
+  DoctorResponse,
   DropHeldResponse,
   GroupsResponse,
   HeldMailEntry,
@@ -705,6 +706,12 @@ export function useTau() {
     }
   }, []);
 
+  const runDoctor = useCallback(async () => {
+    // On demand only: the checks read the data directory, and a
+    // periodic run would re-read files the node is writing to.
+    return apiGet<DoctorResponse>("/api/doctor");
+  }, []);
+
   const createGroup = useCallback(
     async (name: string, members: string[]) => {
       const result = await apiPost<CreateGroupResponse>("/api/groups", {
@@ -1139,6 +1146,7 @@ export function useTau() {
     blockPeer,
     unblockPeer,
     announce,
+    runDoctor,
     markRead,
     setPeerAlias,
     reactToMessage,
