@@ -5860,6 +5860,10 @@ def cmd_react(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if not target.get("id"):
         raise NodeError("that message has no id to react to")
+    if target.get("kind") == NOTE_KIND:
+        # A note is local-only: its destination is this node, not a
+        # remote author, so there is no peer to react to.
+        raise NodeError("notes are local-only and cannot be reacted to")
     author = target.get("destination") or ""
     if not author:
         raise NodeError("that message has no known sender to react to")
