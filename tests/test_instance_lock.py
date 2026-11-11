@@ -191,7 +191,10 @@ def test_stop_workers_handles_current_and_unstarted_threads(tmp_path):
 def stub_start(monkeypatch) -> None:
     """Replace the Reticulum startup with a no-op for lock tests."""
     monkeypatch.setattr(
-        TauNode, "_start", lambda self, *, announce, mail_loop=True, lxmf=False: None
+        TauNode,
+        "_start",
+        lambda self, *, announce, mail_loop=True, lxmf=False,
+        lxmf_propagation=False: None,
     )
 
 
@@ -212,6 +215,37 @@ def test_exclusive_start_takes_and_stop_releases_the_lock(
     contender.release()
 
 
+def test_exclusive_start_reloads_registry_after_forget(tmp_path, monkeypatch):
+    """A peer forgotten before start() takes the lock must not come back.
+
+    The registry is loaded when the node is constructed, before the
+    exclusive lock is held. A concurrent `tau peers forget` in that
+    window removes the peer from the file; without a reload under the
+    lock, the node's next save would restore it.
+    """
+    stub_start(monkeypatch)
+    config = make_config(tmp_path)
+    config.prepare()
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(b"\xbb" * 16, b"\x02" * 64, name="bob", now=100.0)
+    registry.save()
+
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    assert node.registry.get("bob") is not None
+
+    # The concurrent forget: a fresh registry removes the peer from
+    # the file before start() takes the lock.
+    fresh = PeerRegistry(config.peers_path)
+    fresh.remove(b"\xbb" * 16)
+    fresh.save()
+
+    node.start(exclusive=True)
+    assert node.registry.get("bob") is None
+    # stop() saves the registry: the forgotten peer must not come back.
+    node.stop()
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
 def test_plain_start_does_not_take_the_lock(tmp_path, monkeypatch):
     stub_start(monkeypatch)
     config = make_config(tmp_path)
@@ -230,7 +264,8 @@ def test_plain_start_does_not_take_the_lock(tmp_path, monkeypatch):
 
 
 def test_failed_exclusive_start_releases_the_lock(tmp_path, monkeypatch):
-    def failing_start(self, *, announce, mail_loop=True, lxmf=False):
+    def failing_start(self, *, announce, mail_loop=True, lxmf=False,
+                      lxmf_propagation=False):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(TauNode, "_start", failing_start)

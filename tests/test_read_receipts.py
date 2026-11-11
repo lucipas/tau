@@ -494,7 +494,7 @@ def test_collected_sealed_receipt_records_reads(tmp_path):
         message_ids=["msg-1"],
         read_at=150.0,
     )
-    node._request = lambda peer, path, payload, timeout: {
+    node._request = lambda peer, path, payload, timeout, deadline=None: {
         "ok": True,
         "messages": [
             {
@@ -772,7 +772,12 @@ def test_cli_config_read_receipts(tmp_path, capsys):
 
     code = cli.main(["config", "--data-dir", str(data_dir), "--json"])
     assert code == 0
-    assert json.loads(capsys.readouterr().out) == {"send_read_receipts": False}
+    # Bare `tau config` reports every known setting, so the file
+    # setting (off by default) is listed alongside read receipts.
+    assert json.loads(capsys.readouterr().out) == {
+        "accept_files": False,
+        "send_read_receipts": False,
+    }
 
     assert (
         cli.main(["config", "read-receipts", "on", "--data-dir", str(data_dir)])
@@ -952,6 +957,11 @@ def test_bridge_mark_displayed_read_sends_once(tmp_path):
     while time.time() < deadline and not sent:
         time.sleep(0.05)
     assert sent == [("bb" * 16, ["msg-1"])]
+    # The receipt stamp is written by the sender thread after
+    # send_read_receipts returns, so wait for it instead of racing it.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and node.inbox.unreceipted():
+        time.sleep(0.05)
     assert node.inbox.unreceipted() == []
 
     # A second display does not re-send.

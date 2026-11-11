@@ -49,11 +49,11 @@ class FakeMsvcrt:
 @pytest.fixture()
 def windows_lock(monkeypatch):
     """Simulate the Windows branch of ``InstanceLock`` on Linux."""
-    import tau.node as node_mod
+    import tau.instance_lock as lock_mod
 
     fake = FakeMsvcrt()
-    monkeypatch.setattr(node_mod, "fcntl", None)
-    monkeypatch.setattr(node_mod, "msvcrt", fake)
+    monkeypatch.setattr(lock_mod, "fcntl", None)
+    monkeypatch.setattr(lock_mod, "msvcrt", fake)
     return fake
 
 

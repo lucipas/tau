@@ -224,7 +224,15 @@ def test_serve_continues_when_send_server_cannot_bind(tmp_path, caplog, capsys, 
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False, lxmf=False):
+        def start(
+            self,
+            *,
+            announce=True,
+            exclusive=False,
+            mail_loop=True,
+            lxmf=False,
+            lxmf_propagation=False,
+        ):
             events.append("node.start")
 
         def stop(self):
