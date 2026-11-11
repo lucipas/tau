@@ -51,6 +51,14 @@ export function formatRtt(rtt: number | null | undefined): string {
   return `${rtt.toFixed(1)} ms`;
 }
 
+/** "12.4 KB" / "3.2 MB" for a file size in bytes. */
+export function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "unknown size";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** "disappears in 5m" for a sender-set expiry, or null when it never expires. */
 export function formatExpiresIn(expiresAt: number | null | undefined): string | null {
   if (!expiresAt) return null;

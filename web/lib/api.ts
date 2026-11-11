@@ -29,11 +29,22 @@ export const API_BASE = resolveApiBase();
 
 export class ApiError extends Error {
   status: number;
+  // Machine-readable refusal code from the bridge, when it sent one
+  // (e.g. "queued_mail"); queued carries the count behind that code.
+  code?: string;
+  queued?: number;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    code?: string,
+    queued?: number,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.queued = queued;
   }
 }
 
@@ -52,6 +63,8 @@ async function parseResponse<T>(response: Response): Promise<T> {
     throw new ApiError(
       body?.error?.message ?? `request failed (${response.status})`,
       response.status,
+      body?.error?.code,
+      body?.error?.queued,
     );
   }
   return payload as T;
@@ -78,6 +91,21 @@ export async function apiPost<T>(
     },
     body: JSON.stringify(body),
     signal,
+  });
+  return parseResponse<T>(response);
+}
+
+// POST a body that must reach the server byte-for-byte: a signed
+// bundle document, where parsing and re-stringifying on the way in can
+// rewrite a number the signature covers.
+export async function apiPostText<T>(path: string, text: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: text,
   });
   return parseResponse<T>(response);
 }
