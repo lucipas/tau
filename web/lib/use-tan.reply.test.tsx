@@ -33,6 +33,14 @@ function makePost(overrides: Partial<TanPost> = {}): TanPost {
 }
 
 const emptyFollowing = { following: [], count: 0 };
+const emptySuggestions = { suggestions: [], count: 0 };
+
+function routeLoad(path: string, timeline: unknown) {
+  if (path.startsWith("/api/tan/timeline")) return Promise.resolve(timeline);
+  if (path.startsWith("/api/tan/suggest"))
+    return Promise.resolve(emptySuggestions);
+  return Promise.resolve(emptyFollowing);
+}
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -49,9 +57,7 @@ describe("useTan publish with replies", () => {
     });
     let feed: TanPost[] = [parent];
     mockedGet.mockImplementation((path: string) =>
-      path.startsWith("/api/tan/timeline")
-        ? Promise.resolve({ posts: feed, count: feed.length })
-        : Promise.resolve(emptyFollowing),
+      routeLoad(path, { posts: feed, count: feed.length }),
     );
     mockedPost.mockImplementation(async () => {
       feed = [reply, parent];
@@ -74,9 +80,7 @@ describe("useTan publish with replies", () => {
 
   it("omits reply_to for a standalone post", async () => {
     mockedGet.mockImplementation((path: string) =>
-      path.startsWith("/api/tan/timeline")
-        ? Promise.resolve({ posts: [], count: 0 })
-        : Promise.resolve(emptyFollowing),
+      routeLoad(path, { posts: [], count: 0 }),
     );
     const post = makePost();
     mockedPost.mockResolvedValue({ ok: true, post });

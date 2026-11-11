@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -12,7 +13,7 @@ from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.node import NodeError, NotAllowedError, TauNode
 from tau.peers import Peer, PeerRegistry
-from tau.protocol import APP_NAME, ASPECT
+from tau.protocol import APP_NAME, ASPECT, parse_message
 
 
 def make_peer(name: str = "alice") -> Peer:
@@ -84,6 +85,86 @@ def test_info_requires_start(tmp_path):
         node.info()
     with pytest.raises(NodeError):
         node.send_message("alice", "hi")
+
+
+def test_send_message_sends_kind_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    node.send_message("alice", "are you there?", kind="ping")
+    assert parse_message(sent["payload"])["kind"] == "ping"
+
+
+def test_send_message_rejects_invalid_kind(tmp_path):
+    from tau.protocol import ProtocolError
+
+    node = make_node(tmp_path)
+    with pytest.raises(ProtocolError):
+        node.send_message("alice", "hi", kind="has space")
+
+
+def test_send_message_queues_kind_for_offline_peer(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    # The queue path spawns a background flush; stub it out so the
+    # entry is still queued when the test inspects it.
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_message("alice", "doorbell rang", kind="alert")
+
+    assert response["queued"] is True
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.kind == "alert"
+
+
+def test_queued_kind_survives_retry_on_the_wire(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough to queue
+    # The queue path spawns a background flush; stub it out so the
+    # retry below is the only delivery attempt.
+    monkeypatch.setattr(node, "flush_outbox", lambda **kwargs: None)
+    peer = make_peer()
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+    )
+
+    def unreachable(*args, **kwargs):
+        raise NodeError("no path to peer")
+
+    monkeypatch.setattr(node, "_request", unreachable)
+    response = node.send_message("alice", "doorbell rang", kind="alert")
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.kind == "alert"
+
+    sent = {}
+
+    def reachable(peer_arg, path, payload, timeout, **kwargs):
+        sent["payload"] = payload
+        return {"ok": True, "delivered": True}
+
+    monkeypatch.setattr(node, "_request", reachable)
+    assert node._deliver_entry(peer, entry, 1.0) is True
+    assert parse_message(sent["payload"])["kind"] == "alert"
+    assert node.mailbox.get_outbox(response["id"]) is None
 
 
 def test_send_message_records_sent_message_in_inbox(tmp_path, monkeypatch):
@@ -519,6 +600,112 @@ def test_deliver_entry_sends_message_still_queued(tmp_path, monkeypatch):
     assert node.mailbox.get_outbox(entry.id) is None
 
 
+def test_send_message_distrusts_peer_queued_claim(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "queued": True,
+            "id": "spoofed-id",
+            "to": "00" * 16,
+            "expires_at": 9999999999.0,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    # The peer claimed the message was queued with an id it invented;
+    # the node reports a plain delivery, names the local wire
+    # message, and drops the peer's queue keys.
+    assert response["queued"] is False
+    # The spoofed id is discarded: the response names the local wire
+    # message instead, matching the sent message in the inbox.
+    assert response["id"] != "spoofed-id"
+    sent = node.inbox.list_messages(direction="out")
+    assert len(sent) == 1
+    assert sent[0]["id"] == response["id"]
+    assert "to" not in response
+    assert "expires_at" not in response
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
+def test_send_message_distrusts_peer_queued_claim_without_id(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "queued": True, "echo": "hi"},
+    )
+
+    # A queued claim with no id used to make the CLI raise KeyError
+    # on response["id"] after the flush; the normalized response
+    # must not raise anywhere downstream.
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    # The response still names the local wire message, so downstream
+    # readers of response["id"] never see a peer-invented id.
+    assert response["id"]
+    assert response["echo"] == "hi"
+
+
+def test_send_message_keeps_well_behaved_delivery_response(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "echo": "hi",
+            "received_at": 1234.0,
+            "server": "alice",
+            "node": peer.hexhash,
+            "duplicate": False,
+            "_rtt": 0.012,
+        },
+    )
+
+    response = node.send_message("alice", "hi")
+
+    assert response["queued"] is False
+    # A well-behaved delivery still names the local wire message.
+    assert response["id"]
+    assert response["echo"] == "hi"
+    assert response["received_at"] == 1234.0
+    assert response["server"] == "alice"
+    assert response["node"] == peer.hexhash
+    assert response["duplicate"] is False
+    assert response["_rtt"] == 0.012
+
+
 def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
     node = make_node(tmp_path)
     reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
@@ -540,6 +727,49 @@ def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
     sent = parse_message(calls[0][2])
     assert sent["in_reply_to"] == reply_to
     assert sent["text"] == "seconded"
+
+
+def test_deliver_collected_holds_mailbox_transaction(tmp_path):
+    # A collected (relayed) delivery marks the message seen and then
+    # records it.  Both steps run under the mailbox transaction, so a
+    # live backup holding the same transaction sees either both writes
+    # or neither — never a seen marker with no inbox entry.
+    node = make_node(tmp_path)
+    original_append = node.inbox.append
+    started = threading.Event()
+
+    def slow_append(record):
+        started.set()
+        time.sleep(0.3)
+        return original_append(record)
+
+    node.inbox.append = slow_append  # type: ignore[method-assign]
+    message = {
+        "id": "relayed-1",
+        "from": "ab" * 16,
+        "from_name": "alice",
+        "text": "hello via relay",
+        "sent_at": 1000.0,
+    }
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(node._deliver_collected(message)),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    # The delivery is inside the slowed record step: the mailbox
+    # transaction must still be held, so acquiring it times out.
+    with pytest.raises(TimeoutError):
+        with node.mailbox.transaction(timeout=0.1):
+            pass
+    worker.join(timeout=5)
+    assert result == [True]
+    # The transaction is free again once the delivery finishes.
+    with node.mailbox.transaction(timeout=1.0):
+        pass
+    stored = json.loads((tmp_path / "inbox.json").read_text(encoding="utf-8"))
+    assert any(entry["id"] == "relayed-1" for entry in stored["messages"])
 
 
 def test_send_message_records_sent_message_for_quote_lookup(

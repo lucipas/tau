@@ -5,32 +5,68 @@ import { useEffect, useRef, useState } from "react";
 import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
+import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
+import { AllowlistSection } from "./allowlist-section";
+import { DoctorSection } from "./doctor-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
+import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
+import { SettingsSection } from "./settings-section";
 
 export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
-  const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
+  // The selection as it is now, for async completions that must not act
+  // on a conversation the user has since switched to.
+  const targetRef = useRef(target);
 
   useEffect(() => {
-    if (tau.peers.length === 0) {
+    targetRef.current = target;
+  }, [target]);
+
+  useEffect(() => {
+    if (tau.peers.length === 0 && tau.groups.length === 0) {
       setMode("custom");
       return;
     }
-    if (!target && !customPicked.current) {
-      setMode("peer");
-      setTarget(tau.peers[0].destination);
+    // A refresh can remove the selected group: never keep submitting its
+    // stale id. Fall back to a remaining group, then to a peer.
+    if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
+      if (tau.groups.length > 0) {
+        setTarget(tau.groups[0].id);
+      } else if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      return;
     }
-  }, [tau.peers, target]);
+    if (!target && !customPicked.current) {
+      if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      }
+    }
+  }, [tau.peers, tau.groups, target, mode]);
 
-  function changeMode(next: "peer" | "custom") {
+  function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
+    // A pending reply belongs to a peer conversation: the bridge
+    // rejects replies on group sends, so entering group mode drops it.
+    if (next === "group") {
+      setReplyTo(null);
+    }
     setMode(next);
   }
 
@@ -43,6 +79,15 @@ export function Console() {
     }
     setTarget(value);
   }
+
+  // A deleted message can no longer be quoted: the bridge rejects its
+  // wire id. This also covers deletes that arrive from another tab.
+  useEffect(() => {
+    if (!replyTo) return;
+    if (!tau.messages.some((message) => message.id === replyTo.id)) {
+      setReplyTo(null);
+    }
+  }, [replyTo, tau.messages]);
 
   const { markRead } = tau;
   const openUnread =
@@ -89,6 +134,11 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          backingUp={tau.backingUp}
+          backupError={tau.backupError}
+          onBackup={() => {
+            void tau.backup();
+          }}
         />
 
         {tau.connection === "reconnecting" ? (
@@ -99,25 +149,76 @@ export function Console() {
         ) : null}
 
         <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
+          <div className="flex min-w-0 flex-col gap-4">
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
             groups={tau.groups}
             bridge={tau.bridge}
+            social={tau.social}
             pings={tau.pings}
+            verifications={tau.verifications}
+            blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onForgetPeer={async (destination, force) => {
+              const removed = await tau.forgetPeer(destination, force);
+              // The forgotten peer's conversation is gone: clear the
+              // selection and let the auto-select pick the next peer. Only
+              // if it is still selected; the user may have picked another
+              // peer while the forget was pending.
+              if (targetRef.current === removed.destination) {
+                targetRef.current = "";
+                setTarget("");
+                setReplyTo(null);
+              }
+            }}
+            onSetAlias={(destination, alias) =>
+              tau.setPeerAlias(destination, alias)
+            }
+            onVerify={(destination) => {
+              void tau.verifyPeer(destination).catch(() => undefined);
+            }}
+            onShowSafetyNumber={(destination) => {
+              void tau.showSafetyNumber(destination).catch(() => undefined);
+            }}
+            onDismissVerification={(destination) => {
+              tau.clearVerification(destination);
+            }}
+            onBlock={(destination) => {
+              void tau.blockPeer(destination).catch(() => undefined);
+            }}
+            onUnblock={(destination) => {
+              void tau.unblockPeer(destination).catch(() => undefined);
+            }}
             onSelectPeer={selectPeer}
+            onCreateGroup={(name, members) => tau.createGroup(name, members)}
+            onDeleteGroup={(group) => tau.deleteGroup(group)}
           />
+            <AllowlistSection
+              allowlist={tau.allowlist}
+              onAdd={(value) => tau.addAllowlistPeer(value)}
+              onRemove={(value) => tau.removeAllowlistPeer(value)}
+              onToggle={(enabled) => tau.setAllowlistEnabled(enabled)}
+            />
+          </div>
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed
-              messages={tau.messages}
+              messages={
+                tau.searchQuery !== null ? tau.searchResults : tau.messages
+              }
               node={tau.node}
               live={tau.connection === "live"}
+              searching={tau.searchQuery !== null}
+              searchQuery={tau.searchQuery}
+              searchError={tau.searchError}
+              quoteContext={tau.messages}
+              onSearch={tau.search}
+              onClearSearch={tau.clearSearch}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {
@@ -125,27 +226,68 @@ export function Console() {
                   setMode("peer");
                 }
               }}
+              onDelete={async (message) => {
+                await tau.deleteMessage(message.id);
+              }}
+              onReact={async (message, reaction) => {
+                if (!message.wire_id) return;
+                if (reaction === null) {
+                  await tau.clearReaction(message.wire_id);
+                } else {
+                  await tau.reactToMessage(message.wire_id, reaction);
+                }
+              }}
             />
-            {tau.outbox.length > 0 ? (
-              <div className="mt-4">
-                <OutboxSection
-                  entries={tau.outbox}
-                  heldForOthers={tau.heldForOthers}
-                  onCancel={tau.cancelOutbox}
-                />
-              </div>
-            ) : null}
+            {/* Stays mounted when the queue empties so a retry's result
+                line survives the last entry leaving; it renders nothing
+                itself when there is nothing to show. */}
+            <div className="mt-4">
+              <OutboxSection
+                entries={tau.outbox}
+                heldForOthers={tau.heldForOthers}
+                held={tau.heldMail}
+                onCancel={tau.cancelOutbox}
+                onRetry={tau.retryOutbox}
+                onDropHeld={tau.dropHeldMail}
+              />
+            </div>
+            <div className="mt-4">
+              <BundleSection
+                onExport={tau.exportBundle}
+                onImport={tau.importBundle}
+              />
+            </div>
+            <div className="mt-4">
+              <DoctorSection onRun={tau.runDoctor} />
+            </div>
             <Composer
               peers={tau.peers}
+              groups={tau.groups}
               target={target}
               mode={mode}
               onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
+              onSendGroup={tau.sendGroup}
+              onSendFile={tau.sendFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
+            <div className="mt-4">
+              <SettingsSection
+                settings={tau.settings}
+                loadError={tau.settingsError}
+                onToggle={tau.updateSetting}
+              />
+            </div>
           </div>
+
+          <MessagesBackupSection
+            exporting={tau.exporting}
+            importing={tau.importing}
+            onExport={tau.exportMessages}
+            onImport={tau.importMessages}
+          />
         </main>
 
         <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
