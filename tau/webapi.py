@@ -3873,6 +3873,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/api/bundle/import":
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {"error": {"message": "bundle import is only accepted from localhost"}},
+                        head_only,
+                        403,
+                    )
+                    return
                 self._handle_bundle_import(head_only)
                 return
             # A file send carries base64 bytes and an import carries a whole

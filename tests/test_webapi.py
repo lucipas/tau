@@ -5852,6 +5852,19 @@ def test_bundle_import_rejects_garbage(bridge):
     assert "invalid bundle" in payload["error"]["message"]
 
 
+def test_bundle_import_rejects_remote_client(bridge, tmp_path, monkeypatch):
+    # Bulk imports are localhost-only even when the bridge is bound to a
+    # remote interface: a remote client must not be able to merge a bundle
+    # into this node's held mail.
+    import tau.webapi as webapi
+
+    document = _bundle_with_held_mail(tmp_path)
+    monkeypatch.setattr(webapi, "_is_loopback_client", lambda client: False)
+    status, _, payload = _post_bundle(bridge, document)
+    assert status == 403
+    assert "only accepted from localhost" in payload["error"]["message"]
+
+
 def test_bundle_import_accepts_body_over_default_cap(bridge, tmp_path):
     # A bundle import carries the whole signed document, so the route
     # reads up to the 8 MiB bundle cap instead of the 32 KiB limit
