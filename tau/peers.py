@@ -28,6 +28,44 @@ MAX_PEERS = 256
 DEFAULT_MAX_AGE = 7 * 24 * 60 * 60
 
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+# Hex strings that resolve() may read as a hash or hash prefix (>= 4
+# chars): a 32-char target is read as a full hash before aliases, and a
+# 4-or-more-char target as a prefix after them, so such an alias could
+# never reliably select its owner and could misdirect a hash target.
+_HEX_LIKE = re.compile(r"^[0-9a-fA-F]{4,}$")
+
+
+def _clean_stored_alias(value: Any) -> Optional[str]:
+    """Normalise a stored alias, dropping values that are unusable.
+
+    Non-strings and blank strings become ``None``; a hash-like alias
+    (one that would be read as a destination hash or prefix) is also
+    dropped, so an alias saved by an older version or edited by hand
+    cannot misdirect a hash target.
+    """
+    alias = sanitize_name(value, fallback="") or None
+    if alias is not None and _HEX_LIKE.match(alias):
+        return None
+    return alias
+
+
+def _dedupe_aliases(peers: Iterable[Peer]) -> None:
+    """Drop duplicate aliases in place, keeping the first occurrence.
+
+    Aliases must be unique across the registry for ``resolve`` to pick
+    exactly one peer.  A file written by two racing writers can hold
+    the same alias twice; dropping the later ones keeps resolution
+    unambiguous and lets the next save heal the file.
+    """
+    seen: set = set()
+    for peer in peers:
+        if peer.alias is None:
+            continue
+        key = peer.alias.casefold()
+        if key in seen:
+            peer.alias = None
+        else:
+            seen.add(key)
 
 
 def safety_number(*public_keys: bytes) -> str:
@@ -77,6 +115,9 @@ class Peer:
     # never heard directly.  Its reported liveness is second-hand, so mail
     # sweeps rank directly heard peers ahead of it.
     via_exchange: bool = False
+    # Local-only label for this peer, set with `tau peers alias`.  Never
+    # sent in peer exchange or announces, and never overwritten by them.
+    alias: Optional[str] = None
     # When the owner compared safety numbers with this peer out of band
     # and confirmed the key is theirs (``tau peers verify``).  The
     # fingerprint is the pairwise safety number recorded at that moment.
@@ -118,6 +159,8 @@ class Peer:
 
     @property
     def display_name(self) -> str:
+        if self.alias:
+            return self.alias
         return self.name or short_hash(self.hexhash)
 
     def age(self, now: Optional[float] = None) -> float:
@@ -134,6 +177,7 @@ class Peer:
             "protocol": self.protocol,
             "caps": list(self.caps),
             "via_exchange": self.via_exchange,
+            "alias": self.alias,
             "lxmf": self.lxmf_hash,
             "delivered_count": self.delivered_count,
             "last_delivered_at": self.last_delivered_at,
@@ -174,10 +218,10 @@ class Peer:
             raise ValueError("invalid public key length")
 
         last_seen = raw.get("last_seen")
-        if not isinstance(last_seen, (int, float)):
+        if not isinstance(last_seen, (int, float)) or not math.isfinite(last_seen):
             raise ValueError("invalid last_seen timestamp")
         first_seen = raw.get("first_seen")
-        if not isinstance(first_seen, (int, float)):
+        if not isinstance(first_seen, (int, float)) or not math.isfinite(first_seen):
             first_seen = last_seen
         hops = raw.get("hops")
         if not isinstance(hops, int) or hops < 0:
@@ -207,6 +251,7 @@ class Peer:
             protocol=protocol,
             caps=tuple(cap for cap in caps if isinstance(cap, str))[:16],
             via_exchange=raw.get("via_exchange") is True,
+            alias=_clean_stored_alias(raw.get("alias")),
             verified_at=cls._optional_timestamp(raw, "verified_at"),
             verified_fingerprint=verified_fingerprint,
             key_change_at=cls._optional_timestamp(raw, "key_change_at"),
@@ -290,12 +335,22 @@ class PeerRegistry:
             if _HEX32.match(value):
                 return self._peers.get(bytes.fromhex(value))
             for peer in self._peers.values():
+                if peer.alias and peer.alias.casefold() == value.casefold():
+                    return peer
+            for peer in self._peers.values():
                 if peer.name.casefold() == value.casefold():
                     return peer
             return None
 
-    def resolve(self, target: Union[bytes, str]) -> Optional[Peer]:
-        """Resolve a destination hash, hash prefix or peer name."""
+    def resolve(
+        self, target: Union[bytes, str], *, include_alias: bool = True
+    ) -> Optional[Peer]:
+        """Resolve a destination hash, hash prefix, peer name or alias.
+
+        Pass ``include_alias=False`` for security boundaries such as the
+        allow-list, where a local label must never stand in for the
+        peer's asserted name.
+        """
         if isinstance(target, bytes):
             if len(target) != DESTINATION_HASH_BYTES:
                 raise PeerError("destination hash must be 16 bytes")
@@ -311,6 +366,20 @@ class PeerRegistry:
 
         with self._lock:
             peers = list(self._peers.values())
+
+        if include_alias:
+            by_alias = [
+                p
+                for p in peers
+                if p.alias and p.alias.casefold() == value.casefold()
+            ]
+            if len(by_alias) == 1:
+                return by_alias[0]
+            if len(by_alias) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_alias)} peers share the alias {value!r}; "
+                    "use a destination hash"
+                )
 
         by_name = [p for p in peers if p.name.casefold() == value.casefold()]
         if len(by_name) == 1:
@@ -330,6 +399,120 @@ class PeerRegistry:
                     f"{len(by_prefix)} peers match the hash prefix {value!r}"
                 )
         return None
+
+    def set_alias(self, target: Union[bytes, str], alias: str) -> Peer:
+        """Give a known peer a local alias, stored only in this registry.
+
+        The alias is unique across the registry (case-insensitive) so it
+        always resolves to exactly one peer.  Raises :class:`PeerError`
+        for an unknown peer, an empty alias, or an alias another peer
+        already uses.  The alias survives re-announces: :meth:`upsert`
+        never touches it.
+        """
+        clean = sanitize_name(alias, fallback="")
+        if not clean:
+            raise PeerError("alias must not be empty")
+        # A hex-like alias could never reliably select its owner (full
+        # hashes resolve before aliases, prefixes after them), so reject
+        # it up front instead of letting it misdirect a hash target.
+        if _HEX_LIKE.match(clean):
+            raise PeerError(
+                f"alias {clean!r} looks like a destination hash or hash "
+                "prefix; pick a label with a non-hex character"
+            )
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            clash = next(
+                (
+                    other
+                    for other in self._peers.values()
+                    if other.destination_hash != peer.destination_hash
+                    and other.alias
+                    and other.alias.casefold() == clean.casefold()
+                ),
+                None,
+            )
+            if clash is not None:
+                raise PeerError(
+                    f"alias {clean!r} is already used by "
+                    f"{clash.hexhash[:8]} ({clash.display_name})"
+                )
+            peer.alias = clean
+        self.save()
+        return peer
+
+    def clear_alias(self, target: Union[bytes, str]) -> Peer:
+        """Remove a peer's local alias.
+
+        Raises :class:`PeerError` when the peer is unknown or has no
+        alias set.
+        """
+        with self._lock:
+            peer = self.resolve(target)
+            if peer is None:
+                raise PeerError(f"unknown peer {target!r}")
+            if not peer.alias:
+                raise PeerError(f"peer {peer.display_name} has no alias")
+            peer.alias = None
+        self.save()
+        return peer
+
+    def refresh_aliases(self) -> int:
+        """Pick up alias changes another process made to the registry file.
+
+        A running node holds its registry in memory and rewrites the
+        whole file on every save, so an alias set by a one-shot command
+        (``tau peers alias``) while the node serves would be lost at the
+        next save.  Only aliases are refreshed — peer records themselves
+        are this process's observations — and a peer absent from the file
+        keeps its alias.  A disk alias that another in-memory peer
+        already holds is not applied: applying it would leave two peers
+        sharing one alias and make resolution ambiguous.  Returns the
+        number of peers whose alias changed.
+        """
+        if self.path is None:
+            return 0
+        raw = read_json(self.path)
+        entries = raw.get("peers", []) if isinstance(raw, dict) else []
+        if not isinstance(entries, list):
+            return 0
+        changed = 0
+        with self._lock:
+            claimed: Dict[str, bytes] = {}
+            for peer in self._peers.values():
+                if peer.alias is not None:
+                    claimed.setdefault(
+                        peer.alias.casefold(), peer.destination_hash
+                    )
+            for entry in entries:
+                if not isinstance(entry, dict) or "alias" not in entry:
+                    continue
+                destination = entry.get("destination", "")
+                if not isinstance(destination, str) or not _HEX32.match(
+                    destination
+                ):
+                    continue
+                peer = self._peers.get(bytes.fromhex(destination))
+                if peer is None:
+                    continue
+                alias = _clean_stored_alias(entry.get("alias"))
+                if alias is not None:
+                    owner = claimed.get(alias.casefold())
+                    if owner is not None and owner != peer.destination_hash:
+                        # Another peer already holds this alias (for
+                        # example one missing from this file kept it);
+                        # applying it here would make the alias ambiguous.
+                        continue
+                if peer.alias != alias:
+                    if peer.alias is not None:
+                        claimed.pop(peer.alias.casefold(), None)
+                    peer.alias = alias
+                    if alias is not None:
+                        claimed[alias.casefold()] = peer.destination_hash
+                    changed += 1
+        return changed
 
     def upsert(
         self,
@@ -578,6 +761,8 @@ class PeerRegistry:
                 log.debug("Skipping invalid peer entry: %s", exc)
                 continue
             loaded[peer.destination_hash] = peer
+
+        _dedupe_aliases(loaded.values())
 
         with self._lock:
             self._peers = loaded

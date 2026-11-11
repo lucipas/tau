@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import RNS
@@ -12,6 +13,7 @@ from tau.identity import destination_hash, load_identity
 from tau.peers import Peer
 from tau.protocol import APP_NAME, ASPECT, ProtocolError, decode, encode
 from tau.tangents import tan as tan_module
+from tau.tangents.rules import Ruleset
 from tau.tangents.tan import (
     HASH_FIELDS,
     TAN_EXPORT_FORMAT,
@@ -33,6 +35,7 @@ from tau.tangents.tan import (
     create_quote,
     create_reaction,
     create_reply,
+    create_repost,
     deleted_targets,
     edit_states,
     export_entries,
@@ -46,18 +49,22 @@ from tau.tangents.tan import (
     init_db,
     like_counts,
     likers,
+    list_authors,
     mute_keyword,
     muted_keywords,
+    post_likers,
     quote_counts,
     reaction_states,
-    resolve_post,
+    repost_counts,
     resolve_author,
+    resolve_post,
     resolve_muted_name,
     max_seq,
     mentions,
     mute,
     muted,
     muted_author_set,
+    open_readonly_db,
     save_post,
     saved_posts,
     search_posts,
@@ -67,6 +74,7 @@ from tau.tangents.tan import (
     suggest_authors,
     thread,
     timeline,
+    top_posts,
     unfollow,
     unmute,
     unmute_keyword,
@@ -1565,6 +1573,45 @@ def test_reaction_chains_verifies_and_counts(identities, tmp_path):
     assert reaction_states(conn, [post["hash"]])[post["hash"]] == {bob_author: "unlike"}
 
 
+def test_post_likers_lists_newest_first_and_drops_unlikes(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "likeable", name="alice", now=1000)
+
+    # No reactions yet: an empty list, not an error.
+    assert post_likers(conn, post["hash"]) == []
+
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+    create_reaction(conn, carol, post["hash"], liked=True, name="carol", now=1002)
+    likers = post_likers(conn, post["hash"])
+    assert [entry["author"] for entry in likers] == [
+        author_of(carol),
+        author_of(bob),
+    ]
+    assert [entry["liked_at"] for entry in likers] == [1002, 1001]
+
+    # An unlike supersedes the like (latest chain entry wins).
+    create_reaction(conn, bob, post["hash"], liked=False, name="bob", now=1003)
+    assert [entry["author"] for entry in post_likers(conn, post["hash"])] == [
+        author_of(carol)
+    ]
+
+    # Liking again puts the author back, at the newer timestamp.
+    create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1004)
+    assert [entry["author"] for entry in post_likers(conn, post["hash"])] == [
+        author_of(bob),
+        author_of(carol),
+    ]
+
+    # A well-formed hash with no reactions is an empty list.
+    assert post_likers(conn, "cd" * 32) == []
+
+    # A malformed target is rejected, not silently empty.
+    with pytest.raises(PostError):
+        post_likers(conn, "not-a-hash")
+
+
 def test_likers_names_current_likers(identities, tmp_path):
     alice, bob = identities
     carol = RNS.Identity()
@@ -1942,6 +1989,161 @@ def test_author_stats_excludes_deleted_posts(identities, tmp_path):
     assert stats["seq"] == 3
 
 
+def test_list_authors(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    alice_second = create_post(conn, alice, "alice two", name="alice", now=1002)
+    create_post(conn, alice, "alice one", name="alice", now=1000)
+    create_post(conn, bob, "bob one", name="bob", now=1001)
+    follow(conn, author_of(bob), name="bob")
+
+    records = list_authors(conn)
+    assert [record["name"] for record in records] == ["alice", "bob"]
+    alice_record, bob_record = records
+    assert alice_record["posts"] == 2
+    assert alice_record["last_post"] == 1002
+    assert alice_record["followed"] is False
+    assert bob_record["posts"] == 1
+    assert bob_record["last_post"] == 1001
+    assert bob_record["followed"] is True
+
+    assert [record["name"] for record in list_authors(conn, sort="posts")] == [
+        "alice",
+        "bob",
+    ]
+    assert [record["name"] for record in list_authors(conn, sort="name")] == [
+        "alice",
+        "bob",
+    ]
+    assert [record["name"] for record in list_authors(conn, limit=1)] == ["alice"]
+
+    # Deleting alice's newest post drops her count and last-post time.
+    create_delete(conn, alice, alice_second["hash"], name="alice", now=1003)
+    (alice_record,) = [
+        record for record in list_authors(conn) if record["name"] == "alice"
+    ]
+    assert alice_record["posts"] == 1
+    assert alice_record["last_post"] == 1000
+
+    # An author known only from a delete entry (target not cached yet)
+    # has no visible posts, so they are not listed.
+    create_delete(conn, carol, "ab" * 32, name="carol", now=1004)
+    records = list_authors(conn)
+    assert [record["name"] for record in records] == ["bob", "alice"]
+    assert all(record["posts"] > 0 for record in records)
+
+    with pytest.raises(TanError):
+        list_authors(conn, sort="nope")
+    with pytest.raises(TanError):
+        list_authors(conn, limit=-1)
+
+
+def test_open_readonly_db_leaves_store_untouched(identities, tmp_path):
+    alice, _ = identities
+    path = tmp_path / "tan.sqlite3"
+    conn = init_db(path)
+    create_post(conn, alice, "hello", name="alice", now=1000)
+    conn.close()
+
+    before = path.read_bytes()
+    conn = open_readonly_db(path)
+    try:
+        assert len(list_authors(conn)) == 1
+    finally:
+        conn.close()
+    assert path.read_bytes() == before
+
+
+def test_open_readonly_db_rejects_outdated_schema(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(path))
+    # A pre-reactions store: no kind/target columns, so list_authors
+    # would fail mid-query on a missing column.
+    conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(TanError, match="outdated"):
+        open_readonly_db(path)
+
+
+def test_cli_tan_authors(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    # A fresh data dir has no store yet, and listing must not create one.
+    assert (
+        main(["tan", "authors", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {"authors": [], "count": 0}
+    assert not (data_dir / "tan.sqlite3").exists()
+
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    for text in ("first", "second"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+
+    assert (
+        main(["tan", "authors", "--data-dir", str(data_dir), "--json"]) == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    (record,) = payload["authors"]
+    assert record["name"] == "alice"
+    assert record["posts"] == 2
+    assert record["followed"] is False
+
+    assert main(["tan", "authors", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "2 post(s)" in out
+
+    # A pre-reactions store fails cleanly, not with a traceback.
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy_conn = sqlite3.connect(str(legacy_dir / "tan.sqlite3"))
+    legacy_conn.execute(
+        "CREATE TABLE posts (v INTEGER NOT NULL DEFAULT 1, hash TEXT PRIMARY KEY, "
+        "author TEXT NOT NULL, prev TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+        "name TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at REAL NOT NULL, "
+        "received_at REAL NOT NULL, sig TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, "
+        "linked INTEGER NOT NULL DEFAULT 0)"
+    )
+    legacy_conn.execute(
+        "CREATE TABLE follows (author TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+        "added_at REAL NOT NULL)"
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+    assert main(["tan", "authors", "--data-dir", str(legacy_dir), "--json"]) != 0
+    captured = capsys.readouterr()
+    assert "outdated" in captured.err
+    assert "Traceback" not in captured.err
+
+    assert main(["tan", "authors", "--data-dir", str(data_dir), "--limit", "-1"]) != 0
+
+
 def test_sync_hides_deleted_posts(identities, tmp_path):
     alice, bob = identities
     source = init_db(tmp_path / "source.sqlite3")
@@ -1994,8 +2196,8 @@ def test_delete_by_non_author_is_inert(identities, tmp_path):
     assert deleted_targets(conn) == set()
     assert resolve_post(conn, post["hash"])["hash"] == post["hash"]
 
-    # Only posts, replies and quotes can be deleted, even by their own author.
-    with pytest.raises(TanError, match="only posts, replies and quotes can be deleted"):
+    # Only posts, replies, reposts and quotes can be deleted, even by their own author.
+    with pytest.raises(TanError, match="only posts, replies, reposts and quotes can be deleted"):
         create_delete(conn, bob, forged["hash"], name="bob", now=1002)
 
 
@@ -2774,6 +2976,24 @@ def test_mentions_hides_replies_beneath_deleted_ancestor(identities, tmp_path):
     assert mentions(conn, author_of(alice)) == []
 
 
+def test_mentions_with_huge_mute_list_still_returns(identities, tmp_path):
+    # A mute list larger than SQLite's old 999-variable bound still
+    # loads mentions: hidden authors are bound as one JSON parameter,
+    # not one placeholder each.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+    reply = create_reply(conn, bob, post["hash"], "seconded", name="bob", now=1001)
+    with conn:
+        conn.executemany(
+            "INSERT INTO muted_authors(author, name, muted_at) VALUES(?, ?, ?)",
+            [(f"{index:032x}", "", 1000.0) for index in range(1200)],
+        )
+    assert [item["hash"] for item in mentions(conn, author_of(alice))] == [
+        reply["hash"]
+    ]
+
+
 def test_cli_mentions(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
@@ -2966,6 +3186,362 @@ def test_reply_can_be_liked_deleted_and_replied_to(identities, tmp_path):
     }
     with pytest.raises(TanError, match="has been deleted"):
         create_reply(conn, alice, reply["hash"], "too late", name="alice", now=1005)
+
+
+def test_repost_chains_verifies_and_annotates(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original thought", name="alice", now=1000)
+
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost["kind"] == "repost"
+    assert repost["target"] == post["hash"]
+    assert repost["text"] == ""
+    assert verify_post(repost)["hash"] == repost["hash"]
+    assert head(conn, author_of(bob)) == repost["hash"]
+
+    # The sync feed carries the repost; display surfaces show it with
+    # the original attached and a repost count on the original.
+    chain = feed(conn, author=author_of(bob))
+    assert [entry["kind"] for entry in chain] == ["repost"]
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"], post["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "original thought",
+        "deleted": False,
+    }
+    assert "repost_of" not in items[1]
+    assert repost_counts(conn, [post["hash"]])[post["hash"]] == {
+        "reposts": 1,
+        "reposted": False,
+    }
+    assert repost_counts(conn, [post["hash"]], viewer=author_of(bob))[
+        post["hash"]
+    ] == {"reposts": 1, "reposted": True}
+    assert items[1]["reposts"] == 1
+    assert items[1]["reposted"] is False
+    assert items[0]["reposts"] == 0
+    assert [item["hash"] for item in feed(conn, posts_only=True)] == [
+        repost["hash"],
+        post["hash"],
+    ]
+    assert [item["hash"] for item in timeline(conn, include_all=True)] == [
+        repost["hash"],
+        post["hash"],
+    ]
+
+
+def test_repost_rejects_bad_targets(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    like = create_reaction(conn, bob, post["hash"], liked=True, name="bob", now=1001)
+
+    with pytest.raises(TanError, match="unknown post"):
+        create_repost(conn, bob, "cd" * 32, name="bob", now=1002)
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_repost(conn, bob, like["hash"], name="bob", now=1002)
+    with pytest.raises(TanError, match="cannot repost your own post"):
+        create_repost(conn, alice, post["hash"], name="alice", now=1002)
+
+    # A repost of a repost is a repost of a repost, not of a post.
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1002)
+    with pytest.raises(TanError, match="only posts and replies"):
+        create_repost(conn, alice, repost["hash"], name="alice", now=1003)
+    # And the same post cannot be reposted twice while it stands.
+    with pytest.raises(TanError, match="already been reposted"):
+        create_repost(conn, bob, post["hash"], name="bob", now=1003)
+
+
+def test_repost_to_unlinked_parent_is_rejected(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # reposting it would amplify a post with no chain context.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        create_repost(destination, bob, second["hash"], name="bob", now=1002)
+
+    # Once the chain links up, the same repost is accepted.
+    store_post(destination, first)
+    repost = create_repost(destination, bob, second["hash"], name="bob", now=1003)
+    assert repost["kind"] == "repost"
+
+
+def test_repost_of_uncached_original_shows_without_text(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    post = create_post(source, alice, "original thought", name="alice", now=1000)
+    repost = create_repost(source, bob, post["hash"], name="bob", now=1001)
+
+    # The repost arrives (via gossip or sync) before its original: the
+    # store path keeps it, and the timeline shows it without the
+    # original's text until the original is cached.
+    replica = init_db(tmp_path / "replica.sqlite3")
+    record, is_new = store_post(replica, repost)
+    assert is_new is True
+    items = timeline(replica, [author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] is None
+
+    store(replica, post)
+    items = timeline(replica, [author_of(bob)])
+    assert items[0]["repost_of"]["hash"] == post["hash"]
+    assert items[0]["repost_of"]["text"] == "original thought"
+
+
+def test_repost_of_deleted_original_blanks_the_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "doomed", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+
+    # The repost still stands — only the original was deleted — but
+    # its text is blanked, and reposting the deleted post is refused.
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"] == {
+        "hash": post["hash"],
+        "author": post["author"],
+        "name": "alice",
+        "text": "",
+        "deleted": True,
+    }
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+    with pytest.raises(TanError, match="has been deleted"):
+        create_repost(conn, bob, post["hash"], name="bob", now=1003)
+
+
+def test_repost_of_a_reply(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    repost = create_repost(conn, alice, reply["hash"], name="alice", now=1002)
+    assert repost["kind"] == "repost"
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [
+        repost["hash"],
+        reply["hash"],
+        post["hash"],
+    ]
+    assert items[0]["repost_of"]["hash"] == reply["hash"]
+    assert items[0]["repost_of"]["text"] == "first reply"
+
+
+def test_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    # A repost carries no text of its own, so blocking the original's
+    # author hides the repost itself — its words must not leak
+    # through the reposter's timeline.
+    blocked = [author_of(bob)]
+    items = timeline(conn, [author_of(alice)], exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+    items = timeline(conn, include_all=True, exclude_authors=blocked)
+    assert [item["hash"] for item in items] == [other["hash"]]
+
+
+def test_timeline_drops_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    mute(conn, author_of(bob), name="bob")
+    items = timeline(conn, [author_of(alice)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "muted words" not in json.dumps(items)
+
+
+def test_timeline_drops_repost_matching_muted_keyword(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "crypto secrets", name="alice", now=1000)
+    create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    other = create_post(conn, bob, "clean post", name="bob", now=1002)
+    mute_keyword(conn, "crypto")
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "crypto secrets" not in json.dumps(items)
+
+
+def test_repost_of_edited_original_shows_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "original draft", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    create_edit(conn, alice, post["hash"], "original, fixed", name="alice", now=1002)
+
+    items = timeline(conn, [author_of(bob)])
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "original, fixed"
+    assert "original draft" not in json.dumps(items)
+
+
+def test_author_timeline_drops_repost_of_blocked_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "blocked words", name="bob", now=1000)
+    create_repost(conn, alice, post["hash"], name="alice", now=1001)
+    other = create_post(conn, alice, "alice's own post", name="alice", now=1002)
+
+    items = author_timeline(
+        conn, author_of(alice), exclude_authors=[author_of(bob)]
+    )
+    assert [item["hash"] for item in items] == [other["hash"]]
+    assert "blocked words" not in json.dumps(items)
+
+
+def test_author_timeline_keeps_repost_of_muted_author(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "muted words", name="bob", now=1000)
+    repost = create_repost(conn, alice, post["hash"], name="alice", now=1001)
+
+    # An explicit author lookup still shows the repost, the same way
+    # it still shows a reply to a muted parent.
+    mute(conn, author_of(bob), name="bob")
+    items = author_timeline(conn, author_of(alice))
+    assert [item["hash"] for item in items] == [repost["hash"]]
+    assert items[0]["repost_of"]["text"] == "muted words"
+
+
+def test_repost_can_be_deleted_and_reposted_again(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+    # Deleting your own repost removes it from views and from the count.
+    create_delete(conn, bob, repost["hash"], name="bob", now=1002)
+    assert deleted_targets(conn) == {repost["hash"]}
+    items = timeline(conn, [post["author"], author_of(bob)])
+    assert [item["hash"] for item in items] == [post["hash"]]
+    assert items[0]["reposts"] == 0
+
+    # And reposting again after deleting is allowed.
+    again = create_repost(conn, bob, post["hash"], name="bob", now=1003)
+    assert again["kind"] == "repost"
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+
+def test_repost_counts_distinct_reposters(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "worth sharing", name="alice", now=1000)
+    first = create_repost(conn, bob, post["hash"], name="bob", now=1001)
+    assert repost_counts(conn, [post["hash"]])[post["hash"]]["reposts"] == 1
+
+    # A second repost of the same target from the same author — stored
+    # past create_repost's duplicate guard, as a forked chain could
+    # deliver — still counts as one reposter, not two.
+    body = {
+        "v": 1,
+        "author": author_of(bob),
+        "key": bob.get_public_key().hex(),
+        "name": "bob",
+        "text": "",
+        "created_at": 1002.0,
+        "prev": first["hash"],
+        "kind": "repost",
+        "target": post["hash"],
+    }
+    digest = hash(body, previous=first["hash"])
+    mesg = dict(body, hash=digest, sig=bob.sign(bytes.fromhex(digest)).hex())
+    record, is_new = store_post(conn, mesg)
+    assert is_new is True
+    assert repost_counts(conn, [post["hash"]])[post["hash"]] == {
+        "reposts": 1,
+        "reposted": False,
+    }
+    assert repost_counts(conn, [post["hash"]], viewer=author_of(bob))[
+        post["hash"]
+    ]["reposted"] is True
+
+
+def test_thread_resolves_a_repost_to_its_original(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "thread starter", name="alice", now=1000)
+    reply = create_reply(
+        conn, bob, post["hash"], "first reply", name="bob", now=1001
+    )
+    repost = create_repost(conn, bob, post["hash"], name="bob", now=1002)
+
+    # Naming the repost opens the original's thread; the repost itself
+    # is not a thread entry.
+    assert [item["hash"] for item in thread(conn, repost["hash"][:12])] == [
+        post["hash"],
+        reply["hash"],
+    ]
+    assert resolve_post(conn, repost["hash"][:12])["hash"] == repost["hash"]
+
+
+def test_cli_tan_repost(tmp_path, capsys):
+    bob = RNS.Identity()
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = create_post(conn, bob, "worth sharing", name="bob", now=1000)
+    finally:
+        conn.close()
+
+    # JSON output carries the signed repost entry.
+    assert (
+        main(
+            [
+                "tan", "repost", "--data-dir", str(data_dir),
+                "--no-publish", "--json", post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["repost"]["kind"] == "repost"
+    assert payload["repost"]["target"] == post["hash"]
+    assert payload["published"] is None
+
+    # Text timeline output shows who reposted and the original text.
+    assert (
+        main(["tan", "timeline", "--data-dir", str(data_dir), "--all"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "reposted bob" in out
+    assert "worth sharing" in out
+    assert "↻ 1" in out
+
+    # Reposting the same post again is a clean CLI error, not a traceback.
+    assert (
+        main(
+            [
+                "tan", "repost", "--data-dir", str(data_dir),
+                "--no-publish", post["hash"][:16],
+            ]
+        )
+        != 0
+    )
+    assert "already been reposted" in capsys.readouterr().err
 
 
 def test_quote_chains_verifies_and_annotates(identities, tmp_path):
@@ -3175,7 +3751,9 @@ def test_quote_can_be_liked_deleted_and_replied_to(identities, tmp_path):
 
     # A reaction is not a timeline entry, so it cannot be deleted.
     like = create_reaction(conn, alice, post["hash"], liked=True, name="alice", now=1005)
-    with pytest.raises(TanError, match="only posts, replies and quotes"):
+    with pytest.raises(
+        TanError, match="only posts, replies, reposts and quotes can be deleted"
+    ):
         create_delete(conn, alice, like["hash"], name="alice", now=1006)
 
 
@@ -3201,6 +3779,37 @@ def test_quote_of_deleted_post_renders_blanked(identities, tmp_path):
     }
     # The deleted original's quote count still describes the quoting.
     assert quote_counts(conn, [post["hash"]])[post["hash"]]["quotes"] == 1
+
+
+def test_quote_of_blocked_post_renders_redacted(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, alice, "secret plans", name="alice", now=1000)
+    quote = create_quote(
+        conn, bob, post["hash"], "worth quoting", name="bob", now=1001
+    )
+
+    # Blocking the original's author redacts the embedded original —
+    # name and text included — so the block never leaks through a
+    # quote preview, on the timeline or in search.
+    blocked = {post["author"]}
+    items = timeline(
+        conn, [post["author"], author_of(bob)], exclude_authors=blocked
+    )
+    assert [item["hash"] for item in items] == [quote["hash"]]
+    assert items[0]["quoted"] == {
+        "hash": post["hash"],
+        "author": "",
+        "name": "",
+        "text": "",
+        "deleted": False,
+        "blocked": True,
+    }
+    results = search_posts(conn, "quoting", exclude_authors=blocked)
+    assert [item["hash"] for item in results] == [quote["hash"]]
+    assert results[0]["quoted"]["blocked"] is True
+    assert results[0]["quoted"]["text"] == ""
+    assert results[0]["quoted"]["name"] == ""
 
 
 def test_search_includes_quotes(identities, tmp_path):
@@ -3767,6 +4376,23 @@ def test_cli_timeline_shows_reply_parent(tmp_path, capsys):
     assert reply["reply_to"]["text"] == "cli thread starter"
 
 
+def test_resolve_author_ignores_aliases(tmp_path):
+    from tau.peers import PeerRegistry
+
+    conn = init_db(tmp_path / "tan.sqlite3")
+    registry = PeerRegistry()
+    named = registry.upsert(
+        bytes([1]) * 16, bytes([1]) * 64, name="alice", now=100.0
+    )
+    aliased = registry.upsert(
+        bytes([2]) * 16, bytes([2]) * 64, name="bob", now=200.0
+    )
+    registry.set_alias(aliased.destination_hash, "alice")
+    author, name = resolve_author(conn, "alice", registry=registry)
+    assert author == named.hexhash
+    assert name == "alice"
+
+
 def test_mute_keyword_round_trip(tmp_path):
     conn = init_db(tmp_path / "tan.sqlite3")
     record = mute_keyword(conn, "Crypto", now=1000)
@@ -4265,6 +4891,264 @@ def test_cli_tan_saved_deleted_post(tmp_path, capsys):
     assert "unsaved" in capsys.readouterr().out
     assert main(["tan", "saved", "--data-dir", str(data_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_top_posts_ranks_by_likes_then_recency(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    old_hit = create_post(conn, alice, "old hit", name="alice", now=1000)
+    mid_hit = create_post(conn, bob, "mid hit", name="bob", now=1001)
+    newer_hit = create_post(conn, alice, "newer hit", name="alice", now=1002)
+    fresh_flop = create_post(conn, alice, "fresh flop", name="alice", now=1003)
+    create_reaction(conn, bob, old_hit["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, carol, old_hit["hash"], liked=True, name="carol", now=1005)
+    create_reaction(conn, bob, newer_hit["hash"], liked=True, name="bob", now=1006)
+    create_reaction(conn, carol, mid_hit["hash"], liked=True, name="carol", now=1007)
+
+    ranked = top_posts(conn)
+    assert [post["text"] for post in ranked] == [
+        "old hit",
+        "newer hit",
+        "mid hit",
+        "fresh flop",
+    ]
+    assert [post["likes"] for post in ranked] == [2, 1, 1, 0]
+
+    # A reactor's latest reaction wins: bob unlikes the old hit and it
+    # drops to the one-like tier, newest first among the ties.
+    create_reaction(conn, bob, old_hit["hash"], liked=False, name="bob", now=1008)
+    assert [post["text"] for post in top_posts(conn)] == [
+        "newer hit",
+        "mid hit",
+        "old hit",
+        "fresh flop",
+    ]
+
+    # Limit and author filter compose with the ranking.
+    assert [post["text"] for post in top_posts(conn, limit=2)] == [
+        "newer hit",
+        "mid hit",
+    ]
+    assert [post["text"] for post in top_posts(conn, author=author_of(alice))] == [
+        "newer hit",
+        "old hit",
+        "fresh flop",
+    ]
+
+    # Viewer annotations ride along: alice owns her posts and has not
+    # liked anything, so liked is False and own tracks authorship.
+    ranked = top_posts(conn, viewer=author_of(alice))
+    assert [(post["text"], post["liked"], post["own"]) for post in ranked] == [
+        ("newer hit", False, True),
+        ("mid hit", False, False),
+        ("old hit", False, True),
+        ("fresh flop", False, True),
+    ]
+    with pytest.raises(TanError, match="author must be"):
+        top_posts(conn, author="not-a-hash")
+
+
+def test_top_posts_batches_reaction_lookup(identities, tmp_path, monkeypatch):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    posts = [
+        create_post(conn, alice, f"post {i}", name="alice", now=1000 + i)
+        for i in range(5)
+    ]
+    create_reaction(conn, bob, posts[0]["hash"], liked=True, name="bob", now=2000)
+    monkeypatch.setattr("tau.tangents.tan._SQL_BATCH", 2)
+    ranked = top_posts(conn, limit=1)
+    assert [post["text"] for post in ranked] == ["post 0"]
+    assert ranked[0]["likes"] == 1
+
+
+def test_top_posts_hidden_kinds_do_not_consume_limit(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "visible", name="alice", now=1000)
+    create_post(conn, bob, "ignored", name="bob", now=1001)
+    # Hiding the "post" kind drops every candidate before the limit is
+    # applied, so nothing is returned; an unrestricted ruleset keeps both.
+    assert top_posts(conn, limit=1, ruleset=Ruleset(kinds=frozenset({"like"}))) == []
+    assert [post["text"] for post in top_posts(conn, limit=1, ruleset=Ruleset())] == [
+        "ignored"
+    ]
+
+
+def test_top_posts_hidden_reactions_rank_by_recency(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    older = create_post(conn, alice, "older", name="alice", now=1000)
+    create_post(conn, alice, "newer", name="alice", now=1001)
+    create_reaction(conn, bob, older["hash"], liked=True, name="bob", now=1002)
+    ruleset = Ruleset(kinds=frozenset({"post"}))
+    ranked = top_posts(conn, limit=2, ruleset=ruleset)
+    assert [post["text"] for post in ranked] == ["newer", "older"]
+    # With reactions displayed, the liked post leads again.
+    shown = top_posts(conn, limit=2, ruleset=Ruleset())
+    assert [post["text"] for post in shown] == ["older", "newer"]
+
+
+def test_top_posts_hides_deleted_muted_and_unlinked(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    liked = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    doomed = create_post(conn, alice, "liked then deleted", name="alice", now=1001)
+    noisy = create_post(conn, alice, "CRYPTO to the moon", name="alice", now=1002)
+    reply = create_reply(conn, bob, noisy["hash"], "to the moon", name="bob", now=1003)
+    create_reaction(conn, bob, liked["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, bob, doomed["hash"], liked=True, name="bob", now=1005)
+    create_reaction(conn, alice, noisy["hash"], liked=True, name="alice", now=1006)
+    create_reaction(conn, alice, reply["hash"], liked=True, name="alice", now=1007)
+    create_delete(conn, alice, doomed["hash"], name="alice", now=1008)
+    mute_keyword(conn, "crypto")
+
+    ranked = top_posts(conn)
+    # The deleted post never ranks, and neither does the muted post —
+    # but the liked reply to the muted post still ranks, with its
+    # parent preview blanked like the timeline blanks it.
+    assert [post["text"] for post in ranked] == [
+        "to the moon",
+        "everyone loves this",
+    ]
+    assert ranked[0]["reply_to"]["muted"] is True
+    assert ranked[0]["reply_to"]["text"] == ""
+
+    # An unlinked post never ranks even with likes on it.
+    orphan = create_post(conn, bob, "unlinked hit", name="bob", now=1009)
+    create_reaction(conn, alice, orphan["hash"], liked=True, name="alice", now=1010)
+    conn.execute("UPDATE posts SET linked = 0 WHERE hash = ?", (orphan["hash"],))
+    conn.commit()
+    assert [post["text"] for post in top_posts(conn)] == [
+        "to the moon",
+        "everyone loves this",
+    ]
+
+
+
+
+def test_cli_top(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "first post",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "second post",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # With no likes anywhere the ranking falls back to recency.
+    assert main(["tan", "top", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [post["text"] for post in payload["posts"]] == [
+        "second post",
+        "first post",
+    ]
+
+    # Liking the older post promotes it to the top, and --limit trims.
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        older = feed(conn, all_authors=True)[-1]
+    finally:
+        conn.close()
+    assert (
+        main(
+            [
+                "tan",
+                "like",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                older["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(["tan", "top", "--data-dir", str(data_dir), "--json", "--limit", "1"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "first post"
+    assert payload["posts"][0]["likes"] == 1
+
+
+def test_top_posts_batches_reaction_lookups(identities, tmp_path):
+    # Codex P2 on PR #149: annotating every candidate in one
+    # `reaction_states` call passes all hashes to a single IN (...)
+    # query, which raises "too many SQL variables" past 999 posts on
+    # SQLite builds with the 999-variable limit. The ranking must
+    # batch the lookup like thread() does; this pins the ranking at
+    # real scale, past the limit and past several batches.
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    for index in range(1005):
+        create_post(conn, alice, f"post {index}", name="alice", now=1000 + index)
+    winner = create_post(conn, bob, "the winner", name="bob", now=3000)
+    create_reaction(conn, alice, winner["hash"], liked=True, name="alice", now=3001)
+
+    ranked = top_posts(conn, limit=1)
+    assert [post["text"] for post in ranked] == ["the winner"]
+    assert ranked[0]["likes"] == 1
+
+
+def test_top_posts_hides_muted_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    loved = create_post(conn, alice, "everyone loves this", name="alice", now=1000)
+    noisy = create_post(conn, bob, "loud hit", name="bob", now=1001)
+    reply = create_reply(conn, alice, noisy["hash"], "agreed", name="alice", now=1002)
+    create_reaction(conn, alice, noisy["hash"], liked=True, name="alice", now=1003)
+    create_reaction(conn, bob, loved["hash"], liked=True, name="bob", now=1004)
+    create_reaction(conn, bob, reply["hash"], liked=True, name="bob", now=1005)
+    mute(conn, author_of(bob), name="bob")
+
+    ranked = top_posts(conn)
+    # Bob's own liked post never ranks, but alice's reply to it still
+    # ranks — with no parent preview, so bob's name and text never
+    # surface through it.
+    assert [post["text"] for post in ranked] == ["agreed", "everyone loves this"]
+    assert ranked[0]["reply_to"] is None
+
+    # An explicit author lookup still ranks a muted author's posts,
+    # like timeline --author does.
+    assert [post["text"] for post in top_posts(conn, author=author_of(bob))] == [
+        "loud hit"
+    ]
+
+    # But even in an explicit lookup, a reply to a muted author keeps
+    # no parent preview — the mute never leaks through a preview.
+    by_alice = top_posts(conn, author=author_of(alice))
+    assert [post["text"] for post in by_alice] == ["agreed", "everyone loves this"]
+    assert by_alice[0]["reply_to"] is None
 
 
 
