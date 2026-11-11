@@ -1684,6 +1684,13 @@ def test_send_group_message_expired_leg_is_not_delivered(tmp_path):
 
 
 def test_send_group_message_expired_duplicate_still_counts_delivered(tmp_path):
+    """Compatibility with pre-fix peers only.
+
+    Current receivers always answer an expired group message with
+    ``duplicate=False``, so this ``expired+duplicate`` response can only
+    come from a peer that predates that change. Such a peer already saw
+    the message, so the leg still counts as delivered.
+    """
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough for queueing
     group = node.groups.create(
@@ -2016,33 +2023,6 @@ def test_deliver_entry_drops_expired_group_message(tmp_path):
     # dropped the same way) and is never reported delivered.
     assert node.mailbox.get_outbox(entry.id) is None
     assert entry.id not in node._delivered_ids
-
-
-def test_deliver_entry_counts_expired_duplicate_group_message_delivered(tmp_path):
-    node = make_node(tmp_path)
-    node.reticulum = object()
-    group = node.groups.create(
-        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
-    )
-    entry = node.mailbox.enqueue(
-        to=bytes.fromhex(OTHER_HASH),
-        text="already there",
-        expires_at=time.time() + 300,
-        group={
-            "id": group["id"],
-            "name": "weekend",
-            "creator": OWN_HASH,
-            "members": [OWN_HASH, OTHER_HASH],
-        },
-    )
-
-    def fake_request(peer, path, payload, timeout, *, deadline=None):
-        return {"ok": True, "expired": True, "duplicate": True}
-
-    node._request = fake_request  # type: ignore[method-assign]
-    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
-    assert node.mailbox.get_outbox(entry.id) is None
-    assert entry.id in node._delivered_ids
 
 
 # -- CLI ---------------------------------------------------------------------
