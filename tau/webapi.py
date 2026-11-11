@@ -2654,15 +2654,19 @@ class WebBridge:
                 # not in the registry.
                 if cleaned == own_hash:
                     raise ValueError("the creator is already a member")
-                peer = self.node.registry.get(cleaned)
-                if peer is None or peer.destination_hash.hex() != cleaned:
+                try:
+                    peer = self.node.registry.resolve(cleaned)
+                except PeerError as exc:
+                    raise ValueError(str(exc)) from exc
+                if peer is None:
                     raise ValueError(f"unknown peer: {cleaned}")
-                if cleaned in roster:
+                resolved = peer.destination_hash.hex()
+                if resolved in roster:
                     raise ValueError(
                         f"{peer.display_name} is already a member of"
                         f" {group['name']!r}"
                     )
-                roster.append(cleaned)
+                roster.append(resolved)
             else:
                 # A roster hash drops the member without a registry
                 # lookup, so an offline member can still be removed.
@@ -2671,7 +2675,10 @@ class WebBridge:
                 if len(cleaned) == 32 and cleaned in roster:
                     resolved = cleaned
                 else:
-                    peer = self.node.registry.get(cleaned)
+                    try:
+                        peer = self.node.registry.resolve(cleaned)
+                    except PeerError as exc:
+                        raise ValueError(str(exc)) from exc
                     if peer is None:
                         raise ValueError(
                             f"{target.strip()} is not a member of"
@@ -4389,3 +4396,4 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
+))
