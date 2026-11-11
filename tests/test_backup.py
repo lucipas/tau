@@ -435,14 +435,23 @@ def test_backup_stores_hard_linked_received_files_as_regular_members(
 
 
 def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
-    # A `.tau-received-*.tmp` file is a transfer interrupted before its
-    # content was linked into place — it was never a received file, so
-    # the backup leaves it out instead of archiving a partial file.
+    # A `.tau-received-*.tmp` file directly under `files/` is a transfer
+    # interrupted before its content was linked into place — it was
+    # never a received file, so the backup leaves it out instead of
+    # archiving a partial file.  A *published* file whose name merely
+    # starts with the same prefix is a real received file and is
+    # backed up like any other.
     node_a = _init_node(tmp_path, "a", "alice")
     received = _seed_state(node_a)
     capsys.readouterr()
-    sender = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    (sender / ".tau-received-abc123.tmp").write_bytes(b"half-written")
+    (node_a / "files" / ".tau-received-abc123.tmp").write_bytes(b"half-written")
+    lookalike = (
+        node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-received-report.pdf"
+    )
+    lookalike.write_bytes(b"%PDF-1.4 fake\n")
+    received["files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.tau-received-report.pdf"] = (
+        b"%PDF-1.4 fake\n"
+    )
     archive = tmp_path / "backup.tar.gz"
     assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
     capsys.readouterr()
@@ -453,6 +462,7 @@ def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
         [name for name in BACKUP_FILES if (node_a / name).is_file()]
         + sorted(received)
     )
+    assert not any(name.endswith(".tmp") for name in manifest["files"])
 
 
 def test_restore_force_removes_stale_groups_blocklist_files(tmp_path, capsys):

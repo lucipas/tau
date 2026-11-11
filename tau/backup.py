@@ -124,10 +124,7 @@ def _received_files(config: TauConfig) -> List[str]:
     symlinked sender directory, or a symlinked file is skipped, so a
     backup can never smuggle in a path outside the data directory.
     A directory that cannot be listed is an error, never an empty
-    result, so a backup cannot silently omit received files.  A
-    leftover ``.tau-received-*.tmp`` file — a transfer interrupted
-    between the write and the link into place — is skipped: it was
-    never published as a received file.
+    result, so a backup cannot silently omit received files.
     """
     files_dir = config.files_dir
     if files_dir.is_symlink() or not files_dir.is_dir():
@@ -148,8 +145,6 @@ def _received_files(config: TauConfig) -> List[str]:
             ) from exc
         for entry in entries:
             if entry.is_symlink() or not entry.is_file():
-                continue
-            if entry.name.startswith(".tau-received-"):
                 continue
             members.append(f"{FILES_DIR_NAME}/{sender_dir.name}/{entry.name}")
     return members

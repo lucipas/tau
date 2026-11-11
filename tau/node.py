@@ -371,10 +371,13 @@ def _read_resource_data(resource: Any) -> Optional[bytes]:
 def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     """Write *data* to a new file in *directory*, never overwriting.
 
-    The bytes go to a temporary file in the same directory first, then
-    the finished file is linked into place: a name appears only once
-    its content is complete, so a concurrent reader — a live backup,
-    the web console — never sees a half-written received file.  Each
+    The bytes go to a temporary file beside the sender directory
+    first, then the finished file is linked into place: a name appears
+    only once its content is complete, so a concurrent reader — a live
+    backup, the web console — never sees a half-written received file.
+    The temporary file lives directly under ``files/``, not inside the
+    sender directory, so it can never be mistaken for a received file
+    (backup only enumerates files inside sender directories).  Each
     candidate is linked with ``os.link``, so an existing name,
     including a symlink, is never replaced; the next numbered name is
     tried instead.  The check and the link are one syscall, so
@@ -383,7 +386,7 @@ def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     stem = Path(name).stem
     suffix = Path(name).suffix
     fd, tmp_name = tempfile.mkstemp(
-        dir=directory, prefix=".tau-received-", suffix=".tmp"
+        dir=directory.parent, prefix=".tau-received-", suffix=".tmp"
     )
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -402,7 +405,8 @@ def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
             return candidate
     finally:
         # Best effort: a crash between link and unlink leaves a
-        # `.tau-received-*.tmp` file behind, which backup skips.
+        # `.tau-received-*.tmp` file under `files/`, which is never
+        # enumerated as a received file.
         try:
             os.unlink(tmp_name)
         except OSError:  # pragma: no cover - best effort
