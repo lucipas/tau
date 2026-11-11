@@ -393,6 +393,11 @@ tau send --to alice "hi" --no-queue
 tau send --to alice --kind ping "are you there?"
 tau messages --kind ping
 
+# When a node is already serving on this data directory, `tau send`
+# runs through it over a local socket instead of starting a second
+# Reticulum instance on the same identity — same result, same queueing.
+# A stale socket left by a crashed serve simply falls back to a local send.
+
 # See what is waiting on offline peers
 tau outbox
 

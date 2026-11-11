@@ -3614,9 +3614,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
             _restore_stop_handlers(previous_handlers)
             raise
 
+    send_server = None
+    if hasattr(socket, "AF_UNIX"):
+        from .local_send import SendServer
+
+        try:
+            send_server = SendServer(
+                config.data_dir,
+                lambda **request: _send_local_message(node, **request),
+            )
+        except Exception:
+            # The send socket is best-effort: a data directory too long
+            # for a Unix socket path, or a filesystem without socket
+            # support, must not stop the node from serving. One-shot
+            # sends fail closed in that case — the lock probe refuses to
+            # start a second instance on this identity — so no send is
+            # lost silently.
+            log.warning("Could not start the local send server", exc_info=True)
+
     info = node.info()
+    send_socket = send_server is not None
     if _json_mode(args):
-        _emit_event(args, "ready", node=info)
+        _emit_event(args, "ready", node=info, send_socket=send_socket)
         if console_url is not None:
             _emit_event(args, "web", url=console_url, api=f"{console_url}api/")
         if social_app is not None:
@@ -3639,6 +3658,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     f"  lxmf:        propagation {lxmf_info.get('propagation')}"
                 )
         print(f"  data dir:    {config.data_dir}")
+        if not send_socket and hasattr(socket, "AF_UNIX"):
+            # Best-effort serve without a send socket: say so up front,
+            # so the operator can see one-shot sends will fail while
+            # this node serves instead of wondering why.
+            print(
+                "  send:        socket unavailable — tau send fails while "
+                "this node serves"
+            )
         mailbox_counts = info.get("mailbox") or {}
         if mailbox_counts.get("outbox") or mailbox_counts.get("held"):
             print(
@@ -3662,6 +3689,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             while not stop.wait(0.5):
                 pass
     finally:
+        if send_server is not None:
+            send_server.stop()
         if publish_server is not None:
             publish_server.stop()
         if bridge is not None:
@@ -4198,8 +4227,8 @@ def cmd_id_import(args: argparse.Namespace) -> int:
     # against a concurrent `tau init` on the same directory.  Lock order
     # (instance, then identity) matches `TauNode.start`, which takes the
     # instance lock before loading or creating its identity.
-    # Note the instance lock is POSIX-only (no-op without fcntl), the
-    # same limitation `tau serve` itself accepts.
+    # Note the instance lock is a no-op on a platform with neither
+    # fcntl nor msvcrt, the same limitation `tau serve` itself accepts.
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
     lock.acquire()
     try:
@@ -4272,6 +4301,376 @@ def cmd_id_import(args: argparse.Namespace) -> int:
                 "(local identity changed; re-verify peers)"
             )
     return _EXIT_OK
+
+
+def _resolve_send_reply_to(
+    node: TauNode, target: str, ref: str, discover_timeout: Optional[float]
+) -> Dict[str, Any]:
+    """Resolve ``--reply-to`` to an ``in_reply_to`` wire reference on *node*.
+
+    Derive the conversation hash without network discovery, so a reply
+    to a queued message still reaches the outbox when the recipient is
+    offline; discovery is only a fallback.
+    """
+    target_hash = node._target_hash(target)
+    if target_hash is None:
+        peer = node.resolve_peer(
+            target,
+            timeout=float(
+                discover_timeout if discover_timeout is not None else 10.0
+            ),
+        )
+        target_hash = peer.destination_hash
+    return _resolve_reply_target(
+        Inbox(node.config.inbox_path),
+        node.mailbox,
+        ref,
+        target_hash.hex(),
+    )
+
+
+def _finalize_send_result(
+    response: Dict[str, Any],
+    *,
+    target: str,
+    expires_at: Optional[float],
+    queued_before: set,
+) -> Dict[str, Any]:
+    """Massage a raw send response into the result ``tau send`` reports.
+
+    The peer response is untrusted JSON: keep the local recipient label
+    authoritative, so a peer cannot relabel this result. A "queued"
+    claim only counts with a new id (see below); a direct delivery keeps
+    no "queued" key at all, preserving the established single-recipient
+    JSON shape.
+    """
+    result = dict(response)
+    result["target"] = target
+    if expires_at is not None:
+        result["expires_at"] = expires_at
+    if response.get("queued"):
+        result["queued"] = (
+            isinstance(response.get("id"), str)
+            and response["id"] not in queued_before
+        )
+        if result["queued"] and "to" not in response:
+            result["to"] = target
+    return result
+
+
+def _reconcile_queued_sends(
+    node: TauNode, results: List[Dict[str, Any]], expires_at: Optional[float]
+) -> None:
+    """Flip queued results to delivered when a flush moved them.
+
+    After a queued send, give reachable peers a brief chance to take a
+    sealed copy (or the message itself), then report as delivered any
+    message that left the outbox during the flush.
+    """
+    if not any(result.get("queued") for result in results):
+        return
+    node.flush_outbox(timeout=3.0, max_peers=5)
+    for result in results:
+        if not result.get("queued"):
+            continue
+        message_id = result["id"]
+        # Leaving the outbox is not proof of delivery: an entry can also
+        # expire or be cancelled. Only a recorded delivery counts.
+        sent = node.mailbox.sent_record(message_id)
+        if node.mailbox.get_outbox(message_id) is None and (
+            sent is not None and sent.get("delivered_at") is not None
+        ):
+            to_hex = result["to"]
+            target = result["target"]
+            # Keep the private "_" fields (e.g. the resolved reply id).
+            private = {k: v for k, v in result.items() if k.startswith("_")}
+            result.clear()
+            result.update(
+                {
+                    "target": target,
+                    "ok": True,
+                    "delivered": True,
+                    "id": message_id,
+                    "to": to_hex,
+                    **(
+                        {"expires_at": expires_at}
+                        if expires_at is not None
+                        else {}
+                    ),
+                    **private,
+                }
+            )
+
+
+def _wait_for_queued_sends(
+    node: TauNode, results: List[Dict[str, Any]], wait: float
+) -> None:
+    """Wait for each queued result in turn, each with the full budget.
+
+    The ``--wait`` handling from :func:`cmd_send`, shared by the local
+    send path and the send server so both routes report the same
+    result: ``--wait`` replaces the one-shot flush, a direct delivery
+    records ``waited: 0.0``, and a queued message still queued at the
+    deadline — or one that left the queue without a delivery
+    confirmation from this node — is recorded as not delivered.
+    """
+    for result in results:
+        if not result.get("queued"):
+            if result.get("ok", True):
+                result["delivered"] = True
+                result["waited"] = 0.0
+            continue
+        started = time.monotonic()
+        delivered = node.wait_for_delivery(result["id"], timeout=wait)
+        waited = time.monotonic() - started
+        if delivered:
+            result.pop("queued", None)
+            result["delivered"] = True
+            result["waited"] = round(waited, 1)
+        elif node.mailbox.get_outbox(result["id"]) is None:
+            # The entry left the queue without a delivery confirmation
+            # from this node: cancelled by another process, or delivered
+            # by one.  Either way it must not be reported as delivered.
+            result["queued"] = False
+            result["delivered"] = False
+            result["waited"] = round(waited, 1)
+        else:
+            result["delivered"] = False
+            result["waited"] = round(waited, 1)
+
+
+def _send_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    text: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+    queue: bool = True,
+    expires_at: Optional[float] = None,
+    reply_to: Optional[str] = None,
+    kind: Optional[str] = None,
+    wait: float = 0.0,
+) -> Dict[str, Any]:
+    """Send one DM on the running node, for the local send server.
+
+    Mirrors the one-shot path in :func:`cmd_send` (same queued-before
+    snapshot, same queued-to-delivered flush reconciliation) so a send
+    routed through the serving node reports the same result. The
+    resolved reply id travels back under ``_reply_id`` for the caller's
+    human-readable output; callers strip it before printing.  With
+    ``--wait`` the wait replaces the flush reconciliation (see
+    :func:`_wait_for_queued_sends`).
+    """
+    queued_before = {entry.id for entry in node.mailbox.outbox_list()}
+    in_reply_to = None
+    if reply_to is not None:
+        in_reply_to = _resolve_send_reply_to(
+            node, target, reply_to, discover_timeout
+        )
+    response = node.send_message(
+        target,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+        queue=bool(queue),
+        in_reply_to=in_reply_to,
+        expires_at=expires_at,
+        kind=kind,
+    )
+    result = _finalize_send_result(
+        response, target=target, expires_at=expires_at, queued_before=queued_before
+    )
+    if in_reply_to is not None:
+        result["_reply_id"] = in_reply_to["id"]
+    if wait > 0:
+        _wait_for_queued_sends(node, [result], wait)
+    else:
+        _reconcile_queued_sends(node, [result], expires_at)
+    return result
+
+
+def _send_via_local_node(
+    args: argparse.Namespace,
+    config: TauConfig,
+    text: str,
+    targets: List[str],
+    expires_at: Optional[float],
+    reply_ids: Dict[str, str],
+    kind: Optional[str] = None,
+    wait: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """One-shot send on a node this process starts and stops itself."""
+    node = TauNode(config, name=config.name)
+    node.start()
+    results: List[Dict[str, Any]] = []
+    try:
+        for target in targets:
+            # Outbox ids present before this call: only this node's own
+            # queue path creates an entry for the message it just queued,
+            # so a "queued" reply is only genuine when its id is new
+            # since this snapshot. A peer claiming queued with a
+            # pre-existing id (e.g. one it holds a sealed copy of) is
+            # treated as delivered — the link request succeeded.
+            queued_before = {entry.id for entry in node.mailbox.outbox_list()}
+            try:
+                reply_to = None
+                if getattr(args, "reply_to", None):
+                    reply_to = _resolve_send_reply_to(
+                        node,
+                        target,
+                        args.reply_to,
+                        float(getattr(args, "discover_timeout", 10.0)),
+                    )
+                    reply_ids[target] = reply_to["id"]
+                response = node.send_message(
+                    target,
+                    text,
+                    timeout=float(getattr(args, "timeout", 20.0)),
+                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    queue=not getattr(args, "no_queue", False),
+                    in_reply_to=reply_to,
+                    expires_at=expires_at,
+                    kind=kind,
+                )
+            except (NodeError, PeerError, MailboxError) as exc:
+                if len(targets) == 1:
+                    # Single recipient keeps the historical behaviour:
+                    # the error reaches main() and exits non-zero.
+                    raise
+                # One recipient failing must not stop the rest; the
+                # failure is reported per recipient below. This also
+                # covers a full outbox: enqueue raises MailboxFull
+                # inside send_message, and that must not abort the
+                # remaining recipients.
+                results.append({"target": target, "ok": False, "error": str(exc)})
+                continue
+            results.append(
+                _finalize_send_result(
+                    response,
+                    target=target,
+                    expires_at=expires_at,
+                    queued_before=queued_before,
+                )
+            )
+        if wait > 0:
+            _wait_for_queued_sends(node, results, wait)
+        else:
+            _reconcile_queued_sends(node, results, expires_at)
+    finally:
+        node.stop()
+    return results
+
+
+def _send_via_running_node(
+    args: argparse.Namespace,
+    config: TauConfig,
+    text: str,
+    targets: List[str],
+    expires_at: Optional[float],
+    reply_ids: Dict[str, str],
+    kind: Optional[str] = None,
+    wait: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Send through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    results: List[Dict[str, Any]] = []
+    for target in targets:
+        try:
+            result = send_running(
+                config.data_dir,
+                target=target,
+                text=text,
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                queue=not getattr(args, "no_queue", False),
+                expires_at=expires_at,
+                reply_to=getattr(args, "reply_to", None),
+                kind=kind,
+                wait=wait,
+            )
+        except LocalIPCUnavailable as exc:
+            raise NodeError(
+                "the running node stopped answering mid-send; retry the send"
+            ) from exc
+        except (NodeError, PeerError, MailboxError) as exc:
+            if len(targets) == 1:
+                raise
+            results.append({"target": target, "ok": False, "error": str(exc)})
+            continue
+        reply_id = result.pop("_reply_id", None)
+        if reply_id is not None:
+            reply_ids[target] = reply_id
+        results.append(result)
+    return results
+
+
+#: How long a one-shot send waits for a serving node's socket to appear
+#: (or a transient lock holder to finish) before failing closed.
+_SEND_ROUTE_WAIT_SECONDS = 10.0
+
+
+def _instance_lock_free(config: TauConfig) -> bool:
+    """True when no live process holds the data-directory lock.
+
+    The probe is the ground truth: taking the lock (and releasing it)
+    is the only way to know no holder owns the directory.  A PID read
+    from the lock file is never trusted on its own — a holder records
+    its PID just after taking the lock, so the file can still name a
+    dead predecessor while a new holder is starting up, and a dead
+    PID then reads as "free" while a serve is mid-startup.  The probe
+    holds the lock only for microseconds; a `tau serve` starting in
+    that exact window fails fast with "already serving" and can be
+    retried, which beats a false "free" starting a second node on the
+    same identity.
+    """
+    probe = InstanceLock(config.instance_lock_path, config.data_dir)
+    try:
+        probe.acquire()
+    except InstanceAlreadyRunning:
+        return False
+    probe.release()
+    return True
+
+
+def _send_routes_via_running_node(config: TauConfig) -> bool:
+    """True when a serving node should carry the send; False for a local node.
+
+    A serving node holds the data-directory lock for its whole life but
+    answers on its send socket only between startup and shutdown. A
+    socket that answers wins. Otherwise the lock decides: when it is free
+    no node owns the directory (a stale socket is harmless), so a local
+    one-shot node may start. When it is held, the serve may still be
+    starting, so poll briefly for the socket; the holder may also be
+    transient — a standalone `tau tan post` holds the lock without
+    running a send server — so the poll also watches for the lock to
+    free, and a local send proceeds the moment it does. Only a lock
+    still held after the wait fails closed instead of starting a second
+    node on the same identity.
+    """
+    from .local_send import send_server_available
+
+    has_socket = hasattr(socket, "AF_UNIX")
+    if has_socket and send_server_available(config.data_dir):
+        return True
+    config.prepare()
+    if _instance_lock_free(config):
+        return False
+    deadline = time.monotonic() + _SEND_ROUTE_WAIT_SECONDS
+    while True:
+        if has_socket and send_server_available(config.data_dir):
+            return True
+        if _instance_lock_free(config):
+            return False
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    raise NodeError(
+        "a tau node holds this data directory but is not accepting "
+        "sends; retry shortly"
+    ) from None
 
 
 def cmd_backup(args: argparse.Namespace) -> int:
@@ -4388,143 +4787,29 @@ def cmd_send(args: argparse.Namespace) -> int:
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
-    node = TauNode(config, name=config.name)
-    node.start()
+
     targets = args.to if isinstance(args.to, list) else [args.to]
-    results: List[Dict[str, Any]] = []
     reply_ids: Dict[str, str] = {}
-    wait_failed = False
-    try:
-        for target in targets:
-            # Outbox ids present before this call: only this node's own
-            # queue path creates an entry for the message it just queued,
-            # so a "queued" reply is only genuine when its id is new
-            # since this snapshot. A peer claiming queued with a
-            # pre-existing id (e.g. one it holds a sealed copy of) is
-            # treated as delivered — the link request succeeded.
-            queued_before = {entry.id for entry in node.mailbox.outbox_list()}
-            try:
-                reply_to = None
-                if getattr(args, "reply_to", None):
-                    # Derive the conversation hash without network
-                    # discovery, so a reply to a queued message still
-                    # reaches the outbox when the recipient is offline;
-                    # discovery is only a fallback.
-                    target_hash = node._target_hash(target)
-                    if target_hash is None:
-                        peer = node.resolve_peer(
-                            target,
-                            timeout=float(
-                                getattr(args, "discover_timeout", 10.0)
-                            ),
-                        )
-                        target_hash = peer.destination_hash
-                    reply_to = _resolve_reply_target(
-                        Inbox(config.inbox_path),
-                        node.mailbox,
-                        args.reply_to,
-                        target_hash.hex(),
-                    )
-                    reply_ids[target] = reply_to["id"]
-                response = node.send_message(
-                    target,
-                    text,
-                    timeout=float(getattr(args, "timeout", 20.0)),
-                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
-                    queue=not getattr(args, "no_queue", False),
-                    in_reply_to=reply_to,
-                    expires_at=expires_at,
-                    kind=kind,
-                )
-            except (NodeError, PeerError, MailboxError) as exc:
-                if len(targets) == 1:
-                    # Single recipient keeps the historical behaviour:
-                    # the error reaches main() and exits non-zero.
-                    raise
-                # One recipient failing must not stop the rest; the
-                # failure is reported per recipient below. This also
-                # covers a full outbox: enqueue raises MailboxFull
-                # inside send_message, and that must not abort the
-                # remaining recipients.
-                results.append({"target": target, "ok": False, "error": str(exc)})
-                continue
-            # The peer response is untrusted JSON: keep the local
-            # recipient label authoritative, so a peer cannot relabel
-            # this result. A "queued" claim only counts with a new id
-            # (see above); a direct delivery keeps no "queued" key at
-            # all, preserving the established single-recipient JSON shape.
-            result = dict(response)
-            result["target"] = target
-            if expires_at is not None:
-                result["expires_at"] = expires_at
-            if response.get("queued"):
-                result["queued"] = (
-                    isinstance(response.get("id"), str)
-                    and response["id"] not in queued_before
-                )
-                if result["queued"] and "to" not in response:
-                    result["to"] = target
-            results.append(result)
-        if wait > 0:
-            # --wait replaces the one-shot flush below: wait for each
-            # queued message in turn, each with the full budget, and
-            # record the outcome on its result.  A direct delivery
-            # records `waited: 0.0`, so --json callers always see
-            # `delivered` and `waited` when they passed --wait.
-            for result in results:
-                if not result.get("queued"):
-                    if result.get("ok", True):
-                        result["delivered"] = True
-                        result["waited"] = 0.0
-                    continue
-                started = time.monotonic()
-                delivered = node.wait_for_delivery(result["id"], timeout=wait)
-                waited = time.monotonic() - started
-                if delivered:
-                    result.pop("queued", None)
-                    result["delivered"] = True
-                    result["waited"] = round(waited, 1)
-                elif node.mailbox.get_outbox(result["id"]) is None:
-                    # The entry left the queue without a delivery
-                    # confirmation from this node: cancelled by another
-                    # process, or delivered by one.  Either way it must
-                    # not be reported as delivered.
-                    result["queued"] = False
-                    result["delivered"] = False
-                    result["waited"] = round(waited, 1)
-                    wait_failed = True
-                else:
-                    result["delivered"] = False
-                    result["waited"] = round(waited, 1)
-                    wait_failed = True
-        elif any(result.get("queued") for result in results):
-            # One-shot send: give reachable peers a brief chance to take a
-            # sealed copy (or the message itself) before this process exits.
-            node.flush_outbox(timeout=3.0, max_peers=5)
-            for result in results:
-                if result.get("queued") and node.mailbox.get_outbox(result["id"]) is None:
-                    message_id = result["id"]
-                    to_hex = result["to"]
-                    target = result["target"]
-                    result.clear()
-                    result.update(
-                        {
-                            "target": target,
-                            "ok": True,
-                            "delivered": True,
-                            "id": message_id,
-                            "to": to_hex,
-                            **(
-                                {"expires_at": expires_at}
-                                if expires_at is not None
-                                else {}
-                            ),
-                        }
-                    )
-    finally:
-        node.stop()
+    # A serving node owns the data directory: send through it instead of
+    # starting a second Reticulum instance on the same identity.
+    if _send_routes_via_running_node(config):
+        results = _send_via_running_node(
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+        )
+    else:
+        results = _send_via_local_node(
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+        )
 
     failed = [result for result in results if not result.get("ok", True)]
+    # --wait outcomes are recorded on the results by the send path
+    # (see _wait_for_queued_sends): a waited result that is not
+    # delivered failed the wait, whether it is still queued or left the
+    # queue without a delivery confirmation.
+    wait_failed = any(
+        result.get("waited") is not None and result.get("delivered") is False
+        for result in results
+    )
     if _json_mode(args):
         if len(results) == 1 and not failed:
             # Single recipient keeps the historical bare-response shape.

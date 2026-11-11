@@ -215,6 +215,8 @@ class NotAMemberError(NodeError):
     A changed roster or a non-member sender is a permanent refusal, so
     the group leg is not queued for retry.
     """
+
+
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
