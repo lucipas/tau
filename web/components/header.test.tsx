@@ -19,16 +19,25 @@ function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
   };
 }
 
-function renderHeader(onRename = vi.fn().mockResolvedValue(undefined)) {
-  return render(
+function renderHeader(
+  onRename: (name: string) => Promise<void> = () => Promise.resolve(),
+  overrides: Record<string, unknown> = {},
+) {
+  const onBackup = vi.fn();
+  render(
     <Header
       node={makeNode()}
       connection="live"
       announcing={false}
       onAnnounce={() => {}}
       onRename={onRename}
+      backingUp={false}
+      backupError={null}
+      onBackup={onBackup}
+      {...overrides}
     />,
   );
+  return { onBackup };
 }
 
 describe("Header rename", () => {
@@ -106,5 +115,44 @@ describe("Header rename", () => {
 
     expect(onRename).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("node name")).toBeNull();
+  });
+});
+
+describe("Header backup button", () => {
+  it("calls onBackup when the back up button is clicked", () => {
+    const { onBackup } = renderHeader();
+
+    fireEvent.click(screen.getByRole("button", { name: "back up" }));
+
+    expect(onBackup).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the button and shows progress while a backup is running", () => {
+    renderHeader(undefined, { backingUp: true });
+
+    const button = screen.getByRole("button", { name: "backing up…" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("disables the button without a node", () => {
+    renderHeader(undefined, { node: null });
+
+    expect(
+      (screen.getByRole("button", { name: "back up" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("shows the backup error", () => {
+    renderHeader(undefined, { backupError: "no data directory" });
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("no data directory");
+  });
+
+  it("shows no error when the last backup succeeded", () => {
+    renderHeader(undefined, { backupError: null });
+
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

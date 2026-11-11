@@ -7,7 +7,7 @@ import type { ConnectionState } from "@/lib/use-tau";
 import type { NodeInfo } from "@/lib/types";
 import { shortHash } from "@/lib/format";
 
-import { BoltIcon, CopyButton, SignalIcon, StatusDot } from "./ui";
+import { BoltIcon, CopyButton, DownloadIcon, SignalIcon, StatusDot } from "./ui";
 
 const connectionLabel: Record<ConnectionState, string> = {
   live: "live",
@@ -27,12 +27,18 @@ export function Header({
   announcing,
   onAnnounce,
   onRename,
+  backingUp,
+  backupError,
+  onBackup,
 }: {
   node: NodeInfo | null;
   connection: ConnectionState;
   announcing: boolean;
   onAnnounce: () => void;
   onRename: (name: string) => Promise<void>;
+  backingUp: boolean;
+  backupError: string | null;
+  onBackup: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -198,6 +204,26 @@ export function Header({
             <BoltIcon className="h-3.5 w-3.5" />
             {announcing ? "announcing…" : "announce"}
           </button>
+
+          <button
+            type="button"
+            onClick={onBackup}
+            disabled={!node || backingUp}
+            title="Download a backup archive of this node's data directory"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-panel/70 px-3 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-mist/50 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <DownloadIcon className="h-3.5 w-3.5" />
+            {backingUp ? "backing up…" : "back up"}
+          </button>
+          {backupError ? (
+            <span
+              role="alert"
+              className="max-w-64 truncate font-mono text-[11px] text-rose-300"
+              title={backupError}
+            >
+              backup failed: {backupError}
+            </span>
+          ) : null}
         </div>
       </div>
     </header>

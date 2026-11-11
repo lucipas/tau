@@ -1,13 +1,23 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type {
+  TanAuthor,
+  TanExportDocument,
+  TanImportError,
+  TanImportResult,
+  TanLiker,
+  TanPost,
+  TanSuggestion,
+  TanVerifyReport,
+} from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
 import { CopyButton, SectionLabel, SendIcon, StatusDot } from "./ui";
+import { RulesSection } from "./rules-section";
 
 export function SocialConsole() {
   const tan = useTan();
@@ -16,8 +26,12 @@ export function SocialConsole() {
   const [keyword, setKeyword] = useState("");
   const [searchText, setSearchText] = useState("");
   const [replyTarget, setReplyTarget] = useState<TanPost | null>(null);
+  const [quoteTarget, setQuoteTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Audit failures render beside the verify button, not under the
+  // post composer: the shared error state is too far from the action.
+  const [verifyError, setVerifyError] = useState<string | null>(null);
   // Whether the feed shows the saved list instead of the timeline.
   // Saved posts load on demand, not on the feed's poll tick.
   const [showSaved, setShowSaved] = useState(false);
@@ -35,16 +49,47 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Hashes with a repost request in flight; see submitRepost.
+  const repostingRef = useRef<Set<string>>(new Set());
+  // Hash of the post whose liker list is open, if any, and the likers for
+  // it (null while the list is loading). Only one list is open at a time,
+  // and it is always fetched fresh on open so a like toggle cannot leave
+  // a stale list behind.
+  const [likersOpen, setLikersOpen] = useState<string | null>(null);
+  const [likers, setLikers] = useState<TanLiker[] | null>(null);
+  const [likersTotal, setLikersTotal] = useState(0);
+  // Bumped on every open, close, or switch of the liker list. A pending
+  // fetch or like completion applies only if the generation it started
+  // under is still current, so superseded results never reach the UI.
+  const likersGeneration = useRef(0);
+
+  function closeLikers() {
+    likersGeneration.current += 1;
+    setLikersOpen(null);
+    setLikers(null);
+    setLikersTotal(0);
+  }
   // Author hashes with a mute request in flight; same guard as deleting.
   const [muting, setMuting] = useState<ReadonlySet<string>>(() => new Set());
   // The feed shows the timeline or, when the mentions view is selected,
   // the replies to your own posts instead.
   const shown = tan.showMentions ? tan.mentions : tan.posts;
-
   async function submitPost() {
     if (!text.trim()) return;
     setError(null);
     try {
+      if (quoteTarget) {
+        const submittedHash = quoteTarget.hash;
+        const submittedText = text.trim();
+        await tan.quote(submittedHash, submittedText);
+        // Clear only the composer state that still belongs to this quote, so
+        // a target or draft changed while the request was in flight survives.
+        setText((current) => (current.trim() === submittedText ? "" : current));
+        setQuoteTarget((current) =>
+          current?.hash === submittedHash ? null : current,
+        );
+        return;
+      }
       await tan.publish(text.trim(), replyTarget?.hash);
       setText("");
       setReplyTarget(null);
@@ -59,6 +104,39 @@ export function SocialConsole() {
     try {
       await tan.follow(target.trim());
       setTarget("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not follow");
+    }
+  }
+
+  // Follow or unfollow an author from the directory. The hook reloads
+  // the feed after either, so the directory and the following list
+  // update together.
+  async function submitToggleFollowAuthor(author: TanAuthor) {
+    setError(null);
+    try {
+      if (author.followed) {
+        await tan.unfollow(author.author);
+      } else {
+        await tan.follow(author.author);
+      }
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : author.followed
+            ? "could not unfollow"
+            : "could not follow",
+      );
+    }
+  }
+
+  async function submitFollowSuggestion(author: string) {
+    setError(null);
+    try {
+      // Follow reloads the feed, so the followed author drops out of
+      // the suggestions on the same round trip.
+      await tan.follow(author);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not follow");
     }
@@ -81,14 +159,64 @@ export function SocialConsole() {
 
   async function toggleLike(post: TanPost) {
     setError(null);
+    const generation = likersGeneration.current;
+    const listOpenForPost = likersOpen === post.hash;
     try {
       if (post.liked) {
         await tan.unlike(post.hash);
       } else {
         await tan.like(post.hash);
       }
+      // The like count changed, so an open liker list for this post is
+      // stale; close it and let the count button fetch a fresh one. If
+      // the list was closed or reopened while the reaction was pending,
+      // leave the current list alone.
+      if (listOpenForPost && likersGeneration.current === generation) {
+        closeLikers();
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
+  async function submitRepost(post: TanPost) {
+    // A ref, not state: two clicks before React re-renders must not both
+    // send a repost, or the second one reports the store's duplicate error.
+    if (repostingRef.current.has(post.hash)) return;
+    repostingRef.current.add(post.hash);
+    setError(null);
+    try {
+      await tan.repost(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not repost");
+    } finally {
+      repostingRef.current.delete(post.hash);
+    }
+  }
+
+  async function toggleLikers(post: TanPost) {
+    if (likersOpen === post.hash) {
+      closeLikers();
+      return;
+    }
+    const generation = ++likersGeneration.current;
+    setLikersOpen(post.hash);
+    setLikers(null);
+    setLikersTotal(0);
+    setError(null);
+    try {
+      const result = await tan.fetchLikers(post.hash);
+      // A newer open supersedes this response: opening another post's
+      // list first must not show this post's names under that post.
+      if (likersGeneration.current !== generation) return;
+      setLikers(result.likers);
+      setLikersTotal(result.total);
+    } catch (caught) {
+      if (likersGeneration.current !== generation) return;
+      setError(
+        caught instanceof Error ? caught.message : "could not load likers",
+      );
+      closeLikers();
     }
   }
 
@@ -101,8 +229,7 @@ export function SocialConsole() {
         await tan.save(post.hash);
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "could not save");
-    }
+      setError(caught instanceof Error ? caught.message : "could not save");    }
   }
 
   async function submitDelete(post: TanPost) {
@@ -122,6 +249,19 @@ export function SocialConsole() {
     }
   }
 
+  // Returns false when the edit failed, so the card keeps its form open
+  // instead of closing on an error the user has not seen yet.
+  async function submitEdit(post: TanPost, text: string): Promise<boolean> {
+    setError(null);
+    try {
+      await tan.editPost(post.hash, text);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not edit");
+      return false;
+    }
+  }
+
   async function submitSync() {
     setError(null);
     setMessage(null);
@@ -132,6 +272,17 @@ export function SocialConsole() {
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "sync failed");
+    }
+  }
+
+  async function submitVerify() {
+    setVerifyError(null);
+    try {
+      await tan.verify();
+    } catch (caught) {
+      setVerifyError(
+        caught instanceof Error ? caught.message : "verify failed",
+      );
     }
   }
 
@@ -311,6 +462,81 @@ export function SocialConsole() {
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
               <div className="flex items-center justify-between">
+                <SectionLabel>authors</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.authorsTotal}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Everyone with a post in the local store. Follow an author
+                to see their posts in your timeline.
+              </p>
+              <ul className="mt-3 space-y-1.5">
+                {tan.authors.length === 0 ? (
+                  <li className="rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                    No authors yet. Sync to pull posts from your peers.
+                  </li>
+                ) : null}
+                {tan.authors.map((record) => (
+                  <li
+                    key={record.author}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-zinc-200">
+                        {record.name || "unknown"}
+                      </p>
+                      <p className="font-mono text-[10px] text-mist/80">
+                        {shortHash(record.author, 10)} · {record.posts}{" "}
+                        post{record.posts === 1 ? "" : "s"} ·{" "}
+                        {record.last_post
+                          ? formatDateTime(record.last_post)
+                          : "never"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void submitToggleFollowAuthor(record)}
+                      className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                      title={
+                        record.followed
+                          ? "unfollow this author"
+                          : "follow this author"
+                      }
+                    >
+                      {record.followed ? "remove" : "follow"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {tan.authors.length < tan.authorsTotal ? (
+                <button
+                  type="button"
+                  onClick={() => void tan.loadMoreAuthors()}
+                  className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-line bg-void/70 px-3 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+                >
+                  show more ({tan.authors.length} of {tan.authorsTotal})
+                </button>
+              ) : null}
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>suggested authors</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.suggestions.length}
+                </span>
+              </div>
+              <div className="mt-3">
+                <SuggestionList
+                  suggestions={tan.suggestions}
+                  onFollow={(author) => void submitFollowSuggestion(author)}
+                />
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
                 <SectionLabel>muted</SectionLabel>
                 <span className="font-mono text-[10px] text-mist">
                   {tan.mutedAuthors.length + tan.mutedKeywords.length}
@@ -422,6 +648,49 @@ export function SocialConsole() {
                 </p>
               ) : null}
             </section>
+
+            <RulesSection
+              rules={tan.rules}
+              availableKinds={tan.availableKinds}
+              loading={tan.rulesLoading}
+              error={tan.rulesError}
+              onUpdate={tan.updateRules}
+              onRefresh={tan.refreshRules}
+            />
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <SectionLabel>store health</SectionLabel>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Re-verify every stored post&apos;s signature and chain
+                linkage, the same audit{" "}
+                <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+                  tau tan verify
+                </code>{" "}
+                runs. Read-only: verifying never writes to the store.
+              </p>
+              <button
+                type="button"
+                onClick={() => void submitVerify()}
+                disabled={tan.verifying}
+                className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/15 disabled:opacity-50"
+              >
+                {tan.verifying ? "verifying…" : "verify store"}
+              </button>
+              {verifyError ? (
+                <p className="mt-2 font-mono text-[10px] leading-relaxed text-rose-300">
+                  {verifyError}
+                </p>
+              ) : null}
+              {tan.verifyReport ? (
+                <VerifyResult report={tan.verifyReport} />
+              ) : null}
+            </section>
+            <TanBackupSection
+              exporting={tan.exporting}
+              importing={tan.importing}
+              onExport={(allAuthors) => tan.exportTan(allAuthors)}
+              onImport={(doc) => tan.importTan(doc)}
+            />
           </aside>
 
           <div className="flex min-w-0 flex-col">
@@ -452,9 +721,11 @@ export function SocialConsole() {
                             ? "saved"
                           : tan.showMentions
                             ? "mentions"
-                            : tan.all
-                              ? "public cache"
-                              : "timeline"}
+                            : tan.view === "top"
+                              ? "top posts"
+                              : tan.all
+                                ? "public cache"
+                                : "timeline"}
                       </SectionLabel>
                       <span className="font-mono text-[10px] text-mist">
                         {showingSearch
@@ -481,10 +752,14 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           tan.setAll(false);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && !tan.showMentions && !tan.all
+                          tan.view === "timeline" &&
+                          !showSaved &&
+                          !tan.showMentions &&
+                          !tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -496,10 +771,14 @@ export function SocialConsole() {
                         onClick={() => {
                           setShowSaved(false);
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           tan.setAll(true);
                         }}
                         className={`rounded px-2 py-1 ${
-                          !showSaved && !tan.showMentions && tan.all
+                          tan.view === "timeline" &&
+                          !showSaved &&
+                          !tan.showMentions &&
+                          tan.all
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
                         }`}
@@ -510,7 +789,25 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          tan.setShowMentions(false);
+                          tan.setView("top");
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          tan.view === "top" &&
+                          !showSaved &&
+                          !tan.showMentions
+                            ? "bg-signal/15 text-signal"
+                            : "text-mist"
+                        }`}
+                      >
+                        top
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowSaved(false);
                           tan.setShowMentions(true);
+                          tan.setView("timeline");
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.showMentions ? "bg-signal/15 text-signal" : "text-mist"
@@ -522,6 +819,7 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           tan.setShowMentions(false);
+                          tan.setView("timeline");
                           setShowSaved(true);
                         }}
                         className={`rounded px-2 py-1 ${
@@ -567,6 +865,7 @@ export function SocialConsole() {
                     loading={tan.threadLoading}
                     error={tan.threadError ?? tan.error}
                     onToggleLike={toggleLike}
+                    onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
@@ -588,6 +887,7 @@ export function SocialConsole() {
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
@@ -621,6 +921,7 @@ export function SocialConsole() {
                         key={post.hash}
                         post={post}
                         onToggleLike={toggleLike}
+                        onRepost={submitRepost}
                         onToggleSave={toggleSave}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
@@ -633,7 +934,7 @@ export function SocialConsole() {
                   showingSearch ? (
                     <SearchEmptyState query={tan.searchQuery ?? ""} />
                   ) : (
-                    <EmptyState />
+                    <EmptyState top={tan.view === "top"} />
                   )
                 ) : (
                   visiblePosts.map((post) => (
@@ -641,9 +942,22 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onRepost={submitRepost}
+                      onToggleLikers={toggleLikers}
+                      likersOpen={likersOpen === post.hash}
+                      likers={likersOpen === post.hash ? likers : null}
+                      likersTotal={likersOpen === post.hash ? likersTotal : 0}
                       onToggleSave={toggleSave}
-                      onReply={(target) => setReplyTarget(target)}
+                      onReply={(target) => {
+                        setQuoteTarget(null);
+                        setReplyTarget(target);
+                      }}
+                      onQuote={(target) => {
+                        setReplyTarget(null);
+                        setQuoteTarget(target);
+                      }}
                       onDelete={submitDelete}
+                      onEdit={submitEdit}
                       deleting={deleting.has(post.hash)}
                       onMute={submitMute}
                       muting={muting.has(post.author)}
@@ -655,6 +969,23 @@ export function SocialConsole() {
             </section>
 
             <section className="mt-3 rounded-2xl border border-line/80 bg-panel/60 p-3">
+              {quoteTarget ? (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-signal/30 bg-signal/10 px-2.5 py-1.5 text-[11px] text-signal">
+                  <span className="min-w-0 truncate">
+                    Quoting {quoteTarget.name || "anonymous"} ·{" "}
+                    {quoteTarget.text.length > 80
+                      ? `${quoteTarget.text.slice(0, 80)}…`
+                      : quoteTarget.text}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setQuoteTarget(null)}
+                    className="shrink-0 font-mono text-[10px] text-mist/80 transition hover:text-zinc-100"
+                  >
+                    cancel
+                  </button>
+                </div>
+              ) : null}
               {replyTarget ? (
                 <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-signal/30 bg-signal/10 px-2.5 py-1.5 text-[11px] text-signal">
                   <span className="min-w-0 truncate">
@@ -689,9 +1020,11 @@ export function SocialConsole() {
                   rows={2}
                   maxLength={2000}
                   placeholder={
-                    replyTarget
-                      ? `Reply to ${replyTarget.name || "anonymous"}…`
-                      : "Write something to the mesh…"
+                    quoteTarget
+                      ? `Quote ${quoteTarget.name || "anonymous"}…`
+                      : replyTarget
+                        ? `Reply to ${replyTarget.name || "anonymous"}…`
+                        : "Write something to the mesh…"
                   }
                   className="thin-scroll min-h-[64px] w-full resize-y rounded-xl border border-line bg-void/70 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-100 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
                 />
@@ -736,6 +1069,175 @@ export function SocialConsole() {
   );
 }
 
+export function SuggestionList({
+  suggestions,
+  onFollow,
+}: {
+  suggestions: TanSuggestion[];
+  onFollow: (author: string) => void;
+}) {
+  if (suggestions.length === 0) {
+    return (
+      <p className="rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+        No suggestions yet. Follow an author or sync more posts first.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-1.5">
+      {suggestions.map((suggestion) => (
+        <li
+          key={suggestion.author}
+          className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+        >
+          <div className="min-w-0">
+            <p className="truncate text-xs text-zinc-200">
+              {suggestion.name || "unknown"}
+            </p>
+            <p className="font-mono text-[10px] text-mist/80">
+              {shortHash(suggestion.author, 10)} · {suggestion.posts} post(s)
+              {suggestion.likes ? `, ${suggestion.likes} like(s)` : ""}
+            </p>
+            <p className="truncate text-[11px] text-mist">
+              {suggestion.reason}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onFollow(suggestion.author)}
+            className="shrink-0 rounded-lg border border-line bg-void/70 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+          >
+            follow
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function TanBackupSection({
+  exporting,
+  importing,
+  onExport,
+  onImport,
+}: {
+  exporting: boolean;
+  importing: boolean;
+  onExport: (allAuthors: boolean) => Promise<TanExportDocument>;
+  onImport: (doc: TanExportDocument) => Promise<TanImportResult>;
+}) {
+  const [message, setMessage] = useState<string | null>(null);
+  const [errors, setErrors] = useState<TanImportError[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  async function submitExport(allAuthors: boolean) {
+    setError(null);
+    setMessage(null);
+    setErrors([]);
+    try {
+      const doc = await onExport(allAuthors);
+      setMessage(
+        `exported ${doc.entries.length} entr${doc.entries.length === 1 ? "y" : "ies"}${allAuthors ? " (all authors)" : " (your chain)"}`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "export failed");
+    }
+  }
+
+  async function submitImportFile(file: File) {
+    setError(null);
+    setMessage(null);
+    setErrors([]);
+    try {
+      let doc: unknown;
+      try {
+        doc = JSON.parse(await file.text());
+      } catch {
+        setError("that file is not a valid export document");
+        return;
+      }
+      try {
+        const result = await onImport(doc as TanExportDocument);
+        setMessage(
+          `imported ${result.imported} · ${result.present} already present · ${result.skipped} skipped`,
+        );
+        setErrors(result.errors);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "import failed");
+      }
+    } finally {
+      // Picking the same file again must fire onChange, including
+      // after a parse failure that returns before the import runs.
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
+  return (
+    <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+      <SectionLabel>backup</SectionLabel>
+      <p className="mt-2 text-[11px] leading-relaxed text-mist">
+        Back up your signed chain as a file, or restore one. Every imported
+        entry is re-verified before it is stored.
+      </p>
+      <div className="mt-3 flex gap-2">
+        <button
+          type="button"
+          onClick={() => void submitExport(false)}
+          disabled={exporting}
+          className="flex-1 rounded-lg border border-line bg-void/70 px-2.5 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+        >
+          {exporting ? "exporting…" : "export mine"}
+        </button>
+        <button
+          type="button"
+          onClick={() => void submitExport(true)}
+          disabled={exporting}
+          className="flex-1 rounded-lg border border-line bg-void/70 px-2.5 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+        >
+          export all
+        </button>
+        <label
+          htmlFor="tan-import-file"
+          className={`flex-1 cursor-pointer rounded-lg border border-line bg-void/70 px-2.5 py-2 text-center font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal ${importing ? "pointer-events-none opacity-50" : ""}`}
+        >
+          {importing ? "importing…" : "import"}
+        </label>
+        <input
+          ref={importInputRef}
+          id="tan-import-file"
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void submitImportFile(file);
+          }}
+        />
+      </div>
+      {message ? (
+        <p className="mt-2 font-mono text-[10px] text-signal/80">{message}</p>
+      ) : null}
+      {error ? (
+        <p className="mt-2 font-mono text-[10px] text-rose-300">{error}</p>
+      ) : null}
+      {errors.length > 0 ? (
+        <ul className="mt-2 space-y-1">
+          {errors.map((entry) => (
+            <li
+              key={entry.hash || entry.error}
+              className="font-mono text-[10px] leading-relaxed text-rose-300/90"
+            >
+              skipped {entry.hash ? shortHash(entry.hash, 8) : "?"}:{" "}
+              {entry.error}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
 function SearchEmptyState({ query }: { query: string }) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
@@ -758,6 +1260,7 @@ function ThreadView({
   loading,
   error,
   onToggleLike,
+  onRepost,
   onReply,
   onDelete,
   onOpenThread,
@@ -767,6 +1270,7 @@ function ThreadView({
   loading: boolean;
   error: string | null;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
@@ -789,6 +1293,7 @@ function ThreadView({
             key={post.hash}
             post={post}
             onToggleLike={onToggleLike}
+            onRepost={onRepost}
             onReply={onReply}
             onDelete={onDelete}
             deleting={deleting.has(post.hash)}
@@ -815,7 +1320,13 @@ function ThreadView({
   );
 }
 
-function EmptyState({ mentions = false }: { mentions?: boolean }) {
+function EmptyState({
+  mentions = false,
+  top = false,
+}: {
+  mentions?: boolean;
+  top?: boolean;
+}) {
   return (
     <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
       <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
@@ -827,6 +1338,11 @@ function EmptyState({ mentions = false }: { mentions?: boolean }) {
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
         {mentions ? (
           "When someone replies to one of your posts, it shows up here."
+        ) : top ? (
+          <>
+            Once posts arrive, the most-liked rank first here. Like a post
+            to move it up.
+          </>
         ) : (
           <>
             Start a node with{" "}
@@ -858,12 +1374,70 @@ function SavedEmptyState() {
   );
 }
 
+// Whether the console offers a Repost button for this card. The store
+// only accepts posts and replies as repost targets (a missing kind reads
+// as a plain post, the same default the store uses), and refuses your own
+// posts, posts you already reposted, and deleted posts — so the button
+// stays hidden there and the count chip remains a plain display.
+function canRepost(post: TanPost): boolean {
+  if (post.deleted || post.own || post.reposted) return false;
+  return (
+    post.kind === undefined || post.kind === "post" || post.kind === "reply"
+  );
+}
+
+export function VerifyResult({ report }: { report: TanVerifyReport }) {
+  if (report.ok) {
+    return (
+      <p className="mt-2 font-mono text-[10px] leading-relaxed text-signal/80">
+        store OK — {report.entries} entr{report.entries === 1 ? "y" : "ies"}{" "}
+        from {report.authors} author{report.authors === 1 ? "" : "s"}
+        {report.unlinked > 0
+          ? ` · ${report.unlinked} unlinked (partial sync)`
+          : ""}
+      </p>
+    );
+  }
+  return (
+    <div className="mt-2 space-y-1.5">
+      <p className="font-mono text-[10px] leading-relaxed text-rose-300">
+        store NOT OK — {report.problems.length} problem
+        {report.problems.length === 1 ? "" : "s"} in {report.entries} entries
+      </p>
+      <ul className="space-y-1.5">
+        {report.problems.map((problem, index) => (
+          <li
+            // One entry can carry several faults (a bad hash and a
+            // chain fault, say), so the hash alone is not a unique key.
+            key={`${problem.hash}:${index}`}
+            className="rounded-lg border border-rose-400/30 bg-rose-400/5 px-2.5 py-2"
+          >
+            <p className="font-mono text-[10px] text-rose-200">
+              {shortHash(problem.hash, 16)} · {shortHash(problem.author, 10)}
+            </p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-zinc-300">
+              {problem.problem}
+            </p>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function PostCard({
   post,
   onToggleLike,
+  onRepost,
+  onToggleLikers,
+  likersOpen,
+  likers,
+  likersTotal,
   onToggleSave,
   onReply,
+  onQuote,
   onDelete,
+  onEdit,
   deleting,
   onMute,
   muting,
@@ -871,9 +1445,22 @@ export function PostCard({
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
+  // Optional so existing callers (and tests) that only exercise the
+  // like toggle keep working; when absent the count button is inert.
+  onToggleLikers?: (post: TanPost) => void;
+  likersOpen?: boolean;
+  // The likers for the open list, or null while it is loading.
+  likers?: TanLiker[] | null;
+  // Full liker count before the server's cap; 0 when unknown.
+  likersTotal?: number;
   onToggleSave?: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
+  onQuote?: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  // Optional like onQuote/onMute: views that do not wire editing (thread,
+  // saved, mentions) render the card without an edit button.
+  onEdit?: (post: TanPost, text: string) => Promise<boolean>;
   deleting: boolean;
   onMute?: (post: TanPost) => void;
   muting?: boolean;
@@ -881,6 +1468,20 @@ export function PostCard({
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submitEditForm() {
+    if (saving || !onEdit) return;
+    setSaving(true);
+    try {
+      const ok = await onEdit(post, editText.trim());
+      if (ok) setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
   // Thread entries indent by depth (capped, so a deep reply chain does
   // not squeeze the text away); timeline entries have no depth.
   const depth = Math.min(Math.max(post.depth ?? 0, 0), 6);
@@ -956,17 +1557,60 @@ export function PostCard({
               )}
             </p>
           ) : null}
-                      {post.deleted ? (
-              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-                <span className="italic text-mist/70">
-                  This post was deleted.
-                </span>
-              </p>
-            ) : bodyText ? (
-              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-                {bodyText}
-              </p>
-            ) : null}
+          {editing ? (
+            <div className="mt-1.5">
+              <textarea
+                value={editText}
+                disabled={saving}
+                // Code-point-aware cap: the backend counts Python code
+                // points (len), while slice/maxLength count UTF-16 units,
+                // so a plain slice would silently drop emoji from a valid
+                // existing post on the first keystroke.
+                onChange={(event) =>
+                  setEditText(
+                    [...event.target.value].slice(0, 2000).join(""),
+                  )
+                }
+                rows={3}
+                aria-label="Edit post text"
+                className="w-full resize-y rounded-lg border border-line/70 bg-void/60 px-2.5 py-2 text-[13px] leading-relaxed text-zinc-200 outline-none focus:border-signal/50"
+              />
+              <div className="mt-2 flex gap-2 font-mono text-[10px]">
+                <button
+                  type="button"
+                  disabled={
+                    saving ||
+                    !editText.trim() ||
+                    editText.trim() === post.text
+                  }
+                  onClick={() => void submitEditForm()}
+                  title="Save this edit"
+                  className="rounded border border-signal/40 bg-signal/10 px-1.5 py-0.5 text-signal transition-colors hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {saving ? "saving…" : "save"}
+                </button>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => setEditing(false)}
+                  title="Discard this edit"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100 disabled:opacity-50"
+                >
+                  cancel
+                </button>
+              </div>
+            </div>
+          ) : post.deleted ? (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              <span className="italic text-mist/70">
+                This post was deleted.
+              </span>
+            </p>
+          ) : bodyText ? (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              {bodyText}
+            </p>
+          ) : null}
           {post.kind === "quote" ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
               quoting{" "}
@@ -1009,17 +1653,38 @@ export function PostCard({
                 ♥ {post.likes ?? 0}
               </button>
             )}
-            <span
-              title={post.reposted ? "You reposted this" : "Reposts"}
-              className={`rounded border px-1.5 py-0.5 ${
-                post.reposted
-                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
-                  : "border-line/70 bg-panel/60"
-              }`}
-            >
-              ↻ {post.reposts ?? 0}
-            </span>
-            {(post.quotes ?? 0) > 0 ? (
+            {canRepost(post) ? (
+              <button
+                type="button"
+                onClick={() => onRepost(post)}
+                title="Repost this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-emerald-300"
+              >
+                ↻ {post.reposts ?? 0}
+              </button>
+            ) : (
+              <span
+                title={post.reposted ? "You reposted this" : "Reposts"}
+                className={`rounded border px-1.5 py-0.5 ${
+                  post.reposted
+                    ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                    : "border-line/70 bg-panel/60"
+                }`}
+              >
+                ↻ {post.reposts ?? 0}
+              </span>
+            )}
+            {(post.likes ?? 0) > 0 ? (
+              <button
+                type="button"
+                onClick={() => onToggleLikers?.(post)}
+                aria-expanded={Boolean(likersOpen)}
+                title="Show who liked this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-rose-300"
+              >
+                who liked
+              </button>
+            ) : null}            {(post.quotes ?? 0) > 0 ? (
               <span
                 title="Quotes of this post"
                 className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5"
@@ -1056,6 +1721,29 @@ export function PostCard({
                 reply
               </button>
             )}
+            {onQuote && post.kind !== "quote" ? (
+              <button
+                type="button"
+                onClick={() => onQuote(post)}
+                title="Quote this post with your own comment"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
+              >
+                quote
+              </button>
+            ) : null}
+            {onEdit && post.own && post.kind !== "quote" && !editing && !deleting ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setEditText(post.text);
+                  setEditing(true);
+                }}
+                title="Edit this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-signal/40 hover:text-signal"
+              >
+                edit
+              </button>
+            ) : null}
             {!post.own && onMute ? (
               muting ? (
                 <button
@@ -1129,6 +1817,36 @@ export function PostCard({
               )
             )}
           </div>
+          {likersOpen ? (
+            <div className="mt-2 rounded border border-line/70 bg-panel/60 px-2 py-1.5">
+              <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">
+                liked by
+              </p>
+              {likers === null || likers === undefined ? (
+                <p className="mt-1 text-[12px] text-mist/80">loading…</p>
+              ) : likers.length === 0 ? (
+                <p className="mt-1 text-[12px] text-mist/80">no likes yet</p>
+              ) : (
+                <>
+                  <ul className="mt-1 space-y-0.5">
+                    {likers.map((liker) => (
+                      <li
+                        key={liker.author}
+                        className="text-[12px] text-zinc-200"
+                      >
+                        {liker.name || shortHash(liker.author, 16)}
+                      </li>
+                    ))}
+                  </ul>
+                  {(likersTotal ?? 0) > likers.length ? (
+                    <p className="mt-1 text-[11px] text-mist/70">
+                      showing first {likers.length} of {likersTotal} likers
+                    </p>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ) : null}
         </div>
       </div>
     </article>
