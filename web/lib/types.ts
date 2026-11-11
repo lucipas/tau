@@ -459,6 +459,36 @@ export interface TanSyncResponse {
   };
 }
 
+export interface MessagesResponse {
+  messages: TauMessage[];
+}
+
+export interface MessagesExportDocument {
+  format: string;
+  version: number;
+  exported_at: number;
+  messages: Array<Record<string, unknown>>;
+}
+
+export interface MessagesImportError {
+  id: string | null;
+  error: string;
+}
+
+export interface MessagesImportResult {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: MessagesImportError[];
+  // Fresh unread counts, present only when the import stored something.
+  unread?: UnreadCounts;
+}
+
+export interface MessagesImportResponse {
+  ok: boolean;
+  import: MessagesImportResult;
+}
+
 export interface TanExportDocument {
   format: string;
   version: number;

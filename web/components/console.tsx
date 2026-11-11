@@ -9,6 +9,7 @@ import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
+import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
 
@@ -234,6 +235,13 @@ export function Console() {
               onCancelReply={() => setReplyTo(null)}
             />
           </div>
+
+          <MessagesBackupSection
+            exporting={tau.exporting}
+            importing={tau.importing}
+            onExport={tau.exportMessages}
+            onImport={tau.importMessages}
+          />
         </main>
 
         <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
