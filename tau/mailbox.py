@@ -94,6 +94,11 @@ MAX_HELD_TOTAL = 512
 MAX_HELD_PER_RECIPIENT = 64
 MAX_SEEN = 1024
 MAX_HOLDERS_PER_MESSAGE = 3
+# Retraction markers are capped like the seen set, but higher: a
+# marker must outlive the seen entry for the same message, so evicting
+# markers as eagerly as seen ids would defeat them.  Eviction is
+# earliest-expiry first, as in mark_seen.
+MAX_RETRACTED = 4096
 # Sent-message history (for read receipts) and queued receipts waiting
 # on an unreachable sender.  Both are small metadata records, capped
 # like the seen set; sent entries also keep the text so `tau messages
@@ -1632,6 +1637,13 @@ class Mailbox:
             self._retracted[_retraction_key(sender_hash, message_id)] = (
                 timestamp + RETRACTED_RETENTION
             )
+            if len(self._retracted) > MAX_RETRACTED:
+                # A peer can retract ids it never sent (the unknown-id
+                # branch), so the collection must stay bounded: evict
+                # the markers expiring soonest, as mark_seen does.
+                oldest = sorted(self._retracted.items(), key=lambda kv: kv[1])
+                for key, _ in oldest[: len(self._retracted) - MAX_RETRACTED]:
+                    del self._retracted[key]
             self.save()
 
     def is_retracted(

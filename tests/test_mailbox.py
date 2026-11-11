@@ -730,6 +730,24 @@ def test_retraction_markers_persist_and_expire(tmp_path):
     assert reloaded.is_retracted(sender, "msg-1") is False
 
 
+def test_retraction_markers_are_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_retraction(sender, "m-1", now=1000.0)
+    box.record_retraction(sender, "m-2", now=1001.0)
+    box.record_retraction(sender, "m-3", now=1002.0)
+    assert box.counts()["retracted"] == 3
+    # The fourth marker evicts the one expiring soonest (m-1).
+    box.record_retraction(sender, "m-4", now=1003.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_retracted(sender, "m-1", now=1003.0) is False
+    assert box.is_retracted(sender, "m-4", now=1003.0) is True
+    # Re-recording a marker refreshes it instead of growing the set.
+    box.record_retraction(sender, "m-2", now=2000.0)
+    assert box.counts()["retracted"] == 3
+
+
 # -- sealed envelopes -------------------------------------------------------------
 
 
