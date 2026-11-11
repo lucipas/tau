@@ -20,7 +20,14 @@ learned group from the same creator under the same name — but only when
 the message comes from the creator themself, since the creator field is
 only a claim in the payload: a successor carried by another member is
 pinned alongside instead of replacing the predecessor, so no member can
-forge a successor and hijack sends by group name.  While both versions
+forge a successor and hijack sends by group name.  A creator message
+whose ``sent_at`` predates the message that pinned the successor is
+stale — a queued copy sent before the roster changed, delivered late —
+and pins alongside instead of replacing it, so sends by name keep
+resolving to the successor; an intentional creator restore is sent
+after the change, so its ``sent_at`` is newer and it still replaces.
+Both timestamps come from the creator's own clock, so the comparison
+holds regardless of the recipient's clock.  While both versions
 coexist, :meth:`GroupStore.find` keeps resolving the name to the roster
 this node has known longest (a locally created group first), so sends
 by name keep working until the creator themself sends the successor.
@@ -32,6 +39,7 @@ to pin it again.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -132,6 +140,20 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         created_at = float(created_at) if created_at is not None else time.time()
     except (TypeError, ValueError):
         return None
+    # The sent_at of the creator message that last pinned this roster, or
+    # None when unknown (locally created groups, member-carried pins, and
+    # records written before this field existed).  Only creator messages
+    # stamp it: the comparison that tells a stale creator message from an
+    # intentional restore is only meaningful between two timestamps from
+    # the creator's own clock.
+    roster_sent_at = raw.get("roster_sent_at")
+    if roster_sent_at is not None:
+        try:
+            roster_sent_at = float(roster_sent_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(roster_sent_at):
+            return None
     return {
         "id": group_id.lower(),
         "name": name,
@@ -140,6 +162,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "creator": creator,
         "created_by": creator,
         "local": bool(raw.get("local", False)),
+        "roster_sent_at": roster_sent_at,
     }
 
 
@@ -374,6 +397,7 @@ class GroupStore:
         *,
         creator: str,
         sender: str = "",
+        sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
@@ -400,7 +424,24 @@ class GroupStore:
         :meth:`find` keeps resolving the name to the roster known
         longest (a locally created group first), so sends by name keep
         working until the creator sends the successor themself.
+
+        ``sent_at`` is the message's send time on the creator's clock.
+        A creator message sent before the successor was learned is
+        stale — a queued copy that predates the roster change — and
+        pins alongside instead of replacing the successor, so later
+        sends by name cannot include a removed member.  A roster whose
+        pinning message carried no ``sent_at``, or a candidate with
+        none, cannot prove staleness and is superseded as before, so
+        an intentional creator restore (sent after the change, with a
+        newer ``sent_at``) still replaces the successor.
         """
+        if sent_at is not None:
+            try:
+                sent_at = float(sent_at)
+            except (TypeError, ValueError):
+                sent_at = None
+            if sent_at is not None and not math.isfinite(sent_at):
+                sent_at = None
         candidate = _valid_group(
             {
                 "id": group_id,
@@ -415,6 +456,11 @@ class GroupStore:
         if candidate is None:
             return None
         creator_authorized = bool(sender) and sender.lower() == candidate["creator"]
+        if creator_authorized:
+            # Only a creator message stamps the roster: the staleness
+            # comparison is only meaningful between two timestamps from
+            # the creator's own clock.
+            candidate["roster_sent_at"] = sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
             if existing is not None:
@@ -434,6 +480,33 @@ class GroupStore:
                         and other["id"] != candidate["id"]
                     )
                 ]
+                if sent_at is not None:
+                    # A queued creator message sent before the successor
+                    # was learned must not replace it.  Supersede only
+                    # the rosters the candidate is not older than; a
+                    # roster with no recorded sent_at cannot prove the
+                    # candidate stale, so it is superseded as before.
+                    # The rest are pinned alongside the candidate, and
+                    # find() keeps resolving the name to the roster
+                    # known longest — the successor.
+                    stale_for = [
+                        other
+                        for other in superseded
+                        if other.get("roster_sent_at") is not None
+                        and sent_at < other["roster_sent_at"]
+                    ]
+                    if stale_for:
+                        log.info(
+                            "Stale creator message for group %s: sent "
+                            "before the successor roster was learned; "
+                            "pinning alongside instead of replacing it",
+                            group_id,
+                        )
+                        superseded = [
+                            other
+                            for other in superseded
+                            if other not in stale_for
+                        ]
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
                 if learned - len(superseded) >= MAX_LEARNED_GROUPS:
@@ -446,7 +519,26 @@ class GroupStore:
             for other in superseded:
                 del self._groups[other["id"]]
             if existing is not None:
-                if superseded:
+                refreshed = False
+                if (
+                    creator_authorized
+                    and sent_at is not None
+                    and (
+                        existing.get("roster_sent_at") is None
+                        or sent_at > existing["roster_sent_at"]
+                    )
+                ):
+                    # A creator message carrying this roster again stamps
+                    # it with its send time, so a later queued copy of an
+                    # older roster cannot replace it — including one the
+                    # node first learned from a member-carried message,
+                    # which carries no creator timestamp of its own.
+                    self._groups[existing["id"]] = {
+                        **existing,
+                        "roster_sent_at": sent_at,
+                    }
+                    refreshed = True
+                if superseded or refreshed:
                     try:
                         self._save()
                     except OSError as exc:
@@ -456,7 +548,7 @@ class GroupStore:
                             "Could not persist groups to %s: %s", self.path, exc
                         )
                         return None
-                return dict(existing)
+                return dict(self._groups[existing["id"]])
             self._groups[candidate["id"]] = candidate
             try:
                 self._save()

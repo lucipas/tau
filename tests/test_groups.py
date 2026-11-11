@@ -403,6 +403,135 @@ def test_group_store_update_members_ignores_local_cap(tmp_path):
     assert len(store) == MAX_GROUPS
 
 
+def test_group_store_record_stale_creator_message_does_not_replace_successor(
+    tmp_path,
+):
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=100.0,
+        )
+        is not None
+    )
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    assert (
+        store.record(
+            new_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH, OWN_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=200.0,
+        )
+        is not None
+    )
+    assert store.get(old_id) is None
+    # A queued creator message carrying the old roster, sent before the
+    # successor was sent and delivered late, pins alongside instead of
+    # replacing the successor: the message is still accepted, but sends
+    # by name keep resolving to the current roster.
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+        )
+        is not None
+    )
+    assert store.get(new_id) is not None
+    assert store.get(old_id) is not None
+    assert store.find("weekend")["id"] == new_id
+    assert len(store) == 2
+
+
+def test_group_store_record_creator_restore_replaces_successor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    store.record(
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+    )
+    store.record(
+        new_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH, OWN_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+    )
+    # The creator restores the old roster after the change and sends a
+    # message with it: its sent_at is newer than the successor's, so it
+    # is an intentional restore, not a stale copy, and it replaces.
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=300.0,
+        )
+        is not None
+    )
+    assert store.get(new_id) is None
+    assert store.get(old_id) is not None
+    assert store.find("weekend")["id"] == old_id
+    assert len(store) == 1
+
+
+def test_group_store_record_out_of_order_successor_does_not_replace_restore(
+    tmp_path,
+):
+    store = GroupStore(tmp_path / "groups.json")
+    old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
+    new_id = derive_group_id(
+        OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH, OWN_HASH]
+    )
+    # The restore (sent at 300) arrives before the successor's teaching
+    # message (sent at 200): the successor is the stale one here, so it
+    # pins alongside and the restore keeps resolving by name.
+    store.record(
+        old_id,
+        "weekend",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=300.0,
+    )
+    assert (
+        store.record(
+            new_id,
+            "weekend",
+            [OTHER_HASH, THIRD_HASH, OWN_HASH],
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=200.0,
+        )
+        is not None
+    )
+    assert store.get(old_id) is not None
+    assert store.get(new_id) is not None
+    assert store.find("weekend")["id"] == old_id
+
+
 def test_group_store_record_successor_retires_predecessor(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     old_id = derive_group_id(OTHER_HASH, "weekend", [OTHER_HASH, THIRD_HASH])
@@ -978,6 +1107,70 @@ def test_group_message_successor_from_member_does_not_replace(tmp_path):
     assert node.groups.get(forged_id) is not None
     assert len(node.groups) == 1
     assert node.groups.find("weekend")["id"] == forged_id
+
+
+def test_group_message_stale_creator_message_does_not_replace_successor(
+    tmp_path,
+):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    first_members = [OWN_HASH, creator_hash, THIRD_HASH]
+    group_id = derive_group_id(creator_hash, "weekend", first_members)
+    first = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "first",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=first_members,
+            sent_at=100.0,
+        ),
+        remote_identity=creator,
+    )
+    assert first["ok"] is True
+    # The creator removes a member and sends with the new roster.
+    new_members = [OWN_HASH, creator_hash]
+    new_id = derive_group_id(creator_hash, "weekend", new_members)
+    second = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "second",
+            message_id="gm-2",
+            group_id=new_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=new_members,
+            sent_at=200.0,
+        ),
+        remote_identity=creator,
+    )
+    assert second["ok"] is True
+    assert node.groups.get(group_id) is None
+    assert node.groups.find("weekend")["id"] == new_id
+    # A queued copy of a creator message sent with the old roster
+    # before the change arrives late: it is delivered, but the
+    # successor stays pinned and name lookup keeps resolving to it.
+    stale = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "stale",
+            message_id="gm-3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=creator_hash,
+            members=first_members,
+            sent_at=150.0,
+        ),
+        remote_identity=creator,
+    )
+    assert stale["ok"] is True
+    assert len(received) == 3
+    assert node.groups.get(new_id) is not None
+    assert node.groups.get(group_id) is not None
+    assert node.groups.find("weekend")["id"] == new_id
 
 
 def test_group_message_dedupes_by_id(tmp_path):
