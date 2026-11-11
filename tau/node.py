@@ -1452,7 +1452,11 @@ class TauNode:
         )
 
     def _accept_group_message(
-        self, sender_hash: str, group: Dict[str, Any]
+        self,
+        sender_hash: str,
+        group: Dict[str, Any],
+        *,
+        sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -1465,6 +1469,15 @@ class TauNode:
         the sealed envelope's signature (relayed), never by the payload;
         the id derivation is what binds the roster to the id, so a
         member cannot fork an id onto a recipient that has not seen it.
+        The sender is also passed through, so a successor roster only
+        replaces a learned group when the creator themself sent it —
+        the creator field is only a claim, and any member could
+        otherwise forge a successor and hijack sends by group name.
+        ``sent_at`` is the message's send time on the sender's clock;
+        it is what tells a queued creator message carrying an outdated
+        roster (sent before the successor was learned) from an
+        intentional creator restore (sent after), so the stale copy
+        pins alongside instead of replacing the successor.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -1477,7 +1490,12 @@ class TauNode:
         except (ProtocolError, ValueError):
             return None
         return self.groups.record(
-            group["id"], group.get("name") or "group", members, creator=creator
+            group["id"],
+            group.get("name") or "group",
+            members,
+            creator=creator,
+            sender=sender_hash or "",
+            sent_at=sent_at,
         )
 
     def _handle_group_message(
@@ -1532,6 +1550,7 @@ class TauNode:
                 "creator": message["creator"],
                 "members": message["members"],
             },
+            sent_at=message.get("sent_at"),
         )
         if group is None:
             log.info(
@@ -2814,7 +2833,9 @@ class TauNode:
         if group is not None:
             sender = message.get("from")
             pinned = self._accept_group_message(
-                sender if isinstance(sender, str) else "", group
+                sender if isinstance(sender, str) else "",
+                group,
+                sent_at=message.get("sent_at"),
             )
             if pinned is None:
                 log.info(
