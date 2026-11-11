@@ -2079,6 +2079,20 @@ def test_parser_messages_prune_arguments():
     assert args.peer == "alice"
     assert args.dry_run is True
 
+    # Scope flags given before `prune` survive the subparser: the prune
+    # subparser uses SUPPRESS defaults, so a None default cannot
+    # silently discard the parent value and widen the prune.
+    args = parser.parse_args(
+        ["messages", "--peer", "alice", "prune", "--older-than", "90d"]
+    )
+    assert args.peer == "alice"
+    assert args.func is cli.cmd_messages_prune
+    args = parser.parse_args(
+        ["messages", "--group", "team", "prune", "--older-than", "90d"]
+    )
+    assert args.group == "team"
+    assert args.func is cli.cmd_messages_prune
+
 
 def test_messages_prune_dry_run_reports_without_deleting(tmp_path, capsys):
     data_dir, _ = _seed_messages(tmp_path)
@@ -2140,6 +2154,82 @@ def test_messages_prune_scopes_to_peer(tmp_path, capsys):
     )
     assert code == 0
     assert "Pruned 2 messages older than 90d (with alice)" in capsys.readouterr().out
+
+
+def test_messages_prune_keeps_scope_given_before_prune(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "carol old",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "m-3",
+        }
+    )
+    store = GroupStore(config.groups_path)
+    group = store.create(
+        "team", [sender_hash.hex(), "cd" * 16], created_by=sender_hash.hex()
+    )
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "group old",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "m-4",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "team",
+        }
+    )
+
+    # --peer before `prune` still scopes the prune to alice: carol's
+    # DM and group message survive.
+    code = cli.main(
+        [
+            "messages",
+            "--peer",
+            "alice",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 2 messages older than 90d (with alice)" in capsys.readouterr().out
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-4", "m-3"]
+
+    # --group before `prune` still scopes the prune to the group.
+    code = cli.main(
+        [
+            "messages",
+            "--group",
+            "team",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 1 messages older than 90d (in group team)" in capsys.readouterr().out
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-3"]
 
 
 def test_messages_prune_json_and_errors(tmp_path, capsys):

@@ -957,13 +957,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_prune.add_argument(
         "--peer",
-        default=None,
+        # SUPPRESS, not None: the parent `messages` parser also defines
+        # --peer, and a subparser default of None would silently discard
+        # a scope flag given before `prune` (e.g. `messages --peer alice
+        # prune ...`). With SUPPRESS the parent value survives.
+        default=argparse.SUPPRESS,
         metavar="NAME|HASH",
         help="only prune messages exchanged with this peer (name, hash or hash prefix)",
     )
     messages_prune.add_argument(
         "--group",
-        default=None,
+        # Same as --peer above: preserve a --group given before `prune`.
+        default=argparse.SUPPRESS,
         metavar="ID|NAME",
         help="only prune messages from this group (id, id prefix or name)",
     )
