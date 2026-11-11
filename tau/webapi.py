@@ -19,7 +19,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
-    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``    POST /api/ping         measure reachability of a peer
+    POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/outbox/held   sealed mail held for other peers
+    POST /api/outbox/drop-held drop ``{"target": "<message id or prefix>"}``
+    POST /api/ping         measure reachability of a peer
     GET  /api/allowlist    DM allow-list: whether enforced, and who is on it
     POST /api/allowlist/add add ``{"target": "<name, hash or prefix>"}``
     POST /api/allowlist/remove remove ``{"target": "<name, hash or prefix>"}``
@@ -1687,6 +1690,65 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def held_mail(self) -> Dict[str, Any]:
+        """Sealed mail held for other peers, with recipient names.
+
+        Read under the mailbox transaction so envelopes deposited by a
+        separate process are visible instead of the serving process's
+        cached snapshot.  Only metadata is exposed: the sealed blobs
+        stay unreadable through this API.
+        """
+        with self.node.mailbox.transaction():
+            held = [
+                self._describe_held_envelope(envelope)
+                for envelope in self.node.mailbox.held_list()
+            ]
+        return {"held": held, "count": len(held)}
+
+    def drop_held_mail(self, target: str) -> Dict[str, Any]:
+        """Drop one held envelope so it is never delivered again.
+
+        Resolve and remove happen inside one mailbox transaction, so a
+        drop cannot miss an envelope another process just stored, and a
+        fetch that lands in between is reported instead of silently
+        claimed as dropped.  The tombstone stops a sender retry from
+        resurrecting the envelope; a copy the recipient already fetched
+        may still be delivered, and the result says so.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("message id is required")
+        with self.node.mailbox.transaction():
+            envelope = self.node.mailbox.resolve_held(target.strip())
+            if not self.node.mailbox.drop_held(envelope.id, tombstone=True):
+                # Fetched or expired between resolve and drop.
+                raise MailboxError(
+                    f"held message {target.strip()!r} is no longer present"
+                )
+            dropped = self._describe_held_envelope(envelope)
+        dropped["note"] = (
+            "a copy already fetched by the recipient may still be"
+            " delivered; dropping stops this node handing it out again"
+        )
+        return dropped
+
+    def _describe_held_envelope(self, envelope: Any) -> Dict[str, Any]:
+        peer = self.node.registry.get(envelope.to)
+        sender = (
+            self.node.registry.get(bytes.fromhex(envelope.depositor))
+            if envelope.depositor
+            else None
+        )
+        return {
+            "id": envelope.id,
+            "to": envelope.to_hex,
+            "to_name": peer.display_name if peer is not None else "",
+            "from": envelope.depositor,
+            "from_name": sender.display_name if sender is not None else "",
+            "stored_at": envelope.stored_at,
+            "expires_at": envelope.expires_at,
+            "blob_bytes": len(envelope.blob),
+        }
+
     def _describe_outbox_entry(self, entry: Any) -> Dict[str, Any]:
         payload = entry.to_dict()
         peer = self.node.registry.get(entry.to)
@@ -2412,6 +2474,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
                 return
+            if path == "/api/outbox/held":
+                self._send_json(self.bridge.held_mail(), head_only)
+                return
             if path == "/api/allowlist":
                 self._send_json(self.bridge.allowlist(), head_only)
                 return
@@ -2551,6 +2616,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
+                return
+            if path == "/api/outbox/drop-held":
+                self._handle_outbox_drop_held(body, head_only)
                 return
             if path == "/api/ping":
                 self._handle_ping(body, head_only)
@@ -2949,6 +3017,25 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 404)
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
+
+    def _handle_outbox_drop_held(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("target") or body.get("id")
+        if not isinstance(target, str) or not target.strip():
+            self._send_json(
+                {"error": {"message": "field 'target' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            dropped = self.bridge.drop_held_mail(target.strip())
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json({"ok": True, "dropped": dropped}, head_only)
 
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")

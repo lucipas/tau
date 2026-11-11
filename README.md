@@ -144,6 +144,8 @@ The same bridge is the local integration point for scripts:
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/outbox/held` | GET | sealed mail held for other peers |
+| `/api/outbox/drop-held` | POST | drop `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
 | `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |

@@ -160,12 +160,16 @@ export function Console() {
                 }
               }}
             />
-            {tau.outbox.length > 0 ? (
+            {tau.outbox.length > 0 ||
+            tau.heldMail.length > 0 ||
+            tau.heldForOthers > 0 ? (
               <div className="mt-4">
                 <OutboxSection
                   entries={tau.outbox}
                   heldForOthers={tau.heldForOthers}
+                  held={tau.heldMail}
                   onCancel={tau.cancelOutbox}
+                  onDropHeld={tau.dropHeldMail}
                 />
               </div>
             ) : null}

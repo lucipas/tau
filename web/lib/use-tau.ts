@@ -8,7 +8,10 @@ import type {
   BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
+  DropHeldResponse,
   GroupsResponse,
+  HeldMailEntry,
+  HeldMailResponse,
   MarkReadResponse,
   MessagesSearchResponse,
   NodeInfo,
@@ -71,6 +74,7 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
@@ -258,6 +262,7 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const refreshHeldSeq = useRef(0);
   const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
@@ -271,6 +276,15 @@ export function useTau() {
     setHeldForOthers(result.held_for_others);
   }, []);
 
+  const refreshHeldMail = useCallback(async () => {
+    // Same stale-response guard as the outbox refresh: a slow poll
+    // must not restore an entry a drop already removed.
+    const requestId = ++refreshHeldSeq.current;
+    const result = await apiGet<HeldMailResponse>("/api/outbox/held");
+    if (requestId !== refreshHeldSeq.current) return;
+    setHeldMail(result.held);
+  }, []);
+
   const refreshGroups = useCallback(async () => {
     // Same polling shape as the outbox: a group learned from an
     // incoming message shows up here without waiting for a reload.
@@ -282,28 +296,23 @@ export function useTau() {
 
   useEffect(() => {
     if (connection !== "live") return;
-    let disposed = false;
     async function tick() {
-      try {
-        await refreshOutbox();
-      } catch {
-        // The outbox is a side panel: a failed poll leaves the last
-        // known entries in place instead of flashing an error.
-        if (disposed) return;
-      }
-      try {
-        await refreshGroups();
-      } catch {
-        if (disposed) return;
-      }
+      // The three endpoints are independent: a failure on one must not
+      // stop the others from updating their state. The outbox is a side
+      // panel: a failed poll leaves the last known entries in place
+      // instead of flashing an error.
+      await Promise.allSettled([
+        refreshOutbox(),
+        refreshHeldMail(),
+        refreshGroups(),
+      ]);
     }
     void tick();
     const timer = setInterval(() => void tick(), 15000);
     return () => {
-      disposed = true;
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshGroups]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups]);
 
   const allowlistSeq = useRef(0);
 
@@ -403,6 +412,30 @@ export function useTau() {
       return result.cancelled;
     },
     [refreshOutbox],
+  );
+
+  const dropHeldMail = useCallback(
+    async (id: string) => {
+      const result = await apiPost<DropHeldResponse>("/api/outbox/drop-held", {
+        target: id,
+      });
+      // The drop already succeeded: remove the entry locally at once,
+      // and treat the follow-up refreshes as best-effort so a failed
+      // GET cannot make a successful drop look like a failure.
+      const droppedId = result.dropped.id;
+      setHeldMail((previous) =>
+        previous.filter((entry) => entry.id !== droppedId),
+      );
+      // Invalidate any outbox GET issued before this drop so a stale
+      // response cannot restore the old held count.
+      refreshSeq.current++;
+      setHeldForOthers((previous) => Math.max(0, previous - 1));
+      // Run both follow-ups independently so a failed held-mail GET
+      // cannot skip reconciling the count.
+      await Promise.allSettled([refreshHeldMail(), refreshOutbox()]);
+      return result.dropped;
+    },
+    [refreshHeldMail, refreshOutbox],
   );
 
   const send = useCallback(
@@ -699,6 +732,7 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    heldMail,
     allowlist,
     bridge,
     connection,
@@ -718,6 +752,8 @@ export function useTau() {
     refreshOutbox,
     refreshGroups,
     cancelOutbox,
+    refreshHeldMail,
+    dropHeldMail,
     refreshAllowlist,
     addAllowlistPeer,
     removeAllowlistPeer,
