@@ -366,6 +366,7 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -374,7 +375,9 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
-    the id it claims.
+    the id it claims.  ``in_reply_to`` optionally names the earlier
+    message in the group this one quotes, exactly like a direct
+    message (see :func:`clean_in_reply_to`).
     """
     payload = {
         "type": "group_message",
@@ -389,6 +392,9 @@ def encode_group_message(
     }
     if message_id:
         payload["id"] = message_id
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -420,6 +426,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
     }
 
 

@@ -1056,6 +1056,11 @@ def build_parser() -> argparse.ArgumentParser:
     group_send.add_argument("--file", type=Path, help="read the message from a file")
     group_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
     group_send.add_argument(
+        "--reply-to",
+        metavar="ID|PREFIX",
+        help="quote an earlier message in this group (message id or unique prefix)",
+    )
+    group_send.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -5251,13 +5256,57 @@ def _resolve_reply_target(
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 
+def _resolve_group_reply_target(
+    inbox: Inbox, mailbox: Mailbox, ref: str, group_id: str
+) -> Dict[str, Any]:
+    """Resolve ``tau group send --reply-to`` to an ``in_reply_to`` wire reference.
+
+    Same rules as :func:`_resolve_reply_target`, scoped to the group
+    instead of a peer: the quoted message must be in this group's
+    history — a received message, one of this node's own sent legs,
+    or a still-queued leg — and a prefix matching more than one is
+    refused.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("--reply-to must not be empty")
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for item in inbox.find_prefix(ref, group=group_id):
+        candidates.setdefault(str(item["id"]), item)
+    value = ref.lower()
+    for entry in mailbox.outbox_list():
+        if entry.group_id != group_id:
+            continue
+        if entry.id.lower().startswith(value):
+            candidates.setdefault(
+                entry.id, {"id": entry.id, "text": entry.text}
+            )
+    if len(candidates) > 1:
+        raise NodeError(
+            f"{len(candidates)} messages in this group match {ref!r};"
+            " use a longer prefix"
+        )
+    if not candidates:
+        raise NodeError(
+            f"no message {ref!r} in this group to reply to;"
+            " replies quote a message from this group's history"
+        )
+    quoted = next(iter(candidates.values()))
+    return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
+
+
 def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> Optional[str]:
     """Render one message's quote, or ``None`` when it has none.
 
     The quoted text is pulled from the local inbox, in the same
     conversation only; when the original is not there — or its text
     no longer matches the excerpt hash the sender quoted — the line
-    says so instead of trusting anything on the wire.
+    says so instead of trusting anything on the wire.  A group quote
+    is scoped to the group, not the replier: the quoted message may
+    be from any member.  Group legs also carry per-member ids, so a
+    member may hold the quoted text under a different leg id — when
+    the id is not held, the excerpt hash matches the same text
+    within the group instead.
     """
     reply_to = entry.get("in_reply_to")
     if not isinstance(reply_to, dict):
@@ -5265,8 +5314,14 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
     ref_id = reply_to.get("id")
     if not isinstance(ref_id, str) or not ref_id:
         return None
-    quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+    group_id = entry.get("group")
     excerpt = reply_to.get("excerpt")
+    if isinstance(group_id, str) and group_id:
+        quoted = inbox.find(ref_id, group=group_id)
+        if quoted is None and isinstance(excerpt, str) and excerpt:
+            quoted = inbox.find_by_excerpt(excerpt, group=group_id)
+    else:
+        quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
     if quoted is None or (
         isinstance(excerpt, str)
         and excerpt
@@ -5737,6 +5792,15 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
     delivered_ids: Set[str] = set()
+    in_reply_to = None
+    if getattr(args, "reply_to", None):
+        group_id = GroupStore(config.groups_path).find(args.group)["id"]
+        in_reply_to = _resolve_group_reply_target(
+            Inbox(config.inbox_path),
+            Mailbox(config.mailbox_path),
+            str(args.reply_to),
+            group_id,
+        )
     node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start()
     try:
@@ -5747,6 +5811,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            in_reply_to=in_reply_to,
         )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.

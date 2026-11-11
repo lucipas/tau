@@ -37,6 +37,7 @@ from .protocol import (
     DEFAULT_MESSAGE_KIND,
     ProtocolError,
     clean_in_reply_to,
+    excerpt_hash,
     normalize_message_kind,
 )
 from .util import atomic_write_json, read_json
@@ -981,12 +982,21 @@ class Inbox:
             self._save()
             return self._unread_counts_locked()
 
-    def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find(
+        self,
+        message_id: str,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
 
         Quote resolution is scoped to the conversation: a reply
         reference only resolves against a message with the same peer,
-        so a reference to another peer's message never renders.
+        so a reference to another peer's message never renders.  For
+        a group message the conversation is the group instead: pass
+        ``group`` and the match is scoped to that group's messages,
+        from any member.
         """
         if not isinstance(message_id, str) or not message_id:
             return None
@@ -997,16 +1007,19 @@ class Inbox:
                 continue
             if peer is not None and item.get("destination") != peer:
                 continue
+            if group is not None and item.get("group") != group:
+                continue
             return dict(item)
         return None
 
     def find_prefix(
-        self, prefix: str, *, peer: Optional[str] = None
+        self, prefix: str, *, peer: Optional[str] = None, group: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Records whose wire id starts with *prefix*, newest first.
 
         Used to resolve ``tau send --reply-to``: the prefix must match
-        exactly one message in the conversation.
+        exactly one message in the conversation.  ``group`` scopes the
+        match to one group's messages instead of one peer's.
         """
         if not isinstance(prefix, str) or not prefix:
             return []
@@ -1022,8 +1035,37 @@ class Inbox:
                 continue
             if peer is not None and item.get("destination") != peer:
                 continue
+            if group is not None and item.get("group") != group:
+                continue
             matches.append(dict(item))
         return matches
+
+    def find_by_excerpt(
+        self, excerpt: str, *, group: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Newest record whose text hashes to *excerpt*, optionally in one group.
+
+        Group legs carry per-member ids, so the member who quoted a
+        message may name a leg id this node never held — but every
+        member holds the same text, so the excerpt hash (see
+        :func:`tau.protocol.excerpt_hash`) still identifies the quoted
+        message within the group.  Used to render a group quote whose
+        leg id is not in the local inbox.
+        """
+        if not isinstance(excerpt, str) or not excerpt:
+            return None
+        wanted = excerpt.strip().lower()
+        with self._lock:
+            entries = list(self._messages)
+        for item in reversed(entries):
+            if group is not None and item.get("group") != group:
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            if excerpt_hash(text) == wanted:
+                return dict(item)
+        return None
 
     def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.

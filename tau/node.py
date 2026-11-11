@@ -1586,6 +1586,8 @@ class TauNode:
                 "group": group["id"],
                 "group_name": group["name"],
             }
+            if message.get("in_reply_to") is not None:
+                record["in_reply_to"] = message["in_reply_to"]
             log.info(
                 "Group message from %s (%s) in %s: %s",
                 caller_name,
@@ -2296,6 +2298,7 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                in_reply_to=entry.in_reply_to,
             )
             if entry.group_id is not None
             else encode_message(
@@ -3324,6 +3327,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        in_reply_to: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -3337,6 +3341,14 @@ class TauNode:
         queued the same way instead of dropped.  Returns a
         per-member result list: ``delivered``, ``queued``, or an
         ``error`` for that leg.
+
+        ``in_reply_to`` quotes an earlier message in the group:
+        ``{\"id\": <wire id>, \"excerpt\": <short hash>}``.  The
+        reference travels on every leg, through queued legs and
+        sealed relay copies, exactly like a direct-message reply.
+        Each delivered or queued leg is recorded in the local inbox
+        (direction out, like a sent DM), so the sender's own group
+        message can itself be quoted and a peer's reply to it renders.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3346,6 +3358,7 @@ class TauNode:
                 "group record has no creator; delete it and re-create it"
             )
         normalized = normalize_message(text)
+        reply_to = clean_in_reply_to(in_reply_to)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
@@ -3354,6 +3367,23 @@ class TauNode:
             "creator": creator,
             "members": list(group["members"]),
         }
+
+        def _record_sent_leg(leg_id: str, member_hash: str) -> None:
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": member_hash,
+                    "text": normalized,
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": group["name"],
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": leg_id,
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
+            )
         results: List[Dict[str, Any]] = []
         any_queued = False
         # Check the full group request size once, before any leg is sent
@@ -3367,6 +3397,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                in_reply_to=reply_to,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3382,6 +3413,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                in_reply_to=reply_to,
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:
@@ -3422,6 +3454,7 @@ class TauNode:
                         to_name="",
                         message_id=message_id,
                         group=context,
+                        in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
                     results.append(
@@ -3440,6 +3473,7 @@ class TauNode:
                     text=normalized,
                     sent_at=entry.created_at,
                 )
+                _record_sent_leg(entry.id, member)
                 any_queued = True
                 results.append(
                     {
@@ -3481,6 +3515,7 @@ class TauNode:
                     deadline=deadline,
                 )
                 self.mailbox.record_delivered(message_id)
+                _record_sent_leg(message_id, member)
                 results.append(
                     {
                         "to": member,
@@ -3525,6 +3560,7 @@ class TauNode:
                         to_name=peer.display_name if peer is not None else "",
                         message_id=message_id,
                         group=context,
+                        in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
                     # The outbox is full (or the write failed): record the
@@ -3554,6 +3590,7 @@ class TauNode:
                     text=normalized,
                     sent_at=entry.created_at,
                 )
+                _record_sent_leg(entry.id, member)
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "
