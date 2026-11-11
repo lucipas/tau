@@ -2231,6 +2231,104 @@ def import_entries(
     }
 
 
+# A tag is ``#`` followed by a Unicode letter, then letters, digits,
+# ``_`` or ``-``.  The ``#`` must start the text or follow a character
+# that is not a word character, so ``C#`` and ``foo#bar`` are not tags.
+_TAG_PATTERN = re.compile(r"(?<![\w])#([^\W\d_][\w-]*)", re.UNICODE)
+
+
+def extract_tags(text: Any) -> List[str]:
+    """Tags carried by *text*, casefolded and deduplicated in order.
+
+    Tags are derived from the text at read time, never stored: a post
+    gains its tags without a re-publish, and no envelope or schema
+    change is involved.  A trailing ``-`` is not part of a tag, so
+    ``#mesh-`` reads as ``mesh``.
+    """
+    if not isinstance(text, str):
+        return []
+    seen: Set[str] = set()
+    found: List[str] = []
+    for match in _TAG_PATTERN.finditer(text):
+        tag = match.group(1).rstrip("-").casefold()
+        if tag and tag not in seen:
+            seen.add(tag)
+            found.append(tag)
+    return found
+
+
+def clean_tag(value: Any) -> str:
+    """Normalise a user-supplied tag, or raise :class:`TanError`.
+
+    A leading ``#`` is stripped, surrounding whitespace is ignored,
+    and the tag is casefolded.  Anything that is not exactly one tag —
+    empty, starting with a digit, or carrying characters a tag cannot
+    carry — is rejected.
+    """
+    if not isinstance(value, str):
+        raise TanError("tag must be text")
+    raw = value.strip()
+    if raw.startswith("#"):
+        raw = raw[1:]
+    tag = raw.strip().casefold()
+    if not tag or extract_tags("#" + tag) != [tag]:
+        raise TanError(f"not a tag: {value!r}")
+    return tag
+
+
+def _filter_posts_by_tag(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+    tag: str,
+) -> List[Dict[str, Any]]:
+    """Keep only the posts in *posts* carrying *tag*.
+
+    The match runs on each post's current text — an edited post matches
+    its edited text, not the original — and a repost matches on the
+    text of the post it reposts, since a repost carries no text of its
+    own.  A repost whose original has not arrived (or is deleted)
+    carries no visible text and never matches.  Originals are fetched
+    in one query, the same way :func:`annotate_reposts` fetches them.
+    """
+    if not posts:
+        return []
+    states = edit_states(conn, [str(post["hash"]) for post in posts])
+    targets = [
+        str(post["target"])
+        for post in posts
+        if post.get("kind") == KIND_REPOST and post.get("target")
+    ]
+    originals: Dict[str, str] = {}
+    if targets:
+        placeholders = ", ".join("?" for _ in targets)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
+            f"WHERE hash IN ({placeholders}) "
+            "AND kind IN ('post', 'reply') AND linked = 1",
+            targets,
+        ).fetchall()
+        original_posts = _public_posts(rows)
+        original_states = edit_states(
+            conn, [post["hash"] for post in original_posts]
+        )
+        for original in original_posts:
+            text = original_states.get(original["hash"], {}).get(
+                "text", original["text"]
+            )
+            originals[original["hash"]] = str(text)
+    kept: List[Dict[str, Any]] = []
+    for post in posts:
+        if post.get("kind") == KIND_REPOST:
+            text = originals.get(str(post.get("target") or ""), "")
+        else:
+            text = states.get(str(post["hash"]), {}).get(
+                "text", str(post.get("text") or "")
+            )
+        if tag in extract_tags(text):
+            kept.append(post)
+    return kept
+
+
 def timeline(
     conn: sqlite3.Connection,
     authors: Optional[Sequence[str]] = None,
@@ -2241,6 +2339,7 @@ def timeline(
     viewer: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
     exclude_all: bool = False,
+    tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return followed posts (and local posts) newest first.
 
@@ -2265,7 +2364,10 @@ def timeline(
     from blocked authors — and blanks their words from reply
     snippets — while the entries stay stored, so chains stay intact.
     ``exclude_all`` hides every post — the display side of a
-    block-list that failed closed.
+    block-list that failed closed.  When *tag* is given, only posts
+    carrying that tag are returned — a repost counts when the post it
+    reposts carries the tag — and paging keeps going until ``limit``
+    matching posts are collected.
     """
     if exclude_all:
         return []
@@ -2273,6 +2375,12 @@ def timeline(
     blocked = set(_clean_excluded(exclude_authors))
     hidden = silenced | blocked
     keywords = _muted_keyword_list(conn)
+    wanted_tag = clean_tag(tag) if tag is not None else None
+    keep_tag = (
+        (lambda page: _filter_posts_by_tag(conn, page, wanted_tag))
+        if wanted_tag is not None
+        else None
+    )
     if include_all:
         posts = _fill_unmuted(
             conn,
@@ -2287,6 +2395,7 @@ def timeline(
             ),
             before,
             lambda post: float(post["created_at"]),
+            filter_page=keep_tag,
         )
         return annotate_reposts(
             conn,
@@ -2347,6 +2456,7 @@ def timeline(
         page,
         before,
         lambda post: float(post["created_at"]),
+        filter_page=keep_tag,
     )
     return annotate_reposts(
         conn,
@@ -2386,6 +2496,7 @@ def author_timeline(
     viewer: Optional[str] = None,
     exclude_authors: Optional[Sequence[str]] = None,
     exclude_all: bool = False,
+    tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return one author's posts newest first, with muted posts skipped.
 
@@ -2397,7 +2508,8 @@ def author_timeline(
     soon as a second page was needed.  A blocked author (named in
     *exclude_authors*) shows nothing at all, and ``exclude_all``
     hides every author — the display side of a block-list that
-    failed closed.
+    failed closed.  When *tag* is given, only posts carrying that tag
+    are returned, as in :func:`timeline`.
     """
     if exclude_all:
         return []
@@ -2407,6 +2519,12 @@ def author_timeline(
         return []
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
+    wanted_tag = clean_tag(tag) if tag is not None else None
+    keep_tag = (
+        (lambda page: _filter_posts_by_tag(conn, page, wanted_tag))
+        if wanted_tag is not None
+        else None
+    )
 
     def page(cursor: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
@@ -2425,6 +2543,7 @@ def author_timeline(
         page,
         0,
         lambda post: int(post["seq"]),
+        filter_page=keep_tag,
     )
     return annotate_reposts(
         conn,
@@ -2557,19 +2676,28 @@ def _fill_unmuted(
     fetch: Callable[[Any], List[Dict[str, Any]]],
     cursor: Any,
     next_cursor: Callable[[Dict[str, Any]], Any],
+    filter_page: Optional[
+        Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+    ] = None,
 ) -> List[Dict[str, Any]]:
     """Collect up to *limit* unmuted posts by paging through *fetch*.
 
     *fetch* receives a cursor and returns one page of at most
     ``MAX_FEED_POSTS`` posts in feed order; *next_cursor* derives the
     cursor for the page after the last post it returned.  A short page
-    means the feed is exhausted.
+    means the feed is exhausted.  *filter_page*, when given, further
+    narrows each fetched page after the muted-keyword filter — paging
+    keeps going until *limit* posts survive both filters, so a narrow
+    filter never shrinks the result below what is available.
     """
     wanted = max(1, min(int(limit), 200))
     kept: List[Dict[str, Any]] = []
     while len(kept) < wanted:
         page = fetch(cursor)
-        kept.extend(without_muted_keywords(conn, page, keywords))
+        visible = without_muted_keywords(conn, page, keywords)
+        if filter_page is not None:
+            visible = filter_page(visible)
+        kept.extend(visible)
         if len(page) < MAX_FEED_POSTS:
             break
         cursor = next_cursor(page[-1])
@@ -2840,6 +2968,56 @@ def search_posts(
         ),
         viewer=viewer,
     )
+
+
+# Tags share search's ceiling: they are a display surface like the
+# timeline, not a sync page.
+MAX_TAGS = 100
+
+
+def tags(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 30,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> List[Dict[str, Any]]:
+    """Tags in stored posts, with the number of posts carrying each.
+
+    Only linked ``post``, ``reply`` and ``quote`` entries count — a
+    repost carries no text of its own, so it adds nothing, and its
+    original is counted once on its own.  Each post counts once per
+    tag, on its current text: an edited post contributes the tags of
+    its edited text, not the original.  Posts their author deleted
+    never count, and posts by muted or blocked authors never count
+    either.  Muted keywords are ignored — this is an explicit lookup,
+    the way search is.  Results are sorted by count, most-used first,
+    then by tag, and carry ``{"tag": ..., "count": ...}``.
+    """
+    if exclude_all:
+        return []
+    excluded = set(_clean_excluded(exclude_authors))
+    hidden = excluded | muted_author_set(conn)
+    count = max(1, min(int(limit), MAX_TAGS))
+    where = (
+        "linked = 1 AND kind IN ('post', 'reply', 'quote') "
+        f"AND {_NOT_DELETED}"
+    )
+    rows = conn.execute(
+        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts WHERE {where} "
+        "ORDER BY created_at DESC, hash DESC",
+    ).fetchall()
+    posts = _public_posts(rows)
+    states = edit_states(conn, [post["hash"] for post in posts])
+    counts: Dict[str, int] = {}
+    for post in posts:
+        if str(post["author"]) in hidden:
+            continue
+        text = states.get(post["hash"], {}).get("text", post["text"])
+        for tag in extract_tags(text):
+            counts[tag] = counts.get(tag, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [{"tag": tag, "count": n} for tag, n in ranked[:count]]
 
 
 # Mentions share search's ceiling: they are a display surface like the
