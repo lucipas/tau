@@ -3455,6 +3455,23 @@ class TauNode:
                 # disk I/O, so the member still gets the message on a
                 # later retry, exactly as if the attempt had failed to
                 # reach them.
+                if expires_at is not None and expires_at <= time.time():
+                    # The deadline passed while reaching this member:
+                    # queueing would store a leg the next prune removes
+                    # undelivered, so report it as expired instead.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "expired": True,
+                            "error": "expired: the deadline passed before "
+                            "this leg could be sent",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 if not queue or not self.started:
                     results.append(
                         {
@@ -3585,6 +3602,23 @@ class TauNode:
                             "to_name": peer.display_name if peer is not None else "",
                             "ok": False,
                             "error": str(exc),
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                if expires_at is not None and expires_at <= time.time():
+                    # The deadline passed during discovery or the
+                    # attempt: queueing would store a leg the next prune
+                    # removes undelivered, so report it as expired.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "expired": True,
+                            "error": "expired: the deadline passed before "
+                            "this leg could be sent",
                             "id": message_id,
                         }
                     )

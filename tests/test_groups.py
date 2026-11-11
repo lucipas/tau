@@ -1644,6 +1644,44 @@ def test_send_group_message_expired_duplicate_still_counts_delivered(tmp_path):
     )
 
 
+def test_send_group_message_expired_leg_is_not_queued(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    node.resolve_peer = (  # type: ignore[method-assign]
+        lambda target, timeout=10.0: (_ for _ in ()).throw(
+            NodeError("unreachable")
+        )
+    )
+    result = node.send_group_message(
+        group, "too late", expires_at=time.time() - 1
+    )
+    assert result["ok"] is False
+    # The deadline passed before any leg could be sent: queueing would
+    # store entries the next prune removes undelivered, so the legs
+    # report expired instead of queued.
+    assert all(entry["expired"] is True for entry in result["results"])
+    assert all(not entry.get("queued") for entry in result["results"])
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_message_expired_leg_past_deadline_is_not_queued(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    result = node.send_group_message(
+        group, "too late", timeout=0.0, expires_at=time.time() - 1
+    )
+    assert result["ok"] is False
+    assert all(entry["expired"] is True for entry in result["results"])
+    assert all(not entry.get("queued") for entry in result["results"])
+    assert node.mailbox.outbox_list() == []
+
+
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
