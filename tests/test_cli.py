@@ -2129,7 +2129,9 @@ def test_messages_prune_deletes_and_persists(tmp_path, capsys):
     assert code == 0
     out = capsys.readouterr().out
     assert "Pruned 2 messages older than 90d" in out
-    assert "only this node's stored copies were deleted" in out
+    assert "only this node's stored inbox copies were deleted" in out
+    assert "Sent history shown by `tau messages --sent`" in out
+    assert "still queued in the outbox remain stored locally" in out
 
     code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
     assert code == 0

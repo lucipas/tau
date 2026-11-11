@@ -675,7 +675,10 @@ class Inbox:
         Read cursors are untouched: they are sequence numbers, so they
         stay valid after older records are gone, and unread counts for
         surviving messages are unchanged.  The outbox is never touched:
-        a queued message to an offline peer is not history.  A dry run
+        a queued message to an offline peer is not history.  Sent
+        history is a separate store: the mailbox keeps its own sent
+        log (what ``tau messages --sent`` shows), so pruning the inbox
+        does not erase sent text from there.  A dry run
         reports the count without deleting or saving.
 
         Returns ``{"pruned": n, "per_peer": {destination: n},

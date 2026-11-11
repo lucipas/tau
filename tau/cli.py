@@ -5650,9 +5650,11 @@ def cmd_messages_prune(args: argparse.Namespace) -> int:
             print("dry run — nothing was deleted.")
         else:
             print(
-                "note: only this node's stored copies were deleted (received"
-                " and sent); the other parties keep theirs, and sealed copies"
-                " already held by relays are unaffected."
+                "note: only this node's stored inbox copies were deleted"
+                " (received and sent); the other parties keep theirs, and"
+                " sealed copies already held by relays are unaffected."
+                " Sent history shown by `tau messages --sent` and messages"
+                " still queued in the outbox remain stored locally."
             )
     return _EXIT_OK
 
