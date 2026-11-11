@@ -3482,8 +3482,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def on_file(record: Dict[str, Any]) -> None:
             console_file(record)
             # The console lists messages, not files: record the arrival
-            # as an inbound message so the file shows up in its feed
-            # (a download link can follow later).
+            # as an inbound message so the file shows up in its feed.
+            # The file metadata rides along so the feed can offer the
+            # bytes back as a download (GET /api/files/<sender>/<name>).
             bridge.record_inbound(
                 {
                     "destination": record.get("destination"),
@@ -3495,6 +3496,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     ),
                     "sent_at": record.get("sent_at"),
                     "received_at": record.get("received_at"),
+                    "file": {
+                        "name": record.get("name"),
+                        "size": record.get("size"),
+                        "sha256": record.get("sha256"),
+                    },
                 }
             )
 

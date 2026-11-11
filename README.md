@@ -140,6 +140,7 @@ The same bridge is the local integration point for scripts:
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
 | `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/files/<sender>/<name>` | GET | download a file received from `<sender>` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |

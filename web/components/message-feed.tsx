@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { API_BASE } from "@/lib/api";
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
@@ -358,6 +359,15 @@ function MessageBubble({
             >
               sha256 {shortHash(message.file.sha256, 8)}
             </span>
+            {message.direction === "in" && message.peer ? (
+              <a
+                className="shrink-0 text-signal hover:underline"
+                href={`${API_BASE}/api/files/${message.peer}/${encodeURIComponent(message.file.name)}`}
+                download={message.file.name}
+              >
+                Download
+              </a>
+            ) : null}
           </div>
         ) : null}
 

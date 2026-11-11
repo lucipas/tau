@@ -51,6 +51,46 @@ describe("MessageFeed reactions", () => {
 });
 
 describe("MessageFeed file entries", () => {
+  const file = {
+    name: "report.pdf",
+    size: 2048,
+    sha256: "ab".repeat(32),
+  };
+
+  it("shows a download link for a received file", () => {
+    const message = makeMessage({
+      text: "Received file: report.pdf (2048 bytes, sha256 ab…)",
+      file,
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    expect(screen.getByText("2.0 KB")).toBeTruthy();
+    const link = screen.getByRole("link", { name: "Download" });
+    // jsdom runs on :3000, so the configured API base points at the
+    // bridge on :8787 — the link must target the bridge, not the
+    // page's own origin.
+    expect(link.getAttribute("href")).toBe(
+      `http://localhost:8787/api/files/${message.peer}/report.pdf`,
+    );
+  });
+
+  it("shows file metadata but no download link for an outbound file", () => {
+    const message = makeMessage({ direction: "out", file });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Download" })).toBeNull();
+  });
+
+  it("renders no file block when a message has no file", () => {
+    render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    expect(screen.queryByRole("link", { name: "Download" })).toBeNull();
+    expect(screen.queryByText("📎")).toBeNull();
+  });
+
   it("renders the file name, size and hash for a sent file", () => {
     const message = makeMessage({
       direction: "out",

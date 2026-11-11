@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import socket
@@ -4573,6 +4574,288 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["expires_at"] == expires_at
+
+
+# -- received-file downloads -------------------------------------------------
+
+SENDER_HASH = "ab" * 16
+
+
+def _receive_file(node, tmp_path, *, sender, name, data, size=None, sha256=None, path=None):
+    """Stage *data* as a file received from *sender* and record it."""
+    from tau.config import TauConfig
+
+    files_dir = node.config.files_dir
+    sender_dir = files_dir / sender
+    sender_dir.mkdir(parents=True, exist_ok=True)
+    target = sender_dir / name
+    target.write_bytes(data)
+    record = {
+        "kind": "file",
+        "from": "alice",
+        "destination": sender,
+        "name": name,
+        "size": len(data) if size is None else size,
+        "sha256": hashlib.sha256(data).hexdigest() if sha256 is None else sha256,
+        "path": str(target) if path is None else path,
+        "sent_at": 1000.0,
+        "received_at": 1001.0,
+        "id": "00" * 16,
+    }
+    node.inbox.append(record)
+    return record
+
+
+def _with_config(node, tmp_path):
+    from tau.config import TauConfig
+
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+
+def test_download_received_file(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    data = b"hello file"
+    _receive_file(node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=data)
+    status, headers, body = _request(
+        bridge, f"/api/files/{SENDER_HASH}/notes.txt"
+    )
+    assert status == 200
+    assert body == data
+    assert headers["Content-Type"] == "application/octet-stream"
+    assert headers["Content-Disposition"].startswith(
+        'attachment; filename="notes.txt"'
+    )
+    assert headers["Content-Length"] == str(len(data))
+    # A destination hash is case-insensitive: an uppercase sender is
+    # normalised to the same hash, not rejected.
+    status, _, body = _request(bridge, f"/api/files/{SENDER_HASH.upper()}/notes.txt")
+    assert status == 200
+    assert body == data
+
+
+def test_download_response_is_not_followed_by_a_second_response(
+    bridge, node, tmp_path
+):
+    data = b"hello file"
+    _with_config(node, tmp_path)
+    _receive_file(node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=data)
+    connection = http.client.HTTPConnection("127.0.0.1", bridge.port, timeout=5)
+    try:
+        connection.request("GET", f"/api/files/{SENDER_HASH}/notes.txt")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == data
+        # The download must end the response: a second request on the
+        # same keep-alive connection has to get a clean answer, not
+        # the stray bytes of a second response written onto the socket.
+        connection.request("GET", "/api/status")
+        second = connection.getresponse()
+        assert second.status == 200
+        second.read()
+    finally:
+        connection.close()
+
+
+def test_download_received_file_unknown_is_404(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    status, _, payload = _json(bridge, f"/api/files/{SENDER_HASH}/missing.txt")
+    assert status == 404
+    assert "no such received file" in payload["error"]["message"]
+    status, _, _ = _json(bridge, f"/api/files/{'cd' * 16}/notes.txt")
+    assert status == 404
+    # Wrong shape: no name, or an extra segment, is a 404 too.
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}")
+    assert status == 404
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/a/b.txt")
+    assert status == 404
+
+
+def test_download_received_file_rejects_bad_sender_and_name(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    for path in (
+        "/api/files/short/notes.txt",
+        "/api/files/" + "AB" + "ab" * 31 + "/notes.txt",
+        "/api/files/" + SENDER_HASH + "/..%2F..%2Fetc-passwd",
+        "/api/files/" + SENDER_HASH + "/a%2Fb.txt",
+    ):
+        status, _, payload = _json(bridge, path)
+        assert status == 400, path
+        assert payload["error"]["message"]
+
+
+def test_download_received_file_rejects_tampered_bytes(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    data = b"hello file"
+    record = _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=data
+    )
+    # Same length, different bytes: the stored SHA-256 no longer matches.
+    from pathlib import Path
+
+    Path(record["path"]).write_bytes(b"tampered!!")
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/notes.txt")
+    assert status == 404
+    # A record whose size disagrees with the bytes on disk is not served.
+    _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="other.txt", data=b"abc", size=99
+    )
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/other.txt")
+    assert status == 404
+
+
+def test_download_received_file_rejects_escaped_path(bridge, node, tmp_path):
+    from pathlib import Path
+
+    _with_config(node, tmp_path)
+    data = b"outside"
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(data)
+    # The record points outside the files directory, with a matching
+    # size and hash: still not served.
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": SENDER_HASH,
+            "name": "outside.txt",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "path": str(outside),
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "11" * 16,
+        }
+    )
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/outside.txt")
+    assert status == 404
+    # A symlink inside the sender directory pointing out is resolved
+    # to the same outside path and rejected the same way.
+    sender_dir = node.config.files_dir / SENDER_HASH
+    sender_dir.mkdir(parents=True, exist_ok=True)
+    link = sender_dir / "linked.txt"
+    link.symlink_to(outside)
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": SENDER_HASH,
+            "name": "linked.txt",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "path": str(link),
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "22" * 16,
+        }
+    )
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/linked.txt")
+    assert status == 404
+
+
+def test_record_inbound_keeps_file_metadata(bridge):
+    message = bridge.record_inbound(
+        {
+            "destination": SENDER_HASH,
+            "from": "alice",
+            "text": "Received file: notes.txt (10 bytes, sha256 ab…)",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "file": {"name": "notes.txt", "size": 10, "sha256": "ab" * 32},
+        }
+    )
+    assert message["file"] == {"name": "notes.txt", "size": 10, "sha256": "ab" * 32}
+    # File metadata that is not a safe bare name is dropped, not stored.
+    message = bridge.record_inbound(
+        {
+            "destination": SENDER_HASH,
+            "from": "alice",
+            "text": "Received file: x (10 bytes, sha256 ab…)",
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "file": {"name": "../x", "size": 10, "sha256": "ab" * 32},
+        }
+    )
+    assert "file" not in message
+
+
+def test_stored_message_keeps_file_metadata(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    try:
+        bridge.record_inbound(
+            {
+                "destination": SENDER_HASH,
+                "from": "alice",
+                "text": "Received file: notes.txt (10 bytes, sha256 ab…)",
+                "sent_at": 1000.0,
+                "received_at": 1001.0,
+                "file": {"name": "notes.txt", "size": 10, "sha256": "ab" * 32},
+            }
+        )
+    finally:
+        bridge.stop()
+    reloaded = WebBridge(node, host="127.0.0.1", port=0)
+    try:
+        assert reloaded.messages()[0]["file"] == {
+            "name": "notes.txt",
+            "size": 10,
+            "sha256": "ab" * 32,
+        }
+    finally:
+        reloaded.stop()
+
+
+def test_download_received_file_blocked_sender_is_404(bridge, node, tmp_path):
+    from tau.blocklist import BlockList
+
+    _with_config(node, tmp_path)
+    _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=b"hello file"
+    )
+    node.blocklist = BlockList(blocked=frozenset({SENDER_HASH}))
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/notes.txt")
+    assert status == 404
+
+
+def test_download_received_file_symlink_loop_is_404(bridge, node, tmp_path):
+    _with_config(node, tmp_path)
+    sender_dir = node.config.files_dir / SENDER_HASH
+    sender_dir.mkdir(parents=True, exist_ok=True)
+    loop = sender_dir / "loop.txt"
+    loop.symlink_to(loop)
+    node.inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": SENDER_HASH,
+            "name": "loop.txt",
+            "size": 10,
+            "sha256": "ab" * 32,
+            "path": str(loop),
+            "sent_at": 1000.0,
+            "received_at": 1001.0,
+            "id": "33" * 16,
+        }
+    )
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/loop.txt")
+    assert status == 404
+
+
+def test_download_received_file_oversized_replacement_is_404(bridge, node, tmp_path):
+    from pathlib import Path
+
+    _with_config(node, tmp_path)
+    record = _receive_file(
+        node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=b"hello file"
+    )
+    # The bytes are replaced by something far larger than the recorded
+    # size: the download must 404 without loading the whole file.
+    Path(record["path"]).write_bytes(b"x" * (1024 * 1024))
+    status, _, _ = _json(bridge, f"/api/files/{SENDER_HASH}/notes.txt")
+    assert status == 404
 
 
 def test_send_file_is_recorded_with_file_metadata(bridge, node):
