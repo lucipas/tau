@@ -439,6 +439,19 @@ class TauNode:
         self.identity: Optional[RNS.Identity] = None
         self.destination: Optional[RNS.Destination] = None
         self.lxmf_router: Optional[Any] = None
+        # LXMF delivery coordination (see _handle_lxmf_message): the
+        # router invokes the delivery callback on its own thread, so
+        # deliveries can overlap each other and node shutdown.
+        # _lxmf_delivery_lock serialises the dedupe-and-store span so
+        # two copies of one message cannot both claim it; the
+        # stopping flag plus in-flight count let stop() wait for a
+        # delivery already in progress instead of persisting state
+        # and releasing the instance lock under it.
+        self._lxmf_delivery_lock = threading.Lock()
+        self._lxmf_state_lock = threading.Lock()
+        self._lxmf_stopping = False
+        self._lxmf_inflight = 0
+        self._lxmf_drained = threading.Condition(self._lxmf_state_lock)
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
@@ -708,10 +721,12 @@ class TauNode:
         The router listens on the LXMF delivery destination derived from
         the node's identity (the address ``tau id`` and ``tau peers``
         already show) and announces it, so LXMF clients can find a path
-        to this node.  Storage lives under the data directory.  This is
-        the router lifecycle only — nothing is sent over LXMF yet; that
-        follows under the migration tracked in issue #67.  A failure here
-        is a node-start failure: the caller cleans up via :meth:`stop`.
+        to this node.  Incoming LXMF messages are delivered into the DM
+        inbox by :meth:`_handle_lxmf_message`, registered as the
+        router's delivery callback.  Storage lives under the data
+        directory.  Sending over LXMF still follows under the migration
+        tracked in issue #67.  A failure here is a node-start failure:
+        the caller cleans up via :meth:`stop`.
         """
         assert self.identity is not None  # set above, before this runs
         try:
@@ -719,6 +734,7 @@ class TauNode:
                 self.identity,
                 self.config.data_dir,
                 display_name=self.name,
+                delivery_callback=self._handle_lxmf_message,
             )
         except LXMFError as exc:
             raise NodeError(str(exc)) from exc
@@ -728,8 +744,183 @@ class TauNode:
             delivery.hex() if delivery is not None else "unknown",
         )
 
+    def _handle_lxmf_message(self, message: Any) -> None:
+        """Deliver one incoming LXMF message into the DM inbox.
+
+        The router invokes this on its own thread with a decrypted
+        ``LXMessage`` addressed to this node's delivery destination.
+        It mirrors :meth:`_handle_message`: the signature must verify,
+        the sender must be a known peer, and the block-list and DM
+        allow-list gates apply in the same order.  A message that fails
+        any gate is dropped and logged, never stored.  Any failure
+        inside the handler is caught and logged — the callback must
+        never raise back into the router.
+
+        Deliveries that arrive while the node is stopping are dropped:
+        :meth:`stop` sets the flag before tearing the router down and
+        waits for deliveries already in flight, so no delivery writes
+        to the inbox or notifies listeners after shutdown has
+        persisted state and released the instance lock.
+        """
+        with self._lxmf_state_lock:
+            if self._lxmf_stopping:
+                log.info("Dropping LXMF message: node is stopping")
+                return
+            self._lxmf_inflight += 1
+        try:
+            self._deliver_lxmf_message(message)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not deliver incoming LXMF message", exc_info=True)
+        finally:
+            with self._lxmf_state_lock:
+                self._lxmf_inflight -= 1
+                if self._lxmf_inflight == 0:
+                    self._lxmf_drained.notify_all()
+
+    def _deliver_lxmf_message(self, message: Any) -> None:
+        """Store one verified LXMF message, or drop it with a log line."""
+        if not getattr(message, "signature_validated", False):
+            # The router validates the signature against the recalled
+            # source identity while unpacking; an unverified message
+            # proves nothing about its sender, so it never reaches
+            # the inbox — same fail-closed stance as the DM path.
+            log.info("Dropping LXMF message with an unverified signature")
+            return
+        source_hash = getattr(message, "source_hash", None)
+        if not isinstance(source_hash, (bytes, bytearray)):
+            log.info("Dropping LXMF message with no source hash")
+            return
+        source_hex = bytes(source_hash).hex()
+        sender = None
+        for peer in self.registry.all():
+            if peer.lxmf_hash == source_hex:
+                sender = peer
+                break
+        if sender is None:
+            # The inbox keys on tau destination hashes, and only a
+            # known peer maps an LXMF delivery hash to one.  First
+            # contact still needs a tau announce; an LXMF-only sender
+            # cannot be attributed, so its message is dropped.
+            log.info(
+                "Dropping LXMF message from unknown sender %s",
+                source_hex[:8],
+            )
+            return
+        caller_hash = sender.hexhash
+        if self.blocklist.is_blocked(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the block-list",
+                caller_hash,
+            )
+            return
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the DM allow-list",
+                caller_hash,
+            )
+            return
+        content_as_string = getattr(message, "content_as_string", None)
+        text = content_as_string() if callable(content_as_string) else None
+        if not text:
+            log.info(
+                "Dropping LXMF message from %s with no readable text",
+                caller_hash,
+            )
+            return
+        message_hash = getattr(message, "hash", None)
+        if not isinstance(message_hash, (bytes, bytearray)):
+            log.info(
+                "Dropping LXMF message from %s with no message hash",
+                caller_hash,
+            )
+            return
+        # A propagation copy can redeliver the same message after a
+        # router restart, so dedupe on the LXMF hash exactly like the
+        # DM path dedupes relayed copies on the tau message id.
+        # Tau message ids are capped at 64 characters on the wire, so the
+        # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
+        # still collision-free in practice).
+        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
+        # The router can invoke this callback concurrently for two
+        # copies of one message (direct + propagation), and each copy
+        # passes the router's own duplicate check first — so the
+        # is_seen check, the inbox scan, the append and the mark_seen
+        # below run under one lock.  Without it both copies could
+        # pass the checks before either stored anything and the
+        # message would land in the inbox twice.
+        with self._lxmf_delivery_lock:
+            if self.mailbox.is_seen(message_id):
+                log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            if any(
+                entry.get("id") == message_id
+                for entry in self.inbox.list_messages(direction=None)
+            ):
+                # Stored earlier but interrupted before it was marked seen.
+                self.mailbox.mark_seen(message_id)
+                log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            try:
+                sent_at = float(getattr(message, "timestamp", None) or 0.0)
+            except (TypeError, ValueError):
+                sent_at = 0.0
+            received_at = time.time()
+            record = {
+                "from": sender.display_name,
+                "destination": caller_hash,
+                "text": text,
+                "sent_at": sent_at,
+                "received_at": received_at,
+                "id": message_id,
+                "expires_at": None,
+                "direction": "in",
+            }
+            log.info(
+                "LXMF message from %s (%s): %s",
+                sender.display_name,
+                caller_hash,
+                text,
+            )
+            try:
+                self.inbox.append(record)
+            except Exception:
+                # Not stored, so leave it unseen: a redelivery can retry it.
+                log.warning(
+                    "Could not record LXMF message %s", message_id, exc_info=True
+                )
+                return
+            self.mailbox.mark_seen(message_id)
+        if self.on_message is not None:
+            try:
+                self.on_message(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
+
+    def _wait_for_lxmf_deliveries(self) -> None:
+        """Wait for in-flight LXMF deliveries, bounded so stop never hangs.
+
+        A delivery is short — a few store lookups and one inbox append —
+        so the wait is normally immediate.  If one is wedged (for
+        example a listener that never returns), shutdown proceeds after
+        the timeout rather than hanging the process.
+        """
+        with self._lxmf_drained:
+            if not self._lxmf_drained.wait_for(
+                lambda: self._lxmf_inflight == 0, timeout=10
+            ):
+                log.warning(
+                    "Stopping with %d LXMF deliver%s still in flight",
+                    self._lxmf_inflight,
+                    "y" if self._lxmf_inflight == 1 else "ies",
+                )
+
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
+        # No new LXMF delivery starts past this point; deliveries
+        # already in flight finish before state is persisted and the
+        # instance lock is released (see _handle_lxmf_message).
+        with self._lxmf_state_lock:
+            self._lxmf_stopping = True
         # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
 
@@ -743,6 +934,7 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("LXMF router shutdown failed", exc_info=True)
             self.lxmf_router = None
+        self._wait_for_lxmf_deliveries()
 
         if self._announce_handler is not None:
             try:
