@@ -3207,16 +3207,23 @@ class TauNode:
                 # Scheduled: no delivery attempt now, even when the peer
                 # is reachable — the entry leaves the outbox only once
                 # its time arrives (every flush path honours it).
-                entry = self.mailbox.enqueue(
-                    to=peer.destination_hash,
-                    text=normalized,
-                    to_name=peer.display_name,
-                    message_id=message_id,
-                    expires_at=expires_at,
-                    in_reply_to=reply_to,
-                    kind=clean_kind,
-                    send_after=send_after,
-                )
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=peer.destination_hash,
+                        text=normalized,
+                        to_name=peer.display_name,
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        in_reply_to=reply_to,
+                        kind=clean_kind,
+                        send_after=send_after,
+                    )
+                except MailboxError:
+                    # Nothing was queued: forget the sent record made
+                    # above, so a rejected schedule does not linger in
+                    # sent history as a message that never went anywhere.
+                    self.mailbox.discard_sent(message_id)
+                    raise
                 self._record_sent(
                     {
                         "from": self.name,
@@ -3321,6 +3328,10 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=reply_to,
                 kind=clean_kind,
+                # A scheduled send to an undiscovered peer queues here:
+                # the not-before time must survive the fallback, or the
+                # message would go out as soon as the peer is heard from.
+                send_after=send_after,
             )
             self._record_sent(
                 {
@@ -3359,6 +3370,11 @@ class TauNode:
                 "id": entry.id,
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
+                **(
+                    {"send_after": entry.send_after}
+                    if entry.send_after is not None
+                    else {}
+                ),
             }
 
     def send_group_message(

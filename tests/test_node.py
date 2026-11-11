@@ -9,7 +9,7 @@ import pytest
 
 from tau.config import TauConfig
 from tau.inbox import Inbox
-from tau.mailbox import Mailbox
+from tau.mailbox import Mailbox, MailboxError
 from tau.node import NodeError, NotAllowedError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT, parse_message
@@ -679,6 +679,71 @@ def test_send_message_rejects_nonfinite_send_after(tmp_path):
         node.send_message("alice", "hi", send_after=float("nan"))
     with pytest.raises(NodeError):
         node.send_message("alice", "hi", send_after="tomorrow")
+
+
+def test_send_message_scheduled_to_undiscovered_hash_keeps_schedule(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started: the fallback may queue
+    peer = make_peer("bob")
+    # The peer has never announced: resolution fails, so the send
+    # queues through the unresolved-peer fallback.
+    def _no_peer(*args, **kwargs):
+        raise NodeError("no announce")
+
+    monkeypatch.setattr(node, "resolve_peer", _no_peer)
+    send_after = time.time() + 3600.0
+    response = node.send_message(peer.hexhash, "later", send_after=send_after)
+
+    assert response["queued"] is True
+    assert response["send_after"] == send_after
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.send_after == send_after
+    assert entry.is_due() is False
+
+    # The peer announces afterwards: even a backoff-ignoring flush
+    # must not deliver the message before its scheduled time.
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="bob", now=100.0
+    )
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e.id),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_send_message_failed_schedule_leaves_no_sent_record(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    # A schedule past the message's own expiry is rejected at enqueue.
+    send_after = time.time() + 3600.0
+    expires_at = time.time() + 60.0
+    with pytest.raises(MailboxError):
+        node.send_message(
+            "alice", "never", send_after=send_after, expires_at=expires_at
+        )
+    # Nothing was queued, and no sent record lingers behind.
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
 
 
 def test_flush_outbox_never_delivers_scheduled_entry_early(

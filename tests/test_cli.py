@@ -140,6 +140,20 @@ def test_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
     )
     assert code == 1
     assert "--delay duration must be at most 30d" in capsys.readouterr().err
+    # 30d is past the effective maximum: the mail TTL less an hour
+    # of delivery slack. 29d fits and queues.
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "30d", "hi"]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "29d", "hi"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
 
 
 def test_outbox_lists_scheduled_entry_next_try(tmp_path, capsys):

@@ -1171,6 +1171,22 @@ def test_enqueue_stretches_entry_ttl_past_send_after(tmp_path):
     assert entry.expires_at == 1000.0 + 10 * 86400 + 3600.0
 
 
+def test_enqueue_scheduled_ttl_stretch_never_passes_message_expiry(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    # The message expires 20 minutes after its scheduled time: the
+    # entry must die with the message, not live on for the hour of
+    # TTL slack the stretch would otherwise add.
+    entry = box.enqueue(
+        to=BOB,
+        text="short-lived",
+        now=1000.0,
+        send_after=2000.0,
+        expires_at=3200.0,
+        message_id="sched-5",
+    )
+    assert entry.expires_at == 3200.0
+
+
 def test_enqueue_rejects_bad_send_after(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     with pytest.raises(MailboxError, match="before the message expiry"):

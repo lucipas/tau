@@ -400,7 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--delay",
         metavar="DURATION",
         help="schedule the message: queue it now and deliver it after "
-        "this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
     )
     send.set_defaults(func=cmd_send)
 
@@ -4416,8 +4417,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         delay = _parse_duration(delay_text, flag="--delay")
         if delay > MAX_MAIL_TTL - 3600.0:
             print(
-                "error: --delay must leave at least an hour before the "
-                "30d mail TTL",
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
                 file=sys.stderr,
             )
             return 2

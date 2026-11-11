@@ -1067,8 +1067,6 @@ class Mailbox:
             entry_expires_at = timestamp + max(
                 60.0, min(float(ttl), MAX_MAIL_TTL)
             )
-            if expires_at is not None:
-                entry_expires_at = min(entry_expires_at, expires_at)
             if send_after_value is not None:
                 # A scheduled message must still be in the outbox when
                 # its time comes: stretch the entry TTL past the
@@ -1077,6 +1075,11 @@ class Mailbox:
                     entry_expires_at,
                     min(send_after_value + 3600.0, timestamp + MAX_MAIL_TTL),
                 )
+            if expires_at is not None:
+                # The message's own expiry still wins: the stretch
+                # above must never keep a dead message in the outbox
+                # past the deadline the sender set for it.
+                entry_expires_at = min(entry_expires_at, expires_at)
             entry = OutboxEntry(
                 id=entry_id,
                 to=bytes(to),
