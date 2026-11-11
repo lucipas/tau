@@ -58,6 +58,9 @@ export interface TauGroup {
   name: string;
   members: TauGroupMember[];
   created_at: number;
+  // Absent on snapshots from an older bridge; only groups this node
+  // created offer member changes in the console.
+  created_by_me?: boolean;
 }
 
 export interface GroupsResponse {
@@ -73,6 +76,12 @@ export interface CreateGroupResponse {
 export interface DeleteGroupResponse {
   ok: boolean;
   deleted: { id: string; name: string };
+}
+
+export interface ChangeGroupMembersResponse {
+  ok: boolean;
+  group: TauGroup;
+  previous_id: string;
 }
 
 export interface Peer {

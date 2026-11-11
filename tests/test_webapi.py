@@ -1130,6 +1130,173 @@ def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     assert listed["count"] == 0
 
 
+def _add_carol_to_registry(node):
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="carol",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+
+
+def test_api_groups_add_member_returns_successor_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # The roster changed, so the group is a successor with a new id.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert payload["group"]["name"] == "weekend"
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, OTHER_HASH, node.destination_hexhash])
+    assert payload["group"]["created_by_me"] is True
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == payload["group"]["id"]
+
+
+def test_api_groups_remove_member_drops_offline_member(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    # Carol goes offline: she leaves the registry, but the roster hash
+    # is enough to drop her without a lookup.
+    node.registry._peers = [
+        peer for peer in node.registry._peers if peer.hexhash != OTHER_HASH
+    ]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, node.destination_hexhash])
+
+
+def test_api_groups_change_members_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    cases = [
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": ["00" * 16]},
+            "unknown peer",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [PEER_HASH]},
+            "already a member",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "already a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [OTHER_HASH]},
+            "is not a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "cannot remove the creator",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": []},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend"},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"members": [OTHER_HASH]},
+            "field 'group' is required",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "nope", "members": [OTHER_HASH]},
+            "unknown group",
+        ),
+    ]
+    for path, body, message in cases:
+        status, _, payload = _json(bridge, path, method="POST", body=body)
+        assert status == 400, (path, body)
+        assert message in payload["error"]["message"], (path, body)
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == created["id"]
+
+
+def test_api_groups_change_members_refuses_non_creator(bridge, node):
+    # The fixture group "crew" was created by alice, not this node.
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "crew"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "crew", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "crew", "members": [PEER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
 def test_api_groups_delete_sees_group_created_by_another_store(
     bridge, node, tmp_path
 ):

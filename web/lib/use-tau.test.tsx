@@ -197,6 +197,83 @@ describe("useTau group management", () => {
     });
     expect(result.current.groups).toEqual([]);
   });
+
+  it("swaps in the successor group when members are added", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [
+        { hash: PEER_HASH, name: "alice" },
+        { hash: BOB_HASH, name: "bob" },
+        { hash: "cd".repeat(16), name: "carol" },
+      ],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    let returned:
+      | { ok: boolean; group: TauGroup; previous_id: string }
+      | undefined;
+    await act(async () => {
+      returned = await result.current.addGroupMembers(created.id, [
+        "cd".repeat(16),
+      ]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/add-member", {
+      group: created.id,
+      members: ["cd".repeat(16)],
+    });
+    expect(returned).toEqual({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    expect(result.current.groups).toEqual([successor]);
+  });
+
+  it("swaps in the successor group when members are removed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/remove-member", {
+      group: created.id,
+      members: [BOB_HASH],
+    });
+    expect(result.current.groups).toEqual([successor]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {

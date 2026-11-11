@@ -157,6 +157,12 @@ export function Console() {
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}
+            onAddGroupMembers={(group, members) =>
+              tau.addGroupMembers(group, members)
+            }
+            onRemoveGroupMembers={(group, members) =>
+              tau.removeGroupMembers(group, members)
+            }
           />
             <AllowlistSection
               allowlist={tau.allowlist}

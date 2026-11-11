@@ -8,6 +8,7 @@ import type {
   BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
+  ChangeGroupMembersResponse,
   CreateGroupResponse,
   DeleteGroupResponse,
   DropHeldResponse,
@@ -699,6 +700,47 @@ export function useTau() {
     [refreshGroups],
   );
 
+  const changeGroupMembers = useCallback(
+    async (group: string, members: string[], adding: boolean) => {
+      const result = await apiPost<ChangeGroupMembersResponse>(
+        adding ? "/api/groups/add-member" : "/api/groups/remove-member",
+        { group, members },
+      );
+      // A roster change is a successor group: swap the old id for the
+      // new one at once, then refresh best-effort so a failed GET
+      // cannot leave the stale roster on screen.
+      const updated = result.group;
+      const previousId = result.previous_id;
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.some((entry) => entry.id === previousId)
+          ? previous.map((entry) =>
+              entry.id === previousId ? updated : entry,
+            )
+          : [...previous, updated],
+      );
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups],
+  );
+
+  const addGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, true),
+    [changeGroupMembers],
+  );
+
+  const removeGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, false),
+    [changeGroupMembers],
+  );
+
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
       setBlocks((previous) => ({
@@ -954,6 +996,8 @@ export function useTau() {
     markRead,
     createGroup,
     deleteGroup,
+    addGroupMembers,
+    removeGroupMembers,
     refreshOutbox,
     refreshGroups,
     cancelOutbox,

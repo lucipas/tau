@@ -2,7 +2,15 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import type { BridgeInfo, NodeInfo, Peer, SocialInfo, TauGroup, VerifyState } from "@/lib/types";
+import type {
+  BridgeInfo,
+  ChangeGroupMembersResponse,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+  VerifyState,
+} from "@/lib/types";
 import type { BlockState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
@@ -34,6 +42,8 @@ export function PeerSidebar({
   onSelectPeer,
   onCreateGroup,
   onDeleteGroup,
+  onAddGroupMembers,
+  onRemoveGroupMembers,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
@@ -54,6 +64,14 @@ export function PeerSidebar({
   onSelectPeer: (destination: string) => void;
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  onAddGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
+  onRemoveGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
 }) {
   const now = useNow();
   const [showCreate, setShowCreate] = useState(false);
@@ -62,6 +80,10 @@ export function PeerSidebar({
   const [creating, setCreating] = useState(false);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [pickedAdd, setPickedAdd] = useState<string[]>([]);
+  const [pickedRemove, setPickedRemove] = useState<string[]>([]);
+  const [changingId, setChangingId] = useState<string | null>(null);
   const [groupError, setGroupError] = useState<string | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -90,6 +112,33 @@ export function PeerSidebar({
       setGroupError(caught instanceof Error ? caught.message : "delete failed");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  function toggleEditMembers(id: string) {
+    setGroupError(null);
+    setPickedAdd([]);
+    setPickedRemove([]);
+    setEditingId((previous) => (previous === id ? null : id));
+  }
+
+  async function submitMemberChange(groupId: string, adding: boolean) {
+    const apply = adding ? onAddGroupMembers : onRemoveGroupMembers;
+    const picked = adding ? pickedAdd : pickedRemove;
+    if (!apply || picked.length === 0) return;
+    setChangingId(groupId);
+    setGroupError(null);
+    try {
+      await apply(groupId, picked);
+      // A roster change is a successor group with a new id, so the
+      // panel belongs to the old id: close it on success.
+      setPickedAdd([]);
+      setPickedRemove([]);
+      setEditingId(null);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "change failed");
+    } finally {
+      setChangingId(null);
     }
   }
 
@@ -644,7 +693,25 @@ export function PeerSidebar({
           </p>
         ) : (
           <ul className="mt-2 space-y-2">
-            {groups.map((group) => (
+            {groups.map((group) => {
+              const canEditMembers =
+                group.created_by_me === true &&
+                onAddGroupMembers !== undefined &&
+                onRemoveGroupMembers !== undefined;
+              const addCandidates = canEditMembers
+                ? peers.filter(
+                    (peer) =>
+                      !group.members.some(
+                        (member) => member.hash === peer.destination,
+                      ),
+                  )
+                : [];
+              const removeCandidates = canEditMembers
+                ? group.members.filter(
+                    (member) => member.hash !== node?.destination,
+                  )
+                : [];
+              return (
               <li
                 key={group.id}
                 className="rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
@@ -658,33 +725,154 @@ export function PeerSidebar({
                       {group.members.map((member) => member.name).join(", ")}
                     </p>
                   </div>
-                  {onDeleteGroup ? (
-                    <button
-                      type="button"
-                      disabled={deletingId === group.id}
-                      onClick={() => {
-                        if (confirmingId === group.id) {
-                          void confirmDelete(group.id);
-                        } else {
-                          armDeleteConfirm(group.id);
-                        }
-                      }}
-                      className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
-                        confirmingId === group.id
-                          ? "border-amber/60 bg-amber/10 text-amber"
-                          : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
-                      }`}
-                    >
-                      {deletingId === group.id
-                        ? "deleting…"
-                        : confirmingId === group.id
-                          ? "confirm delete"
-                          : "delete"}
-                    </button>
-                  ) : null}
+                  <div className="flex shrink-0 gap-1.5">
+                    {canEditMembers ? (
+                      <button
+                        type="button"
+                        disabled={changingId === group.id}
+                        onClick={() => toggleEditMembers(group.id)}
+                        className="rounded-md border border-line/80 bg-panel/60 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                      >
+                        {editingId === group.id ? "close" : "members"}
+                      </button>
+                    ) : null}
+                    {onDeleteGroup ? (
+                      <button
+                        type="button"
+                        disabled={deletingId === group.id}
+                        onClick={() => {
+                          if (confirmingId === group.id) {
+                            void confirmDelete(group.id);
+                          } else {
+                            armDeleteConfirm(group.id);
+                          }
+                        }}
+                        className={`rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                          confirmingId === group.id
+                            ? "border-amber/60 bg-amber/10 text-amber"
+                            : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                        }`}
+                      >
+                        {deletingId === group.id
+                          ? "deleting…"
+                          : confirmingId === group.id
+                            ? "confirm delete"
+                            : "delete"}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
+                {canEditMembers && editingId === group.id ? (
+                  <div className="mt-2 space-y-2 border-t border-line/50 pt-2">
+                    {addCandidates.length === 0 ? (
+                      <p className="text-[11px] leading-relaxed text-mist">
+                        Everyone you know is already in this group.
+                      </p>
+                    ) : (
+                      <fieldset>
+                        <legend className="mb-1 font-mono text-[10px] uppercase tracking-wide text-mist">
+                          add
+                        </legend>
+                        <ul className="max-h-24 space-y-1 overflow-y-auto thin-scroll">
+                          {addCandidates.map((peer) => (
+                            <li key={peer.destination}>
+                              <label className="flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-xs text-zinc-200 hover:bg-void/40">
+                                <input
+                                  type="checkbox"
+                                  checked={pickedAdd.includes(peer.destination)}
+                                  onChange={(event) => {
+                                    setPickedAdd((previous) =>
+                                      event.target.checked
+                                        ? [...previous, peer.destination]
+                                        : previous.filter(
+                                            (hash) =>
+                                              hash !== peer.destination,
+                                          ),
+                                    );
+                                  }}
+                                  className="h-3.5 w-3.5 accent-emerald-400"
+                                />
+                                <span className="min-w-0 truncate">
+                                  {peer.name || "unknown"}{" "}
+                                  <span className="font-mono text-[10px] text-mist">
+                                    {shortHash(peer.destination, 10)}
+                                  </span>
+                                </span>
+                              </label>
+                            </li>
+                          ))}
+                        </ul>
+                      </fieldset>
+                    )}
+                    {removeCandidates.length === 0 ? (
+                      <p className="text-[11px] leading-relaxed text-mist">
+                        No members to remove — you stay in a group you
+                        created.
+                      </p>
+                    ) : (
+                      <fieldset>
+                        <legend className="mb-1 font-mono text-[10px] uppercase tracking-wide text-mist">
+                          remove
+                        </legend>
+                        <ul className="max-h-24 space-y-1 overflow-y-auto thin-scroll">
+                          {removeCandidates.map((member) => (
+                            <li key={member.hash}>
+                              <label className="flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-xs text-zinc-200 hover:bg-void/40">
+                                <input
+                                  type="checkbox"
+                                  checked={pickedRemove.includes(member.hash)}
+                                  onChange={(event) => {
+                                    setPickedRemove((previous) =>
+                                      event.target.checked
+                                        ? [...previous, member.hash]
+                                        : previous.filter(
+                                            (hash) => hash !== member.hash,
+                                          ),
+                                    );
+                                  }}
+                                  className="h-3.5 w-3.5 accent-emerald-400"
+                                />
+                                <span className="min-w-0 truncate">
+                                  {member.name}{" "}
+                                  <span className="font-mono text-[10px] text-mist">
+                                    {shortHash(member.hash, 10)}
+                                  </span>
+                                </span>
+                              </label>
+                            </li>
+                          ))}
+                        </ul>
+                      </fieldset>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        disabled={
+                          changingId === group.id || pickedAdd.length === 0
+                        }
+                        onClick={() => void submitMemberChange(group.id, true)}
+                        className="rounded-md border border-signal/50 bg-signal/10 px-2.5 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                      >
+                        {changingId === group.id ? "changing…" : "add selected"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={
+                          changingId === group.id || pickedRemove.length === 0
+                        }
+                        onClick={() => void submitMemberChange(group.id, false)}
+                        className="rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
+                      >
+                        {changingId === group.id
+                          ? "changing…"
+                          : "remove selected"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </section>

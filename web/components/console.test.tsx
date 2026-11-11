@@ -70,6 +70,8 @@ function tauState(groups: TauGroup[]) {
     markRead: vi.fn().mockResolvedValue({ per_peer: {}, total: 0 }),
     refreshOutbox: vi.fn(),
     refreshGroups: vi.fn(),
+    addGroupMembers: vi.fn(),
+    removeGroupMembers: vi.fn(),
     cancelOutbox: vi.fn(),
   };
 }
