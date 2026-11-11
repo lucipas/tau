@@ -4633,6 +4633,29 @@ def test_download_received_file(bridge, node, tmp_path):
     assert body == data
 
 
+def test_download_response_is_not_followed_by_a_second_response(
+    bridge, node, tmp_path
+):
+    data = b"hello file"
+    _with_config(node, tmp_path)
+    _receive_file(node, tmp_path, sender=SENDER_HASH, name="notes.txt", data=data)
+    connection = http.client.HTTPConnection("127.0.0.1", bridge.port, timeout=5)
+    try:
+        connection.request("GET", f"/api/files/{SENDER_HASH}/notes.txt")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read() == data
+        # The download must end the response: a second request on the
+        # same keep-alive connection has to get a clean answer, not
+        # the stray bytes of a second response written onto the socket.
+        connection.request("GET", "/api/status")
+        second = connection.getresponse()
+        assert second.status == 200
+        second.read()
+    finally:
+        connection.close()
+
+
 def test_download_received_file_unknown_is_404(bridge, node, tmp_path):
     _with_config(node, tmp_path)
     status, _, payload = _json(bridge, f"/api/files/{SENDER_HASH}/missing.txt")

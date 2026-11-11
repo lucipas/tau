@@ -2973,6 +2973,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._handle_download_file(parts[0], parts[1], head_only)
+                return
             if path == "/api/messages/search":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=200)
                 text = (query.get("q") or [""])[0]
