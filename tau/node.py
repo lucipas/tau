@@ -1542,6 +1542,27 @@ class TauNode:
             peer = self.registry.get(caller_hash)
             caller_name = peer.display_name if peer is not None else caller_hash[:8]
 
+        # A delayed group request past the sender's deadline is dropped
+        # before the roster is pinned: an expired request must not add an
+        # unseen group or replace a saved roster, and it is never shown.
+        message_id = message.get("id")
+        expires_at = message.get("expires_at")
+        if expires_at is not None and expires_at <= received_at:
+            log.info(
+                "Dropping expired group message %s from %s",
+                message_id,
+                caller_hash,
+            )
+            return response_ok(
+                echo=message["text"],
+                received_at=received_at,
+                server=self.name,
+                node=self.destination_hexhash,
+                group=message["group"],
+                duplicate=False,
+                expired=True,
+            )
+
         group = self._accept_group_message(
             caller_hash,
             {
@@ -1565,19 +1586,8 @@ class TauNode:
 
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
-        message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
-        # A delayed group request past the sender's deadline is dropped
-        # unrecorded (and not marked seen), so it is never shown.
-        expires_at = message.get("expires_at")
-        expired = expires_at is not None and expires_at <= received_at
-        if expired:
-            log.info(
-                "Dropping expired group message %s from %s",
-                message_id,
-                caller_hash,
-            )
-        if not duplicate and not expired:
+        if not duplicate:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -1613,7 +1623,7 @@ class TauNode:
             node=self.destination_hexhash,
             group=group["id"],
             duplicate=duplicate,
-            expired=expired,
+            expired=False,
         )
 
     def _handle_file(
@@ -2313,7 +2323,7 @@ class TauNode:
             return False
         via_lxmf = False
         try:
-            self._request(
+            response = self._request(
                 peer,
                 REQUEST_GROUP_MESSAGE
                 if entry.group_id is not None
@@ -2322,6 +2332,26 @@ class TauNode:
                 timeout,
                 deadline=deadline,
             )
+            if response.get("expired"):
+                # The receiver dropped the copy because the deadline passed
+                # in flight: this is not a confirmed delivery. The entry
+                # stays queued until the next prune removes it.
+                log.info(
+                    "Queued message %s expired before %s took it",
+                    entry.id,
+                    peer.hexhash,
+                )
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error="expired", timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record expired attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
         except NotAMemberError as exc:
             # Permanent refusal: the recipient will not accept this roster,
             # so stop retrying rather than holding the leg until its TTL.
@@ -3487,6 +3517,22 @@ class TauNode:
                     _remaining(deadline) or 0.0,
                     deadline=deadline,
                 )
+                if response.get("expired"):
+                    # The receiver dropped the copy: the deadline passed
+                    # while the request was in flight. That is not a
+                    # delivery, and a queued retry would be dropped the
+                    # same way, so the leg fails here.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name,
+                            "ok": False,
+                            "error": "expired",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 self.mailbox.record_delivered(message_id)
                 results.append(
                     {
