@@ -5505,7 +5505,31 @@ def cmd_messages(args: argparse.Namespace) -> int:
             newest_shown[destination] = max(
                 newest_shown.get(destination, 0), int(entry["seq"])
             )
+        # A read cursor is per-sender, shared by DMs and group posts,
+        # so showing a group post would otherwise mark an older hidden
+        # DM read without the owner ever seeing it.  Cap each
+        # destination's advance just before its oldest unread message
+        # that this listing did not show — archived mail, or mail a
+        # filtered view (group, --archived) left out.  The capped
+        # message stays unread until the owner displays it; the next
+        # listing that does advances past it.
+        shown_seqs = {int(entry["seq"]) for entry in shown}
+        hidden_floor: Dict[str, int] = {}
+        for entry in inbox.list_messages(limit=None):
+            destination = str(entry.get("destination") or "")
+            if destination not in newest_shown:
+                continue
+            if not entry.get("unread"):
+                continue
+            if int(entry["seq"]) in shown_seqs:
+                continue
+            seq = int(entry["seq"])
+            if destination not in hidden_floor or seq < hidden_floor[destination]:
+                hidden_floor[destination] = seq
         for destination, up_to_seq in newest_shown.items():
+            floor = hidden_floor.get(destination)
+            if floor is not None:
+                up_to_seq = min(up_to_seq, floor - 1)
             inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
         # Listing a DM is reading it: send the sender a receipt, unless
         # this node opted out.  Best-effort — failures stay silent.

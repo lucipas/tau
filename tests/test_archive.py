@@ -407,3 +407,45 @@ def test_archive_takes_the_lock(tmp_path, capsys):
     assert code == 0
     capsys.readouterr()
     assert (data_dir / ".archived.json.lock").exists()
+
+
+def test_group_view_does_not_clear_hidden_dm_unread(tmp_path, capsys):
+    data_dir, senders = _seed_two_peers(tmp_path)
+    _seed_group_message(data_dir, senders, "alice", "group hello")
+    cli.main(["archive", "--data-dir", str(data_dir), "alice"])
+    capsys.readouterr()
+
+    # Viewing the group shows the group post, but alice's hidden DM
+    # must stay unread: the shared per-sender cursor stops just
+    # before it.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--group", "weekend"])
+    assert code == 0
+    assert "group hello" in capsys.readouterr().out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["archived_unread"] == 1
+
+    # Once the DM is read via --archived, the next group listing
+    # advances past the group post too.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--archived"])
+    assert code == 0
+    assert "first hello" in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", "weekend", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    # The listing annotates read state before its own mark-read, so
+    # the post still shows unread here; the next listing sees it read.
+    assert payload["messages"][0]["unread"] is True
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", "weekend", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"][0]["unread"] is False

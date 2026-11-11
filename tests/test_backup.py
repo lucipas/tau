@@ -47,6 +47,7 @@ def _seed_state(data_dir):
     (data_dir / "messages.json").write_text('{"messages": []}\n', encoding="utf-8")
     (data_dir / "tan-rules.json").write_text('{"kinds": ["post"]}\n', encoding="utf-8")
     (data_dir / "allowlist.json").write_text('{"allowed": []}\n', encoding="utf-8")
+    (data_dir / "archived.json").write_text('{"archived": []}\n', encoding="utf-8")
     conn = init_db(data_dir / "tan.sqlite3")
     conn.close()
     # Runtime state that must never be archived.

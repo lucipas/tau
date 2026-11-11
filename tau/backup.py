@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from . import __version__
-from .config import TauConfig
+from .config import ARCHIVED_FILE_NAME, TauConfig
 from .instance_lock import BackupError, InstanceLock
 from .util import ensure_dir
 
@@ -56,6 +56,7 @@ BACKUP_FILES = (
     SOCIAL_DB_NAME,
     "tan-rules.json",
     "allowlist.json",
+    ARCHIVED_FILE_NAME,
     RNS_CONFIG_MEMBER,
 )
 
