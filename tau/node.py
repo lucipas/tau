@@ -740,7 +740,9 @@ class TauNode:
         signature against the recalled source identity, the sender must
         resolve to a known peer by LXMF delivery hash (first contact
         still needs a tau announce), the block-list wins over the
-        allow-list, and the body must decode as non-empty UTF-8 text.
+        allow-list, and the body must decode as non-empty UTF-8 text
+        under the same rules as a tau-protocol DM (control characters
+        stripped, length cap enforced).
 
         An accepted message is stored with the same record shape as
         :meth:`_handle_message` (``direction: "in"``, ``sent_at`` from
@@ -781,18 +783,24 @@ class TauNode:
                 return
             content = getattr(message, "content", None)
             if isinstance(content, str):
-                text = content.strip()
+                decoded = content
             elif isinstance(content, (bytes, bytearray, memoryview)):
                 try:
-                    text = bytes(content).decode("utf-8").strip()
+                    decoded = bytes(content).decode("utf-8")
                 except UnicodeDecodeError:
                     log.info("Dropping LXMF message with non-UTF-8 content")
                     return
             else:
                 log.info("Dropping LXMF message with no content")
                 return
-            if not text:
-                log.info("Dropping LXMF message with an empty body")
+            try:
+                # Same body rules as a tau-protocol DM: control
+                # characters (including terminal escapes) are stripped
+                # and the length cap applies, so a signed peer cannot
+                # flood or spoof the console and logs with an LXMF body.
+                text = normalize_message(decoded)
+            except ProtocolError as exc:
+                log.info("Dropping LXMF message with an invalid body: %s", exc)
                 return
             message_hash = getattr(message, "hash", None)
             if not isinstance(message_hash, (bytes, bytearray, memoryview)):

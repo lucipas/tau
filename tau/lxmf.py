@@ -123,6 +123,8 @@ def start_lxmf_router(
         )
         if delivery is None:
             raise LXMFError("could not register the LXMF delivery identity")
+        if delivery_callback is not None:
+            router.register_delivery_callback(delivery_callback)
         router.announce(delivery.hash)
     except BaseException:
         _shutdown_router(router)

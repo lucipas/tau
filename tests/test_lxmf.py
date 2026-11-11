@@ -174,6 +174,7 @@ class _FakeLXMRouter:
         self.delivery_destinations = {}
         self.display_name = None
         self.delivery_callback = None
+        self.call_order: list = []
         self.announced: list = []
         self.exit_handler_calls = 0
         type(self).created.append(self)
@@ -188,9 +189,11 @@ class _FakeLXMRouter:
 
     def register_delivery_callback(self, callback):
         self.delivery_callback = callback
+        self.call_order.append("callback")
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
+        self.call_order.append("announce")
 
     def exit_handler(self):
         self.exit_handler_calls += 1
@@ -218,6 +221,20 @@ def test_start_router_registers_delivery_and_announces(fake_lxmf, tmp_path):
     delivery = lxmf.lxmf_delivery_hash(identity)
     assert lxmf.lxmf_router_delivery_hash(router) == delivery
     assert router.announced == [delivery]
+
+
+def test_start_router_registers_callback_before_announce(
+    fake_lxmf, tmp_path
+):
+    # A callback registered only after the announce would miss mail
+    # sent in response to it; the router drops messages it has no
+    # callback for.
+    received = []
+    router = lxmf.start_lxmf_router(
+        RNS.Identity(), tmp_path, delivery_callback=received.append
+    )
+    assert router.delivery_callback == received.append
+    assert router.call_order == ["callback", "announce"]
 
 
 def test_start_router_requires_installed_package(monkeypatch, tmp_path):
@@ -429,13 +446,37 @@ def test_deliver_lxmf_message_never_raises(tmp_path):
     node, sender = _node_with_sender(tmp_path)
     # A bare object: every attribute lookup falls back to a drop.
     node._deliver_lxmf_message(object())
-    # A message whose content access explodes mid-delivery.
-    broken = _FakeLXMessage(sender)
+    # A message whose content access explodes mid-delivery.  A local
+    # subclass, not a property patched onto the shared fake class:
+    # patching the class would break every later _FakeLXMessage.
+    class _BrokenMessage(_FakeLXMessage):
+        @property
+        def content(self):
+            raise RuntimeError("boom")
 
-    @property
-    def _boom(self):
-        raise RuntimeError("boom")
+        @content.setter
+        def content(self, value):
+            pass
 
-    type(broken).content = _boom
-    node._deliver_lxmf_message(broken)
+    node._deliver_lxmf_message(_BrokenMessage(sender))
     assert node.inbox.list_messages() == []
+
+
+def test_deliver_lxmf_message_normalizes_body(tmp_path):
+    from tau.protocol import MAX_MESSAGE_CHARS
+
+    node, sender = _node_with_sender(tmp_path)
+    # Terminal escapes are stripped like a tau-protocol DM.
+    node._deliver_lxmf_message(
+        _FakeLXMessage(sender, content=b"\x1b[31mred\x1b[0m ok")
+    )
+    assert node.inbox.list_messages()[0]["text"] == "[31mred[0m ok"
+    # An overlong body is dropped, not stored.
+    node._deliver_lxmf_message(
+        _FakeLXMessage(
+            sender,
+            content=b"x" * (MAX_MESSAGE_CHARS + 1),
+            message_hash=b"\x03" * 32,
+        )
+    )
+    assert len(node.inbox.list_messages()) == 1
