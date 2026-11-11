@@ -1206,6 +1206,110 @@ def test_api_groups_remove_member_drops_offline_member(bridge, node, tmp_path):
     ) == sorted([PEER_HASH, node.destination_hexhash])
 
 
+def test_api_groups_add_member_accepts_a_name(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": ["carol"]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_change_members_refuses_ambiguous_names(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    # A second peer asserts the same name: neither add nor remove may
+    # guess which carol the caller means.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex("99" * 16),
+            name="carol",
+            public_key=b"\x03" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    for path in ("/api/groups/add-member", "/api/groups/remove-member"):
+        status, _, payload = _json(
+            bridge,
+            path,
+            method="POST",
+            body={"group": "weekend", "members": ["carol"]},
+        )
+        assert status == 400, path
+        assert "are named" in payload["error"]["message"], path
+    # The roster hash still removes exactly one carol, unambiguously.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_learned_group_is_not_created_by_me(bridge, node, tmp_path):
+    from tau.groups import GroupStore, derive_group_id
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    # A group learned from the mesh that merely claims this node as
+    # its creator: the console must not offer member changes for it.
+    group_id = derive_group_id(
+        node.destination_hexhash,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+    )
+    assert node.groups.record(
+        group_id,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+        creator=node.destination_hexhash,
+        sender=PEER_HASH,
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "learned"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "learned", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
 def test_api_groups_change_members_rejects_bad_input(bridge, node, tmp_path):
     from tau.groups import GroupStore
 

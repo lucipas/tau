@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
@@ -353,6 +353,70 @@ describe("PeerSidebar group management", () => {
     expect(
       screen.getByRole("button", { name: "add selected" }),
     ).toBeTruthy();
+  });
+
+  it("does not let a finished change discard another group's editor", async () => {
+    let resolveAdd: (value: ChangeGroupMembersResponse) => void = () => {};
+    const pending = new Promise<ChangeGroupMembersResponse>((resolve) => {
+      resolveAdd = resolve;
+    });
+    const onAddGroupMembers = vi.fn(() => pending);
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+        makeGroup({
+          id: "22".repeat(16),
+          name: "other",
+          created_by_me: true,
+          members: [
+            { hash: "ab".repeat(16), name: "alice" },
+            { hash: "cd".repeat(16), name: "bob" },
+          ],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    // Open the first group's editor and start adding bob.
+    fireEvent.click(screen.getAllByRole("button", { name: "members" })[0]);
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+    expect(onAddGroupMembers).toHaveBeenCalledTimes(1);
+
+    // Switch to the other group's editor while the change is pending
+    // and pick bob for removal there.
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+
+    // The first change lands: the new editor keeps its selection and
+    // stays open.
+    await act(async () => {
+      resolveAdd({
+        ok: true,
+        group: makeGroup({ id: "33".repeat(16) }),
+        previous_id: "11".repeat(16),
+      });
+    });
+    expect(
+      screen.getByRole("button", { name: "remove selected" }),
+    ).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("checkbox", {
+          name: /bob/,
+        }) as HTMLInputElement
+      ).checked,
+    ).toBe(true);
   });
 });
 

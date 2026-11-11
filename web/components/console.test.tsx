@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { TauGroup } from "@/lib/types";
@@ -92,6 +92,60 @@ describe("Console group target", () => {
     rerender(<Console />);
     await waitFor(() =>
       expect(screen.getByDisplayValue("team · 2 members")).toBeTruthy(),
+    );
+  });
+
+  it("follows the selected group to its successor after a roster change", async () => {
+    const team = makeGroup("b".repeat(32), "team");
+    const crew = makeGroup("a".repeat(32), "crew");
+    crew.created_by_me = true;
+    const successor = makeGroup("c".repeat(32), "crew");
+    successor.members = [{ hash: "ab".repeat(16), name: "alice" }];
+    successor.created_by_me = true;
+    // The mock hook refreshes its groups and records the swap when the
+    // change lands, as the real hook does.
+    const removeGroupMembers = vi.fn(async () => {
+      mockedUseTau.mockReturnValue({
+        ...tauState([team, successor]),
+        groupSwap: { from: crew.id, to: successor.id },
+        removeGroupMembers,
+      });
+      return { ok: true, group: successor, previous_id: crew.id };
+    });
+    mockedUseTau.mockReturnValue({
+      ...tauState([team, crew]),
+      removeGroupMembers,
+    });
+
+    const { rerender } = render(<Console />);
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("team · 2 members")).toBeTruthy(),
+    );
+    // Select the second group, crew, as the composer target.
+    fireEvent.change(screen.getByDisplayValue("team · 2 members"), {
+      target: { value: crew.id },
+    });
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy(),
+    );
+
+    // Remove bob from crew from the sidebar.
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "remove selected" }));
+
+    await waitFor(() =>
+      expect(removeGroupMembers).toHaveBeenCalledWith(crew.id, [
+        "ef".repeat(16),
+      ]),
+    );
+    // The hook update lands as a new render, as in the real app: the
+    // groups list and the recorded swap arrive together.
+    rerender(<Console />);
+    // The composer still addresses crew — now one member — instead
+    // of falling back to team, the first group in the list.
+    await waitFor(() =>
+      expect(screen.getByDisplayValue("crew · 1 member")).toBeTruthy(),
     );
   });
 });

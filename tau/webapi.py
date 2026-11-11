@@ -2568,9 +2568,11 @@ class WebBridge:
             "members": members,
             "created_at": group["created_at"],
             # The console only offers member changes on groups this
-            # node created; the store refuses anyone else.
-            "created_by_me": group.get("creator")
-            == self.node.destination_hexhash,
+            # node created; the store refuses anyone else.  A learned
+            # group only claims its creator in the message, so it never
+            # counts, even when it names this node.
+            "created_by_me": bool(group.get("local"))
+            and group.get("creator") == self.node.destination_hexhash,
         }
 
     def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:
@@ -4396,4 +4398,3 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-))

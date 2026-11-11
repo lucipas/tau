@@ -276,6 +276,36 @@ describe("useTau group management", () => {
     expect(mockedGet).toHaveBeenCalledWith("/api/groups");
     expect(result.current.groups).toEqual([successor]);
   });
+
+  it("does not duplicate a group when the successor is already listed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    expect(source).toBeTruthy();
+    // A poll landed with the successor before the POST came back.
+    act(() => {
+      source.emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [], [created, successor]),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(2));
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(result.current.groups).toEqual([successor]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
