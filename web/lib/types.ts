@@ -512,6 +512,21 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanAuthor {
+  author: string;
+  name: string;
+  posts: number;
+  last_post: number;
+  followed: boolean;
+}
+
+export interface TanAuthorsResponse {
+  authors: TanAuthor[];
+  count: number;
+  // How many authors the directory holds behind the returned page.
+  total: number;
+}
+
 export interface TanSuggestion {
   author: string;
   name: string;

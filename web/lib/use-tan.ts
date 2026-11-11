@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
+  TanAuthor,
+  TanAuthorsResponse,
   TanExportDocument,
   TanFollow,
   TanFollowingResponse,
@@ -32,6 +34,8 @@ const POLL_INTERVAL_MS = 5000;
 // cadence than the feed and stays off the feed's poll critical path.
 const SUGGEST_INTERVAL_MS = 60000;
 const SAVED_PAGE_SIZE = 100;
+// Authors per directory page, matching the API's default limit.
+const AUTHORS_PAGE_SIZE = 50;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
@@ -45,6 +49,21 @@ export function useTan() {
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  // Every known author in the local store, not just the followed ones:
+  // the directory the console uses to discover who to follow.
+  const [authors, setAuthors] = useState<TanAuthor[]>([]);
+  // How many authors the directory holds in total, behind the pages
+  // currently shown; the console offers the next page while the shown
+  // count is below this.
+  const [authorsTotal, setAuthorsTotal] = useState(0);
+  // The shown authors, mirrored for refreshes that re-read the loaded
+  // pages, and a generation for the directory's own loads: a newer
+  // refresh supersedes an older one, as the feed's does.
+  const authorsRef = useRef(authors);
+  useEffect(() => {
+    authorsRef.current = authors;
+  }, [authors]);
+  const authorsGenerationRef = useRef(0);
   const [suggestions, setSuggestions] = useState<TanSuggestion[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
@@ -239,6 +258,49 @@ export function useTan() {
     }
   }, []);
 
+  // Re-read the directory pages currently shown, in offset-sized
+  // pages, so a follow, unfollow or sync refreshes the followed flags
+  // without losing the user's place. The directory loads on its own
+  // generation, not the feed's: a failed or stalled authors request
+  // never blocks the feed, and on failure the previous directory
+  // stays in place.
+  const refreshAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    // Re-read at least one page, even before anything is shown.
+    const target = Math.max(authorsRef.current.length, AUTHORS_PAGE_SIZE);
+    const pages: TanAuthor[] = [];
+    let total = 0;
+    let offset = 0;
+    while (offset < target) {
+      const result = await apiGet<TanAuthorsResponse>(
+        `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+      );
+      if (authorsGenerationRef.current !== generation) return;
+      pages.push(...result.authors);
+      total = result.total;
+      offset += result.authors.length;
+      if (result.authors.length === 0) break;
+    }
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors(pages);
+    setAuthorsTotal(total);
+  }, []);
+
+  // Fetch the next directory page and append it. Offset paging, not a
+  // growing limit: the API caps a single request at 200 rows, so
+  // growing the limit would fetch the same first 200 rows forever and
+  // never reach author 201.
+  const loadMoreAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    const offset = authorsRef.current.length;
+    const result = await apiGet<TanAuthorsResponse>(
+      `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+    );
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors((previous) => [...previous, ...result.authors]);
+    setAuthorsTotal(result.total);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     async function tick(supersede: boolean) {
@@ -259,6 +321,10 @@ export function useTan() {
     // skip while a load is pending instead of invalidating it.
     setLoading(true);
     void tick(true);
+    // The directory loads once with the feed; the poll tick does not
+    // re-read it (a follow, unfollow or sync refreshes it instead),
+    // so paging past the first page is never undone by a poll.
+    void refreshAuthors().catch(() => {});
     // The top ranking changes only when someone likes, unlikes, posts
     // or deletes, and every one of those actions reloads the current
     // view — so the top view loads on demand and on manual refresh,
@@ -274,7 +340,7 @@ export function useTan() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, view, searchQuery, showMentions, load]);
+  }, [all, view, searchQuery, showMentions, load, refreshAuthors]);
 
   // Suggestions have their own generation so a slow ranking response cannot
   // overwrite a newer one, and they never block the feed load.
@@ -609,19 +675,19 @@ export function useTan() {
   const follow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
-      await load();
+      await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
     },
-    [load, loadSuggestions],
+    [load, refreshAuthors, loadSuggestions],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
-      await load();
+      await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
     },
-    [load, loadSuggestions],
+    [load, refreshAuthors, loadSuggestions],
   );
 
   const muteAuthor = useCallback(
@@ -718,13 +784,15 @@ export function useTan() {
       const result = await apiPost<TanSyncResponse>("/api/tan/sync", {
         explore: true,
       });
-      await load();
+      // A sync can bring in new authors, so the directory refreshes
+      // alongside the feed.
+      await Promise.all([load(), refreshAuthors()]);
       void loadSuggestions().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load, invalidateVerify, loadSuggestions]);
+  }, [load, invalidateVerify, refreshAuthors, loadSuggestions]);
 
   // A read-only audit: verifying never writes to the store and never
   // reloads the feed, so it stays independent of the poll cadence.
@@ -743,7 +811,6 @@ export function useTan() {
       setVerifying(false);
     }
   }, []);
-
 
   // Download the signed export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
@@ -805,6 +872,9 @@ export function useTan() {
     searchQuery,
     mentions,
     following,
+    authors,
+    authorsTotal,
+    loadMoreAuthors,
     suggestions,
     mutedAuthors,
     mutedKeywords,
