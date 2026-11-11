@@ -942,8 +942,11 @@ unlinked, and stall sync at the gap.
   console); `tau id` shows this node's own address. `tau serve --lxmf`
   (requires the `lxmf` extra) also runs an LXMRouter on the node's
   identity, registers its delivery destination and announces it.
-  Nothing is sent over LXMF yet — sending and the migration of
-  store-and-forward follow under #67.
+  `tau serve --lxmf --lxmf-propagation` also serves as an LXMF
+  propagation node, holding mail for offline recipients until they
+  fetch it (message store capped at 256 MB). Nothing is sent over
+  LXMF yet — sending and the migration of store-and-forward follow
+  under #67.
 
 ## Development
 

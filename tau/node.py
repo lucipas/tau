@@ -50,6 +50,7 @@ from .lxmf import (
     LXMFError,
     build_lxmf_message,
     lxmf_router_delivery_hash,
+    lxmf_router_propagation_hash,
     send_lxmf_message,
     start_lxmf_router,
     stop_lxmf_router,
@@ -595,6 +596,7 @@ class TauNode:
         exclusive: bool = False,
         mail_loop: bool = True,
         lxmf: bool = False,
+        lxmf_propagation: bool = False,
     ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
@@ -613,8 +615,13 @@ class TauNode:
         to the loop's first round and silently report nothing moved.
         With ``lxmf`` on, an LXMF router also runs alongside the node
         (see :meth:`_start_lxmf_router`); it needs the ``lxmf`` extra
-        installed and must start on the main thread.
+        installed and must start on the main thread.  With
+        ``lxmf_propagation`` on (which requires ``lxmf``), the router
+        also serves as an LXMF propagation node, holding mail for
+        offline recipients.
         """
+        if lxmf_propagation and not lxmf:
+            raise NodeError("lxmf_propagation requires lxmf")
         if self.reticulum is not None:
             raise NodeError("node is already running")
         if self._shutdown:
@@ -637,7 +644,12 @@ class TauNode:
             # snapshot is no older than the lock itself.
             self.registry.load()
         try:
-            self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
+            self._start(
+                announce=announce,
+                mail_loop=mail_loop,
+                lxmf=lxmf,
+                lxmf_propagation=lxmf_propagation,
+            )
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -649,7 +661,14 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool, mail_loop: bool = True, lxmf: bool = False) -> None:
+    def _start(
+        self,
+        *,
+        announce: bool,
+        mail_loop: bool = True,
+        lxmf: bool = False,
+        lxmf_propagation: bool = False,
+    ) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -719,20 +738,22 @@ class TauNode:
             self._mail_thread.start()
 
         if lxmf:
-            self._start_lxmf_router()
+            self._start_lxmf_router(propagation=lxmf_propagation)
 
         if announce:
             self.announce()
 
         log.info("tau node %r ready at %s", self.name, self.destination.hexhash)
 
-    def _start_lxmf_router(self) -> None:
+    def _start_lxmf_router(self, *, propagation: bool = False) -> None:
         """Run an LXMF router on this node's identity.
 
         The router listens on the LXMF delivery destination derived from
         the node's identity (the address ``tau id`` and ``tau peers``
         already show) and announces it, so LXMF clients can find a path
-        to this node.  Incoming LXMF messages are delivered into the DM
+        to this node.  With ``propagation`` on, the router also serves
+        as an LXMF propagation node, holding mail for offline
+        recipients.  Incoming LXMF messages are delivered into the DM
         inbox by :meth:`_handle_lxmf_message`, registered as the
         router's delivery callback.  Storage lives under the data
         directory.  Sending over LXMF still follows under the migration
@@ -745,6 +766,7 @@ class TauNode:
                 self.identity,
                 self.config.data_dir,
                 display_name=self.name,
+                propagation=propagation,
                 delivery_callback=self._handle_lxmf_message,
             )
         except LXMFError as exc:
@@ -754,6 +776,12 @@ class TauNode:
             "LXMF router running, delivery %s",
             delivery.hex() if delivery is not None else "unknown",
         )
+        propagation_hash = lxmf_router_propagation_hash(self.lxmf_router)
+        if propagation_hash is not None:
+            log.info(
+                "LXMF propagation node enabled, propagation %s",
+                propagation_hash.hex(),
+            )
 
     def _handle_lxmf_message(self, message: Any) -> None:
         """Deliver one incoming LXMF message into the DM inbox.
@@ -2866,6 +2894,7 @@ class TauNode:
         except Exception:  # pragma: no cover - introspection only
             pass
         lxmf_delivery = lxmf_router_delivery_hash(self.lxmf_router)
+        lxmf_propagation = lxmf_router_propagation_hash(self.lxmf_router)
         return {
             "name": self.name,
             "destination": self.destination.hexhash,
@@ -2879,6 +2908,9 @@ class TauNode:
             "lxmf": {
                 "enabled": self.lxmf_router is not None,
                 "delivery": lxmf_delivery.hex() if lxmf_delivery else None,
+                "propagation": (
+                    lxmf_propagation.hex() if lxmf_propagation else None
+                ),
             },
         }
 

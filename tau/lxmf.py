@@ -84,6 +84,7 @@ def start_lxmf_router(
     data_dir: Path,
     *,
     display_name: Optional[str] = None,
+    propagation: bool = False,
     delivery_callback: Optional[Any] = None,
 ) -> Any:
     """Start an ``LXMRouter`` on *identity* and register its delivery identity.
@@ -92,6 +93,11 @@ def start_lxmf_router(
     to the storage path it is given).  The router listens on the same
     delivery destination :func:`lxmf_delivery_hash` derives, and that
     destination is announced so other LXMF clients can find a path to it.
+
+    With ``propagation`` on, the router also serves as an LXMF
+    propagation node (see :func:`enable_lxmf_propagation`): it holds
+    mail for offline recipients until they fetch it, with the
+    message store capped so it cannot fill the filesystem.
 
     When *delivery_callback* is given it is registered with
     ``router.register_delivery_callback`` and invoked with each
@@ -120,6 +126,8 @@ def start_lxmf_router(
         )
         if delivery is None:
             raise LXMFError("could not register the LXMF delivery identity")
+        if propagation:
+            enable_lxmf_propagation(router)
         if delivery_callback is not None:
             router.register_delivery_callback(delivery_callback)
         router.announce(delivery.hash)
@@ -127,6 +135,35 @@ def start_lxmf_router(
         _shutdown_router(router)
         raise
     return router
+
+
+def enable_lxmf_propagation(
+    router: Any,
+    *,
+    message_storage_limit_mb: int = 256,
+) -> None:
+    """Enable propagation on a running LXMF router.
+
+    ``LXMRouter.enable_propagation`` indexes the message store,
+    registers the propagation request handlers and announces the
+    propagation destination, so LXMF clients can store messages for
+    offline recipients on this node.  Before enabling it, the message
+    store is capped at ``message_storage_limit_mb`` megabytes: the
+    router's default is unlimited, so an opt-in propagation node under
+    sustained traffic could otherwise fill its filesystem and stop
+    tau persisting state.  Note the cap is enforced by LXMF's periodic
+    message-store cleanup, not at admission — a burst of validly
+    stamped messages can overshoot it between cleanups.  The admission
+    path lives in the upstream router, so tau cannot enforce it
+    without patching LXMF internals; the cap still bounds
+    steady-state usage.  Raises :class:`LXMFError` when propagation
+    cannot be enabled.
+    """
+    try:
+        router.set_message_storage_limit(megabytes=message_storage_limit_mb)
+        router.enable_propagation()
+    except Exception as exc:
+        raise LXMFError(f"could not enable LXMF propagation: {exc}") from exc
 
 
 def stop_lxmf_router(router: Optional[Any]) -> None:
@@ -191,6 +228,25 @@ def lxmf_router_delivery_hash(router: Optional[Any]) -> Optional[bytes]:
     if not destinations:
         return None
     return next(iter(destinations))
+
+
+def lxmf_router_propagation_hash(router: Optional[Any]) -> Optional[bytes]:
+    """Return the propagation destination hash a router serves on.
+
+    Returns ``None`` when the router is ``None`` or propagation is not
+    enabled.  The router always constructs a propagation destination,
+    so the ``propagation_node`` flag is what says this node actually
+    offers the role — a router that only receives LXMF mail reports
+    no propagation hash.
+    """
+    if router is None:
+        return None
+    if not getattr(router, "propagation_node", False):
+        return None
+    destination = getattr(router, "propagation_destination", None)
+    if destination is None:
+        return None
+    return getattr(destination, "hash", None)
 
 
 # -- sending ---------------------------------------------------------------

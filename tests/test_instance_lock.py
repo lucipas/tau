@@ -143,7 +143,10 @@ def test_stop_workers_handles_current_and_unstarted_threads(tmp_path):
 def stub_start(monkeypatch) -> None:
     """Replace the Reticulum startup with a no-op for lock tests."""
     monkeypatch.setattr(
-        TauNode, "_start", lambda self, *, announce, mail_loop=True, lxmf=False: None
+        TauNode,
+        "_start",
+        lambda self, *, announce, mail_loop=True, lxmf=False,
+        lxmf_propagation=False: None,
     )
 
 
@@ -213,7 +216,8 @@ def test_plain_start_does_not_take_the_lock(tmp_path, monkeypatch):
 
 
 def test_failed_exclusive_start_releases_the_lock(tmp_path, monkeypatch):
-    def failing_start(self, *, announce, mail_loop=True, lxmf=False):
+    def failing_start(self, *, announce, mail_loop=True, lxmf=False,
+                      lxmf_propagation=False):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(TauNode, "_start", failing_start)
