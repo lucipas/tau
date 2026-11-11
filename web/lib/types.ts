@@ -473,6 +473,21 @@ export interface TanSyncResponse {
   };
 }
 
+export interface TanVerifyProblem {
+  hash: string;
+  author: string;
+  problem: string;
+}
+
+export interface TanVerifyReport {
+  entries: number;
+  authors: number;
+  unlinked: number;
+  problems: TanVerifyProblem[];
+  ok: boolean;
+}
+
+
 export interface MessagesResponse {
   messages: TauMessage[];
 }

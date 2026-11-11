@@ -4,9 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
 import { shortHash } from "@/lib/format";
-import type { TanExportDocument, TanPost } from "@/lib/types";
+import type { TanExportDocument, TanPost, TanVerifyReport } from "@/lib/types";
 
-import { PostCard, SocialConsole, TanBackupSection } from "./social-console";
+import {
+  PostCard,
+  SocialConsole,
+  TanBackupSection,
+  VerifyResult,
+} from "./social-console";
 
 const mockTan = vi.hoisted(() => ({
   current: {} as Record<string, unknown>,
@@ -135,6 +140,87 @@ describe("PostCard delete control", () => {
     expect(screen.queryByTitle("Delete this post")).toBeNull();
     fireEvent.click(screen.getByText("deleting…"));
     expect(onDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("VerifyResult", () => {
+  function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
+    return {
+      entries: 12,
+      authors: 3,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+      ...overrides,
+    };
+  }
+
+  it("reports a healthy store with its counts", () => {
+    render(<VerifyResult report={makeReport()} />);
+    expect(
+      screen.getByText("store OK — 12 entries from 3 authors"),
+    ).toBeTruthy();
+  });
+
+  it("notes unlinked entries as partial sync, not damage", () => {
+    render(<VerifyResult report={makeReport({ unlinked: 2 })} />);
+    expect(screen.getByText(/2 unlinked \(partial sync\)/)).toBeTruthy();
+  });
+
+  it("lists each problem with its post hash and message", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 1 problem in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+  });
+
+  it("renders two faults on one post as separate rows", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "sequence jumps from 1 to 3",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 2 problems in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+    expect(screen.getByText("sequence jumps from 1 to 3")).toBeTruthy();
   });
 });
 

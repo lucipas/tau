@@ -21,6 +21,7 @@ import type {
   TanSuggestion,
   TanSyncResponse,
   TanTimelineResponse,
+  TanVerifyReport,
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
@@ -52,6 +53,10 @@ export function useTan() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyReport, setVerifyReport] = useState<TanVerifyReport | null>(
+    null,
+  );
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,6 +66,17 @@ export function useTan() {
   const [threadRef, setThreadRef] = useState<string | null>(null);
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
+
+  // A displayed audit is only as fresh as the store it read. Every
+  // action that writes posts bumps this generation and drops the
+  // report, so the sidebar never presents a stale audit as the
+  // store's current health; an audit that resolves after a mutation
+  // is discarded the same way.
+  const verifyGenerationRef = useRef(0);
+  const invalidateVerify = useCallback(() => {
+    verifyGenerationRef.current += 1;
+    setVerifyReport(null);
+  }, []);
 
   // The filter the timeline is showing right now. Actions refresh through
   // this ref instead of a captured `all`, so a filter switch mid-action
@@ -435,6 +451,7 @@ export function useTan() {
 
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
+      invalidateVerify();
       setPosting(true);
       try {
         const result = await apiPost<TanPostResponse>("/api/tan/posts", {
@@ -453,7 +470,7 @@ export function useTan() {
         setPosting(false);
       }
     },
-    [load],
+    [load, invalidateVerify],
   );
 
   const quote = useCallback(
@@ -536,18 +553,22 @@ export function useTan() {
 
   const like = useCallback(
     async (target: string) => {
+      // Likes are chain entries in the store, so they invalidate an
+      // audit exactly like a post does.
+      invalidateVerify();
       await apiPost("/api/tan/like", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded],
   );
 
   const unlike = useCallback(
     async (target: string) => {
+      invalidateVerify();
       await apiPost("/api/tan/unlike", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded],
   );
 
   // Who liked one post, newest like first. Fetched on demand when the
@@ -562,10 +583,11 @@ export function useTan() {
 
   const deletePost = useCallback(
     async (target: string) => {
+      invalidateVerify();
       await apiPost("/api/tan/delete", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded],
   );
 
   const editPost = useCallback(
@@ -585,6 +607,7 @@ export function useTan() {
   );
 
   const sync = useCallback(async () => {
+    invalidateVerify();
     setSyncing(true);
     try {
       const result = await apiPost<TanSyncResponse>("/api/tan/sync", {
@@ -596,7 +619,26 @@ export function useTan() {
     } finally {
       setSyncing(false);
     }
-  }, [load, loadSuggestions]);
+  }, [load, invalidateVerify, loadSuggestions]);
+
+  // A read-only audit: verifying never writes to the store and never
+  // reloads the feed, so it stays independent of the poll cadence.
+  // The report is kept only if no store-changing action landed while
+  // the audit was in flight.
+  const verify = useCallback(async () => {
+    setVerifying(true);
+    const generation = verifyGenerationRef.current;
+    try {
+      const report = await apiGet<TanVerifyReport>("/api/tan/verify");
+      if (verifyGenerationRef.current === generation) {
+        setVerifyReport(report);
+      }
+      return report;
+    } finally {
+      setVerifying(false);
+    }
+  }, []);
+
 
   // Download the signed export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
@@ -674,6 +716,8 @@ export function useTan() {
     loading,
     posting,
     syncing,
+    verifying,
+    verifyReport,
     exporting,
     importing,
     error,
@@ -700,6 +744,7 @@ export function useTan() {
     deletePost,
     editPost,
     sync,
+    verify,
     exportTan,
     importTan,
   };

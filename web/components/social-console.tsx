@@ -11,6 +11,7 @@ import type {
   TanLiker,
   TanPost,
   TanSuggestion,
+  TanVerifyReport,
 } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
@@ -26,6 +27,9 @@ export function SocialConsole() {
   const [quoteTarget, setQuoteTarget] = useState<TanPost | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Audit failures render beside the verify button, not under the
+  // post composer: the shared error state is too far from the action.
+  const [verifyError, setVerifyError] = useState<string | null>(null);
   // Whether the feed shows the saved list instead of the timeline.
   // Saved posts load on demand, not on the feed's poll tick.
   const [showSaved, setShowSaved] = useState(false);
@@ -227,6 +231,17 @@ export function SocialConsole() {
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "sync failed");
+    }
+  }
+
+  async function submitVerify() {
+    setVerifyError(null);
+    try {
+      await tan.verify();
+    } catch (caught) {
+      setVerifyError(
+        caught instanceof Error ? caught.message : "verify failed",
+      );
     }
   }
 
@@ -533,6 +548,33 @@ export function SocialConsole() {
               ) : null}
             </section>
 
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <SectionLabel>store health</SectionLabel>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Re-verify every stored post&apos;s signature and chain
+                linkage, the same audit{" "}
+                <code className="rounded bg-void/80 px-1 py-0.5 font-mono text-[11px] text-zinc-300">
+                  tau tan verify
+                </code>{" "}
+                runs. Read-only: verifying never writes to the store.
+              </p>
+              <button
+                type="button"
+                onClick={() => void submitVerify()}
+                disabled={tan.verifying}
+                className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-signal/40 bg-signal/10 px-3 py-2 text-xs font-medium text-signal transition hover:border-signal/70 hover:bg-signal/15 disabled:opacity-50"
+              >
+                {tan.verifying ? "verifying…" : "verify store"}
+              </button>
+              {verifyError ? (
+                <p className="mt-2 font-mono text-[10px] leading-relaxed text-rose-300">
+                  {verifyError}
+                </p>
+              ) : null}
+              {tan.verifyReport ? (
+                <VerifyResult report={tan.verifyReport} />
+              ) : null}
+            </section>
             <TanBackupSection
               exporting={tan.exporting}
               importing={tan.importing}
@@ -1171,6 +1213,45 @@ function SavedEmptyState() {
         Save a post from the timeline to read it later. Saves stay on this
         node — they are never published or shared with peers.
       </p>
+    </div>
+  );
+}
+
+export function VerifyResult({ report }: { report: TanVerifyReport }) {
+  if (report.ok) {
+    return (
+      <p className="mt-2 font-mono text-[10px] leading-relaxed text-signal/80">
+        store OK — {report.entries} entr{report.entries === 1 ? "y" : "ies"}{" "}
+        from {report.authors} author{report.authors === 1 ? "" : "s"}
+        {report.unlinked > 0
+          ? ` · ${report.unlinked} unlinked (partial sync)`
+          : ""}
+      </p>
+    );
+  }
+  return (
+    <div className="mt-2 space-y-1.5">
+      <p className="font-mono text-[10px] leading-relaxed text-rose-300">
+        store NOT OK — {report.problems.length} problem
+        {report.problems.length === 1 ? "" : "s"} in {report.entries} entries
+      </p>
+      <ul className="space-y-1.5">
+        {report.problems.map((problem, index) => (
+          <li
+            // One entry can carry several faults (a bad hash and a
+            // chain fault, say), so the hash alone is not a unique key.
+            key={`${problem.hash}:${index}`}
+            className="rounded-lg border border-rose-400/30 bg-rose-400/5 px-2.5 py-2"
+          >
+            <p className="font-mono text-[10px] text-rose-200">
+              {shortHash(problem.hash, 16)} · {shortHash(problem.author, 10)}
+            </p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-zinc-300">
+              {problem.problem}
+            </p>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

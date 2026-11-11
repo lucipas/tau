@@ -699,3 +699,109 @@ describe("useTan search resubmit", () => {
     expect(searchCallsAfter).toBeGreaterThan(searchCallsBefore);
   });
 });
+
+describe("useTan verify", () => {
+  it("fetches /api/tan/verify and returns the report without reloading the feed", async () => {
+    const report = {
+      entries: 2,
+      authors: 1,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+    };
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/verify"
+        ? Promise.resolve(report)
+        : path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [], count: 0 })
+          : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    let returned;
+    await act(async () => {
+      returned = await result.current.verify();
+    });
+
+    expect(returned).toEqual(report);
+    expect(result.current.verifyReport).toEqual(report);
+    // Verifying is read-only: exactly one audit request, no feed reload.
+    const laterCalls = mockedGet.mock.calls
+      .slice(loadsBefore)
+      .map(([path]) => path);
+    expect(laterCalls).toEqual(["/api/tan/verify"]);
+  });
+
+  it("drops the stored report when a post is published", async () => {
+    const report = {
+      entries: 2,
+      authors: 1,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+    };
+    const mine = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/verify"
+        ? Promise.resolve(report)
+        : path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [mine], count: 1 })
+          : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true, post: mine });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    await act(async () => {
+      await result.current.verify();
+    });
+    expect(result.current.verifyReport).toEqual(report);
+
+    await act(async () => {
+      await result.current.publish("another post");
+    });
+    expect(result.current.verifyReport).toBeNull();
+  });
+
+  it("discards an audit that resolves after a mutation", async () => {
+    const report = {
+      entries: 2,
+      authors: 1,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+    };
+    const mine = makePost();
+    const verifyGate = deferred();
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/verify"
+        ? verifyGate.promise
+        : path.startsWith("/api/tan/timeline")
+          ? Promise.resolve({ posts: [mine], count: 1 })
+          : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true, post: mine });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+
+    let verifyPromise: Promise<unknown> | undefined;
+    act(() => {
+      verifyPromise = result.current.verify();
+    });
+    // A publish lands while the audit is in flight.
+    await act(async () => {
+      await result.current.publish("another post");
+    });
+    await act(async () => {
+      verifyGate.resolve(report);
+      await verifyPromise;
+    });
+    // The audit read the store before the publish: it must not be shown.
+    expect(result.current.verifyReport).toBeNull();
+  });
+});

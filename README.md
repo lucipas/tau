@@ -178,6 +178,7 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/verify` | GET | re-verify every stored post's signature and chain linkage |
 | `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
 | `/api/tan/import` | POST | import an export document (every entry verified) |
 | `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
