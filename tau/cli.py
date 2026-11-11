@@ -5675,19 +5675,28 @@ def cmd_group_leave(args: argparse.Namespace) -> int:
             print(f"already left group {query[:8]}")
             return _EXIT_OK
         raise
-    identity = load_identity(config.identity_path)
-    own_hash = destination_hash(identity).hex() if identity is not None else None
-    if own_hash is not None and group["creator"] == own_hash:
+    if group["local"]:
+        # The `local` flag is the durable marker of a group this node
+        # created — it survives even if the identity file is gone, and
+        # it cannot be forged by a member claiming this node as the
+        # creator of a learned group.
         raise NodeError(
             "only members can leave a group they did not create —"
             " delete your own group with `tau group delete`"
         )
-    if not store.leave(group["id"]):
+    left_ids = store.leave(group["id"])
+    if not left_ids:
         raise NodeError(f"unknown group: {args.group!r}")
+    siblings = [gid for gid in left_ids if gid != group["id"]]
     if _json_mode(args):
-        _emit({"left": group["id"], "name": group["name"]}, True)
+        payload: Dict[str, Any] = {"left": group["id"], "name": group["name"]}
+        if siblings:
+            payload["also_left"] = siblings
+        _emit(payload, True)
         return _EXIT_OK
     print(f"left group {group['name']} ({group['id'][:8]})")
+    if siblings:
+        print(f"also left {len(siblings)} related roster(s) for the same group")
     print("Future messages for it will be rejected; rejoin with `tau group rejoin <id>`.")
     return _EXIT_OK
 
@@ -5729,7 +5738,8 @@ def cmd_group_left(args: argparse.Namespace) -> int:
         left_at = time.strftime(
             "%Y-%m-%d %H:%M", time.localtime(entry["left_at"])
         )
-        print(f"{entry['id'][:8]} — left {left_at}")
+        # The full id: `tau group rejoin` needs all 32 characters.
+        print(f"{entry['id']} — left {left_at}")
     return _EXIT_OK
 
 

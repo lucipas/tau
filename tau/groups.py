@@ -39,12 +39,15 @@ A member can leave a group they did not create with
 :meth:`GroupStore.leave` (``tau group leave``): the record is deleted
 and the id is remembered as left, so a later group message for it
 cannot re-pin the group — unlike :meth:`GroupStore.delete`, whose
-removal the next message undoes.  Leaving is local only: the creator
-is not told and keeps the member on the roster, so the messages keep
-coming and are rejected on arrival.  :meth:`GroupStore.rejoin`
-(``tau group rejoin``) clears a left id, so the next message pins the
-group again; a re-invite under a changed roster is a new id and pins
-without a rejoin.
+removal the next message undoes.  A successor roster for the same
+creator and name that was already pinned alongside leaves with it: it
+is the same group under a new roster, and leaving one version while
+the other keeps receiving would not be leaving the group.  Leaving is
+local only: the creator is not told and keeps the member on the
+roster, so the messages keep coming and are rejected on arrival.
+:meth:`GroupStore.rejoin` (``tau group rejoin``) clears a left id, so
+the next message pins the group again; a re-invite under a changed
+roster is a new id and pins without a rejoin.
 """
 
 from __future__ import annotations
@@ -641,33 +644,49 @@ class GroupStore:
         group_id = group_id.lower()
         return any(entry["id"] == group_id for entry in self._left)
 
-    def leave(self, group_id: str) -> bool:
-        """Leave a known group; ``False`` when it was not stored.
+    def leave(self, group_id: str) -> List[str]:
+        """Leave a known group; ``[]`` when it was not stored.
 
-        The record is deleted and the id is remembered as left, so a
+        Returns the ids left: the resolved group plus any successor
+        roster for the same creator and name already pinned alongside
+        it — the same group under a new roster, which would keep
+        receiving if it stayed.  Each id is remembered as left, so a
         later group message for it cannot re-pin the group (see
         :meth:`record`) — unlike :meth:`delete`, whose removal the next
-        message undoes.  Raises :class:`OSError` when the write fails,
-        leaving the in-memory store as it was on disk.
+        message undoes.  A genuinely new roster arriving after the
+        leave is a new id and pins normally.  Raises :class:`OSError`
+        when the write fails, leaving the in-memory store as it was on
+        disk.
         """
         with self._transaction():
             existing = self._groups.get(group_id.lower())
             if existing is None:
-                return False
+                return []
             snapshot = self._snapshot()
-            del self._groups[group_id.lower()]
-            if not self.is_left(group_id):
-                self._left.append(
-                    {"id": group_id.lower(), "left_at": time.time()}
-                )
-                if len(self._left) > MAX_LEFT_GROUPS:
-                    del self._left[: len(self._left) - MAX_LEFT_GROUPS]
+            family = [existing] + [
+                other
+                for other in self._groups.values()
+                if other["id"] != existing["id"]
+                and not other["local"]
+                and other["creator"] == existing["creator"]
+                and other["name"] == existing["name"]
+            ]
+            left_ids = []
+            for group in family:
+                del self._groups[group["id"]]
+                left_ids.append(group["id"])
+                if not self.is_left(group["id"]):
+                    self._left.append(
+                        {"id": group["id"], "left_at": time.time()}
+                    )
+                    if len(self._left) > MAX_LEFT_GROUPS:
+                        del self._left[: len(self._left) - MAX_LEFT_GROUPS]
             try:
                 self._save()
             except OSError:
                 self._restore(snapshot)
                 raise
-        return True
+        return left_ids
 
     def rejoin(self, group_id: str) -> bool:
         """Clear a left group id, so the next message can pin it again.
@@ -725,9 +744,11 @@ class GroupStore:
             groups = [dict(group) for group in self._groups.values()]
         if len(query) == 32:
             group = self.get(query)
-            if group is None:
-                raise ValueError(f"unknown group: {query!r}")
-            return group
+            if group is not None:
+                return group
+            # A 32-character name is also possible: fall through to the
+            # name match below instead of erroring here.  An actual id
+            # still wins — get() above already checked it.
         by_name = [
             group for group in groups if group["name"].casefold() == query.casefold()
         ]
