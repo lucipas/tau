@@ -11,6 +11,7 @@ import pytest
 import RNS
 
 from tau import cli
+from tau.blocklist import BlockList, save_blocklist
 from tau.config import TauConfig, write_node_metadata
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
@@ -3634,6 +3635,67 @@ def test_forward_prefers_registry_alias_for_sender_label(
 def test_forward_own_sent_message_labels_you(tmp_path, monkeypatch):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "my earlier note",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "d" * 32,
+            "direction": "out",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "dddd"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from you:\nmy earlier note"
+    )
+
+
+def test_forward_blocked_sender_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({"ab" * 16})))
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "aaaa"])
+    assert code == 1
+    assert "blocked peer" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_unknown_sender_uses_short_hash(tmp_path, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "ab" * 16,
+            "text": "nameless hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "2" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "2222"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from abababab:\nnameless hello"
+    )
+
+
+def test_forward_own_sent_message_ignores_blocked_recipient(
+    tmp_path, monkeypatch
+):
+    # A sent message carries its *recipient* in `destination`: blocking
+    # that recipient must not stop the owner forwarding their own words.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({"ab" * 16})))
     inbox = Inbox(config.inbox_path)
     inbox.append(
         {

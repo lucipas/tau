@@ -4648,12 +4648,15 @@ def cmd_forward(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     # Messages hidden by the block-list are hidden from `tau messages`
     # and must not be forwarded either.  An unreadable block-list fails
-    # closed, matching the listing.
-    blocked = load_blocked_set(config.blocklist_path)
-    if blocked is None:
-        raise NodeError("cannot forward: the block-list could not be read")
-    if record.get("destination") in blocked:
-        raise NodeError("cannot forward a message from a blocked peer")
+    # closed, matching the listing.  Sent messages carry the *recipient*
+    # in `destination`, so the check only applies to received ones —
+    # forwarding your own message must not trip on its old recipient.
+    if record.get("direction") != "out":
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            raise NodeError("cannot forward: the block-list could not be read")
+        if record.get("destination") in blocked:
+            raise NodeError("cannot forward a message from a blocked peer")
     text = record.get("text")
     if not text:
         # File records carry no text (see inbox._valid_record).
