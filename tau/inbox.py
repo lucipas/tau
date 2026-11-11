@@ -617,7 +617,7 @@ class Inbox:
         """
         cleaned = normalize_message(text)
         now = time.time()
-        entry = self.append(
+        record = _valid_record(
             {
                 "from": sender_name,
                 "destination": destination,
@@ -629,8 +629,39 @@ class Inbox:
                 "kind": NOTE_KIND,
             }
         )
-        self.mark_read(peer=destination, up_to_seq=entry["seq"])
-        return entry
+        if record is None:
+            raise ValueError("inbox record needs text")
+        # Store and read in one transaction: a note is never persisted
+        # without its read cursor, and a failed write raises instead of
+        # reporting a saved note.
+        with self._transaction():
+            previous_messages = list(self._messages)
+            previous_cursors = dict(self._read_cursors)
+            record["seq"] = self._next_seq()
+            self._messages.append(record)
+            self._messages = _retain(self._messages)
+            self._advance_own_cursor(record)
+            try:
+                self._save(strict=True)
+            except OSError:
+                self._messages = previous_messages
+                self._read_cursors = previous_cursors
+                raise
+        return record
+
+    def _advance_own_cursor(self, entry: Dict[str, Any]) -> None:
+        """Move this node's read cursor up to a note (caller holds the lock).
+
+        The cursor is keyed by destination, and no peer message carries
+        our own hash, so this only ever marks notes read.
+        """
+        destination = entry.get("destination") or ""
+        current = self._read_cursors.get(destination)
+        if current is None or current["last_read_seq"] < entry["seq"]:
+            self._read_cursors[destination] = {
+                "last_read_seq": entry["seq"],
+                "last_read_id": entry.get("id"),
+            }
 
     def delete(self, ref: str) -> Dict[str, Any]:
         """Remove one stored message by full id or unique prefix.
@@ -739,6 +770,8 @@ class Inbox:
                 and item.get("id")
                 and item.get("read_at") is not None
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
 
     def mark_receipt_sent(
@@ -779,6 +812,8 @@ class Inbox:
                 if isinstance(item.get("id"), str)
                 and item.get("id")
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1128,6 +1163,7 @@ class Inbox:
         added: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._messages)
+            previous_cursors = dict(self._read_cursors)
             seen = {_dedupe_key(item) for item in self._messages}
             for entry in entries:
                 record = _valid_record(entry)
@@ -1167,6 +1203,18 @@ class Inbox:
                 # the transaction would find none of them and the caller
                 # would mirror nothing.
                 kept = {id(item) for item in self._messages}
+                inserted.extend(item for item in added if id(item) in kept)
+        return {
+            "imported": imported,
+            "present": present,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._messages)
+tem) for item in self._messages}
                 inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
