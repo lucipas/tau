@@ -3776,6 +3776,12 @@ class TauNode:
             self._request_on_link(
                 link, REQUEST_FILE, offer, 20.0, deadline=deadline
             )
+            # The offer may have answered just as the deadline passed:
+            # do not start a transfer with no time left to finish it.
+            if _past(deadline):
+                raise NodeError(
+                    f"deadline passed before sending file {transfer_id[:8]}"
+                )
             concluded = threading.Event()
             state: Dict[str, Any] = {}
 
