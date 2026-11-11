@@ -13,12 +13,9 @@ from pathlib import Path
 
 import pytest
 
-<<<<<<< HEAD
-from tau.groups import GroupStore
-=======
 from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.blocklist import BlockList
->>>>>>> origin/main
+from tau.groups import GroupStore
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
 from tau.peers import AmbiguousPeer, Peer, PeerError
@@ -134,16 +131,13 @@ class FakeNode:
             ]
         )
         self.sent = []
-<<<<<<< HEAD
         self.group_sent = []
         self.group_refusals = set()
         self.groups = GroupStore(groups_path)
         self.groups.create(
             "crew", [PEER_HASH, BOB_HASH], created_by=PEER_HASH
         )
-=======
         self.sent_files = []
->>>>>>> origin/main
         self.announced = 0
         self.flush_calls = []
         self.flush_lock_busy = False
@@ -274,7 +268,6 @@ class FakeNode:
             "id": wire_id,
         }
 
-<<<<<<< HEAD
     def send_group_message(
         self, group, text, *, timeout=20.0, discover_timeout=None, queue=True
     ):
@@ -322,7 +315,9 @@ class FakeNode:
             "group": group["id"],
             "name": group["name"],
             "results": results,
-=======
+        }
+
+
     def send_file(
         self,
         target,
@@ -345,7 +340,6 @@ class FakeNode:
             "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
             "to": peer.hexhash,
->>>>>>> origin/main
         }
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):

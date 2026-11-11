@@ -2,14 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
-<<<<<<< HEAD
 import type { Peer, TauGroup, TauMessage } from "@/lib/types";
-import { MAX_MESSAGE_CHARS } from "@/lib/constants";
-=======
-import type { Peer, TauMessage } from "@/lib/types";
 import { MAX_FILE_BYTES, MAX_MESSAGE_CHARS } from "@/lib/constants";
 import { formatFileSize } from "@/lib/format";
->>>>>>> origin/main
 
 import { SendIcon } from "./ui";
 
@@ -21,11 +16,8 @@ export function Composer({
   onTargetChange,
   onModeChange,
   onSend,
-<<<<<<< HEAD
   onSendGroup,
-=======
   onSendFile,
->>>>>>> origin/main
   replyTo,
   onCancelReply,
 }: {
@@ -41,11 +33,8 @@ export function Composer({
     expiresIn?: number,
     replyTo?: string,
   ) => Promise<TauMessage>;
-<<<<<<< HEAD
   onSendGroup: (group: string, text: string) => Promise<TauMessage[]>;
-=======
   onSendFile?: (to: string, file: File) => Promise<TauMessage>;
->>>>>>> origin/main
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
 }) {

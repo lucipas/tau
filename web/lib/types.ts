@@ -227,15 +227,15 @@ export interface SendResponse {
   response: Record<string, unknown>;
 }
 
-<<<<<<< HEAD
 export interface SendGroupResponse {
   ok: boolean;
   messages: TauMessage[];
-=======
+  response: Record<string, unknown>;
+}
+
 export interface SendFileResponse {
   ok: boolean;
   message: TauMessage;
->>>>>>> origin/main
   response: Record<string, unknown>;
 }
 

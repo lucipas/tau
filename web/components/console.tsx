@@ -206,11 +206,8 @@ export function Console() {
               onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
-<<<<<<< HEAD
               onSendGroup={tau.sendGroup}
-=======
               onSendFile={tau.sendFile}
->>>>>>> origin/main
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />

@@ -1,7 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-<<<<<<< HEAD
 import type { Peer, TauGroup, TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
@@ -32,19 +31,46 @@ const groups: TauGroup[] = [
   },
 ];
 
-function makeMessage(): TauMessage {
+function makeMessage(overrides: Partial<TauMessage> = {}): TauMessage {
   return {
     id: 1,
     direction: "out",
     peer: PEER_HASH,
     peer_name: "alice",
-    text: "hi all",
+    text: "Sent file: notes.txt (5 bytes)",
     sent_at: 1000,
     received_at: 1001,
     status: "delivered",
     group: GROUP_ID,
     group_name: "crew",
+    ...overrides,
   };
+}
+
+function renderComposer({
+  onSendFile = vi.fn().mockResolvedValue(makeMessage()),
+  onSend = vi.fn().mockResolvedValue(makeMessage()),
+  onSendGroup = vi.fn().mockResolvedValue([]),
+} = {}) {
+  render(
+    <Composer
+      peers={[]}
+      groups={[]}
+      target={"ab".repeat(16)}
+      mode="custom"
+      onTargetChange={() => {}}
+      onModeChange={() => {}}
+      onSend={onSend}
+      onSendGroup={onSendGroup}
+      onSendFile={onSendFile}
+    />,
+  );
+  return { onSend, onSendFile };
+}
+
+function attachFile(file: File) {
+  const input = screen.getByLabelText("Attach a file");
+  fireEvent.change(input, { target: { files: [file] } });
 }
 
 describe("Composer group mode", () => {
@@ -119,47 +145,8 @@ describe("Composer group mode", () => {
     );
 
     expect(screen.queryByText("group chat…")).toBeNull();
-=======
-import type { TauMessage } from "@/lib/types";
-
-import { Composer } from "./composer";
-
-function makeMessage(overrides: Partial<TauMessage> = {}): TauMessage {
-  return {
-    id: 1,
-    direction: "out",
-    peer: "ab".repeat(16),
-    peer_name: "alice",
-    text: "Sent file: notes.txt (5 bytes)",
-    sent_at: 1000,
-    received_at: 1001,
-    status: "delivered",
-    ...overrides,
-  };
-}
-
-function renderComposer({
-  onSendFile = vi.fn().mockResolvedValue(makeMessage()),
-  onSend = vi.fn().mockResolvedValue(makeMessage()),
-} = {}) {
-  render(
-    <Composer
-      peers={[]}
-      target={"ab".repeat(16)}
-      mode="custom"
-      onTargetChange={() => {}}
-      onModeChange={() => {}}
-      onSend={onSend}
-      onSendFile={onSendFile}
-    />,
-  );
-  return { onSend, onSendFile };
-}
-
-function attachFile(file: File) {
-  const input = screen.getByLabelText("Attach a file");
-  fireEvent.change(input, { target: { files: [file] } });
-}
+  });
+});
 
 describe("Composer file attach", () => {
   it("shows the picked file and sends it to the selected peer", async () => {
@@ -207,6 +194,5 @@ describe("Composer file attach", () => {
         undefined,
       ),
     );
->>>>>>> origin/main
   });
 });
