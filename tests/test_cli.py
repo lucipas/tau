@@ -3563,6 +3563,173 @@ def test_send_reply_to_unknown_reference_is_an_error(
     assert _FakeSendNode.instances[0].sent == []
 
 
+def _run_forward(tmp_path, monkeypatch, argv):
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    _FakeSendNode.deliver_on_flush = False
+    return cli.main(["forward", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_parser_forward_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["forward", "--to", "bob", "abcdef12"])
+    assert args.command == "forward"
+    assert args.to == ["bob"]
+    assert args.message == "abcdef12"
+    assert args.timeout == 20.0
+    assert args.wait is None
+    assert args.no_queue is False
+
+    multi = parser.parse_args(
+        ["forward", "--to", "alice", "--to", "bob", "--wait", "5", "abcdef12"]
+    )
+    assert multi.to == ["alice", "bob"]
+    assert multi.wait == 5.0
+
+
+def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "aaaa"])
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    target, text, _ = node.sent[0]
+    assert target == "bob"
+    assert text == "Forwarded from alice:\noriginal thought"
+    assert "delivered to bob" in capsys.readouterr().out
+
+
+def test_forward_prefers_registry_alias_for_sender_label(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.set_alias(sender_hash, "ally")
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "hello there",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "c" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "cccc"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from ally:\nhello there"
+    )
+
+
+def test_forward_own_sent_message_labels_you(tmp_path, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "my earlier note",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "d" * 32,
+            "direction": "out",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "dddd"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from you:\nmy earlier note"
+    )
+
+
+def test_forward_unknown_reference_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "zzzz"])
+    assert code == 1
+    assert "unknown message: 'zzzz'" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_ambiguous_prefix_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    for message_id in ("e" * 31 + "1", "e" * 31 + "2"):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": "ab" * 16,
+                "text": "shared prefix",
+                "sent_at": 10.0,
+                "received_at": 20.0,
+                "id": message_id,
+                "direction": "in",
+            }
+        )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "eeee"])
+    assert code == 1
+    assert "messages match prefix" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_file_message_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "name": "photo.jpg",
+            "size": 42,
+            "sha256": "f" * 64,
+            "path": "received/photo.jpg",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "f" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 1
+    assert "no text to send" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_too_long_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "x" * 1990,
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "1" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "1111"])
+    assert code == 1
+    assert "too long to forward" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
 def test_messages_renders_reactions(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
     inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)

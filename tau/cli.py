@@ -74,6 +74,7 @@ from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
     MAX_MAIL_TTL,
+    MAX_MESSAGE_CHARS,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
@@ -389,6 +390,47 @@ def build_parser() -> argparse.ArgumentParser:
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
     send.set_defaults(func=cmd_send)
+
+    # `tau forward` shares `tau send`'s delivery flags: a forward is a
+    # new message carrying the original text plus an attribution line.
+    forward = subparsers.add_parser(
+        "forward",
+        parents=[common],
+        help="forward a stored message to a peer",
+    )
+    forward.add_argument(
+        "--to",
+        action="append",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: forward to several peers)",
+    )
+    forward.add_argument(
+        "message",
+        metavar="ID|PREFIX",
+        help="message id or unique prefix (see tau messages)",
+    )
+    forward.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    forward.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    forward.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    forward.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    forward.set_defaults(func=cmd_forward)
 
     # `send --file` already means "read the message text from a file",
     # so file transfer gets its own subcommand instead of overloading it.
@@ -4589,6 +4631,52 @@ def cmd_send(args: argparse.Namespace) -> int:
     return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
 
 
+def cmd_forward(args: argparse.Namespace) -> int:
+    """Forward a stored message to another peer, attributed to its sender.
+
+    The forwarded text is the original prefixed with one attribution
+    line, so the recipient sees who said it on any transport with no
+    protocol change.  Delivery reuses :func:`cmd_send` wholesale — the
+    forward is a new message, so it carries no expiry, kind, or reply
+    chain from the original.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    try:
+        record = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    text = record.get("text")
+    if not text:
+        # File records carry no text (see inbox._valid_record).
+        raise NodeError("cannot forward a file message: it has no text to send")
+    if record.get("direction") == "out":
+        # The message is one this node sent; the recipient already knows
+        # the forwarder, so the attribution names the forwarder as "you".
+        label = "you"
+    else:
+        # Inbox records already store the sender's display name as known
+        # when the message arrived; re-resolve it so a newer alias wins,
+        # falling back to the stored label (a name, or the short hash).
+        label = str(record.get("from") or "unknown")
+        sender_hash = record.get("destination")
+        peer = (
+            PeerRegistry(config.peers_path).get(sender_hash)
+            if isinstance(sender_hash, str) and sender_hash
+            else None
+        )
+        if peer is not None:
+            label = peer.display_name
+    forwarded = f"Forwarded from {label}:\n{text}"
+    if len(forwarded) > MAX_MESSAGE_CHARS:
+        raise NodeError(
+            f"message is too long to forward "
+            f"({len(forwarded)} > {MAX_MESSAGE_CHARS} characters)"
+        )
+    # `cmd_send` reads its text from `args.message`; hand it the
+    # attributed text and let it own delivery, queueing, and output.
+    args.message = forwarded
+    return cmd_send(args)
 
 
 def cmd_send_file(args: argparse.Namespace) -> int:
