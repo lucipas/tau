@@ -1517,6 +1517,7 @@ class TauNode:
             creator=creator,
             sender=sender_hash or "",
             sent_at=sent_at,
+            renamed_from=group.get("renamed_from"),
         )
 
     def _handle_group_message(
@@ -1570,6 +1571,7 @@ class TauNode:
                 "name": message["group_name"],
                 "creator": message["creator"],
                 "members": message["members"],
+                "renamed_from": message.get("renamed_from") or [],
             },
             sent_at=message.get("sent_at"),
         )
@@ -2310,6 +2312,10 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                renamed_from=(
+                    (self.groups.get(entry.group_id) or {}).get("renamed_from")
+                    or None
+                ),
             )
             if entry.group_id is not None
             else encode_message(
@@ -3381,6 +3387,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                renamed_from=group.get("renamed_from") or None,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3396,6 +3403,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                renamed_from=group.get("renamed_from") or None,
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:

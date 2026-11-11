@@ -841,15 +841,16 @@ class Inbox:
         limit: Optional[int] = None,
         peer: Optional[str] = None,
         query: Optional[str] = None,
-        group: Optional[str] = None,
+        group: Optional[Union[str, List[str]]] = None,
         kind: Optional[str] = None,
         direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``kind`` filters to one message kind;
-        ``query`` keeps only messages whose
+        filters to one group id, or to several (a group plus its rename
+        predecessors, so history spans renames); ``kind`` filters to
+        one message kind; ``query`` keeps only messages whose
         text contains it (case-insensitive substring); ``limit`` caps
         how many are returned (``None`` means all of them).  Sent
         messages are recorded here too — a reply quotes the sender's
@@ -885,10 +886,11 @@ class Inbox:
                 if needle in str(item.get("text") or "").casefold()
             ]
         if group is not None:
+            group_ids = {group} if isinstance(group, str) else set(group)
             entries = [
                 item
                 for item in entries
-                if item.get("kind") == "group" and item.get("group") == group
+                if item.get("kind") == "group" and item.get("group") in group_ids
             ]
         if kind is not None:
             entries = [item for item in entries if item.get("kind") == kind]

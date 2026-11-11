@@ -957,7 +957,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="create a group with a fixed member list",
     )
-    group_create.add_argument("name", help="group name")
+    group_create.add_argument(
+        "group_name", metavar="NAME", help="group name"
+    )
     group_create.add_argument(
         "--peer",
         required=True,
@@ -1050,7 +1052,9 @@ def build_parser() -> argparse.ArgumentParser:
     group_rename.add_argument(
         "group", metavar="GROUP", help="group id, id prefix or name"
     )
-    group_rename.add_argument("name", metavar="NAME", help="the new group name")
+    group_rename.add_argument(
+        "new_name", metavar="NAME", help="the new group name"
+    )
     group_rename.set_defaults(func=cmd_group_rename)
 
     group_send = group_sub.add_parser(
@@ -5301,9 +5305,12 @@ def cmd_messages(args: argparse.Namespace) -> int:
     peer_hash = None
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
-    group_id = None
+    group_ids = None
     if getattr(args, "group", None):
-        group_id = GroupStore(config.groups_path).find(args.group)["id"]
+        group = GroupStore(config.groups_path).find(args.group)
+        # History spans renames: messages stored under a predecessor
+        # id still belong to this group.
+        group_ids = [group["id"], *(group.get("renamed_from") or [])]
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
         counts = inbox.unread_counts()
@@ -5347,7 +5354,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
     entries = inbox.list_messages(
-        limit=None, peer=peer_hash, group=group_id, query=query, kind=kind
+        limit=None, peer=peer_hash, group=group_ids, query=query, kind=kind
     )
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
@@ -5590,7 +5597,7 @@ def cmd_group_create(args: argparse.Namespace) -> int:
         if len(members) < 2:
             raise NodeError("a group needs at least one other peer")
         group = node.groups.create(
-            getattr(args, "name"), members, created_by=own_hash
+            getattr(args, "group_name"), members, created_by=own_hash
         )
     finally:
         node.stop()
@@ -5760,7 +5767,7 @@ def cmd_group_rename(args: argparse.Namespace) -> int:
         if not group["local"] or group["creator"] != own_hash:
             raise NodeError("only the creator can rename a group")
         new_group = node.groups.rename(
-            group["id"], args.name, created_by=own_hash
+            group["id"], args.new_name, created_by=own_hash
         )
     finally:
         node.stop()

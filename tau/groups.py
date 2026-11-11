@@ -154,6 +154,24 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if not math.isfinite(roster_sent_at):
             return None
+    # Rename lineage: predecessor ids, newest first.  The lineage is
+    # not part of the id derivation, so a stored record with a malformed
+    # entry keeps only the usable ids instead of dropping the group.
+    renamed_from: List[str] = []
+    lineage = raw.get("renamed_from")
+    if isinstance(lineage, list):
+        seen_ids = set()
+        for entry in lineage:
+            if not isinstance(entry, str) or len(entry) != 32:
+                continue
+            try:
+                bytes.fromhex(entry)
+            except ValueError:
+                continue
+            entry = entry.lower()
+            if entry not in seen_ids:
+                seen_ids.add(entry)
+                renamed_from.append(entry)
     return {
         "id": group_id.lower(),
         "name": name,
@@ -163,6 +181,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "created_by": creator,
         "local": bool(raw.get("local", False)),
         "roster_sent_at": roster_sent_at,
+        "renamed_from": renamed_from,
     }
 
 
@@ -367,6 +386,7 @@ class GroupStore:
                     "creator": existing["creator"],
                     "created_by": existing["creator"],
                     "local": True,
+                    "renamed_from": existing.get("renamed_from") or [],
                 }
             )
             if candidate is None:
@@ -436,6 +456,12 @@ class GroupStore:
                     "created_by": existing["creator"],
                     "local": True,
                     "roster_sent_at": existing.get("roster_sent_at"),
+                    # The successor remembers the whole lineage, newest
+                    # first, so a member that missed an intermediate
+                    # rename still retires every predecessor, and group
+                    # history can span the renames.
+                    "renamed_from": [existing["id"]]
+                    + list(existing.get("renamed_from") or []),
                 }
             )
             if candidate is None:
@@ -467,6 +493,7 @@ class GroupStore:
         creator: str,
         sender: str = "",
         sent_at: Optional[float] = None,
+        renamed_from: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
@@ -494,6 +521,16 @@ class GroupStore:
         longest (a locally created group first), so sends by name keep
         working until the creator sends the successor themself.
 
+        ``renamed_from`` is the successor's rename lineage (predecessor
+        ids, newest first).  A creator-authorized message carrying it
+        retires those predecessors the same way: a learned predecessor
+        from the same creator is deleted and its id retired, so a
+        member that still holds the old name stops sending to an id
+        the creator retired, and a queued copy of an old message
+        cannot re-pin it.  A member-carried message never retires
+        anything — the lineage is only a claim until the creator
+        themself sends under the new name.
+
         ``sent_at`` is the message's send time on the creator's clock.
         A creator message sent before the successor was learned is
         stale — a queued copy that predates the roster change — and
@@ -520,6 +557,7 @@ class GroupStore:
                 "creator": creator,
                 "created_by": creator,
                 "local": False,
+                "renamed_from": list(renamed_from or []),
             }
         )
         if candidate is None:
@@ -538,6 +576,7 @@ class GroupStore:
             elif candidate["id"] in self._retired:
                 return None
             superseded = []
+            predecessors = []
             if creator_authorized:
                 superseded = [
                     other
@@ -549,6 +588,23 @@ class GroupStore:
                         and other["id"] != candidate["id"]
                     )
                 ]
+                # A rename successor names its predecessors: learned
+                # predecessors from the same creator are retired, so
+                # the member stops sending to an id the creator no
+                # longer accepts.  A predecessor this node created
+                # itself is never touched — only the creator retires
+                # their own groups, and a local copy means this node
+                # is the creator.
+                for pred_id in dict.fromkeys(renamed_from or []):
+                    other = self._groups.get(pred_id)
+                    if (
+                        other is None
+                        or other["local"]
+                        or other["creator"] != candidate["creator"]
+                        or other["id"] == candidate["id"]
+                    ):
+                        continue
+                    predecessors.append(other)
                 if sent_at is not None:
                     # A queued creator message sent before the successor
                     # was learned must not replace it.  Supersede only
@@ -560,7 +616,7 @@ class GroupStore:
                     # known longest — the successor.
                     stale_for = [
                         other
-                        for other in superseded
+                        for other in superseded + predecessors
                         if other.get("roster_sent_at") is not None
                         and sent_at < other["roster_sent_at"]
                     ]
@@ -576,9 +632,17 @@ class GroupStore:
                             for other in superseded
                             if other not in stale_for
                         ]
+                        predecessors = [
+                            other
+                            for other in predecessors
+                            if other not in stale_for
+                        ]
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
-                if learned - len(superseded) >= MAX_LEARNED_GROUPS:
+                if (
+                    learned - len(superseded) - len(predecessors)
+                    >= MAX_LEARNED_GROUPS
+                ):
                     log.info(
                         "Refusing to pin group %s: learned-group limit reached",
                         group_id,
@@ -587,6 +651,12 @@ class GroupStore:
             snapshot = self._snapshot()
             for other in superseded:
                 del self._groups[other["id"]]
+            for other in predecessors:
+                del self._groups[other["id"]]
+                if other["id"] not in self._retired:
+                    self._retired.append(other["id"])
+                    if len(self._retired) > MAX_RETIRED_GROUPS:
+                        del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
             if existing is not None:
                 refreshed = False
                 if (
@@ -607,7 +677,26 @@ class GroupStore:
                         "roster_sent_at": sent_at,
                     }
                     refreshed = True
-                if superseded or refreshed:
+                if creator_authorized and renamed_from:
+                    # A creator message carries the authoritative
+                    # lineage: a successor first pinned from a
+                    # member-carried message has none, so adopt it
+                    # here (a message without lineage never wipes
+                    # one already known).
+                    current = self._groups[existing["id"]]
+                    merged = list(
+                        dict.fromkeys(
+                            list(renamed_from)
+                            + list(current.get("renamed_from") or [])
+                        )
+                    )
+                    if merged != list(current.get("renamed_from") or []):
+                        self._groups[existing["id"]] = {
+                            **current,
+                            "renamed_from": merged,
+                        }
+                        refreshed = True
+                if superseded or predecessors or refreshed:
                     try:
                         self._save()
                     except OSError as exc:
