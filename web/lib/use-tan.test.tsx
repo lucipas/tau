@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
-import type { TanPost } from "./types";
+import type { TanPost, TanRules } from "./types";
 import { useTan } from "./use-tan";
 
 vi.mock("./api", () => ({
@@ -51,6 +51,17 @@ function routeLoad(path: string, timeline: unknown) {
   if (path.startsWith("/api/tan/suggest")) return Promise.resolve(emptySuggestions);
   return Promise.resolve(emptyFollowing);
 }
+
+const emptyRules = {
+  rules: {
+    default: "allow",
+    allow_authors: [],
+    block_authors: [],
+    allow_followed: false,
+    kinds: null,
+  },
+  available_kinds: [],
+};
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -301,15 +312,20 @@ describe("useTan deletePost", () => {
         firstSuggestions,
       ];
       let next = 0;
-      mockedGet.mockImplementation(() => queue[next++].promise);
+      mockedGet.mockImplementation((path: string) =>
+        path === "/api/tan/rules"
+          ? Promise.resolve(emptyRules)
+          : queue[next++].promise,
+      );
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      expect(mockedGet.mock.calls.length).toBe(5);
+      // Five feed calls plus the one rules load.
+      expect(mockedGet.mock.calls.length).toBe(6);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(5);
+      expect(mockedGet.mock.calls.length).toBe(6);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
@@ -327,7 +343,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(5);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(6);
     } finally {
       vi.useRealTimers();
     }
@@ -348,7 +364,11 @@ describe("useTan deletePost", () => {
       deferred(),
     ];
     let next = 0;
-    mockedGet.mockImplementation(() => queue[next++].promise);
+    mockedGet.mockImplementation((path: string) =>
+      path === "/api/tan/rules"
+        ? Promise.resolve(emptyRules)
+        : queue[next++].promise,
+    );
 
     const { result } = renderHook(() => useTan());
     // The initial load is in flight; start a newer one before it resolves.
@@ -803,5 +823,150 @@ describe("useTan verify", () => {
     });
     // The audit read the store before the publish: it must not be shown.
     expect(result.current.verifyReport).toBeNull();
+  });
+});
+
+const allowRules: TanRules = {
+  default: "allow",
+  allow_authors: [],
+  block_authors: [],
+  allow_followed: false,
+  kinds: null,
+};
+
+const denyRules: TanRules = { ...allowRules, default: "deny" };
+
+function mockFeed(rulesImpl: (path: string) => Promise<unknown>) {
+  mockedGet.mockImplementation((path: string) => {
+    if (path === "/api/tan/rules") return rulesImpl(path);
+    if (path.startsWith("/api/tan/timeline"))
+      return Promise.resolve({ posts: [], count: 0 });
+    return Promise.resolve(emptyFollowing);
+  });
+}
+
+describe("useTan rules", () => {
+  it("loads the rules and available kinds", async () => {
+    mockFeed(() =>
+      Promise.resolve({
+        rules: allowRules,
+        available_kinds: ["post", "like"],
+      }),
+    );
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.rulesLoading).toBe(false));
+
+    expect(result.current.rules).toEqual(allowRules);
+    expect(result.current.availableKinds).toEqual(["post", "like"]);
+    expect(result.current.rulesError).toBeNull();
+  });
+
+  it("sets rulesError when the rules fail to load", async () => {
+    mockFeed(() => Promise.reject(new Error("node unreachable")));
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.rulesLoading).toBe(false));
+
+    expect(result.current.rulesError).toBe("node unreachable");
+    expect(result.current.rules).toBeNull();
+  });
+
+  it("saves the rules, updates state and reloads the feed", async () => {
+    mockFeed(() =>
+      Promise.resolve({ rules: allowRules, available_kinds: ["post"] }),
+    );
+    mockedPost.mockResolvedValue({ rules: denyRules });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.rules).toEqual(allowRules));
+    const feedLoadsBefore = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/timeline"),
+    ).length;
+
+    let saved: unknown;
+    await act(async () => {
+      saved = await result.current.updateRules(denyRules);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/rules", denyRules);
+    expect(saved).toEqual(denyRules);
+    expect(result.current.rules).toEqual(denyRules);
+    expect(result.current.rulesError).toBeNull();
+    const feedLoadsAfter = mockedGet.mock.calls.filter((call) =>
+      String(call[0]).startsWith("/api/tan/timeline"),
+    ).length;
+    expect(feedLoadsAfter).toBeGreaterThan(feedLoadsBefore);
+  });
+
+  it("throws and keeps the previous rules when a save is rejected", async () => {
+    mockFeed(() =>
+      Promise.resolve({ rules: allowRules, available_kinds: ["post"] }),
+    );
+    mockedPost.mockRejectedValue(new Error("unknown author"));
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.rules).toEqual(allowRules));
+
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await result.current.updateRules(denyRules);
+      } catch (caught) {
+        failure = caught;
+      }
+    });
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("unknown author");
+    expect(result.current.rules).toEqual(allowRules);
+  });
+
+  it("reports a feed reload failure without rejecting a confirmed save", async () => {
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/tan/rules")
+        return Promise.resolve({ rules: allowRules, available_kinds: [] });
+      if (path.startsWith("/api/tan/timeline"))
+        return Promise.reject(new Error("feed unreachable"));
+      return Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ rules: denyRules });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.rules).toEqual(allowRules));
+
+    let saved: unknown;
+    await act(async () => {
+      saved = await result.current.updateRules(denyRules);
+    });
+
+    expect(saved).toEqual(denyRules);
+    expect(result.current.rules).toEqual(denyRules);
+    expect(result.current.rulesError).toBeNull();
+    expect(result.current.error).toBe("feed unreachable");
+  });
+
+  it("discards a rules GET that was superseded by a confirmed save", async () => {
+    const initial = deferred<unknown>();
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/tan/rules") return initial.promise;
+      if (path.startsWith("/api/tan/timeline"))
+        return Promise.resolve({ posts: [], count: 0 });
+      return Promise.resolve(emptyFollowing);
+    });
+    mockedPost.mockResolvedValue({ rules: denyRules });
+
+    const { result } = renderHook(() => useTan());
+    await act(async () => {
+      await result.current.updateRules(denyRules);
+    });
+    expect(result.current.rules).toEqual(denyRules);
+
+    // The GET began before the save and answers with the old policy.
+    await act(async () => {
+      initial.resolve({ rules: allowRules, available_kinds: [] });
+    });
+
+    expect(result.current.rules).toEqual(denyRules);
   });
 });

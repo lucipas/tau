@@ -186,6 +186,8 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/rules` | GET | current Tan admission ruleset and the kinds that can be displayed |
+| `/api/tan/rules` | POST | replace the ruleset (applies to the running node at once) |
 | `/api/tan/verify` | GET | re-verify every stored post's signature and chain linkage |
 | `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
 | `/api/tan/import` | POST | import an export document (every entry verified) |
@@ -803,8 +805,9 @@ author is always admitted, the block list denies, the allow list and
 default policy. Entries you create yourself are never filtered, and with
 no rules file everything is admitted, as before. A rules file that
 cannot be parsed fails closed (remote entries denied) rather than
-silently opening the node up. A running `serve` applies saved rules
-when it restarts.
+silently opening the node up. The web console's admission-rules section
+(`GET`/`POST /api/tan/rules`) applies a change to the running node at
+once; rules saved from the CLI apply when `serve` restarts.
 
 ### DM allow-list
 

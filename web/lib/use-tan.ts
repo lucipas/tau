@@ -16,6 +16,9 @@ import type {
   TanMutedResponse,
   TanPost,
   TanPostResponse,
+  TanRules,
+  TanRulesResponse,
+  TanRulesUpdateResponse,
   TanSavedResponse,
   TanSuggestResponse,
   TanSuggestion,
@@ -60,6 +63,14 @@ export function useTan() {
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rules, setRules] = useState<TanRules | null>(null);
+  const [availableKinds, setAvailableKinds] = useState<string[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(true);
+  const [rulesError, setRulesError] = useState<string | null>(null);
+  // Generation of rules requests; a response from an older request, or
+  // one superseded by a confirmed save, is discarded.
+  const rulesGenerationRef = useRef(0);
+
   // The thread currently open in the console, if any: the reference it
   // was opened with and its entries (null while none is open).
   const [threadPosts, setThreadPosts] = useState<TanPost[] | null>(null);
@@ -264,6 +275,68 @@ export function useTan() {
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // Admission rules change rarely, so they load once and on demand
+  // rather than on the feed's poll: a rules edit on the CLI shows up
+  // after a manual refresh (or a page reload), not mid-scroll.
+  const refreshRules = useCallback(async () => {
+    // A newer rules request (a refresh or a confirmed save) supersedes
+    // this one, so a slow GET cannot overwrite a newer policy.
+    const generation = ++rulesGenerationRef.current;
+    try {
+      const result = await apiGet<TanRulesResponse>("/api/tan/rules");
+      if (generation !== rulesGenerationRef.current) return;
+      if (!result || typeof result.rules !== "object" || result.rules === null) {
+        throw new Error("could not load rules");
+      }
+      setRules(result.rules);
+      setAvailableKinds(
+        Array.isArray(result.available_kinds) ? result.available_kinds : [],
+      );
+      setRulesError(null);
+    } catch (caught) {
+      if (generation !== rulesGenerationRef.current) return;
+      setRulesError(
+        caught instanceof Error ? caught.message : "could not load rules",
+      );
+    } finally {
+      if (generation === rulesGenerationRef.current) {
+        setRulesLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshRules();
+  }, [refreshRules]);
+
+  const updateRules = useCallback(
+    async (next: TanRules) => {
+      const result = await apiPost<TanRulesUpdateResponse>(
+        "/api/tan/rules",
+        // apiPost takes a plain JSON object; a TanRules is exactly that.
+        { ...next } as Record<string, unknown>,
+      );
+      // The save is confirmed: supersede any GET still in flight so it
+      // cannot restore the policy from before the save.
+      rulesGenerationRef.current += 1;
+      setRules(result.rules);
+      setRulesError(null);
+      setRulesLoading(false);
+      // A kinds change re-filters the timeline; reload it at once. A
+      // failed feed reload is reported as a feed error, not as a failed
+      // rules save, since the policy above is already saved.
+      try {
+        await load();
+      } catch (caught) {
+        setError(
+          caught instanceof Error ? caught.message : "could not load the feed",
+        );
+      }
+      return result.rules;
+    },
+    [load],
+  );
 
   // A search is a view switch, like `all`: setting the query re-runs the
   // load effect, which fetches the search endpoint instead of the
@@ -721,13 +794,19 @@ export function useTan() {
     exporting,
     importing,
     error,
+    rules,
+    availableKinds,
+    rulesLoading,
+    rulesError,
+    refresh,
+    refreshRules,
+    updateRules,
     threadPosts,
     threadRef,
     threadLoading,
     threadError,
     openThread,
     closeThread,
-    refresh,
     search,
     clearSearch,
     publish,

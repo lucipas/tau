@@ -1901,6 +1901,73 @@ class WebBridge:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
 
+    def tan_rules(self) -> Dict[str, Any]:
+        """This node's Tan admission ruleset, as ``tau tan rules`` reports it.
+
+        The live Tan app's ruleset when the feed is enabled, so the
+        console shows exactly what the running node enforces; otherwise
+        the rules file in the data directory. A rules file that cannot
+        be parsed fails closed here exactly as it does for admission.
+        """
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+
+        app = self._tan_app()
+        if app is not None:
+            return app.ruleset.to_dict()
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "tan_rules_path", None)
+        if path is None:
+            raise WebBridgeError("this node has no data directory")
+        try:
+            return load_ruleset(path).to_dict()
+        except RulesError:
+            return Ruleset(default_allow=False).to_dict()
+
+    def update_tan_rules(self, payload: Any) -> Dict[str, Any]:
+        """Replace the Tan admission ruleset and apply it to the running node.
+
+        *payload* is the full ruleset as ``Ruleset.to_dict`` reports it.
+        Author entries accept a peer name or author hash, resolved like
+        ``tau tan rules`` resolves them; anything unresolvable, or a
+        malformed ruleset, is a ``ValueError``. The saved ruleset is
+        reloaded into the live Tan app, so the change applies at once
+        instead of on the next restart — a CLI edit still needs a
+        restart, since the CLI cannot reach the running process.
+        """
+        from .tangents.rules import Ruleset, save_ruleset
+        from .tangents.tan import resolve_author
+
+        if not isinstance(payload, dict):
+            raise ValueError("ruleset must be a JSON object")
+        config = getattr(self.node, "config", None)
+        path = getattr(config, "tan_rules_path", None)
+        if path is None:
+            raise WebBridgeError("this node has no data directory")
+        data = dict(payload)
+        conn = self._tan_conn()
+        try:
+            for field in ("allow_authors", "block_authors"):
+                values = data.get(field)
+                if values is None:
+                    continue
+                if not isinstance(values, list):
+                    raise ValueError(f"{field} must be a list of authors")
+                resolved = []
+                for value in values:
+                    author, _ = resolve_author(
+                        conn, value, registry=self.node.registry
+                    )
+                    resolved.append(author)
+                data[field] = resolved
+        finally:
+            conn.close()
+        ruleset = Ruleset.from_dict(data)
+        save_ruleset(path, ruleset)
+        app = self._tan_app()
+        if app is not None:
+            app.reload_ruleset()
+        return ruleset.to_dict()
+
     def tan_verify(self) -> Dict[str, Any]:
         """Audit the local Tan store, re-verifying every entry and its chain.
 
@@ -4159,6 +4226,18 @@ class _WebHandler(BaseHTTPRequestHandler):
                 posts = self.bridge.tan_posts(limit=limit)
                 self._send_json({"posts": posts, "count": len(posts)}, head_only)
                 return
+            if path == "/api/tan/rules":
+                from .tangents.tan import ENTRY_KINDS
+
+                try:
+                    rules = self.bridge.tan_rules()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json(
+                    {"rules": rules, "available_kinds": list(ENTRY_KINDS)},
+                    head_only,
+                )
             if path == "/api/tan/verify":
                 try:
                     report = self.bridge.tan_verify()
@@ -4663,6 +4742,16 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "sync": result}, head_only)
                 return
+            if path == "/api/tan/rules":
+                try:
+                    rules = self.bridge.update_tan_rules(body)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "rules": rules}, head_only)
             if path == "/api/tan/import":
                 try:
                     result = self.bridge.tan_import(body)

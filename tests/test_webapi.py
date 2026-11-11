@@ -3311,6 +3311,96 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_rules_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The default ruleset admits everything.
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"] == {
+            "default": "allow",
+            "allow_authors": [],
+            "block_authors": [],
+            "allow_followed": False,
+            "kinds": None,
+        }
+        assert payload["available_kinds"] == [
+            "post",
+            "like",
+            "unlike",
+            "delete",
+            "repost",
+            "reply",
+            "edit",
+            "quote",
+        ]
+
+        # Cache the live app's ruleset first: the update below must
+        # reload it, not just be picked up on a lazy first load.
+        assert node.app.ruleset.default_allow is True
+
+        # A peer name resolves to its author hash, like `tau tan rules`.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/rules",
+            method="POST",
+            body={
+                "default": "deny",
+                "allow_authors": ["alice"],
+                "block_authors": [OTHER_HASH],
+                "allow_followed": True,
+                "kinds": ["post", "reply"],
+            },
+        )
+        assert status == 200
+        assert payload["rules"] == {
+            "default": "deny",
+            "allow_authors": [PEER_HASH],
+            "block_authors": [OTHER_HASH],
+            "allow_followed": True,
+            "kinds": ["post", "reply"],
+        }
+
+        # The saved ruleset persists, and the live app picked it up
+        # without a restart.
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert node.app.ruleset.default_allow is False
+        assert node.app.ruleset.allow_authors == frozenset({PEER_HASH})
+        assert node.app.ruleset.displays("post") is True
+        assert node.app.ruleset.displays("like") is False
+
+        # Bad input is a 400 and leaves the saved ruleset untouched.
+        for body in (
+            {"default": "maybe"},
+            {"allow_authors": ["nobody-here"]},
+            {"block_authors": [OTHER_HASH], "kinds": ["poke"]},
+            {"allow_authors": "alice"},
+            ["not", "an", "object"],
+        ):
+            status, _, payload = _json(
+                bridge, "/api/tan/rules", method="POST", body=body
+            )
+            assert status == 400
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+    finally:
+        bridge.stop()
+
+
 def test_tan_edit_via_api(tmp_path):
     import RNS
 
@@ -3551,6 +3641,35 @@ def test_tan_export_import_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_rules_without_tan_app(tmp_path):
+    # No Tan app attached: the rules file is still readable.
+    from tau.config import TauConfig
+    from tau.tangents.rules import Ruleset, save_ruleset
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    save_ruleset(
+        node.config.tan_rules_path,
+        Ruleset(default_allow=False, allow_followed=True),
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert payload["rules"]["allow_followed"] is True
+
+        # A rules file that cannot be parsed fails closed, like admission.
+        node.config.tan_rules_path.write_text("not json", encoding="utf-8")
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert payload["rules"]["allow_authors"] == []
+    finally:
+        bridge.stop()
+
+
 def _likers_setup(tmp_path):
     """A node with one post by bob, liked by alice, carol and dave.
 
@@ -3645,6 +3764,25 @@ def test_tan_likers_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/likes")
         assert status == 400
         assert "target is required" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_rules_without_data_dir(tmp_path):
+    # The node has no config, so there is no rules file to read. (The
+    # fixture node always carries a config now, so build one here and
+    # take it away instead of relying on the shared bridge fixture.)
+    node = FakeNode(tmp_path / "mailbox.json")
+    del node.config
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 503
+        status, _, payload = _json(
+            bridge, "/api/tan/rules", method="POST", body={"default": "deny"}
+        )
+        assert status == 503
     finally:
         bridge.stop()
 

@@ -564,6 +564,26 @@ export interface TanSyncResponse {
   };
 }
 
+export interface TanRules {
+  default: "allow" | "deny";
+  allow_authors: string[];
+  block_authors: string[];
+  allow_followed: boolean;
+  // null means every kind is displayed; a list names the kinds shown.
+  // Display-only: every kind from an admitted author is still stored.
+  kinds: string[] | null;
+}
+
+export interface TanRulesResponse {
+  rules: TanRules;
+  available_kinds: string[];
+}
+
+export interface TanRulesUpdateResponse {
+  ok: boolean;
+  rules: TanRules;
+}
+
 export interface TanVerifyProblem {
   hash: string;
   author: string;
