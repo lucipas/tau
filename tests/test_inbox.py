@@ -303,6 +303,154 @@ def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
     assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
 
 
+def test_pin_by_full_id_and_unique_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a" * 32, text="one"))
+    inbox.append(_record(id="b" * 32, text="two"))
+
+    entry, changed = inbox.pin("a" * 32)
+    assert changed is True
+    assert entry["pinned"] is True
+    entry, changed = inbox.pin("b" * 28)
+    assert changed is True
+    # Pinning twice is a no-op, not an error.
+    _, changed = inbox.pin("a" * 32)
+    assert changed is False
+
+    pinned = inbox.list_messages(pinned_only=True)
+    assert [item["id"] for item in pinned] == ["b" * 32, "a" * 32]
+    # The default listing still shows everything, pinned included.
+    assert len(inbox.list_messages()) == 2
+
+
+def test_pin_unknown_and_ambiguous(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="abcd" + "2" * 28, text="two"))
+
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.pin("zzzz")
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.pin("abcd")
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.pin("  ")
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pin_persists_across_instances_and_unpin_clears(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="keep", text="keep me"))
+    inbox.append(_record(id="other", text="other"))
+    inbox.pin("keep")
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages(pinned_only=True)] == [
+        "keep"
+    ]
+    entry, changed = reloaded.unpin("keep")
+    assert changed is True
+    assert "pinned" not in entry
+    assert Inbox(path).list_messages(pinned_only=True) == []
+
+
+def test_unpin_never_pinned_is_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="plain", text="nothing pinned here"))
+
+    entry, changed = inbox.unpin("plain")
+    assert changed is False
+    assert "pinned" not in entry
+
+
+def test_pin_write_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.inbox
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="keep", text="keep me"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _boom)
+    with pytest.raises(InboxError, match="could not persist inbox"):
+        inbox.pin("keep")
+    # The pin was rolled back: the message is still unpinned.
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_delete_drops_pin_with_message(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="gone", text="bye"))
+    inbox.pin("gone")
+    assert len(inbox.list_messages(pinned_only=True)) == 1
+
+    inbox.delete("gone")
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pinned_only_covers_sent_messages_too(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="sent-one", text="sent", direction="out"))
+    inbox.append(_record(id="recv-one", text="received"))
+    inbox.pin("sent-one")
+    inbox.pin("recv-one")
+
+    # The default listing is received-only, so only the received pin shows.
+    assert [entry["id"] for entry in inbox.list_messages(pinned_only=True)] == [
+        "recv-one"
+    ]
+    # With direction=None, pinned sent messages show up too, newest first.
+    assert [
+        entry["id"]
+        for entry in inbox.list_messages(pinned_only=True, direction=None)
+    ] == ["recv-one", "sent-one"]
+    assert [
+        entry["id"]
+        for entry in inbox.list_messages(pinned_only=True, direction="in")
+    ] == ["recv-one"]
+
+
+def test_pin_file_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+        }
+    )
+
+    entry, changed = inbox.pin("f1")
+    assert changed is True
+    assert entry["kind"] == "file"
+    assert [item["id"] for item in inbox.list_messages(pinned_only=True)] == ["f1"]
+
+
+def test_export_import_preserves_pin(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    source.append(_record(id="one", text="first"))
+    source.append(_record(id="two", text="second"))
+    source.pin("one")
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(source.export_document())
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    assert [entry["id"] for entry in target.list_messages(pinned_only=True)] == [
+        "one"
+    ]
+
+
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))
