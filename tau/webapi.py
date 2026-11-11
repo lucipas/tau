@@ -2536,33 +2536,78 @@ class WebBridge:
 
     def groups(self) -> List[Dict[str, Any]]:
         try:
-            groups = []
-            for group in self.node.groups.list_groups():
-                members = []
-                for member_hash in group["members"]:
-                    peer = self.node.registry.get(member_hash)
-                    members.append(
-                        {
-                            "hash": member_hash,
-                            "name": (
-                                peer.display_name
-                                if peer is not None
-                                else member_hash[:8]
-                            ),
-                        }
-                    )
-                groups.append(
-                    {
-                        "id": group["id"],
-                        "name": group["name"],
-                        "members": members,
-                        "created_at": group["created_at"],
-                    }
-                )
-            return groups
+            return [
+                self._describe_group(group)
+                for group in self.node.groups.list_groups()
+            ]
         except Exception:  # pragma: no cover - defensive
             log.debug("Could not read group store", exc_info=True)
             return []
+
+    def _describe_group(self, group: Dict[str, Any]) -> Dict[str, Any]:
+        members = []
+        for member_hash in group["members"]:
+            peer = self.node.registry.get(member_hash)
+            members.append(
+                {
+                    "hash": member_hash,
+                    "name": (
+                        peer.display_name
+                        if peer is not None
+                        else member_hash[:8]
+                    ),
+                }
+            )
+        return {
+            "id": group["id"],
+            "name": group["name"],
+            "members": members,
+            "created_at": group["created_at"],
+        }
+
+    def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:
+        """Create a group from the console, mirroring ``tau group create``.
+
+        The creator is always a member, so this node's own hash is
+        added when the caller did not include it.  Members are peer
+        hashes from the console's picker; the store validates each one
+        and the roster size.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field 'name' is required")
+        if not isinstance(members, list) or not members:
+            raise ValueError("field 'members' must be a non-empty list")
+        cleaned: List[str] = []
+        for member in members:
+            if not isinstance(member, str) or not member.strip():
+                raise ValueError("field 'members' must contain peer hashes")
+            cleaned.append(member.strip().lower())
+        own_hash = self.node.destination_hexhash
+        for member in cleaned:
+            if member == own_hash:
+                continue
+            # Only known peers can receive a group leg; an unknown hash
+            # would leave a delivery that can never be sent.
+            peer = self.node.registry.get(member)
+            if peer is None or peer.destination_hash.hex() != member:
+                raise ValueError(f"unknown peer: {member}")
+        if own_hash not in cleaned:
+            cleaned.append(own_hash)
+        if len(cleaned) < 2:
+            raise ValueError("a group needs at least one other peer")
+        group = self.node.groups.create(
+            name.strip(), cleaned, created_by=own_hash
+        )
+        return self._describe_group(group)
+
+    def delete_group(self, query: str) -> Dict[str, Any]:
+        """Delete a known group from the console, mirroring ``tau group delete``."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        group = self.node.groups.find(query.strip())
+        if not self.node.groups.delete(group["id"]):
+            raise ValueError(f"unknown group: {query.strip()!r}")
+        return {"id": group["id"], "name": group["name"]}
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
@@ -3293,6 +3338,38 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
+                return
+            if path == "/api/groups":
+                try:
+                    group = self.bridge.create_group(
+                        body.get("name"), body.get("members")
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "group": group}, head_only)
+                return
+            if path == "/api/groups/delete":
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    deleted = self.bridge.delete_group(target.strip())
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, "deleted": deleted}, head_only)
                 return
             if path == "/api/outbox/retry":
                 self._handle_outbox_retry(body, head_only)

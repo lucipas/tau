@@ -150,6 +150,55 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("useTau group management", () => {
+  it("shows a created group even when the follow-up refresh fails", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    let returned: TauGroup | undefined;
+    await act(async () => {
+      returned = await result.current.createGroup("weekend", [
+        "ab".repeat(16),
+      ]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups", {
+      name: "weekend",
+      members: ["ab".repeat(16)],
+    });
+    expect(returned).toEqual(created);
+    expect(result.current.groups).toEqual([created]);
+  });
+
+  it("drops a deleted group even when the follow-up refresh fails", async () => {
+    const created = makeGroup();
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("weekend", ["ab".repeat(16)]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      deleted: { id: created.id, name: "weekend" },
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.deleteGroup(created.id);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/delete", {
+      group: created.id,
+    });
+    expect(result.current.groups).toEqual([]);
+  });
+});
+
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
   const { result } = renderHook(() => useTau());
   const source = FakeEventSource.instances[0];

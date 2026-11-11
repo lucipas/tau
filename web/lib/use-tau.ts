@@ -8,6 +8,8 @@ import type {
   BlockPeerResponse,
   BridgeInfo,
   CancelOutboxResponse,
+  CreateGroupResponse,
+  DeleteGroupResponse,
   DropHeldResponse,
   GroupsResponse,
   HeldMailEntry,
@@ -110,6 +112,20 @@ export function useTau() {
   const [announcing, setAnnouncing] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Counts completed group creates/deletes, so a snapshot that predates
+  // one is not allowed to restore the old roster.
+  const groupEdits = useRef(0);
+  const groupsSeq = useRef(0);
+
+  const refreshGroups = useCallback(async () => {
+    // Same polling shape as the outbox: a group learned from an
+    // incoming message shows up here without waiting for a reload.
+    const requestId = ++groupsSeq.current;
+    const result = await apiGet<GroupsResponse>("/api/groups");
+    if (requestId !== groupsSeq.current) return;
+    setGroups(result.groups);
+  }, []);
+
   // Verification time the console last applied per peer. Peer events
   // queued before a successful verify carry the older trust state and
   // must not undo the badge.
@@ -143,9 +159,13 @@ export function useTau() {
 
   useEffect(() => {
     let disposed = false;
+    // Edits made before this connection opened are in its snapshot;
+    // edits made after may not be.
+    let editsAtOpen = groupEdits.current;
     const source = new EventSource(eventsUrl(0));
 
     const onOpen = () => {
+      editsAtOpen = groupEdits.current;
       if (!disposed) setConnection("live");
     };
 
@@ -162,7 +182,15 @@ export function useTau() {
       snapshotRevision.current = peerEventSeq.current;
       localVerifiedAt.current = {};
       setPeers(sortPeers(snapshot.peers));
-      setGroups(snapshot.groups ?? []);
+      if (groupEdits.current !== editsAtOpen) {
+        // A group edit completed after this connection opened, so the
+        // snapshot's roster may predate it. Re-fetch instead.
+        refreshGroups().catch(() => {
+          // The next poll reconciles.
+        });
+      } else {
+        setGroups(snapshot.groups ?? []);
+      }
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
       // revision baseline so a delayed event from the old connection
@@ -276,7 +304,7 @@ export function useTau() {
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread]);
+  }, [applyUnread, refreshGroups]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -288,7 +316,6 @@ export function useTau() {
 
   const refreshSeq = useRef(0);
   const refreshHeldSeq = useRef(0);
-  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -308,15 +335,6 @@ export function useTau() {
     const result = await apiGet<HeldMailResponse>("/api/outbox/held");
     if (requestId !== refreshHeldSeq.current) return;
     setHeldMail(result.held);
-  }, []);
-
-  const refreshGroups = useCallback(async () => {
-    // Same polling shape as the outbox: a group learned from an
-    // incoming message shows up here without waiting for a reload.
-    const requestId = ++groupsSeq.current;
-    const result = await apiGet<GroupsResponse>("/api/groups");
-    if (requestId !== groupsSeq.current) return;
-    setGroups(result.groups);
   }, []);
 
   useEffect(() => {
@@ -636,6 +654,51 @@ export function useTau() {
     }
   }, []);
 
+  const createGroup = useCallback(
+    async (name: string, members: string[]) => {
+      const result = await apiPost<CreateGroupResponse>("/api/groups", {
+        name,
+        members,
+      });
+      // The create already succeeded: add the group locally at once,
+      // then refresh best-effort so a failed GET cannot hide it.
+      const created = result.group;
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.some((entry) => entry.id === created.id)
+          ? previous.map((entry) => (entry.id === created.id ? created : entry))
+          : [...previous, created],
+      );
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.group;
+    },
+    [refreshGroups],
+  );
+
+  const deleteGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<DeleteGroupResponse>("/api/groups/delete", {
+        group,
+      });
+      // Drop the group locally at once; the best-effort refresh below
+      // must not be the only thing that removes it.
+      const deletedId = result.deleted.id;
+      groupEdits.current += 1;
+      setGroups((previous) => previous.filter((entry) => entry.id !== deletedId));
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.deleted;
+    },
+    [refreshGroups],
+  );
+
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
       setBlocks((previous) => ({
@@ -889,6 +952,8 @@ export function useTau() {
     unblockPeer,
     announce,
     markRead,
+    createGroup,
+    deleteGroup,
     refreshOutbox,
     refreshGroups,
     cancelOutbox,

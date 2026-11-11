@@ -109,6 +109,7 @@ class FakeRegistry:
 class FakeNode:
     def __init__(self, mailbox_path=None, groups_path=None):
         self.name = "tester"
+        self.destination_hexhash = "ef" * 16
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
         self._allowlist = AllowList()
@@ -1013,6 +1014,158 @@ def test_api_groups_lists_known_groups(bridge, node, tmp_path):
     ]
     # The registry resolves the first member's display name.
     assert group["members"][0]["name"] == "alice"
+
+
+def test_api_groups_create_adds_creator_and_lists_group(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    group = payload["group"]
+    assert group["name"] == "weekend"
+    # The creator is always a member, even when the caller omits it.
+    assert [member["hash"] for member in group["members"]] == sorted(
+        [PEER_HASH, node.destination_hexhash]
+    )
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == group["id"]
+
+
+def test_api_groups_create_is_idempotent(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    first = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )
+    assert status == 200
+    assert payload["group"]["id"] == first["id"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+
+
+def test_api_groups_create_rejects_unknown_member(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    status, _, payload = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+
+
+def test_api_groups_create_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    cases = [
+        ({}, "field 'name' is required"),
+        ({"name": "  ", "members": [PEER_HASH]}, "field 'name' is required"),
+        ({"name": "weekend"}, "field 'members' must be a non-empty list"),
+        ({"name": "weekend", "members": []}, "field 'members' must be a non-empty list"),
+        (
+            {"name": "weekend", "members": ["not-a-hash"]},
+            "unknown peer",
+        ),
+        (
+            {"name": "weekend", "members": [node.destination_hexhash]},
+            "a group needs at least one other peer",
+        ),
+    ]
+    for body, message in cases:
+        status, _, payload = _json(
+            bridge, "/api/groups", method="POST", body=body
+        )
+        assert status == 400
+        assert message in payload["error"]["message"]
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+
+
+def test_api_groups_delete_removes_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/delete",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["deleted"] == {"id": created["id"], "name": "weekend"}
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 0
+
+
+def test_api_groups_delete_sees_group_created_by_another_store(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    path = tmp_path / "groups.json"
+    node.groups = GroupStore(path)
+    # A separate process (e.g. `tau group create`) writes the group.
+    other = GroupStore(path)
+    created = other.create(
+        "weekend", [PEER_HASH, node.destination_hexhash], created_by=node.destination_hexhash
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/delete",
+        method="POST",
+        body={"group": "weekend"},
+    )
+    assert status == 200
+    assert payload["deleted"] == {"id": created["id"], "name": "weekend"}
+
+
+def test_api_groups_delete_unknown_group_is_400(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    status, _, payload = _json(
+        bridge, "/api/groups/delete", method="POST", body={"group": "nope"}
+    )
+    assert status == 400
+    assert "nope" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge, "/api/groups/delete", method="POST", body={}
+    )
+    assert status == 400
+    assert payload["error"]["message"] == "field 'group' is required"
 
 
 def _inbound_record(node, **overrides):

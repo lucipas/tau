@@ -65,6 +65,16 @@ export interface GroupsResponse {
   count: number;
 }
 
+export interface CreateGroupResponse {
+  ok: boolean;
+  group: TauGroup;
+}
+
+export interface DeleteGroupResponse {
+  ok: boolean;
+  deleted: { id: string; name: string };
+}
+
 export interface Peer {
   destination: string;
   name: string;

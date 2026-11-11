@@ -155,6 +155,8 @@ export function Console() {
               void tau.unblockPeer(destination).catch(() => undefined);
             }}
             onSelectPeer={selectPeer}
+            onCreateGroup={(name, members) => tau.createGroup(name, members)}
+            onDeleteGroup={(group) => tau.deleteGroup(group)}
           />
             <AllowlistSection
               allowlist={tau.allowlist}
