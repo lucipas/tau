@@ -1009,6 +1009,9 @@ def test_group_message_expired_is_dropped_unrecorded(tmp_path):
     assert received == []
     assert node.inbox.list_messages() == []
     assert node.mailbox.is_seen("gm-expired") is False
+    # And it must not pin the roster: an expired request has no
+    # business adding an unseen group.
+    assert node.groups.get(group_id) is None
 
 
 def test_group_message_stores_expiry(tmp_path):
@@ -1580,6 +1583,67 @@ def test_send_group_message_carries_expiry_to_legs_and_queue(tmp_path):
     assert queued[0].expires_at == expires_at
 
 
+def test_send_group_message_expired_leg_is_not_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        if peer.hexhash == OTHER_HASH:
+            return {"ok": True, "expired": True}
+        raise AssertionError("only the reachable leg should be attempted")
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    result = node.send_group_message(
+        group, "vanish soon", expires_at=time.time() + 300
+    )
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    expired_leg = by_to[OTHER_HASH]
+    assert expired_leg.get("delivered") is not True
+    assert expired_leg["expired"] is True
+    assert "expired" in expired_leg["error"]
+    # The receiver never stored it, so no read receipt can ever
+    # verify: the send record is forgotten, like a refusal.
+    assert node.mailbox.sent_record(expired_leg["id"]) is None
+    assert by_to[THIRD_HASH]["queued"] is True
+
+
+def test_send_group_message_expired_duplicate_still_counts_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True, "duplicate": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = (  # type: ignore[method-assign]
+        lambda target, timeout=10.0: _stub_peer(OTHER_HASH, "bob")
+    )
+    result = node.send_group_message(
+        group, "vanish soon", expires_at=time.time() + 300
+    )
+    assert result["ok"] is True
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["delivered"] is True
+    # A duplicate the receiver already saw keeps its delivery
+    # confirmation: the message did reach the peer once.
+    assert (
+        node.mailbox.sent_record(by_to[OTHER_HASH]["id"]) is not None
+    )
+
+
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
@@ -1819,6 +1883,62 @@ def test_deliver_entry_keeps_group_message_expiry(tmp_path):
     # A retry must not silently extend the message: the re-encoded
     # payload carries the original deadline.
     assert seen[0][1]["expires_at"] == expires_at
+
+
+def test_deliver_entry_drops_expired_group_message(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="too late",
+        expires_at=time.time() + 300,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is False
+    # Terminal outcome: the entry leaves the outbox (a retry would be
+    # dropped the same way) and is never reported delivered.
+    assert node.mailbox.get_outbox(entry.id) is None
+    assert entry.id not in node._delivered_ids
+
+
+def test_deliver_entry_counts_expired_duplicate_group_message_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="already there",
+        expires_at=time.time() + 300,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True, "duplicate": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
+    assert node.mailbox.get_outbox(entry.id) is None
+    assert entry.id in node._delivered_ids
 
 
 # -- CLI ---------------------------------------------------------------------

@@ -1545,6 +1545,9 @@ class TauNode:
         # A delayed group request past the sender's deadline is dropped
         # before the roster is pinned: an expired request must not add an
         # unseen group or replace a saved roster, and it is never shown.
+        # The duplicate flag is still reported: a retry of a message
+        # already seen counts as delivered on the sender's side, even
+        # though the deadline has since passed.
         message_id = message.get("id")
         expires_at = message.get("expires_at")
         if expires_at is not None and expires_at <= received_at:
@@ -1559,7 +1562,7 @@ class TauNode:
                 server=self.name,
                 node=self.destination_hexhash,
                 group=message["group"],
-                duplicate=False,
+                duplicate=bool(message_id and self.mailbox.is_seen(message_id)),
                 expired=True,
             )
 
@@ -2332,23 +2335,35 @@ class TauNode:
                 timeout,
                 deadline=deadline,
             )
-            if response.get("expired"):
+            # A response is a dict; a stubbed request can return None,
+            # so guard the lookup.  Scoped to group legs: the direct
+            # message path keeps its established handling, where the
+            # CLI reports the receiver's expired note.
+            if (
+                entry.group_id is not None
+                and isinstance(response, dict)
+                and response.get("expired")
+                and not response.get("duplicate")
+            ):
                 # The receiver dropped the copy because the deadline passed
-                # in flight: this is not a confirmed delivery. The entry
-                # stays queued until the next prune removes it.
+                # in flight: this is not a confirmed delivery, and no
+                # retry can succeed — the receiver will drop it again —
+                # so the entry leaves the outbox now instead of lingering
+                # until the next prune.  A duplicate the receiver already
+                # saw still counts as delivered below.
                 log.info(
-                    "Queued message %s expired before %s took it",
+                    "Dropping queued group message %s: receiver dropped "
+                    "it past its expiry",
                     entry.id,
-                    peer.hexhash,
                 )
                 try:
-                    self.mailbox.record_attempt(
-                        entry.id, error="expired", timeout=_remaining(deadline)
+                    self.mailbox.remove_outbox(
+                        entry.id, timeout=_remaining(deadline)
                     )
                 except TimeoutError:
-                    log.debug(
-                        "Could not record expired attempt for %s: "
-                        "mailbox lock busy",
+                    log.warning(
+                        "Expired queued message %s could not leave the "
+                        "outbox; the mailbox lock stayed busy",
                         entry.id,
                     )
                 return False
@@ -3517,18 +3532,21 @@ class TauNode:
                     _remaining(deadline) or 0.0,
                     deadline=deadline,
                 )
-                if response.get("expired"):
+                if response.get("expired") and not response.get("duplicate"):
                     # The receiver dropped the copy: the deadline passed
                     # while the request was in flight. That is not a
                     # delivery, and a queued retry would be dropped the
-                    # same way, so the leg fails here.
+                    # same way, so the leg fails here.  A duplicate the
+                    # receiver already saw still counts as delivered.
                     self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
                             "to_name": peer.display_name,
                             "ok": False,
-                            "error": "expired",
+                            "expired": True,
+                            "error": "expired: the receiver dropped it — "
+                            "past its expiry",
                             "id": message_id,
                         }
                     )
