@@ -795,6 +795,9 @@ def test_cli_messages_sent_shows_read_state(tmp_path, capsys):
     box.record_sent("msg-1", to=b"\xaa" * 16, text="hello alice", sent_at=100.0)
     box.record_sent("msg-2", to=b"\xaa" * 16, text="hello again", sent_at=200.0)
     box.record_read("msg-1", 150.0, reader_hash=(b"\xaa" * 16).hex())
+    # msg-2 was delivered (but not read): delivery confirmation is what
+    # separates "delivered" from "unknown" in the sent-messages display.
+    box.record_delivered("msg-2", now=250.0)
     box.enqueue(to=b"\xaa" * 16, text="still waiting", message_id="msg-3")
     # A queued message is recorded as sent when it is queued (as
     # TauNode.send_message does); the direct enqueue above does not.
@@ -954,6 +957,11 @@ def test_bridge_mark_displayed_read_sends_once(tmp_path):
     while time.time() < deadline and not sent:
         time.sleep(0.05)
     assert sent == [("bb" * 16, ["msg-1"])]
+    # The receipt stamp is written by the sender thread after
+    # send_read_receipts returns, so wait for it instead of racing it.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and node.inbox.unreceipted():
+        time.sleep(0.05)
     assert node.inbox.unreceipted() == []
 
     # A second display does not re-send.

@@ -11,7 +11,7 @@ import pytest
 import RNS
 
 from tau import cli
-from tau.config import TauConfig
+from tau.config import TauConfig, write_node_metadata
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
 from tau.lxmf import lxmf_delivery_hash
@@ -40,6 +40,10 @@ def test_parser_send_arguments():
     assert args.message == "hello world"
     assert args.timeout == 20.0
     assert args.expire is None
+    assert args.kind is None
+
+    kinded = parser.parse_args(["send", "--to", "alice", "--kind", "ping", "hi"])
+    assert kinded.kind == "ping"
 
     ephemeral = parser.parse_args(
         ["send", "--to", "alice", "--expire", "1h", "vanish soon"]
@@ -136,6 +140,10 @@ class _FakeSendNode:
                 text=text,
                 message_id=f"{len(self.calls):032x}",
             )
+            # The real node records the send when it queues (see
+            # TauNode.send_message), so the sent record exists for the
+            # queued-to-delivered flip to confirm against.
+            self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
             return {
                 "ok": True,
                 "queued": True,
@@ -148,6 +156,8 @@ class _FakeSendNode:
         self.flush_calls.append(kwargs)
         if _FakeSendNode.deliver_on_flush:
             for entry in self.mailbox.outbox_list():
+                # The real node records delivery before leaving the outbox.
+                self.mailbox.record_delivered(entry.id)
                 self.mailbox.remove_outbox(entry.id)
 
 
@@ -1037,11 +1047,297 @@ def test_id_import_refuses_when_node_serving(tmp_path, capsys):
     assert "already serving" in capsys.readouterr().err
 
 
+def test_parser_id_rename_subcommand():
+    parser = cli.build_parser()
+    args = parser.parse_args(["id", "rename", "bob"])
+    assert args.func is cli.cmd_id_rename
+    assert args.new_name == "bob"
+
+
+def test_id_rename_end_to_end(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    destination = _id_destination(node, capsys)
+    capsys.readouterr()
+
+    code = cli.main(["id", "rename", "bob", "--data-dir", str(node), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "name": "bob",
+        "previous_name": "alice",
+        "changed": True,
+        "destination": destination,
+    }
+
+    assert cli.main(["id", "--data-dir", str(node), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "bob"
+    assert _id_destination(node, capsys) == destination
+    assert json.loads((node / "node.json").read_text())["name"] == "bob"
+
+
+def test_id_rename_text_output_collapses_whitespace(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "  bob   smith  ", "--data-dir", str(node)])
+    assert code == 0
+    assert 'Renamed node "alice" to "bob smith".' in capsys.readouterr().out
+
+
+def test_id_rename_same_name_is_noop(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "alice", "--data-dir", str(node), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["changed"] is False
+    assert payload["name"] == "alice"
+    assert payload["previous_name"] == "alice"
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_id_rename_rejects_empty_name(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "   ", "--data-dir", str(node)])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_id_rename_rejects_control_only_name(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    code = cli.main(["id", "rename", "\x01\x02", "--data-dir", str(node)])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_id_rename_refuses_without_identity(tmp_path, capsys):
+    code = cli.main(["id", "rename", "bob", "--data-dir", str(tmp_path / "fresh")])
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
+
+
+def test_id_rename_refuses_while_serving(tmp_path, capsys):
+    node = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    holder = InstanceLock(config.instance_lock_path, config.data_dir)
+    holder.acquire()
+    try:
+        code = cli.main(["id", "rename", "bob", "--data-dir", str(node)])
+    finally:
+        holder.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert json.loads((node / "node.json").read_text())["name"] == "alice"
+
+
+def test_refresh_served_name_picks_up_rename(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "bob")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="alice", announce=lambda: announced.append(True))
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=False)
+    assert node.name == "bob"
+    assert announced == [True]
+
+
+def test_refresh_served_name_sanitises_hand_edited_name(tmp_path):
+    node_dir = tmp_path / "node"
+    node_dir.mkdir()
+    (node_dir / "node.json").write_text(
+        json.dumps({"name": "  bob\x01  ", "protocol": "tau"}), encoding="utf-8"
+    )
+    config = TauConfig.resolve(data_dir=node_dir)
+    node = SimpleNamespace(name="alice", announce=lambda: None)
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=True)
+    assert node.name == "bob"
+
+
+def test_refresh_served_name_respects_name_override(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "bob")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="carol", announce=lambda: announced.append(True))
+    cli._refresh_served_name(
+        config, node, SimpleNamespace(name="carol"), no_announce=False
+    )
+    assert node.name == "carol"
+    assert announced == []
+
+
+def test_refresh_served_name_noop_without_change(tmp_path):
+    node_dir = tmp_path / "node"
+    write_node_metadata(node_dir, "alice")
+    config = TauConfig.resolve(data_dir=node_dir)
+    announced = []
+    node = SimpleNamespace(name="alice", announce=lambda: announced.append(True))
+    cli._refresh_served_name(config, node, SimpleNamespace(), no_announce=False)
+    assert node.name == "alice"
+    assert announced == []
+
+
 def test_peers_on_empty_registry(tmp_path, capsys):
     code = cli.main(["peers", "--data-dir", str(tmp_path / "node")])
     assert code == 0
     assert "No peers known" in capsys.readouterr().out
 
+
+# -- peers show ---------------------------------------------------------------
+
+def _seed_peer_show(tmp_path):
+    """One peer with inbox messages, a queued message and a held envelope."""
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        peer_hash,
+        identity.get_public_key(),
+        name="alice",
+        hops=2,
+        caps=("mail", "tan"),
+        now=1000.0,
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    for index, text in enumerate(("first hello", "second hello")):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": peer_hash.hex(),
+                "text": text,
+                "sent_at": 10.0 + index,
+                "received_at": 20.0 + index,
+                "id": f"m-{index + 1}",
+            }
+        )
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=peer_hash, text="queued hello", to_name="alice", now=1000.0)
+    box.hold(
+        to=peer_hash,
+        blob=b"sealed-bytes",
+        message_id="held-1",
+        expires_at=time.time() + 3600,
+    )
+    return data_dir, identity, peer_hash
+
+
+def test_parser_peers_show_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "show", "alice"])
+    assert args.command == "peers"
+    assert args.peers_command == "show"
+    assert args.target == "alice"
+    assert args.func is cli.cmd_peers_show
+
+    plain = parser.parse_args(["peers"])
+    assert plain.peers_command is None
+    assert plain.func is cli.cmd_peers
+
+
+def test_peers_show_by_name(tmp_path, capsys):
+    data_dir, identity, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert peer_hash.hex() in out
+    assert lxmf_delivery_hash(identity).hex() in out
+    assert "first seen:" in out
+    assert "last seen:" in out
+    assert "hops:         2" in out
+    assert "protocol:     1" in out
+    assert "caps:         mail, tan" in out
+    assert "via exchange: no" in out
+    assert "queued mail:  1 message(s) waiting for this peer" in out
+    assert "held mail:    1 sealed message(s) held for this peer" in out
+    assert "received:     2 message(s) from this peer in the inbox" in out
+
+
+def test_peers_show_by_hash_prefix_and_full_hash(tmp_path, capsys):
+    data_dir, _, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(
+        ["peers", "show", peer_hash.hex()[:8], "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "show", peer_hash.hex(), "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+
+def test_peers_show_json(tmp_path, capsys):
+    data_dir, identity, peer_hash = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "alice"
+    assert payload["destination"] == peer_hash.hex()
+    assert payload["lxmf"] == lxmf_delivery_hash(identity).hex()
+    assert payload["public_key"] == identity.get_public_key().hex()
+    assert payload["first_seen"] == 1000.0
+    assert payload["last_seen"] == 1000.0
+    assert payload["hops"] == 2
+    assert payload["protocol"] == 1
+    assert payload["caps"] == ["mail", "tan"]
+    assert payload["via_exchange"] is False
+    assert payload["queued"] == 1
+    assert payload["held"] == 1
+    assert payload["received"] == 2
+
+
+def test_peers_show_unknown_peer(tmp_path, capsys):
+    data_dir, _, _ = _seed_peer_show(tmp_path)
+    code = cli.main(["peers", "show", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
+def test_peers_show_ambiguous_name(tmp_path, capsys):
+    data_dir, _, first_hash = _seed_peer_show(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    registry = PeerRegistry(config.peers_path)
+    other = RNS.Identity()
+    registry.upsert(
+        destination_hash(other), other.get_public_key(), name="alice", now=1000.0
+    )
+    registry.save()
+    code = cli.main(["peers", "show", "alice", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "use a destination hash" in capsys.readouterr().err
+    # A full hash still resolves unambiguously.
+    code = cli.main(
+        ["peers", "show", first_hash.hex(), "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert first_hash.hex() in capsys.readouterr().out
+
+
+def test_peers_show_via_exchange(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="owner")
+    source = PeerRegistry(config.peers_path)
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    peer = source.upsert(peer_hash, identity.get_public_key(), name="carol")
+    registry = PeerRegistry(config.peers_path)
+    merged = registry.merge_exchanged([peer.exchange_dict()])
+    assert merged["added"] == 1
+    registry.save()
+    code = cli.main(["peers", "show", "carol", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "via exchange: yes — never heard directly" in out
+    assert "queued mail:  0 message(s)" in out
+    assert "received:     0 message(s)" in out
 
 def _init_and_seed_peer(tmp_path, peer_name="alice", capsys=None):
     """Init a node and register one peer built from a real identity."""
@@ -1381,10 +1677,15 @@ def test_parser_messages_arguments():
     assert args.command == "messages"
     assert args.peer == "alice"
     assert args.limit == 5
+    assert args.kind is None
+
+    kinded = parser.parse_args(["messages", "--kind", "ping"])
+    assert kinded.kind == "ping"
 
     defaults = parser.parse_args(["messages"])
     assert defaults.peer is None
     assert defaults.limit == 30
+    assert defaults.kind is None
     assert defaults.search is None
     assert defaults.sent is False
 
@@ -1436,6 +1737,40 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "first hello" in out
     assert out.index("second hello") < out.index("first hello")
     assert "alice" in out
+
+
+def test_messages_kind_filter_and_tag(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "are you there?",
+            "kind": "ping",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-3",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "ping"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "are you there?" in out
+    assert "[ping]" in out
+    assert "second hello" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    kinds = {item["id"]: item["kind"] for item in payload["messages"]}
+    assert kinds == {"m-3": "ping", "m-2": "chat", "m-1": "chat"}
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "has space"])
+    assert code == 1
+    assert "message kind" in capsys.readouterr().err
 
 
 def test_messages_json_and_peer_filter(tmp_path, capsys):
@@ -2368,6 +2703,140 @@ def _seed_retry_outbox(data_dir):
     return config, box, first, second
 
 
+def test_parser_peers_forget_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "forget", "alice"])
+    assert args.command == "peers"
+    assert args.peers_command == "forget"
+    assert args.target == "alice"
+    assert args.func is cli.cmd_peers_forget
+
+    listing = parser.parse_args(["peers", "--max-age", "1"])
+    assert listing.func is cli.cmd_peers
+
+
+def _seed_forget_peers(data_dir):
+    from tau.config import TauConfig
+    from tau.peers import PeerRegistry
+
+    config = TauConfig.resolve(data_dir=data_dir)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(b"\xbb" * 16, b"\x02" * 64, name="bob", now=100.0)
+    registry.upsert(b"\xcc" * 16, b"\x03" * 64, name="carol", now=100.0)
+    registry.save()
+    return config
+
+
+def test_peers_forget_removes_peer_and_keeps_others(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Forgot bob" in capsys.readouterr().out
+    registry = PeerRegistry(config.peers_path)
+    assert registry.get("bob") is None
+    assert registry.get("carol") is not None
+
+
+def test_peers_forget_json_and_prefix(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+
+    code = cli.main(
+        ["peers", "forget", "bb" * 4, "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["forgotten"]["name"] == "bob"
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
+def test_peers_forget_unknown_peer(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    _seed_forget_peers(data_dir)
+
+    code = cli.main(["peers", "forget", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "no peer matches" in capsys.readouterr().err
+
+
+def test_peers_forget_refuses_queued_mail(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(to=b"\xbb" * 16, text="for bob", message_id="aa" + "11" * 15)
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "queued" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_refuses_pending_acks(tmp_path, capsys):
+    from tau.mailbox import Mailbox
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    box = Mailbox(config.mailbox_path)
+    box.add_pending_acks("bb" * 16, ["aa" + "11" * 15])
+
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "acknowledgements" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_refuses_while_serving(tmp_path, capsys):
+    from tau.node import InstanceLock
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    finally:
+        lock.release()
+    assert code == 1
+    assert "already serving" in capsys.readouterr().err
+    assert PeerRegistry(config.peers_path).get("bob") is not None
+
+
+def test_peers_forget_holds_mailbox_transaction(tmp_path, capsys, monkeypatch):
+    import fcntl
+
+    data_dir = tmp_path / "node"
+    config = _seed_forget_peers(data_dir)
+    lock_path = config.mailbox_path.with_name(config.mailbox_path.name + ".lock")
+    blocked = {}
+
+    real_save = PeerRegistry.save
+
+    def save_and_probe(self):
+        # A non-blocking flock on the mailbox lock file must fail while
+        # forget holds the mailbox transaction across the registry save:
+        # a concurrent send could not enqueue between the safety check
+        # and the removal.
+        with open(lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked["held"] = True
+            else:
+                blocked["held"] = False
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return real_save(self)
+
+    monkeypatch.setattr(PeerRegistry, "save", save_and_probe)
+    code = cli.main(["peers", "forget", "bob", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert blocked.get("held") is True
+    assert PeerRegistry(config.peers_path).get("bob") is None
+
+
 def test_outbox_retry_all_ignores_backoff(tmp_path, capsys, monkeypatch):
     from tau.mailbox import Mailbox
 
@@ -2630,7 +3099,10 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False, lxmf=False):
+        def start(
+            self, *, announce=True, exclusive=False, lxmf=False,
+            lxmf_propagation=False
+        ):
             events.append("node.start")
 
         def stop(self):
@@ -2669,6 +3141,134 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
         cli.cmd_serve(args)
 
     assert events == ["node.start", "bridge.start", "node.stop"]
+
+
+# -- peers alias ------------------------------------------------------------
+
+
+def _seed_alias_peer(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = RNS.Identity()
+    peer_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(peer_hash, identity.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    return data_dir, peer_hash
+
+
+def test_peers_alias_sets_lists_and_unaliases(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", peer_hash.hex(), "my-laptop",
+         "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "alias 'my-laptop' set for alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "my-laptop (alice)" in capsys.readouterr().out
+
+    code = cli.main(
+        ["peers", "unalias", "my-laptop", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "removed alias for alice" in capsys.readouterr().out
+
+    code = cli.main(["peers", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "my-laptop" not in capsys.readouterr().out
+
+
+def test_peers_alias_json_includes_alias(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", "alice", "my-laptop",
+         "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alias"] == "my-laptop"
+    assert payload["name"] == "alice"
+
+
+def test_peers_alias_unknown_peer_and_duplicates(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    code = cli.main(
+        ["peers", "alias", "nobody", "spare", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    assert cli.main(
+        ["peers", "alias", peer_hash.hex(), "spare",
+         "--data-dir", str(data_dir)]
+    ) == 0
+    capsys.readouterr()
+
+    identity = RNS.Identity()
+    other_hash = destination_hash(identity)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(other_hash, identity.get_public_key(), name="carol", now=200.0)
+    registry.save()
+
+    code = cli.main(
+        ["peers", "alias", "carol", "SPARE", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "already used" in capsys.readouterr().err
+
+
+def test_parser_peers_alias_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["peers", "alias", "bob", "laptop"])
+    assert args.command == "peers"
+    assert args.peers_command == "alias"
+    assert args.peer == "bob"
+    assert args.alias == "laptop"
+
+    args = parser.parse_args(["peers", "unalias", "laptop"])
+    assert args.peers_command == "unalias"
+    assert args.peer == "laptop"
+
+    plain = parser.parse_args(["peers"])
+    assert plain.command == "peers"
+    assert plain.peers_command is None
+
+
+def test_allowlist_add_ignores_aliases_and_lists_asserted_names(tmp_path, capsys):
+    data_dir, peer_hash = _seed_alias_peer(tmp_path)
+    # A second peer aliased "alice" must not be the one allow-listed when
+    # the operator names "alice".
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    identity = RNS.Identity()
+    other_hash = destination_hash(identity)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(other_hash, identity.get_public_key(), name="carol", now=200.0)
+    registry.set_alias(other_hash, "alice")
+    registry.save()
+
+    code = cli.main(["allowlist", "add", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        ["allowlist", "list", "--data-dir", str(data_dir), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        peer_hash.hex()
+    ]
+    assert [entry["name"] for entry in payload["entries"]] == ["alice"]
+
+    code = cli.main(["allowlist", "list", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"{peer_hash.hex()} (alice)" in out
+    assert "carol" not in out
 
 
 def test_parser_messages_export_import_arguments():

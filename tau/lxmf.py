@@ -84,6 +84,8 @@ def start_lxmf_router(
     data_dir: Path,
     *,
     display_name: Optional[str] = None,
+    propagation: bool = False,
+    delivery_callback: Optional[Any] = None,
 ) -> Any:
     """Start an ``LXMRouter`` on *identity* and register its delivery identity.
 
@@ -91,6 +93,16 @@ def start_lxmf_router(
     to the storage path it is given).  The router listens on the same
     delivery destination :func:`lxmf_delivery_hash` derives, and that
     destination is announced so other LXMF clients can find a path to it.
+
+    With ``propagation`` on, the router also serves as an LXMF
+    propagation node (see :func:`enable_lxmf_propagation`): it holds
+    mail for offline recipients until they fetch it, with the
+    message store capped so it cannot fill the filesystem.
+
+    When *delivery_callback* is given it is registered with
+    ``router.register_delivery_callback`` and invoked with each
+    ``LXMessage`` the router delivers; the router calls it on its own
+    thread, so the callback must be thread-safe and must never raise.
 
     Raises :class:`LXMFError` when the ``lxmf`` package is not installed,
     when called off the main thread (LXMRouter installs signal handlers),
@@ -102,13 +114,7 @@ def start_lxmf_router(
             "the LXMF router must start on the main thread "
             "(LXMRouter installs signal handlers)"
         )
-    try:
-        lxmf_module = importlib.import_module("LXMF")
-    except ImportError as exc:
-        raise LXMFError(
-            "LXMF is not installed; install it with "
-            f"{LXMF_INSTALL_HINT}"
-        ) from exc
+    lxmf_module = _import_lxmf()
     previous = _signal_handlers()
     router = lxmf_module.LXMRouter(identity=identity, storagepath=str(data_dir))
     installed = _signal_handlers()
@@ -120,11 +126,44 @@ def start_lxmf_router(
         )
         if delivery is None:
             raise LXMFError("could not register the LXMF delivery identity")
+        if propagation:
+            enable_lxmf_propagation(router)
+        if delivery_callback is not None:
+            router.register_delivery_callback(delivery_callback)
         router.announce(delivery.hash)
     except BaseException:
         _shutdown_router(router)
         raise
     return router
+
+
+def enable_lxmf_propagation(
+    router: Any,
+    *,
+    message_storage_limit_mb: int = 256,
+) -> None:
+    """Enable propagation on a running LXMF router.
+
+    ``LXMRouter.enable_propagation`` indexes the message store,
+    registers the propagation request handlers and announces the
+    propagation destination, so LXMF clients can store messages for
+    offline recipients on this node.  Before enabling it, the message
+    store is capped at ``message_storage_limit_mb`` megabytes: the
+    router's default is unlimited, so an opt-in propagation node under
+    sustained traffic could otherwise fill its filesystem and stop
+    tau persisting state.  Note the cap is enforced by LXMF's periodic
+    message-store cleanup, not at admission — a burst of validly
+    stamped messages can overshoot it between cleanups.  The admission
+    path lives in the upstream router, so tau cannot enforce it
+    without patching LXMF internals; the cap still bounds
+    steady-state usage.  Raises :class:`LXMFError` when propagation
+    cannot be enabled.
+    """
+    try:
+        router.set_message_storage_limit(megabytes=message_storage_limit_mb)
+        router.enable_propagation()
+    except Exception as exc:
+        raise LXMFError(f"could not enable LXMF propagation: {exc}") from exc
 
 
 def stop_lxmf_router(router: Optional[Any]) -> None:
@@ -189,3 +228,118 @@ def lxmf_router_delivery_hash(router: Optional[Any]) -> Optional[bytes]:
     if not destinations:
         return None
     return next(iter(destinations))
+
+
+def lxmf_router_propagation_hash(router: Optional[Any]) -> Optional[bytes]:
+    """Return the propagation destination hash a router serves on.
+
+    Returns ``None`` when the router is ``None`` or propagation is not
+    enabled.  The router always constructs a propagation destination,
+    so the ``propagation_node`` flag is what says this node actually
+    offers the role — a router that only receives LXMF mail reports
+    no propagation hash.
+    """
+    if router is None:
+        return None
+    if not getattr(router, "propagation_node", False):
+        return None
+    destination = getattr(router, "propagation_destination", None)
+    if destination is None:
+        return None
+    return getattr(destination, "hash", None)
+
+
+# -- sending ---------------------------------------------------------------
+
+def _import_lxmf() -> Any:
+    """Import the ``lxmf`` package or raise :class:`LXMFError`."""
+    try:
+        return importlib.import_module("LXMF")
+    except ImportError as exc:
+        raise LXMFError(
+            "LXMF is not installed; install it with "
+            f"{LXMF_INSTALL_HINT}"
+        ) from exc
+
+
+def _lxmf_destination(identity: RNS.Identity) -> Any:
+    """Return the LXMF delivery ``RNS.Destination`` for *identity*."""
+    return RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        LXMF_APP_NAME,
+        LXMF_DELIVERY_ASPECT,
+    )
+
+
+def build_lxmf_message(
+    source_identity: RNS.Identity,
+    destination_public_key: bytes,
+    text: str,
+) -> Any:
+    """Build an ``LXMessage`` carrying *text* to a peer's LXMF address.
+
+    The destination is the peer's LXMF delivery destination, derived
+    from their public key, and the source is this node's own delivery
+    destination, so the receiver can attribute the message to a known
+    peer exactly like an incoming delivery.  Raises
+    :class:`LXMFError` when the ``lxmf`` package is not installed
+    and :class:`ValueError` for a key that cannot be loaded.
+    """
+    lxmf_module = _import_lxmf()
+    destination = _lxmf_destination(_identity_for_key(destination_public_key))
+    source = _lxmf_destination(source_identity)
+    return lxmf_module.LXMessage(destination, source, content=text)
+
+
+def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:
+    """Hand *message* to *router* and wait for delivery confirmation.
+
+    The router owns retries once the message is handed over, so the
+    caller waits at most *timeout* seconds for the delivery callback
+    (fired when the peer receives the message, or when a propagation
+    node accepts it) or the failed callback.  On timeout the router's
+    copy is cancelled, so it cannot deliver late after the caller has
+    kept the message queued and sends a fresh copy on the next sweep.
+    Returns True only on confirmation.  Raises :class:`LXMFError`
+    when the router refuses the message.
+    """
+    if router is None:
+        raise LXMFError("no LXMF router running")
+    outcome: dict = {}
+    done = threading.Event()
+    lock = threading.Lock()
+
+    # The first settlement wins: a callback and the timeout path race
+    # under the lock, so a confirmation that lands at the timeout
+    # boundary is either counted or ignored, never half-applied.
+    def _settle(ok: bool) -> None:
+        with lock:
+            if "ok" not in outcome:
+                outcome["ok"] = ok
+                done.set()
+
+    def _delivered(_message: Any) -> None:
+        _settle(True)
+
+    def _failed(_message: Any) -> None:
+        _settle(False)
+
+    message.register_delivery_callback(_delivered)
+    message.register_failed_callback(_failed)
+    try:
+        router.handle_outbound(message)
+    except Exception as exc:
+        raise LXMFError(
+            f"could not hand message to the LXMF router: {exc}"
+        ) from exc
+    if not done.wait(timeout):
+        _settle(False)
+    if outcome["ok"]:
+        return True
+    try:
+        router.cancel_outbound(getattr(message, "message_id", None))
+    except Exception:  # pragma: no cover - defensive
+        log.debug("Could not cancel unconfirmed LXMF message", exc_info=True)
+    return False
