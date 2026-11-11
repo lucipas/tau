@@ -3616,16 +3616,18 @@ class TauNode:
         failed leg, not a queued one.  Each leg is bounded by
         ``timeout`` — the per-leg deadline discipline from
         ``send_group_message``, so one slow member cannot consume
-        another member's window.  Returns a per-member result list:
+        another member's window.  The file is read once up front, so
+        every leg carries the same bytes even if the file changes
+        mid-fan-out.  Returns a per-member result list:
         ``delivered`` (with the transfer id, name, size and sha256)
         or an ``error`` for that leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
-        # Validate the file once, before any leg is sent, so a missing
-        # or oversized file fails cleanly up front rather than
-        # aborting the fan-out partway through.
-        _read_file_payload(path)
+        # Read the file once, before any leg is sent, so a missing or
+        # oversized file fails cleanly up front rather than aborting
+        # the fan-out partway through.
+        data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         results: List[Dict[str, Any]] = []
@@ -3650,11 +3652,14 @@ class TauNode:
                 else None
             )
             try:
-                sent = self.send_file(
+                sent = self._send_file_bytes(
                     member,
-                    path,
+                    data,
+                    name,
+                    digest,
                     timeout=budget,
                     discover_timeout=leg_discover,
+                    deadline=deadline,
                 )
                 results.append(
                     {
@@ -3695,6 +3700,7 @@ class TauNode:
         timeout: float = _FILE_TRANSFER_TIMEOUT,
         discover_timeout: Optional[float] = None,
         progress_callback: Optional[Callable[[float], None]] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a small file to a peer over an RNS Resource.
 
@@ -3704,16 +3710,53 @@ class TauNode:
         links only in v1 (no store-and-forward).  Once accepted, the
         bytes travel as a Resource on the same link; the receiver
         verifies the hash before writing anything to disk.
+        ``deadline`` is a monotonic cutoff for the whole transfer:
+        every stage (discovery, link, offer, resource) is capped by
+        the time left before it, instead of each taking the full
+        ``timeout`` in turn.
         """
         data, name, digest = _read_file_payload(path)
+        return self._send_file_bytes(
+            target,
+            data,
+            name,
+            digest,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+            progress_callback=progress_callback,
+            deadline=deadline,
+        )
+
+    def _send_file_bytes(
+        self,
+        target: Union[str, bytes, Peer],
+        data: bytes,
+        name: str,
+        digest: str,
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send already-read file bytes to a peer over an RNS Resource.
+
+        The shared transfer body for ``send_file`` and
+        ``send_group_file``: the fan-out reads the file once so every
+        leg carries identical bytes.  ``deadline`` bounds the whole
+        transfer — see ``send_file``.
+        """
         if self.identity is None:
             raise NodeError("node has not been started")
         transfer_id = generate_message_id()
+        discover = (
+            discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0)
+        )
         peer = self.resolve_peer(
             target,
-            timeout=discover_timeout
-            if discover_timeout is not None
-            else min(timeout, 10.0),
+            timeout=_budget(discover, deadline),
         )
         # The offer names its recipient, so a captured offer cannot be
         # replayed to a third node: address it to this peer.
@@ -3725,12 +3768,14 @@ class TauNode:
             size=len(data),
             sha256=digest,
         )
-        link = self._open_link(peer, min(timeout, 30.0))
+        link = self._open_link(peer, min(timeout, 30.0), deadline=deadline)
         try:
             # The offer request runs on this link, and the Resource
             # follows on the same link — the receiver's resource
             # callback matches the advertisement against this offer.
-            self._request_on_link(link, REQUEST_FILE, offer, 20.0)
+            self._request_on_link(
+                link, REQUEST_FILE, offer, 20.0, deadline=deadline
+            )
             concluded = threading.Event()
             state: Dict[str, Any] = {}
 
@@ -3758,7 +3803,13 @@ class TauNode:
             # advertise by default, and a second advertise job
             # corrupts the transfer's timing and cancels it.
             resource.advertise()
-            if not concluded.wait(timeout):
+            # The resource wait is capped by the deadline, not the
+            # full timeout again: the stages above already consumed
+            # part of the leg's budget.
+            wait_for = (
+                _remaining(deadline) if deadline is not None else timeout
+            )
+            if not concluded.wait(wait_for):
                 try:
                     resource.cancel()
                 except Exception:  # pragma: no cover - defensive
