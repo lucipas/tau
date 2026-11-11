@@ -470,10 +470,8 @@ and decrypt its traffic, so keep it private.
 
 To back up identity, peer registry, queued outbox
 mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
-and the Reticulum config, use `tau backup`:
-
-The backup does not include `groups.json`, `blocklist.json`, or received
-files in `files/`. Back up these paths separately if needed.
+groups, the block list, received files, and the Reticulum config, use
+`tau backup`:
 
 ```bash
 tau backup ~/tau-backup.tar.gz
