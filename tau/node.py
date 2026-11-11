@@ -3622,10 +3622,10 @@ class TauNode:
         """
         if isinstance(group, str):
             group = self.groups.find(group)
-        # Validate the file once, before any leg is sent, so a missing
-        # or oversized file fails cleanly up front rather than
-        # aborting the fan-out partway through.
-        _read_file_payload(path)
+        # Validate and read the file once, before any leg is sent, so a
+        # missing or oversized file fails cleanly up front and every leg
+        # carries the same bytes, even if the file changes mid-fan-out.
+        data, name, digest = _read_file_payload(path)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         results: List[Dict[str, Any]] = []
@@ -3650,9 +3650,11 @@ class TauNode:
                 else None
             )
             try:
-                sent = self.send_file(
+                sent = self._send_file_bytes(
                     member,
-                    path,
+                    data,
+                    name,
+                    digest,
                     timeout=budget,
                     discover_timeout=leg_discover,
                 )
@@ -3758,7 +3760,7 @@ class TauNode:
             # advertise by default, and a second advertise job
             # corrupts the transfer's timing and cancels it.
             resource.advertise()
-            if not concluded.wait(timeout):
+            if not concluded.wait(_remaining(deadline)):
                 try:
                     resource.cancel()
                 except Exception:  # pragma: no cover - defensive
@@ -4338,4 +4340,21 @@ class TauNode:
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+m exc
+        if decoded.get("ok") is not True:
+            error = decoded.get("error") or {}
+            message = error.get("message", "unknown error")
+            if error.get("code") == "not_allowed":
+                raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "unavailable":
+                # The block-list drops silently with this generic code;
+                # it is still the peer's explicit refusal, not transport.
+                raise PeerRefusedError(f"peer rejected the request: {message}")
+            if error.get("code") == "not_a_member":
+                raise NotAMemberError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
         return decoded

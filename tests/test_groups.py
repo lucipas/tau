@@ -1622,22 +1622,23 @@ def _stub_group_send_file(node, *, fail_for=()):
     """Replace ``send_file`` with a recorder; *fail_for* members raise."""
     calls = []
 
-    def fake_send_file(target, path, *, timeout=300.0, discover_timeout=None):
-        calls.append((target, str(path), timeout, discover_timeout))
+    def fake_send_file_bytes(
+        target, data, name, digest, *, timeout=300.0, discover_timeout=None
+    ):
+        calls.append((target, name, timeout, discover_timeout, data))
         member = target if isinstance(target, str) else target.hexhash
         if member in fail_for:
             raise NodeError("unreachable")
-        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         return {
             "ok": True,
             "id": f"{member[:8]}-transfer",
-            "name": Path(path).name,
-            "size": Path(path).stat().st_size,
+            "name": name,
+            "size": len(data),
             "sha256": digest,
             "to": member,
         }
 
-    node.send_file = fake_send_file  # type: ignore[method-assign]
+    node._send_file_bytes = fake_send_file_bytes  # type: ignore[method-assign]
     return calls
 
 
