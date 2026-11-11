@@ -35,6 +35,8 @@ default ruleset admits everything, matching Tan's original behaviour.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Union
@@ -179,8 +181,20 @@ def save_ruleset(path: Union[str, Path], ruleset: Ruleset) -> Path:
     """Persist *ruleset* to *path* as JSON and return the path."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(ruleset.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    text = json.dumps(ruleset.to_dict(), indent=2, sort_keys=True) + "\n"
+    # Write to a temp file and rename over the target so a concurrent
+    # reader never sees a partially written (and so unparseable) ruleset.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return target

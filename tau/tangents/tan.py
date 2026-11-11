@@ -1231,6 +1231,36 @@ def like_counts(
     return result
 
 
+def post_likers(
+    conn: sqlite3.Connection, target: str
+) -> List[Dict[str, Any]]:
+    """Return the likers of one post, newest like first.
+
+    Each entry is ``{"author": <hex>, "liked_at": <created_at>}``. Only
+    linked reactions count and the latest entry per reactor wins, so an
+    ``unlike`` after a ``like`` removes that author. A target with no
+    reactions (or no stored post at all) yields an empty list.
+    """
+    clean = _require_hex(target, HASH_HEX_LENGTH, "target")
+    rows = conn.execute(
+        "SELECT author, kind, created_at FROM posts "
+        "WHERE kind IN ('like', 'unlike') AND linked = 1 AND target = ? "
+        "ORDER BY author, seq ASC",
+        (clean,),
+    ).fetchall()
+    latest: Dict[str, Tuple[str, float]] = {}
+    for row in rows:
+        # Rows arrive in chain order per reactor, so the last write wins.
+        latest[str(row["author"])] = (str(row["kind"]), float(row["created_at"]))
+    likers = [
+        {"author": author, "liked_at": liked_at}
+        for author, (kind, liked_at) in latest.items()
+        if kind == KIND_LIKE
+    ]
+    likers.sort(key=lambda entry: entry["liked_at"], reverse=True)
+    return likers
+
+
 def repost_counts(
     conn: sqlite3.Connection,
     targets: Sequence[str],
@@ -1570,6 +1600,7 @@ def annotate_quotes(
     *,
     muted_keywords: Optional[Sequence[str]] = None,
     exclude_authors: Optional[Set[str]] = None,
+    blocked_authors: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach a ``quoted`` original summary to quote entries, in place.
 
@@ -1582,7 +1613,12 @@ def annotate_quotes(
     is reported the same way, with its text blanked and ``muted`` set,
     so the muted content does not leak through the preview.  An
     original whose author is in *exclude_authors* (muted) is reported
-    as ``None`` so its name and text never surface.  Top-level posts
+    as ``None`` so its name and text never surface.  An original whose
+    author is in *blocked_authors* is reported with its text blanked,
+    its author and name redacted, and ``blocked`` set, so blocking an
+    author never leaks their words — or their name — through a quote
+    preview, the same protection :func:`annotate_replies` gives reply
+    snippets.  Top-level posts
     and replies get no ``quoted`` key.
 
     Parents are fetched in one query and their deletion status in a
@@ -1628,6 +1664,18 @@ def annotate_quotes(
             post["quoted"] = None
             continue
         is_deleted = (parent["hash"], parent["author"]) in deleted
+        if blocked_authors and parent["author"] in blocked_authors:
+            # Redact identity too: a blocked author's name and hash must
+            # not leak through a quote preview, as in annotate_replies.
+            post["quoted"] = {
+                "hash": parent["hash"],
+                "author": "",
+                "name": "",
+                "text": "",
+                "deleted": is_deleted,
+                "blocked": True,
+            }
+            continue
         is_muted = _text_matches_muted_keywords(
             str(parent.get("text") or ""), muted_pattern
         )
@@ -2260,6 +2308,7 @@ def timeline(
                     ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
+                    blocked_authors=blocked,
                 ),
                 viewer=viewer,
             ),
@@ -2319,6 +2368,7 @@ def timeline(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=blocked,
             ),
             viewer=viewer,
         ),
@@ -2399,6 +2449,7 @@ def author_timeline(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=blocked,
             ),
             viewer=viewer,
         ),
@@ -2417,8 +2468,15 @@ def top_posts(
     limit: int = 10,
     viewer: Optional[str] = None,
     ruleset: Optional[Ruleset] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the most-liked posts in the local store, best first.
+
+    Posts by *exclude_authors* (blocked) are dropped in the query, before
+    the limit is applied, so they never take up result slots.  A reply
+    to a blocked author's post keeps its parent preview redacted, as in
+    the timeline.  The exclusion is a single JSON parameter, so a large
+    block-list cannot exceed SQLite's bound-variable limit.
 
     When *ruleset* is given, kinds it hides are dropped before the limit
     is applied, so hidden entries never take up result slots.  If it
@@ -2451,12 +2509,18 @@ def top_posts(
     count = max(1, min(int(limit), MAX_TOP_POSTS))
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
     params: List[Any] = []
     where = f"linked = 1 AND kind IN ('post', 'reply') AND {_NOT_DELETED}"
     if silenced and author is None:
-        placeholders = ", ".join("?" for _ in silenced)
-        where += f" AND author NOT IN ({placeholders})"
-        params.extend(sorted(silenced))
+        # One JSON parameter instead of one placeholder per author, so a
+        # large mute list cannot exceed SQLite's bound-variable limit —
+        # the same pattern feed() uses.
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(silenced)))
+    if blocked:
+        where += " AND author NOT IN (SELECT value FROM json_each(?))"
+        params.append(json.dumps(sorted(blocked)))
     if author is not None:
         author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
         where += " AND author = ?"
@@ -2466,7 +2530,10 @@ def top_posts(
         "ORDER BY created_at DESC, hash DESC",
         params,
     ).fetchall()
-    candidates = without_muted_keywords(conn, _public_posts(rows), keywords)
+    # Edits first, so keyword muting and the ruleset see the text that
+    # is actually displayed.
+    candidates = annotate_edits(conn, _public_posts(rows))
+    candidates = without_muted_keywords(conn, candidates, keywords)
     if ruleset is not None:
         candidates = [
             post
@@ -2491,11 +2558,17 @@ def top_posts(
         # newest first, so keep that order and only attach ownership.
         for post in candidates:
             post["own"] = viewer is not None and post["author"] == viewer
-    return annotate_replies(
+    shown = annotate_replies(
         conn,
         candidates[:count],
         muted_keywords=keywords,
         exclude_authors=silenced,
+        blocked_authors=blocked,
+    )
+    return annotate_repost_counts(
+        conn,
+        annotate_quote_counts(conn, shown),
+        viewer=viewer,
     )
 
 
@@ -2695,6 +2768,7 @@ def thread(
                 ),
                 muted_keywords=keywords,
                 exclude_authors=silenced,
+                blocked_authors=excluded,
             ),
             viewer=viewer,
         )
@@ -2784,6 +2858,7 @@ def search_posts(
                     conn, annotate_reactions(conn, matches[:count], viewer=viewer)
                 ),
             ),
+            blocked_authors=excluded,
         ),
         viewer=viewer,
     )
@@ -2821,6 +2896,8 @@ def mentions(
     viewer: str,
     *,
     limit: int = DEFAULT_FEED_LIMIT,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return stored replies to the viewer's own posts, newest first.
 
@@ -2830,34 +2907,74 @@ def mentions(
     you wrote to your own post is not a mention of you.  The same
     hiding rules as the thread view apply: a reply its author deleted
     never appears, and neither does a reply to a post you deleted.
-    Unlinked replies never appear either.  Results carry the same like
-    annotations and ``reply_to`` parent summary as the timeline, and
-    the query reads only the local store: it makes no network requests.
+    Unlinked replies never appear either.  The console's hiding rules
+    apply as in :func:`timeline`: replies by muted or blocked authors
+    (``exclude_authors``) and replies matching a muted keyword never
+    appear, and ``exclude_all`` hides every mention — the display side
+    of a block-list that failed closed.  Pages are read until *limit*
+    visible mentions are collected or the store is exhausted.  Results
+    carry the same like annotations and ``reply_to`` parent summary as
+    the timeline, and the query reads only the local store: it makes
+    no network requests.
     """
     viewer = _require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer")
+    if exclude_all:
+        return []
     count = max(1, min(int(limit), MAX_MENTIONS_POSTS))
-    rows = conn.execute(
-        f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r "
-        "WHERE r.linked = 1 AND r.kind = 'reply' AND r.author != ? "
-        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
-        "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
-        "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
-        "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
-        "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
-        "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
-        "ORDER BY r.created_at DESC, r.hash DESC",
-        (viewer, viewer),
-    ).fetchall()
-    # A reply beneath a deleted ancestor is hidden with that subtree, as
-    # the thread view hides it, so filter on the ancestor chain before
-    # applying the limit to keep the requested count of visible mentions.
-    visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
-    rows = visible[:count]
+    silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
+    hidden = sorted(silenced | blocked)
+    keywords = _muted_keyword_list(conn)
+    author_clause = ""
+    if hidden:
+        # One JSON parameter instead of one placeholder per author,
+        # so a large mute/block list cannot exceed SQLite's
+        # bound-variable limit — the same pattern :func:`feed` uses.
+        author_clause = "AND r.author NOT IN (SELECT value FROM json_each(?)) "
+    kept: List[Dict[str, Any]] = []
+    cursor: Optional[Tuple[float, str]] = None
+    while len(kept) < count:
+        where = "r.linked = 1 AND r.kind = 'reply' AND r.author != ? " + author_clause
+        params: List[Any] = [viewer]
+        if hidden:
+            params.append(json.dumps(hidden))
+        if cursor is not None:
+            where += "AND (r.created_at < ? OR (r.created_at = ? AND r.hash < ?)) "
+            params.extend([cursor[0], cursor[0], cursor[1]])
+        where += (
+            "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+            "AND d.linked = 1 AND d.target = r.hash AND d.author = r.author) "
+            "AND EXISTS (SELECT 1 FROM posts AS p WHERE p.hash = r.target "
+            "AND p.linked = 1 AND p.kind IN ('post', 'reply') AND p.author = ? "
+            "AND NOT EXISTS (SELECT 1 FROM posts AS d WHERE d.kind = 'delete' "
+            "AND d.linked = 1 AND d.target = p.hash AND d.author = p.author)) "
+        )
+        params.append(viewer)
+        rows = conn.execute(
+            f"SELECT {', '.join(_POST_COLUMNS)} FROM posts AS r WHERE {where}"
+            "ORDER BY r.created_at DESC, r.hash DESC LIMIT ?",
+            [*params, MAX_FEED_POSTS],
+        ).fetchall()
+        if not rows:
+            break
+        # A reply beneath a deleted ancestor is hidden with that subtree, as
+        # the thread view hides it.  Hidden rows still advance the cursor so
+        # paging continues past them.
+        visible = [row for row in rows if not _hidden_under_deleted(conn, row)]
+        kept.extend(without_muted_keywords(conn, _public_posts(visible), keywords))
+        if len(rows) < MAX_FEED_POSTS:
+            break
+        last = rows[-1]
+        cursor = (float(last["created_at"]), str(last["hash"]))
+    posts = kept[:count]
     return annotate_replies(
         conn,
         annotate_edits(
-            conn, annotate_reactions(conn, _public_posts(rows), viewer=viewer)
+            conn, annotate_reactions(conn, posts, viewer=viewer)
         ),
+        muted_keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
     )
 
 
@@ -2914,11 +3031,14 @@ def suggest_authors(
     *,
     viewer: Optional[str] = None,
     limit: int = DEFAULT_SUGGEST_LIMIT,
+    exclude: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rank cached authors the viewer does not follow yet.
 
     Candidates are authors with at least one linked, non-deleted post or
-    reply in the local store, excluding followed authors and the viewer.
+    reply in the local store, excluding followed authors, the viewer, and
+    any authors in ``exclude`` (for example blocked authors). Excluded
+    authors are dropped before ``limit`` is applied.
     Each candidate scores ``SUGGEST_FOLLOWED_WEIGHT`` per distinct author
     the viewer follows who liked or replied to one of the candidate's
     posts or replies, plus one per like on the candidate's posts (so a
@@ -2928,6 +3048,8 @@ def suggest_authors(
     """
     followed = {record["author"]: record["name"] for record in following(conn)}
     excluded = set(followed)
+    if exclude is not None:
+        excluded.update(exclude)
     if viewer is not None:
         excluded.add(_require_hex(viewer, AUTHOR_HEX_LENGTH, "viewer"))
     limit = max(0, int(limit))
@@ -3464,6 +3586,38 @@ def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:
     }
 
 
+def author_stats_many(
+    conn: sqlite3.Connection, authors: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """:func:`author_stats` for many authors, using two grouped queries.
+
+    Returns the same per-author values :func:`author_stats` would, keyed
+    by author hash; authors with no cached posts get zero values.
+    """
+    clean = [_require_hex(author, AUTHOR_HEX_LENGTH, "author") for author in authors]
+    stats: Dict[str, Dict[str, Any]] = {
+        author: {"author": author, "posts": 0, "seq": 0, "last_post": 0.0}
+        for author in clean
+    }
+    if not clean:
+        return stats
+    placeholders = ",".join("?" for _ in clean)
+    for row in conn.execute(
+        "SELECT author, COUNT(*) AS posts, COALESCE(MAX(created_at), 0) AS last_post "
+        f"FROM posts WHERE linked = 1 AND kind = 'post' AND {_NOT_DELETED} "
+        f"AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])].update(
+            posts=int(row["posts"]), last_post=float(row["last_post"])
+        )
+    for row in conn.execute(
+        "SELECT author, COALESCE(MAX(seq), 0) AS seq FROM posts "
+        f"WHERE linked = 1 AND author IN ({placeholders}) GROUP BY author",
+        clean,
+    ).fetchall():
+        stats[str(row["author"])]["seq"] = int(row["seq"])
+    return stats
 def list_authors(
     conn: sqlite3.Connection, *, sort: str = "recent", limit: int = 50
 ) -> List[Dict[str, Any]]:
@@ -3846,6 +4000,7 @@ class TanApp:
         self._gossip_slots = threading.BoundedSemaphore(4)
         self._closed = False
         self._ruleset = ruleset
+        self._ruleset_lock = threading.Lock()
         self._ruleset_path = getattr(config, "tan_rules_path", None)
 
     @property
@@ -3855,16 +4010,30 @@ class TanApp:
         A ruleset that cannot be parsed fails closed — remote entries
         are denied — rather than silently reverting to admit-all, but
         loading is lazy so a broken file never blocks local operations.
+        Loading holds ``_ruleset_lock`` so it cannot interleave with
+        ``reload_ruleset`` and install a pre-save value after it.
         """
-        if self._ruleset is None:
-            try:
-                self._ruleset = load_ruleset(self._ruleset_path)
-            except RulesError as exc:
-                log.error(
-                    "Tan ruleset unusable (%s); denying remote entries", exc
-                )
-                self._ruleset = Ruleset(default_allow=False)
-        return self._ruleset
+        with self._ruleset_lock:
+            if self._ruleset is None:
+                try:
+                    self._ruleset = load_ruleset(self._ruleset_path)
+                except RulesError as exc:
+                    log.error(
+                        "Tan ruleset unusable (%s); denying remote entries", exc
+                    )
+                    self._ruleset = Ruleset(default_allow=False)
+            return self._ruleset
+
+    def reload_ruleset(self) -> None:
+        """Drop the cached admission ruleset so the next access re-reads it.
+
+        Lets a ruleset change made in-process — for example from the web
+        console — apply to the running node at once instead of waiting
+        for a restart. A rules file that cannot be parsed still fails
+        closed on the next load, through the ``ruleset`` property.
+        """
+        with self._ruleset_lock:
+            self._ruleset = None
 
     def _admitted(self, conn: sqlite3.Connection, author: str) -> bool:
         ruleset = self.ruleset

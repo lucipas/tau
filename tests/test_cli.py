@@ -140,6 +140,10 @@ class _FakeSendNode:
                 text=text,
                 message_id=f"{len(self.calls):032x}",
             )
+            # The real node records the send when it queues (see
+            # TauNode.send_message), so the sent record exists for the
+            # queued-to-delivered flip to confirm against.
+            self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
             return {
                 "ok": True,
                 "queued": True,
@@ -152,6 +156,8 @@ class _FakeSendNode:
         self.flush_calls.append(kwargs)
         if _FakeSendNode.deliver_on_flush:
             for entry in self.mailbox.outbox_list():
+                # The real node records delivery before leaving the outbox.
+                self.mailbox.record_delivered(entry.id)
                 self.mailbox.remove_outbox(entry.id)
 
 
@@ -3093,7 +3099,10 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False, lxmf=False):
+        def start(
+            self, *, announce=True, exclusive=False, lxmf=False,
+            lxmf_propagation=False
+        ):
             events.append("node.start")
 
         def stop(self):
