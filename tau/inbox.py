@@ -33,7 +33,12 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
-from .protocol import clean_in_reply_to
+from .protocol import (
+    DEFAULT_MESSAGE_KIND,
+    ProtocolError,
+    clean_in_reply_to,
+    normalize_message_kind,
+)
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -90,6 +95,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         return _valid_file_record(raw)
     text = raw.get("text")
     if not isinstance(text, str) or not text:
+        return None
+    # A lone surrogate passes the checks above but cannot be stored as
+    # UTF-8, so it is rejected per record instead of failing the save.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
@@ -166,6 +177,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["kind"] = "group"
         record["group"] = group_id.lower()
         record["group_name"] = str(raw.get("group_name") or "group")
+    else:
+        try:
+            kind = normalize_message_kind(raw.get("kind"))
+        except ProtocolError:
+            # A hand-edited record keeps its text; the kind falls back to
+            # plain chat rather than dropping the message.
+            kind = DEFAULT_MESSAGE_KIND
+        record["kind"] = kind
     return record
 
 
@@ -380,6 +399,10 @@ def _record_error(raw: Any) -> Optional[str]:
     text = raw.get("text")
     if not isinstance(text, str) or not text:
         return "inbox record needs text"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "text is not valid UTF-8"
     try:
         float(raw.get("sent_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
@@ -819,12 +842,14 @@ class Inbox:
         peer: Optional[str] = None,
         query: Optional[str] = None,
         group: Optional[str] = None,
+        kind: Optional[str] = None,
         direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``query`` keeps only messages whose
+        filters to one group id; ``kind`` filters to one message kind;
+        ``query`` keeps only messages whose
         text contains it (case-insensitive substring); ``limit`` caps
         how many are returned (``None`` means all of them).  Sent
         messages are recorded here too — a reply quotes the sender's
@@ -865,6 +890,8 @@ class Inbox:
                 for item in entries
                 if item.get("kind") == "group" and item.get("group") == group
             ]
+        if kind is not None:
+            entries = [item for item in entries if item.get("kind") == kind]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
@@ -1004,9 +1031,12 @@ class Inbox:
         Messages are in stored (oldest-first) order so an import replays
         them in order; ``peer`` restricts the export to one sender
         destination hash.  The document is the same shape
-        :meth:`import_messages` accepts.
+        :meth:`import_messages` accepts.  The snapshot is read through
+        the cross-process transaction, so messages another process
+        committed since this inbox last loaded are included instead of
+        silently omitted from the backup.
         """
-        with self._lock:
+        with self.transaction():
             entries = [dict(item) for item in self._messages]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1017,15 +1047,22 @@ class Inbox:
             "messages": entries,
         }
 
-    def import_messages(self, document: Any) -> Dict[str, Any]:
+    def import_messages(
+        self,
+        document: Any,
+        inserted: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
         Returns ``{"imported": n, "present": n, "skipped": n, "errors":
         [...]}``.  An entry that fails validation is skipped with its
         error recorded; it never aborts the rest of the import, and
         entries already in the inbox are counted as present rather than
-        stored twice.  The whole merge runs in one transaction, so a
-        concurrent ``tau serve`` cannot lose entries, and the
+        stored twice.  When *inserted* is given, the records this call
+        actually stored are appended to it, in arrival order, so a
+        caller mirrors exactly what this import added.  The whole merge
+        runs in one transaction, so a concurrent ``tau serve`` cannot
+        lose entries, and the
         per-direction 500-record caps still apply.  Imported records
         get local arrival sequences (an export carries the source
         node's, which mean nothing here), and a failed persist raises
@@ -1048,6 +1085,7 @@ class Inbox:
 
         imported = present = skipped = 0
         errors: List[Dict[str, Any]] = []
+        added: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._messages)
             seen = {_dedupe_key(item) for item in self._messages}
@@ -1071,6 +1109,7 @@ class Inbox:
                     continue
                 seen.add(key)
                 self._messages.append(record)
+                added.append(record)
                 imported += 1
             self._messages = _retain(self._messages)
             _number_sequence(self._messages)
@@ -1080,6 +1119,15 @@ class Inbox:
                 # never stored.
                 self._messages = previous
                 raise OSError(f"could not persist inbox to {self.path}")
+            if inserted is not None:
+                # Only records that survived the retention cap were
+                # stored. Collect them while the transaction still holds
+                # the lock: a concurrent reload replaces the record
+                # objects in self._messages, so an identity check after
+                # the transaction would find none of them and the caller
+                # would mirror nothing.
+                kept = {id(item) for item in self._messages}
+                inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
             "present": present,

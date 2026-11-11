@@ -132,27 +132,61 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/alias` | POST | set a peer's local alias `{"destination": "<hash>", "alias": "name"}` (empty alias clears it) |
+| `/api/peers/verify` | POST | mark a peer verified `{"target": "alice"}` — only after comparing the safety number out of band (returns it) |
+| `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |
+| `/api/peers/block` | POST | block `{"target": "alice"}` |
+| `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
-| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
+| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` — or to a group with `{"group": "<id, id prefix or name>", "text": "hi"}` (one outbound entry per member; replies and expiry are peer-DM-only) |
+| `/api/messages/export` | GET | stored DMs as the CLI's JSON export document (localhost only) |
+| `/api/messages/import` | POST | import a DM export document (localhost only) |
+| `/api/files/<sender>/<name>` | GET | download a file received from `<sender>` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
 | `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
 | `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
+| `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
+| `/api/outbox/held` | GET | sealed mail held for other peers |
+| `/api/outbox/drop-held` | POST | drop `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
+| `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
+| `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |
+| `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
+| `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
+| `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
+| `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
+| `/api/tan/suggest` | GET | suggested authors to follow (`?limit=5`) |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
+| `/api/tan/quote` | POST | quote `{"target": "<post hash>", "text": "…"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/likes` | GET | who liked a post (`?target=<post hash>`) |
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
+| `/api/tan/muted` | GET | muted authors and their post counts |
+| `/api/tan/mute` | POST | mute `{"target": "alice"}` |
+| `/api/tan/unmute` | POST | unmute `{"target": "alice"}` |
+| `/api/tan/muted-keywords` | GET | muted keywords |
+| `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
+| `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/verify` | GET | re-verify every stored post's signature and chain linkage |
+| `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
+| `/api/tan/import` | POST | import an export document (every entry verified) |
+| `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
+| `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |
+| `/api/tan/unsave` | POST | unsave `{"target": "<post hash>"}` |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
@@ -196,6 +230,50 @@ tau tan timeline --json
 
 `tau serve --social --social-sync-interval 60` also pulls the public timeline
 from known peers every minute, so a long-running node keeps its cache fresh.
+
+Useful flags:
+
+```bash
+# Store a post without starting Reticulum or contacting peers
+tau tan post --no-publish "draft"
+
+# Publish only to one peer
+tau tan post --to alice "direct delivery"
+
+# Show every cached post, or one author's chain
+tau tan timeline --all
+tau tan timeline --author alice
+
+# Search stored posts by keyword (local only, newest first)
+tau tan search mesh --limit 10
+tau tan search mesh --author alice
+
+# Show the most-liked stored posts (best first; unliked posts last, newest first)
+tau tan top --limit 10
+tau tan top --author alice
+
+# Follow by destination hash or by a unique hash prefix
+tau tan follow 5c04c868
+tau tan following
+
+# Hide a word or phrase from your local views (whole-word match,
+# case-insensitive; entries keep syncing, so unmuting restores them)
+tau tan mute-keyword crypto
+tau tan mute-keyword "climate change"
+tau tan muted-keywords
+tau tan unmute-keyword crypto
+
+# Mute an author: their posts leave your timeline, search and threads,
+# but keep syncing and storing — unmute to see them again
+tau tan mute alice
+tau tan muted
+
+# Back up your posts (or every cached author's) and restore them later —
+# every entry's signature and hash are re-verified on import
+tau tan export --output tan-backup.json
+tau tan export --all --output tan-backup.json
+tau tan import tan-backup.json
+```
 
 More Tan flags — drafts, direct delivery, search, keyword and author
 mutes, export/import: see [FLAGS.md](FLAGS.md#tan-flags).
@@ -254,7 +332,9 @@ Global options may appear before or after the command:
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
+| `tau doctor` | Check the local data directory's health (read-only; `--json` for scripting) |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know) |
+| `tau peers show NAME\|HASH` | Show what this node knows about one peer (offline, read-only) |
 | `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
 | `tau peers unalias PEER` | Remove a peer's local alias |
 | `tau messages` | List received direct messages kept in the node inbox |
@@ -272,14 +352,18 @@ Global options may appear before or after the command:
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
+| `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
+| `tau tan top` | Show the most-liked stored posts, best first |
+| `tau tan mentions` | Show replies to your own posts |
 | `tau tan verify` | Re-verify every stored post's signature and chain linkage |
 | `tau tan follow PEER` | Follow a peer or destination hash |
 | `tau tan unfollow PEER` | Stop following an author |
 | `tau tan following` | List followed authors |
+| `tau tan authors` | List every author in the local Tan store |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
@@ -312,6 +396,15 @@ echo "piped message" | tau send --to alice
 
 # Fail fast instead of queueing when the peer is offline
 tau send --to alice "hi" --no-queue
+
+# Tag a message with a kind (default chat); the receiver can filter by it
+tau send --to alice --kind ping "are you there?"
+tau messages --kind ping
+
+# When a node is already serving on this data directory, `tau send`
+# runs through it over a local socket instead of starting a second
+# Reticulum instance on the same identity — same result, same queueing.
+# A stale socket left by a crashed serve simply falls back to a local send.
 
 # See what is waiting on offline peers
 tau outbox
@@ -662,6 +755,7 @@ later entry superseding an earlier one.
 tau tan like 5c04c868          # by post hash or unique prefix
 tau tan unlike 5c04c868
 tau tan timeline               # shows ♥ counts under each post
+tau tan top                    # ranks stored posts by ♥ count
 tau tan likes 5c04c868         # names the authors whose like currently stands
 ```
 
@@ -671,7 +765,10 @@ later unlike, does not appear. Like the thread view, it refuses a post your
 Tan display rules hide.
 
 The web console shows the same counts with a ♥ toggle on every post
-(`POST /api/tan/like` / `POST /api/tan/unlike`).
+(`POST /api/tan/like` / `POST /api/tan/unlike`). Saved posts work the
+same way: `tau tan save` keeps a post to read later (local only, never
+published), and the console has a Saved view with a save toggle on every
+post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
 
 ### Admission rules
 
@@ -704,7 +801,8 @@ when it restarts.
 Direct messages are open by default, like Tan posts. The owner can
 restrict them to known senders with an allow-list, stored as
 `allowlist.json` in the data directory (mode `0600`) and managed via
-the CLI:
+the CLI or the web console's allow-list section (console changes apply
+to the running node immediately; CLI changes apply when it restarts):
 
 ```bash
 tau allowlist list             # show whether the list is enforced and who is on it
@@ -851,16 +949,21 @@ unlinked, and stall sync at the gap.
   in (or allow-listed the sender). There is no store-and-forward for
   files yet — the recipient must be online — and no resume: a failed
   transfer restarts from the beginning.
-- Natural extensions: group destinations, allow-lists, typed messages, LXMF interop, a shared-instance mode
+- Natural extensions: group destinations, allow-lists, LXMF interop, a shared-instance mode
   for running several local clients against one node, and richer Tan clients
-  (media, moderation, follow recommendations).
+  (media, moderation, follow recommendations). Direct messages can already
+  carry a kind (`tau send --kind`, default `chat`); every kind is
+  delivered, queued and stored exactly like chat.
 - LXMF addressing is in place: every peer's LXMF delivery address is
   derived from its public key and shown by `tau peers` (and the web
   console); `tau id` shows this node's own address. `tau serve --lxmf`
   (requires the `lxmf` extra) also runs an LXMRouter on the node's
   identity, registers its delivery destination and announces it.
-  Nothing is sent over LXMF yet — sending and the migration of
-  store-and-forward follow under #67.
+  `tau serve --lxmf --lxmf-propagation` also serves as an LXMF
+  propagation node, holding mail for offline recipients until they
+  fetch it (message store capped at 256 MB). Nothing is sent over
+  LXMF yet — sending and the migration of store-and-forward follow
+  under #67.
 
 ## Development
 
