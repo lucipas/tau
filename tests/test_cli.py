@@ -3835,18 +3835,41 @@ def test_group_send_reply_to_empty_is_an_error(tmp_path, capsys, monkeypatch):
     assert _FakeGroupSendNode.instances == []
 
 
-def test_direct_reply_target_excludes_group_messages(tmp_path):
-    """A group message is not a DM reply target, even when its sender
-    is the DM peer: replies stay inside their own conversation."""
+def test_direct_reply_target_still_quotes_received_group_message(tmp_path):
+    """Narrowing the DM/group boundary: a *received* group message
+    from a peer keeps quoting in a DM to that peer, exactly as before
+    this PR — only the new group-send records stay out of DMs."""
     data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
     inbox = Inbox(config.inbox_path)
     mailbox = Mailbox(config.mailbox_path)
+    ref = cli._resolve_reply_target(inbox, mailbox, "a" * 32, "cd" * 16)
+    assert ref["id"] == "a" * 32
+
+
+def test_direct_reply_target_excludes_queued_group_leg(tmp_path):
+    """A queued group leg to the peer is not a DM reply target: its
+    id belongs to the group send."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="queued leg",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
     with pytest.raises(cli.NodeError, match="no message"):
-        cli._resolve_reply_target(inbox, mailbox, "aaaa", "cd" * 16)
+        cli._resolve_reply_target(inbox, mailbox, "dddd", "cd" * 16)
 
 
-def test_direct_quote_of_group_message_is_unavailable(tmp_path, capsys):
+def test_direct_quote_of_received_group_message_renders(tmp_path, capsys):
     data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
     inbox = Inbox(config.inbox_path)
@@ -3875,9 +3898,45 @@ def test_direct_quote_of_group_message_is_unavailable(tmp_path, capsys):
         ]
     )
     assert code == 0
-    out = capsys.readouterr().out
-    assert "↩ original not available" in out
-    assert "↩ alice: original thought" not in out
+    assert "↩ alice: original thought" in capsys.readouterr().out
+
+
+def test_group_reply_target_dedupes_queued_leg_with_sent_record(tmp_path):
+    """A queued leg whose id is already covered by the group send's
+    inbox record (in leg_ids) is one candidate, not an ambiguity."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "hello group",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "c" * 31 + "1",
+            "leg_ids": ["c" * 31 + "1", "d" * 32],
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+        }
+    )
+    mailbox.enqueue(
+        to=bytes.fromhex("ef" * 16),
+        text="hello group",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    ref = cli._resolve_group_reply_target(inbox, mailbox, "d" * 32, group["id"])
+    assert ref["id"] == "d" * 32
+    assert ref["excerpt"] == cli.excerpt_hash("hello group")
 
 
 def test_group_quote_with_duplicate_text_is_unavailable(tmp_path, capsys):

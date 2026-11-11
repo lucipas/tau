@@ -5235,14 +5235,11 @@ def _resolve_reply_target(
     # rather than silently quoting whichever store is searched first.
     candidates: Dict[str, Dict[str, Any]] = {}
     for item in inbox.find_prefix(ref, peer=peer_hash):
-        # Group messages live in the same inbox but belong to their
-        # group, never to a direct conversation: a DM reply must not
-        # quote one.
-        if item.get("kind") == "group":
-            continue
         candidates.setdefault(str(item["id"]), item)
     value = ref.lower()
     for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        # A queued group leg to this peer is not a DM: its id belongs
+        # to the group send, so it must not resolve as a direct reply.
         if entry.group_id is not None:
             continue
         if entry.id.lower().startswith(value):
@@ -5278,11 +5275,37 @@ def _resolve_group_reply_target(
     if not ref:
         raise NodeError("--reply-to must not be empty")
     candidates: Dict[str, Dict[str, Any]] = {}
-    for item in inbox.find_prefix(ref, group=group_id):
-        candidates.setdefault(str(item["id"]), item)
+    # A group send is one inbox record with every leg id, and a queued
+    # leg is also an outbox entry: the same leg seen in both stores is
+    # one candidate, not two — otherwise quoting a queued leg's id is
+    # always refused as ambiguous.  A candidate is keyed by the leg id
+    # that matched the prefix, so the reference names the leg quoted;
+    # two legs of one send matching the same prefix still resolve to
+    # that one send.
+    covered_ids: Set[str] = set()
     value = ref.lower()
+    for item in inbox.find_prefix(ref, group=group_id):
+        matched: Optional[str] = None
+        if str(item["id"]).lower().startswith(value):
+            matched = str(item["id"])
+        else:
+            for leg in item.get("leg_ids") or []:
+                if isinstance(leg, str) and leg.lower().startswith(value):
+                    matched = leg
+                    break
+        if matched is None:
+            continue
+        candidates.setdefault(
+            matched, {"id": matched, "text": str(item["text"])}
+        )
+        covered_ids.add(str(item["id"]))
+        for leg in item.get("leg_ids") or []:
+            if isinstance(leg, str):
+                covered_ids.add(leg)
     for entry in mailbox.outbox_list():
         if entry.group_id != group_id:
+            continue
+        if entry.id in covered_ids:
             continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
@@ -5329,10 +5352,6 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
             quoted = inbox.find_by_excerpt(excerpt, group=group_id)
     else:
         quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
-        if quoted is not None and quoted.get("kind") == "group":
-            # A direct reply quotes a direct message; a group message
-            # quoted here belongs to its group, not this conversation.
-            return "↩ original not available"
     if quoted is None or (
         isinstance(excerpt, str)
         and excerpt
