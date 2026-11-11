@@ -59,6 +59,40 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
     assert entries[0].created_at == 1000.0
 
 
+def test_enqueue_kind_survives_reload(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="ping?", kind="ping", now=1000.0)
+    assert entry.kind == "ping"
+    assert entry.to_dict()["kind"] == "ping"
+
+    reloaded = Mailbox(path)
+    assert reloaded.outbox_list()[0].kind == "ping"
+
+
+def test_enqueue_defaults_to_chat_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(to=BOB, text="hello")
+    assert entry.kind == "chat"
+
+
+def test_enqueue_rejects_invalid_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(ProtocolError):
+        box.enqueue(to=BOB, text="hello", kind="has space")
+
+
+def test_outbox_entry_without_kind_loads_as_chat(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="old entry", now=1000.0)
+    raw = json.loads(path.read_text())
+    del raw["outbox"][0]["kind"]
+    path.write_text(json.dumps(raw))
+
+    assert Mailbox(path).outbox_list()[0].kind == "chat"
+
+
 def test_enqueue_dedupes_by_message_id(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     first = box.enqueue(to=BOB, text="once", message_id="fixed-id")
@@ -67,6 +101,32 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     # cross-process transaction, so the deduped entry is a fresh copy.
     assert first == second
     assert box.counts()["outbox"] == 1
+
+
+def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
+    """`delivered_at` must survive a reload: the queued-to-delivered flip
+    and the sent-messages display both read it after one."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0)
+
+    reloaded = Mailbox(path)
+    delivered = reloaded.sent_record("m1")
+    assert delivered is not None
+    assert delivered["delivered_at"] == 1002.0
+    pending = reloaded.sent_record("m2")
+    assert pending is not None
+    assert pending["delivered_at"] is None
+
+    # A record written before delivery tracking has no such key and
+    # keeps counting as delivered in the sent-messages display.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_at"]
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_at" not in reloaded.sent_record("m2")
 
 
 def test_load_dedupes_duplicate_message_ids(tmp_path):
@@ -682,6 +742,34 @@ def test_seal_and_open_roundtrip():
     assert message["from_name"] == "alice"
     assert message["from"] == destination_hash(sender).hex()
     assert message["sent_at"] == 4242.0
+
+
+def test_seal_and_open_keep_kind():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-kind",
+        text="are you there?",
+        sent_at=4242.0,
+        kind="ping",
+    )
+    message = open_message(recipient, blob)
+    assert message["kind"] == "ping"
+
+
+def test_seal_and_open_default_kind_is_chat():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-chat",
+        text="hello",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, blob)["kind"] == "chat"
 
 
 def test_seal_and_open_roundtrip_with_reply():

@@ -58,6 +58,29 @@ def test_remove_drops_peer_and_persists(tmp_path):
     assert reloaded.get("bob") is not None
 
 
+def test_restore_puts_back_a_forgotten_peer(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    removed = registry.forget(peer.destination_hash)
+    assert removed is peer
+    assert registry.get(peer.destination_hash) is None
+
+    registry.restore(removed)
+    assert registry.get(peer.destination_hash) is peer
+
+
+def test_restore_does_not_overwrite_a_reannounced_peer(tmp_path):
+    registry = PeerRegistry(tmp_path / "peers.json")
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    removed = registry.forget(peer.destination_hash)
+    fresh = make_peer(registry, 1, "alice", now=200.0)
+
+    registry.restore(removed)
+    assert registry.get(peer.destination_hash) is fresh
+
+
 def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     registry = PeerRegistry()
     peer = make_peer(registry, 2, "bob", now=100.0)
@@ -861,6 +884,21 @@ def test_local_dict_includes_trust_state_public_dict_does_not(tmp_path):
     assert local["verified"] is True
     assert local["verified_at"] == 150.0
     assert local["key_change_at"] is None
+
+
+def test_local_dict_includes_alias_public_dict_does_not(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    assert peer.local_dict(now=200.0)["alias"] is None
+    registry.set_alias(peer.destination_hash, "laptop")
+
+    local = peer.local_dict(now=200.0)
+    assert local["alias"] == "laptop"
+    # The alias is owner-only, like verification: it never leaves in a
+    # public description or a peer-exchange payload.
+    assert "alias" not in peer.public_dict(now=200.0)
+    assert "alias" not in peer.exchange_dict(now=200.0)
 
 
 def test_from_dict_tolerates_bad_verification_fields(tmp_path):
