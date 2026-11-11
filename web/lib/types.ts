@@ -283,6 +283,10 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface DeleteMessageResponse {
+  ok: boolean;
+  deleted: { id: number; wire_id?: string | null };
+}
 export interface RetryOutboxResponse {
   ok: boolean;
   delivered: number;

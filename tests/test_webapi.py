@@ -4849,6 +4849,252 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     assert status == 400
 
 
+def test_delete_message_endpoint_removes_history_and_inbox_entry(bridge, node):
+    node.inbox.append(
+        {
+            "id": "wire-1",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {"ok": True, "deleted": {"id": 1, "wire_id": "wire-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+    # The bus stamps its own sequence into `id`, so the deleted
+    # console id must ride under `message_id`: other tabs drop the
+    # deleted bubble, not whichever one shares the event sequence.
+    deleted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(deleted_events) == 1
+    assert deleted_events[0]["message_id"] == 1
+
+
+def test_delete_message_endpoint_removes_console_only_entry(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            # No wire id: an entry from before ids existed, or one the
+            # node inbox never stored. The console copy still goes.
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {"ok": True, "deleted": {"id": 1, "wire_id": None}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
+def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": "1"}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_delete_message_survives_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "still here",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "wire-2",
+            }
+        )
+        status, _, _ = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 200
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert [message["id"] for message in messages] == [2]
+        assert messages[0]["text"] == "still here"
+    finally:
+        bridge2.stop()
+
+
+def test_delete_message_rejects_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+
+    status, _, payload = _json(
+        bridge, "/api/messages/delete", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert len(feed["messages"]) == 1
+
+
+def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        node.inbox.append(
+            {
+                "id": "wire-1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "hello",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-1",
+            }
+        )
+        # A directory in the history file's place makes the atomic
+        # replace fail, so the strict save raises.
+        messages_path = tmp_path / "messages.json"
+        messages_path.unlink()
+        messages_path.mkdir()
+        status, _, payload = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 500
+        _, _, feed = _json(bridge, "/api/messages")
+        assert len(feed["messages"]) == 1
+        # Inbox-first ordering: the inbox copy is already gone, but the
+        # bubble stays visible, so a retry once the file is repaired
+        # completes the delete (the inbox delete of the already-removed
+        # wire id is ignored).
+        assert node.inbox.export_document()["messages"] == []
+        messages_path.rmdir()
+        status, _, payload = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 1}
+        )
+        assert status == 200
+        _, _, feed = _json(bridge, "/api/messages")
+        assert feed["messages"] == []
+        assert node.inbox.export_document()["messages"] == []
+    finally:
+        bridge.stop()
+
+
+def test_delete_message_rollback_survives_append_to_full_log(
+    node, tmp_path, monkeypatch
+):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        # Fill the bounded log (500 entries) with console-only messages.
+        for i in range(1, 501):
+            bridge._messages.append(
+                {
+                    "id": i,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": f"m{i}",
+                    "sent_at": float(i),
+                    "received_at": float(i),
+                    "status": "received",
+                }
+            )
+        bridge._next_message_id = 501
+
+        # A message arriving while the strict save is in flight refills
+        # the log, then the write fails. The rollback must restore the
+        # deleted entry instead of raising on the full deque.
+        def _append_then_fail(*args, **kwargs):
+            bridge._messages.append(
+                {
+                    "id": 501,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": "m501",
+                    "sent_at": 501.0,
+                    "received_at": 501.0,
+                    "status": "received",
+                }
+            )
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "tau.webapi.atomic_write_json", _append_then_fail
+        )
+        status, _, _ = _json(
+            bridge, "/api/messages/delete", method="POST", body={"id": 250}
+        )
+        assert status == 500
+        # The feed API pages the log, so check the deque itself: the
+        # restore must have landed despite the full log.
+        assert len(bridge._messages) == 500
+        ids = [message["id"] for message in bridge._messages]
+        assert 250 in ids  # the deleted entry was restored
+        assert 501 in ids  # the interleaved append survived
+        assert ids == sorted(ids)  # the restore kept id order
+    finally:
+        bridge.stop()
+
+
 def test_reaction_annotates_matching_history_entry(bridge):
     record = {
         "from": "alice",

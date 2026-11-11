@@ -69,6 +69,15 @@ export function Console() {
     setTarget(value);
   }
 
+  // A deleted message can no longer be quoted: the bridge rejects its
+  // wire id. This also covers deletes that arrive from another tab.
+  useEffect(() => {
+    if (!replyTo) return;
+    if (!tau.messages.some((message) => message.id === replyTo.id)) {
+      setReplyTo(null);
+    }
+  }, [replyTo, tau.messages]);
+
   const { markRead } = tau;
   const openUnread =
     mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
@@ -185,6 +194,9 @@ export function Console() {
                   setTarget(message.peer);
                   setMode("peer");
                 }
+              }}
+              onDelete={async (message) => {
+                await tau.deleteMessage(message.id);
               }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;

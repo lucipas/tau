@@ -50,6 +50,88 @@ describe("MessageFeed reactions", () => {
   });
 });
 
+describe("MessageFeed delete", () => {
+  it("shows no delete button without an onDelete handler", () => {
+    render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Delete this message")).toBeNull();
+  });
+
+  it("asks for confirmation before deleting", async () => {
+    const message = makeMessage();
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(screen.getByText("confirm delete")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("confirm delete"));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith(message);
+  });
+
+  it("keeps the message when the confirmation is cancelled", () => {
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    fireEvent.click(screen.getByText("keep"));
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(screen.queryByText("confirm delete")).toBeNull();
+    expect(screen.getByTitle("Delete this message")).toBeTruthy();
+  });
+
+  it("reports a failed delete inline and keeps the message", async () => {
+    const onDelete = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    fireEvent.click(screen.getByText("confirm delete"));
+    expect(await screen.findByText("boom")).toBeTruthy();
+    // The bubble stays, with the plain delete button back for a retry.
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Delete this message")).toBeTruthy();
+  });
+
+  it("hides the delete button while the message is still queued", () => {
+    // A queued message is removed by cancelling its outbox entry, not
+    // by deleting the bubble: deleting here would leave the outbox
+    // entry to deliver it anyway.
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage({ status: "queued" })]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+    expect(screen.queryByTitle("Delete this message")).toBeNull();
+  });
+});
 
 describe("MessageFeed react picker", () => {
   const NODE: NodeInfo = {

@@ -25,6 +25,9 @@ script) can read what arrives from the mesh and send messages back:
                            (optional ``"timeout"`` seconds, default 300)
     POST /api/react        react ``{"target": "<wire id>", "reaction": "👍"}``
                            or retract ``{"target": "<wire id>", "clear": true}``
+    POST /api/messages/delete delete ``{"id": <console message id>}`` from
+                           the console history (and the node inbox, when the
+                           message carries a wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     POST /api/outbox/retry  retry queued mail now, ignoring backoff
@@ -99,7 +102,7 @@ from . import __version__
 from .allowlist import AllowListError, clean_destination
 from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
 from .config import MESSAGES_FILE_NAME
-from .inbox import MAX_REACTIONS, merge_reaction
+from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
 from .peers import Peer, PeerError, safety_number
@@ -715,7 +718,7 @@ class WebBridge:
         if purged:
             self._save_messages()
 
-    def _save_messages(self) -> None:
+    def _save_messages(self, *, strict: bool = False) -> None:
         """Persist the current message log to ``messages.json``.
 
         Saves are serialised through ``_save_lock`` and the snapshot is
@@ -723,25 +726,40 @@ class WebBridge:
         overwrite a newer one: the last save to finish always holds the
         newest log. A failed write only logs a warning: the messages are
         already in memory, and a full disk (or an unencodable record) must
-        never break sending or receiving.
+        never break sending or receiving. ``strict`` callers (deletion)
+        need the write to have landed, so they get the error instead.
         """
         path = self._messages_path
         if path is None:
             return
         with self._save_lock:
-            with self._lock:
-                messages = list(self._messages)
-                next_id = self._next_message_id
-            try:
-                atomic_write_json(
-                    path,
-                    {"messages": messages, "next_message_id": next_id},
-                    mode=0o600,
-                )
-            except (OSError, ValueError) as exc:
-                log.warning(
-                    "Could not persist message history to %s: %s", path, exc
-                )
+            self._save_messages_locked(strict=strict)
+
+    def _save_messages_locked(self, *, strict: bool = False) -> None:
+        """Write the current log; the caller holds ``_save_lock``.
+
+        Split out so a deletion can hold the save lock across removal,
+        strict persistence and failure rollback: no other save can
+        persist the transiently deleted deque in between.
+        """
+        path = self._messages_path
+        if path is None:
+            return
+        with self._lock:
+            messages = list(self._messages)
+            next_id = self._next_message_id
+        try:
+            atomic_write_json(
+                path,
+                {"messages": messages, "next_message_id": next_id},
+                mode=0o600,
+            )
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise
+            log.warning(
+                "Could not persist message history to %s: %s", path, exc
+            )
 
     @property
     def url(self) -> str:
@@ -2123,6 +2141,119 @@ class WebBridge:
             "id": response.get("id"),
         }
 
+    def delete_message(self, target: int) -> Dict[str, Any]:
+        """Delete one stored DM from the console history, by console id.
+
+        Removes the entry from this console's ``messages.json`` log, and
+        when the entry carries a wire id also deletes that id from the
+        node inbox, so ``tau messages`` agrees with the console
+        afterwards.  Only this node's copies are removed — the sender
+        keeps theirs, and sealed copies already held by relays are
+        unaffected.  A wire id the inbox no longer knows is not an
+        error: the console entry is still removed.  Other tabs learn
+        through a ``message_deleted`` event, and the unread badge is
+        re-published because deleting an unread message clears it.
+
+        Ordering keeps every failure retryable from the console: the
+        inbox goes first, so an inbox failure leaves the bubble in
+        place; the console log is then persisted strictly, and a
+        failed write restores the entry in memory and reports an
+        error instead of success.  A retry after either failure
+        completes the delete (the inbox delete of an already-removed
+        wire id is ignored), so no failure can leave a message the
+        console reports as deleted but a restart brings back, nor a
+        message deleted from the console but stuck in the inbox.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if removed is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if removed.get("status") == "queued":
+                # Deleting would hide the bubble while the outbox keeps
+                # delivering it, so cancellation has to go through there.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = removed.get("wire_id")
+        inbox = None
+        if isinstance(wire_id, str) and wire_id:
+            inbox = getattr(self.node, "inbox", None)
+            if inbox is not None:
+                try:
+                    inbox.delete(wire_id)
+                except InboxError as exc:
+                    # Already gone from the inbox (a stale wire id) is
+                    # fine.  Any other inbox failure leaves the console
+                    # entry in place, so the delete can be retried.
+                    if not str(exc).startswith("unknown message"):
+                        raise
+        # Hold the save lock across removal, strict persistence and
+        # failure rollback: no other history save can persist the
+        # transiently deleted deque between the failed write and the
+        # in-memory restore. (Appends may still interleave, but their
+        # saves wait on this lock and persist the restored log.)
+        with self._save_lock:
+            with self._lock:
+                kept = [
+                    message
+                    for message in self._messages
+                    if message.get("id") != target
+                ]
+                self._messages.clear()
+                self._messages.extend(kept)
+            # Persist the console history strictly: a failed write
+            # restores the entry and reports an error, so success is
+            # never reported for a delete that a restart would undo.
+            try:
+                self._save_messages_locked(strict=True)
+            except Exception:
+                with self._lock:
+                    # A message can arrive while the strict write is in
+                    # flight (the save lock serialises saves, not
+                    # appends): with a full log the append refills the
+                    # deque, and insert() on a full bounded deque raises
+                    # instead of restoring the entry. Drop the oldest
+                    # first — the same eviction an append would have
+                    # caused — so the restore always lands.
+                    if (
+                        self._messages.maxlen is not None
+                        and len(self._messages) >= self._messages.maxlen
+                    ):
+                        self._messages.popleft()
+                    index = next(
+                        (
+                            i
+                            for i, message in enumerate(self._messages)
+                            if message.get("id", 0) > target
+                        ),
+                        len(self._messages),
+                    )
+                    self._messages.insert(index, removed)
+                raise
+        # The bus stamps its own sequence into ``id``, so the deleted
+        # console id rides under ``message_id`` instead: using ``id``
+        # would make other tabs drop whichever bubble shares the
+        # event's sequence number.
+        self.bus.publish({"type": "message_deleted", "message_id": target})
+        if inbox is not None:
+            self.bus.publish({"type": "unread", "unread": self.unread()})
+        return {
+            "ok": True,
+            "deleted": {
+                "id": target,
+                "wire_id": wire_id if isinstance(wire_id, str) else None,
+            },
+        }
+
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
 
@@ -3334,6 +3465,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/react":
                 self._handle_react(body, head_only)
                 return
+            if path == "/api/messages/delete":
+                self._handle_delete_message(body, head_only)
+                return
             if path == "/api/messages/read":
                 peer = body.get("peer")
                 if peer is not None and (
@@ -3989,6 +4123,24 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_delete_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.delete_message(target)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
 
