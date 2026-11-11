@@ -222,7 +222,7 @@ describe("useTau group management", () => {
       group: successor,
       previous_id: created.id,
     });
-    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
     let returned:
       | { ok: boolean; group: TauGroup; previous_id: string }
       | undefined;
@@ -241,6 +241,7 @@ describe("useTau group management", () => {
       group: successor,
       previous_id: created.id,
     });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
     expect(result.current.groups).toEqual([successor]);
   });
 
@@ -263,7 +264,7 @@ describe("useTau group management", () => {
       group: successor,
       previous_id: created.id,
     });
-    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
     await act(async () => {
       await result.current.removeGroupMembers(created.id, [BOB_HASH]);
     });
@@ -272,6 +273,7 @@ describe("useTau group management", () => {
       group: created.id,
       members: [BOB_HASH],
     });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
     expect(result.current.groups).toEqual([successor]);
   });
 });
