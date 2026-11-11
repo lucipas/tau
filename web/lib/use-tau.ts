@@ -22,6 +22,7 @@ import type {
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
+  SendGroupResponse,
   SendResponse,
   Snapshot,
   SocialInfo,
@@ -522,6 +523,70 @@ export function useTau() {
     return result.message;
   }, [refreshOutbox]);
 
+  const sendGroup = useCallback(
+    async (group: string, text: string) => {
+      const result = await apiPost<SendGroupResponse>("/api/messages", {
+        group,
+        text,
+      });
+      setMessages((previous) => {
+        const fresh = result.messages.filter(
+          (entry) => !previous.some((known) => known.id === entry.id),
+        );
+        if (fresh.length === 0) return previous;
+        return [...previous, ...fresh].sort((a, b) => a.id - b.id);
+      });
+      // Do not advance snapshotMax here: the legs are not a complete
+      // view up to their highest id, and an inbound message recorded
+      // between two legs must still be accepted from its SSE event.
+      // Duplicate leg events are dropped by the dedupe in onMessage.
+      // A queued leg lands in the outbox; refresh so it shows at once
+      // instead of waiting for the next poll. Best-effort: a failed
+      // refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      if (!result.ok) {
+        // The legs are already in the feed with their own statuses, so
+        // this only surfaces the summary: the message stays sendable.
+        // Name the members who already received it — or have a copy
+        // queued and will still receive it — so a retry is a
+        // deliberate duplicate fan-out, not a silent one.
+        const legs = (result.response.results as Array<
+          Record<string, unknown>
+        >) ?? [];
+        const failed = legs.filter((leg) => !leg.delivered && !leg.queued);
+        const deliveredNames = legs
+          .filter((leg) => leg.delivered)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const queuedNames = legs
+          .filter((leg) => leg.queued)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const names = failed.map((leg) =>
+          String(leg.to_name || leg.to || "a member").slice(0, 8),
+        );
+        const already = [
+          ...(deliveredNames.length > 0
+            ? [`${deliveredNames.join(", ")} already received this`]
+            : []),
+          ...(queuedNames.length > 0
+            ? [`${queuedNames.join(", ")} have a copy queued`]
+            : []),
+        ].join("; ");
+        throw new Error(
+          names.length > 0
+            ? already.length > 0
+              ? `could not send to ${names.join(", ")} — ${already}; sending again resends it to the whole group`
+              : `could not send to ${names.join(", ")}`
+            : "some group members did not receive the message",
+        );
+      }
+      return result.messages;
+    },
+    [refreshOutbox],
+  );
   const sendFile = useCallback(async (to: string, file: File) => {
     const data = await fileToBase64(file);
     const result = await apiPost<SendFileResponse>("/api/send-file", {
@@ -814,6 +879,7 @@ export function useTau() {
     blocks,
     announcing,
     send,
+    sendGroup,
     sendFile,
     ping,
     showSafetyNumber,

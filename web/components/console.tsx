@@ -15,23 +15,47 @@ import { PeerSidebar } from "./peer-sidebar";
 export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
-  const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
 
   useEffect(() => {
-    if (tau.peers.length === 0) {
+    if (tau.peers.length === 0 && tau.groups.length === 0) {
       setMode("custom");
       return;
     }
-    if (!target && !customPicked.current) {
-      setMode("peer");
-      setTarget(tau.peers[0].destination);
+    // A refresh can remove the selected group: never keep submitting its
+    // stale id. Fall back to a remaining group, then to a peer.
+    if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
+      if (tau.groups.length > 0) {
+        setTarget(tau.groups[0].id);
+      } else if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      return;
     }
-  }, [tau.peers, target]);
+    if (!target && !customPicked.current) {
+      if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      }
+    }
+  }, [tau.peers, tau.groups, target, mode]);
 
-  function changeMode(next: "peer" | "custom") {
+  function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
+    // A pending reply belongs to a peer conversation: the bridge
+    // rejects replies on group sends, so entering group mode drops it.
+    if (next === "group") {
+      setReplyTo(null);
+    }
     setMode(next);
   }
 
@@ -176,11 +200,13 @@ export function Console() {
             </div>
             <Composer
               peers={tau.peers}
+              groups={tau.groups}
               target={target}
               mode={mode}
               onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
+              onSendGroup={tau.sendGroup}
               onSendFile={tau.sendFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}

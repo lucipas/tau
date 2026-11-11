@@ -402,7 +402,9 @@ function MessageBubble({
                 ? "queued"
                 : message.status === "read"
                   ? "read"
-                  : "delivered"
+                  : message.status === "failed"
+                    ? "failed"
+                    : "delivered"
               : "received"}
           </span>
           {message.rtt_ms !== undefined ? (

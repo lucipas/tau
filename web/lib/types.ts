@@ -23,7 +23,8 @@ export interface TauMessage {
   read_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
-  // Group DM context, present on inbound group messages.
+  // Group DM context, present on group messages (inbound, and
+  // outbound legs recorded per member on a console group send).
   group?: string;
   group_name?: string;
   // Sender-set expiry (epoch seconds). Absent when the message never
@@ -223,6 +224,12 @@ export interface VerifyState {
 export interface SendResponse {
   ok: boolean;
   message: TauMessage;
+  response: Record<string, unknown>;
+}
+
+export interface SendGroupResponse {
+  ok: boolean;
+  messages: TauMessage[];
   response: Record<string, unknown>;
 }
 

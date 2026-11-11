@@ -3295,8 +3295,12 @@ class TauNode:
         leg is a ``/tau/group`` request carrying the roster; a member
         that cannot be reached is queued in the outbox (with the group
         context, so a retry re-sends the group payload) unless it
-        explicitly refused the message.  Returns a per-member result
-        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        explicitly refused the message.  Each leg is bounded by
+        ``timeout``: the stages of one delivery share that leg's
+        budget, and a leg the deadline leaves no time to attempt is
+        queued the same way instead of dropped.  Returns a
+        per-member result list: ``delivered``, ``queued``, or an
+        ``error`` for that leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3344,16 +3348,103 @@ class TauNode:
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None
+            # One deadline bounds each leg, and the budget is per leg:
+            # the stages of a single delivery (resolve, path, link,
+            # response) share the leg's budget instead of each taking
+            # the full timeout, but one member's leg must not consume
+            # another's.  The roster is in sorted-hash order, so who
+            # runs first is arbitrary — with a single fan-out-wide
+            # deadline, an offline member sorted first burned the whole
+            # budget waiting for a path that could never appear, and
+            # every later (reachable) member was queued without an
+            # attempt.  A per-leg deadline reserves the full attempt
+            # window for every member while keeping each leg capped at
+            # ``timeout``.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                # Out of time for another attempt — but the leg must
+                # not be dropped to the deadline: queueing is local
+                # disk I/O, so the member still gets the message on a
+                # later retry, exactly as if the attempt had failed to
+                # reach them.
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": "not attempted: group send time limit reached",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name="",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                any_queued = True
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                    }
+                )
+                continue
             try:
                 peer = self.resolve_peer(
                     member,
-                    timeout=discover_timeout
-                    if discover_timeout is not None
-                    else min(timeout, 10.0),
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
                 )
+                # Remember the leg before the request so a read receipt
+                # from this member verifies; a refused or unqueued leg
+                # is forgotten below.
+                self.mailbox.record_sent(
+                    message_id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                )
+                # Pass the leg's deadline through: without it, path
+                # discovery, link establishment and the response could
+                # each consume the leg's budget on a slow link, and
+                # one leg could take close to three timeouts.
                 response = self._request(
-                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                    peer,
+                    REQUEST_GROUP_MESSAGE,
+                    payload,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
                 )
+                self.mailbox.record_delivered(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3366,6 +3457,7 @@ class TauNode:
             except (NotAllowedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; queueing
                 # would retry a refusal until its TTL expires.
+                self.mailbox.discard_sent(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3379,6 +3471,7 @@ class TauNode:
                 )
             except NodeError as exc:
                 if not queue or not self.started:
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3401,6 +3494,7 @@ class TauNode:
                     # The outbox is full (or the write failed): record the
                     # leg as failed and keep going, so the legs already
                     # delivered or queued are not lost with the exception.
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3411,6 +3505,19 @@ class TauNode:
                         }
                     )
                     continue
+                # A queued leg is registered under its outbox id, like
+                # a queued peer DM, so a receipt for it verifies. When
+                # resolve already succeeded the wire id was registered
+                # above (the outbox reuses it as its id, so this is a
+                # no-op); when resolve failed, this is the leg's only
+                # record, and without it the receipt would be rejected
+                # as unknown.
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "

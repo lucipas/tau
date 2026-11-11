@@ -696,8 +696,8 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     )
     calls = []
 
-    def fake_request(peer, path, payload, timeout):
-        calls.append((peer.hexhash, path, payload))
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
         return {"ok": True}
 
     def fake_resolve(target, timeout=10.0):
@@ -715,6 +715,9 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert by_to[THIRD_HASH]["queued"] is True
     assert len(calls) == 1
     assert calls[0][1] == "/tau/group"
+    # The leg's deadline rides along, so one slow leg cannot
+    # consume its whole budget stage by stage.
+    assert calls[0][3] is not None
     parsed = parse_group_message(calls[0][2])
     assert parsed["text"] == "hello all"
     assert parsed["group"] == group["id"]
@@ -727,6 +730,26 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert queued[0].group_creator == OWN_HASH
     assert queued[0].group_members == [OWN_HASH, OTHER_HASH, THIRD_HASH]
 
+    # Each leg is registered for read receipts, like a peer DM: the
+    # delivered leg under its wire id, so a recipient's receipt
+    # verifies instead of being rejected as unknown. (The queued leg
+    # is registered under the same id twice over: the outbox entry
+    # reuses the wire id as its id, so the second registration is a
+    # no-op, exactly as for a queued peer DM.)
+    delivered_id = by_to[OTHER_HASH]["id"]
+    assert node.mailbox.sent_record(delivered_id) is not None
+    assert (
+        node.mailbox.record_read(delivered_id, time.time(), reader_hash=OTHER_HASH)
+        is True
+    )
+    assert node.mailbox.read_at(delivered_id) is not None
+    third_records = [
+        record for record in node.mailbox.sent_list() if record["to"] == THIRD_HASH
+    ]
+    assert len(third_records) == 1
+    assert third_records[0]["id"] == by_to[THIRD_HASH]["id"]
+    assert third_records[0]["id"] == queued[0].id
+
 
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     node = make_node(tmp_path)
@@ -735,7 +758,7 @@ def test_send_group_message_skips_self_and_records_refusal(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def fake_request(peer, path, payload, timeout):
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
         from tau.node import NotAllowedError
 
         raise NotAllowedError("not allowed")
@@ -751,6 +774,9 @@ def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     assert all(entry.get("error") == "not_allowed" for entry in result["results"])
     assert len(result["results"]) == 2
     assert node.mailbox.outbox_list() == []
+    # A refused leg leaves no sent record behind: a later receipt
+    # for its id must not verify.
+    assert node.mailbox.sent_list() == []
 
 
 def test_send_group_message_treats_not_a_member_as_final(tmp_path):
@@ -762,7 +788,7 @@ def test_send_group_message_treats_not_a_member_as_final(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def fake_request(peer, path, payload, timeout):
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
         raise NotAMemberError("peer rejected the request: not a member")
 
     node._request = fake_request  # type: ignore[method-assign]
@@ -786,7 +812,7 @@ def test_send_group_message_keeps_results_when_outbox_full(tmp_path):
         "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
     )
 
-    def unreachable(peer, path, payload, timeout):
+    def unreachable(peer, path, payload, timeout, *, deadline=None):
         raise NodeError("unreachable")
 
     node._request = unreachable  # type: ignore[method-assign]
@@ -812,6 +838,75 @@ def test_send_group_message_keeps_results_when_outbox_full(tmp_path):
     assert result["results"][1].get("ok") is False
     assert result["results"][1]["error"].startswith("could not queue")
     assert len(node.mailbox.outbox_list()) == 1
+    # The queued leg is registered under its id (wire id and outbox
+    # id are the same here); the leg that could not be queued leaves
+    # no sent record behind.
+    sent = node.mailbox.sent_list()
+    assert len(sent) == 1
+    assert sent[0]["to"] == OTHER_HASH
+    assert sent[0]["id"] == result["results"][0]["id"]
+
+
+def test_send_group_message_queues_legs_past_the_deadline(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+
+    def no_request(peer, path, payload, timeout, *, deadline=None):
+        raise AssertionError("leg attempted past the deadline")
+
+    node._request = no_request  # type: ignore[method-assign]
+    # A zero timeout leaves no budget for any attempt: every leg must
+    # still reach the outbox instead of being dropped to the deadline,
+    # so the members get the message on a later retry.
+    result = node.send_group_message(group, "hello", timeout=0.0)
+    assert result["ok"] is True
+    assert len(result["results"]) == 2
+    assert all(entry.get("queued") is True for entry in result["results"])
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 2
+    assert all(entry.group_id == group["id"] for entry in queued)
+    assert all(
+        node.mailbox.sent_record(entry["id"]) is not None
+        for entry in result["results"]
+    )
+
+
+def test_send_group_message_slow_first_leg_does_not_starve_later_legs(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    attempts = []
+
+    def fake_resolve(target, timeout=10.0):
+        return _stub_peer(target, "peer")
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        attempts.append(peer.hexhash)
+        if peer.hexhash == OTHER_HASH:
+            # An offline member's path wait consumes its whole leg
+            # budget before the attempt fails.
+            time.sleep(1.2)
+            raise NodeError("no path")
+        return {"ok": True}
+
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    node._request = fake_request  # type: ignore[method-assign]
+    # The roster is attempted in sorted order (OTHER before THIRD).
+    # With a single fan-out-wide deadline, the first leg burning its
+    # budget left every later member queued without an attempt — the
+    # regression behind the flaky
+    # test_three_nodes_exchange_group_messages integration failure,
+    # where an offline member sorting first starved the online one.
+    result = node.send_group_message(group, "hello", timeout=1.0)
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["queued"] is True
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert attempts == [OTHER_HASH, THIRD_HASH]
 
 
 def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
@@ -820,7 +915,7 @@ def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     members = [OWN_HASH] + [f"{i:032x}" for i in range(1, 32)]
     group = node.groups.create("big", members, created_by=OWN_HASH)
     calls = []
-    node._request = lambda peer, path, payload, timeout: calls.append(peer)  # type: ignore[method-assign]
+    node._request = lambda peer, path, payload, timeout, **kwargs: calls.append(peer)  # type: ignore[method-assign]
     node.resolve_peer = lambda target, timeout=10.0: _stub_peer(  # type: ignore[method-assign]
         target, "peer"
     )
