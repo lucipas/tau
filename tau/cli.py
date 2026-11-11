@@ -5184,7 +5184,11 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
         raise NodeError(f"export file is not valid JSON: {exc}") from exc
     inbox = Inbox(config.inbox_path)
     mailbox = Mailbox(config.mailbox_path)
-    result = inbox.import_messages(document, is_retracted=mailbox.is_retracted)
+    # Hold the mailbox transaction across the import: it reloads the
+    # markers from disk, so a retract persisted by a running `tau serve`
+    # is seen, and it cannot land between the check and the insert.
+    with mailbox.transaction():
+        result = inbox.import_messages(document, is_retracted=mailbox.is_retracted)
     if _json_mode(args):
         _emit(result, True)
     else:
