@@ -70,6 +70,14 @@ GROUPS_FILE_NAME = "groups.json"
 # when a cap is reached.
 MAX_GROUPS = 100
 MAX_LEARNED_GROUPS = 50
+# A rename lineage is capped, newest first: each predecessor id is 32
+# hex chars (~35 bytes on the wire), so an unbounded chain would
+# eventually push even a short group message past the 8 KiB request
+# budget and make the group unsendable.  32 ids (~1.1 KiB) leaves room
+# for a full 32-member roster and a 2000-character message; a member
+# that missed more renames than that still retires same-name
+# predecessors through the supersede path.
+MAX_RENAME_LINEAGE = 32
 # Retired group ids (rosters replaced by their creator) are kept so a
 # removed peer cannot restore one by replaying an old group message.
 # The list is capped like the groups themselves; the oldest retirement
@@ -456,18 +464,22 @@ class GroupStore:
                     "created_by": existing["creator"],
                     "local": True,
                     "roster_sent_at": existing.get("roster_sent_at"),
-                    # The successor remembers the whole lineage, newest
-                    # first, so a member that missed an intermediate
-                    # rename still retires every predecessor, and group
+                    # The successor remembers the newest predecessors,
+                    # newest first, so a member that missed an
+                    # intermediate rename still retires them, and group
                     # history can span the renames.  The lineage never
                     # names the successor itself: renaming back to an
-                    # earlier name drops that name from the chain.
-                    "renamed_from": [existing["id"]]
-                    + [
-                        pred
-                        for pred in (existing.get("renamed_from") or [])
-                        if pred != new_id
-                    ],
+                    # earlier name drops that name from the chain.  It
+                    # is capped so repeated renames can never make the
+                    # group unsendable (see MAX_RENAME_LINEAGE).
+                    "renamed_from": (
+                        [existing["id"]]
+                        + [
+                            pred
+                            for pred in (existing.get("renamed_from") or [])
+                            if pred != new_id
+                        ]
+                    )[:MAX_RENAME_LINEAGE],
                 }
             )
             if candidate is None:
@@ -534,8 +546,12 @@ class GroupStore:
         member that still holds the old name stops sending to an id
         the creator retired, and a queued copy of an old message
         cannot re-pin it.  A member-carried message never retires
-        anything — the lineage is only a claim until the creator
-        themself sends under the new name.
+        anything — and its lineage is not stored at all: the lineage
+        is only a claim until the creator themself sends under the new
+        name, and storing it would let this node's later sends
+        retransmit it under the creator's authenticated identity
+        (``send_group_message`` and the sealed re-send both read the
+        stored lineage), retiring a group the creator never retired.
 
         ``sent_at`` is the message's send time on the creator's clock.
         A creator message sent before the successor was learned is
@@ -563,12 +579,21 @@ class GroupStore:
                 "creator": creator,
                 "created_by": creator,
                 "local": False,
-                "renamed_from": list(renamed_from or []),
+                "renamed_from": list(renamed_from or [])[:MAX_RENAME_LINEAGE],
             }
         )
         if candidate is None:
             return None
         creator_authorized = bool(sender) and sender.lower() == candidate["creator"]
+        if not creator_authorized:
+            # A member-carried lineage is only a claim: never store it.
+            # Otherwise a later send to this group would retransmit it
+            # under the creator's authenticated identity (the send and
+            # sealed re-send paths read the stored lineage), and other
+            # members would retire a group the creator never retired.
+            # The creator's own message adopts the authoritative
+            # lineage on the existing record below.
+            candidate["renamed_from"] = []
         if creator_authorized:
             # Only a creator message stamps the roster: the staleness
             # comparison is only meaningful between two timestamps from
@@ -723,7 +748,7 @@ class GroupStore:
                             list(renamed_from)
                             + list(current.get("renamed_from") or [])
                         )
-                    )
+                    )[:MAX_RENAME_LINEAGE]
                     if merged != list(current.get("renamed_from") or []):
                         self._groups[existing["id"]] = {
                             **current,

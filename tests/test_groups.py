@@ -16,7 +16,7 @@ import pytest
 
 from tau import cli
 from tau.config import TauConfig
-from tau.groups import GroupStore
+from tau.groups import MAX_RENAME_LINEAGE, GroupStore
 from tau.identity import destination_hash
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, open_message, seal_message
@@ -839,6 +839,100 @@ def test_group_store_record_keeps_predecessor_without_creator(tmp_path):
     assert again is not None
     assert again["renamed_from"] == [old_id]
     assert store.get(old_id) is None
+
+
+def test_group_store_record_drops_member_carried_lineage(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # A member-carried successor pins alongside, but its lineage is
+    # only a claim: it must not be stored, or this node's later sends
+    # would retransmit it under the creator's identity and other
+    # members would retire the named group.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert successor["renamed_from"] == []
+    assert store.get(new_id)["renamed_from"] == []
+    assert store.get(old_id) is not None
+    # The creator's own message still adopts the authoritative lineage.
+    again = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert again is not None
+    assert again["renamed_from"] == [old_id]
+    assert store.get(old_id) is None
+
+
+def test_group_store_rename_caps_lineage(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OTHER_HASH, OWN_HASH, THIRD_HASH]
+    current = store.create("place-0", members, created_by=OTHER_HASH)
+    assert current["renamed_from"] == []
+    for i in range(1, 41):
+        current = store.rename(current["id"], f"place-{i}", created_by=OTHER_HASH)
+    assert len(current["renamed_from"]) == MAX_RENAME_LINEAGE
+    # Newest first: the most recent predecessor is place-39's id, and
+    # the oldest retained one is place-8's (40 renames, 32 kept).
+    assert current["renamed_from"][0] == derive_group_id(
+        OTHER_HASH, "place-39", members
+    )
+    assert current["renamed_from"][-1] == derive_group_id(
+        OTHER_HASH, "place-8", members
+    )
+    # A short message to the much-renamed group still fits the wire budget.
+    encode_group_message(
+        "hi",
+        group_id=current["id"],
+        group_name=current["name"],
+        creator=OTHER_HASH,
+        members=members,
+        renamed_from=current["renamed_from"],
+    )
+
+
+def test_group_store_record_caps_creator_lineage(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    lineage = [
+        derive_group_id(OTHER_HASH, f"old-{i}", members) for i in range(40)
+    ]
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=lineage,
+    )
+    assert successor is not None
+    assert successor["renamed_from"] == lineage[:MAX_RENAME_LINEAGE]
+    # A later creator message merges more lineage; the total stays capped.
+    extra = [
+        derive_group_id(OTHER_HASH, f"new-{i}", members) for i in range(5)
+    ]
+    again = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+        renamed_from=extra,
+    )
+    assert again is not None
+    assert len(again["renamed_from"]) == MAX_RENAME_LINEAGE
+    assert again["renamed_from"][:5] == extra
 
 
 def test_group_store_record_stale_predecessor_not_retired(tmp_path):
@@ -1776,6 +1870,52 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert len(third_records) == 1
     assert third_records[0]["id"] == by_to[THIRD_HASH]["id"]
     assert third_records[0]["id"] == queued[0].id
+
+
+def test_send_group_message_does_not_retransmit_member_carried_lineage(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group = node.groups.create(
+        "weekend", members, created_by=OWN_HASH
+    )
+    # A member sends the creator a message for a successor group that
+    # names the weekend group in its lineage — a claim, not the
+    # creator's rename.  The lineage must not be stored, or the
+    # creator's next send would retransmit it under the creator's
+    # identity and other members would retire the weekend group.
+    successor_id = derive_group_id(OWN_HASH, "road trip", members)
+    pinned = node._accept_group_message(
+        THIRD_HASH,
+        {
+            "id": successor_id,
+            "name": "road trip",
+            "creator": OWN_HASH,
+            "members": members,
+            "renamed_from": [group["id"]],
+        },
+        sent_at=100.0,
+    )
+    assert pinned is not None
+    assert pinned["renamed_from"] == []
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    result = node.send_group_message(node.groups.get(successor_id), "hello all")
+    assert result["ok"] is True
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["renamed_from"] == []
 
 
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
