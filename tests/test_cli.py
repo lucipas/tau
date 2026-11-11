@@ -706,6 +706,65 @@ def test_status_reports_empty_node(tmp_path, capsys):
     assert not (data_dir / "tan.sqlite3").exists()
 
 
+def test_parser_group_topic_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "topic", "weekend", "planning the meetup"])
+    assert args.group_command == "topic"
+    assert args.group == "weekend"
+    assert args.text == "planning the meetup"
+    assert args.clear is False
+    assert args.file is None
+
+    shown = parser.parse_args(["group", "topic", "weekend"])
+    assert shown.text is None
+
+    cleared = parser.parse_args(["group", "topic", "weekend", "--clear"])
+    assert cleared.clear is True
+
+
+def test_group_topic_set_show_and_clear(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main(base) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    assert cli.main([*base, "planning the meetup"]) == 0
+    out = capsys.readouterr().out
+    assert "planning the meetup" in out
+    assert "next message" in out
+    # The CLI wrote through its own store instance: re-read from disk.
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"])["topic"]
+        == "planning the meetup"
+    )
+
+    assert cli.main([*base, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["group"]["topic"] == "planning the meetup"
+
+    assert cli.main(["group", "list", "--data-dir", str(data_dir)]) == 0
+    assert "topic: planning the meetup" in capsys.readouterr().out
+
+    assert cli.main([*base, "--clear"]) == 0
+    assert "cleared the topic" in capsys.readouterr().out
+    assert GroupStore(data_dir / "groups.json").get(group["id"])["topic"] == ""
+
+    # A group this node did not create refuses a topic change.
+    store.create("other", ["cd" * 16, "ef" * 16], created_by="cd" * 16)
+    assert (
+        cli.main(["group", "topic", "--data-dir", str(data_dir), "other", "forged"])
+        == 1
+    )
+    assert "only the creator" in capsys.readouterr().err
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])

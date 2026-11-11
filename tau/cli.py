@@ -1042,6 +1042,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_topic = group_sub.add_parser(
+        "topic",
+        parents=[common],
+        help="set or show the topic of a group you created",
+    )
+    group_topic.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_topic.add_argument(
+        "text",
+        nargs="?",
+        help="topic text (omit to show the current topic)",
+    )
+    group_topic.add_argument(
+        "--file", type=Path, help="read the topic text from a file"
+    )
+    group_topic.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the topic instead of setting one",
+    )
+    group_topic.set_defaults(func=cmd_group_topic)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -5557,6 +5580,7 @@ def _describe_group(
         "members": members,
         "created_at": group["created_at"],
         "created_by": group["created_by"],
+        "topic": group.get("topic", ""),
     }
 
 
@@ -5609,6 +5633,8 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
         print(f"{group['name']} ({group['id'][:8]}) — {names}")
+        if group.get("topic"):
+            print(f"  topic: {group['topic']}")
     return _EXIT_OK
 
 
@@ -5731,6 +5757,65 @@ def cmd_group_add_member(args: argparse.Namespace) -> int:
 
 def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
+
+
+def cmd_group_topic(args: argparse.Namespace) -> int:
+    """Set or show the topic of a group this node created.
+
+    With no text (and no ``--clear``) this only reads: the topic is
+    visible to any member, so showing it needs no creator check and no
+    identity.  Setting it does — only the creator can — and needs no
+    running node: the topic is local state until the next group message
+    carries it to the members.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if getattr(args, "clear", False) and getattr(args, "text", None) is not None:
+        raise NodeError("pass a topic or --clear, not both")
+    text = getattr(args, "text", None)
+    if getattr(args, "file", None):
+        try:
+            text = Path(args.file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    registry = PeerRegistry(config.peers_path)
+    if text is None and not getattr(args, "clear", False):
+        described = _describe_group(group, registry)
+        if _json_mode(args):
+            _emit({"group": described}, True)
+            return _EXIT_OK
+        topic = group.get("topic", "")
+        if topic:
+            print(f"{group['name']} ({group['id'][:8]}): {topic}")
+        else:
+            print(f"{group['name']} ({group['id'][:8]}) has no topic set.")
+        return _EXIT_OK
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    try:
+        group = store.set_topic(
+            group["id"],
+            "" if getattr(args, "clear", False) else (text or ""),
+            created_by=own_hash,
+        )
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_group(group, registry)
+    if _json_mode(args):
+        _emit({"group": described}, True)
+        return _EXIT_OK
+    if group.get("topic"):
+        print(f"topic for {group['name']} ({group['id'][:8]}): {group['topic']}")
+    else:
+        print(f"cleared the topic for {group['name']} ({group['id'][:8]})")
+    print("Members learn the new topic from the next message sent to it.")
+    return _EXIT_OK
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:

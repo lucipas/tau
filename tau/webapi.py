@@ -3509,6 +3509,7 @@ class WebBridge:
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
+            "topic": group.get("topic", ""),
         }
 
     def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:

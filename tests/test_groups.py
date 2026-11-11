@@ -23,7 +23,9 @@ from tau.mailbox import Mailbox, open_message, seal_message
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
+    MAX_GROUP_TOPIC_LENGTH,
     ProtocolError,
+    clean_group_topic,
     decode,
     derive_group_id,
     encode_group_message,
@@ -105,7 +107,57 @@ def test_group_message_roundtrip():
     assert parsed["sent_at"] == 123.0
 
 
-def test_group_id_derives_from_creator_name_and_roster():
+def test_group_message_roundtrip_with_topic():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    payload = encode_group_message(
+        "hi all",
+        message_id="gm-1",
+        group_id=group_id,
+        group_name="weekend",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+        group_topic="planning the meetup",
+    )
+    parsed = parse_group_message(payload)
+    assert parsed["group_topic"] == "planning the meetup"
+    # Clearing is a present empty topic, not an absent one.
+    cleared = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            group_topic="",
+        )
+    )
+    assert cleared["group_topic"] == ""
+    # A sender that predates topics omits the field: the local topic
+    # must be left alone, so parse reports None.
+    legacy = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+        )
+    )
+    assert legacy["group_topic"] is None
+
+
+def test_clean_group_topic_truncates_and_collapses():
+    assert clean_group_topic("  planning   the  meetup ") == "planning the meetup"
+    assert clean_group_topic("hello\n") == "hello"
+    assert clean_group_topic("") == ""
+    assert clean_group_topic(None) == ""
+    assert clean_group_topic(123) == ""
+    long_topic = "x" * (MAX_GROUP_TOPIC_LENGTH + 10)
+    assert clean_group_topic(long_topic) == "x" * MAX_GROUP_TOPIC_LENGTH
     members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
     first = derive_group_id(OWN_HASH, "weekend", members)
     # Order-independent and deterministic.
@@ -324,6 +376,136 @@ def test_group_store_update_members_adds_and_removes(tmp_path):
     )
     assert shrunk["members"] == [OWN_HASH, THIRD_HASH]
     assert len(store) == 1
+
+
+def test_group_store_set_topic(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert group["topic"] == ""
+    updated = store.set_topic(group["id"], "planning the meetup", created_by=OWN_HASH)
+    assert updated["topic"] == "planning the meetup"
+    assert updated["topic_sent_at"] is not None
+    # Setting the same topic again is a no-op returning the record.
+    assert store.set_topic(group["id"], "planning the meetup", created_by=OWN_HASH) == updated
+    # Clearing, and the change survives a reload.
+    cleared = store.set_topic(group["id"], "", created_by=OWN_HASH)
+    assert cleared["topic"] == ""
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group["id"])["topic"] == ""
+    # Only the creator can set it; a learned group is refused too.
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_topic(group["id"], "forged", created_by=OTHER_HASH)
+    learned = store.record(
+        derive_group_id(OTHER_HASH, "other", [OTHER_HASH, THIRD_HASH]),
+        "other",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+    )
+    assert learned is not None
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_topic(learned["id"], "forged", created_by=OTHER_HASH)
+    with pytest.raises(ValueError, match="unknown group"):
+        store.set_topic(generate_group_id(), "nope", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="longer than"):
+        store.set_topic(
+            group["id"], "x" * (MAX_GROUP_TOPIC_LENGTH + 1), created_by=OWN_HASH
+        )
+
+
+def test_group_store_topic_survives_roster_change(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with_topic = store.set_topic(
+        group["id"], "planning the meetup", created_by=OWN_HASH
+    )
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["topic"] == "planning the meetup"
+    assert grown["topic_sent_at"] == with_topic["topic_sent_at"]
+    assert store.get(grown["id"])["topic"] == "planning the meetup"
+
+
+def test_group_store_record_topic_pinning(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    # First sighting from the creator carries the topic.
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert pinned is not None and pinned["topic"] == "planning the meetup"
+    assert pinned["topic_sent_at"] == 100.0
+    # A member-carried message cannot set (or forge) the topic.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+            topic="forged",
+        )["topic"]
+        == "planning the meetup"
+    )
+    # A sender that predates topics leaves the topic alone.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=200.0,
+        )["topic"]
+        == "planning the meetup"
+    )
+    # A newer creator message replaces it; a stale queued copy does not.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=300.0,
+            topic="new plan",
+        )["topic"]
+        == "new plan"
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=250.0,
+            topic="planning the meetup",
+        )["topic"]
+        == "new plan"
+    )
+    # The creator clearing the topic sends "" with a newer sent_at.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=400.0,
+            topic="",
+        )["topic"]
+        == ""
+    )
 
 
 def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
@@ -1171,6 +1353,60 @@ def test_group_message_stale_creator_message_does_not_replace_successor(
     assert node.groups.get(new_id) is not None
     assert node.groups.get(group_id) is not None
     assert node.groups.find("weekend")["id"] == new_id
+
+
+def test_group_message_topic_pinned_from_creator_only(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def send(sender, text, *, topic=None, sent_at, message_id):
+        kwargs = {}
+        if topic is not None:
+            kwargs["group_topic"] = topic
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    first = send(creator, "first", topic="planning the meetup", sent_at=100.0, message_id="gm-t1")
+    assert first["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "planning the meetup"
+    # A member's message carries whatever topic they know; it must not
+    # set (or forge) the group's topic.
+    forged = send(member, "forged", topic="forged topic", sent_at=150.0, message_id="gm-t2")
+    assert forged["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "planning the meetup"
+    # A newer creator message replaces the topic...
+    second = send(creator, "second", topic="new plan", sent_at=200.0, message_id="gm-t3")
+    assert second["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # ...but a queued creator copy sent before it does not.
+    stale = send(creator, "stale", topic="planning the meetup", sent_at=150.0, message_id="gm-t4")
+    assert stale["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # A creator message from a client that predates topics leaves it.
+    legacy = send(creator, "legacy", sent_at=250.0, message_id="gm-t5")
+    assert legacy["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # Clearing sends an empty topic with a newer sent_at.
+    cleared = send(creator, "cleared", topic="", sent_at=300.0, message_id="gm-t6")
+    assert cleared["ok"] is True
+    assert node.groups.get(group_id)["topic"] == ""
+    assert len(received) == 6
 
 
 def test_group_message_dedupes_by_id(tmp_path):

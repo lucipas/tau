@@ -1219,6 +1219,7 @@ def test_api_groups_lists_known_groups(bridge, node, tmp_path):
     assert payload["count"] == 1
     group = payload["groups"][0]
     assert group["name"] == "weekend"
+    assert group["topic"] == ""
     assert [member["hash"] for member in group["members"]] == [
         PEER_HASH,
         OTHER_HASH,

@@ -1517,6 +1517,7 @@ class TauNode:
             creator=creator,
             sender=sender_hash or "",
             sent_at=sent_at,
+            topic=group.get("topic"),
         )
 
     def _handle_group_message(
@@ -1570,6 +1571,7 @@ class TauNode:
                 "name": message["group_name"],
                 "creator": message["creator"],
                 "members": message["members"],
+                "topic": message.get("group_topic"),
             },
             sent_at=message.get("sent_at"),
         )
@@ -2268,6 +2270,23 @@ class TauNode:
         except TimeoutError:
             return True
 
+    def _current_group_topic(self, group_id: Optional[str]) -> str:
+        """The topic a queued group message should carry on retry.
+
+        Read from the store at delivery time, so a topic set or cleared
+        after queueing travels with the retry.  A group that is gone
+        (deleted, or roster-changed into a successor) carries none.
+        """
+        if not group_id:
+            return ""
+        try:
+            # find() reloads from disk, so a topic set by another
+            # process (``tau group topic`` while serving) is seen.
+            group = self.groups.find(group_id)
+        except (ValueError, OSError):  # unknown group, or unreadable store
+            return ""
+        return str(group.get("topic", "") or "")
+
     def _deliver_entry(
         self,
         peer: Peer,
@@ -2310,6 +2329,10 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                # Re-read the topic at retry time, not queue time: a
+                # topic set or cleared after queueing travels with the
+                # retry, and a stale queued copy cannot resurrect one.
+                group_topic=self._current_group_topic(entry.group_id),
             )
             if entry.group_id is not None
             else encode_message(
@@ -3381,6 +3404,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                group_topic=group.get("topic", ""),
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3396,6 +3420,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                group_topic=group.get("topic", ""),
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:
