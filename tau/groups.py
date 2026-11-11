@@ -389,6 +389,75 @@ class GroupStore:
                 raise
         return dict(candidate)
 
+    def rename(
+        self, group_id: str, new_name: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Rename a group this node created.
+
+        The group id derives from the name, so a renamed group is a new
+        group: the successor (same roster, new name, new id, same
+        ``created_at``) is created and the old record deleted inside
+        one transaction, so the local cap cannot block a net-zero
+        change and a failure cannot leave both groups or neither.  The
+        old id is retired (persisted): a replayed old message cannot
+        restore the pre-rename name, and the retirement is lifted if
+        the name is ever changed back to it.  The new name is
+        sanitized exactly as :func:`tau.protocol.sanitize_group_name`
+        sanitizes it at creation, so a blank name becomes ``"group"``.
+
+        Raises :class:`ValueError` when the group is unknown or was
+        not created by this node, and :class:`OSError` when the write
+        fails (the store is left as it was on disk).
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can rename a group")
+            name = sanitize_group_name(new_name)
+            try:
+                new_id = derive_group_id(
+                    existing["creator"], name, existing["members"]
+                )
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
+            if new_id == existing["id"]:
+                return dict(existing)
+            if new_id in self._groups:  # pragma: no cover - hash collision
+                raise ValueError("group id already exists with another roster")
+            candidate = _valid_group(
+                {
+                    "id": new_id,
+                    "name": name,
+                    "members": existing["members"],
+                    "created_at": existing["created_at"],
+                    "creator": existing["creator"],
+                    "created_by": existing["creator"],
+                    "local": True,
+                    "roster_sent_at": existing.get("roster_sent_at"),
+                }
+            )
+            if candidate is None:
+                raise ValueError("invalid group: the creator must be a member")
+            snapshot = self._snapshot()
+            del self._groups[existing["id"]]
+            self._groups[new_id] = candidate
+            if existing["id"] not in self._retired:
+                self._retired.append(existing["id"])
+                if len(self._retired) > MAX_RETIRED_GROUPS:
+                    del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+            if new_id in self._retired:
+                # The name is live again (renamed back to it), so the
+                # old id must not stay retired.
+                self._retired.remove(new_id)
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(candidate)
+
     def record(
         self,
         group_id: str,

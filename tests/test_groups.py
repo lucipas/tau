@@ -769,6 +769,99 @@ def test_group_store_update_members_save_failure_rolls_back(
     assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
 
 
+def test_group_store_rename(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    created_at = group["created_at"]
+    renamed = store.rename(group["id"], "  road trip ", created_by=OWN_HASH)
+    assert renamed["id"] == derive_group_id(
+        OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH]
+    )
+    assert renamed["id"] != group["id"]
+    assert renamed["name"] == "road trip"
+    assert renamed["members"] == [OWN_HASH, OTHER_HASH]
+    assert renamed["created_at"] == created_at
+    assert renamed["local"] is True
+    assert store.get(group["id"]) is None
+    assert store.get(renamed["id"]) == renamed
+    assert len(store) == 1
+    with pytest.raises(ValueError, match="unknown group"):
+        store.find("weekend")
+    assert store.find("road trip") == renamed
+    # Renaming to the current name is a no-op: the same record comes back.
+    assert store.rename(renamed["id"], "road trip", created_by=OWN_HASH) == renamed
+    # A blank name sanitizes to "group", exactly as at creation.
+    blank = store.rename(renamed["id"], "   ", created_by=OWN_HASH)
+    assert blank["name"] == "group"
+    assert blank["id"] == derive_group_id(
+        OWN_HASH, "group", [OWN_HASH, OTHER_HASH]
+    )
+
+
+def test_group_store_rename_refusals(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    learned = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert learned is not None
+    with pytest.raises(ValueError, match="unknown group"):
+        store.rename("00" * 16, "new", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="only the creator"):
+        store.rename(learned["id"], "new", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="only the creator"):
+        store.rename(group["id"], "new", created_by=OTHER_HASH)
+    # Refusals leave the store untouched.
+    assert store.get(group["id"]) == group
+    assert len(store) == 2
+
+
+def test_group_store_rename_retires_old_name(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    renamed = store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    # The old id is retired: a replayed old message cannot restore it.
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Renaming back lifts the retirement.
+    restored = store.rename(renamed["id"], "weekend", created_by=OWN_HASH)
+    assert restored["id"] == group["id"]
+    assert store.delete(restored["id"]) is True
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is not None
+    )
+
+
+def test_group_store_rename_save_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.groups as groups_module
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(groups_module, "atomic_write_json", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    # Neither the old record lost nor the successor kept.
+    assert store.get(group["id"]) == group
+    assert len(store) == 1
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
+
+
 def test_group_store_save_failure_rolls_back(tmp_path, monkeypatch):
     import tau.groups as groups_module
 
@@ -1889,6 +1982,87 @@ def test_group_change_members_refusals(tmp_path, capsys, monkeypatch):
     # Refusals leave the store untouched.
     assert store.list_groups() != []
     assert store.get(group["id"]) == group
+
+
+def test_group_rename_via_cli(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "weekend",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "renamed group 'weekend' to 'road trip'" in out
+    assert group["id"][:8] in out
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+    renamed = store.list_groups()[0]
+    assert renamed["name"] == "road trip"
+    assert renamed["id"] == derive_group_id(
+        OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH]
+    )
+    assert store.get(group["id"]) is None
+
+
+def test_group_rename_json_and_same_name(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "weekend",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["previous_id"] == group["id"]
+    assert payload["group"]["name"] == "road trip"
+    # Renaming to the current name is a no-op.
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "road trip",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "already has that name" in capsys.readouterr().out
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+
+
+def test_group_rename_refusals(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    data_dir = str(tmp_path / "node")
+    store = GroupStore(config.groups_path)
+    learned_id = derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        learned_id, "theirs", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+    )
+
+    def _run(argv):
+        code = cli.main([*argv, "--data-dir", data_dir])
+        assert code != 0
+        return capsys.readouterr().err
+
+    assert "only the creator" in _run(["group", "rename", "theirs", "new"])
+    assert "unknown group" in _run(["group", "rename", "nope", "new"])
+    # Refusals leave the store untouched.
+    assert store.get(group["id"]) == group
+    assert len(store) == 2
 
 
 def test_messages_group_filter(tmp_path, capsys):

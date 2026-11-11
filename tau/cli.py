@@ -1042,6 +1042,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_rename = group_sub.add_parser(
+        "rename",
+        parents=[common],
+        help="rename a group you created",
+    )
+    group_rename.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_rename.add_argument("name", metavar="NAME", help="the new group name")
+    group_rename.set_defaults(func=cmd_group_rename)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -5731,6 +5742,47 @@ def cmd_group_add_member(args: argparse.Namespace) -> int:
 
 def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
+
+
+def cmd_group_rename(args: argparse.Namespace) -> int:
+    """Rename a group this node created.
+
+    The id derives from the name, so the rename is a successor group
+    (same roster, new id); the store swaps the old record for the new
+    one in a single transaction.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can rename a group")
+        new_group = node.groups.rename(
+            group["id"], args.name, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described, "previous_id": group["id"]}, True)
+        return _EXIT_OK
+    if new_group["id"] == group["id"]:
+        print(
+            f"group {new_group['name']} ({new_group['id'][:8]})"
+            " already has that name"
+        )
+    else:
+        print(
+            f"renamed group {group['name']!r} to {new_group['name']!r}"
+            f" ({group['id'][:8]} -> {new_group['id'][:8]})"
+        )
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the new name from the next message sent to it.")
+    return _EXIT_OK
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
