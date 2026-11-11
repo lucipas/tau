@@ -34,6 +34,7 @@ script) can read what arrives from the mesh and send messages back:
                            message carries a wire id)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    GET  /api/backup       download a backup archive of the data directory
     GET  /api/doctor       health verdicts for the data directory (``tau doctor``)
     POST /api/bundle/export build a signed sneakernet bundle
                            ``{"include_tan": true}`` for Tan posts too
@@ -93,7 +94,9 @@ import json
 import logging
 import math
 import mimetypes
+import os
 import queue
+import shutil
 import socket
 import sys
 import tempfile
@@ -101,6 +104,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -109,6 +113,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
 from .allowlist import AllowListError, clean_destination
+from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
 from .config import MESSAGES_FILE_NAME
@@ -158,6 +163,11 @@ MAX_EVENT_LOG = 500
 # reported as ``total`` so the console can say when a list is truncated.
 MAX_LIKERS = 100
 MAX_SUBSCRIBERS = 32
+# Backup archives in flight at once (being built or still streaming).  Each
+# one is a full copy of the data directory in temporary storage.
+MAX_CONCURRENT_BACKUPS = 2
+# How long shutdown waits for an archive build to finish before cleanup.
+_BACKUP_SHUTDOWN_WAIT = 3.0
 SUBSCRIBER_QUEUE_SIZE = 256
 SSE_HEARTBEAT_SECONDS = 15.0
 
@@ -270,6 +280,13 @@ def _check_web_console_bind_windows(host: str, port: int) -> None:
         "listening there. Stop it, or choose a different "
         "console port with --http"
     )
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _is_local_origin(origin: str) -> bool:
@@ -656,6 +673,12 @@ class WebBridge:
         self._server: Optional[_WebServer] = None
         self._thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
+        # Backup bookkeeping, guarded by _backup_lock: archives being built,
+        # archives awaiting download, and the temp paths to clean up on stop.
+        self._backup_lock = threading.Lock()
+        self._backup_idle = threading.Condition(self._backup_lock)
+        self._backups_building = 0
+        self._backup_artifacts: Set[Path] = set()
         self._started_at = time.time()
 
     # -- lifecycle ---------------------------------------------------------
@@ -683,7 +706,8 @@ class WebBridge:
         return self.url
 
     def stop(self) -> None:
-        self._closing.set()
+        with self._backup_lock:
+            self._closing.set()
         self.bus.close()
         server = self._server
         self._server = None
@@ -694,6 +718,24 @@ class WebBridge:
         self._thread = None
         if thread is not None:
             thread.join(timeout=3.0)
+        # Request threads are daemons and may outlive this call.  Let any
+        # archive build finish (so its staging file is renamed or removed),
+        # then delete every archive still on disk: each holds the identity.
+        with self._backup_lock:
+            self._backup_idle.wait_for(
+                lambda: self._backups_building == 0,
+                timeout=_BACKUP_SHUTDOWN_WAIT,
+            )
+            leftovers = list(self._backup_artifacts)
+            self._backup_artifacts.clear()
+        for path in leftovers:
+            _unlink_quietly(path)
+
+    def finish_backup(self, path: Path) -> None:
+        """Release an archive returned by :meth:`backup` and delete it."""
+        with self._backup_lock:
+            self._backup_artifacts.discard(path)
+        _unlink_quietly(path)
 
     # -- message history ---------------------------------------------------
 
@@ -2940,6 +2982,83 @@ class WebBridge:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
 
+    def backup(self) -> Dict[str, Any]:
+        """Write a backup archive of the live data directory.
+
+        The bridge runs inside the serving node, so the archive is
+        built with the live backup path: the instance lock is skipped
+        (this process already holds it), each state file is read
+        through a stable descriptor, because the node's own writes are
+        atomic, and the mailbox is read under its transaction, so a
+        delivery cannot land between the seen-marker and inbox writes
+        (deliveries hold the same transaction across both steps).
+        Returns the archive's temp path, download filename, manifest
+        file list and size; the caller streams the file and removes
+        it.  Raises :class:`WebBridgeError` when this node has no data
+        directory to back up.
+        """
+        config = getattr(self.node, "config", None)
+        if config is None or getattr(config, "data_dir", None) is None:
+            raise WebBridgeError("this node has no data directory to back up")
+        with self._backup_lock:
+            if self._closing.is_set():
+                raise WebBridgeError("the web console is shutting down")
+            if self._backups_building + len(self._backup_artifacts) >= (
+                MAX_CONCURRENT_BACKUPS
+            ):
+                raise WebBridgeError(
+                    "too many backups in progress; try again shortly"
+                )
+            self._backups_building += 1
+        try:
+            result = self._build_backup(config)
+        finally:
+            with self._backup_lock:
+                self._backups_building -= 1
+                self._backup_idle.notify_all()
+        target = Path(result["path"])
+        with self._backup_lock:
+            if self._closing.is_set():
+                _unlink_quietly(target)
+                raise WebBridgeError("the web console is shutting down")
+            self._backup_artifacts.add(target)
+        return result
+
+    def _build_backup(self, config: Any) -> Dict[str, Any]:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"tau-backup-{_backup_name(config.name)}-{stamp}.tar.gz"
+        fd, tmp_name = tempfile.mkstemp(prefix="tau-backup-", suffix=".tar.gz")
+        os.close(fd)
+        target = Path(tmp_name)
+        try:
+            # create_backup refuses an existing target without --force;
+            # the mkstemp file only reserved the name.
+            target.unlink()
+            # Hold the mailbox transaction while the archive is read.
+            # Delivery marks a message seen (mailbox) and then records
+            # it in the inbox, and holds this same transaction across
+            # both steps — so a snapshot between those two writes would
+            # restore a seen marker with no inbox entry, and the
+            # message would then be rejected as already seen and lost.
+            # Holding it here makes the backup see either both writes
+            # or neither.  The mail sweep lock alone would not cover
+            # this: direct deliveries never take it.
+            mailbox = getattr(self.node, "mailbox", None)
+            if mailbox is not None:
+                with mailbox.transaction():
+                    _, manifest = create_backup(config, target, live=True)
+            else:
+                _, manifest = create_backup(config, target, live=True)
+        except BaseException:
+            _unlink_quietly(target)
+            raise
+        return {
+            "path": str(target),
+            "filename": filename,
+            "files": manifest.get("files", []),
+            "size": target.stat().st_size,
+        }
+
     # -- snapshots ---------------------------------------------------------
 
     def peers(self) -> List[Dict[str, Any]]:
@@ -3613,6 +3732,19 @@ def _with_reaction(
     return kept
 
 
+def _backup_name(name: Any) -> str:
+    """Node name made safe for a download filename.
+
+    Keeps letters, digits and ``-_.``; anything else becomes ``-``.
+    A name with nothing keepable falls back to ``node``.
+    """
+    cleaned = "".join(
+        char if char.isascii() and (char.isalnum() or char in "-_.") else "-"
+        for char in str(name or "")
+    ).strip(".-")
+    return cleaned[:64] or "node"
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -3785,6 +3917,26 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
                 return
+            if path == "/api/backup":
+                try:
+                    result = self.bridge.backup()
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                    return
+                except BackupError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 500
+                    )
+                    return
+                archive = Path(result["path"])
+                try:
+                    self._send_file(archive, result["filename"], head_only)
+                finally:
+                    # The archive holds the node identity: never leave
+                    # the temp file behind after the download.
+                    self.bridge.finish_backup(archive)
             if path == "/api/doctor":
                 try:
                     self._send_json(self.bridge.doctor(), head_only)
@@ -5118,6 +5270,36 @@ class _WebHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Max-Age", "600")
+            # Lets cross-origin console pages read the download's filename.
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
+
+    def _send_file(
+        self, path: Path, filename: str, head_only: bool = False
+    ) -> None:
+        """Stream *path* as a download named *filename*."""
+        # Open before any header is committed: a missing or unreadable
+        # archive then reaches the caller as an ordinary error response.
+        with path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"'
+            )
+            self.send_header("Cache-Control", "no-store")
+            self._cors_headers()
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if head_only:
+                return
+            try:
+                shutil.copyfileobj(handle, self.wfile)
+            except OSError:
+                # The 200 and headers are already on the wire, so a second
+                # response would corrupt the reply.  Log, and drop the
+                # connection so the client sees a truncated transfer.
+                log.warning("backup download aborted", exc_info=True)
+                self.close_connection = True
 
     def _send_json(
         self,

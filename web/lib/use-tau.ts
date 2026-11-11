@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiGet, apiPost, apiPostText, eventsUrl } from "./api";
+import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
   AllowlistResponse,
   BlockPeerResponse,
@@ -132,6 +132,8 @@ export function useTau() {
   >({});
   const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupError, setBackupError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const snapshotMax = useRef(0);
@@ -740,6 +742,32 @@ export function useTau() {
     }
   }, []);
 
+  const backup = useCallback(async () => {
+    // A failed download leaves the error on the button until the next
+    // attempt; a success needs no confirmation — the file is in the
+    // browser's download folder.
+    setBackingUp(true);
+    setBackupError(null);
+    try {
+      const { blob, filename } = await apiDownload("/api/backup");
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setBackupError(
+        error instanceof Error ? error.message : "backup failed",
+      );
+    } finally {
+      setBackingUp(false);
+    }
+  }, []);
+
+
   const forgetPeer = useCallback(
     async (destination: string, force = false) => {
       const result = await apiPost<ForgetPeerResponse>("/api/peers/forget", {
@@ -1191,6 +1219,8 @@ export function useTau() {
     verifications,
     blocks,
     announcing,
+    backingUp,
+    backupError,
     exporting,
     importing,
     send,
@@ -1204,6 +1234,7 @@ export function useTau() {
     blockPeer,
     unblockPeer,
     announce,
+    backup,
     runDoctor,
     markRead,
     setPeerAlias,
