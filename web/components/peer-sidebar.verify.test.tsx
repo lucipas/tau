@@ -38,11 +38,13 @@ function renderSidebar({
       bridge={null}
       social={null}
       pings={{}}
+      infos={{}}
       blocks={{}}
       verifications={verifications}
       unread={{}}
       selected=""
       onPing={() => {}}
+      onInfo={() => {}}
       onForgetPeer={async () => {}}
       onBlock={() => {}}
       onUnblock={() => {}}

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
 import type { NodeInfo, Peer, SocialInfo, TauGroup } from "@/lib/types";
+import type { PeerInfoState } from "@/lib/use-tau";
 
 import { PeerSidebar } from "./peer-sidebar";
 
@@ -48,35 +49,48 @@ function makeGroup(overrides: Partial<TauGroup> = {}): TauGroup {
 }
 
 
+type SidebarOptions = {
+  peers?: Peer[];
+  onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  groups?: TauGroup[];
+  onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
+  onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  node?: NodeInfo | null;
+  social?: SocialInfo | null;
+  blocks?: Record<string, { pending?: boolean; error?: string }>;
+  onBlock?: (destination: string) => void;
+  onUnblock?: (destination: string) => void;
+  onForgetPeer?: (destination: string, force: boolean) => Promise<void>;
+  infos?: Record<string, PeerInfoState>;
+  onInfo?: (destination: string) => void;
+};
+
 function renderSidebar(
   unread: Record<string, number>,
   onSelectPeer = vi.fn(),
   third:
+    | Record<string, PeerInfoState>
     | ((destination: string, force: boolean) => Promise<void>)
-    | {
-        peers?: Peer[];
-        onSetAlias?: (
-          destination: string,
-          alias: string | null,
-        ) => Promise<Peer>;
-        groups?: TauGroup[];
-        onCreateGroup?: (
-          name: string,
-          members: string[],
-        ) => Promise<TauGroup>;
-        onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
-        node?: NodeInfo | null;
-        social?: SocialInfo | null;
-        blocks?: Record<string, { pending?: boolean; error?: string }>;
-        onBlock?: (destination: string) => void;
-        onUnblock?: (destination: string) => void;
-        onForgetPeer?: (
-          destination: string,
-          force: boolean,
-        ) => Promise<void>;
-      } = {},
+    | SidebarOptions = {},
+  onInfo = vi.fn(),
 ) {
-  const options = typeof third === "function" ? {} : third;
+  // The branch's peer-info tests pass the infos record positionally as the
+  // third argument; the options object carries the same record as `infos`.
+  const infosRecord =
+    typeof third !== "function" &&
+    Object.values(third).some(
+      (value) =>
+        value !== null &&
+        typeof value === "object" &&
+        ("info" in value || "pending" in value || "error" in value),
+    );
+  const options: SidebarOptions =
+    typeof third === "function" || infosRecord
+      ? {}
+      : (third as unknown as SidebarOptions);
+  const infos = infosRecord
+    ? (third as Record<string, PeerInfoState>)
+    : (options.infos ?? {});
   const onForgetPeer =
     typeof third === "function" ? third : (options.onForgetPeer ?? vi.fn());
   const onSetAlias =
@@ -95,11 +109,13 @@ function renderSidebar(
       bridge={null}
       social={options.social ?? null}
       pings={{}}
+      infos={infos}
       blocks={options.blocks ?? {}}
       verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
+      onInfo={options.onInfo ?? onInfo}
       onForgetPeer={onForgetPeer}
       onBlock={options.onBlock ?? (() => {})}
       onUnblock={options.onUnblock ?? (() => {})}
@@ -142,6 +158,63 @@ describe("PeerSidebar unread badges", () => {
     renderSidebar({ ["ab".repeat(16)]: 150 });
 
     expect(screen.getByTitle("150 unread messages").textContent).toBe("99+");
+  });
+});
+
+describe("PeerSidebar peer info", () => {
+  const aliceHash = "ab".repeat(16);
+
+  it("asks for info when the info button is clicked", () => {
+    const onInfo = vi.fn();
+    renderSidebar({}, vi.fn(), {}, onInfo);
+
+    fireEvent.click(screen.getByLabelText("Show info for alice"));
+    expect(onInfo).toHaveBeenCalledWith(aliceHash);
+  });
+
+  it("shows the reported version, protocol, uptime, peers and LXMF state", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        [aliceHash]: {
+          info: {
+            version: "0.2.0",
+            rns_version: "0.9.3",
+            protocol: 1,
+            uptime: 3661,
+            peers: 3,
+            lxmf_enabled: true,
+          },
+        },
+      },
+    );
+
+    expect(
+      screen.getByText(
+        "tau 0.2.0 · RNS 0.9.3 · protocol 1 · up 1h 01m · 3 peers · lxmf on",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("shows a pending line while asking the peer", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { pending: true } });
+
+    expect(screen.getByText("asking peer…")).toBeTruthy();
+  });
+
+  it("shows the error when the peer does not answer", () => {
+    renderSidebar({}, vi.fn(), {
+      [aliceHash]: { error: "peer did not answer" },
+    });
+
+    expect(screen.getByText("peer did not answer")).toBeTruthy();
+  });
+
+  it("says so when the peer answers with no usable info", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { info: {} } });
+
+    expect(screen.getByText("answered with no usable info")).toBeTruthy();
   });
 });
 

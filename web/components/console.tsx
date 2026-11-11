@@ -157,12 +157,16 @@ export function Console() {
             bridge={tau.bridge}
             social={tau.social}
             pings={tau.pings}
+            infos={tau.infos}
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
+            }}
+            onInfo={(destination) => {
+              void tau.fetchInfo(destination);
             }}
             onForgetPeer={async (destination, force) => {
               const removed = await tau.forgetPeer(destination, force);

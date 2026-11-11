@@ -206,6 +206,22 @@ export interface PingResult {
   rtt_ms: number | null;
 }
 
+export interface PeerInfo {
+  name?: string;
+  version?: string;
+  rns_version?: string;
+  protocol?: number;
+  uptime?: number;
+  peers?: number;
+  lxmf_enabled?: boolean;
+}
+
+export interface PeerInfoResult {
+  ok: boolean;
+  peer: Peer;
+  info: PeerInfo;
+}
+
 export interface SafetyNumberResult {
   peer: string;
   name: string;

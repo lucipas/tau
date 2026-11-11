@@ -11,7 +11,7 @@ import type {
   TauGroup,
   VerifyState,
 } from "@/lib/types";
-import type { BlockState, PingState } from "@/lib/use-tau";
+import type { BlockState, PeerInfoState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
   formatRtt,
@@ -20,7 +20,7 @@ import {
 } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
 
-import { CopyButton, PingIcon, SectionLabel, SignalIcon } from "./ui";
+import { CopyButton, InfoIcon, PingIcon, SectionLabel, SignalIcon } from "./ui";
 
 export function PeerSidebar({
   node,
@@ -29,11 +29,13 @@ export function PeerSidebar({
   bridge,
   social,
   pings,
+  infos,
   blocks,
   verifications,
   unread,
   selected,
   onPing,
+  onInfo,
   onForgetPeer,
   onBlock,
   onUnblock,
@@ -51,11 +53,13 @@ export function PeerSidebar({
   bridge: BridgeInfo | null;
   social: SocialInfo | null;
   pings: Record<string, PingState>;
+  infos: Record<string, PeerInfoState>;
   blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onInfo: (destination: string) => void;
   onForgetPeer: (destination: string, force: boolean) => Promise<void>;
   onBlock: (destination: string) => void;
   onUnblock: (destination: string) => void;
@@ -397,6 +401,26 @@ export function PeerSidebar({
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
             {peers.map((peer) => {
               const ping = pings[peer.destination];
+              const info = infos[peer.destination];
+              const infoParts: string[] = [];
+              if (info?.info) {
+                const reported = info.info;
+                if (reported.version) infoParts.push(`tau ${reported.version}`);
+                if (reported.rns_version)
+                  infoParts.push(`RNS ${reported.rns_version}`);
+                if (reported.protocol !== undefined)
+                  infoParts.push(`protocol ${reported.protocol}`);
+                if (reported.uptime !== undefined)
+                  infoParts.push(`up ${formatUptime(reported.uptime)}`);
+                if (reported.peers !== undefined)
+                  infoParts.push(
+                    `${reported.peers} peer${reported.peers === 1 ? "" : "s"}`,
+                  );
+                if (reported.lxmf_enabled !== undefined)
+                  infoParts.push(
+                    reported.lxmf_enabled ? "lxmf on" : "lxmf off",
+                  );
+              }
               const block = blocks[peer.destination];
               const verification = verifications[peer.destination];
               const age = now
@@ -599,6 +623,20 @@ export function PeerSidebar({
                             ? "confirm forget"
                             : "forget"}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => onInfo(peer.destination)}
+                        disabled={info?.pending}
+                        aria-label={`Show info for ${peer.name}`}
+                        title="Show peer info (version, uptime, peers)"
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                      >
+                        <InfoIcon
+                          className={`h-3.5 w-3.5 ${
+                            info?.pending ? "animate-pulse" : ""
+                          }`}
+                        />
+                      </button>
                       </div>
                     </div>
                     {isEditingAlias ? (
@@ -670,6 +708,25 @@ export function PeerSidebar({
                           : ping.error
                             ? ping.error
                             : `pong ${formatRtt(ping.rtt_ms)}`}
+                      </p>
+                    ) : null}
+                    {info ? (
+                      <p
+                        className={`mt-1 pl-[42px] font-mono text-[10px] ${
+                          info.error
+                            ? "text-rose-300"
+                            : info.pending
+                              ? "text-mist"
+                              : "text-zinc-300"
+                        }`}
+                      >
+                        {info.pending
+                          ? "asking peer…"
+                          : info.error
+                            ? info.error
+                            : infoParts.length > 0
+                              ? infoParts.join(" · ")
+                              : "answered with no usable info"}
                       </p>
                     ) : null}
                     {forgetErrors[peer.destination] ? (

@@ -26,6 +26,7 @@ from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
+from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import (
     PeerForgetBlocked,
@@ -288,7 +289,8 @@ class FakeNode:
     def resolve_peer(self, target, *, timeout=10.0):
         if target in ("alice", PEER_HASH):
             return self.registry.all()[0]
-        raise ValueError(f"unknown peer: {target}")
+        # Mirror TauNode.resolve_peer: an unknown name is a NodeError.
+        raise NodeError(f"unknown peer: {target}")
 
     def send_message(
         self,
@@ -388,6 +390,20 @@ class FakeNode:
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
         return {"ok": True, "pong": True, "server": self.name, "_rtt": 0.004}
+
+    def request_info(self, peer, *, timeout=15.0, discover_timeout=None):
+        return {
+            "ok": True,
+            "name": peer.name,
+            "destination": peer.destination_hash.hex(),
+            "protocol": 1,
+            "version": "0.2.0",
+            "rns_version": "0.9.0",
+            "uptime": 3600.0,
+            "peers": 3,
+            "lxmf": {"enabled": True, "delivery": "ab" * 16},
+            "caller": "tester",
+        }
 
     def announce(self):
         self.announced += 1
@@ -1490,6 +1506,77 @@ def test_ping_peer(bridge):
     assert status == 200
     assert payload["rtt_ms"] == 4.0
     assert payload["peer"]["destination"] == PEER_HASH
+
+
+def test_ping_unknown_peer(bridge):
+    status, _, _ = _json(bridge, "/api/ping", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info(bridge):
+    status, _, payload = _json(bridge, "/api/info", method="POST", body={"to": "alice"})
+    assert status == 200
+    assert payload["peer"]["destination"] == PEER_HASH
+    assert payload["info"]["version"] == "0.2.0"
+    assert payload["info"]["protocol"] == 1
+    assert payload["info"]["uptime"] == 3600.0
+    assert payload["info"]["peers"] == 3
+    assert payload["info"]["lxmf_enabled"] is True
+
+
+def test_peer_info_unknown_peer(bridge):
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info_missing_target(bridge):
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={})
+    assert status == 400
+
+
+def test_peer_info_unknown_name_from_real_resolver(bridge, node, monkeypatch):
+    from tau.node import NodeError
+
+    def resolve(target, *, timeout=10.0):
+        raise NodeError(f"unknown peer: {target!r}")
+
+    monkeypatch.setattr(node, "resolve_peer", resolve)
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge, "/api/info", method="POST", body={"to": "alice", "timeout": 10**400}
+    )
+    assert status == 200
+    assert payload["info"]["version"] == "0.2.0"
+
+
+def test_public_peer_info_drops_non_finite_numbers():
+    from tau.webapi import _public_peer_info
+
+    info = _public_peer_info(
+        {"protocol": float("nan"), "uptime": float("inf"), "peers": 2}
+    )
+    assert info == {"peers": 2}
+
+
+def test_public_peer_info_drops_unexpected_types():
+    from tau.webapi import _public_peer_info
+
+    info = _public_peer_info(
+        {
+            "name": "bob",
+            "version": 3,
+            "rns_version": "0.9.0",
+            "protocol": 2,
+            "uptime": "soon",
+            "peers": True,
+            "lxmf": {"enabled": "yes"},
+        }
+    )
+    assert info == {"name": "bob", "rns_version": "0.9.0", "protocol": 2}
 
 
 def test_forget_peer(bridge, node):
