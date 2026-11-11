@@ -7,7 +7,8 @@ encrypted Reticulum ``Link``:
 
     /tau/ping     -> liveness and clock information
     /tau/info     -> static node information
-    /tau/message  -> deliver a text message, echo it back
+    /tau/message  -> deliver a text message (optionally tagged with a
+                     kind, default ``chat``), echo it back
     /tau/file     -> offer a small file transfer (signed header first;
                     the bytes follow over an RNS Resource on the same link)
     /tau/peers    -> ask a peer which peers it has heard from; the answer
@@ -24,6 +25,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -41,6 +43,23 @@ DEFAULT_TCP_PORT = 4343
 
 MAX_NAME_LENGTH = 48
 MAX_MESSAGE_CHARS = 2000
+# Message kinds (``tau send --kind``): a short lowercase slug tagging what
+# a DM is for — ``chat`` is plain conversation, anything else is a typed
+# message a receiver can filter on.  The wire field is optional so old
+# peers keep working: a payload without a kind is a chat message.
+DEFAULT_MESSAGE_KIND = "chat"
+MAX_MESSAGE_KIND_LENGTH = 32
+# ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
+# would break the documented slug grammar for consumers that enforce it.
+_MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# ``group`` and ``file`` are inbox record types, not message kinds: a
+# direct message tagged with either would fail inbox validation (a
+# "group" text record needs a roster, a "file" one needs file fields)
+# and be silently lost — `_record_received` swallows the failure while
+# the sender already got success and the seen-id blocks a retry.  So
+# they are reserved here, at the one choke point every kind passes
+# through, and the wire parser rejects them the same way.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -130,6 +149,44 @@ def normalize_message(text: Any) -> str:
     if len(cleaned) > MAX_MESSAGE_CHARS:
         raise ProtocolError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
     return cleaned
+
+
+def normalize_message_kind(kind: Any) -> str:
+    """Validate a message kind slug, defaulting an absent one to chat.
+
+    A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
+    at most 32 characters) so it is safe to print, compare and filter
+    on.  ``None`` — the local default — means plain chat.  ``group``
+    and ``file`` are reserved: they name inbox record types, and a
+    direct message carrying either could never be stored.
+    """
+    if kind is None:
+        return DEFAULT_MESSAGE_KIND
+    if not isinstance(kind, str):
+        raise ProtocolError("message kind must be a string")
+    cleaned = kind.strip().lower()
+    if _MESSAGE_KIND_RE.fullmatch(cleaned) is None:
+        raise ProtocolError(
+            "message kind must match [a-z0-9][a-z0-9_-]{0,31}"
+        )
+    if cleaned in _RESERVED_MESSAGE_KINDS:
+        raise ProtocolError(f"message kind {cleaned!r} is reserved")
+    return cleaned
+
+
+def kind_from_wire(payload: Dict[str, Any]) -> str:
+    """Kind from a peer payload: absent means chat, present must be valid.
+
+    An explicit ``null`` is malformed, not chat — only a missing key
+    gets the default, so a peer cannot smuggle an invalid kind past
+    validation by sending ``null``.
+    """
+    if "kind" not in payload:
+        return DEFAULT_MESSAGE_KIND
+    kind = payload["kind"]
+    if kind is None:
+        raise ProtocolError("message kind must be a string")
+    return normalize_message_kind(kind)
 
 
 def encode(obj: Any, *, max_bytes: Optional[int] = None) -> bytes:
@@ -534,6 +591,7 @@ def encode_message(
     sent_at: Optional[float] = None,
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    kind: Optional[str] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request.
 
@@ -549,6 +607,7 @@ def encode_message(
         "type": "message",
         "v": PROTOCOL_VERSION,
         "text": normalize_message(text),
+        "kind": normalize_message_kind(kind),
         "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
         "client": f"tau/{__version__}",
     }
@@ -577,6 +636,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         message_id = None
     return {
         "text": text,
+        "kind": kind_from_wire(payload),
         "sent_at": sent_at,
         "id": message_id,
         "expires_at": _clean_expires_at(payload.get("expires_at")),
