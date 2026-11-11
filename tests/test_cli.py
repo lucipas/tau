@@ -3814,6 +3814,118 @@ def test_group_send_reply_to_unknown_reference_is_an_error(
     assert _FakeGroupSendNode.instances == []
 
 
+def test_group_send_reply_to_empty_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "",
+            "weekend",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_direct_reply_target_excludes_group_messages(tmp_path):
+    """A group message is not a DM reply target, even when its sender
+    is the DM peer: replies stay inside their own conversation."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "aaaa", "cd" * 16)
+
+
+def test_direct_quote_of_group_message_is_unavailable(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "quoting the group in a DM",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "e" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": cli.excerpt_hash("original thought"),
+            },
+        }
+    )
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--search",
+            "quoting the group",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "↩ original not available" in out
+    assert "↩ alice: original thought" not in out
+
+
+def test_group_quote_with_duplicate_text_is_unavailable(tmp_path, capsys):
+    """Two members posting identical text leaves the excerpt fallback
+    with no author to attribute the quote to."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    for sender, destination in (("alice", "cd" * 16), ("carol", "ef" * 16)):
+        inbox.append(
+            {
+                "from": sender,
+                "destination": destination,
+                "text": "same words",
+                "sent_at": 13.0,
+                "received_at": 23.0,
+                "id": "f" * 31 + ("1" if sender == "alice" else "2"),
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "weekend",
+                "direction": "in",
+            }
+        )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "which one?",
+            "sent_at": 14.0,
+            "received_at": 24.0,
+            "id": "c" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": cli.excerpt_hash("same words"),
+            },
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
 def test_messages_renders_reactions(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
     inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)

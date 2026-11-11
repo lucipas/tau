@@ -5235,9 +5235,16 @@ def _resolve_reply_target(
     # rather than silently quoting whichever store is searched first.
     candidates: Dict[str, Dict[str, Any]] = {}
     for item in inbox.find_prefix(ref, peer=peer_hash):
+        # Group messages live in the same inbox but belong to their
+        # group, never to a direct conversation: a DM reply must not
+        # quote one.
+        if item.get("kind") == "group":
+            continue
         candidates.setdefault(str(item["id"]), item)
     value = ref.lower()
     for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        if entry.group_id is not None:
+            continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
                 entry.id, {"id": entry.id, "text": entry.text}
@@ -5322,6 +5329,10 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
             quoted = inbox.find_by_excerpt(excerpt, group=group_id)
     else:
         quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+        if quoted is not None and quoted.get("kind") == "group":
+            # A direct reply quotes a direct message; a group message
+            # quoted here belongs to its group, not this conversation.
+            return "↩ original not available"
     if quoted is None or (
         isinstance(excerpt, str)
         and excerpt
@@ -5793,7 +5804,7 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     config = _make_config(args)
     delivered_ids: Set[str] = set()
     in_reply_to = None
-    if getattr(args, "reply_to", None):
+    if getattr(args, "reply_to", None) is not None:
         group_id = GroupStore(config.groups_path).find(args.group)["id"]
         in_reply_to = _resolve_group_reply_target(
             Inbox(config.inbox_path),

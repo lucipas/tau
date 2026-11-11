@@ -1532,15 +1532,25 @@ def test_send_group_message_with_reply_carries_reference_on_every_leg(tmp_path):
     queued = node.mailbox.outbox_list()
     assert len(queued) == 1
     assert queued[0].in_reply_to == reply_to
-    # Each leg is recorded as a sent message, so the sender's own group
-    # message can be quoted and a peer's reply to it renders.
-    for leg in result["results"]:
-        sent = node.inbox.find(leg["id"])
-        assert sent is not None
-        assert sent["direction"] == "out"
-        assert sent["kind"] == "group"
-        assert sent["group"] == group["id"]
-        assert sent["in_reply_to"] == reply_to
+    # One inbox record per send — not one per leg — so a wide fan-out
+    # cannot evict sent DMs from the shared sent cap; the record
+    # carries every leg id, so any leg can still be quoted.
+    out_records = [
+        entry
+        for entry in node.inbox.export_document()["messages"]
+        if entry.get("direction") == "out"
+    ]
+    assert len(out_records) == 1
+    sent = out_records[0]
+    assert sent["kind"] == "group"
+    assert sent["group"] == group["id"]
+    assert sent["in_reply_to"] == reply_to
+    leg_ids = {leg["id"] for leg in result["results"]}
+    assert set(sent["leg_ids"]) == leg_ids
+    for leg_id in leg_ids:
+        found = node.inbox.find(leg_id, group=group["id"])
+        assert found is not None
+        assert found["leg_ids"] == sent["leg_ids"]
     # Sent legs stay out of the received listing.
     assert node.inbox.list_messages() == []
 

@@ -783,6 +783,70 @@ def test_find_prefix_needs_a_unique_match_in_the_conversation(tmp_path):
     assert inbox.find_prefix("zzz", peer="ab" * 16) == []
 
 
+def test_find_matches_group_send_leg_ids(tmp_path):
+    """One record per group send keeps every leg id: any leg resolves."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="leg-1",
+            leg_ids=["leg-1", "leg-2"],
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+            direction="out",
+            destination="",
+            text="hello group",
+        )
+    )
+
+    for leg_id in ("leg-1", "leg-2"):
+        assert inbox.find(leg_id, group="a" * 32)["text"] == "hello group"
+        assert len(inbox.find_prefix(leg_id[:4], group="a" * 32)) == 1
+    assert inbox.find("leg-2", group="b" * 32) is None
+    assert inbox.find("missing", group="a" * 32) is None
+
+
+def test_find_by_excerpt_needs_one_author(tmp_path):
+    from tau.protocol import excerpt_hash
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    excerpt = excerpt_hash("same words")
+    inbox.append(
+        _record(
+            id="m-1",
+            destination="ab" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    inbox.append(
+        _record(
+            id="m-2",
+            destination="ab" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    # Same author repeating the text still attributes to that author.
+    assert inbox.find_by_excerpt(excerpt, group="a" * 32)["id"] == "m-2"
+    inbox.append(
+        _record(
+            id="m-3",
+            destination="cd" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    # Two authors, same text: the quote cannot be attributed.
+    assert inbox.find_by_excerpt(excerpt, group="a" * 32) is None
+
+
 def test_record_keeps_reply_reference_and_direction(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}

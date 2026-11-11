@@ -170,6 +170,22 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["read_at"] = read_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    leg_ids = raw.get("leg_ids")
+    if isinstance(leg_ids, list):
+        # One record per group send keeps every leg id, so any leg can
+        # be quoted; the list is cleaned like an id, and a record with
+        # no usable leg id keeps none.
+        cleaned_legs = []
+        for leg in leg_ids:
+            if (
+                isinstance(leg, str)
+                and leg
+                and len(leg) <= 64
+                and leg not in cleaned_legs
+            ):
+                cleaned_legs.append(leg)
+        if cleaned_legs:
+            record["leg_ids"] = cleaned_legs
     kind = raw.get("kind")
     if kind == "group":
         group_id = raw.get("group")
@@ -1004,7 +1020,9 @@ class Inbox:
             entries = list(self._messages)
         for item in reversed(entries):
             if item.get("id") != message_id:
-                continue
+                legs = item.get("leg_ids")
+                if not (isinstance(legs, list) and message_id in legs):
+                    continue
             if peer is not None and item.get("destination") != peer:
                 continue
             if group is not None and item.get("group") != group:
@@ -1031,7 +1049,12 @@ class Inbox:
             message_id = item.get("id")
             if not isinstance(message_id, str):
                 continue
-            if not message_id.lower().startswith(value):
+            legs = item.get("leg_ids")
+            leg_match = isinstance(legs, list) and any(
+                isinstance(leg, str) and leg.lower().startswith(value)
+                for leg in legs
+            )
+            if not message_id.lower().startswith(value) and not leg_match:
                 continue
             if peer is not None and item.get("destination") != peer:
                 continue
@@ -1050,13 +1073,17 @@ class Inbox:
         member holds the same text, so the excerpt hash (see
         :func:`tau.protocol.excerpt_hash`) still identifies the quoted
         message within the group.  Used to render a group quote whose
-        leg id is not in the local inbox.
+        leg id is not in the local inbox.  When several messages in
+        the group share the text under different authors, the quote
+        cannot be attributed — ``None`` instead of naming the wrong
+        author.
         """
         if not isinstance(excerpt, str) or not excerpt:
             return None
         wanted = excerpt.strip().lower()
         with self._lock:
             entries = list(self._messages)
+        matches = []
         for item in reversed(entries):
             if group is not None and item.get("group") != group:
                 continue
@@ -1064,8 +1091,16 @@ class Inbox:
             if not isinstance(text, str):
                 continue
             if excerpt_hash(text) == wanted:
-                return dict(item)
-        return None
+                matches.append(item)
+        if not matches:
+            return None
+        authors = {
+            (str(item.get("destination") or ""), item.get("direction"))
+            for item in matches
+        }
+        if len(authors) > 1:
+            return None
+        return dict(matches[0])
 
     def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.
