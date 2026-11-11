@@ -22,7 +22,7 @@ import logging
 import signal
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import RNS
 
@@ -84,6 +84,7 @@ def start_lxmf_router(
     data_dir: Path,
     *,
     display_name: Optional[str] = None,
+    delivery_callback: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Start an ``LXMRouter`` on *identity* and register its delivery identity.
 
@@ -91,6 +92,8 @@ def start_lxmf_router(
     to the storage path it is given).  The router listens on the same
     delivery destination :func:`lxmf_delivery_hash` derives, and that
     destination is announced so other LXMF clients can find a path to it.
+    *delivery_callback*, when given, is registered before the destination
+    is announced, so mail sent in response to the announce is not missed.
 
     Raises :class:`LXMFError` when the ``lxmf`` package is not installed,
     when called off the main thread (LXMRouter installs signal handlers),

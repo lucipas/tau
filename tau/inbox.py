@@ -570,8 +570,13 @@ class Inbox:
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Record one message, dropping the oldest past its direction's cap."""
+    def append(self, record: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
+        """Record one message, dropping the oldest past its direction's cap.
+
+        With ``strict=True`` a failed persist raises ``OSError`` (and the
+        entry is withdrawn from memory), so the caller can leave the
+        message unacknowledged for redelivery.
+        """
         entry = _valid_record(record)
         if entry is None:
             raise ValueError("inbox record needs text")
@@ -579,7 +584,11 @@ class Inbox:
             entry["seq"] = self._next_seq()
             self._messages.append(entry)
             self._messages = _retain(self._messages)
-            self._save()
+            try:
+                self._save(strict=strict)
+            except OSError:
+                self._messages = [m for m in self._messages if m is not entry]
+                raise
         return entry
 
     def delete(self, ref: str) -> Dict[str, Any]:

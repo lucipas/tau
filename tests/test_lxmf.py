@@ -353,7 +353,8 @@ def test_deliver_lxmf_message_stores_in_inbox(tmp_path):
     assert record["kind"] == "chat"
     assert record["sent_at"] == 1234.5
     assert record["direction"] == "in"
-    assert record["id"] == "lxmf:" + (b"\x01" * 32).hex()
+    assert record["id"] == (b"\x01" * 32).hex()
+    assert len(record["id"]) <= 64
     assert node.mailbox.is_seen(record["id"])
     # on_message fires with the same message (the stored copy carries
     # the inbox's normalized fields, so compare by id, not by dict).

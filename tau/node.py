@@ -720,10 +720,10 @@ class TauNode:
                 self.identity,
                 self.config.data_dir,
                 display_name=self.name,
+                delivery_callback=self._deliver_lxmf_message,
             )
         except LXMFError as exc:
             raise NodeError(str(exc)) from exc
-        self.lxmf_router.register_delivery_callback(self._deliver_lxmf_message)
         delivery = lxmf_router_delivery_hash(self.lxmf_router)
         log.info(
             "LXMF router running, delivery %s",
@@ -744,10 +744,13 @@ class TauNode:
 
         An accepted message is stored with the same record shape as
         :meth:`_handle_message` (``direction: "in"``, ``sent_at`` from
-        the LXMF timestamp) and id ``lxmf:<message hash hex>``, so a
+        the LXMF timestamp) and id ``<message hash hex>`` (64 characters,
+        within the limit the read-receipt builders enforce), so a
         redelivery after a router restart is deduped through the
         mailbox seen-set exactly like a relayed tau copy, and
         ``on_message`` fires so the console and live views see it.
+        The message is marked seen only once the inbox append is
+        durable, so a failed write is retried on redelivery.
 
         Nothing here ever raises back into the router: a bad message
         is dropped with a log line, and an unexpected failure is
@@ -795,13 +798,15 @@ class TauNode:
             if not isinstance(message_hash, (bytes, bytearray, memoryview)):
                 log.info("Dropping LXMF message without a hash")
                 return
-            message_id = f"lxmf:{bytes(message_hash).hex()}"
+            if len(message_hash) != 32:
+                log.info("Dropping LXMF message with a malformed hash")
+                return
+            message_id = bytes(message_hash).hex()
             if self.mailbox.is_seen(message_id):
                 return
             sent_at = getattr(message, "timestamp", None)
             if not isinstance(sent_at, (int, float)):
                 sent_at = received_at
-            self.mailbox.mark_seen(message_id)
             record = {
                 "from": sender.display_name,
                 "destination": sender_hash,
@@ -818,12 +823,21 @@ class TauNode:
                 sender_hash,
                 text,
             )
-            self._record_received(record)
-            if self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            # A crash between the inbox append and mark_seen would leave
+            # the message unmarked; check for the stored copy first so a
+            # redelivery does not duplicate it.
+            already_stored = self.inbox.find(message_id) is not None
+            if not already_stored:
+                # Raises on a failed write, leaving the message unseen so
+                # the router's redelivery gets another attempt.
+                self.inbox.append(record, strict=True)
+            self.mailbox.mark_seen(message_id)
+            if already_stored or self.on_message is None:
+                return
+            try:
+                self.on_message(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
         except Exception:  # never raise back into LXMRouter
             log.warning("LXMF delivery failed", exc_info=True)
 
