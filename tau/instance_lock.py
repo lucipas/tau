@@ -6,6 +6,7 @@ lock and raise its errors without loading RNS.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import time
@@ -16,6 +17,11 @@ try:  # POSIX only; the instance lock is a no-op without it.
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the instance lock uses msvcrt there.
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +52,9 @@ class InstanceLock:
     corrupting the shared peer registry, mailbox and Tan database.
     The lock file records the holder's PID for diagnostics; the
     ``flock`` itself is the guard, so a file left behind by a crashed
-    node never blocks a restart.  POSIX only — without ``fcntl`` the
-    lock is a no-op, mirroring the mailbox's cross-process locking.
+    node never blocks a restart.  POSIX uses ``fcntl.flock`` and
+    Windows uses ``msvcrt.locking`` (the same primitive as the identity
+    lock); on a platform with neither, the lock is a no-op.
     """
 
     def __init__(self, path: Path, data_dir: Path) -> None:
@@ -57,30 +64,54 @@ class InstanceLock:
 
     def acquire(self) -> None:
         """Take the lock, raising :class:`NodeError` when it is held."""
-        if self._handle is not None or fcntl is None:
+        if self._handle is not None:
+            return
+        if fcntl is None and msvcrt is None:
             return
         handle = open(self.path, "a+", encoding="utf-8")
-        for attempt in range(_LOCK_PROBE_RETRIES + 1):
+        if fcntl is not None:
+            for attempt in range(_LOCK_PROBE_RETRIES + 1):
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt < _LOCK_PROBE_RETRIES:
+                        time.sleep(_LOCK_PROBE_RETRY_DELAY)
+                        continue
+                    self._raise_held(handle)
+        else:  # Windows: no flock, so lock the first byte with msvcrt.
+            # The file needs at least one byte before it can be locked.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(" ")
+                handle.flush()
+            handle.seek(0)
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if attempt < _LOCK_PROBE_RETRIES:
-                    time.sleep(_LOCK_PROBE_RETRY_DELAY)
-                    continue
-                holder = self._read_holder_pid(handle)
-                handle.close()
-                detail = f" (pid {holder})" if holder is not None else ""
-                raise InstanceAlreadyRunning(
-                    "another tau node is already serving on data directory "
-                    f"{self.data_dir}{detail}; stop it before starting a "
-                    "second node on the same directory"
-                ) from None
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                # The CRT reports a contested non-blocking lock as
+                # EDEADLOCK (EACCES on some runtimes); anything else is
+                # a real I/O failure and propagates.
+                if exc.errno not in (errno.EDEADLOCK, errno.EACCES):
+                    handle.close()
+                    raise
+                self._raise_held(handle)
         handle.seek(0)
         handle.truncate()
         handle.write(str(os.getpid()))
         handle.flush()
         self._handle = handle
+
+    def _raise_held(self, handle: Any) -> None:
+        """Close *handle* and raise for a lock held by another process."""
+        holder = self._read_holder_pid(handle)
+        handle.close()
+        detail = f" (pid {holder})" if holder is not None else ""
+        raise InstanceAlreadyRunning(
+            "another tau node is already serving on data directory "
+            f"{self.data_dir}{detail}; stop it before starting a "
+            "second node on the same directory"
+        ) from None
 
     @staticmethod
     def _read_holder_pid(handle: Any) -> Optional[int]:
@@ -102,6 +133,9 @@ class InstanceLock:
         try:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:  # pragma: no cover - defensive
             log.debug("Could not unlock %s", self.path, exc_info=True)
         handle.close()

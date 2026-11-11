@@ -6,6 +6,9 @@ import os
 import sqlite3
 import stat
 import tarfile
+from pathlib import Path
+import tempfile
+import threading
 
 import pytest
 
@@ -40,17 +43,33 @@ def _id_destination(data_dir, capsys):
 
 
 def _seed_state(data_dir):
-    """Write one of every back-up file so the round-trip is meaningful."""
+    """Write one of every back-up file so the round-trip is meaningful.
+
+    Returns the received files seeded under ``files/``, as
+    ``{member name: bytes}``, for the caller to compare after restore.
+    """
     (data_dir / "peers.json").write_text('{"peers": []}\n', encoding="utf-8")
     (data_dir / "mailbox.json").write_text('{"outbox": []}\n', encoding="utf-8")
     (data_dir / "inbox.json").write_text('{"messages": []}\n', encoding="utf-8")
     (data_dir / "messages.json").write_text('{"messages": []}\n', encoding="utf-8")
     (data_dir / "tan-rules.json").write_text('{"kinds": ["post"]}\n', encoding="utf-8")
     (data_dir / "allowlist.json").write_text('{"allowed": []}\n', encoding="utf-8")
+    (data_dir / "groups.json").write_text('{"groups": []}\n', encoding="utf-8")
+    (data_dir / "blocklist.json").write_text('{"blocked": []}\n', encoding="utf-8")
     conn = init_db(data_dir / "tan.sqlite3")
     conn.close()
     # Runtime state that must never be archived.
     (data_dir / "node.lock").write_text("1234", encoding="utf-8")
+    # Received files, one per sender, as the node stores them.
+    received = {
+        "files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report.pdf": b"%PDF-1.4 fake\n",
+        "files/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/photo.png": b"\x89PNG fake\n",
+    }
+    for name, data in received.items():
+        path = data_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return received
 
 
 def test_parser_backup_restore_subcommands():
@@ -69,7 +88,7 @@ def test_parser_backup_restore_subcommands():
 
 def test_backup_restore_round_trip(tmp_path, capsys):
     node_a = _init_node(tmp_path, "a", "alice")
-    _seed_state(node_a)
+    received = _seed_state(node_a)
     capsys.readouterr()
     destination_a = _id_destination(node_a, capsys)
     contents_before = {
@@ -77,6 +96,7 @@ def test_backup_restore_round_trip(tmp_path, capsys):
         for name in BACKUP_FILES
         if (node_a / name).is_file()
     }
+    contents_before.update(received)
     assert "identity" in contents_before
     assert "tan.sqlite3" in contents_before
     assert "reticulum/config" in contents_before
@@ -194,6 +214,84 @@ def test_backup_refuses_while_node_serving(tmp_path, capsys):
     assert "already serving" in capsys.readouterr().err
 
 
+def test_backup_live_runs_while_node_serving(tmp_path, capsys):
+    # The serving node's own backup: the instance lock is held (this
+    # process stands in for the serving node), so the plain path would
+    # refuse — but the live path skips the lock and still writes a
+    # valid archive, because the node's own writes are atomic.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node_a)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        archive = tmp_path / "backup.tar.gz"
+        target, manifest = create_backup(config, archive, live=True)
+    finally:
+        lock.release()
+    assert target == archive
+    assert manifest["format"] == 1
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+    assert (node_b / "mailbox.json").exists()
+    assert (node_b / "tan.sqlite3").exists()
+
+
+def test_live_backup_survives_concurrent_state_replacement(tmp_path, capsys):
+    # A live node replaces state files atomically while a backup reads
+    # them.  Members are read from one open descriptor, so a replacement
+    # between the size lookup and the read cannot truncate a member:
+    # every archive holds either the old or the new complete file,
+    # never a mix of the two.
+    node = _init_node(tmp_path, "node", "alice")
+    _seed_state(node)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    small = b'{"peers": []}\n'
+    large = b'{"peers": [' + b'{"x": 1}, ' * 5000 + b']}\n'
+    stop = threading.Event()
+
+    def atomic_write(path, data):
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".peers.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def rewrite():
+        toggle = False
+        while not stop.is_set():
+            atomic_write(node / "peers.json", large if toggle else small)
+            toggle = not toggle
+
+    writer = threading.Thread(target=rewrite, daemon=True)
+    writer.start()
+    try:
+        for i in range(15):
+            archive = tmp_path / f"backup-{i}.tar.gz"
+            create_backup(config, archive, live=True)
+            with tarfile.open(archive, mode="r:gz") as tar:
+                member = tar.extractfile("peers.json")
+                assert member is not None
+                content = member.read()
+            assert content in (small, large), "truncated or mixed peers.json"
+    finally:
+        stop.set()
+        writer.join(timeout=5)
+
+
 def test_backup_captures_uncheckpointed_wal_rows(tmp_path, capsys):
     # A row committed to the Tan database while the only writer holds
     # its connection open lives in tan.sqlite3-wal, not in the main
@@ -253,6 +351,329 @@ def test_restore_force_removes_state_absent_from_archive(tmp_path, capsys):
     assert not (node_b / "tan.sqlite3").exists()
     assert not (node_b / "tan.sqlite3-wal").exists()
     assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_backup_skips_symlinks_under_files(tmp_path, capsys):
+    # A symlink under files/ — whether a symlinked file or a symlinked
+    # sender directory — must never be followed into the archive: the
+    # target could sit outside the data directory.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    sender = node_a / "files" / "cccccccccccccccccccccccccccccccc"
+    sender.mkdir(parents=True, exist_ok=True)
+    (sender / "link.bin").symlink_to(outside)
+    (node_a / "files" / "dddddddddddddddddddddddddddddddd").symlink_to(
+        sender, target_is_directory=True
+    )
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = tar.getnames()
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+        assert all(
+            tar.getmember(name).isreg()
+            for name in names
+            if name != MANIFEST_NAME
+        )
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+    assert not any(name.endswith("link.bin") for name in names)
+    assert not any("dddddddd" in name for name in names)
+
+
+def test_backup_stores_hard_linked_received_files_as_regular_members(
+    tmp_path, capsys
+):
+    # Two received files sharing one inode (e.g. a deduplicating
+    # filesystem, or a sender dir hard-linked by hand) must both be
+    # archived as regular members: tarfile would otherwise emit the
+    # second as a hard-link member, which restore rejects outright.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    sender = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    linked = sender / "report-copy.pdf"
+    os.link(sender / "report.pdf", linked)
+    received["files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report-copy.pdf"] = (
+        b"%PDF-1.4 fake\n"
+    )
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = tar.getnames()
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+        assert all(
+            tar.getmember(name).isreg()
+            for name in names
+            if name != MANIFEST_NAME
+        )
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--json"])
+        == 0
+    )
+    assert (node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / "report.pdf").read_bytes() == (
+        b"%PDF-1.4 fake\n"
+    )
+    assert (node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / "report-copy.pdf").read_bytes() == (
+        b"%PDF-1.4 fake\n"
+    )
+
+
+def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
+    # A `.tau-received-*.tmp` file under a sender's `.tau-tmp` staging
+    # directory is a transfer interrupted before its content was linked
+    # into place — it was never a received file, so the backup leaves
+    # it out instead of archiving a partial file.  A *published* file
+    # whose name merely starts with the same prefix is a real received
+    # file and is backed up like any other.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    staging = (
+        node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-tmp-ab12cd34"
+    )
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / ".tau-received-abc123.tmp").write_bytes(b"half-written")
+    lookalike = (
+        node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / ".tau-received-report.pdf"
+    )
+    lookalike.write_bytes(b"%PDF-1.4 fake\n")
+    received["files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.tau-received-report.pdf"] = (
+        b"%PDF-1.4 fake\n"
+    )
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+    assert not any(name.endswith(".tmp") for name in manifest["files"])
+
+
+def test_restore_force_removes_stale_groups_blocklist_files(tmp_path, capsys):
+    # A --force restore replaces the whole node state, including the
+    # newly backed-up files: groups, blocklist and received files the
+    # archive does not hold must not survive it.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = _init_node(tmp_path, "b", "bob")
+    (node_b / "groups.json").write_text('{"groups": []}\n', encoding="utf-8")
+    (node_b / "blocklist.json").write_text('{"blocked": []}\n', encoding="utf-8")
+    stale = node_b / "files" / "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" / "stale.bin"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"stale\n")
+    capsys.readouterr()
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--force"])
+        == 0
+    )
+    capsys.readouterr()
+    assert not (node_b / "groups.json").exists()
+    assert not (node_b / "blocklist.json").exists()
+    assert not stale.exists()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+
+
+def test_restore_rejects_misplaced_files_member(tmp_path):
+    # Received-file members are exactly files/<sender>/<name>: a file
+    # directly under files/, or nested any deeper, is not a member
+    # this module ever writes.
+    node = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=node)
+    for bad_name in ("files/evil", "files/a/b/c"):
+        archive = tmp_path / "bad.tar.gz"
+        _write_archive(
+            archive,
+            {"format": 1, "files": ["identity", bad_name]},
+            [("identity", b"x"), (bad_name, b"x")],
+        )
+        with pytest.raises(Exception, match="unexpected member"):
+            restore_backup(config, archive)
+        assert not (node / "identity").exists()
+
+
+def test_backup_refuses_symlinked_state_file(tmp_path, capsys):
+    # A state file that is a symlink would be archived as a symlink
+    # member, which restore rejects — so the backup must refuse
+    # loudly instead of publishing an archive that can never restore.
+    node_a = _init_node(tmp_path, "a", "alice")
+    capsys.readouterr()
+    outside = tmp_path / "outside-groups.json"
+    outside.write_text('{"groups": []}\n', encoding="utf-8")
+    (node_a / "groups.json").symlink_to(outside)
+    archive = tmp_path / "backup.tar.gz"
+    code = cli.main(["backup", str(archive), "--data-dir", str(node_a)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not archive.exists()
+
+
+def test_backup_refuses_when_over_restore_size_limit(tmp_path, capsys, monkeypatch):
+    # The restore side enforces an 8 GiB expanded-size budget; a
+    # backup that would exceed it must fail up front instead of
+    # publishing an archive restore rejects on every attempt.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    monkeypatch.setattr("tau.backup.MAX_TOTAL_BYTES", 10)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "exceeds the restore size limit" in err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_backup_refuses_when_manifest_over_limit(tmp_path, capsys, monkeypatch):
+    # Same for the manifest: restore refuses a manifest over 1 MiB,
+    # so a backup whose member list would overflow it must fail here.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    monkeypatch.setattr("tau.backup.MAX_MANIFEST_BYTES", 10)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "manifest" in err
+    assert "restore limit" in err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_backup_fails_when_received_files_unreadable(
+    tmp_path, capsys, monkeypatch
+):
+    # An unreadable received-files directory must fail the backup,
+    # not silently publish an archive missing those files.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    files_dir = node_a / "files"
+    real_iterdir = Path.iterdir
+
+    def _failing_iterdir(self):
+        if self == files_dir:
+            raise OSError("permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _failing_iterdir)
+    code = cli.main(
+        ["backup", str(tmp_path / "backup.tar.gz"), "--data-dir", str(node_a)]
+    )
+    assert code == 1
+    assert "could not list received files" in capsys.readouterr().err
+    assert not (tmp_path / "backup.tar.gz").exists()
+
+
+def test_restore_rebases_inbox_file_paths(tmp_path, capsys):
+    # File records store the absolute path the file was saved to.  A
+    # restore into a different directory installs the file at the new
+    # location, so the record must be rebased to match.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    member = "files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report.pdf"
+    record = {
+        "kind": "file",
+        "from": "alice",
+        "destination": "a" * 32,
+        "name": "report.pdf",
+        "size": len(received[member]),
+        "sha256": "0" * 64,
+        "path": str(node_a / member),
+        "sent_at": 1000.0,
+        "received_at": 1000.0,
+        "id": "x" * 32,
+    }
+    (node_a / "inbox.json").write_text(
+        json.dumps({"messages": [record]}), encoding="utf-8"
+    )
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    restored = json.loads((node_b / "inbox.json").read_text(encoding="utf-8"))
+    assert restored["messages"][0]["path"] == str(node_b / member)
+    assert (node_b / member).read_bytes() == received[member]
+
+
+def test_restore_leaves_unparseable_inbox_untouched(tmp_path, capsys):
+    # Rebasing must never make an otherwise valid restore fail: an
+    # inbox that cannot be parsed is restored byte for byte.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    (node_a / "inbox.json").write_text("not json at all\n", encoding="utf-8")
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    assert (node_b / "inbox.json").read_text(encoding="utf-8") == "not json at all\n"
+
+
+def test_restore_refuses_symlinked_received_file_dir(tmp_path, capsys):
+    # If files/ (or a sender directory under it) in the target is a
+    # symlink pointing outside the data directory, staging would write
+    # the archive contents there.  Restore refuses instead.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    outside = tmp_path / "outside-files"
+    outside.mkdir()
+    node_b = tmp_path / "b"
+    node_b.mkdir()
+    (node_b / "files").symlink_to(outside, target_is_directory=True)
+    code = cli.main(["restore", str(archive), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not (outside / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").exists()
+
+    # Same for a symlinked sender directory under a real files/.
+    (node_b / "files").unlink()
+    sender = node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    sender.mkdir(parents=True, exist_ok=True)
+    sender.rmdir()
+    sender.symlink_to(outside, target_is_directory=True)
+    capsys.readouterr()
+    code = cli.main(["restore", str(archive), "--data-dir", str(node_b)])
+    assert code == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert not list(outside.iterdir())
 
 
 def test_restore_rejects_archive_without_identity(tmp_path):

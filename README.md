@@ -135,27 +135,70 @@ The same bridge is the local integration point for scripts:
 | --- | --- | --- |
 | `/api/status` | GET | node info, peers, recent messages |
 | `/api/peers` | GET | peer registry |
+| `/api/peers/forget` | POST | forget a peer `{"target": "<name or hash>", "force": true}` |
+| `/api/peers/alias` | POST | set a peer's local alias `{"destination": "<hash>", "alias": "name"}` (empty alias clears it) |
+| `/api/peers/verify` | POST | mark a peer verified `{"target": "alice"}` — only after comparing the safety number out of band (returns it) |
+| `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |
+| `/api/peers/block` | POST | block `{"target": "alice"}` |
+| `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
-| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` |
+| `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |
+| `/api/messages` | POST | send `{"to": "alice", "text": "hi"}` — or to a group with `{"group": "<id, id prefix or name>", "text": "hi"}` (one outbound entry per member; replies and expiry are peer-DM-only) |
+| `/api/messages/export` | GET | stored DMs as the CLI's JSON export document (localhost only) |
+| `/api/messages/import` | POST | import a DM export document (localhost only) |
+| `/api/files/<sender>/<name>` | GET | download a file received from `<sender>` |
 | `/api/react` | POST | react `{"target": "<wire id>", "reaction": "👍"}` or retract `{"target": "<wire id>", "clear": true}` |
 | `/api/messages/read` | POST | mark a conversation read `{"peer": "<hash>"}` (omit `peer` for all) |
 | `/api/outbox` | GET | queued mail waiting on offline peers |
 | `/api/outbox/cancel` | POST | cancel `{"target": "<message id or prefix>"}` |
+| `/api/bundle/export` | POST | build a signed sneakernet bundle `{"include_tan": true}` |
+| `/api/bundle/import` | POST | merge a bundle document (the signed JSON) into this node |
+| `/api/outbox/retry` | POST | retry queued mail now, ignoring backoff (`{"target": "<message id or prefix>"}` for one entry; omit it to retry everything) |
+| `/api/outbox/held` | GET | sealed mail held for other peers |
+| `/api/outbox/drop-held` | POST | drop `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
 | `/api/info` | POST | show a peer's reported info (`{"to": "alice"}`) — version, protocol, uptime, peer count, LXMF state |
+| `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
+| `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |
+| `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
+| `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/settings` | GET | node settings (`accept_files`, `send_read_receipts`) |
+| `/api/settings` | POST | change one setting `{"setting": "accept_files", "value": true}` |
+| `/api/backup` | GET | download a backup archive of the data directory |
+| `/api/doctor` | GET | health verdicts for the data directory (`tau doctor`) |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |
+| `/api/tan/top` | GET | most-liked stored posts (`?limit=10`, `?author=<name or hash>`) |
+| `/api/tan/search` | GET | search stored posts by keyword (`?q=...`, optional `?author=...`, `?limit=N`) |
+| `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
 | `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
+| `/api/tan/suggest` | GET | suggested authors to follow (`?limit=5`) |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
+| `/api/tan/quote` | POST | quote `{"target": "<post hash>", "text": "…"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/likes` | GET | who liked a post (`?target=<post hash>`) |
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
 | `/api/tan/unfollow` | POST | unfollow `{"target": "alice"}` |
+| `/api/tan/muted` | GET | muted authors and their post counts |
+| `/api/tan/mute` | POST | mute `{"target": "alice"}` |
+| `/api/tan/unmute` | POST | unmute `{"target": "alice"}` |
+| `/api/tan/muted-keywords` | GET | muted keywords |
+| `/api/tan/mute-keyword` | POST | mute a keyword `{"keyword": "crypto"}` |
+| `/api/tan/unmute-keyword` | POST | unmute a keyword `{"keyword": "crypto"}` |
 | `/api/tan/sync` | POST | pull missing posts from peers |
+| `/api/tan/rules` | GET | current Tan admission ruleset and the kinds that can be displayed |
+| `/api/tan/rules` | POST | replace the ruleset (applies to the running node at once) |
+| `/api/tan/verify` | GET | re-verify every stored post's signature and chain linkage |
+| `/api/tan/export` | GET | export stored posts (`?scope=mine` or `?scope=all`) |
+| `/api/tan/import` | POST | import an export document (every entry verified) |
+| `/api/tan/saved` | GET | saved posts, newest save first (`?limit=` and `?offset=` page through them; the response carries `next_offset`, null when exhausted) |
+| `/api/tan/save` | POST | save `{"target": "<post hash>"}` to read later |
+| `/api/tan/unsave` | POST | unsave `{"target": "<post hash>"}` |
 | `/api/events` | GET | SSE stream of messages, peers and posts |
 
 ```bash
@@ -370,6 +413,11 @@ tau send --to alice "hi" --no-queue
 tau send --to alice --kind ping "are you there?"
 tau messages --kind ping
 
+# When a node is already serving on this data directory, `tau send`
+# runs through it over a local socket instead of starting a second
+# Reticulum instance on the same identity — same result, same queueing.
+# A stale socket left by a crashed serve simply falls back to a local send.
+
 # See what is waiting on offline peers
 tau outbox
 
@@ -426,10 +474,8 @@ and decrypt its traffic, so keep it private.
 
 To back up identity, peer registry, queued outbox
 mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
-and the Reticulum config, use `tau backup`:
-
-The backup does not include `groups.json`, `blocklist.json`, or received
-files in `files/`. Back up these paths separately if needed.
+groups, the block list, received files, and the Reticulum config, use
+`tau backup`:
 
 ```bash
 tau backup ~/tau-backup.tar.gz
@@ -441,7 +487,12 @@ tau version, file list); the runtime lock file is never included. The Tan
 database is snapshotted with SQLite's backup API, so committed rows still
 sitting in the write-ahead log are included. Both
 commands refuse while a node is serving on the data directory, so a backup
-never catches the mailbox or the Tan database half-written. `restore`
+never catches the mailbox or the Tan database half-written. The web
+console's Back up button is the exception: the bridge builds the same
+archive from the live node, whose own writes are atomic, so a
+console-only user can back up without stopping the node. Restore stays a
+terminal operation — stop the node and run `tau restore` — because a
+restore replaces the state under the running node. `restore`
 validates the archive first — unknown format, unexpected members, absolute
 paths and `..` traversal are all rejected — and refuses to overwrite
 existing included node state unless `--force` is given; a `--force` restore
@@ -662,6 +713,10 @@ default, `--max-bytes N` on either command) are refused. The import
 reports what was accepted, already present and skipped. No identity or
 private material is ever included, and there is no auto-import — a
 bundle only moves when someone carries the file and runs the command.
+The web console offers the same flow in its Sneakernet section
+(`POST /api/bundle/export`, `POST /api/bundle/import`): export downloads
+the signed bundle as a file, import takes a bundle file and reports the
+merge.
 
 ### Tan posts
 
@@ -725,7 +780,10 @@ later unlike, does not appear. Like the thread view, it refuses a post your
 Tan display rules hide.
 
 The web console shows the same counts with a ♥ toggle on every post
-(`POST /api/tan/like` / `POST /api/tan/unlike`).
+(`POST /api/tan/like` / `POST /api/tan/unlike`). Saved posts work the
+same way: `tau tan save` keeps a post to read later (local only, never
+published), and the console has a Saved view with a save toggle on every
+post (`GET /api/tan/saved`, `POST /api/tan/save` / `POST /api/tan/unsave`).
 
 ### Admission rules
 
@@ -750,15 +808,17 @@ author is always admitted, the block list denies, the allow list and
 default policy. Entries you create yourself are never filtered, and with
 no rules file everything is admitted, as before. A rules file that
 cannot be parsed fails closed (remote entries denied) rather than
-silently opening the node up. A running `serve` applies saved rules
-when it restarts.
+silently opening the node up. The web console's admission-rules section
+(`GET`/`POST /api/tan/rules`) applies a change to the running node at
+once; rules saved from the CLI apply when `serve` restarts.
 
 ### DM allow-list
 
 Direct messages are open by default, like Tan posts. The owner can
 restrict them to known senders with an allow-list, stored as
 `allowlist.json` in the data directory (mode `0600`) and managed via
-the CLI:
+the CLI or the web console's allow-list section (console changes apply
+to the running node immediately; CLI changes apply when it restarts):
 
 ```bash
 tau allowlist list             # show whether the list is enforced and who is on it
@@ -915,8 +975,11 @@ unlinked, and stall sync at the gap.
   console); `tau id` shows this node's own address. `tau serve --lxmf`
   (requires the `lxmf` extra) also runs an LXMRouter on the node's
   identity, registers its delivery destination and announces it.
-  Nothing is sent over LXMF yet — sending and the migration of
-  store-and-forward follow under #67.
+  `tau serve --lxmf --lxmf-propagation` also serves as an LXMF
+  propagation node, holding mail for offline recipients until they
+  fetch it (message store capped at 256 MB). Nothing is sent over
+  LXMF yet — sending and the migration of store-and-forward follow
+  under #67.
 
 ## Development
 
