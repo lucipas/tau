@@ -25,6 +25,12 @@ from .allowlist import (
     load_allowlist_or_deny_all,
     save_allowlist,
 )
+from .archive import (
+    ArchiveError,
+    load_archive,
+    load_archived_set,
+    save_archive,
+)
 from .backup import create_backup, restore_backup
 from .blocklist import (
     BlockListError,
@@ -846,6 +852,29 @@ def build_parser() -> argparse.ArgumentParser:
     unblock.add_argument("peer", help="peer name, destination hash or hash prefix")
     unblock.set_defaults(func=cmd_block, block_command="remove")
 
+    archive = subparsers.add_parser(
+        "archive",
+        parents=[common],
+        help="hide a peer's conversation from `tau messages` (history kept)",
+    )
+    archive.add_argument("peer", help="peer name, destination hash or hash prefix")
+    archive.set_defaults(func=cmd_archive)
+
+    unarchive = subparsers.add_parser(
+        "unarchive",
+        parents=[common],
+        help="restore an archived conversation to `tau messages`",
+    )
+    unarchive.add_argument("peer", help="peer name, destination hash or hash prefix")
+    unarchive.set_defaults(func=cmd_unarchive)
+
+    archived = subparsers.add_parser(
+        "archived",
+        parents=[common],
+        help="list archived conversations",
+    )
+    archived.set_defaults(func=cmd_archived)
+
 
     messages = subparsers.add_parser(
         "messages",
@@ -892,6 +921,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--unread",
         action="store_true",
         help="only show messages not yet read",
+    )
+    messages.add_argument(
+        "--archived",
+        action="store_true",
+        help="only show conversations archived with `tau archive`",
     )
     messages.add_argument(
         "--count",
@@ -5276,6 +5310,39 @@ def cmd_messages(args: argparse.Namespace) -> int:
     query = getattr(args, "search", None)
     if query is not None and not query.strip():
         raise NodeError("--search must not be empty")
+    archived = load_archived_set(config.archived_path)
+    show_archived = getattr(args, "archived", False)
+    if (
+        peer_hash is not None
+        and not show_archived
+        and query is None
+        and group_id is None
+        and not getattr(args, "sent", False)
+        and peer_hash in archived
+    ):
+        # An archived peer's thread is hidden from the default
+        # listing; say so instead of showing an empty list.
+        peer = registry.get(peer_hash)
+        name = peer.display_name if peer is not None else "unknown"
+        unread = inbox.unread_counts()["per_peer"].get(peer_hash, 0)
+        if _json_mode(args):
+            _emit(
+                {
+                    "messages": [],
+                    "count": 0,
+                    "more_unread": {},
+                    "archived_unread": unread,
+                    "archived": True,
+                },
+                True,
+            )
+            return _EXIT_OK
+        print(
+            f"Conversation with {name} ({short_hash(peer_hash)}) is archived — "
+            f"see it with `tau messages --archived --peer {args.peer}` "
+            f"or restore it with `tau unarchive {args.peer}`."
+        )
+        return _EXIT_OK
     if getattr(args, "sent", False):
         return _cmd_messages_sent(args, config, registry, limit)
     # Blocked senders' history stays stored but is hidden locally;
@@ -5293,6 +5360,28 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
+    # Archived conversations stay stored but are hidden from the
+    # default listing; unarchiving restores the view.  Filter before
+    # applying the limit so hidden messages do not use up the
+    # requested count.  A search is an explicit lookup and still
+    # finds archived messages; a group listing is a different view
+    # and is unaffected.
+    archived_unread = 0
+    if query is None and group_id is None:
+        if show_archived:
+            entries = [
+                entry for entry in entries if entry.get("destination") in archived
+            ]
+        elif archived:
+            hidden = [
+                entry for entry in entries if entry.get("destination") in archived
+            ]
+            archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+            entries = [
+                entry
+                for entry in entries
+                if entry.get("destination") not in archived
+            ]
     # Filter before limiting, so --unread finds older unread mail even
     # when newer messages from the same listing are already read.
     unread_only = getattr(args, "unread", False)
@@ -5308,7 +5397,12 @@ def cmd_messages(args: argparse.Namespace) -> int:
             more_unread[destination] = more_unread.get(destination, 0) + 1
     if _json_mode(args):
         _emit(
-            {"messages": shown, "count": len(shown), "more_unread": more_unread},
+            {
+                "messages": shown,
+                "count": len(shown),
+                "more_unread": more_unread,
+                "archived_unread": archived_unread,
+            },
             True,
         )
     elif not shown:
@@ -5320,6 +5414,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             print(
                 "No unread messages." if unread_only else "No messages received yet."
             )
+        if archived_unread:
+            _print_archived_unread(archived_unread)
     else:
         for entry in shown:
             peer = registry.get(entry.get("destination") or "")
@@ -5377,6 +5473,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 )
         if more_unread:
             _print_more_unread(registry, more_unread)
+        if archived_unread:
+            _print_archived_unread(archived_unread)
     # Reading a conversation advances its cursor to the newest message
     # just shown, so the next listing only flags what arrived since.  A
     # conversation with unread mail omitted by --limit is left alone:
@@ -5484,6 +5582,121 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             ref = error["id"] if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        archive = load_archive(config.archived_path)
+    except ArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    already = destination in archive.archived
+    if not already:
+        archive = archive.with_added(destination)
+        save_archive(config.archived_path, archive)
+    if _json_mode(args):
+        _emit(
+            {
+                "destination": destination,
+                "name": name,
+                "archived": True,
+                "changed": not already,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if already:
+        print(
+            f"Conversation with {name} ({short_hash(destination)}) "
+            "is already archived."
+        )
+    else:
+        print(
+            f"Archived conversation with {name} ({short_hash(destination)}). "
+            "Messages keep arriving; `tau unarchive` restores the view."
+        )
+    return _EXIT_OK
+
+
+def cmd_unarchive(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        archive = load_archive(config.archived_path)
+    except ArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_ERROR
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    was_archived = destination in archive.archived
+    if was_archived:
+        archive = archive.with_removed(destination)
+        save_archive(config.archived_path, archive)
+    if _json_mode(args):
+        _emit(
+            {
+                "destination": destination,
+                "name": name,
+                "archived": False,
+                "changed": was_archived,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if was_archived:
+        print(
+            f"Restored conversation with {name} ({short_hash(destination)}) "
+            "to `tau messages`."
+        )
+    else:
+        print(
+            f"Conversation with {name} ({short_hash(destination)}) "
+            "was not archived."
+        )
+    return _EXIT_OK
+
+
+def cmd_archived(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    archived = load_archived_set(config.archived_path)
+    counts: Dict[str, int] = {}
+    for entry in inbox.list_messages(limit=None):
+        destination = str(entry.get("destination") or "")
+        if destination in archived:
+            counts[destination] = counts.get(destination, 0) + 1
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+            "messages": counts.get(destination, 0),
+        }
+
+    entries = [describe(destination) for destination in sorted(archived)]
+    if _json_mode(args):
+        _emit({"archived": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No archived conversations — hide one with `tau archive PEER`.")
+        return _EXIT_OK
+    for entry in entries:
+        name = entry["name"] or "unknown"
+        print(
+            f"{name} ({short_hash(entry['destination'])}): "
+            f"{entry['messages']} message(s)"
+        )
+    return _EXIT_OK
 
 
 def _describe_group(
@@ -5711,6 +5924,16 @@ def _print_more_unread(
             f"{count} more unread from {name} ({short_hash(destination)})"
             " — raise --limit to see them."
         )
+
+
+def _print_archived_unread(archived_unread: int) -> None:
+    """Hint line for unread mail hidden in archived conversations."""
+    print(
+        f"{archived_unread} unread in archived conversations"
+        " — see `tau messages --archived`."
+    )
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* printable characters of *ref*.
 
