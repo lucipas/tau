@@ -5783,6 +5783,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
     ]
     exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if expires_at is not None:
+        response["expires_at"] = expires_at
     if _json_mode(args):
         _emit(response, True)
         return exit_code
