@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 
 import RNS
@@ -58,6 +59,40 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
     assert entries[0].created_at == 1000.0
 
 
+def test_enqueue_kind_survives_reload(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="ping?", kind="ping", now=1000.0)
+    assert entry.kind == "ping"
+    assert entry.to_dict()["kind"] == "ping"
+
+    reloaded = Mailbox(path)
+    assert reloaded.outbox_list()[0].kind == "ping"
+
+
+def test_enqueue_defaults_to_chat_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(to=BOB, text="hello")
+    assert entry.kind == "chat"
+
+
+def test_enqueue_rejects_invalid_kind(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(ProtocolError):
+        box.enqueue(to=BOB, text="hello", kind="has space")
+
+
+def test_outbox_entry_without_kind_loads_as_chat(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="old entry", now=1000.0)
+    raw = json.loads(path.read_text())
+    del raw["outbox"][0]["kind"]
+    path.write_text(json.dumps(raw))
+
+    assert Mailbox(path).outbox_list()[0].kind == "chat"
+
+
 def test_enqueue_dedupes_by_message_id(tmp_path):
     box = Mailbox(tmp_path / "mailbox.json")
     first = box.enqueue(to=BOB, text="once", message_id="fixed-id")
@@ -66,6 +101,32 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     # cross-process transaction, so the deduped entry is a fresh copy.
     assert first == second
     assert box.counts()["outbox"] == 1
+
+
+def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
+    """`delivered_at` must survive a reload: the queued-to-delivered flip
+    and the sent-messages display both read it after one."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0)
+
+    reloaded = Mailbox(path)
+    delivered = reloaded.sent_record("m1")
+    assert delivered is not None
+    assert delivered["delivered_at"] == 1002.0
+    pending = reloaded.sent_record("m2")
+    assert pending is not None
+    assert pending["delivered_at"] is None
+
+    # A record written before delivery tracking has no such key and
+    # keeps counting as delivered in the sent-messages display.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_at"]
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_at" not in reloaded.sent_record("m2")
 
 
 def test_load_dedupes_duplicate_message_ids(tmp_path):
@@ -683,6 +744,34 @@ def test_seal_and_open_roundtrip():
     assert message["sent_at"] == 4242.0
 
 
+def test_seal_and_open_keep_kind():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-kind",
+        text="are you there?",
+        sent_at=4242.0,
+        kind="ping",
+    )
+    message = open_message(recipient, blob)
+    assert message["kind"] == "ping"
+
+
+def test_seal_and_open_default_kind_is_chat():
+    sender, recipient = make_identity_pair()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="msg-chat",
+        text="hello",
+        sent_at=4242.0,
+    )
+    assert open_message(recipient, blob)["kind"] == "chat"
+
+
 def test_seal_and_open_roundtrip_with_reply():
     sender, recipient = make_identity_pair()
     reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
@@ -931,6 +1020,100 @@ def test_transaction_is_reentrant(tmp_path):
     with box._transaction():
         entry = box.enqueue(to=BOB, text="nested write", now=time.time())
     assert box.get_outbox(entry.id) is not None
+
+
+def test_transaction_timeout_when_lock_held(tmp_path):
+    # A stalled lock holder (another process holding the flock) must
+    # not block a bounded transaction past its budget.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with box.transaction(timeout=0.1):
+                raise AssertionError("must not acquire a held lock")
+        assert time.monotonic() - started < 2.0
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    # Once the holder releases, the same bounded transaction succeeds.
+    with box.transaction(timeout=1.0):
+        assert box.get_outbox(box.outbox_list()[0].id) is not None
+
+
+def test_transaction_shares_timeout_across_both_locks(tmp_path):
+    # The in-process lock and the flock share one deadline: a
+    # transaction that waits on both must not take up to twice its
+    # timeout.
+    fcntl = pytest.importorskip("fcntl")
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    lock_path = tmp_path / "mailbox.json.lock"
+    handle = open(lock_path, "a")
+    acquired = threading.Event()
+
+    def hold_in_process_lock():
+        box._lock.acquire()
+        acquired.set()
+        try:
+            time.sleep(0.4)
+        finally:
+            box._lock.release()
+
+    holder = threading.Thread(target=hold_in_process_lock, daemon=True)
+    holder.start()
+    assert acquired.wait(5.0)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            with box.transaction(timeout=0.5):
+                raise AssertionError("must not acquire the held locks")
+        elapsed = time.monotonic() - started
+        # 0.4s on the in-process lock leaves 0.1s for the flock: the
+        # shared deadline expires at ~0.5s, not 0.4 + 0.5.
+        assert elapsed < 0.75, "the two lock waits must share one deadline"
+        assert elapsed >= 0.4
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    holder.join(timeout=5.0)
+
+
+def test_outbox_list_timeout_when_lock_held(tmp_path):
+    # A bounded outbox read raises instead of waiting out a stalled
+    # in-process lock holder.
+    box = Mailbox(tmp_path / "mailbox.json")
+    box.enqueue(to=BOB, text="queued", now=time.time())
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        box._lock.acquire()
+        acquired.set()
+        try:
+            release.wait(5.0)
+        finally:
+            box._lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert acquired.wait(5.0)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            box.outbox_list(timeout=0.1)
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        holder.join(timeout=5.0)
+    assert len(box.outbox_list()) == 1
 
 
 def test_enqueue_caps_entry_expiry_at_message_expiry(tmp_path):

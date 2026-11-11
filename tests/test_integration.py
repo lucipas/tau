@@ -169,6 +169,30 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
         assert response["server"] == "alice"
         assert response["node"] == alice_hash
 
+        # --wait is a no-op when the peer answers at once: the same send
+        # reports delivered and carries how long was waited.
+        waited = run_tau(
+            "send",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            "hello again",
+            "--timeout",
+            "20",
+            "--discover-timeout",
+            "10",
+            "--wait",
+            "10",
+            "--json",
+            timeout=60.0,
+        )
+        waited_response = json.loads(require_ok(waited))
+        assert waited_response["ok"] is True
+        assert waited_response["delivered"] is True
+        assert waited_response["waited"] >= 0
+        assert waited_response["echo"] == "hello again"
+
         ping = json.loads(
             require_ok(
                 run_tau(
@@ -866,6 +890,222 @@ def test_second_serve_on_same_tcp_port_fails_fast(tmp_path: Path) -> None:
         assert "ready" not in result.stdout
     finally:
         stop_process(alice)
+
+
+def test_three_nodes_exchange_group_messages(tmp_path: Path) -> None:
+    """Group DMs (issue #80): create, fan out, offline leg queues.
+
+    Alice creates the group with one-shot commands (her node binds the
+    TCP listen port); bob and carol serve as TCP clients and announce,
+    so alice discovers them first.  The offline leg is queued in
+    alice's outbox and delivered by `tau outbox retry` once carol
+    returns.
+    """
+    port = free_port()
+    alice_init = init_node(tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{port}")
+    alice_hash = alice_init["destination"]
+    bob_init = init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{port}")
+    bob_hash = bob_init["destination"]
+    carol_init = init_node(tmp_path, "carol", "--tcp-connect", f"127.0.0.1:{port}")
+    carol_hash = carol_init["destination"]
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+    carol_dir = tmp_path / "carol"
+
+    bob_out = tmp_path / "bob.out"
+    bob_err = tmp_path / "bob.err"
+    carol_out = tmp_path / "carol.out"
+    carol_err = tmp_path / "carol.err"
+    bob = start_serve(bob_dir, bob_out, bob_err)
+    carol = start_serve(carol_dir, carol_out, carol_err)
+    try:
+        time.sleep(2.0)
+        assert bob.poll() is None, bob_err.read_text()
+        assert carol.poll() is None, carol_err.read_text()
+
+        # Alice's one-shot discover binds the listen port, letting the
+        # clients connect and announce; wait until both are known.
+        for wanted in (bob_hash, carol_hash):
+            discovered = discover_until(alice_dir, wanted, attempts=4)
+            assert wanted in discovered, (
+                f"peer {wanted} was not discovered"
+            )
+
+        created = json.loads(
+            require_ok(
+                run_tau(
+                    "group",
+                    "create",
+                    "weekend",
+                    "--peer",
+                    bob_hash,
+                    "--peer",
+                    carol_hash,
+                    "--data-dir",
+                    str(alice_dir),
+                    "--discover-timeout",
+                    "15",
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        group_id = created["group"]["id"]
+        assert created["group"]["name"] == "weekend"
+        assert len(created["group"]["members"]) == 3
+
+        sent = json.loads(
+            require_ok(
+                run_tau(
+                    "group",
+                    "send",
+                    "weekend",
+                    "hello group",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--timeout",
+                    "20",
+                    "--discover-timeout",
+                    "10",
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        assert sent["group"] == group_id
+        assert all(
+            result.get("delivered") for result in sent["results"]
+        ), sent
+
+        assert wait_for_text(bob_out, "hello group"), bob_err.read_text()
+        assert wait_for_text(carol_out, "hello group"), carol_err.read_text()
+
+        for member_dir in (bob_dir, carol_dir):
+            inbox = json.loads(
+                require_ok(
+                    run_tau(
+                        "messages",
+                        "--data-dir",
+                        str(member_dir),
+                        "--json",
+                        timeout=30.0,
+                    )
+                )
+            )
+            matches = [
+                entry
+                for entry in inbox["messages"]
+                if entry["text"] == "hello group"
+            ]
+            assert len(matches) == 1, inbox
+            assert matches[0].get("kind") == "group"
+            assert matches[0].get("group") == group_id
+            assert matches[0].get("group_name") == "weekend"
+
+        listed = json.loads(
+            require_ok(
+                run_tau(
+                    "group",
+                    "list",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--json",
+                    timeout=30.0,
+                )
+            )
+        )
+        assert listed["count"] == 1
+        assert listed["groups"][0]["id"] == group_id
+    finally:
+        stop_process(bob)
+        stop_process(carol)
+
+    # Carol stays offline but bob returns, so only carol's leg queues.
+    bob = start_serve(bob_dir, bob_out, bob_err)
+    try:
+        time.sleep(2.0)
+        assert bob.poll() is None, bob_err.read_text()
+        # Bob's client reconnects once alice's one-shot node binds the
+        # listen port; confirm the path is live before sending.
+        discovered = discover_until(alice_dir, bob_hash, attempts=3)
+        assert bob_hash in discovered
+
+        # Carol goes offline. The next group message queues her leg only.
+        sent = json.loads(
+            require_ok(
+                run_tau(
+                    "group",
+                    "send",
+                    "weekend",
+                    "while carol was away",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--timeout",
+                    "8",
+                    "--discover-timeout",
+                    "3",
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        by_to = {result["to"]: result for result in sent["results"]}
+        assert by_to[bob_hash].get("delivered") is True, sent
+        assert by_to[carol_hash].get("queued") is True, sent
+    finally:
+        stop_process(bob)
+
+    outbox = json.loads(
+        require_ok(
+            run_tau("outbox", "--data-dir", str(alice_dir), "--json", timeout=30.0)
+        )
+    )
+    assert outbox["count"] == 1
+    assert outbox["outbox"][0]["group"]["id"] == group_id
+
+    # Carol returns; `tau outbox retry` delivers the queued leg.
+    carol = start_serve(carol_dir, carol_out, carol_err)
+    try:
+        time.sleep(2.0)
+        assert carol.poll() is None, carol_err.read_text()
+        summary = json.loads(
+            require_ok(
+                run_tau(
+                    "outbox",
+                    "retry",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        assert summary["delivered"] == 1, summary
+        assert wait_for_text(carol_out, "while carol was away"), (
+            carol_err.read_text()
+        )
+    finally:
+        stop_process(carol)
+
+    outbox = json.loads(
+        require_ok(
+            run_tau("outbox", "--data-dir", str(alice_dir), "--json", timeout=30.0)
+        )
+    )
+    assert outbox["count"] == 0
+    inbox = json.loads(
+        require_ok(
+            run_tau("messages", "--data-dir", str(carol_dir), "--json", timeout=30.0)
+        )
+    )
+    matches = [
+        entry
+        for entry in inbox["messages"]
+        if entry["text"] == "while carol was away"
+    ]
+    assert len(matches) == 1, inbox
+    assert matches[0].get("kind") == "group"
+    assert matches[0].get("group") == group_id
 
 
 def test_two_nodes_send_a_file(tmp_path: Path) -> None:

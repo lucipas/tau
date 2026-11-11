@@ -7,7 +7,8 @@ encrypted Reticulum ``Link``:
 
     /tau/ping     -> liveness and clock information
     /tau/info     -> static node information
-    /tau/message  -> deliver a text message, echo it back
+    /tau/message  -> deliver a text message (optionally tagged with a
+                     kind, default ``chat``), echo it back
     /tau/file     -> offer a small file transfer (signed header first;
                     the bytes follow over an RNS Resource on the same link)
     /tau/peers    -> ask a peer which peers it has heard from; the answer
@@ -24,6 +25,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -41,6 +43,23 @@ DEFAULT_TCP_PORT = 4343
 
 MAX_NAME_LENGTH = 48
 MAX_MESSAGE_CHARS = 2000
+# Message kinds (``tau send --kind``): a short lowercase slug tagging what
+# a DM is for — ``chat`` is plain conversation, anything else is a typed
+# message a receiver can filter on.  The wire field is optional so old
+# peers keep working: a payload without a kind is a chat message.
+DEFAULT_MESSAGE_KIND = "chat"
+MAX_MESSAGE_KIND_LENGTH = 32
+# ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
+# would break the documented slug grammar for consumers that enforce it.
+_MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# ``group`` and ``file`` are inbox record types, not message kinds: a
+# direct message tagged with either would fail inbox validation (a
+# "group" text record needs a roster, a "file" one needs file fields)
+# and be silently lost — `_record_received` swallows the failure while
+# the sender already got success and the seen-id blocks a retry.  So
+# they are reserved here, at the one choke point every kind passes
+# through, and the wire parser rejects them the same way.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -74,6 +93,7 @@ REQUEST_REACT = "/tau/react"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
+REQUEST_GROUP_MESSAGE = "/tau/group"
 REQUEST_PATHS = (
     REQUEST_PING,
     REQUEST_INFO,
@@ -84,8 +104,14 @@ REQUEST_PATHS = (
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
+    REQUEST_GROUP_MESSAGE,
 )
 
+# Group DMs: a fixed roster, carried in every group message so a
+# recipient that has never seen the group can learn (and pin) it.
+MAX_GROUP_NAME_LENGTH = 48
+MAX_GROUP_MEMBERS = 32
+MIN_GROUP_MEMBERS = 2
 # A read receipt names at most this many message ids; a receipt is
 # batched, but a compromised peer must not make the sender buffer an
 # unbounded list.
@@ -123,6 +149,44 @@ def normalize_message(text: Any) -> str:
     if len(cleaned) > MAX_MESSAGE_CHARS:
         raise ProtocolError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
     return cleaned
+
+
+def normalize_message_kind(kind: Any) -> str:
+    """Validate a message kind slug, defaulting an absent one to chat.
+
+    A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
+    at most 32 characters) so it is safe to print, compare and filter
+    on.  ``None`` — the local default — means plain chat.  ``group``
+    and ``file`` are reserved: they name inbox record types, and a
+    direct message carrying either could never be stored.
+    """
+    if kind is None:
+        return DEFAULT_MESSAGE_KIND
+    if not isinstance(kind, str):
+        raise ProtocolError("message kind must be a string")
+    cleaned = kind.strip().lower()
+    if _MESSAGE_KIND_RE.fullmatch(cleaned) is None:
+        raise ProtocolError(
+            "message kind must match [a-z0-9][a-z0-9_-]{0,31}"
+        )
+    if cleaned in _RESERVED_MESSAGE_KINDS:
+        raise ProtocolError(f"message kind {cleaned!r} is reserved")
+    return cleaned
+
+
+def kind_from_wire(payload: Dict[str, Any]) -> str:
+    """Kind from a peer payload: absent means chat, present must be valid.
+
+    An explicit ``null`` is malformed, not chat — only a missing key
+    gets the default, so a peer cannot smuggle an invalid kind past
+    validation by sending ``null``.
+    """
+    if "kind" not in payload:
+        return DEFAULT_MESSAGE_KIND
+    kind = payload["kind"]
+    if kind is None:
+        raise ProtocolError("message kind must be a string")
+    return normalize_message_kind(kind)
 
 
 def encode(obj: Any, *, max_bytes: Optional[int] = None) -> bytes:
@@ -236,6 +300,127 @@ def _clean_expires_at(value: Any) -> Optional[float]:
 def generate_message_id() -> str:
     """Return a fresh random message identifier (32 hex characters)."""
     return uuid.uuid4().hex
+
+
+def generate_group_id() -> str:
+    """Return a fresh random group identifier (32 hex characters)."""
+    return uuid.uuid4().hex
+
+
+def derive_group_id(creator: str, name: str, members: List[str]) -> str:
+    """Derive a group's id from its creator, name and roster.
+
+    The id commits to the roster: a message carrying a different roster
+    for the same id cannot verify, so a member cannot fork a group id
+    onto a recipient that has not seen it yet — the recipient pins the
+    roster that matches the id, and only that roster.  Creating a group
+    with a fresh id and an arbitrary roster is still possible, but that
+    is unsolicited group creation, gated by the DM allow-list exactly
+    like a direct message from a stranger.
+    """
+    canonical = "\n".join(
+        [
+            _clean_hexhash(creator, "creator"),
+            sanitize_group_name(name),
+            *[member.lower() for member in sorted(_clean_member_list(members))],
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def sanitize_group_name(name: Any, fallback: str = "group") -> str:
+    """Normalise a human readable group name."""
+    if not isinstance(name, str):
+        return fallback
+    cleaned = " ".join(_clean_text(name).split())
+    cleaned = cleaned[:MAX_GROUP_NAME_LENGTH].strip()
+    return cleaned or fallback
+
+
+def _clean_member_list(value: Any) -> List[str]:
+    """Validate a group roster: 2-32 unique 32-hex destination hashes."""
+    if not isinstance(value, list):
+        raise ProtocolError("members must be a list of destination hashes")
+    members: List[str] = []
+    for member in value:
+        members.append(_clean_hexhash(member, "member"))
+    if len(members) < MIN_GROUP_MEMBERS:
+        raise ProtocolError(
+            f"a group needs at least {MIN_GROUP_MEMBERS} members"
+        )
+    if len(members) > MAX_GROUP_MEMBERS:
+        raise ProtocolError(
+            f"a group has at most {MAX_GROUP_MEMBERS} members"
+        )
+    if len(set(members)) != len(members):
+        raise ProtocolError("group members must be unique")
+    return members
+
+
+def encode_group_message(
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    group_id: str,
+    group_name: str,
+    creator: str,
+    members: List[str],
+    sent_at: Optional[float] = None,
+) -> bytes:
+    """Encode a group chat message for the ``/tau/group`` request.
+
+    The roster rides in every message, signed by the link identity of
+    the sender (the same authentication as a direct message), so a
+    recipient that has never seen the group can learn and pin it.  The
+    group id is derived from the creator, name and roster (see
+    :func:`derive_group_id`), so the roster a message carries must match
+    the id it claims.
+    """
+    payload = {
+        "type": "group_message",
+        "v": PROTOCOL_VERSION,
+        "text": normalize_message(text),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+        "group": _clean_hexhash(group_id, "group"),
+        "group_name": sanitize_group_name(group_name),
+        "creator": _clean_hexhash(creator, "creator"),
+        "members": _clean_member_list(members),
+    }
+    if message_id:
+        payload["id"] = message_id
+    return encode(payload, max_bytes=MAX_REQUEST_BYTES)
+
+
+def parse_group_message(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/group`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "group_message":
+        raise ProtocolError("expected a group_message payload")
+    text = normalize_message(payload.get("text"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    group = _clean_hexhash(payload.get("group"), "group")
+    group_name = sanitize_group_name(payload.get("group_name"))
+    creator = _clean_hexhash(payload.get("creator"), "creator")
+    members = _clean_member_list(payload.get("members"))
+    if creator not in members:
+        raise ProtocolError("group creator must be a member of the group")
+    if derive_group_id(creator, group_name, members) != group:
+        raise ProtocolError("group id does not match its creator and roster")
+    return {
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "group": group,
+        "group_name": group_name,
+        "creator": creator,
+        "members": members,
+    }
 
 
 def clean_reaction(value: Any) -> str:
@@ -399,8 +584,6 @@ def clean_in_reply_to(value: Any) -> Optional[Dict[str, Any]]:
             raise ProtocolError("in_reply_to excerpt must be a short hex hash")
         excerpt = excerpt.lower()
     return {"id": message_id, "excerpt": excerpt}
-
-
 def encode_message(
     text: str,
     *,
@@ -408,6 +591,7 @@ def encode_message(
     sent_at: Optional[float] = None,
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    kind: Optional[str] = None,
 ) -> bytes:
     """Encode a chat message for the ``/tau/message`` request.
 
@@ -423,6 +607,7 @@ def encode_message(
         "type": "message",
         "v": PROTOCOL_VERSION,
         "text": normalize_message(text),
+        "kind": normalize_message_kind(kind),
         "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
         "client": f"tau/{__version__}",
     }
@@ -451,6 +636,7 @@ def parse_message(raw: Any) -> Dict[str, Any]:
         message_id = None
     return {
         "text": text,
+        "kind": kind_from_wire(payload),
         "sent_at": sent_at,
         "id": message_id,
         "expires_at": _clean_expires_at(payload.get("expires_at")),

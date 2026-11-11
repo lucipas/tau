@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Union
 
 AUTHOR_HEX_LENGTH = 32
-ENTRY_KINDS = ("post", "like", "unlike", "delete", "reply", "quote")
 
 
 class RulesError(ValueError):
@@ -76,6 +75,12 @@ def _clean_kinds(values: Any) -> Optional[frozenset]:
     if not isinstance(values, (list, tuple, set, frozenset)):
         raise RulesError("kinds must be a list of entry kinds")
     kinds = frozenset(str(value).strip().lower() for value in values)
+    # The canonical kind list lives in tan.py; import it lazily because
+    # tan imports this module at load time.  A second copy here would
+    # drift again the next time a kind is added (a repost was missed
+    # exactly this way).
+    from .tan import ENTRY_KINDS
+
     unknown = kinds - set(ENTRY_KINDS)
     if unknown:
         raise RulesError(f"unknown entry kinds: {', '.join(sorted(unknown))}")
