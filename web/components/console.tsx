@@ -6,6 +6,7 @@ import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
 import { Composer } from "./composer";
+import { AllowlistSection } from "./allowlist-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
 import { OutboxSection } from "./outbox-section";
@@ -14,23 +15,47 @@ import { PeerSidebar } from "./peer-sidebar";
 export function Console() {
   const tau = useTau();
   const [target, setTarget] = useState("");
-  const [mode, setMode] = useState<"peer" | "custom">("peer");
+  const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
 
   useEffect(() => {
-    if (tau.peers.length === 0) {
+    if (tau.peers.length === 0 && tau.groups.length === 0) {
       setMode("custom");
       return;
     }
-    if (!target && !customPicked.current) {
-      setMode("peer");
-      setTarget(tau.peers[0].destination);
+    // A refresh can remove the selected group: never keep submitting its
+    // stale id. Fall back to a remaining group, then to a peer.
+    if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
+      if (tau.groups.length > 0) {
+        setTarget(tau.groups[0].id);
+      } else if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      return;
     }
-  }, [tau.peers, target]);
+    if (!target && !customPicked.current) {
+      if (tau.peers.length > 0) {
+        setMode("peer");
+        setTarget(tau.peers[0].destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      }
+    }
+  }, [tau.peers, tau.groups, target, mode]);
 
-  function changeMode(next: "peer" | "custom") {
+  function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
+    // A pending reply belongs to a peer conversation: the bridge
+    // rejects replies on group sends, so entering group mode drops it.
+    if (next === "group") {
+      setReplyTo(null);
+    }
     setMode(next);
   }
 
@@ -99,27 +124,61 @@ export function Console() {
         ) : null}
 
         <main className="mx-auto grid w-full max-w-7xl gap-4 px-4 py-4 lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:px-8 lg:py-6">
+          <div className="flex min-w-0 flex-col gap-4">
           <PeerSidebar
             node={tau.node}
             peers={tau.peers}
             groups={tau.groups}
             bridge={tau.bridge}
+            social={tau.social}
             pings={tau.pings}
+            verifications={tau.verifications}
+            blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onVerify={(destination) => {
+              void tau.verifyPeer(destination).catch(() => undefined);
+            }}
+            onShowSafetyNumber={(destination) => {
+              void tau.showSafetyNumber(destination).catch(() => undefined);
+            }}
+            onDismissVerification={(destination) => {
+              tau.clearVerification(destination);
+            }}
+            onBlock={(destination) => {
+              void tau.blockPeer(destination).catch(() => undefined);
+            }}
+            onUnblock={(destination) => {
+              void tau.unblockPeer(destination).catch(() => undefined);
+            }}
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}
           />
+            <AllowlistSection
+              allowlist={tau.allowlist}
+              onAdd={(value) => tau.addAllowlistPeer(value)}
+              onRemove={(value) => tau.removeAllowlistPeer(value)}
+              onToggle={(enabled) => tau.setAllowlistEnabled(enabled)}
+            />
+          </div>
 
           <div className="flex min-w-0 flex-col">
             <MessageFeed
-              messages={tau.messages}
+              messages={
+                tau.searchQuery !== null ? tau.searchResults : tau.messages
+              }
               node={tau.node}
               live={tau.connection === "live"}
+              searching={tau.searchQuery !== null}
+              searchQuery={tau.searchQuery}
+              searchError={tau.searchError}
+              quoteContext={tau.messages}
+              onSearch={tau.search}
+              onClearSearch={tau.clearSearch}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {
@@ -128,22 +187,29 @@ export function Console() {
                 }
               }}
             />
-            {tau.outbox.length > 0 ? (
-              <div className="mt-4">
-                <OutboxSection
-                  entries={tau.outbox}
-                  heldForOthers={tau.heldForOthers}
-                  onCancel={tau.cancelOutbox}
-                />
-              </div>
-            ) : null}
+            {/* Stays mounted when the queue empties so a retry's result
+                line survives the last entry leaving; it renders nothing
+                itself when there is nothing to show. */}
+            <div className="mt-4">
+              <OutboxSection
+                entries={tau.outbox}
+                heldForOthers={tau.heldForOthers}
+                held={tau.heldMail}
+                onCancel={tau.cancelOutbox}
+                onRetry={tau.retryOutbox}
+                onDropHeld={tau.dropHeldMail}
+              />
+            </div>
             <Composer
               peers={tau.peers}
+              groups={tau.groups}
               target={target}
               mode={mode}
               onTargetChange={handleTargetChange}
               onModeChange={changeMode}
               onSend={tau.send}
+              onSendGroup={tau.sendGroup}
+              onSendFile={tau.sendFile}
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
