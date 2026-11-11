@@ -81,6 +81,21 @@ def test_update_preserves_first_seen_and_ignores_unknown_name(tmp_path):
     assert peer.first_seen == 100.0
 
 
+def test_from_dict_rejects_nonfinite_timestamps():
+    # JSON accepts NaN/Infinity literals, so a hand-edited registry file
+    # can carry them; a non-finite timestamp used to crash every reader
+    # that formats an age (e.g. `tau peers show` via _ago).
+    registry = PeerRegistry()
+    peer = make_peer(registry, 3, "carol", now=100.0)
+    raw = peer.to_dict()
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            Peer.from_dict(dict(raw, last_seen=bad))
+        # A non-finite first_seen falls back to last_seen, like a missing one.
+        recovered = Peer.from_dict(dict(raw, first_seen=bad))
+        assert recovered.first_seen == peer.last_seen
+        assert recovered.last_seen == peer.last_seen
+
 def test_record_delivered_tracks_history_and_persists(tmp_path):
     registry = PeerRegistry(tmp_path / "peers.json")
     peer = make_peer(registry, 3, "carol", now=100.0)
@@ -846,6 +861,21 @@ def test_local_dict_includes_trust_state_public_dict_does_not(tmp_path):
     assert local["verified"] is True
     assert local["verified_at"] == 150.0
     assert local["key_change_at"] is None
+
+
+def test_local_dict_includes_alias_public_dict_does_not(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    assert peer.local_dict(now=200.0)["alias"] is None
+    registry.set_alias(peer.destination_hash, "laptop")
+
+    local = peer.local_dict(now=200.0)
+    assert local["alias"] == "laptop"
+    # The alias is owner-only, like verification: it never leaves in a
+    # public description or a peer-exchange payload.
+    assert "alias" not in peer.public_dict(now=200.0)
+    assert "alias" not in peer.exchange_dict(now=200.0)
 
 
 def test_from_dict_tolerates_bad_verification_fields(tmp_path):

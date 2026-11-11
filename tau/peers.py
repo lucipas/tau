@@ -218,10 +218,10 @@ class Peer:
             raise ValueError("invalid public key length")
 
         last_seen = raw.get("last_seen")
-        if not isinstance(last_seen, (int, float)):
+        if not isinstance(last_seen, (int, float)) or not math.isfinite(last_seen):
             raise ValueError("invalid last_seen timestamp")
         first_seen = raw.get("first_seen")
-        if not isinstance(first_seen, (int, float)):
+        if not isinstance(first_seen, (int, float)) or not math.isfinite(first_seen):
             first_seen = last_seen
         hops = raw.get("hops")
         if not isinstance(hops, int) or hops < 0:
@@ -281,9 +281,11 @@ class Peer:
         Verification is a local judgement, never shared with other peers:
         it stays out of ``public_dict`` (and therefore out of exchange
         payloads) and is only shown to this node's owner — the CLI, the
-        web console, and the persisted registry.
+        web console, and the persisted registry.  The local alias is the
+        same kind of owner-only label.
         """
         payload = self.public_dict(now)
+        payload["alias"] = self.alias
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at
