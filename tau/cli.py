@@ -4646,6 +4646,14 @@ def cmd_forward(args: argparse.Namespace) -> int:
         record = inbox.resolve(args.message)
     except ValueError as exc:
         raise NodeError(str(exc)) from exc
+    # Messages hidden by the block-list are hidden from `tau messages`
+    # and must not be forwarded either.  An unreadable block-list fails
+    # closed, matching the listing.
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        raise NodeError("cannot forward: the block-list could not be read")
+    if record.get("destination") in blocked:
+        raise NodeError("cannot forward a message from a blocked peer")
     text = record.get("text")
     if not text:
         # File records carry no text (see inbox._valid_record).
@@ -4658,8 +4666,17 @@ def cmd_forward(args: argparse.Namespace) -> int:
         # Inbox records already store the sender's display name as known
         # when the message arrived; re-resolve it so a newer alias wins,
         # falling back to the stored label (a name, or the short hash).
-        label = str(record.get("from") or "unknown")
         sender_hash = record.get("destination")
+        stored_name = record.get("from")
+        if not stored_name or stored_name == "unknown":
+            # No real name was ever recorded: attribute by short hash.
+            label = (
+                short_hash(sender_hash)
+                if isinstance(sender_hash, str) and sender_hash
+                else "unknown"
+            )
+        else:
+            label = str(stored_name)
         peer = (
             PeerRegistry(config.peers_path).get(sender_hash)
             if isinstance(sender_hash, str) and sender_hash
