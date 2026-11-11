@@ -7,6 +7,8 @@ import sqlite3
 import stat
 import tarfile
 from pathlib import Path
+import tempfile
+import threading
 
 import pytest
 
@@ -210,6 +212,84 @@ def test_backup_refuses_while_node_serving(tmp_path, capsys):
         lock.release()
     assert code == 1
     assert "already serving" in capsys.readouterr().err
+
+
+def test_backup_live_runs_while_node_serving(tmp_path, capsys):
+    # The serving node's own backup: the instance lock is held (this
+    # process stands in for the serving node), so the plain path would
+    # refuse — but the live path skips the lock and still writes a
+    # valid archive, because the node's own writes are atomic.
+    node_a = _init_node(tmp_path, "a", "alice")
+    _seed_state(node_a)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node_a)
+    lock = InstanceLock(config.instance_lock_path, config.data_dir)
+    lock.acquire()
+    try:
+        archive = tmp_path / "backup.tar.gz"
+        target, manifest = create_backup(config, archive, live=True)
+    finally:
+        lock.release()
+    assert target == archive
+    assert manifest["format"] == 1
+
+    node_b = tmp_path / "b"
+    assert cli.main(["restore", str(archive), "--data-dir", str(node_b)]) == 0
+    capsys.readouterr()
+    assert _id_destination(node_b, capsys) == _id_destination(node_a, capsys)
+    assert (node_b / "mailbox.json").exists()
+    assert (node_b / "tan.sqlite3").exists()
+
+
+def test_live_backup_survives_concurrent_state_replacement(tmp_path, capsys):
+    # A live node replaces state files atomically while a backup reads
+    # them.  Members are read from one open descriptor, so a replacement
+    # between the size lookup and the read cannot truncate a member:
+    # every archive holds either the old or the new complete file,
+    # never a mix of the two.
+    node = _init_node(tmp_path, "node", "alice")
+    _seed_state(node)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    small = b'{"peers": []}\n'
+    large = b'{"peers": [' + b'{"x": 1}, ' * 5000 + b']}\n'
+    stop = threading.Event()
+
+    def atomic_write(path, data):
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".peers.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def rewrite():
+        toggle = False
+        while not stop.is_set():
+            atomic_write(node / "peers.json", large if toggle else small)
+            toggle = not toggle
+
+    writer = threading.Thread(target=rewrite, daemon=True)
+    writer.start()
+    try:
+        for i in range(15):
+            archive = tmp_path / f"backup-{i}.tar.gz"
+            create_backup(config, archive, live=True)
+            with tarfile.open(archive, mode="r:gz") as tar:
+                member = tar.extractfile("peers.json")
+                assert member is not None
+                content = member.read()
+            assert content in (small, large), "truncated or mixed peers.json"
+    finally:
+        stop.set()
+        writer.join(timeout=5)
 
 
 def test_backup_captures_uncheckpointed_wal_rows(tmp_path, capsys):
