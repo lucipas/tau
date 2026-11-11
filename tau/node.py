@@ -140,6 +140,31 @@ def _remaining(deadline: Optional[float]) -> Optional[float]:
     return max(0.0, deadline - time.monotonic())
 
 
+def _read_file_payload(path: Union[str, Path]) -> Tuple[bytes, str, str]:
+    """Read and validate a file for sending; returns ``(data, name, sha256)``.
+
+    The read is bounded at one byte past the limit, so an oversized (or
+    growing) file is rejected without loading it all.
+    """
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise NodeError(f"no such file: {source}")
+    try:
+        with source.open("rb") as handle:
+            data = handle.read(MAX_FILE_BYTES + 1)
+    except OSError as exc:
+        raise NodeError(f"could not read {source}: {exc}") from exc
+    if len(data) < 1 or len(data) > MAX_FILE_BYTES:
+        raise NodeError(
+            f"file of {len(data)} bytes is outside the 1..{MAX_FILE_BYTES} "
+            "byte limit"
+        )
+    name = sanitize_file_name(source.name)
+    if not name:
+        raise NodeError(f"file name {source.name!r} is not usable")
+    return data, name, hashlib.sha256(data).hexdigest()
+
+
 # Reticulum adds framing and resource overhead on top of request payloads.
 _REQUEST_WIRE_LIMIT = MAX_REQUEST_BYTES + 2 * 1024
 _MAIL_WIRE_LIMIT = MAX_MAIL_REQUEST_BYTES + 2 * 1024
@@ -3573,6 +3598,95 @@ class TauNode:
             "results": results,
         }
 
+    def send_group_file(
+        self,
+        group: Union[str, Dict[str, Any]],
+        path: Union[str, Path],
+        *,
+        timeout: float = _FILE_TRANSFER_TIMEOUT,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a file out to every member of a group except this node.
+
+        *group* is a group id, id prefix, name, or group record.  Each
+        leg is one ``send_file`` transfer (its own transfer id and
+        ``/tau/file`` offer, hash verified by the receiver, 10 MiB
+        limit).  Files are direct links only in v1, like ``send_file``:
+        a member that cannot be reached or refuses the offer is a
+        failed leg, not a queued one.  Each leg is bounded by
+        ``timeout`` — the per-leg deadline discipline from
+        ``send_group_message``, so one slow member cannot consume
+        another member's window.  Returns a per-member result list:
+        ``delivered`` (with the transfer id, name, size and sha256)
+        or an ``error`` for that leg.
+        """
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        # Validate the file once, before any leg is sent, so a missing
+        # or oversized file fails cleanly up front rather than
+        # aborting the fan-out partway through.
+        _read_file_payload(path)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            found = self.registry.get(bytes.fromhex(member))
+            peer_name = found.display_name if found is not None else ""
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "ok": False,
+                        "error": "not attempted: group send time limit reached",
+                    }
+                )
+                continue
+            leg_discover = (
+                min(discover_timeout, budget)
+                if discover_timeout is not None
+                else None
+            )
+            try:
+                sent = self.send_file(
+                    member,
+                    path,
+                    timeout=budget,
+                    discover_timeout=leg_discover,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "delivered": True,
+                        "id": sent["id"],
+                        "name": sent["name"],
+                        "size": sent["size"],
+                        "sha256": sent["sha256"],
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer_name,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+        # Aggregate success only when every leg was delivered; a
+        # failed leg is a failed fan-out (there is no queue for files).
+        all_ok = all(r.get("delivered") for r in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "results": results,
+        }
+
     def send_file(
         self,
         target: Union[str, bytes, Peer],
@@ -3591,28 +3705,10 @@ class TauNode:
         bytes travel as a Resource on the same link; the receiver
         verifies the hash before writing anything to disk.
         """
-        source = Path(path).expanduser()
-        if not source.is_file():
-            raise NodeError(f"no such file: {source}")
-        try:
-            # Read at most one byte past the limit so an oversized (or
-            # growing) file is rejected without loading it all.
-            with source.open("rb") as handle:
-                data = handle.read(MAX_FILE_BYTES + 1)
-        except OSError as exc:
-            raise NodeError(f"could not read {source}: {exc}") from exc
-        if len(data) < 1 or len(data) > MAX_FILE_BYTES:
-            raise NodeError(
-                f"file of {len(data)} bytes is outside the 1..{MAX_FILE_BYTES} "
-                "byte limit"
-            )
-        name = sanitize_file_name(source.name)
-        if not name:
-            raise NodeError(f"file name {source.name!r} is not usable")
+        data, name, digest = _read_file_payload(path)
         if self.identity is None:
             raise NodeError("node has not been started")
         transfer_id = generate_message_id()
-        digest = hashlib.sha256(data).hexdigest()
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout

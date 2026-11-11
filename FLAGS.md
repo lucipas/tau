@@ -35,6 +35,7 @@ Global options may appear before or after the command:
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
+| `tau group send-file GROUP FILE` | Send a file (at most 10 MiB) to every member of a group, one direct transfer per member (a member that cannot be reached or refuses is reported as failed, not queued) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
