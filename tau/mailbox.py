@@ -854,11 +854,20 @@ class Mailbox:
         retracted: Dict[str, float] = {}
         raw_retracted = raw.get("retracted")
         if isinstance(raw_retracted, dict):
-            retracted = {
-                str(k): float(v)
-                for k, v in raw_retracted.items()
-                if isinstance(v, (int, float))
-            }
+            # A marker is written as now + RETRACTED_RETENTION, so any
+            # expiry beyond that (or non-finite, or too large to convert)
+            # is malformed: drop it rather than let it suppress a message
+            # indefinitely or abort the load.
+            latest = time.time() + RETRACTED_RETENTION
+            for k, v in raw_retracted.items():
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    continue
+                try:
+                    until = float(v)
+                except OverflowError:
+                    continue
+                if math.isfinite(until) and until <= latest:
+                    retracted[str(k)] = until
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
