@@ -3525,7 +3525,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         on_file=console_file,
     )
     if web_settings is not None:
-        from .webapi import WebBridge, WebBridgeError, check_web_console_bind
+        from .webapi import (
+            WebBridge,
+            WebBridgeError,
+            check_web_console_bind,
+            file_arrival_text,
+        )
 
         host, port, web_dir = web_settings
         try:
@@ -3557,11 +3562,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 {
                     "destination": record.get("destination"),
                     "from": record.get("from"),
-                    "text": (
-                        f"Received file: {record.get('name')} "
-                        f"({record.get('size')} bytes, "
-                        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
-                    ),
+                    "text": file_arrival_text(record),
                     "sent_at": record.get("sent_at"),
                     "received_at": record.get("received_at"),
                     "file": {

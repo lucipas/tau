@@ -18,6 +18,8 @@ script) can read what arrives from the mesh and send messages back:
                            ``"expires_in"`` seconds for a disappearing message)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
                            (one outbound entry per member; replies and expiry are peer-DM-only)
+    GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
+    POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
                            download a file received from ``<sender>``
                            (sender destination hash, sanitised file name)
@@ -131,12 +133,12 @@ MAX_BODY_BYTES = 32 * 1024
 # file is ~13.4 MB once encoded, so this endpoint gets its own cap.  The
 # bridge still enforces the 10 MiB file limit after decoding.
 MAX_FILE_BODY_BYTES = 15 * 1024 * 1024
-# An import carries a whole signed chain, so the 32 KiB action cap would
-# reject any real backup. The bridge binds to loopback only and the
-# document is validated entry by entry, so a 16 MiB cap is the bound —
-# and the export is held to the same cap, so the console never hands
-# out a backup it cannot import back (larger caches back up with the
-# CLI, which has no cap).
+# An import carries a whole message history or a whole signed chain, so
+# the 32 KiB action cap would reject any real backup. The bridge binds
+# to loopback only and the document is validated entry by entry, so a
+# 16 MiB cap is the bound — and the export is held to the same cap, so
+# the console never hands out a backup it cannot import back (larger
+# histories and caches back up with the CLI, which has no cap).
 MAX_IMPORT_BYTES = 16 * 1024 * 1024
 MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
@@ -1345,6 +1347,32 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_suggest(self, limit: int = 5) -> List[Dict[str, Any]]:
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import suggest_authors
+
+        # Same block-list snapshot as the timeline: a blocked author is
+        # never suggested, and a failed-closed list suggests nobody.
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        if blocklist is not None and blocklist.block_all:
+            return []
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            return suggest_authors(
+                conn, viewer=viewer, limit=limit, exclude=blocked
+            )
+        finally:
+            conn.close()
+
     def tan_likers(self, target: Any) -> Dict[str, Any]:
         """List who liked one Tan post, newest like first.
 
@@ -1748,6 +1776,157 @@ class WebBridge:
         if app is None:
             raise WebBridgeError("the Tan social feed is not enabled; run serve --social")
         return app.sync(self.node, explore=explore)
+
+    def messages_export(self) -> Dict[str, Any]:
+        """Return the portable backup document the CLI writes.
+
+        The same document ``tau messages export`` produces, so a
+        console backup restores with the CLI and vice versa.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        document = inbox.export_document()
+        # The console must never hand out a backup it cannot import
+        # back: the import route rejects bodies over MAX_IMPORT_BYTES,
+        # so an export past that size is refused here, with the CLI as
+        # the route for larger histories.
+        size = len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+        if size > MAX_IMPORT_BYTES:
+            raise ValueError(
+                "this export is larger than the console can import back "
+                f"({MAX_IMPORT_BYTES // (1024 * 1024)} MiB); back up with "
+                "`tau messages export` from the command line instead"
+            )
+        return document
+
+    def messages_import(self, document: Any) -> Dict[str, Any]:
+        """Merge an export document into the node inbox.
+
+        Returns the same ``{"imported", "present", "skipped",
+        "errors"}`` counts as the CLI import; a bad entry is skipped
+        with its error recorded and never aborts the rest. Newly
+        imported entries are also mirrored into the console feed, so
+        restored messages show up right away instead of landing in
+        the inbox only.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise WebBridgeError("this node has no message inbox")
+        # The inbox reports the records this call stored, so a concurrent
+        # import or live arrival can never make the same entry mirror twice.
+        inserted: List[Dict[str, Any]] = []
+        result = inbox.import_messages(document, inserted=inserted)
+        # An invalid entry's id comes from untrusted JSON and may hold
+        # a lone surrogate, which the UTF-8 response encoder cannot
+        # write. Replace unencodable characters so the counts still
+        # reach the console.
+        for error in result["errors"]:
+            for key in ("id", "error"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    error[key] = value.encode("utf-8", "replace").decode("utf-8")
+        if inserted:
+            self._mirror_imported_messages(inserted)
+            # Other open consoles learn the new unread counts from SSE;
+            # the importing tab also gets them in the response.
+            unread = self.unread()
+            self.bus.publish({"type": "unread", "unread": unread})
+            result["unread"] = unread
+        return result
+
+    def _mirror_imported_messages(self, records: List[Dict[str, Any]]) -> None:
+        """Append newly imported inbox records to the console feed.
+
+        The feed is the console's own log, not a view of the inbox,
+        so without this a restore would land in ``inbox.json`` only
+        and the user would see nothing change. Records are mirrored
+        in stored (oldest-first) order with the same field mapping
+        live traffic uses in :meth:`record_inbound`; a disappearing
+        message whose deadline already passed is skipped — the feed
+        purges it on read anyway — and the log is saved once, not
+        once per entry.
+        """
+        names = {
+            item["destination"]: item["name"]
+            for item in self.peers()
+            if isinstance(item.get("destination"), str)
+            and isinstance(item.get("name"), str)
+            and item.get("name")
+        }
+        now = time.time()
+        appended: List[Dict[str, Any]] = []
+        for record in records:
+            expires_at = record.get("expires_at")
+            if (
+                isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and float(expires_at) <= now
+            ):
+                continue
+            direction = (
+                record.get("direction")
+                if record.get("direction") in ("in", "out")
+                else "in"
+            )
+            peer_hash = str(record.get("destination") or "")
+            if direction == "in":
+                peer_name = str(record.get("from") or "")
+                if not peer_name or peer_name == "unknown":
+                    peer_name = short_hash(peer_hash) if peer_hash else "unknown"
+            else:
+                peer_name = names.get(peer_hash) or (
+                    short_hash(peer_hash) if peer_hash else "unknown"
+                )
+            group = record.get("group") if record.get("kind") == "group" else None
+            wire_id = record.get("id")
+            # A file record has no text: describe it the way the live
+            # file arrival does, so the feed shows the same line.
+            if record.get("kind") == "file":
+                text = file_arrival_text(record)
+            else:
+                text = str(record.get("text") or "")
+            message = self._append_message(
+                direction=direction,
+                peer=peer_hash or None,
+                peer_name=sanitize_name(peer_name, fallback="unknown"),
+                text=text,
+                sent_at=_as_float(record.get("sent_at")),
+                received_at=_as_float(record.get("received_at"), default=time.time()),
+                status="received" if direction == "in" else "delivered",
+                group=group if isinstance(group, str) else None,
+                group_name=(
+                    str(record.get("group_name") or "")
+                    if isinstance(record.get("group_name"), str)
+                    else None
+                ),
+                expires_at=(
+                    float(expires_at)
+                    if isinstance(expires_at, (int, float))
+                    and not isinstance(expires_at, bool)
+                    else None
+                ),
+                wire_id=wire_id if isinstance(wire_id, str) else None,
+                in_reply_to=record.get("in_reply_to"),
+                save=False,
+            )
+            appended.append(message)
+        self._save_messages()
+        # Live consoles show arrivals from their message events; publish
+        # the restored entries the same way, in feed order. Blocked
+        # senders stay hidden like the messages API hides them: the
+        # record is kept for unblocking, but no event shows it.
+        blocklist = getattr(self.node, "blocklist", None)
+        for message in appended:
+            if (
+                message.get("direction") == "in"
+                and blocklist is not None
+                and blocklist.is_blocked(
+                    message.get("destination") or message.get("peer")
+                )
+            ):
+                continue
+            self.bus.publish({"type": "message", "message": message})
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
         """Return the portable backup document the CLI writes.
@@ -3053,6 +3232,7 @@ class WebBridge:
         wire_id: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
+        save: bool = True,
     ) -> Dict[str, Any]:
         with self._lock:
             message = {
@@ -3094,7 +3274,10 @@ class WebBridge:
                 message["file"] = cleaned_file
             self._next_message_id += 1
             self._messages.append(message)
-        self._save_messages()
+        # A bulk caller (import mirroring) passes save=False and saves
+        # once after the loop instead of once per entry.
+        if save:
+            self._save_messages()
         return message
 
     # -- static files ------------------------------------------------------
@@ -3153,6 +3336,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def file_arrival_text(record: Dict[str, Any]) -> str:
+    """Feed line for a received file: name, size and short SHA-256.
+
+    Shared by live file delivery and backup restore so both show the
+    same entry for a file.
+    """
+    return (
+        f"Received file: {record.get('name')} "
+        f"({record.get('size')} bytes, "
+        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
+    )
 
 
 def _valid_expires_in(value: Any) -> bool:
@@ -3257,6 +3453,30 @@ class _WebHandler(BaseHTTPRequestHandler):
                 limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 self._send_json({"messages": self.bridge.messages(limit)}, head_only)
                 return
+            if path == "/api/messages/export":
+                # The full inbox backup goes only to the local machine,
+                # even when the bridge is bound to a remote interface.
+                if not _is_loopback_client(self.client_address[0]):
+                    self._send_json(
+                        {
+                            "error": {
+                                "message": "messages export is only available from localhost"
+                            }
+                        },
+                        head_only,
+                        403,
+                    )
+                    return
+                try:
+                    document = self.bridge.messages_export()
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json(document, head_only)
+                return
             if path.startswith("/api/files/"):
                 parts = [
                     unquote(part) for part in path[len("/api/files/") :].split("/")
@@ -3352,6 +3572,13 @@ class _WebHandler(BaseHTTPRequestHandler):
                     {"following": records, "count": len(records)}, head_only
                 )
                 return
+            if path == "/api/tan/suggest":
+                limit = _int_param(query, "limit", default=5, minimum=1, maximum=50)
+                suggestions = self.bridge.tan_suggest(limit=limit)
+                self._send_json(
+                    {"suggestions": suggestions, "count": len(suggestions)}, head_only
+                )
+                return
             if path == "/api/tan/export":
                 scope = (query.get("scope") or ["mine"])[0]
                 if scope not in ("mine", "all"):
@@ -3437,6 +3664,19 @@ class _WebHandler(BaseHTTPRequestHandler):
             # Bulk imports write many entries with no per-request quota, so
             # they are accepted only from the local machine, even when the
             # bridge is bound to a remote interface.
+            if path == "/api/messages/import" and not _is_loopback_client(
+                self.client_address[0]
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "messages import is only accepted from localhost"
+                        }
+                    },
+                    head_only,
+                    403,
+                )
+                return
             if path == "/api/tan/import" and not _is_loopback_client(
                 self.client_address[0]
             ):
@@ -3447,11 +3687,11 @@ class _WebHandler(BaseHTTPRequestHandler):
                 )
                 return
             # A file send carries base64 bytes and an import carries a whole
-            # signed chain, so each gets a larger body cap than a chat
-            # message or a single action.
+            # message history or a whole signed chain, so each gets a larger
+            # body cap than a chat message or a single action.
             if path == "/api/send-file":
                 limit = MAX_FILE_BODY_BYTES
-            elif path == "/api/tan/import":
+            elif path in ("/api/messages/import", "/api/tan/import"):
                 limit = MAX_IMPORT_BYTES
             else:
                 limit = MAX_BODY_BYTES
@@ -3483,6 +3723,17 @@ class _WebHandler(BaseHTTPRequestHandler):
                     peer.strip() if isinstance(peer, str) else None
                 )
                 self._send_json({"ok": True, "unread": counts}, head_only)
+                return
+            if path == "/api/messages/import":
+                try:
+                    result = self.bridge.messages_import(body)
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                self._send_json({"ok": True, "import": result}, head_only)
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)

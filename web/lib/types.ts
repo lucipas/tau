@@ -405,6 +405,20 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanSuggestion {
+  author: string;
+  name: string;
+  posts: number;
+  likes: number;
+  reason: string;
+  last_post: number;
+}
+
+export interface TanSuggestResponse {
+  suggestions: TanSuggestion[];
+  count: number;
+}
+
 export interface TanLiker {
   author: string;
   name: string;
@@ -457,6 +471,36 @@ export interface TanSyncResponse {
     duplicates: number;
     errors: Array<{ peer: string; author: string; error: string }>;
   };
+}
+
+export interface MessagesResponse {
+  messages: TauMessage[];
+}
+
+export interface MessagesExportDocument {
+  format: string;
+  version: number;
+  exported_at: number;
+  messages: Array<Record<string, unknown>>;
+}
+
+export interface MessagesImportError {
+  id: string | null;
+  error: string;
+}
+
+export interface MessagesImportResult {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: MessagesImportError[];
+  // Fresh unread counts, present only when the import stored something.
+  unread?: UnreadCounts;
+}
+
+export interface MessagesImportResponse {
+  ok: boolean;
+  import: MessagesImportResult;
 }
 
 export interface TanExportDocument {

@@ -32,6 +32,7 @@ const { fakeTan, postA, postB } = vi.hoisted(() => {
   const fakeTan = {
     posts: [postA, postB],
     following: [],
+    suggestions: [],
     // Main's console reads these during render; the liker-race mock
     // must carry them even though the races never touch them.
     searchResults: [],

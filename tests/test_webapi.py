@@ -1487,6 +1487,75 @@ def test_tan_timeline_and_follow(tmp_path):
         bridge.stop()
 
 
+def test_tan_suggest_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bob = RNS.Identity()
+    carol = RNS.Identity()
+    dave = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        bob_post = create_post(conn, bob, "bob posts", name="bob", now=1000)
+        carol_post = create_post(conn, carol, "carol posts", name="carol", now=1001)
+        dave_post = create_post(conn, dave, "dave posts", name="dave", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # No follows yet and no likes: equal scores, newest post first.
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert status == 200
+        assert [item["author"] for item in payload["suggestions"]] == [
+            dave_post["author"],
+            carol_post["author"],
+            bob_post["author"],
+        ]
+        assert payload["count"] == 3
+        assert payload["suggestions"][0]["name"] == "dave"
+        assert payload["suggestions"][0]["posts"] == 1
+
+        status, _, payload = _json(bridge, "/api/tan/suggest?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["suggestions"][0]["author"] == dave_post["author"]
+
+        # Following bob removes him from the suggestions.
+        status, _, _ = _json(
+            bridge,
+            "/api/tan/follow",
+            method="POST",
+            body={"target": bob_post["author"]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert [item["author"] for item in payload["suggestions"]] == [
+            dave_post["author"],
+            carol_post["author"],
+        ]
+
+        # A blocked author is never suggested; a failed-closed list
+        # suggests nobody at all.
+        node.blocklist = BlockList(blocked=frozenset({dave_post["author"]}))
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert [item["author"] for item in payload["suggestions"]] == [
+            carol_post["author"]
+        ]
+        node.blocklist = BlockList(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/suggest")
+        assert payload["suggestions"] == []
+        assert payload["count"] == 0
+    finally:
+        bridge.stop()
+
+
 def test_snapshot_counts_tan_posts_from_the_store(tmp_path):
     """Regression test for the Codex P2 on PR #180: snapshot
     ``social.posts`` counted the session-scoped post-event buffer, so
@@ -5311,6 +5380,81 @@ def test_send_with_expires_in_records_deadline(bridge, node):
     assert feed["messages"][0]["expires_at"] == expires_at
 
 
+def test_messages_export_import_via_api(bridge, node):
+    _inbound_record(node)
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": PEER_HASH,
+            "text": "reply back",
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "m-2",
+            "direction": "out",
+        }
+    )
+
+    status, _, payload = _json(bridge, "/api/messages/export")
+    assert status == 200
+    assert payload["format"] == "tau-messages-export"
+    assert payload["version"] == 1
+    assert [entry["text"] for entry in payload["messages"]] == [
+        "hello",
+        "reply back",
+    ]
+
+    # A fresh node restores the whole document; the restored messages
+    # show up in its console feed, then report as already present on
+    # a second import — without duplicating the feed.
+    node2 = FakeNode()
+    bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+    bridge2.start()
+    try:
+        _, _, document = _json(bridge, "/api/messages/export")
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 2
+        assert payload["import"]["present"] == 0
+        assert payload["import"]["skipped"] == 0
+        assert payload["import"]["errors"] == []
+        # Restored mail advances the unread counts: both entries sit
+        # after the (absent) read cursor, so the fresh counts ride
+        # along with the import result.
+        assert payload["import"]["unread"]["total"] == 2
+        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 2}
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert [m["text"] for m in feed["messages"]] == ["hello", "reply back"]
+        assert feed["messages"][0]["direction"] == "in"
+        assert feed["messages"][0]["peer_name"] == "alice"
+        assert feed["messages"][1]["direction"] == "out"
+        assert feed["messages"][1]["status"] == "delivered"
+        assert feed["messages"][1]["peer_name"] == "alice"
+
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 0
+        assert payload["import"]["present"] == 2
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert len(feed["messages"]) == 2
+
+        # An export document is bigger than the 32 KiB cap for
+        # ordinary actions; the import route accepts it.
+        big = json.loads(json.dumps(document))
+        big["messages"] = big["messages"] * 100
+        assert len(json.dumps(big).encode("utf-8")) > 32 * 1024
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=big
+        )
+        assert status == 200
+        assert payload["import"]["skipped"] == 0
+    finally:
+        bridge2.stop()
+
+
 # -- received-file downloads -------------------------------------------------
 
 SENDER_HASH = "ab" * 16
@@ -5657,6 +5801,151 @@ def test_send_file_survives_bridge_restart(node, tmp_path):
         }
     finally:
         bridge2.stop()
+
+
+def test_messages_import_rejects_wrong_format(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body={"format": "nope"}
+    )
+    assert status == 400
+    assert "unsupported export format" in payload["error"]["message"]
+
+
+def test_messages_import_skips_bad_entries(bridge):
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "exported_at": 1000.0,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "good one",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "good-1",
+            },
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "bad-1",
+            },
+        ],
+    }
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
+    assert payload["import"]["skipped"] == 1
+    assert len(payload["import"]["errors"]) == 1
+    assert payload["import"]["errors"][0]["id"] == "bad-1"
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["good one"]
+
+
+def test_messages_import_skips_expired_in_feed(bridge):
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "exported_at": 1000.0,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "already gone",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "gone-1",
+                "expires_at": 200.0,
+            }
+        ],
+    }
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 1
+    # The restore landed in the inbox, but a message whose deadline
+    # already passed is not resurrected into the feed.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    _, _, exported = _json(bridge, "/api/messages/export")
+    assert len(exported["messages"]) == 1
+
+
+def test_messages_export_too_large_for_import_is_refused(bridge, node, monkeypatch):
+    import tau.webapi as webapi
+
+    _inbound_record(node)
+    monkeypatch.setattr(webapi, "MAX_IMPORT_BYTES", 10)
+    status, _, payload = _json(bridge, "/api/messages/export")
+    assert status == 400
+    assert "command line" in payload["error"]["message"]
+
+
+def test_messages_import_loopback_guard():
+    from tau.webapi import _is_loopback_client
+
+    assert _is_loopback_client("127.0.0.1") is True
+    assert _is_loopback_client("::1") is True
+    assert _is_loopback_client("192.168.1.5") is False
+    assert _is_loopback_client("not an address") is False
+
+
+def test_messages_import_hides_blocked_sender_from_events(bridge, node):
+    from tau.blocklist import BlockList
+
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "from alice",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "m-1",
+                "direction": "in",
+            },
+            {
+                "from": "mallory",
+                "destination": OTHER_HASH,
+                "text": "from mallory",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "m-2",
+                "direction": "in",
+            },
+        ],
+    }
+    node.blocklist = BlockList(blocked=frozenset({OTHER_HASH}))
+    status, _, payload = _json(
+        bridge, "/api/messages/import", method="POST", body=document
+    )
+    assert status == 200
+    assert payload["import"]["imported"] == 2
+    # Only the unblocked sender's restore is announced to live consoles.
+    published = [
+        event["message"]["text"]
+        for event in bridge.bus.replay(0)
+        if event.get("type") == "message"
+        and event["message"].get("text") in ("from alice", "from mallory")
+    ]
+    assert published == ["from alice"]
+    # The blocked record is still stored: unblocking restores the view.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == ["from alice"]
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [m["text"] for m in feed["messages"]] == [
+        "from alice",
+        "from mallory",
+    ]
 
 
 def test_send_file_endpoint(bridge, node):

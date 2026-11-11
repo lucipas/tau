@@ -10,6 +10,7 @@ import type {
   TanImportResult,
   TanLiker,
   TanPost,
+  TanSuggestion,
 } from "@/lib/types";
 import { useTan } from "@/lib/use-tan";
 
@@ -95,6 +96,17 @@ export function SocialConsole() {
     try {
       await tan.follow(target.trim());
       setTarget("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not follow");
+    }
+  }
+
+  async function submitFollowSuggestion(author: string) {
+    setError(null);
+    try {
+      // Follow reloads the feed, so the followed author drops out of
+      // the suggestions on the same round trip.
+      await tan.follow(author);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not follow");
     }
@@ -390,6 +402,21 @@ export function SocialConsole() {
                   </li>
                 ))}
               </ul>
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>suggested authors</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.suggestions.length}
+                </span>
+              </div>
+              <div className="mt-3">
+                <SuggestionList
+                  suggestions={tan.suggestions}
+                  onFollow={(author) => void submitFollowSuggestion(author)}
+                />
+              </div>
             </section>
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
@@ -854,6 +881,52 @@ export function SocialConsole() {
         </footer>
       </div>
     </div>
+  );
+}
+
+export function SuggestionList({
+  suggestions,
+  onFollow,
+}: {
+  suggestions: TanSuggestion[];
+  onFollow: (author: string) => void;
+}) {
+  if (suggestions.length === 0) {
+    return (
+      <p className="rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+        No suggestions yet. Follow an author or sync more posts first.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-1.5">
+      {suggestions.map((suggestion) => (
+        <li
+          key={suggestion.author}
+          className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+        >
+          <div className="min-w-0">
+            <p className="truncate text-xs text-zinc-200">
+              {suggestion.name || "unknown"}
+            </p>
+            <p className="font-mono text-[10px] text-mist/80">
+              {shortHash(suggestion.author, 10)} · {suggestion.posts} post(s)
+              {suggestion.likes ? `, ${suggestion.likes} like(s)` : ""}
+            </p>
+            <p className="truncate text-[11px] text-mist">
+              {suggestion.reason}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onFollow(suggestion.author)}
+            className="shrink-0 rounded-lg border border-line bg-void/70 px-2 py-1 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+          >
+            follow
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 
