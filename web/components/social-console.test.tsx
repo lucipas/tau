@@ -1,12 +1,17 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
 import { shortHash } from "@/lib/format";
-import type { TanPost } from "@/lib/types";
+import type { TanExportDocument, TanPost, TanVerifyReport } from "@/lib/types";
 
-import { PostCard, SocialConsole } from "./social-console";
+import {
+  PostCard,
+  SocialConsole,
+  TanBackupSection,
+  VerifyResult,
+} from "./social-console";
 
 const mockTan = vi.hoisted(() => ({
   current: {} as Record<string, unknown>,
@@ -66,10 +71,11 @@ describe("PostCard delete control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -88,10 +94,11 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -107,10 +114,11 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost({ own: false })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -123,9 +131,11 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
+        onEdit={async () => true}
         deleting
       />,
     );
@@ -137,16 +147,193 @@ describe("PostCard delete control", () => {
   });
 });
 
+describe("VerifyResult", () => {
+  function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
+    return {
+      entries: 12,
+      authors: 3,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+      ...overrides,
+    };
+  }
+
+  it("reports a healthy store with its counts", () => {
+    render(<VerifyResult report={makeReport()} />);
+    expect(
+      screen.getByText("store OK — 12 entries from 3 authors"),
+    ).toBeTruthy();
+  });
+
+  it("notes unlinked entries as partial sync, not damage", () => {
+    render(<VerifyResult report={makeReport({ unlinked: 2 })} />);
+    expect(screen.getByText(/2 unlinked \(partial sync\)/)).toBeTruthy();
+  });
+
+  it("lists each problem with its post hash and message", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 1 problem in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+  });
+
+  it("renders two faults on one post as separate rows", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "sequence jumps from 1 to 3",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 2 problems in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+    expect(screen.getByText("sequence jumps from 1 to 3")).toBeTruthy();
+  });
+});
+
+describe("PostCard edit control", () => {
+  function renderCard(post: TanPost, onEdit = vi.fn().mockResolvedValue(true)) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        onEdit={onEdit}
+        deleting={false}
+      />,
+    );
+    return onEdit;
+  }
+
+  it("opens a form prefilled with the post text and saves the edit", async () => {
+    const post = makePost();
+    const onEdit = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    expect((field as HTMLTextAreaElement).value).toBe("regret this");
+
+    fireEvent.change(field, { target: { value: "meant this" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledWith(post, "meant this");
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("keeps the form open when the save fails", async () => {
+    const onEdit = renderCard(makePost(), vi.fn().mockResolvedValue(false));
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    fireEvent.change(screen.getByLabelText("Edit post text"), {
+      target: { value: "new text" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("Edit post text")).toBeTruthy();
+  });
+
+  it("cancels without calling onEdit and disables save for empty text", () => {
+    const onEdit = renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    fireEvent.change(field, { target: { value: "   " } });
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText("cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("disables save while the text is unchanged", () => {
+    renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("hides the edit control on other authors' posts", () => {
+    renderCard(makePost({ own: false }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+
+  it("preserves emoji-heavy posts instead of truncating by UTF-16 units", () => {
+    // The backend counts code points, not UTF-16 units: 1,200 emoji are
+    // 1,200 code points but 2,400 UTF-16 units, so a plain slice(0, 2000)
+    // would silently drop 199 emoji from a valid post on first edit.
+    renderCard(makePost({ text: "😀".repeat(1200) }));
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText(
+      "Edit post text",
+    ) as HTMLTextAreaElement;
+    expect(field.value).toBe("😀".repeat(1200));
+
+    fireEvent.change(field, { target: { value: "😀".repeat(2001) } });
+    expect(field.value).toBe("😀".repeat(2000));
+  });
+
+  it("hides the edit control on your own quotes", () => {
+    // Quotes are not editable: create_edit only permits posts and replies,
+    // so the console must not offer the button for them.
+    renderCard(makePost({ kind: "quote", own: true }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+});
+
 describe("PostCard quote rendering", () => {
   function renderCard(post: TanPost) {
     render(
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
   }
@@ -258,10 +445,11 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 2 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.getByText("❝ 2")).toBeTruthy();
@@ -270,13 +458,148 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 0 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();
+  });
+});
+
+describe("TanBackupSection", () => {
+  const doc: TanExportDocument = {
+    format: "tau-tan-export",
+    version: 1,
+    exported_at: 1000,
+    authors: ["a".repeat(64)],
+    entries: [{ hash: "c".repeat(64), text: "hello" }],
+  };
+
+  function renderSection(overrides: {
+    exporting?: boolean;
+    importing?: boolean;
+    onExport?: (allAuthors: boolean) => Promise<TanExportDocument>;
+    onImport?: (doc: TanExportDocument) => Promise<{
+      imported: number;
+      present: number;
+      skipped: number;
+      errors: Array<{ hash: string; error: string }>;
+    }>;
+  } = {}) {
+    const onExport = overrides.onExport ?? vi.fn(async () => doc);
+    const onImport =
+      overrides.onImport ??
+      vi.fn(async () => ({
+        imported: 2,
+        present: 1,
+        skipped: 0,
+        errors: [],
+      }));
+    render(
+      <TanBackupSection
+        exporting={overrides.exporting ?? false}
+        importing={overrides.importing ?? false}
+        onExport={onExport}
+        onImport={onImport}
+      />,
+    );
+    return { onExport, onImport };
+  }
+
+  function pickFile(contents: string) {
+    const file = new File([contents], "backup.json", {
+      type: "application/json",
+    });
+    const input = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+  }
+
+  it("exports the node's own chain and reports the entry count", async () => {
+    const { onExport } = renderSection();
+
+    fireEvent.click(screen.getByText("export mine"));
+    await waitFor(() => expect(onExport).toHaveBeenCalledWith(false));
+    expect(
+      await screen.findByText("exported 1 entry (your chain)"),
+    ).toBeTruthy();
+  });
+
+  it("exports all cached authors when asked", async () => {
+    const { onExport } = renderSection();
+
+    fireEvent.click(screen.getByText("export all"));
+    await waitFor(() => expect(onExport).toHaveBeenCalledWith(true));
+    expect(
+      await screen.findByText("exported 1 entry (all authors)"),
+    ).toBeTruthy();
+  });
+
+  it("disables the export buttons while an export is running", () => {
+    renderSection({ exporting: true });
+
+    expect(screen.getByText("exporting…")).toBeTruthy();
+    expect(
+      (screen.getByText("exporting…") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("imports a picked export file and reports the counts", async () => {
+    const { onImport } = renderSection();
+
+    pickFile(JSON.stringify(doc));
+    await waitFor(() => expect(onImport).toHaveBeenCalledWith(doc));
+    expect(
+      await screen.findByText("imported 2 · 1 already present · 0 skipped"),
+    ).toBeTruthy();
+  });
+
+  it("lists per-entry errors from the import", async () => {
+    const onImport = vi.fn(async () => ({
+      imported: 0,
+      present: 1,
+      skipped: 1,
+      errors: [{ hash: "d".repeat(64), error: "bad signature" }],
+    }));
+    renderSection({ onImport });
+
+    pickFile(JSON.stringify(doc));
+    await waitFor(() => expect(onImport).toHaveBeenCalled());
+    const line = await screen.findByText(/bad signature/);
+    expect(line.textContent).toContain("skipped");
+  });
+
+  it("rejects a file that is not a valid export document", async () => {
+    const { onImport } = renderSection();
+
+    pickFile("not json");
+    expect(
+      await screen.findByText("that file is not a valid export document"),
+    ).toBeTruthy();
+    expect(onImport).not.toHaveBeenCalled();
+  });
+
+  it("lets the same invalid file be picked again after a parse failure", async () => {
+    const { onImport } = renderSection();
+    const input = document.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+
+    pickFile("not json");
+    await screen.findByText("that file is not a valid export document");
+    // The input is cleared even though parsing failed, so choosing
+    // the same file again fires onChange instead of doing nothing.
+    expect(input.value).toBe("");
+
+    pickFile("not json");
+    expect(
+      await screen.findByText("that file is not a valid export document"),
+    ).toBeTruthy();
+    expect(onImport).not.toHaveBeenCalled();
   });
 });
 
@@ -286,6 +609,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -317,6 +641,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -342,6 +667,10 @@ describe("SocialConsole muted sidebar", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       saved: [],
@@ -353,6 +682,8 @@ describe("SocialConsole muted sidebar", () => {
       unsave: vi.fn(),
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -464,10 +795,16 @@ describe("SocialConsole search", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -486,6 +823,7 @@ describe("SocialConsole search", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -563,10 +901,16 @@ describe("SocialConsole mentions view", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -585,6 +929,7 @@ describe("SocialConsole mentions view", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -630,6 +975,7 @@ describe("SocialConsole mentions view", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "following" }));
     expect(state.setShowMentions).toHaveBeenCalledWith(false);
+    expect(state.setView).toHaveBeenCalledWith("timeline");
     expect(state.setAll).toHaveBeenCalledWith(false);
   });
 
@@ -654,6 +1000,147 @@ describe("SocialConsole mentions view", () => {
   });
 });
 
+describe("SocialConsole authors directory", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  function makeAuthor(overrides: Record<string, unknown> = {}) {
+    return {
+      author: "a".repeat(64),
+      name: "alice",
+      posts: 3,
+      last_post: 1000,
+      followed: false,
+      ...overrides,
+    };
+  }
+
+  it("lists known authors with a follow button for the unfollowed", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor(),
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    expect(screen.getByText("alice")).toBeTruthy();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText(/3 posts/)).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("follow this author"));
+    expect(state.follow).toHaveBeenCalledTimes(1);
+    expect(state.follow).toHaveBeenCalledWith("a".repeat(64));
+  });
+
+  it("offers to remove a followed author from the directory", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByTitle("unfollow this author"));
+    expect(state.unfollow).toHaveBeenCalledTimes(1);
+    expect(state.unfollow).toHaveBeenCalledWith("b".repeat(64));
+  });
+
+  it("says there are no authors yet when the store is empty", () => {
+    mockedUseTan.mockReturnValue(hookState());
+
+    render(<SocialConsole />);
+    expect(
+      screen.getByText("No authors yet. Sync to pull posts from your peers."),
+    ).toBeTruthy();
+  });
+
+  it("offers the next page while authors are still hidden", () => {
+    const state = hookState({
+      authors: [makeAuthor()],
+      authorsTotal: 120,
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    const button = screen.getByText("show more (1 of 120)");
+    expect(button).toBeTruthy();
+
+    fireEvent.click(button);
+    expect(state.loadMoreAuthors).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the show-more button once every author is shown", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({ authors: [makeAuthor()], authorsTotal: 1 }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.queryByText(/show more/)).toBeNull();
+  });
+});
+
 
 describe("PostCard save control", () => {
   function renderCard(post: TanPost, onToggleSave = vi.fn()) {
@@ -661,6 +1148,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onToggleSave={onToggleSave}
         onReply={() => {}}
         onDelete={vi.fn()}
@@ -692,6 +1180,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}

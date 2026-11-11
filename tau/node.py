@@ -10,6 +10,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -19,7 +20,12 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set, Union
 import RNS
 
 from . import __version__
-from .allowlist import AllowList, load_allowlist_or_deny_all
+from .allowlist import (
+    AllowList,
+    load_allowlist,
+    load_allowlist_or_deny_all,
+    save_allowlist,
+)
 from .blocklist import BlockList, load_blocklist_or_block_all
 from .config import (
     TauConfig,
@@ -43,7 +49,10 @@ from .instance_lock import (
 )
 from .lxmf import (
     LXMFError,
+    build_lxmf_message,
     lxmf_router_delivery_hash,
+    lxmf_router_propagation_hash,
+    send_lxmf_message,
     start_lxmf_router,
     stop_lxmf_router,
 )
@@ -187,7 +196,16 @@ _FILE_TRANSFER_TIMEOUT = 300.0
 _FILE_METADATA_OVERHEAD = 64
 
 
-class NotAllowedError(NodeError):
+class PeerRefusedError(NodeError):
+    """Raised when a peer explicitly refuses a request.
+
+    Distinct from transport failures: a refusal must never be retried
+    over another route (such as LXMF), since that bypasses the peer's
+    policy.
+    """
+
+
+class NotAllowedError(PeerRefusedError):
     """Raised when a peer explicitly rejects a request (allow-list denial).
 
     Distinct from other :class:`NodeError` failures so callers can tell
@@ -202,6 +220,8 @@ class NotAMemberError(NodeError):
     A changed roster or a non-member sender is a permanent refusal, so
     the group leg is not queued for retry.
     """
+
+
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
@@ -355,40 +375,53 @@ def _read_resource_data(resource: Any) -> Optional[bytes]:
 def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     """Write *data* to a new file in *directory*, never overwriting.
 
-    Each candidate is created with an exclusive open (``O_EXCL``), so
-    an existing name, including a symlink, is never opened for
-    writing; the next numbered name is tried instead.  The check and
-    the create are one syscall, so concurrent transfers cannot pick
-    the same destination.
+    The bytes go to a temporary file first, then the finished file is
+    linked into place: a name appears only once its content is
+    complete, so a concurrent reader — a live backup, the web console —
+    never sees a half-written received file.  The temporary file lives
+    in a fresh staging directory inside the sender directory: that
+    keeps the staging file on the sender directory's own mount (a
+    ``files/<sender>`` mount point would make a cross-device link
+    fail) while keeping it out of backups, which only enumerate files
+    directly inside sender directories.  The staging directory gets a
+    unique random suffix, so it can never collide with a received
+    file's name, and it is removed once the transfer is published.
+    Each candidate is linked with ``os.link``, so an existing name,
+    including a symlink, is never replaced; the next numbered name is
+    tried instead.  The check and the link are one syscall, so
+    concurrent transfers cannot pick the same destination.
     """
     stem = Path(name).stem
     suffix = Path(name).suffix
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-    counter = 1
-    while True:
-        candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
-        candidate = directory / candidate_name
-        try:
-            fd = os.open(candidate, flags, 0o600)
-        except FileExistsError:
-            counter += 1
-            continue
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-        except BaseException:
+    staging = Path(tempfile.mkdtemp(prefix=".tau-tmp-", dir=directory))
+    fd, tmp_name = tempfile.mkstemp(dir=staging, prefix=".tau-received-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        counter = 1
+        while True:
+            candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
+            candidate = directory / candidate_name
             try:
-                os.unlink(candidate)
-            except OSError:  # pragma: no cover - best effort
-                pass
-            raise
-        return candidate
+                os.link(tmp_name, candidate)
+            except FileExistsError:
+                counter += 1
+                continue
+            return candidate
+    finally:
+        # Best effort: a crash between link and cleanup leaves a
+        # staging directory behind, which is never enumerated as a
+        # received file.
+        try:
+            os.unlink(tmp_name)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        try:
+            staging.rmdir()
+        except OSError:  # pragma: no cover - best effort
+            pass
 
 
 class TauNode:
@@ -438,6 +471,19 @@ class TauNode:
         self.identity: Optional[RNS.Identity] = None
         self.destination: Optional[RNS.Destination] = None
         self.lxmf_router: Optional[Any] = None
+        # LXMF delivery coordination (see _handle_lxmf_message): the
+        # router invokes the delivery callback on its own thread, so
+        # deliveries can overlap each other and node shutdown.
+        # _lxmf_delivery_lock serialises the dedupe-and-store span so
+        # two copies of one message cannot both claim it; the
+        # stopping flag plus in-flight count let stop() wait for a
+        # delivery already in progress instead of persisting state
+        # and releasing the instance lock under it.
+        self._lxmf_delivery_lock = threading.Lock()
+        self._lxmf_state_lock = threading.Lock()
+        self._lxmf_stopping = False
+        self._lxmf_inflight = 0
+        self._lxmf_drained = threading.Condition(self._lxmf_state_lock)
 
         self._announce_handler: Optional[_AnnounceHandler] = None
         self._announce_thread: Optional[threading.Thread] = None
@@ -459,6 +505,7 @@ class TauNode:
         self._shutdown = False
         self.app: Optional[Any] = None
         self._allowlist: Optional[AllowList] = None
+        self._allowlist_lock = threading.RLock()
         self._blocklist: Optional[BlockList] = None
 
     @property
@@ -473,6 +520,41 @@ class TauNode:
                 getattr(self.config, "allowlist_path", None)
             )
         return self._allowlist
+
+    def set_allowlist(self, allowlist: AllowList) -> None:
+        """Replace the DM allow-list, in memory and on disk.
+
+        The web console uses this so an owner changing the list from
+        the console sees it enforced immediately: unlike the CLI,
+        whose saved changes only apply when the node restarts, the
+        console *is* the running node.
+        """
+        with self._allowlist_lock:
+            # Persist first: if the write fails, the running node keeps
+            # the policy that is actually on disk.
+            save_allowlist(self.config.allowlist_path, allowlist)
+            self._allowlist = allowlist
+
+    def update_allowlist(
+        self, transform: Callable[[AllowList], AllowList]
+    ) -> AllowList:
+        """Atomically apply *transform* to the DM allow-list.
+
+        The saved list is re-read first, so a change another process
+        (e.g. the CLI) saved while this node runs is preserved instead
+        of overwritten, and a corrupt saved file refuses the edit —
+        the CLI refuses the same edit — instead of replacing the file
+        with the node's fail-closed fallback. The whole
+        read-modify-write is serialised, so overlapping console
+        mutations cannot lose each other's changes.
+        """
+        with self._allowlist_lock:
+            current = load_allowlist(
+                getattr(self.config, "allowlist_path", None)
+            )
+            updated = transform(current)
+            self.set_allowlist(updated)
+            return updated
 
     @property
     def read_receipts_enabled(self) -> bool:
@@ -534,6 +616,7 @@ class TauNode:
         exclusive: bool = False,
         mail_loop: bool = True,
         lxmf: bool = False,
+        lxmf_propagation: bool = False,
     ) -> None:
         """Start Reticulum, load the identity and begin answering requests.
 
@@ -552,8 +635,13 @@ class TauNode:
         to the loop's first round and silently report nothing moved.
         With ``lxmf`` on, an LXMF router also runs alongside the node
         (see :meth:`_start_lxmf_router`); it needs the ``lxmf`` extra
-        installed and must start on the main thread.
+        installed and must start on the main thread.  With
+        ``lxmf_propagation`` on (which requires ``lxmf``), the router
+        also serves as an LXMF propagation node, holding mail for
+        offline recipients.
         """
+        if lxmf_propagation and not lxmf:
+            raise NodeError("lxmf_propagation requires lxmf")
         if self.reticulum is not None:
             raise NodeError("node is already running")
         if self._shutdown:
@@ -576,7 +664,12 @@ class TauNode:
             # snapshot is no older than the lock itself.
             self.registry.load()
         try:
-            self._start(announce=announce, mail_loop=mail_loop, lxmf=lxmf)
+            self._start(
+                announce=announce,
+                mail_loop=mail_loop,
+                lxmf=lxmf,
+                lxmf_propagation=lxmf_propagation,
+            )
         except BaseException:
             # Clean up partial startup, including workers and links, before
             # returning the directory to another process.
@@ -588,7 +681,14 @@ class TauNode:
                 self._release_instance_lock()
             raise
 
-    def _start(self, *, announce: bool, mail_loop: bool = True, lxmf: bool = False) -> None:
+    def _start(
+        self,
+        *,
+        announce: bool,
+        mail_loop: bool = True,
+        lxmf: bool = False,
+        lxmf_propagation: bool = False,
+    ) -> None:
         if not self.config.rns_config_file.exists():
             log.info("No Reticulum config found; writing a default one")
             write_rns_config(
@@ -659,23 +759,27 @@ class TauNode:
             self._mail_thread.start()
 
         if lxmf:
-            self._start_lxmf_router()
+            self._start_lxmf_router(propagation=lxmf_propagation)
 
         if announce:
             self.announce()
 
         log.info("tau node %r ready at %s", self.name, self.destination.hexhash)
 
-    def _start_lxmf_router(self) -> None:
+    def _start_lxmf_router(self, *, propagation: bool = False) -> None:
         """Run an LXMF router on this node's identity.
 
         The router listens on the LXMF delivery destination derived from
         the node's identity (the address ``tau id`` and ``tau peers``
         already show) and announces it, so LXMF clients can find a path
-        to this node.  Storage lives under the data directory.  This is
-        the router lifecycle only — nothing is sent over LXMF yet; that
-        follows under the migration tracked in issue #67.  A failure here
-        is a node-start failure: the caller cleans up via :meth:`stop`.
+        to this node.  With ``propagation`` on, the router also serves
+        as an LXMF propagation node, holding mail for offline
+        recipients.  Incoming LXMF messages are delivered into the DM
+        inbox by :meth:`_handle_lxmf_message`, registered as the
+        router's delivery callback.  Storage lives under the data
+        directory.  Sending over LXMF still follows under the migration
+        tracked in issue #67.  A failure here is a node-start failure:
+        the caller cleans up via :meth:`stop`.
         """
         assert self.identity is not None  # set above, before this runs
         try:
@@ -683,6 +787,8 @@ class TauNode:
                 self.identity,
                 self.config.data_dir,
                 display_name=self.name,
+                propagation=propagation,
+                delivery_callback=self._handle_lxmf_message,
             )
         except LXMFError as exc:
             raise NodeError(str(exc)) from exc
@@ -691,9 +797,190 @@ class TauNode:
             "LXMF router running, delivery %s",
             delivery.hex() if delivery is not None else "unknown",
         )
+        propagation_hash = lxmf_router_propagation_hash(self.lxmf_router)
+        if propagation_hash is not None:
+            log.info(
+                "LXMF propagation node enabled, propagation %s",
+                propagation_hash.hex(),
+            )
+
+    def _handle_lxmf_message(self, message: Any) -> None:
+        """Deliver one incoming LXMF message into the DM inbox.
+
+        The router invokes this on its own thread with a decrypted
+        ``LXMessage`` addressed to this node's delivery destination.
+        It mirrors :meth:`_handle_message`: the signature must verify,
+        the sender must be a known peer, and the block-list and DM
+        allow-list gates apply in the same order.  A message that fails
+        any gate is dropped and logged, never stored.  Any failure
+        inside the handler is caught and logged — the callback must
+        never raise back into the router.
+
+        Deliveries that arrive while the node is stopping are dropped:
+        :meth:`stop` sets the flag before tearing the router down and
+        waits for deliveries already in flight, so no delivery writes
+        to the inbox or notifies listeners after shutdown has
+        persisted state and released the instance lock.
+        """
+        with self._lxmf_state_lock:
+            if self._lxmf_stopping:
+                log.info("Dropping LXMF message: node is stopping")
+                return
+            self._lxmf_inflight += 1
+        try:
+            self._deliver_lxmf_message(message)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("Could not deliver incoming LXMF message", exc_info=True)
+        finally:
+            with self._lxmf_state_lock:
+                self._lxmf_inflight -= 1
+                if self._lxmf_inflight == 0:
+                    self._lxmf_drained.notify_all()
+
+    def _deliver_lxmf_message(self, message: Any) -> None:
+        """Store one verified LXMF message, or drop it with a log line."""
+        if not getattr(message, "signature_validated", False):
+            # The router validates the signature against the recalled
+            # source identity while unpacking; an unverified message
+            # proves nothing about its sender, so it never reaches
+            # the inbox — same fail-closed stance as the DM path.
+            log.info("Dropping LXMF message with an unverified signature")
+            return
+        source_hash = getattr(message, "source_hash", None)
+        if not isinstance(source_hash, (bytes, bytearray)):
+            log.info("Dropping LXMF message with no source hash")
+            return
+        source_hex = bytes(source_hash).hex()
+        sender = None
+        for peer in self.registry.all():
+            if peer.lxmf_hash == source_hex:
+                sender = peer
+                break
+        if sender is None:
+            # The inbox keys on tau destination hashes, and only a
+            # known peer maps an LXMF delivery hash to one.  First
+            # contact still needs a tau announce; an LXMF-only sender
+            # cannot be attributed, so its message is dropped.
+            log.info(
+                "Dropping LXMF message from unknown sender %s",
+                source_hex[:8],
+            )
+            return
+        caller_hash = sender.hexhash
+        if self.blocklist.is_blocked(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the block-list",
+                caller_hash,
+            )
+            return
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "LXMF message from %s denied by the DM allow-list",
+                caller_hash,
+            )
+            return
+        content_as_string = getattr(message, "content_as_string", None)
+        text = content_as_string() if callable(content_as_string) else None
+        if not text:
+            log.info(
+                "Dropping LXMF message from %s with no readable text",
+                caller_hash,
+            )
+            return
+        message_hash = getattr(message, "hash", None)
+        if not isinstance(message_hash, (bytes, bytearray)):
+            log.info(
+                "Dropping LXMF message from %s with no message hash",
+                caller_hash,
+            )
+            return
+        # A propagation copy can redeliver the same message after a
+        # router restart, so dedupe on the LXMF hash exactly like the
+        # DM path dedupes relayed copies on the tau message id.
+        # Tau message ids are capped at 64 characters on the wire, so the
+        # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
+        # still collision-free in practice).
+        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
+        # The router can invoke this callback concurrently for two
+        # copies of one message (direct + propagation), and each copy
+        # passes the router's own duplicate check first — so the
+        # is_seen check, the inbox scan, the append and the mark_seen
+        # below run under one lock.  Without it both copies could
+        # pass the checks before either stored anything and the
+        # message would land in the inbox twice.
+        with self._lxmf_delivery_lock:
+            if self.mailbox.is_seen(message_id):
+                log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            if any(
+                entry.get("id") == message_id
+                for entry in self.inbox.list_messages(direction=None)
+            ):
+                # Stored earlier but interrupted before it was marked seen.
+                self.mailbox.mark_seen(message_id)
+                log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            try:
+                sent_at = float(getattr(message, "timestamp", None) or 0.0)
+            except (TypeError, ValueError):
+                sent_at = 0.0
+            received_at = time.time()
+            record = {
+                "from": sender.display_name,
+                "destination": caller_hash,
+                "text": text,
+                "sent_at": sent_at,
+                "received_at": received_at,
+                "id": message_id,
+                "expires_at": None,
+                "direction": "in",
+            }
+            log.info(
+                "LXMF message from %s (%s): %s",
+                sender.display_name,
+                caller_hash,
+                text,
+            )
+            try:
+                self.inbox.append(record)
+            except Exception:
+                # Not stored, so leave it unseen: a redelivery can retry it.
+                log.warning(
+                    "Could not record LXMF message %s", message_id, exc_info=True
+                )
+                return
+            self.mailbox.mark_seen(message_id)
+        if self.on_message is not None:
+            try:
+                self.on_message(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
+
+    def _wait_for_lxmf_deliveries(self) -> None:
+        """Wait for in-flight LXMF deliveries, bounded so stop never hangs.
+
+        A delivery is short — a few store lookups and one inbox append —
+        so the wait is normally immediate.  If one is wedged (for
+        example a listener that never returns), shutdown proceeds after
+        the timeout rather than hanging the process.
+        """
+        with self._lxmf_drained:
+            if not self._lxmf_drained.wait_for(
+                lambda: self._lxmf_inflight == 0, timeout=10
+            ):
+                log.warning(
+                    "Stopping with %d LXMF deliver%s still in flight",
+                    self._lxmf_inflight,
+                    "y" if self._lxmf_inflight == 1 else "ies",
+                )
 
     def stop(self) -> None:
         """Stop announcing, close links and persist the peer registry."""
+        # No new LXMF delivery starts past this point; deliveries
+        # already in flight finish before state is persisted and the
+        # instance lock is released (see _handle_lxmf_message).
+        with self._lxmf_state_lock:
+            self._lxmf_stopping = True
         # Workers must finish before pruning/saving state or releasing the lock.
         self._stop_workers()
 
@@ -707,6 +994,7 @@ class TauNode:
             except Exception:  # pragma: no cover - defensive
                 log.debug("LXMF router shutdown failed", exc_info=True)
             self.lxmf_router = None
+        self._wait_for_lxmf_deliveries()
 
         if self._announce_handler is not None:
             try:
@@ -1144,8 +1432,6 @@ class TauNode:
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
         if not duplicate and not expired:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
             record = {
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1165,7 +1451,16 @@ class TauNode:
                 caller_hash or "anonymous",
                 message["text"],
             )
-            self._record_received(record)
+            # Marking seen and recording the message are one delivery:
+            # hold the mailbox transaction across both, so a live
+            # backup never restores a seen marker with no inbox entry
+            # (the message would then be rejected as already seen and
+            # lost).  The record step takes the inbox transaction
+            # inside this one; the order is mailbox first everywhere.
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1183,7 +1478,11 @@ class TauNode:
         )
 
     def _accept_group_message(
-        self, sender_hash: str, group: Dict[str, Any]
+        self,
+        sender_hash: str,
+        group: Dict[str, Any],
+        *,
+        sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -1196,6 +1495,15 @@ class TauNode:
         the sealed envelope's signature (relayed), never by the payload;
         the id derivation is what binds the roster to the id, so a
         member cannot fork an id onto a recipient that has not seen it.
+        The sender is also passed through, so a successor roster only
+        replaces a learned group when the creator themself sent it —
+        the creator field is only a claim, and any member could
+        otherwise forge a successor and hijack sends by group name.
+        ``sent_at`` is the message's send time on the sender's clock;
+        it is what tells a queued creator message carrying an outdated
+        roster (sent before the successor was learned) from an
+        intentional creator restore (sent after), so the stale copy
+        pins alongside instead of replacing the successor.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -1208,7 +1516,12 @@ class TauNode:
         except (ProtocolError, ValueError):
             return None
         return self.groups.record(
-            group["id"], group.get("name") or "group", members, creator=creator
+            group["id"],
+            group.get("name") or "group",
+            members,
+            creator=creator,
+            sender=sender_hash or "",
+            sent_at=sent_at,
         )
 
     def _handle_group_message(
@@ -1263,6 +1576,7 @@ class TauNode:
                 "creator": message["creator"],
                 "members": message["members"],
             },
+            sent_at=message.get("sent_at"),
         )
         if group is None:
             log.info(
@@ -1280,8 +1594,6 @@ class TauNode:
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
             record = {
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1300,7 +1612,13 @@ class TauNode:
                 group["name"],
                 message["text"],
             )
-            self._record_received(record)
+            # One delivery: mark seen and record under the mailbox
+            # transaction, so a live backup never restores a seen
+            # marker with no inbox entry (see _handle_message).
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -2131,6 +2449,7 @@ class TauNode:
         )
         if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
+        via_lxmf = False
         try:
             self._request(
                 peer,
@@ -2148,17 +2467,39 @@ class TauNode:
             self.mailbox.remove_outbox(entry.id)
             return False
         except NodeError as exc:
-            try:
-                self.mailbox.record_attempt(
-                    entry.id, error=str(exc), timeout=_remaining(deadline)
-                )
-            except TimeoutError:
-                log.debug(
-                    "Could not record failed delivery attempt for %s: "
-                    "mailbox lock busy",
-                    entry.id,
-                )
-            return False
+            # An explicit refusal (allow-list, block-list) is final: falling
+            # back to LXMF would deliver to the peer's separate destination
+            # and bypass the policy that refused it.  Only transport
+            # failures may try LXMF.
+            if isinstance(exc, PeerRefusedError) or not self._still_queued(
+                entry.id, timeout=_remaining(deadline)
+            ):
+                # A cancel may have landed while the direct request was in
+                # flight; do not start a fresh send for a cancelled entry.
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            if not self._deliver_via_lxmf(entry, timeout):
+                try:
+                    self.mailbox.record_attempt(
+                        entry.id, error=str(exc), timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.debug(
+                        "Could not record failed delivery attempt for %s: "
+                        "mailbox lock busy",
+                        entry.id,
+                    )
+                return False
+            via_lxmf = True
         # Record the confirmed delivery before the entry leaves the outbox,
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)
@@ -2174,7 +2515,12 @@ class TauNode:
                 "busy; leaving it queued for a later round",
                 entry.id,
             )
-        log.info("Delivered queued message %s to %s", entry.id, peer.hexhash)
+        log.info(
+            "Delivered queued message %s to %s%s",
+            entry.id,
+            peer.hexhash,
+            " over LXMF" if via_lxmf else "",
+        )
         self.registry.record_delivered(peer.destination_hash)
         if self.on_delivered is not None:
             try:
@@ -2182,6 +2528,54 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_delivered callback failed", exc_info=True)
         return True
+
+    def _deliver_via_lxmf(self, entry: Any, timeout: float) -> bool:
+        """Try one queued entry over LXMF; True only on confirmation.
+
+        The LXMF router must be running and the recipient must have a
+        registered public key — without it no LXMF address can be
+        derived.  Delivery is confirmed by the router's callback (the
+        peer received it, or a propagation node accepted it); anything
+        else leaves the entry queued for the next sweep.
+        """
+        if self.lxmf_router is None or self.identity is None:
+            return False
+        if getattr(entry, "group_id", None) is not None:
+            # LXMF carries only plain text: a group message sent this
+            # way would land in the recipient's DM inbox, not the
+            # group.  Leave it queued for a direct retry instead.
+            return False
+        if entry.expires_at <= time.time() or (
+            entry.message_expires_at is not None
+            and entry.message_expires_at <= time.time()
+        ):
+            # The deadline passed while the direct request was in
+            # flight. The LXMF receiver carries no deadline, so an
+            # expired message must not go out over LXMF.
+            log.debug(
+                "Skipping LXMF send for expired queued message %s",
+                entry.id,
+            )
+            return False
+        recipient = self.registry.get(entry.to)
+        if recipient is None or not recipient.public_key:
+            log.debug(
+                "No public key for %s; cannot address an LXMF message",
+                entry.to_hex,
+            )
+            return False
+        try:
+            message = build_lxmf_message(
+                self.identity, recipient.public_key, entry.text
+            )
+            return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
+        except (LXMFError, ValueError) as exc:
+            log.debug(
+                "Could not send queued message %s over LXMF: %s",
+                entry.id,
+                exc,
+            )
+            return False
 
     def _deposit_entry(
         self,
@@ -2590,7 +2984,9 @@ class TauNode:
         if group is not None:
             sender = message.get("from")
             pinned = self._accept_group_message(
-                sender if isinstance(sender, str) else "", group
+                sender if isinstance(sender, str) else "",
+                group,
+                sent_at=message.get("sent_at"),
             )
             if pinned is None:
                 log.info(
@@ -2599,7 +2995,6 @@ class TauNode:
                     sender or "unknown",
                 )
                 return False
-        self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
             "destination": message["from"],
@@ -2624,7 +3019,12 @@ class TauNode:
             message["from"],
             message["text"],
         )
-        self._record_received(record)
+        # One delivery: mark seen and record under the mailbox
+        # transaction, so a live backup never restores a seen marker
+        # with no inbox entry (see _handle_message).
+        with self.mailbox.transaction():
+            self.mailbox.mark_seen(message["id"])
+            self._record_received(record)
         if self.on_message is not None:
             try:
                 self.on_message(record)
@@ -2672,6 +3072,7 @@ class TauNode:
         except Exception:  # pragma: no cover - introspection only
             pass
         lxmf_delivery = lxmf_router_delivery_hash(self.lxmf_router)
+        lxmf_propagation = lxmf_router_propagation_hash(self.lxmf_router)
         return {
             "name": self.name,
             "destination": self.destination.hexhash,
@@ -2685,6 +3086,9 @@ class TauNode:
             "lxmf": {
                 "enabled": self.lxmf_router is not None,
                 "delivery": lxmf_delivery.hex() if lxmf_delivery else None,
+                "propagation": (
+                    lxmf_propagation.hex() if lxmf_propagation else None
+                ),
             },
         }
 
@@ -3067,8 +3471,12 @@ class TauNode:
         leg is a ``/tau/group`` request carrying the roster; a member
         that cannot be reached is queued in the outbox (with the group
         context, so a retry re-sends the group payload) unless it
-        explicitly refused the message.  Returns a per-member result
-        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        explicitly refused the message.  Each leg is bounded by
+        ``timeout``: the stages of one delivery share that leg's
+        budget, and a leg the deadline leaves no time to attempt is
+        queued the same way instead of dropped.  Returns a
+        per-member result list: ``delivered``, ``queued``, or an
+        ``error`` for that leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3116,16 +3524,103 @@ class TauNode:
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None
+            # One deadline bounds each leg, and the budget is per leg:
+            # the stages of a single delivery (resolve, path, link,
+            # response) share the leg's budget instead of each taking
+            # the full timeout, but one member's leg must not consume
+            # another's.  The roster is in sorted-hash order, so who
+            # runs first is arbitrary — with a single fan-out-wide
+            # deadline, an offline member sorted first burned the whole
+            # budget waiting for a path that could never appear, and
+            # every later (reachable) member was queued without an
+            # attempt.  A per-leg deadline reserves the full attempt
+            # window for every member while keeping each leg capped at
+            # ``timeout``.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                # Out of time for another attempt — but the leg must
+                # not be dropped to the deadline: queueing is local
+                # disk I/O, so the member still gets the message on a
+                # later retry, exactly as if the attempt had failed to
+                # reach them.
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": "not attempted: group send time limit reached",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name="",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                any_queued = True
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                    }
+                )
+                continue
             try:
                 peer = self.resolve_peer(
                     member,
-                    timeout=discover_timeout
-                    if discover_timeout is not None
-                    else min(timeout, 10.0),
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
                 )
+                # Remember the leg before the request so a read receipt
+                # from this member verifies; a refused or unqueued leg
+                # is forgotten below.
+                self.mailbox.record_sent(
+                    message_id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                )
+                # Pass the leg's deadline through: without it, path
+                # discovery, link establishment and the response could
+                # each consume the leg's budget on a slow link, and
+                # one leg could take close to three timeouts.
                 response = self._request(
-                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                    peer,
+                    REQUEST_GROUP_MESSAGE,
+                    payload,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
                 )
+                self.mailbox.record_delivered(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3138,6 +3633,7 @@ class TauNode:
             except (NotAllowedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; queueing
                 # would retry a refusal until its TTL expires.
+                self.mailbox.discard_sent(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3151,6 +3647,7 @@ class TauNode:
                 )
             except NodeError as exc:
                 if not queue or not self.started:
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3173,6 +3670,7 @@ class TauNode:
                     # The outbox is full (or the write failed): record the
                     # leg as failed and keep going, so the legs already
                     # delivered or queued are not lost with the exception.
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3183,6 +3681,19 @@ class TauNode:
                         }
                     )
                     continue
+                # A queued leg is registered under its outbox id, like
+                # a queued peer DM, so a receipt for it verifies. When
+                # resolve already succeeded the wire id was registered
+                # above (the outbox reuses it as its id, so this is a
+                # no-op); when resolve failed, this is the leg's only
+                # record, and without it the receipt would be rejected
+                # as unknown.
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "
@@ -3923,6 +4434,10 @@ class TauNode:
             message = error.get("message", "unknown error")
             if error.get("code") == "not_allowed":
                 raise NotAllowedError(f"peer rejected the request: {message}")
+            if error.get("code") == "unavailable":
+                # The block-list drops silently with this generic code;
+                # it is still the peer's explicit refusal, not transport.
+                raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
             raise NodeError(f"peer rejected the request: {message}")
