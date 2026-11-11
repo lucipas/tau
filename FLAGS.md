@@ -27,7 +27,7 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
 | `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`, and while mail acknowledgements are owed). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
-| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
+| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; `--ignored` for only ignored groups — ignored ones are hidden by default and their unread count is reported instead; listing marks shown messages read) |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
@@ -35,6 +35,9 @@ Global options may appear before or after the command:
 | `tau group list` | List known groups |
 | `tau group delete GROUP` | Delete a group (frees capacity when a group cap is reached) |
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
+| `tau group ignore GROUP` | Hide a group's messages from `tau messages` (history kept, mail keeps arriving; idempotent) |
+| `tau group unignore GROUP` | Show an ignored group's messages in `tau messages` again (idempotent) |
+| `tau group ignored` | List ignored groups (group name + id, message count) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -144,6 +147,10 @@ tau group create weekend --peer bob --peer carol
 tau group send weekend "who is driving?"
 tau messages --group weekend
 tau group list
+tau group ignore weekend
+tau messages --ignored         # only ignored groups
+tau group ignored
+tau group unignore weekend
 
 # Reply to an earlier message in the conversation (message id or prefix)
 tau send --to alice --reply-to a1b2c3d4 "seconded"

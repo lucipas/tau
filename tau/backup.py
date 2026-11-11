@@ -56,6 +56,7 @@ BACKUP_FILES = (
     SOCIAL_DB_NAME,
     "tan-rules.json",
     "allowlist.json",
+    "ignored-groups.json",
     RNS_CONFIG_MEMBER,
 )
 
