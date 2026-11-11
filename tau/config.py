@@ -5,12 +5,18 @@ from __future__ import annotations
 import logging
 import os
 import socket
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from .protocol import APP_NAME, DEFAULT_TCP_PORT, sanitize_name
 from .util import atomic_write_text, ensure_dir, read_json
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 
@@ -20,10 +26,12 @@ IDENTITY_FILE_NAME = "identity"
 PEERS_FILE_NAME = "peers.json"
 MAILBOX_FILE_NAME = "mailbox.json"
 INBOX_FILE_NAME = "inbox.json"
+GROUPS_FILE_NAME = "groups.json"
 MESSAGES_FILE_NAME = "messages.json"
 SOCIAL_DB_FILE_NAME = "tan.sqlite3"
 TAN_RULES_FILE_NAME = "tan-rules.json"
 ALLOWLIST_FILE_NAME = "allowlist.json"
+FILES_DIR_NAME = "files"
 BLOCKLIST_FILE_NAME = "blocklist.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
@@ -50,6 +58,7 @@ class TauConfig:
     peers_path: Path
     mailbox_path: Path
     inbox_path: Path
+    groups_path: Path
     node_file: Path
     social_db_path: Path
     tan_rules_path: Path
@@ -86,6 +95,7 @@ class TauConfig:
             peers_path=base / PEERS_FILE_NAME,
             mailbox_path=base / MAILBOX_FILE_NAME,
             inbox_path=base / INBOX_FILE_NAME,
+            groups_path=base / GROUPS_FILE_NAME,
             node_file=base / NODE_FILE_NAME,
             social_db_path=base / SOCIAL_DB_FILE_NAME,
             tan_rules_path=base / TAN_RULES_FILE_NAME,
@@ -99,6 +109,11 @@ class TauConfig:
     @property
     def rns_config_file(self) -> Path:
         return self.rns_config_dir / RNS_CONFIG_FILE_NAME
+
+    @property
+    def files_dir(self) -> Path:
+        """Directory received files land in, grouped by sender hash."""
+        return self.data_dir / FILES_DIR_NAME
 
     @property
     def instance_lock_path(self) -> Path:
@@ -119,22 +134,19 @@ def load_node_name(data_dir: Path) -> Optional[str]:
     return None
 
 
-def load_node_settings(data_dir: Path) -> Dict[str, Any]:
-    """Read the node's own settings from ``node.json``.
-
-    Tolerates a missing or corrupt file: settings are best-effort and
-    every reader supplies its own default.  Only the keys this module
-    knows are returned, so a hand-edited file cannot smuggle arbitrary
-    state into a settings lookup.
-    """
-    raw = read_json(Path(data_dir) / NODE_FILE_NAME, default=None)
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        key: raw[key]
-        for key in ("send_read_receipts",)
-        if key in raw
-    }
+@contextmanager
+def _node_file_lock(path: Path) -> Iterator[None]:
+    """Serialize read-modify-write updates of ``node.json`` across processes."""
+    if fcntl is None:  # pragma: no cover - non-POSIX
+        yield
+        return
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def send_read_receipts_enabled(data_dir: Path) -> bool:
@@ -148,33 +160,64 @@ def send_read_receipts_enabled(data_dir: Path) -> bool:
     return load_node_settings(data_dir).get("send_read_receipts", True) is not False
 
 
-def set_node_setting(data_dir: Path, key: str, value: Any) -> Dict[str, Any]:
-    """Persist one node setting in ``node.json``, keeping the others."""
-    from .util import atomic_write_json
-
-    path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
-    raw = read_json(path, default=None)
-    settings = dict(raw) if isinstance(raw, dict) else {}
-    settings[key] = value
-    atomic_write_json(path, settings, mode=0o600)
-    return settings
-
-
 def write_node_metadata(data_dir: Path, name: str) -> Path:
     from .util import atomic_write_json
 
     path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
-    # Preserve settings written since init (e.g. the read-receipt
-    # opt-out): re-running `tau init` must not silently reset them.
-    raw = read_json(path, default=None)
-    metadata = dict(raw) if isinstance(raw, dict) else {}
-    metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
-    atomic_write_json(
-        path,
-        metadata,
-        mode=0o600,
-    )
+    with _node_file_lock(path):
+        # Preserve settings written since init (e.g. the file-acceptance
+        # policy and the read-receipt opt-out): re-running `tau init`
+        # must not silently reset them.
+        raw = read_json(path, default=None)
+        metadata = dict(raw) if isinstance(raw, dict) else {}
+        metadata.update({"name": sanitize_name(name), "protocol": APP_NAME})
+        atomic_write_json(
+            path,
+            metadata,
+            mode=0o600,
+        )
     return path
+
+
+def load_node_settings(data_dir: Path) -> Dict[str, object]:
+    """Read this node's own settings out of ``node.json``.
+
+    Only keys the code knows how to interpret are returned, so a
+    hand-edited file cannot smuggle an unknown setting into a lookup.
+    """
+    raw = read_json(Path(data_dir) / NODE_FILE_NAME, default=None)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: raw[key]
+        for key in ("accept_files", "send_read_receipts")
+        if key in raw
+    }
+
+
+def accept_files_enabled(data_dir: Path) -> bool:
+    """True only when this node opted in to receiving files.
+
+    Off by default: an unsolicited file is never written to disk
+    unless the owner turned acceptance on, or the sender is on the
+    DM allow-list (see :meth:`TauNode._handle_file`).  Only an
+    explicit ``true`` in ``node.json`` enables it — any other value
+    (including a corrupt one) keeps the default off.
+    """
+    return load_node_settings(data_dir).get("accept_files", False) is True
+
+
+def set_node_setting(data_dir: Path, key: str, value: object) -> Dict[str, object]:
+    """Persist one node setting in ``node.json``, keeping the others."""
+    from .util import atomic_write_json
+
+    path = ensure_dir(Path(data_dir)) / NODE_FILE_NAME
+    with _node_file_lock(path):
+        raw = read_json(path, default=None)
+        settings = dict(raw) if isinstance(raw, dict) else {}
+        settings[key] = value
+        atomic_write_json(path, settings, mode=0o600)
+    return settings
 
 
 def parse_host_port(value: str, *, default_host: str = "127.0.0.1") -> Tuple[str, int]:

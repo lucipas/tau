@@ -11,6 +11,8 @@ import pytest
 import RNS
 
 from tau import lxmf
+from tau.allowlist import AllowList
+from tau.blocklist import BlockList
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.node import NodeError, NotAllowedError, PeerRefusedError, TauNode
@@ -211,6 +213,7 @@ class _FakeLXMRouter:
         self.delivery_destinations = {}
         self.display_name = None
         self.announced: list = []
+        self.delivery_callback = None
         self.exit_handler_calls = 0
         self.outbound: list = []
         self.cancelled: list = []
@@ -224,6 +227,9 @@ class _FakeLXMRouter:
         )
         self.delivery_destinations[destination.hash] = destination
         return destination
+
+    def register_delivery_callback(self, callback):
+        self.delivery_callback = callback
 
     def announce(self, destination_hash):
         self.announced.append(destination_hash)
@@ -266,6 +272,25 @@ def test_start_router_registers_delivery_and_announces(fake_lxmf, tmp_path):
     delivery = lxmf.lxmf_delivery_hash(identity)
     assert lxmf.lxmf_router_delivery_hash(router) == delivery
     assert router.announced == [delivery]
+
+
+def test_start_router_registers_delivery_callback(fake_lxmf, tmp_path):
+    received: list = []
+
+    def callback(message):
+        received.append(message)
+
+    router = lxmf.start_lxmf_router(
+        RNS.Identity(), tmp_path, delivery_callback=callback
+    )
+    assert router.delivery_callback is callback
+    router.delivery_callback("message")
+    assert received == ["message"]
+
+
+def test_start_router_without_callback_registers_none(fake_lxmf, tmp_path):
+    router = lxmf.start_lxmf_router(RNS.Identity(), tmp_path)
+    assert router.delivery_callback is None
 
 
 def test_start_router_requires_installed_package(monkeypatch, tmp_path):
@@ -400,7 +425,7 @@ def test_send_lxmf_message_raises_when_router_refuses(fake_lxmf, tmp_path):
 
 # -- outbox fallback -------------------------------------------------------
 
-def _lxmf_node(tmp_path):
+def _lxmf_send_node(tmp_path):
     """A node with a fake LXMF router attached and one known peer."""
     config = TauConfig.resolve(data_dir=tmp_path, name="tester")
     node = TauNode(config, registry=PeerRegistry(config.peers_path))
@@ -441,7 +466,7 @@ def test_deliver_entry_never_routes_a_refusal_over_lxmf(
     # A peer that explicitly refuses the DM — allow-list (NotAllowedError)
     # or block-list ("unavailable" answers as PeerRefusedError) — must
     # never have the refused text routed around the refusal via LXMF.
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "deliver"
     for message_id, error in [
         ("cc" + "59" * 15, NotAllowedError("peer rejected the request: not allowed")),
@@ -460,7 +485,7 @@ def test_deliver_via_lxmf_skips_expired_message(tmp_path, fake_lxmf):
     # A deadline that passes while the direct request is in flight must
     # not be sent over LXMF: the LXMF receiver carries no deadline, so
     # the copy would live in the recipient's inbox past its expiry.
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "deliver"
     entry = node.mailbox.enqueue(
         to=peer.destination_hash,
@@ -487,7 +512,7 @@ def test_deliver_via_lxmf_skips_expired_message(tmp_path, fake_lxmf):
 def test_deliver_entry_falls_back_to_lxmf_when_direct_fails(
     tmp_path, monkeypatch, fake_lxmf
 ):
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "deliver"
     entry = node.mailbox.enqueue(
         to=peer.destination_hash, text="via lxmf", message_id="cc" + "55" * 15
@@ -507,7 +532,7 @@ def test_deliver_entry_falls_back_to_lxmf_when_direct_fails(
 def test_deliver_entry_keeps_entry_when_lxmf_fails(
     tmp_path, monkeypatch, fake_lxmf
 ):
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "fail"
     entry = node.mailbox.enqueue(
         to=peer.destination_hash, text="stays queued", message_id="cc" + "56" * 15
@@ -519,7 +544,7 @@ def test_deliver_entry_keeps_entry_when_lxmf_fails(
 
 
 def test_deliver_entry_keeps_entry_without_router(tmp_path, monkeypatch, fake_lxmf):
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     node.lxmf_router = None
     entry = node.mailbox.enqueue(
         to=peer.destination_hash, text="no router", message_id="cc" + "57" * 15
@@ -533,7 +558,7 @@ def test_deliver_entry_keeps_entry_without_router(tmp_path, monkeypatch, fake_lx
 def test_deliver_entry_skips_lxmf_for_unknown_recipient(
     tmp_path, monkeypatch, fake_lxmf
 ):
-    node, peer, router = _lxmf_node(tmp_path)
+    node, peer, router = _lxmf_send_node(tmp_path)
     router.outcome = "deliver"
     entry = node.mailbox.enqueue(
         to=b"\xbb" * 16, text="nobody", message_id="cc" + "58" * 15
@@ -542,3 +567,244 @@ def test_deliver_entry_skips_lxmf_for_unknown_recipient(
     assert node._deliver_entry(peer, entry, timeout=1.0) is False
     assert node.mailbox.get_outbox(entry.id) is not None
     assert router.outbound == []
+# -- incoming LXMF delivery ------------------------------------------------
+
+def _lxmf_node(tmp_path, *, on_message=None):
+    """A node with a fake LXMF router running, no live Reticulum."""
+    config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    node = TauNode(
+        config,
+        registry=PeerRegistry(config.peers_path),
+        on_message=on_message,
+    )
+    node.identity = RNS.Identity()
+    node._start_lxmf_router()
+    return node
+
+
+def _lxmf_peer(node, name="alice"):
+    """Add a peer to *node*'s registry; return (peer, sender identity)."""
+    sender = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(sender),
+        sender.get_public_key(),
+        name=name,
+    )
+    return peer, sender
+
+
+def _lxmf_message(sender, *, text="hello via lxmf", verified=True):
+    """A delivered LXMessage stand-in for *sender*."""
+    return types.SimpleNamespace(
+        source_hash=lxmf.lxmf_delivery_hash(sender),
+        signature_validated=verified,
+        content_as_string=lambda: text,
+        hash=b"\x11" * 16,
+        timestamp=1_700_000_000.0,
+    )
+
+
+def test_node_lxmf_delivery_stores_message(fake_lxmf, tmp_path):
+    seen: list = []
+    node = _lxmf_node(tmp_path, on_message=seen.append)
+    peer, sender = _lxmf_peer(node)
+    try:
+        router = node.lxmf_router
+        assert router.delivery_callback is not None
+        router.delivery_callback(_lxmf_message(sender))
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        record = stored[0]
+        assert record["text"] == "hello via lxmf"
+        assert record["from"] == "alice"
+        assert record["destination"] == peer.hexhash
+        assert record["direction"] == "in"
+        assert record["id"] == "lxmf:" + (b"\x11" * 16).hex()
+        assert record["sent_at"] == 1_700_000_000.0
+        # on_message gets the same record (before the inbox stamps seq).
+        assert len(seen) == 1
+        assert seen[0]["id"] == record["id"]
+        assert seen[0]["text"] == record["text"]
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_requires_verified_signature(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(sender, verified=False)
+        )
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_unknown_sender(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(RNS.Identity()))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_respects_blocklist(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    node._blocklist = BlockList(blocked={peer.hexhash})
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_respects_allowlist(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    node._allowlist = AllowList(enabled=True, allow=frozenset())
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert node.inbox.list_messages() == []
+        node._allowlist = AllowList(enabled=True, allow={peer.hexhash})
+        node.lxmf_router.delivery_callback(_lxmf_message(sender))
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_unreadable_content(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(_lxmf_message(sender, text=None))
+        node.lxmf_router.delivery_callback(_lxmf_message(sender, text=""))
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_invalid_utf8(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+
+        def _undecodable():
+            return b"\xff\xfe".decode("utf-8")  # raises UnicodeDecodeError
+
+        message.content_as_string = _undecodable
+        node.lxmf_router.delivery_callback(message)
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_long_hash_id_fits_wire_limit(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        message.hash = b"\xab" * 32  # full-length LXMF hash
+        node.lxmf_router.delivery_callback(message)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        assert len(stored[0]["id"]) <= 64
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_dedupes_redelivery(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        node.lxmf_router.delivery_callback(message)
+        node.lxmf_router.delivery_callback(message)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_callback_never_raises(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        class _BrokenMessage:
+            @property
+            def signature_validated(self):
+                raise RuntimeError("boom")
+
+        # A broken message object must not take the router down with it.
+        node._handle_lxmf_message(_BrokenMessage())
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_concurrent_duplicates_store_once(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        message = _lxmf_message(sender)
+        threads = [
+            threading.Thread(
+                target=node.lxmf_router.delivery_callback, args=(message,)
+            )
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_after_stop_is_dropped(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    router = node.lxmf_router
+    node.stop()
+    router.delivery_callback(_lxmf_message(sender))
+    assert node.inbox.list_messages() == []
+
+
+def test_node_lxmf_stop_waits_for_inflight_delivery(
+    fake_lxmf, tmp_path, monkeypatch
+):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    entered = threading.Event()
+    release = threading.Event()
+    real_append = node.inbox.append
+
+    def _blocking_append(record):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_append(record)
+
+    monkeypatch.setattr(node.inbox, "append", _blocking_append)
+    try:
+        delivery = threading.Thread(
+            target=node.lxmf_router.delivery_callback,
+            args=(_lxmf_message(sender),),
+        )
+        delivery.start()
+        assert entered.wait(timeout=10)
+        stopped = threading.Thread(target=node.stop)
+        stopped.start()
+        # stop() is still waiting for the delivery while it is blocked.
+        stopped.join(timeout=1)
+        assert stopped.is_alive()
+        release.set()
+        stopped.join(timeout=10)
+        assert not stopped.is_alive()
+        delivery.join(timeout=10)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        release.set()
+        node.stop()
