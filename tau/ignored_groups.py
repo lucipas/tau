@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,11 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the lock uses msvcrt there, as identity.py does.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 IGNORED_GROUPS_FILE_MODE = 0o600
 
@@ -144,19 +150,32 @@ def ignored_groups_lock(path: Union[str, Path]) -> Iterator[None]:
     alone does not protect the whole update — without the lock, two
     ignore commands racing load the same file and the last save
     discards the other's change.  Callers must reload inside the
-    lock.  Non-POSIX platforms get no lock, like the node lock.
+    lock.  Windows locks the first byte of the sidecar with
+    ``msvcrt.locking``, as ``tau.identity`` does.
     """
-    if fcntl is None:  # pragma: no cover - non-POSIX
+    if fcntl is None and msvcrt is None:  # pragma: no cover - neither platform
         yield
         return
     target = Path(path).expanduser()
     lock_path = target.with_name(f".{target.name}.lock")
     with open(lock_path, "a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - exercised on Windows
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(" ")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         try:
             yield
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            else:  # pragma: no cover - exercised on Windows
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def load_ignored_group_ids(path: Optional[Union[str, Path]]) -> FrozenSet[str]:
