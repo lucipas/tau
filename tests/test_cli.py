@@ -3310,6 +3310,34 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
 
 
+def test_messages_import_skips_retracted_messages(tmp_path, capsys):
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    export_path = tmp_path / "messages-backup.json"
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--output", str(export_path)]
+    )
+    assert code == 0
+
+    target_dir = tmp_path / "other-node"
+    # The sender retracted m-1 on the target node before the import.
+    mailbox = Mailbox(target_dir / "mailbox.json")
+    mailbox.record_retraction(sender_hash.hex(), "m-1")
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "Imported 1 messages (0 already present, 1 skipped)" in out
+    assert "skipped m-1: message was retracted by its sender" in out
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2"]
+
+
 def test_messages_export_to_stdout_and_peer_filter(tmp_path, capsys):
     source_dir, sender_hash = _seed_messages(tmp_path)
     code = cli.main(["messages", "export", "--data-dir", str(source_dir)])

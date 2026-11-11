@@ -83,6 +83,12 @@ log = logging.getLogger(__name__)
 MAILBOX_VERSION = 1
 DEFAULT_TTL = 7 * 24 * 60 * 60
 SEEN_RETENTION = 30 * 24 * 60 * 60
+# Retraction markers: (sender hash, message id) -> expiry.  A retract
+# deletes the inbox copy, but a sealed relay copy can still arrive
+# afterwards — and the bounded seen-id cache can evict the id — so the
+# marker outlives both, for the possible delivery lifetime of the
+# message (the 7-day mail TTL), then expires.
+RETRACTED_RETENTION = DEFAULT_TTL
 MAX_OUTBOX = 256
 MAX_HELD_TOTAL = 512
 MAX_HELD_PER_RECIPIENT = 64
@@ -95,6 +101,11 @@ MAX_HOLDERS_PER_MESSAGE = 3
 MAX_SENT = 256
 MAX_RECEIPTS = 256
 SENT_RETENTION = 30 * 24 * 60 * 60
+
+
+def _retraction_key(sender_hash: str, message_id: str) -> str:
+    """One flat key for a (sender, message id) pair; both parts are hex."""
+    return f"{sender_hash}:{message_id}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -580,6 +591,9 @@ class Mailbox:
         # deposit must not resurrect the copy until the original would
         # have expired anyway.
         self._dropped_held: Dict[str, float] = {}
+        # Retraction markers, keyed by (sender hash, message id), with
+        # the time the marker expires (see RETRACTED_RETENTION).
+        self._retracted: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -693,6 +707,7 @@ class Mailbox:
             self._seen = state["seen"]
             self._pending_acks = state["pending_acks"]
             self._dropped_held = state["dropped_held"]
+            self._retracted = state["retracted"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -836,6 +851,15 @@ class Mailbox:
                 if isinstance(v, (int, float))
             }
 
+        retracted: Dict[str, float] = {}
+        raw_retracted = raw.get("retracted")
+        if isinstance(raw_retracted, dict):
+            retracted = {
+                str(k): float(v)
+                for k, v in raw_retracted.items()
+                if isinstance(v, (int, float))
+            }
+
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
         if isinstance(raw_sent, dict):
@@ -888,6 +912,7 @@ class Mailbox:
             "seen": seen,
             "pending_acks": acks,
             "dropped_held": dropped_held,
+            "retracted": retracted,
             "sent": sent,
             "receipts": receipts,
         }
@@ -911,6 +936,7 @@ class Mailbox:
                     entry.to_dict() for entry in self._receipts.values()
                 ],
                 "dropped_held": dict(self._dropped_held),
+                "retracted": dict(self._retracted),
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -928,6 +954,7 @@ class Mailbox:
                 "seen": len(self._seen),
                 "sent": len(self._sent),
                 "receipts": len(self._receipts),
+                "retracted": len(self._retracted),
             }
 
     # -- outbox ------------------------------------------------------------
@@ -1578,6 +1605,41 @@ class Mailbox:
                     del self._seen[key]
             self.save()
 
+    # -- retraction markers -------------------------------------------------
+
+    def record_retraction(
+        self, sender_hash: str, message_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Remember that *sender_hash* retracted *message_id*.
+
+        The marker lives for the possible delivery lifetime of the
+        message (RETRACTED_RETENTION), independently of the bounded
+        seen-id cache, so a relayed copy arriving after the retract —
+        or after the id leaves the seen cache — is still dropped.
+        Recording the same retraction again refreshes the marker.
+        """
+        timestamp = now if now is not None else time.time()
+        with self._transaction():
+            self._retracted[_retraction_key(sender_hash, message_id)] = (
+                timestamp + RETRACTED_RETENTION
+            )
+            self.save()
+
+    def is_retracted(
+        self, sender_hash: str, message_id: str, *, now: Optional[float] = None
+    ) -> bool:
+        """True while a live retraction marker covers this message.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away; a marker for another sender never matches.
+        """
+        with self._lock:
+            until = self._retracted.get(_retraction_key(sender_hash, message_id))
+            if until is None:
+                return False
+            timestamp = now if now is not None else time.time()
+            return timestamp < until
+
     # -- pending fetch acknowledgements --------------------------------------
 
     def add_pending_acks(self, holder_hexhash: str, message_ids: List[str]) -> None:
@@ -1658,6 +1720,13 @@ class Mailbox:
             ]
             for key in dead_dropped:
                 del self._dropped_held[key]
+            dead_retracted = [
+                key
+                for key, until in self._retracted.items()
+                if until <= timestamp
+            ]
+            for key in dead_retracted:
+                del self._retracted[key]
             if (
                 dead_outbox
                 or dead_held
@@ -1665,6 +1734,7 @@ class Mailbox:
                 or dead_sent
                 or dead_receipts
                 or dead_dropped
+                or dead_retracted
             ):
                 self.save()
             return {
@@ -1674,6 +1744,7 @@ class Mailbox:
                 "sent": len(dead_sent),
                 "receipts": len(dead_receipts),
                 "dropped_held": len(dead_dropped),
+                "retracted": len(dead_retracted),
             }
 
 

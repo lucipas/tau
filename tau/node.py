@@ -1041,6 +1041,23 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_retraction(self, sender_hash: str, message_id: str) -> None:
+        """Persist a retraction marker; never break the retract itself.
+
+        The marker is the durable half of a retract: the inbox copy is
+        already gone (or never arrived), and a marker that failed to
+        persist only risks a relayed copy resurfacing — worth a log
+        line, not a failed retract.
+        """
+        try:
+            self.mailbox.record_retraction(sender_hash, message_id)
+        except Exception:  # pragma: no cover - storage failure
+            log.warning(
+                "Could not record retraction marker for %s",
+                message_id[:8],
+                exc_info=True,
+            )
+
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
 
@@ -1143,7 +1160,17 @@ class TauNode:
         expired = expires_at is not None and expires_at <= received_at
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
-        if not duplicate and not expired:
+        # A message its sender retracted is dropped the same way: the
+        # marker outlives the seen cache, so a copy that arrives after
+        # the id was evicted still loses to the retract.
+        retracted = bool(
+            message_id
+            and caller_hash
+            and self.mailbox.is_retracted(caller_hash, message_id)
+        )
+        if retracted:
+            log.info("Dropping retracted message %s from %s", message_id, caller_hash)
+        if not duplicate and not expired and not retracted:
             if message_id:
                 self.mailbox.mark_seen(message_id)
             record = {
@@ -1180,6 +1207,7 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
             expired=expired,
+            retracted=retracted,
         )
 
     def _accept_group_message(
@@ -1593,6 +1621,14 @@ class TauNode:
         except ValueError:
             stored = None
         if stored is None or stored.get("id") != retract["target"]:
+            # No stored copy to check the sender against — the message
+            # may already be deleted or never have arrived.  Record the
+            # marker anyway: the retract is authenticated, and a copy
+            # arriving later (a relayed copy, or one that outlives the
+            # seen cache) must still lose to it.  The key carries the
+            # caller's own hash, so a sender can only ever suppress
+            # their own messages this way.
+            self._record_retraction(caller_hash, retract["target"])
             return response_ok(
                 target=retract["target"],
                 received_at=received_at,
@@ -1626,6 +1662,11 @@ class TauNode:
             return response_error(
                 "storage_failed", f"could not retract message: {exc}"
             )
+        # The copy is gone, but a sealed relay copy can still arrive —
+        # and the seen cache can evict the id — so leave a marker that
+        # outlives both.  (A refused retract records nothing: the
+        # message stays, so it must stay deliverable.)
+        self._record_retraction(caller_hash, retract["target"])
         log.info(
             "Retraction from %s deleted %s",
             caller_hash[:8],
@@ -2584,6 +2625,15 @@ class TauNode:
         if expires_at is not None and expires_at <= time.time():
             # Past the sender's deadline: do not record or show it.
             log.info("Dropping expired relayed message %s", message["id"])
+            return False
+        if message.get("group") is None and self.mailbox.is_retracted(
+            sender if isinstance(sender, str) else "", message["id"]
+        ):
+            # A retract the sender issued after this copy was sealed
+            # still wins: the marker outlives the seen cache, so a
+            # relayed copy is dropped, never stored.  Group messages
+            # are not retractable in v1, so they never match a marker.
+            log.info("Dropping retracted relayed message %s", message["id"])
             return False
         group = message.get("group")
         pinned: Optional[Dict[str, Any]] = None

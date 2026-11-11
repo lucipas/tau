@@ -12,6 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
+    RETRACTED_RETENTION,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -48,6 +49,7 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
         "seen": 0,
         "sent": 0,
         "receipts": 0,
+        "retracted": 0,
     }
 
     reloaded = Mailbox(path)
@@ -156,7 +158,7 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0}
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
     kept = box.get_outbox("dup-id")
     assert kept is not None
     assert kept.text == "newer copy"
@@ -215,7 +217,7 @@ def test_load_skips_nonfinite_timestamps(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0}
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
     assert box.get_outbox("nan-created") is None
     assert box.get_outbox("good-id") is not None
 
@@ -669,6 +671,7 @@ def test_prune_expires_everything(tmp_path):
         "sent": 0,
         "receipts": 0,
         "dropped_held": 1,
+        "retracted": 0,
     }
     assert box.counts() == {
         "outbox": 0,
@@ -676,6 +679,7 @@ def test_prune_expires_everything(tmp_path):
         "seen": 0,
         "sent": 0,
         "receipts": 0,
+        "retracted": 0,
     }
 
 
@@ -689,6 +693,41 @@ def test_seen_and_pending_acks(tmp_path):
     box.add_pending_acks("holder1", ["b", "c"])
     assert box.take_pending_acks("holder1") == ["a", "b", "c"]
     assert box.take_pending_acks("holder1") == []
+
+
+def test_retraction_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    assert box.is_retracted(sender, "msg-1") is False
+
+    recorded_at = time.time()
+    box.record_retraction(sender, "msg-1", now=recorded_at)
+    assert box.is_retracted(sender, "msg-1") is True
+    # A marker is keyed by (sender, id): another sender's message with
+    # the same id, or another id from the same sender, is unaffected.
+    assert box.is_retracted("bb" * 32, "msg-1") is False
+    assert box.is_retracted(sender, "msg-2") is False
+    assert box.counts()["retracted"] == 1
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_retracted(sender, "msg-1") is True
+    assert (
+        reloaded.is_retracted(
+            sender, "msg-1", now=recorded_at + RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_retracted(sender, "msg-1", now=recorded_at + RETRACTED_RETENTION)
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + RETRACTED_RETENTION)
+    assert removed["retracted"] == 1
+    assert reloaded.counts()["retracted"] == 0
+    assert reloaded.is_retracted(sender, "msg-1") is False
 
 
 # -- sealed envelopes -------------------------------------------------------------

@@ -663,7 +663,12 @@ identity and verified by the receiver against the link identity, like a
 reaction, and the receiver only deletes a message the caller actually
 sent: a retract from anyone else fails with `not_sender`, and a retract
 for an id the receiver never held answers ok with nothing deleted, so
-retries are safe. Group messages cannot be retracted in v1 — a group
+retries are safe. A retract also leaves a marker keyed by (sender,
+message id) that lives for the message's delivery lifetime (7 days),
+so a sealed relay copy that arrives after the retract — or after the
+id leaves the receiver's seen cache — is dropped instead of stored,
+and `tau messages import` skips the message instead of resurrecting
+it. Group messages cannot be retracted in v1 — a group
 message lives in every member's inbox, and deleting it from one member
 alone would silently half-retract it.
 
