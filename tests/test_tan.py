@@ -5472,3 +5472,60 @@ def test_cli_timeline_tag(tmp_path, capsys):
         == 1
     )
     assert "not a tag" in capsys.readouterr().err
+
+
+def test_extract_tags_skips_tags_that_do_not_survive_casefolding():
+    # "İ" casefolds to "i" plus a combining mark, which a tag cannot
+    # carry — so it is no tag at all, rather than a mangled one.
+    assert extract_tags("about #İ") == []
+    # Every tag extraction returns passes clean_tag: the two agree.
+    for text in (
+        "#MeshNet #ato-2026",
+        "#café #tag_1 (see #yo!)",
+        "plain text, no tags",
+    ):
+        for tag in extract_tags(text):
+            assert clean_tag(tag) == tag
+            assert clean_tag("#" + tag) == tag
+
+
+def test_timeline_tag_excludes_repost_of_deleted_post(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, alice, "tagged #meshnet", name="alice", now=1000)
+    create_repost(conn, bob, tagged["hash"], name="bob", now=1001)
+    create_delete(conn, alice, tagged["hash"], name="alice", now=1002)
+    authors = [tagged["author"], author_of(bob)]
+
+    # The repost must not match on the deleted original's text: the
+    # tag view stays empty instead of showing a blank repost that
+    # leaks that the deleted post carried the tag.
+    assert timeline(conn, authors, tag="meshnet") == []
+    assert timeline(conn, include_all=True, tag="meshnet") == []
+    assert tags(conn) == []
+
+
+def test_timeline_tag_hidden_repost_does_not_consume_limit(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    visible = create_post(conn, alice, "#meshnet visible", name="alice", now=1000)
+    hidden = create_post(conn, bob, "#meshnet hidden", name="bob", now=1001)
+    repost = create_repost(conn, carol, hidden["hash"], name="carol", now=1002)
+    authors = [visible["author"], hidden["author"], author_of(carol)]
+
+    mute(conn, author_of(bob), name="bob")
+    # The repost of bob's post is hidden by the timeline's repost
+    # rules, so with limit 1 the tag view must page past it to the
+    # visible post instead of coming back empty.
+    assert [post["hash"] for post in timeline(conn, authors, tag="meshnet", limit=1)] == [
+        visible["hash"]
+    ]
+    assert [post["hash"] for post in timeline(conn, include_all=True, tag="meshnet", limit=1)] == [
+        visible["hash"]
+    ]
+    # The author view keeps reposts of muted authors, the way its
+    # untagged view does — the filter mirrors the call site.
+    assert [post["hash"] for post in author_timeline(conn, author_of(carol), tag="meshnet")] == [
+        repost["hash"]
+    ]

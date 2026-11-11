@@ -2243,7 +2243,10 @@ def extract_tags(text: Any) -> List[str]:
     Tags are derived from the text at read time, never stored: a post
     gains its tags without a re-publish, and no envelope or schema
     change is involved.  A trailing ``-`` is not part of a tag, so
-    ``#mesh-`` reads as ``mesh``.
+    ``#mesh-`` reads as ``mesh``.  A candidate that does not survive
+    casefolding as one tag — a capital ``İ`` casefolds to ``i`` plus a
+    combining mark, which a tag cannot carry — is skipped, so every
+    tag returned here passes :func:`clean_tag`.
     """
     if not isinstance(text, str):
         return []
@@ -2251,7 +2254,9 @@ def extract_tags(text: Any) -> List[str]:
     found: List[str] = []
     for match in _TAG_PATTERN.finditer(text):
         tag = match.group(1).rstrip("-").casefold()
-        if tag and tag not in seen:
+        if not tag or _TAG_PATTERN.fullmatch("#" + tag) is None:
+            continue
+        if tag not in seen:
             seen.add(tag)
             found.append(tag)
     return found
@@ -2304,7 +2309,7 @@ def _filter_posts_by_tag(
         rows = conn.execute(
             f"SELECT {', '.join(_POST_COLUMNS)} FROM posts "
             f"WHERE hash IN ({placeholders}) "
-            "AND kind IN ('post', 'reply') AND linked = 1",
+            f"AND kind IN ('post', 'reply') AND linked = 1 AND {_NOT_DELETED}",
             targets,
         ).fetchall()
         original_posts = _public_posts(rows)
@@ -2327,6 +2332,39 @@ def _filter_posts_by_tag(
         if tag in extract_tags(text):
             kept.append(post)
     return kept
+
+
+def _tag_page_filter(
+    conn: sqlite3.Connection,
+    tag: Optional[str],
+    *,
+    keywords: List[str],
+    exclude_authors: Optional[Set[str]] = None,
+    blocked_authors: Optional[Set[str]] = None,
+) -> Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]]:
+    """Page filter for a tag search, or ``None`` when no tag is given.
+
+    Reposts the timeline would hide — of a blocked or muted author's
+    post, or of a post matching a muted keyword — are dropped before
+    the tag match, so they never count toward the paging limit.  The
+    arguments mirror the call site's final :func:`annotate_reposts`:
+    the author view keeps reposts of muted authors, so it passes no
+    *exclude_authors*.
+    """
+    if tag is None:
+        return None
+
+    def keep(page: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        visible = annotate_reposts(
+            conn,
+            page,
+            muted_keywords=keywords,
+            exclude_authors=exclude_authors,
+            blocked_authors=blocked_authors,
+        )
+        return _filter_posts_by_tag(conn, visible, tag)
+
+    return keep
 
 
 def timeline(
@@ -2376,10 +2414,12 @@ def timeline(
     hidden = silenced | blocked
     keywords = _muted_keyword_list(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
-    keep_tag = (
-        (lambda page: _filter_posts_by_tag(conn, page, wanted_tag))
-        if wanted_tag is not None
-        else None
+    keep_tag = _tag_page_filter(
+        conn,
+        wanted_tag,
+        keywords=keywords,
+        exclude_authors=silenced,
+        blocked_authors=blocked,
     )
     if include_all:
         posts = _fill_unmuted(
@@ -2520,10 +2560,8 @@ def author_timeline(
     keywords = _muted_keyword_list(conn)
     silenced = muted_author_set(conn)
     wanted_tag = clean_tag(tag) if tag is not None else None
-    keep_tag = (
-        (lambda page: _filter_posts_by_tag(conn, page, wanted_tag))
-        if wanted_tag is not None
-        else None
+    keep_tag = _tag_page_filter(
+        conn, wanted_tag, keywords=keywords, blocked_authors=blocked
     )
 
     def page(cursor: int) -> List[Dict[str, Any]]:
