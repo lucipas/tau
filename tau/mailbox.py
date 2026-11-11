@@ -66,6 +66,7 @@ from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
+    clean_group_topic,
     clean_in_reply_to,
     decode,
     encode,
@@ -1763,6 +1764,14 @@ def seal_message(
             "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
+        # The topic is covered by the signature.  Present "" is an
+        # explicit clear; absent means the sender predates topics.
+        group_topic = group.get("topic")
+        if isinstance(group_topic, str):
+            inner["group"]["topic"] = clean_group_topic(group_topic)
+            topic_at = group.get("topic_sent_at")
+            if isinstance(topic_at, (int, float)) and math.isfinite(topic_at):
+                inner["group"]["topic_sent_at"] = float(topic_at)
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -2029,6 +2038,17 @@ def _validated_sealed_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise MailboxError("sealed receipt has an invalid message id")
         if message_id not in cleaned_ids:
             cleaned_ids.append(message_id)
+    read_at = payload.get("read_at")
+    if not isinstance(read_at, (int, float)) or not math.isfinite(float(read_at)):
+        raise MailboxError("sealed receipt has an invalid read_at")
+    return {
+        "id": receipt_id,
+        "from": payload["from"].lower(),
+        "from_name": sanitize_name(payload.get("from_name")),
+        "ids": cleaned_ids,
+        "read_at": float(read_at),
+    }
+  cleaned_ids.append(message_id)
     read_at = payload.get("read_at")
     if not isinstance(read_at, (int, float)) or not math.isfinite(float(read_at)):
         raise MailboxError("sealed receipt has an invalid read_at")

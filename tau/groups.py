@@ -528,6 +528,17 @@ class GroupStore:
         # non-text value is not a topic at all, and a present string
         # (including "") is authoritative.
         topic = clean_group_topic(topic) if isinstance(topic, str) else None
+        # A retried topic carries the time it was set, which can be later
+        # than the queued message's send time; the topic is judged by that.
+        if topic_sent_at is not None:
+            try:
+                topic_sent_at = float(topic_sent_at)
+            except (TypeError, ValueError):
+                topic_sent_at = None
+            if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+                topic_sent_at = None
+        if topic_sent_at is None:
+            topic_sent_at = sent_at
         candidate = _valid_group(
             {
                 "id": group_id,
@@ -551,7 +562,7 @@ class GroupStore:
                 # A first sighting from the creator carries the topic;
                 # one from a member keeps "" — members cannot set it.
                 candidate["topic"] = topic
-                candidate["topic_sent_at"] = sent_at
+                candidate["topic_sent_at"] = topic_sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
             if existing is not None:
@@ -636,15 +647,16 @@ class GroupStore:
                     existing_topic_at = existing.get("topic_sent_at")
                     stale = (
                         existing_topic_at is not None
-                        and sent_at is not None
-                        and sent_at < existing_topic_at
+                        and topic_sent_at is not None
+                        and topic_sent_at < existing_topic_at
                     )
                     if not stale and (
-                        existing.get("topic", "") != topic or sent_at is not None
+                        existing.get("topic", "") != topic
+                        or topic_sent_at is not None
                     ):
                         updates["topic"] = topic
-                        if sent_at is not None:
-                            updates["topic_sent_at"] = sent_at
+                        if topic_sent_at is not None:
+                            updates["topic_sent_at"] = topic_sent_at
                 if updates:
                     self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True

@@ -1574,6 +1574,7 @@ class TauNode:
                 "topic": message.get("group_topic"),
             },
             sent_at=message.get("sent_at"),
+            topic_sent_at=message.get("group_topic_sent_at"),
         )
         if group is None:
             log.info(
@@ -2270,22 +2271,33 @@ class TauNode:
         except TimeoutError:
             return True
 
-    def _current_group_topic(self, group_id: Optional[str]) -> str:
-        """The topic a queued group message should carry on retry.
+    def _current_group_topic(
+        self, group_id: Optional[str]
+    ) -> Optional[Tuple[str, Optional[float]]]:
+        """The topic a queued group message should carry on retry, with
+        the time it was set (``None`` when unknown).
 
         Read from the store at delivery time, so a topic set or cleared
-        after queueing travels with the retry.  A group that is gone
-        (deleted, or roster-changed into a successor) carries none.
+        after queueing travels with the retry.  Returns ``None`` when the
+        group is gone (deleted, or roster-changed into a successor) or the
+        store cannot be read: the retry then omits the topic, and the
+        recipient keeps its own, rather than treating it as a clear.
         """
         if not group_id:
-            return ""
+            return None
         try:
             # find() reloads from disk, so a topic set by another
             # process (``tau group topic`` while serving) is seen.
             group = self.groups.find(group_id)
         except (ValueError, OSError):  # unknown group, or unreadable store
-            return ""
-        return str(group.get("topic", "") or "")
+            return None
+        if group is None:
+            return None
+        topic_at = group.get("topic_sent_at")
+        return (
+            str(group.get("topic", "") or ""),
+            float(topic_at) if isinstance(topic_at, (int, float)) else None,
+        )
 
     def _deliver_entry(
         self,
@@ -2320,22 +2332,47 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
-        payload = (
-            encode_group_message(
-                entry.text,
+        if entry.group_id is not None:
+            group_kwargs: Dict[str, Any] = dict(
                 message_id=entry.id,
                 sent_at=entry.created_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
-                # Re-read the topic at retry time, not queue time: a
-                # topic set or cleared after queueing travels with the
-                # retry, and a stale queued copy cannot resurrect one.
-                group_topic=self._current_group_topic(entry.group_id),
             )
-            if entry.group_id is not None
-            else encode_message(
+            # Re-read the topic at retry time, not queue time: a topic
+            # set or cleared after queueing travels with the retry, and
+            # a stale queued copy cannot resurrect one.  Its own set
+            # time rides along, since it can postdate the queued message.
+            # A group that is gone carries no topic at all (None), so
+            # the recipient keeps its own rather than being cleared.
+            current = self._current_group_topic(entry.group_id)
+            topic, topic_at = current if current is not None else (None, None)
+            try:
+                payload = encode_group_message(
+                    entry.text,
+                    group_topic=topic,
+                    group_topic_sent_at=topic_at,
+                    **group_kwargs,
+                )
+            except ProtocolError:
+                # A topic set after queueing can push the payload past
+                # the size limit.  Send without it rather than abort the
+                # whole flush round; the recipient keeps its topic.
+                try:
+                    payload = encode_group_message(
+                        entry.text, group_topic=None, **group_kwargs
+                    )
+                except ProtocolError:
+                    log.error(
+                        "Queued group message %s to %s cannot be encoded",
+                        entry.id,
+                        peer.hexhash,
+                    )
+                    return False
+        else:
+            payload = encode_message(
                 entry.text,
                 message_id=entry.id,
                 sent_at=entry.created_at,
@@ -2343,7 +2380,6 @@ class TauNode:
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
             )
-        )
         if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
         via_lxmf = False
@@ -2884,6 +2920,7 @@ class TauNode:
                 sender if isinstance(sender, str) else "",
                 group,
                 sent_at=message.get("sent_at"),
+                topic_sent_at=group.get("topic_sent_at"),
             )
             if pinned is None:
                 log.info(
@@ -4296,4 +4333,12 @@ class TauNode:
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+))
+        return decoded
+e NodeError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+))
         return decoded

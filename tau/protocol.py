@@ -384,6 +384,7 @@ def encode_group_message(
     members: List[str],
     sent_at: Optional[float] = None,
     group_topic: Optional[str] = None,
+    group_topic_sent_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -439,6 +440,15 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
     # A present string, including "", is authoritative: the creator
     # clearing a topic sends "".
     topic = clean_group_topic(raw_topic) if isinstance(raw_topic, str) else None
+    raw_topic_at = payload.get("group_topic_sent_at")
+    topic_sent_at = None
+    if (
+        topic is not None
+        and isinstance(raw_topic_at, (int, float))
+        and not isinstance(raw_topic_at, bool)
+        and math.isfinite(raw_topic_at)
+    ):
+        topic_sent_at = float(raw_topic_at)
     return {
         "text": text,
         "sent_at": sent_at,
@@ -448,6 +458,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "creator": creator,
         "members": members,
         "group_topic": topic,
+        "group_topic_sent_at": topic_sent_at,
     }
 
 
@@ -1078,6 +1089,19 @@ def response_ok(**fields: Any) -> bytes:
 
 def response_error(code: str, message: str) -> bytes:
     return encode(
+        {
+            "ok": False,
+            "v": PROTOCOL_VERSION,
+            "error": {"code": code, "message": message},
+        },
+        max_bytes=MAX_RESPONSE_BYTES,
+    )
+
+
+def short_hash(value: str, length: int = 8) -> str:
+    """Return a display friendly prefix of a hex hash."""
+    return value[:length] if value else ""
+rn encode(
         {
             "ok": False,
             "v": PROTOCOL_VERSION,
