@@ -1099,6 +1099,9 @@ class Inbox:
                 if (
                     is_retracted is not None
                     and record.get("direction") == "in"
+                    # Group and file records are never retractable (see
+                    # the retract handler), so a marker can't cover them.
+                    and record.get("kind") not in ("group", "file")
                     and isinstance(record.get("destination"), str)
                     and isinstance(record.get("id"), str)
                     and is_retracted(record["destination"], record["id"])
