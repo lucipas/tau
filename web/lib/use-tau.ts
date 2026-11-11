@@ -21,6 +21,7 @@ import type {
   PingResult,
   RetryOutboxResponse,
   SafetyNumberResponse,
+  SendFileResponse,
   SendResponse,
   Snapshot,
   SocialInfo,
@@ -59,6 +60,25 @@ function readEventData<T>(event: Event): T | null {
   } catch {
     return null;
   }
+}
+
+/** Read a browser-picked file as a base64 string (no data-URL prefix). */
+export function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("could not read file"));
+    reader.onload = () => {
+      const url = reader.result;
+      if (typeof url !== "string") {
+        reject(new Error("could not read file"));
+        return;
+      }
+      // "data:<type>;base64,<payload>" — the payload is the file bytes.
+      const comma = url.indexOf(",");
+      resolve(comma === -1 ? "" : url.slice(comma + 1));
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 export function useTau() {
@@ -502,6 +522,23 @@ export function useTau() {
     return result.message;
   }, [refreshOutbox]);
 
+  const sendFile = useCallback(async (to: string, file: File) => {
+    const data = await fileToBase64(file);
+    const result = await apiPost<SendFileResponse>("/api/send-file", {
+      to,
+      name: file.name,
+      data,
+    });
+    setMessages((previous) => {
+      if (previous.some((entry) => entry.id === result.message.id)) {
+        return previous;
+      }
+      return [...previous, result.message].sort((a, b) => a.id - b.id);
+    });
+    snapshotMax.current = Math.max(snapshotMax.current, result.message.id);
+    return result.message;
+  }, []);
+
   const ping = useCallback(async (destination: string) => {
     setPings((previous) => ({
       ...previous,
@@ -777,6 +814,7 @@ export function useTau() {
     blocks,
     announcing,
     send,
+    sendFile,
     ping,
     showSafetyNumber,
     verifyPeer,
