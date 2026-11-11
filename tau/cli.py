@@ -5672,18 +5672,6 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
     group = store.find(args.group)
     if not store.delete(group["id"]):
         raise NodeError(f"unknown group: {args.group!r}")
-    # Forgetting the group forgets its ignore preference too: without
-    # the record, an ignored id could never be unignored again, and
-    # its stored posts would stay hidden with no way out.
-    with ignored_groups_lock(config.ignored_groups_path):
-        try:
-            ignored = load_ignored_groups(config.ignored_groups_path)
-        except IgnoredGroupsError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return _EXIT_ERROR
-        if ignored.is_ignored(group["id"]):
-            ignored = ignored.with_removed(group["id"])
-            save_ignored_groups(config.ignored_groups_path, ignored)
     if _json_mode(args):
         _emit({"deleted": group["id"], "name": group["name"]}, True)
         return _EXIT_OK
@@ -5731,6 +5719,26 @@ def cmd_group_ignore(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _stored_group_matches(store: GroupStore, query: str) -> bool:
+    """True when any stored group matches *query* by id, id prefix, or name.
+
+    Mirrors :meth:`tau.groups.GroupStore.find`: a full id matches by
+    lookup, a shorter query by exact (case-insensitive) name or by an
+    id prefix of at least four characters.  Used to tell an ambiguous
+    lookup apart from one that found nothing at all.
+    """
+    needle = query.strip()
+    if len(needle) == 32:
+        return store.get(needle) is not None
+    lowered = needle.lower()
+    for group in store.list_groups():
+        if group["name"].casefold() == needle.casefold():
+            return True
+        if len(needle) >= 4 and group["id"].startswith(lowered):
+            return True
+    return False
+
+
 def _ignored_id_for_query(ignored: IgnoredGroups, query: str) -> Optional[str]:
     """The ignored id *query* names when no stored group record does.
 
@@ -5774,6 +5782,12 @@ def cmd_group_unignore(args: argparse.Namespace) -> int:
             group_id = group["id"]
             name = group["name"]
         else:
+            # The orphan fallback is only for a lookup that found no
+            # stored group at all: an ambiguous name or id prefix must
+            # still be rejected, not silently resolved against an
+            # orphaned ignored id that happens to share the prefix.
+            if _stored_group_matches(store, args.group):
+                raise find_error
             try:
                 resolved = _ignored_id_for_query(ignored, args.group)
             except ValueError as exc:

@@ -478,7 +478,10 @@ def test_unignore_orphan_prefix_errors(tmp_path, capsys):
     assert "unknown group" in capsys.readouterr().err
 
 
-def test_group_delete_drops_its_ignore_entry(tmp_path, capsys):
+def test_group_delete_keeps_ignored_mail_hidden(tmp_path, capsys):
+    # Deleting an ignored group frees capacity; it does not un-ignore
+    # it. Its stored posts stay hidden, and the id stays removable
+    # through the orphan fallback.
     data_dir, _, group_id = _seed_group_and_dm(tmp_path)
     cli.main(["group", "ignore", "weekend", "--data-dir", str(data_dir)])
     capsys.readouterr()
@@ -487,8 +490,60 @@ def test_group_delete_drops_its_ignore_entry(tmp_path, capsys):
     assert code == 0
     assert "deleted group weekend" in capsys.readouterr().out
 
-    # The ignore entry is gone with the group: nothing stale is left
-    # for `tau group ignored` to list as unknown.
+    code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unknown" in out
+    assert "1 message(s)" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "group hello" not in out
+    assert "1 unread in ignored groups" in out
+
+    code = cli.main(["group", "unignore", group_id, "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Restored group unknown" in capsys.readouterr().out
+
     code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
     assert code == 0
     assert "No ignored groups" in capsys.readouterr().out
+
+
+def test_unignore_ambiguous_name_is_rejected(tmp_path, capsys):
+    # Two stored groups share the name "dead", and an orphaned
+    # ignored id shares the same prefix: the query is ambiguous and
+    # must be rejected, not silently resolved against the orphan.
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+    import RNS
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    senders = {}
+    for name in ("alice", "carol", "dave"):
+        identity = RNS.Identity()
+        sender_hash = destination_hash(identity)
+        registry = PeerRegistry(config.peers_path)
+        registry.upsert(sender_hash, identity.get_public_key(), name=name, now=100.0)
+        registry.save()
+        senders[name] = sender_hash.hex()
+    store = GroupStore(config.groups_path)
+    store.create(
+        "dead", [senders["alice"], senders["carol"]], created_by=senders["alice"]
+    )
+    store.create(
+        "dead", [senders["alice"], senders["dave"]], created_by=senders["alice"]
+    )
+    orphan = "deadbeef" * 4
+    data_dir = _seed_orphan_ignored(tmp_path, orphan)
+
+    code = cli.main(["group", "unignore", "dead", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "2 groups are named 'dead'" in capsys.readouterr().err
+
+    # The orphan is still ignored: nothing was unignored by mistake.
+    code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "1 message(s)" in capsys.readouterr().out
