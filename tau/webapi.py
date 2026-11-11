@@ -2828,11 +2828,17 @@ class WebBridge:
         queue mail for the peer between the check and the removal.
         Aliases are picked up first, so the save does not erase ones a
         one-shot command set while this node was serving — the same
-        reason ``TauNode._save_peers`` refreshes before saving.
+        reason ``TauNode._save_peers`` refreshes before saving. The
+        node's peer-save lock is held across the whole removal, before
+        the mailbox transaction (the same order ``_save_peers`` uses):
+        a concurrent alias, verification or node save could otherwise
+        snapshot the peer first and write it back over our removal.
+        A node-like without the lock (e.g. in tests) simply forgets.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("peer is required")
-        with self.node.mailbox.transaction():
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock, self.node.mailbox.transaction():
             self.node.registry.refresh_aliases()
             try:
                 peer = self.node.registry.resolve(target.strip())

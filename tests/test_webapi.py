@@ -1494,6 +1494,24 @@ def test_forget_peer(bridge, node):
     assert node.registry.saved is True
 
 
+def test_forget_peer_holds_save_lock(bridge, node):
+    # A concurrent alias, verification or node save must not snapshot
+    # the peer and write it back over the removal: forget_peer holds
+    # the node's peer-save lock across the removal and its save.
+    node._save_lock = threading.Lock()
+    held_during_save = []
+    original_save = node.registry.save
+
+    def save():
+        held_during_save.append(node._save_lock.locked())
+        return original_save()
+
+    node.registry.save = save
+    result = bridge.forget_peer("alice")
+    assert result["ok"] is True
+    assert held_during_save == [True]
+
+
 def test_forget_peer_unknown(bridge):
     with pytest.raises(ValueError, match="no peer matches"):
         bridge.forget_peer("nobody")
