@@ -9,7 +9,10 @@ Reticulum's runtime storage is recreated on first run.
 Both directions refuse to run while a node is serving on the data
 directory (the single-instance lock), so a backup can never catch the
 mailbox or the Tan database half-written, and a restore can never land
-under a running node.  The Tan database is captured with SQLite's
+under a running node — with one exception: a backup taken *by* the
+serving node itself (``live=True``) skips the lock, because the node's
+own writes are atomic and each file it reads is a consistent snapshot.
+The Tan database is captured with SQLite's
 backup API, so committed entries still sitting in a write-ahead log are
 included.  Restore treats the archive as untrusted input: the manifest
 must declare format 1, every member must be an allowlisted regular file
@@ -130,7 +133,7 @@ def _snapshot_sqlite(source: Path, dest: Path) -> Path:
 
 
 def create_backup(
-    config: TauConfig, target: Path, *, force: bool = False
+    config: TauConfig, target: Path, *, force: bool = False, live: bool = False
 ) -> Tuple[Path, Dict[str, object]]:
     """Write a backup of *config*'s data directory to *target*.
 
@@ -138,6 +141,14 @@ def create_backup(
     there is no node to back up, the target already exists without
     ``--force``, the target sits inside the data directory, or a node
     is serving on the data directory.
+
+    Pass ``live=True`` only when the caller *is* the serving node (the
+    web console bridge): the instance lock is then skipped, because the
+    serving node's own writes are atomic (temp file + rename), so each
+    state file the backup reads is a consistent snapshot, and the Tan
+    database is captured through SQLite's backup API.  Any other
+    caller must leave it off, so a node that starts mid-backup cannot
+    mutate the mailbox or the Tan database under the archive.
     """
     target = Path(target).expanduser()
     if target.is_dir():
@@ -161,9 +172,12 @@ def create_backup(
     # Hold the instance lock while the archive is written: a node that
     # starts mid-backup would mutate the mailbox and the Tan database
     # under us, and a node already serving means the on-disk state is
-    # moving.  The lock file itself is never a backup member.
+    # moving.  The lock file itself is never a backup member.  A live
+    # backup skips the lock: the caller is the serving node, whose own
+    # writes are atomic, so each file read is a consistent snapshot.
     lock = InstanceLock(config.instance_lock_path, config.data_dir)
-    lock.acquire()
+    if not live:
+        lock.acquire()
     try:
         files = [name for name in BACKUP_FILES if destinations[name].is_file()]
         manifest = _manifest(config.data_dir, files, config.name)
@@ -192,7 +206,21 @@ def create_backup(
                                 source = _snapshot_sqlite(
                                     source, Path(scratch) / SOCIAL_DB_NAME
                                 )
-                            archive.add(source, arcname=name)
+                            # Size and bytes come from one open descriptor:
+                            # a live node may atomically replace the file
+                            # between a pathname stat and the open.
+                            try:
+                                handle_in = open(source, "rb")
+                            except FileNotFoundError as exc:
+                                raise BackupError(
+                                    f"{name} disappeared while the backup was "
+                                    "being written; try again"
+                                ) from exc
+                            with handle_in:
+                                info = archive.gettarinfo(
+                                    arcname=name, fileobj=handle_in
+                                )
+                                archive.addfile(info, handle_in)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(tmp_name, 0o600)
@@ -204,7 +232,8 @@ def create_backup(
                 pass
             raise
     finally:
-        lock.release()
+        if not live:
+            lock.release()
     return target, manifest
 
 

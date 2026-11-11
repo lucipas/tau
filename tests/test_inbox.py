@@ -93,6 +93,24 @@ def test_list_filters_by_peer_and_limit(tmp_path):
     assert inbox.list_messages(limit=0) == []
 
 
+def test_records_default_to_chat_kind(tmp_path):
+    # Records written before kinds existed carry no kind field.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old"))
+    assert inbox.list_messages()[0]["kind"] == "chat"
+
+
+def test_list_filters_by_kind(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="c1", kind="chat", received_at=1.0))
+    inbox.append(_record(id="p1", kind="ping", received_at=2.0))
+    inbox.append(_record(id="p2", kind="ping", received_at=3.0))
+
+    assert [e["id"] for e in inbox.list_messages(kind="ping")] == ["p2", "p1"]
+    assert [e["id"] for e in inbox.list_messages(kind="chat")] == ["c1"]
+    assert inbox.list_messages(kind="alert") == []
+
+
 def test_list_filters_by_text_query(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16, text="Hello world", received_at=1.0))
@@ -314,6 +332,61 @@ def test_export_document_filters_by_peer(tmp_path):
 
     document = inbox.export_document(peer="aa" * 16)
     assert [entry["id"] for entry in document["messages"]] == ["a1"]
+
+
+def test_export_document_sees_messages_committed_by_another_process(tmp_path):
+    # A serving node's in-memory inbox goes stale when another process
+    # (e.g. `tau messages import`) commits to the same file: the export
+    # must read through the cross-process transaction, not the stale copy.
+    path = tmp_path / "inbox.json"
+    serving = Inbox(path)
+    serving.append(_record(id="one", text="first"))
+
+    cli = Inbox(path)
+    cli.append(_record(id="two", text="second"))
+
+    document = serving.export_document()
+    assert [entry["id"] for entry in document["messages"]] == ["one", "two"]
+
+
+def test_import_reports_inserted_records_under_concurrent_appends(tmp_path):
+    # The records an import stored are collected while its transaction
+    # still holds the lock: a concurrent append reloads the inbox and
+    # replaces the record objects, so collecting them afterwards would
+    # report a successful restore that mirrors nothing.
+    import threading
+
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    other = Inbox(path)
+    stop = threading.Event()
+
+    def append_forever():
+        index = 0
+        while not stop.is_set():
+            other.append(_record(id=f"race-{index}", text="noise"))
+            index += 1
+
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id=f"imp-{index}", text=f"imported {index}")
+            for index in range(100)
+        ],
+    }
+    worker = threading.Thread(target=append_forever)
+    worker.start()
+    try:
+        inserted: list = []
+        result = inbox.import_messages(document, inserted=inserted)
+    finally:
+        stop.set()
+        worker.join()
+    assert result["imported"] == 100
+    assert [entry["id"] for entry in inserted] == [
+        f"imp-{index}" for index in range(100)
+    ]
 
 
 def test_import_dedupes_records_without_ids_by_content(tmp_path):
