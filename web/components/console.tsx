@@ -134,6 +134,9 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          onRename={async (name) => {
+            await tau.renameNode(name);
+          }}
           backingUp={tau.backingUp}
           backupError={tau.backupError}
           onBackup={() => {

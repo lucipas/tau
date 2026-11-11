@@ -4,6 +4,7 @@ import type { Mock } from "vitest";
 
 import type {
   BlockPeerResponse,
+  NodeInfo,
   Peer,
   Snapshot,
   TauGroup,
@@ -21,6 +22,20 @@ import { apiGet, apiPost } from "./api";
 
 const mockedGet = apiGet as Mock;
 const mockedPost = apiPost as Mock;
+
+function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
+  return {
+    name: "tester",
+    destination: "cd".repeat(16),
+    protocol: 1,
+    version: "0.1.0",
+    rns_version: "test",
+    uptime: 12.5,
+    peers: 1,
+    interfaces: [{ name: "TCP", online: true }],
+    ...overrides,
+  };
+}
 
 // useTau opens an EventSource on mount; capture it so tests can push
 // snapshot events into the hook.
@@ -603,6 +618,60 @@ describe("useTau search", () => {
 
     expect(mockedGet).not.toHaveBeenCalled();
     expect(result.current.searchQuery).toBeNull();
+  });
+});
+
+describe("useTau rename", () => {
+  it("renames the node and refreshes its record", async () => {
+    mockedPost.mockResolvedValue({
+      ok: true,
+      name: "renamed",
+      previous_name: "tester",
+      changed: true,
+    });
+    mockedGet.mockResolvedValue({ node: makeNode({ name: "renamed" }) });
+
+    const { result } = renderHook(() => useTau());
+
+    let response;
+    await act(async () => {
+      response = await result.current.renameNode("renamed");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/id/rename", {
+      name: "renamed",
+    });
+    expect(response).toEqual({
+      ok: true,
+      name: "renamed",
+      previous_name: "tester",
+      changed: true,
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/status");
+    expect(result.current.node?.name).toBe("renamed");
+  });
+
+  it("a status event re-reads the node record", async () => {
+    let source: FakeEventSource | undefined;
+    class CapturingSource extends FakeEventSource {
+      constructor(url: string) {
+        super(url);
+        source = this;
+      }
+    }
+    vi.stubGlobal("EventSource", CapturingSource);
+    mockedGet.mockResolvedValue({ node: makeNode({ name: "renamed" }) });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      source?.listeners["status"]?.forEach((listener) =>
+        listener(new Event("status")),
+      );
+    });
+
+    expect(mockedGet).toHaveBeenCalledWith("/api/status");
+    expect(result.current.node?.name).toBe("renamed");
   });
 });
 

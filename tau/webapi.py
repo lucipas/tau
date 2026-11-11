@@ -52,6 +52,7 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/allowlist/remove remove ``{"target": "<name, hash or prefix>"}``
     POST /api/allowlist/set-enabled turn enforcement ``{"enabled": true}`` on/off
     POST /api/announce     announce this node immediately
+    POST /api/id/rename    rename this node (live name + re-announce)
     GET  /api/events       server-sent events for live messages, peers and posts
     GET  /api/tan/timeline followee timeline (or all cached posts)
     GET  /api/tan/top      most-liked stored posts (``?limit=10``, ``?author=<name or hash>``)
@@ -124,6 +125,7 @@ from .config import (
     accept_files_enabled,
     send_read_receipts_enabled,
     set_node_setting,
+    write_node_metadata,
 )
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
@@ -672,6 +674,9 @@ class WebBridge:
         self._verify_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Serialises concurrent renames so a second rename cannot read
+        # the old name, persist it, and leave disk and the live node split.
+        self._rename_lock = threading.Lock()
         # One health check at a time: run_checks reads whole store files
         # and runs a SQLite integrity check, so concurrent scans would
         # contend with the serving node for threads, disk and CPU.
@@ -3270,6 +3275,51 @@ class WebBridge:
         self.node.announce()
         self.bus.publish({"type": "status", "action": "announce"})
 
+    def id_rename(self, name: str) -> Dict[str, Any]:
+        """Rename this node, applying the new name live.
+
+        The CLI refuses to rename while the node is serving because the
+        running node announces with its in-memory name. The console
+        runs inside that serving node, so it can update the live name
+        instead: the node and its Tan app take the new name, the stored
+        metadata is rewritten, and the node re-announces so peers learn
+        the new name at once. The identity itself never changes.
+        """
+        if not isinstance(name, str):
+            raise ValueError("field 'name' is required")
+        new_name = sanitize_name(name, fallback="")
+        if not new_name:
+            raise ValueError("new name must not be empty")
+        with self._rename_lock:
+            old_name = getattr(self.node, "name", None) or "anonymous"
+            if new_name == old_name:
+                return {
+                    "ok": True,
+                    "name": new_name,
+                    "previous_name": old_name,
+                    "changed": False,
+                }
+            # Persist first: a failed write leaves the live name untouched.
+            write_node_metadata(self.node.config.data_dir, new_name)
+            self.node.name = new_name
+            app = getattr(self.node, "app", None)
+            if app is not None and hasattr(app, "name"):
+                app.name = new_name
+            try:
+                self.node.announce()
+            except Exception:
+                # The rename already landed; the periodic announce loop
+                # re-announces with the new name anyway. Any announce
+                # failure is best-effort here, not a failed rename.
+                log.debug("re-announce after rename failed", exc_info=True)
+        self.bus.publish({"type": "status", "action": "rename"})
+        return {
+            "ok": True,
+            "name": new_name,
+            "previous_name": old_name,
+            "changed": True,
+        }
+
     def backup(self) -> Dict[str, Any]:
         """Write a backup archive of the live data directory.
 
@@ -4718,6 +4768,29 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/announce":
                 self.bridge.announce()
                 self._send_json({"ok": True}, head_only)
+                return
+            if path == "/api/id/rename":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'name' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.id_rename(name)
+                except ValueError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                except NodeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 502
+                    )
+                    return
+                self._send_json(result, head_only)
                 return
             if path == "/api/peers/alias":
                 destination = body.get("destination") or body.get("target")
