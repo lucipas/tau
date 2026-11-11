@@ -886,6 +886,21 @@ def test_local_dict_includes_trust_state_public_dict_does_not(tmp_path):
     assert local["key_change_at"] is None
 
 
+def test_local_dict_includes_alias_public_dict_does_not(tmp_path):
+    registry = PeerRegistry()
+    peer = make_peer(registry, 1, "alice", now=100.0)
+
+    assert peer.local_dict(now=200.0)["alias"] is None
+    registry.set_alias(peer.destination_hash, "laptop")
+
+    local = peer.local_dict(now=200.0)
+    assert local["alias"] == "laptop"
+    # The alias is owner-only, like verification: it never leaves in a
+    # public description or a peer-exchange payload.
+    assert "alias" not in peer.public_dict(now=200.0)
+    assert "alias" not in peer.exchange_dict(now=200.0)
+
+
 def test_from_dict_tolerates_bad_verification_fields(tmp_path):
     path = tmp_path / "peers.json"
     path.write_text(
