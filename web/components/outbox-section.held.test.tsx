@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { HeldMailEntry } from "@/lib/types";
+import type { HeldMailEntry, RetryOutboxResponse } from "@/lib/types";
 
 import { OutboxSection } from "./outbox-section";
 
@@ -21,6 +21,15 @@ function makeHeld(overrides: Partial<HeldMailEntry> = {}): HeldMailEntry {
 
 const noop = () => Promise.resolve();
 
+const retryNoop = async (): Promise<RetryOutboxResponse> => ({
+  ok: true,
+  delivered: 0,
+  deposited: 0,
+  received: 0,
+  still_queued: 0,
+  lock_busy: false,
+});
+
 function renderHeld(held: HeldMailEntry[], onDropHeld = noop) {
   return render(
     <OutboxSection
@@ -28,6 +37,7 @@ function renderHeld(held: HeldMailEntry[], onDropHeld = noop) {
       heldForOthers={held.length}
       held={held}
       onCancel={noop}
+      onRetry={retryNoop}
       onDropHeld={onDropHeld}
     />,
   );
@@ -72,6 +82,7 @@ describe("OutboxSection held mail", () => {
         heldForOthers={2}
         held={[]}
         onCancel={noop}
+        onRetry={retryNoop}
         onDropHeld={noop}
       />,
     );

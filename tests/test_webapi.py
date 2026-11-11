@@ -129,8 +129,71 @@ class FakeNode:
         )
         self.sent = []
         self.announced = 0
+        self.flush_calls = []
+        self.flush_lock_busy = False
+        self.flush_deliver_all = False
+        self.flush_deliver_target = True
+        self.flush_concurrent_delivery = False
         self.blocklist = None
         self.config = None
+
+    def flush_outbox(
+        self,
+        *,
+        timeout=6.0,
+        max_peers=None,
+        respect_backoff=True,
+        to=None,
+        message_id=None,
+        wait_for_lock=0.0,
+    ):
+        """Test stand-in for the node's mail sweep: deliver what it is told to.
+
+        A targeted flush removes that entry (delivery); a retry-all
+        removes every entry only when ``flush_deliver_all`` is set,
+        modelling unreachable peers otherwise.
+        """
+        self.flush_calls.append(
+            {
+                "timeout": timeout,
+                "max_peers": max_peers,
+                "respect_backoff": respect_backoff,
+                "to": to,
+                "message_id": message_id,
+                "wait_for_lock": wait_for_lock,
+            }
+        )
+        if self.flush_lock_busy:
+            return {
+                "delivered": 0,
+                "deposited": 0,
+                "received": 0,
+                "receipts": 0,
+                "lock_busy": True,
+            }
+        delivered = 0
+        if message_id is not None:
+            if self.flush_concurrent_delivery:
+                # Another round delivered the entry while this flush
+                # waited for the mail lock: it leaves the queue, but
+                # this flush reports no delivery of its own.
+                self.mailbox.remove_outbox(message_id)
+            elif self.flush_deliver_target and self.mailbox.remove_outbox(
+                message_id
+            ):
+                delivered = 1
+        elif self.flush_deliver_all:
+            for entry in self.mailbox.outbox_list():
+                if self.mailbox.remove_outbox(entry.id):
+                    delivered += 1
+        return {
+            "delivered": delivered,
+            "deposited": 0,
+            "received": 0,
+            "receipts": 0,
+            "lock_busy": False,
+        }
+
 
     def set_blocklist(self, blocklist):
         self.blocklist = blocklist
@@ -2469,6 +2532,160 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def test_outbox_retry_one_by_id_and_prefix(bridge, node):
+    first = _queue(node, PEER_HASH, "first")
+    second = _queue(node, PEER_HASH, "second")
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": first.id}
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["delivered"] == 1
+    assert payload["still_queued"] == 1
+    assert payload["target"] == first.id
+    assert payload["target_delivered"] is True
+    assert payload["target_still_queued"] is False
+    # Backoff is ignored: the operator asked for a retry *now*.
+    assert node.flush_calls[-1]["respect_backoff"] is False
+    assert node.flush_calls[-1]["message_id"] == first.id
+    assert node.flush_calls[-1]["to"] == bytes.fromhex(PEER_HASH)
+    assert node.mailbox.get_outbox(first.id) is None
+
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/retry",
+        method="POST",
+        body={"id": second.id[:8]},
+    )
+    assert status == 200
+    assert payload["target_delivered"] is True
+    assert payload["target_still_queued"] is False
+    assert payload["still_queued"] == 0
+
+    # A targeted retry against an unreachable peer leaves the entry
+    # queued and says so: not delivered is not the same as gone.
+    third = _queue(node, PEER_HASH, "third")
+    node.flush_deliver_target = False
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": third.id}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["target_delivered"] is False
+    assert payload["target_still_queued"] is True
+    assert payload["still_queued"] == 1
+    assert node.mailbox.get_outbox(third.id) is not None
+
+    status, _, payload = _json(bridge, "/api/outbox")
+    assert [item["id"] for item in payload["outbox"]] == [third.id]
+
+
+def test_outbox_retry_all_reports_what_is_left(bridge, node):
+    first = _queue(node, PEER_HASH, "first")
+    _queue(node, PEER_HASH, "second")
+
+    # Peers unreachable: nothing moves, everything stays queued.
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["still_queued"] == 2
+    assert "target" not in payload
+    assert node.flush_calls[-1]["message_id"] is None
+    assert node.flush_calls[-1]["to"] is None
+
+    # Peers reachable: the whole queue drains.
+    node.flush_deliver_all = True
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={}
+    )
+    assert status == 200
+    assert payload["delivered"] == 2
+    assert payload["still_queued"] == 0
+    assert node.mailbox.get_outbox(first.id) is None
+
+
+def test_outbox_retry_errors(bridge, node):
+    # A non-string target is a 400, not a retry-all.
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": 42}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    # A supplied-but-blank target is a 400 too: {"target": ""} must
+    # not silently become a retry of the whole queue.
+    for body in ({"target": ""}, {"target": "   "}, {"id": ""}, {"target": 0}):
+        status, _, payload = _json(
+            bridge, "/api/outbox/retry", method="POST", body=body
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    assert node.flush_calls == []
+
+    # Unknown and ambiguous ids are 404s, like cancel.
+    status, _, payload = _json(
+        bridge,
+        "/api/outbox/retry",
+        method="POST",
+        body={"target": "ff" * 16},
+    )
+    assert status == 404
+    assert "unknown queued message" in payload["error"]["message"]
+
+    _queue(node, PEER_HASH, "one", message_id="aa" + "11" * 15)
+    _queue(node, PEER_HASH, "two", message_id="aa" + "22" * 15)
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": "aa"}
+    )
+    assert status == 404
+    assert "match prefix" in payload["error"]["message"]
+
+    # A mail round already running is a 409: the retry never ran, so
+    # nothing is reported as delivered.
+    node.flush_lock_busy = True
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={}
+    )
+    assert status == 409
+    assert "already running" in payload["error"]["message"]
+    assert node.mailbox.counts()["outbox"] == 2
+
+def test_outbox_retry_counts_concurrent_delivery(bridge, node):
+    # A concurrent mail round delivers the entry after resolution but
+    # before this flush visits it: the flush reports no delivery and
+    # the entry is gone, yet the bridge's delivery record confirms it
+    # was delivered — not expired or cancelled.
+    entry = _queue(node, PEER_HASH, "concurrent")
+    node.flush_concurrent_delivery = True
+    assert bridge.record_delivery(entry.id) is None  # buffered: no console record
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["target_delivered"] is True
+    assert payload["target_still_queued"] is False
+    assert node.mailbox.get_outbox(entry.id) is None
+
+def test_outbox_retry_unconfirmed_departure(bridge, node):
+    # The entry leaves the queue with no delivery recorded anywhere —
+    # expired, or cancelled by another process. The response says so
+    # honestly (not delivered, not queued) instead of guessing.
+    entry = _queue(node, PEER_HASH, "gone")
+    node.flush_concurrent_delivery = True
+
+    status, _, payload = _json(
+        bridge, "/api/outbox/retry", method="POST", body={"target": entry.id}
+    )
+    assert status == 200
+    assert payload["delivered"] == 0
+    assert payload["target_delivered"] is False
+    assert payload["target_still_queued"] is False
+
 def _hold(node, to_hex, message_id, blob=b"sealed-bytes", expires_at=None,
           depositor=None, now=None):
     return node.mailbox.hold(
@@ -2479,7 +2696,6 @@ def _hold(node, to_hex, message_id, blob=b"sealed-bytes", expires_at=None,
         now=now,
         depositor=bytes.fromhex(depositor) if depositor else None,
     )
-
 
 def test_outbox_held_lists_envelopes_with_names(bridge, node):
     first = "cc" + "11" * 15
@@ -2515,7 +2731,6 @@ def test_outbox_held_lists_envelopes_with_names(bridge, node):
     # Oldest first.
     assert [entry["id"] for entry in payload["held"]] == [first, second]
 
-
 def test_outbox_drop_held_by_id_and_prefix(bridge, node):
     first = "cc" + "11" * 15
     second = "dd" + "22" * 15
@@ -2541,7 +2756,6 @@ def test_outbox_drop_held_by_id_and_prefix(bridge, node):
 
     status, _, payload = _json(bridge, "/api/outbox/held")
     assert payload == {"held": [], "count": 0}
-
 
 def test_outbox_drop_held_errors(bridge, node):
     status, _, payload = _json(
@@ -2577,6 +2791,7 @@ def test_outbox_drop_held_errors(bridge, node):
     )
     assert status == 400
     assert "unknown held message" in payload["error"]["message"]
+
 
 
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):

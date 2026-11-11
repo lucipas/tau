@@ -20,6 +20,9 @@ script) can read what arrives from the mesh and send messages back:
                            or retract ``{"target": "<wire id>", "clear": true}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
+    POST /api/outbox/retry  retry queued mail now, ignoring backoff
+                           (``{"target": "<message id or prefix>"}`` for one
+                           entry; omit it to retry everything queued)
     GET  /api/outbox/held   sealed mail held for other peers
     POST /api/outbox/drop-held drop ``{"target": "<message id or prefix>"}``
     POST /api/ping         measure reachability of a peer
@@ -1817,6 +1820,77 @@ class WebBridge:
                 )
             return self._describe_outbox_entry(entry)
 
+    def _was_delivered(self, mail_id: str) -> bool:
+        """True if this bridge recorded a delivery for *mail_id*.
+
+        The node's delivery callback flows through
+        :meth:`record_delivery`, so a delivery by a concurrent mail
+        round — one this retry did not run itself — still shows up
+        here, either as a flipped console record or, for mail queued
+        outside the console, in the early-delivery buffer.
+        """
+        with self._lock:
+            if mail_id in self._early_deliveries:
+                return True
+            return any(
+                message.get("direction") == "out"
+                and message.get("mail_id") == mail_id
+                and message.get("status") in ("delivered", "read")
+                for message in self._messages
+            )
+
+    def retry_outbox(self, target: Optional[str] = None) -> Dict[str, Any]:
+        """Try delivering queued mail now, ignoring backoff.
+
+        The console counterpart of ``tau outbox retry``: with
+        ``target`` (a message id or unique prefix) only that entry is
+        attempted — nothing is deposited with the peer — otherwise the
+        whole queue is retried.  Backoff is ignored either way: the
+        operator asked for a retry *now*, not at the next scheduled
+        attempt.  A targeted entry counts as delivered when this
+        flush reports a delivery for it, or when the bridge already
+        recorded one — a concurrent mail round can deliver the entry
+        after resolution but before this flush visits it, and that
+        delivery must not be reported as an expiry or a cancel.
+        ``still_queued`` is read back from the queue afterwards.
+        """
+        to = None
+        message_id = None
+        if target is not None:
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError("message id must not be empty")
+            with self.node.mailbox.transaction():
+                entry = self.node.mailbox.resolve_outbox(target.strip())
+                to = entry.to
+                message_id = entry.id
+        summary = self.node.flush_outbox(
+            respect_backoff=False,
+            to=to,
+            message_id=message_id,
+            wait_for_lock=10.0,
+        )
+        with self.node.mailbox.transaction():
+            still_queued = len(self.node.mailbox.outbox_list())
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "delivered": summary["delivered"],
+            "deposited": summary["deposited"],
+            "received": summary["received"],
+            "still_queued": still_queued,
+            "lock_busy": bool(summary["lock_busy"]),
+        }
+        if message_id is not None:
+            payload["target"] = message_id
+            payload["target_delivered"] = (
+                summary["delivered"] > 0
+                or self._was_delivered(message_id)
+            )
+            with self.node.mailbox.transaction():
+                payload["target_still_queued"] = (
+                    self.node.mailbox.get_outbox(message_id) is not None
+                )
+        return payload
+
     def held_mail(self) -> Dict[str, Any]:
         """Sealed mail held for other peers, with recipient names.
 
@@ -2758,6 +2832,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
                 return
+            if path == "/api/outbox/retry":
+                self._handle_outbox_retry(body, head_only)
+                return
             if path == "/api/outbox/drop-held":
                 self._handle_outbox_drop_held(body, head_only)
                 return
@@ -3159,6 +3236,42 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
+    def _handle_outbox_retry(self, body: Dict[str, Any], head_only: bool) -> None:
+        # An explicitly supplied target (even blank) must be valid; only
+        # an absent one means "retry the whole queue".
+        supplied = "target" in body or "id" in body
+        target = body["target"] if "target" in body else body.get("id")
+        if supplied and (not isinstance(target, str) or not target.strip()):
+            self._send_json(
+                {"error": {"message": "field 'target' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = self.bridge.retry_outbox(
+                target.strip() if supplied else None
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except MailboxError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        if result["lock_busy"]:
+            self._send_json(
+                {
+                    "error": {
+                        "message": "a mail round is already running; "
+                        "try again shortly"
+                    }
+                },
+                head_only,
+                409,
+            )
+            return
+        self._send_json(result, head_only)
+
     def _handle_outbox_drop_held(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("target") or body.get("id")
         if not isinstance(target, str) or not target.strip():
@@ -3177,6 +3290,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json({"ok": True, "dropped": dropped}, head_only)
+
 
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")

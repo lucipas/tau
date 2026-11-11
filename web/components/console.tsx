@@ -160,19 +160,19 @@ export function Console() {
                 }
               }}
             />
-            {tau.outbox.length > 0 ||
-            tau.heldMail.length > 0 ||
-            tau.heldForOthers > 0 ? (
-              <div className="mt-4">
-                <OutboxSection
-                  entries={tau.outbox}
-                  heldForOthers={tau.heldForOthers}
-                  held={tau.heldMail}
-                  onCancel={tau.cancelOutbox}
-                  onDropHeld={tau.dropHeldMail}
-                />
-              </div>
-            ) : null}
+            {/* Stays mounted when the queue empties so a retry's result
+                line survives the last entry leaving; it renders nothing
+                itself when there is nothing to show. */}
+            <div className="mt-4">
+              <OutboxSection
+                entries={tau.outbox}
+                heldForOthers={tau.heldForOthers}
+                held={tau.heldMail}
+                onCancel={tau.cancelOutbox}
+                onRetry={tau.retryOutbox}
+                onDropHeld={tau.dropHeldMail}
+              />
+            </div>
             <Composer
               peers={tau.peers}
               target={target}

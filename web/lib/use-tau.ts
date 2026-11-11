@@ -19,6 +19,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  RetryOutboxResponse,
   SafetyNumberResponse,
   SendResponse,
   Snapshot,
@@ -414,6 +415,37 @@ export function useTau() {
     [refreshOutbox],
   );
 
+  const retryOutbox = useCallback(
+    async (id?: string) => {
+      const result = await apiPost<RetryOutboxResponse>(
+        "/api/outbox/retry",
+        id ? { target: id } : {},
+      );
+      // The retry already ran: drop a confirmed delivery locally at once,
+      // so a failed refresh cannot leave it listed as actionable.
+      if (result.target && result.target_delivered) {
+        const deliveredId = result.target;
+        setOutbox((previous) =>
+          previous.filter((entry) => entry.id !== deliveredId),
+        );
+      }
+      // Refresh so the rest of the queue is current. Best-effort, like
+      // cancel: a failed GET cannot make a successful retry look like
+      // a failure — but a retry-all cannot name which entries left,
+      // so a failed refresh gets one delayed re-attempt before the
+      // list is left to the next poll.
+      try {
+        await refreshOutbox();
+      } catch {
+        setTimeout(() => {
+          void refreshOutbox().catch(() => undefined);
+        }, 2000);
+      }
+      return result;
+    },
+    [refreshOutbox],
+  );
+
   const dropHeldMail = useCallback(
     async (id: string) => {
       const result = await apiPost<DropHeldResponse>("/api/outbox/drop-held", {
@@ -752,6 +784,7 @@ export function useTau() {
     refreshOutbox,
     refreshGroups,
     cancelOutbox,
+    retryOutbox,
     refreshHeldMail,
     dropHeldMail,
     refreshAllowlist,
