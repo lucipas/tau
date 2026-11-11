@@ -636,6 +636,27 @@ def test_mark_unread_does_not_mark_unread_messages_read(tmp_path):
     assert [entry["unread"] for entry in listed] == [True, True, False]
 
 
+def test_sent_records_do_not_inflate_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.mark_read()
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+
+    # A reply this node sent is never unread for its owner.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == counts
+
+
 def test_mark_unread_raises_when_the_cursor_cannot_persist(tmp_path, monkeypatch):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))

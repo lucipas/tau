@@ -901,9 +901,17 @@ class Inbox:
         return annotated
 
     def _unread_counts_locked(self) -> Dict[str, Any]:
-        """Per-conversation unread counts from the in-memory state."""
+        """Per-conversation unread counts from the in-memory state.
+
+        Only received messages count: a reply this node sent is never
+        unread for its owner, so sent records past the cursor must not
+        inflate the counts (see :meth:`mark_unread`, which reports the
+        same received-only totals).
+        """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
+            if entry.get("direction") != "in":
+                continue
             if _is_unread(
                 entry, self._read_cursors.get(entry.get("destination") or "")
             ):
@@ -1026,14 +1034,7 @@ class Inbox:
                 except OSError:
                     self._read_cursors = snapshot
                     raise
-            unread_per_peer: Dict[str, int] = {}
-            for entry in self._messages:
-                if entry.get("direction") != "in":
-                    continue
-                destination = entry.get("destination") or ""
-                if _is_unread(entry, self._read_cursors.get(destination)):
-                    unread_per_peer[destination] = unread_per_peer.get(destination, 0) + 1
-            return {"per_peer": unread_per_peer, "total": sum(unread_per_peer.values())}
+            return self._unread_counts_locked()
 
     def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
