@@ -395,6 +395,10 @@ def encode_group_message(
     :func:`derive_group_id`), so the roster a message carries must match
     the id it claims.  ``group_topic`` rides along when given (``""``
     clears it); ``None`` omits it, for senders that predate topics.
+    ``group_topic_sent_at`` is the time the topic was set on the
+    sender's clock, so the recipient judges the topic by its own
+    timestamp rather than the message's send time; ``None`` omits it
+    and the recipient falls back to ``sent_at``.
     """
     payload = {
         "type": "group_message",
@@ -409,6 +413,13 @@ def encode_group_message(
     }
     if group_topic is not None:
         payload["group_topic"] = clean_group_topic(group_topic)
+    if group_topic_sent_at is not None:
+        try:
+            topic_at = float(group_topic_sent_at)
+        except (TypeError, ValueError):
+            topic_at = None
+        if topic_at is not None and math.isfinite(topic_at):
+            payload["group_topic_sent_at"] = topic_at
     if message_id:
         payload["id"] = message_id
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
@@ -1089,19 +1100,6 @@ def response_ok(**fields: Any) -> bytes:
 
 def response_error(code: str, message: str) -> bytes:
     return encode(
-        {
-            "ok": False,
-            "v": PROTOCOL_VERSION,
-            "error": {"code": code, "message": message},
-        },
-        max_bytes=MAX_RESPONSE_BYTES,
-    )
-
-
-def short_hash(value: str, length: int = 8) -> str:
-    """Return a display friendly prefix of a hex hash."""
-    return value[:length] if value else ""
-rn encode(
         {
             "ok": False,
             "v": PROTOCOL_VERSION,

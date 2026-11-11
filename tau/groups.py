@@ -472,6 +472,7 @@ class GroupStore:
         sender: str = "",
         sent_at: Optional[float] = None,
         topic: Optional[str] = None,
+        topic_sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
@@ -516,6 +517,11 @@ class GroupStore:
         same staleness rule applies — a queued creator copy sent before
         a newer topic was set must not overwrite it — with the stamp
         left alone when the message carries no ``sent_at``.
+        ``topic_sent_at`` is the time the carried topic was set on the
+        sender's clock (``None`` falls back to ``sent_at``): a retried
+        message re-reads the current topic, whose set time can postdate
+        the queued message's send time, so the topic is judged by its
+        own timestamp, not the message's.
         """
         if sent_at is not None:
             try:

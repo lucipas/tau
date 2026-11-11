@@ -1478,6 +1478,7 @@ class TauNode:
         group: Dict[str, Any],
         *,
         sent_at: Optional[float] = None,
+        topic_sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -1518,6 +1519,7 @@ class TauNode:
             sender=sender_hash or "",
             sent_at=sent_at,
             topic=group.get("topic"),
+            topic_sent_at=topic_sent_at,
         )
 
     def _handle_group_message(
@@ -2547,6 +2549,21 @@ class TauNode:
             # Without the recipient's public key the message cannot be
             # sealed for anyone else to hold; direct delivery only.
             return False
+        sealed_group = None
+        if entry.group_id is not None:
+            sealed_group = {
+                "id": entry.group_id,
+                "name": entry.group_name,
+                "creator": entry.group_creator,
+                "members": entry.group_members,
+            }
+            # A relayed copy carries the topic like a direct one, with
+            # its own set time, so the recipient judges it the same way.
+            # A group that is gone carries none: the recipient keeps
+            # its own rather than being cleared.
+            current = self._current_group_topic(entry.group_id)
+            if current is not None:
+                sealed_group["topic"], sealed_group["topic_sent_at"] = current
         try:
             blob = seal_message(
                 self.identity,
@@ -2555,16 +2572,7 @@ class TauNode:
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
-                group=(
-                    {
-                        "id": entry.group_id,
-                        "name": entry.group_name,
-                        "creator": entry.group_creator,
-                        "members": entry.group_members,
-                    }
-                    if entry.group_id is not None
-                    else None
-                ),
+                group=sealed_group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3442,6 +3450,7 @@ class TauNode:
                 creator=creator,
                 members=list(group["members"]),
                 group_topic=group.get("topic", ""),
+                group_topic_sent_at=group.get("topic_sent_at"),
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3458,6 +3467,7 @@ class TauNode:
                 creator=creator,
                 members=list(group["members"]),
                 group_topic=group.get("topic", ""),
+                group_topic_sent_at=group.get("topic_sent_at"),
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:
@@ -4333,12 +4343,4 @@ class TauNode:
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
-        return decoded
-))
-        return decoded
-e NodeError(f"peer rejected the request: {message}")
-        if isinstance(state.get("rtt"), (int, float)):
-            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
-        return decoded
-))
         return decoded

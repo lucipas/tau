@@ -2021,6 +2021,16 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
             "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
+        # The topic rides in the sealed envelope with its own set time,
+        # so a relayed copy is judged exactly like a direct one.  A
+        # present "" is an explicit clear; absent means the sender
+        # predates topics and the local topic is left alone.
+        group_topic = group_raw.get("topic")
+        if isinstance(group_topic, str):
+            result["group"]["topic"] = clean_group_topic(group_topic)
+            topic_at = group_raw.get("topic_sent_at")
+            if isinstance(topic_at, (int, float)) and math.isfinite(topic_at):
+                result["group"]["topic_sent_at"] = float(topic_at)
     return result
 
 
@@ -2038,17 +2048,6 @@ def _validated_sealed_receipt(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise MailboxError("sealed receipt has an invalid message id")
         if message_id not in cleaned_ids:
             cleaned_ids.append(message_id)
-    read_at = payload.get("read_at")
-    if not isinstance(read_at, (int, float)) or not math.isfinite(float(read_at)):
-        raise MailboxError("sealed receipt has an invalid read_at")
-    return {
-        "id": receipt_id,
-        "from": payload["from"].lower(),
-        "from_name": sanitize_name(payload.get("from_name")),
-        "ids": cleaned_ids,
-        "read_at": float(read_at),
-    }
-  cleaned_ids.append(message_id)
     read_at = payload.get("read_at")
     if not isinstance(read_at, (int, float)) or not math.isfinite(float(read_at)):
         raise MailboxError("sealed receipt has an invalid read_at")
