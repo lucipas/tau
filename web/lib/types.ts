@@ -107,6 +107,16 @@ export interface BlockPeerResponse {
   block: BlockPeerResult;
 }
 
+export interface ForgetPeerResult {
+  peer: { destination: string; name: string };
+  queued_messages: number;
+}
+
+export interface ForgetPeerResponse {
+  ok: boolean;
+  forget: ForgetPeerResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;

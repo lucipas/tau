@@ -137,6 +137,7 @@ The same bridge is the local integration point for scripts:
 | `/api/peers/safety-number` | POST | show a peer's safety number `{"target": "alice"}` without recording anything |
 | `/api/peers/block` | POST | block `{"target": "alice"}` |
 | `/api/peers/unblock` | POST | unblock `{"target": "alice"}` |
+| `/api/peers/forget` | POST | forget a peer `{"target": "alice"}` (refuses with queued mail unless `"force": true`) |
 | `/api/groups` | GET | known group DMs with their member lists |
 | `/api/messages` | GET | recent inbound/outbound messages |
 | `/api/messages/search` | GET | search stored messages (`?q=<text>`, optional `peer` and `limit`) |

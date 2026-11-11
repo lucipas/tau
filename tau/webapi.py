@@ -11,6 +11,8 @@ script) can read what arrives from the mesh and send messages back:
     ``{"target": "alice"}`` without recording anything
     POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
     POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
+    POST /api/peers/forget  forget ``{"target": "<name, hash or prefix>"}``
+                           (refuses with queued mail unless ``"force": true``)
     GET  /api/groups       known group DMs with their member lists
     GET  /api/messages     recent inbound/outbound messages
     GET  /api/messages/search search stored messages by keyword
@@ -3065,6 +3067,67 @@ class WebBridge:
         """Unblock a peer."""
         return self._edit_blocklist(target, block=False)
 
+    def forget_peer(self, target: str, *, force: bool = False) -> Dict[str, Any]:
+        """Forget a peer from the console, with the CLI's safety guards.
+
+        The serving node's live registry is edited, so the removal never
+        fights the node's own saves — but the CLI's guards stay: refuse
+        while mail is still queued for the peer unless *force* is passed,
+        and refuse while the peer still owes mail acknowledgements (force
+        never overrides that one). The mailbox transaction is held across
+        the checks and the removal, so a one-shot send cannot queue mail
+        for the peer between the check and the removal — the same pattern
+        as ``cmd_peers_forget`` and ``TauNode._save_peers``. A
+        ``peer_removed`` event carries the removal to every open console
+        at once; the next genuine announce re-adds the peer.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target peer is required")
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            raise WebBridgeError("this node has no mailbox")
+        registry = self.node.registry
+        # Hold the node's peer-save lock across the edit and its save:
+        # an announce can otherwise trigger _save_peers mid-request and
+        # rewrite the registry file from the pre-removal snapshot.
+        # Mirrors set_peer_alias; a node-like without the lock (e.g. in
+        # tests) simply edits.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            try:
+                peer = registry.resolve(target.strip())
+            except PeerError as exc:
+                raise ValueError(str(exc)) from exc
+            if peer is None:
+                raise ValueError(f"no peer matches {target.strip()!r}")
+            with mailbox.transaction():
+                queued = mailbox.outbox_list(to=peer.destination_hash)
+                if queued and not force:
+                    raise ValueError(
+                        f"{peer.display_name} still has {len(queued)} queued "
+                        "message(s); forgetting this peer would strand them "
+                        "until it is rediscovered. Deliver or cancel the mail "
+                        "first, or pass force to forget anyway."
+                    )
+                if peer.hexhash in mailbox.pending_ack_holders():
+                    raise ValueError(
+                        f"{peer.display_name} still has mail acknowledgements "
+                        "owed; wait for the next mail sweep to send them, "
+                        "then try again"
+                    )
+                registry.remove(peer.destination_hash)
+                registry.save()
+        self.bus.publish(
+            {"type": "peer_removed", "destination": peer.hexhash}
+        )
+        return {
+            "peer": {
+                "destination": peer.hexhash,
+                "name": peer.display_name,
+            },
+            "queued_messages": len(queued),
+        }
+
     def groups(self) -> List[Dict[str, Any]]:
         try:
             return [
@@ -4085,6 +4148,37 @@ class _WebHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 self._send_json({"ok": True, "block": result}, head_only)
+                return
+            if path == "/api/peers/forget":
+                target = body.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                force = body.get("force")
+                if force is not None and not isinstance(force, bool):
+                    self._send_json(
+                        {"error": {"message": "field 'force' must be a boolean"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    result = self.bridge.forget_peer(
+                        target.strip(), force=bool(force)
+                    )
+                except WebBridgeError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                except (ValueError, PeerError) as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 400
+                    )
+                    return
+                self._send_json({"ok": True, "forget": result}, head_only)
                 return
             if path == "/api/announce":
                 self.bridge.announce()

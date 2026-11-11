@@ -58,8 +58,17 @@ function renderSidebar(
     node?: NodeInfo | null;
     social?: SocialInfo | null;
     blocks?: Record<string, { pending?: boolean; error?: string }>;
+    forgets?: Record<string, {
+      pending?: boolean;
+      error?: string;
+      canForce?: boolean;
+    }>;
     onBlock?: (destination: string) => void;
     onUnblock?: (destination: string) => void;
+    onForget?: (destination: string, force?: boolean) => Promise<{
+      peer: { destination: string; name: string };
+      queued_messages: number;
+    }>;
   } = {},
 ) {
   const onSetAlias =
@@ -79,12 +88,14 @@ function renderSidebar(
       social={options.social ?? null}
       pings={{}}
       blocks={options.blocks ?? {}}
+      forgets={options.forgets ?? {}}
       verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
       onBlock={options.onBlock ?? (() => {})}
       onUnblock={options.onUnblock ?? (() => {})}
+      onForget={options.onForget}
       onVerify={() => {}}
       onShowSafetyNumber={() => {}}
       onDismissVerification={() => {}}
@@ -387,5 +398,76 @@ describe("PeerSidebar block and unblock", () => {
     expect(
       screen.getByRole("button", { name: "Block alice" }),
     ).toHaveProperty("disabled", true);
+  });
+});
+
+describe("PeerSidebar forget peer", () => {
+  it("asks twice before forgetting: arm, then confirm", async () => {
+    const onForget = vi.fn(async () => ({
+      peer: { destination: "ab".repeat(16), name: "alice" },
+      queued_messages: 0,
+    }));
+    renderSidebar({}, vi.fn(), { onForget });
+
+    const button = screen.getByRole("button", { name: "Forget alice" });
+    fireEvent.click(button);
+    expect(onForget).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/click again to forget alice/),
+    ).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirm forgetting alice" }),
+    );
+    await waitFor(() => expect(onForget).toHaveBeenCalledTimes(1));
+    expect(onForget).toHaveBeenCalledWith("ab".repeat(16));
+  });
+
+  it("offers a forced forget after a queued-mail refusal", async () => {
+    const onForget = vi.fn(async () => ({
+      peer: { destination: "ab".repeat(16), name: "alice" },
+      queued_messages: 1,
+    }));
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        onForget,
+        forgets: {
+          ["ab".repeat(16)]: {
+            error: "alice still has 1 queued message(s); forgetting",
+            canForce: true,
+          },
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByText(/forget anyway/));
+    await waitFor(() => expect(onForget).toHaveBeenCalledTimes(1));
+    expect(onForget).toHaveBeenCalledWith("ab".repeat(16), true);
+  });
+
+  it("shows a forget error with no force option when it cannot be forced", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        onForget: vi.fn(async () => ({
+          peer: { destination: "ab".repeat(16), name: "alice" },
+          queued_messages: 0,
+        })),
+        forgets: {
+          ["ab".repeat(16)]: {
+            error: "alice still has mail acknowledgements owed",
+            canForce: false,
+          },
+        },
+      },
+    );
+
+    expect(
+      screen.getByText("alice still has mail acknowledgements owed"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/forget anyway/)).toBeNull();
   });
 });

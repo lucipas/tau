@@ -41,6 +41,25 @@ export function Console() {
       }
       return;
     }
+    // Forgetting the selected peer removes it the same way: fall back
+    // to a remaining peer, then to a group, instead of composing to a
+    // record that no longer exists.
+    if (
+      mode === "peer" &&
+      target &&
+      !tau.peers.some((peer) => peer.destination === target)
+    ) {
+      if (tau.peers.length > 0) {
+        setTarget(tau.peers[0].destination);
+      } else if (tau.groups.length > 0) {
+        setMode("group");
+        setTarget(tau.groups[0].id);
+      } else {
+        setMode("custom");
+        setTarget("");
+      }
+      return;
+    }
     if (!target && !customPicked.current) {
       if (tau.peers.length > 0) {
         setMode("peer");
@@ -146,6 +165,7 @@ export function Console() {
             pings={tau.pings}
             verifications={tau.verifications}
             blocks={tau.blocks}
+            forgets={tau.forgets}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
@@ -169,6 +189,9 @@ export function Console() {
             onUnblock={(destination) => {
               void tau.unblockPeer(destination).catch(() => undefined);
             }}
+            onForget={(destination, force) =>
+              tau.forgetPeer(destination, force)
+            }
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}

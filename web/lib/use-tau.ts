@@ -15,6 +15,7 @@ import type {
   DeleteMessageResponse,
   DoctorResponse,
   DropHeldResponse,
+  ForgetPeerResponse,
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
@@ -60,6 +61,15 @@ export interface PingState {
 export interface BlockState {
   pending?: boolean;
   error?: string;
+}
+
+export interface ForgetState {
+  pending?: boolean;
+  error?: string;
+  // The refusal was the queued-mail guard, which the owner can
+  // override with force — the pending-acks refusal cannot be forced,
+  // so it never sets this.
+  canForce?: boolean;
 }
 
 function sortPeers(peers: Peer[]): Peer[] {
@@ -118,6 +128,7 @@ export function useTau() {
     Record<string, VerifyState>
   >({});
   const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
+  const [forgets, setForgets] = useState<Record<string, ForgetState>>({});
   const [announcing, setAnnouncing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -313,6 +324,18 @@ export function useTau() {
       });
     };
 
+    const onPeerRemoved = (event: Event) => {
+      // A forget from any console: drop the peer at once. A later
+      // genuine announce re-adds it through the normal peer event.
+      const payload = readEventData<{ destination: string }>(event);
+      if (!payload?.destination) return;
+      setPeers((previous) =>
+        previous.filter(
+          (entry) => entry.destination !== payload.destination,
+        ),
+      );
+    };
+
     const onUnread = (event: Event) => {
       const payload = readEventData<{ unread: UnreadCounts }>(event);
       if (!payload?.unread) return;
@@ -329,6 +352,7 @@ export function useTau() {
     source.addEventListener("message_updated", onMessageUpdated);
     source.addEventListener("message_deleted", onMessageDeleted);
     source.addEventListener("peer", onPeer);
+    source.addEventListener("peer_removed", onPeerRemoved);
     source.addEventListener("unread", onUnread);
     source.addEventListener("error", onError);
 
@@ -340,6 +364,7 @@ export function useTau() {
       source.removeEventListener("message_updated", onMessageUpdated);
       source.removeEventListener("message_deleted", onMessageDeleted);
       source.removeEventListener("peer", onPeer);
+      source.removeEventListener("peer_removed", onPeerRemoved);
       source.removeEventListener("unread", onUnread);
       source.removeEventListener("error", onError);
       source.close();
@@ -824,6 +849,52 @@ export function useTau() {
     [editBlock],
   );
 
+  const forgetPeer = useCallback(
+    async (destination: string, force = false) => {
+      setForgets((previous) => ({
+        ...previous,
+        [destination]: { pending: true },
+      }));
+      const requestSeq = peerEventSeq.current;
+      try {
+        const result = await apiPost<ForgetPeerResponse>(
+          "/api/peers/forget",
+          { target: destination, force },
+        );
+        // The bridge also publishes a peer_removed event, so this local
+        // drop is only the immediate feedback; the event reconciles it
+        // for every open console. Skip it when a newer peer event or
+        // snapshot arrived after the request was sent — a genuine
+        // announce in that window re-added the peer.
+        const newestSeq = Math.max(
+          peerRevision.current.get(destination) ?? 0,
+          snapshotRevision.current,
+        );
+        if (newestSeq <= requestSeq) {
+          setPeers((previous) =>
+            previous.filter((entry) => entry.destination !== destination),
+          );
+        }
+        setForgets((previous) => ({ ...previous, [destination]: {} }));
+        return result.forget;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "forget failed";
+        setForgets((previous) => ({
+          ...previous,
+          [destination]: {
+            error: message,
+            // The bridge's queued-mail refusal names the guard; the
+            // pending-acks refusal does not, and force never overrides it.
+            canForce: message.includes("queued message"),
+          },
+        }));
+        throw error;
+      }
+    },
+    [],
+  );
+
   // Showing the safety number records nothing: the peer stays
   // unverified and any key-change warning stays up until the owner
   // compares the number out of band and confirms it matches.
@@ -1132,6 +1203,7 @@ export function useTau() {
     pings,
     verifications,
     blocks,
+    forgets,
     announcing,
     exporting,
     importing,
@@ -1145,6 +1217,7 @@ export function useTau() {
     clearVerification,
     blockPeer,
     unblockPeer,
+    forgetPeer,
     announce,
     runDoctor,
     markRead,

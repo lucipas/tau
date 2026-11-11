@@ -4,6 +4,7 @@ import type { Mock } from "vitest";
 
 import type {
   BlockPeerResponse,
+  ForgetPeerResponse,
   Peer,
   Snapshot,
   TauGroup,
@@ -457,6 +458,109 @@ describe("useTau blockPeer / unblockPeer", () => {
 
     expect(result.current.messages).toEqual([]);
     expect(result.current.peers[0].blocked).toBe(true);
+  });
+});
+
+describe("useTau forgetPeer", () => {
+  it("posts to /api/peers/forget and drops the peer at once", async () => {
+    mockedPost.mockResolvedValue({
+      ok: true,
+      forget: {
+        peer: { destination: "ab".repeat(16), name: "alice" },
+        queued_messages: 0,
+      },
+    });
+    const { result } = await renderWithPeer(makePeer());
+
+    await act(async () => {
+      await result.current.forgetPeer("ab".repeat(16));
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/peers/forget", {
+      target: "ab".repeat(16),
+      force: false,
+    });
+    expect(result.current.peers).toEqual([]);
+    expect(result.current.forgets["ab".repeat(16)]).toEqual({});
+  });
+
+  it("drops the peer when a peer_removed event arrives from another console", async () => {
+    const { result, source } = await renderWithPeer(makePeer());
+
+    act(() => {
+      source.emit("peer_removed", { destination: "ab".repeat(16) });
+    });
+
+    expect(result.current.peers).toEqual([]);
+  });
+
+  it("marks a queued-mail refusal as forceable and keeps the peer", async () => {
+    mockedPost.mockRejectedValue(
+      new Error("alice still has 1 queued message(s); forgetting this peer"),
+    );
+    const { result } = await renderWithPeer(makePeer());
+
+    let caught: unknown;
+    await act(async () => {
+      try {
+        await result.current.forgetPeer("ab".repeat(16));
+      } catch (error) {
+        caught = error;
+      }
+    });
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(result.current.peers).toHaveLength(1);
+    expect(result.current.forgets["ab".repeat(16)]?.canForce).toBe(true);
+    expect(result.current.forgets["ab".repeat(16)]?.error).toContain(
+      "queued message",
+    );
+  });
+
+  it("does not mark a pending-acks refusal as forceable", async () => {
+    mockedPost.mockRejectedValue(
+      new Error("alice still has mail acknowledgements owed; wait"),
+    );
+    const { result } = await renderWithPeer(makePeer());
+
+    await act(async () => {
+      await expect(
+        result.current.forgetPeer("ab".repeat(16)),
+      ).rejects.toThrow("acknowledgements owed");
+    });
+
+    expect(result.current.peers).toHaveLength(1);
+    expect(result.current.forgets["ab".repeat(16)]?.canForce).toBe(false);
+  });
+
+  it("ignores a forget reply superseded by a newer peer event", async () => {
+    const pending = deferred<ForgetPeerResponse>();
+    mockedPost.mockReturnValue(pending.promise);
+    const { result, source } = await renderWithPeer(makePeer());
+
+    let outcome: Promise<unknown>;
+    act(() => {
+      outcome = result.current.forgetPeer("ab".repeat(16));
+    });
+    // A genuine announce re-adds the peer while the request is in flight.
+    act(() => {
+      source.emit("peer", { peer: makePeer({ last_seen: 200 }) });
+    });
+
+    await act(async () => {
+      pending.resolve({
+        ok: true,
+        forget: {
+          peer: { destination: "ab".repeat(16), name: "alice" },
+          queued_messages: 0,
+        },
+      });
+      await outcome;
+    });
+
+    // The stale reply must not drop the re-added peer.
+    expect(result.current.peers).toHaveLength(1);
+    expect(result.current.peers[0].last_seen).toBe(200);
   });
 });
 

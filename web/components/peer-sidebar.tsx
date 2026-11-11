@@ -2,8 +2,16 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-import type { BridgeInfo, NodeInfo, Peer, SocialInfo, TauGroup, VerifyState } from "@/lib/types";
-import type { BlockState, PingState } from "@/lib/use-tau";
+import type {
+  BridgeInfo,
+  ForgetPeerResult,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+  VerifyState,
+} from "@/lib/types";
+import type { BlockState, ForgetState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
   formatRtt,
@@ -22,12 +30,14 @@ export function PeerSidebar({
   social,
   pings,
   blocks,
+  forgets,
   verifications,
   unread,
   selected,
   onPing,
   onBlock,
   onUnblock,
+  onForget,
   onVerify,
   onShowSafetyNumber,
   onDismissVerification,
@@ -43,12 +53,17 @@ export function PeerSidebar({
   social: SocialInfo | null;
   pings: Record<string, PingState>;
   blocks: Record<string, BlockState>;
+  forgets?: Record<string, ForgetState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
   onBlock: (destination: string) => void;
   onUnblock: (destination: string) => void;
+  onForget?: (
+    destination: string,
+    force?: boolean,
+  ) => Promise<ForgetPeerResult>;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;
@@ -171,6 +186,10 @@ export function PeerSidebar({
   // two clicks: arm on the first, confirm on the second. Unblocking is
   // directly reversible and needs only one.
   const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
+  // Forgetting drops the peer record, so it takes two clicks like
+  // blocking: arm on the first, confirm on the second. The next
+  // genuine announce re-adds the peer.
+  const [confirmForget, setConfirmForget] = useState<string | null>(null);
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -334,6 +353,7 @@ export function PeerSidebar({
             {peers.map((peer) => {
               const ping = pings[peer.destination];
               const block = blocks[peer.destination];
+              const forget = forgets?.[peer.destination];
               const verification = verifications[peer.destination];
               const age = now
                 ? Math.max(0, now / 1000 - peer.last_seen)
@@ -343,6 +363,7 @@ export function PeerSidebar({
               const displayName = peer.alias || peer.name || "unknown";
               const isEditingAlias = editingAlias === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
+              const armingForget = confirmForget === peer.destination;
               return (
                 <li key={peer.destination}>
                   <div
@@ -493,6 +514,39 @@ export function PeerSidebar({
                             ⊘
                           </span>
                         </button>
+                        {onForget ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (armingForget) {
+                                setConfirmForget(null);
+                                void onForget(peer.destination).catch(
+                                  () => undefined,
+                                );
+                                return;
+                              }
+                              setConfirmForget(peer.destination);
+                            }}
+                            disabled={forget?.pending}
+                            aria-label={
+                              armingForget
+                                ? `Confirm forgetting ${peer.name}`
+                                : `Forget ${peer.name}`
+                            }
+                            title={
+                              armingForget
+                                ? `Click again to forget ${peer.name}`
+                                : `Forget ${peer.name} — drops their record; their next announce re-adds it`
+                            }
+                            className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[10px] transition disabled:opacity-50 ${
+                              armingForget
+                                ? "border-rose-400/50 bg-rose-400/10 text-rose-300 hover:border-rose-400/70"
+                                : "border-line/70 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                            }`}
+                          >
+                            {forget?.pending ? "forgetting…" : "Forget"}
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           onClick={() => onShowSafetyNumber(peer.destination)}
@@ -660,6 +714,36 @@ export function PeerSidebar({
                       <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
                         {block.error}
                       </p>
+                    ) : null}
+                    {armingForget ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-rose-300">
+                        click again to forget {peer.name} — their record is
+                        dropped, and their next announce re-adds it
+                      </p>
+                    ) : null}
+                    {forget?.pending ? (
+                      <p className="mt-1 pl-[42px] font-mono text-[10px] text-mist">
+                        forgetting…
+                      </p>
+                    ) : forget?.error ? (
+                      <div className="mt-1 pl-[42px]">
+                        <p className="font-mono text-[10px] text-rose-300">
+                          {forget.error}
+                        </p>
+                        {forget.canForce && onForget ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void onForget(peer.destination, true).catch(
+                                () => undefined,
+                              )
+                            }
+                            className="mt-1 rounded-md border border-rose-400/50 px-2 py-0.5 font-mono text-[10px] text-rose-300 transition hover:border-rose-400"
+                          >
+                            forget anyway — strand the queued mail
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
                   </div>
                 </li>

@@ -108,6 +108,16 @@ class FakeRegistry:
                 )
         return None
 
+    def remove(self, destination_hash):
+        for peer in list(self._peers):
+            if peer.destination_hash == destination_hash:
+                self._peers.remove(peer)
+                return peer
+        return None
+
+    def save(self):
+        return True
+
 
 class FakeNode:
     def __init__(self, mailbox_path=None, groups_path=None):
@@ -1943,6 +1953,105 @@ def test_peers_block_unblock_via_api(tmp_path):
             bridge, "/api/peers/block", method="POST", body={}
         )
         assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_peers_forget_via_api(tmp_path):
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+        )
+        assert status == 200
+        assert payload["forget"]["peer"]["destination"] == PEER_HASH
+        assert payload["forget"]["peer"]["name"] == "alice"
+        assert payload["forget"]["queued_messages"] == 0
+        # Gone from the registry and from the snapshot, and a
+        # peer_removed event went out so other consoles drop it too.
+        assert node.registry.get(PEER_HASH) is None
+        status, _, payload = _json(bridge, "/api/peers")
+        assert status == 200
+        assert payload["peers"] == []
+        assert [
+            event
+            for event in bridge.bus.replay(0)
+            if event.get("type") == "peer_removed"
+            and event.get("destination") == PEER_HASH
+        ]
+        # Forgetting again is a 400: the peer is unknown now.
+        status, _, payload = _json(
+            bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+        )
+        assert status == 400
+        # Missing and non-boolean force are rejected.
+        status, _, payload = _json(
+            bridge, "/api/peers/forget", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/forget",
+            method="POST",
+            body={"target": "alice", "force": "yes"},
+        )
+        assert status == 400
+    finally:
+        bridge.stop()
+
+
+def test_peers_forget_refuses_queued_mail_unless_forced(tmp_path):
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        node.mailbox.enqueue(to=bytes.fromhex(PEER_HASH), text="queued mail")
+        # Refused while mail is queued, and the peer stays.
+        status, _, payload = _json(
+            bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+        )
+        assert status == 400
+        assert "queued message" in payload["error"]["message"]
+        assert node.registry.get(PEER_HASH) is not None
+        # force forgets anyway and reports the stranded count.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/forget",
+            method="POST",
+            body={"target": "alice", "force": True},
+        )
+        assert status == 200
+        assert payload["forget"]["queued_messages"] == 1
+        assert node.registry.get(PEER_HASH) is None
+    finally:
+        bridge.stop()
+
+
+def test_peers_forget_refuses_pending_acks_even_when_forced(tmp_path):
+    node = FakeNode(tmp_path / "mailbox.json")
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        node.mailbox.add_pending_acks(PEER_HASH, ["a" * 32])
+        status, _, payload = _json(
+            bridge, "/api/peers/forget", method="POST", body={"target": "alice"}
+        )
+        assert status == 400
+        assert "acknowledgements owed" in payload["error"]["message"]
+        # force never overrides the ack guard.
+        status, _, payload = _json(
+            bridge,
+            "/api/peers/forget",
+            method="POST",
+            body={"target": "alice", "force": True},
+        )
+        assert status == 400
+        assert node.registry.get(PEER_HASH) is not None
     finally:
         bridge.stop()
 
