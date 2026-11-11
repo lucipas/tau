@@ -395,3 +395,100 @@ def test_ignore_takes_the_lock(tmp_path, capsys):
     assert code == 0
     capsys.readouterr()
     assert (data_dir / ".ignored-groups.json.lock").exists()
+
+
+def _seed_orphan_ignored(tmp_path, group_id):
+    # An ignored id whose group record is gone — as after a backup
+    # restore that brought ignored-groups.json without groups.json.
+    from tau.ignored_groups import save_ignored_groups
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    save_ignored_groups(
+        config.ignored_groups_path,
+        IgnoredGroups(ignored=frozenset({group_id})),
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "aa" * 16,
+            "text": "orphan group hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "weekend",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-orphan",
+        }
+    )
+    return data_dir
+
+
+def test_unignore_orphan_id_by_full_id_and_prefix(tmp_path, capsys):
+    orphan = "cc" * 16
+    data_dir = _seed_orphan_ignored(tmp_path, orphan)
+
+    code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "unknown" in out
+    assert "1 message(s)" in out
+
+    # A unique id prefix resolves the orphan too.
+    code = cli.main(
+        ["group", "unignore", orphan[:8], "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    assert "Restored group unknown" in capsys.readouterr().out
+
+    code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No ignored groups" in capsys.readouterr().out
+
+    # And the full id works when seeded again.
+    data_dir = _seed_orphan_ignored(tmp_path, orphan)
+    code = cli.main(["group", "unignore", orphan, "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "Restored group unknown" in capsys.readouterr().out
+
+
+def test_unignore_orphan_prefix_errors(tmp_path, capsys):
+    first = "ab" * 16
+    second = "ab" * 15 + "cd"
+    data_dir = _seed_orphan_ignored(tmp_path, first)
+    from tau.ignored_groups import load_ignored_groups, save_ignored_groups
+
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    ignored = load_ignored_groups(config.ignored_groups_path)
+    save_ignored_groups(
+        config.ignored_groups_path, ignored.with_added(second)
+    )
+
+    # A prefix matching two ignored ids is ambiguous.
+    code = cli.main(["group", "unignore", "abab", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "2 ignored groups match the id prefix" in capsys.readouterr().err
+
+    # An id that is ignored nowhere reports the original unknown group.
+    code = cli.main(
+        ["group", "unignore", "dd" * 16, "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "unknown group" in capsys.readouterr().err
+
+
+def test_group_delete_drops_its_ignore_entry(tmp_path, capsys):
+    data_dir, _, group_id = _seed_group_and_dm(tmp_path)
+    cli.main(["group", "ignore", "weekend", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    code = cli.main(["group", "delete", "weekend", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "deleted group weekend" in capsys.readouterr().out
+
+    # The ignore entry is gone with the group: nothing stale is left
+    # for `tau group ignored` to list as unknown.
+    code = cli.main(["group", "ignored", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No ignored groups" in capsys.readouterr().out

@@ -5481,13 +5481,10 @@ def cmd_messages(args: argparse.Namespace) -> int:
         # so showing a DM would otherwise mark an older hidden group
         # post read without the owner ever seeing it.  Cap each
         # destination's advance just before its oldest unread message
-        # that this listing did not show — mail a filtered view (group,
-        # --ignored) left out, or a plain listing's omitted mail.  The
-        # capped message stays unread until the owner displays it; the
-        # next listing that does advances past it.  Ignored-group posts
-        # are left out of the cap: a sender cursor cannot mark a shown
-        # DM read while an older hidden post stays unread, so they
-        # would otherwise keep the DM unread on every listing.
+        # that this listing did not show — ignored-group mail, or mail a
+        # filtered view (group, --ignored) left out.  The capped
+        # message stays unread until the owner displays it; the next
+        # listing that does advances past it.
         shown_seqs = {int(entry["seq"]) for entry in shown}
         hidden_floor: Dict[str, int] = {}
         for entry in inbox.list_messages(limit=None):
@@ -5497,8 +5494,6 @@ def cmd_messages(args: argparse.Namespace) -> int:
             if not entry.get("unread"):
                 continue
             if int(entry["seq"]) in shown_seqs:
-                continue
-            if entry.get("kind") == "group" and str(entry.get("group") or "") in ignored:
                 continue
             seq = int(entry["seq"])
             if destination not in hidden_floor or seq < hidden_floor[destination]:
@@ -5677,6 +5672,18 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
     group = store.find(args.group)
     if not store.delete(group["id"]):
         raise NodeError(f"unknown group: {args.group!r}")
+    # Forgetting the group forgets its ignore preference too: without
+    # the record, an ignored id could never be unignored again, and
+    # its stored posts would stay hidden with no way out.
+    with ignored_groups_lock(config.ignored_groups_path):
+        try:
+            ignored = load_ignored_groups(config.ignored_groups_path)
+        except IgnoredGroupsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if ignored.is_ignored(group["id"]):
+            ignored = ignored.with_removed(group["id"])
+            save_ignored_groups(config.ignored_groups_path, ignored)
     if _json_mode(args):
         _emit({"deleted": group["id"], "name": group["name"]}, True)
         return _EXIT_OK
