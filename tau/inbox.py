@@ -988,30 +988,51 @@ class Inbox:
         after the mark.
         """
         with self._transaction():
+            # Only received messages count: a reply we sent must neither
+            # stand in for the unread reminder nor satisfy the presence check.
             entries = [
                 entry
                 for entry in self._messages
                 if (entry.get("destination") or "") == peer
+                and entry.get("direction") == "in"
             ]
             if not entries:
                 return None
+            snapshot = dict(self._read_cursors)
             if all:
                 self._read_cursors.pop(peer, None)
             else:
                 newest = max(entries, key=lambda entry: entry["seq"])
-                earlier = [
-                    entry for entry in entries if entry["seq"] < newest["seq"]
-                ]
-                if not earlier:
-                    self._read_cursors.pop(peer, None)
-                else:
-                    previous = max(earlier, key=lambda entry: entry["seq"])
-                    self._read_cursors[peer] = {
-                        "last_read_seq": previous["seq"],
-                        "last_read_id": previous.get("id"),
-                    }
-            self._save()
-            return self._unread_counts_locked()
+                cursor = self._read_cursors.get(peer)
+                # Already unread: the newest received message is past the cursor.
+                if not _is_unread(newest, cursor):
+                    earlier = [
+                        entry for entry in entries if entry["seq"] < newest["seq"]
+                    ]
+                    if not earlier:
+                        self._read_cursors.pop(peer, None)
+                    else:
+                        # The newest is read, so the cursor is at or past it;
+                        # stepping to the previous received message only moves backward.
+                        previous = max(earlier, key=lambda entry: entry["seq"])
+                        self._read_cursors[peer] = {
+                            "last_read_seq": previous["seq"],
+                            "last_read_id": previous.get("id"),
+                        }
+            if self._read_cursors != snapshot:
+                try:
+                    self._save(strict=True)
+                except OSError:
+                    self._read_cursors = snapshot
+                    raise
+            unread_per_peer: Dict[str, int] = {}
+            for entry in self._messages:
+                if entry.get("direction") != "in":
+                    continue
+                destination = entry.get("destination") or ""
+                if _is_unread(entry, self._read_cursors.get(destination)):
+                    unread_per_peer[destination] = unread_per_peer.get(destination, 0) + 1
+            return {"per_peer": unread_per_peer, "total": sum(unread_per_peer.values())}
 
     def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
