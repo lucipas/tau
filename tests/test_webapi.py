@@ -491,6 +491,38 @@ def test_peers_alias_response_keeps_blocked_flag(bridge, node, tmp_path):
     assert payload["peer"]["blocked"] is True
 
 
+def test_peers_alias_waits_for_node_peer_save_lock(bridge, node, tmp_path):
+    """An alias edit must not race the node's peer save: _save_peers
+    refreshes aliases from disk before rewriting the file, so an edit
+    landing between the refresh and the save would be lost. The
+    endpoint therefore holds the node's peer-save lock across the edit
+    and its save, like peers_verify does."""
+    _seed_alias_registry(node, tmp_path)
+    node._save_lock = threading.Lock()
+    node._save_lock.acquire()
+    try:
+        done = threading.Event()
+        result: dict = {}
+
+        def edit():
+            result["payload"] = bridge.set_peer_alias(PEER_HASH, "laptop")
+            done.set()
+
+        worker = threading.Thread(target=edit, daemon=True)
+        worker.start()
+        # The edit is blocked on the lock: it must not complete (and
+        # must not have written the alias) while a peer save holds it.
+        assert not done.wait(timeout=1.0)
+        assert worker.is_alive()
+        assert node.registry.get(PEER_HASH).alias is None
+    finally:
+        node._save_lock.release()
+    worker.join(timeout=5.0)
+    assert done.is_set()
+    assert result["payload"]["alias"] == "laptop"
+    assert node.registry.get(PEER_HASH).alias == "laptop"
+
+
 def test_peers_alias_endpoint_rejects_bad_requests(bridge, node, tmp_path):
     registry = _seed_alias_registry(node, tmp_path)
     registry.set_alias(bytes.fromhex(OTHER_HASH), "laptop")

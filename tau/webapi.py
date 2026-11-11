@@ -2756,10 +2756,18 @@ class WebBridge:
         request through them.  A peer event goes out so every open
         console updates its peer list at once.
         """
-        if alias is not None and alias.strip():
-            peer = self.node.registry.set_alias(destination, alias)
-        else:
-            peer = self.node.registry.clear_alias(destination)
+        # Hold the node's peer-save lock across the edit and its save:
+        # an announce can otherwise trigger _save_peers mid-request,
+        # whose refresh_aliases() would copy the old disk alias back
+        # over the new in-memory one before either save completes.
+        # Mirrors peers_verify; a node-like without the lock (e.g. in
+        # tests) simply edits.
+        lock = getattr(self.node, "_save_lock", None) or nullcontext()
+        with lock:
+            if alias is not None and alias.strip():
+                peer = self.node.registry.set_alias(destination, alias)
+            else:
+                peer = self.node.registry.clear_alias(destination)
         self.record_peer(peer)
         # The annotated payload, not bare local_dict: the hook replaces
         # its peer record with this response, and a bare dict would drop
