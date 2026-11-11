@@ -217,6 +217,16 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface AllowlistEntry {
+  destination: string;
+  name: string;
+}
+
+export interface AllowlistResponse {
+  enabled: boolean;
+  entries: AllowlistEntry[];
+}
+
 export interface ApiErrorBody {
   error?: { message?: string };
 }

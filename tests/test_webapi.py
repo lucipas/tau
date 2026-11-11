@@ -8,9 +8,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
+from tau.allowlist import AllowList, load_allowlist, save_allowlist
 from tau.blocklist import BlockList
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
@@ -54,9 +56,10 @@ class FakeRegistry:
 
     def resolve(self, target, *, include_alias=True):
         # Mirror PeerRegistry.resolve for the single-peer fixture: name,
-        # destination hash or hash prefix, with ambiguity rejected.
-        # The fixture has no aliases, so include_alias changes nothing,
-        # but the keyword must exist: tan.resolve_author calls
+        # alias (only when include_alias), destination hash or hash
+        # prefix, with ambiguity rejected. A test may set an alias on
+        # the fixture peer to prove a security boundary never resolves
+        # by alias; tan.resolve_author calls
         # registry.resolve(value, include_alias=False).
         if not isinstance(target, str):
             raise PeerError("peer target must be a string or bytes")
@@ -67,6 +70,19 @@ class FakeRegistry:
             char in "0123456789abcdefABCDEF" for char in value
         ):
             return self.get(value)
+        if include_alias:
+            by_alias = [
+                p
+                for p in self._peers
+                if getattr(p, "alias", None)
+                and p.alias.casefold() == value.casefold()
+            ]
+            if len(by_alias) == 1:
+                return by_alias[0]
+            if len(by_alias) > 1:
+                raise AmbiguousPeer(
+                    f"{len(by_alias)} peers share the alias {value!r}; use a destination hash"
+                )
         by_name = [p for p in self._peers if p.name.casefold() == value.casefold()]
         if len(by_name) == 1:
             return by_name[0]
@@ -92,6 +108,13 @@ class FakeNode:
         self.name = "tester"
         self.mailbox = Mailbox(mailbox_path)
         self.inbox = Inbox()
+        self._allowlist = AllowList()
+        self._allowlist_lock = threading.RLock()
+        self.allowlist_path = (
+            Path(mailbox_path).with_name("allowlist.json")
+            if mailbox_path is not None
+            else None
+        )
         self.registry = FakeRegistry(
             [
                 Peer(
@@ -111,6 +134,27 @@ class FakeNode:
 
     def set_blocklist(self, blocklist):
         self.blocklist = blocklist
+
+    @property
+    def allowlist(self):
+        return self._allowlist
+
+    def set_allowlist(self, allowlist):
+        # Mirrors TauNode.set_allowlist: the running node's in-memory
+        # list and the file change together, persist first.
+        with self._allowlist_lock:
+            save_allowlist(self.allowlist_path, allowlist)
+            self._allowlist = allowlist
+
+    def update_allowlist(self, transform):
+        # Mirrors TauNode.update_allowlist: re-read the saved list so a
+        # change another process saved is preserved, refuse a corrupt
+        # file, and serialise the whole read-modify-write.
+        with self._allowlist_lock:
+            current = load_allowlist(self.allowlist_path)
+            updated = transform(current)
+            self.set_allowlist(updated)
+            return updated
 
     def info(self):
         return {
@@ -2192,6 +2236,210 @@ def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
     assert payload["cancelled"]["id"] == entry.id
     # A fresh view of the file agrees the entry is gone.
     assert Mailbox(tmp_path / "mailbox.json").get_outbox(entry.id) is None
+
+
+def test_allowlist_get_empty(bridge):
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_name_and_remove(bridge, node):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    # The entry survives a fresh GET, with its registry name attached.
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/remove", method="POST", body={"target": "alice"}
+    )
+    assert status == 200
+    assert payload == {"enabled": False, "entries": []}
+
+
+def test_allowlist_add_by_raw_hash_has_no_name(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": OTHER_HASH}
+    )
+    assert status == 200
+    assert payload["entries"] == [{"destination": OTHER_HASH, "name": ""}]
+
+
+def test_allowlist_add_by_prefix(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "abab"}
+    )
+    assert status == 200
+    assert payload["entries"] == [
+        {"destination": PEER_HASH, "name": "alice"}
+    ]
+
+
+def test_allowlist_add_rejects_alias(bridge, node):
+    # The allow-list is a security boundary: a local alias must never
+    # stand in for the peer's asserted name, so the fixture peer's
+    # alias "ally" does not resolve here even though the registry
+    # would resolve it with include_alias=True.
+    node.registry.get(PEER_HASH).alias = "ally"
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "ally"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+
+def test_allowlist_set_enabled_applies_immediately(bridge, node, tmp_path):
+    _json(bridge, "/api/allowlist/add", method="POST", body={"target": "alice"})
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    assert payload["enabled"] is True
+    assert [entry["destination"] for entry in payload["entries"]] == [PEER_HASH]
+
+    # The running node's in-memory gate changed too — no restart needed.
+    assert node.allowlist.is_allowed(PEER_HASH) is True
+    assert node.allowlist.is_allowed(OTHER_HASH) is False
+    # And the file agrees, so a restart keeps the same state.
+    from tau.allowlist import load_allowlist
+
+    saved = load_allowlist(tmp_path / "allowlist.json")
+    assert saved.enabled is True
+    assert saved.allow == frozenset({PEER_HASH})
+
+
+def test_allowlist_errors(bridge):
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "  "}
+    )
+    assert status == 400
+    assert "target" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "nobody"}
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/remove",
+        method="POST",
+        body={"target": "nobody"},
+    )
+    assert status == 400
+    assert "unknown peer" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": "yes"},
+    )
+    assert status == 400
+    assert "boolean" in payload["error"]["message"]
+
+
+def test_allowlist_concurrent_adds_keep_every_entry(bridge):
+    # Overlapping mutations must not lose each other's changes: each
+    # add derives from the latest saved list, not a stale snapshot.
+    hashes = [f"{n:02x}" * 16 for n in range(1, 11)]
+    errors = []
+
+    def add_one(destination):
+        try:
+            status, _, _ = _json(
+                bridge,
+                "/api/allowlist/add",
+                method="POST",
+                body={"target": destination},
+            )
+            assert status == 200
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=add_one, args=(destination,))
+        for destination in hashes
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+    status, _, payload = _json(bridge, "/api/allowlist")
+    assert status == 200
+    assert [entry["destination"] for entry in payload["entries"]] == sorted(
+        hashes
+    )
+
+
+def test_allowlist_toggle_keeps_cli_saved_entries(bridge, node, tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    # The CLI saved a change while this node runs; the running node's
+    # in-memory list does not know about it yet.
+    save_allowlist(
+        tmp_path / "allowlist.json",
+        AllowList(enabled=False, allow=frozenset({OTHER_HASH})),
+    )
+    assert node.allowlist.is_allowed(OTHER_HASH) is True  # not enforced yet
+
+    status, _, payload = _json(
+        bridge,
+        "/api/allowlist/set-enabled",
+        method="POST",
+        body={"enabled": True},
+    )
+    assert status == 200
+    # The console toggle reconciled with the saved file instead of
+    # overwriting it with the stale in-memory list.
+    assert [entry["destination"] for entry in payload["entries"]] == [
+        OTHER_HASH
+    ]
+    assert node.allowlist.is_allowed(OTHER_HASH) is True
+    assert node.allowlist.is_allowed(PEER_HASH) is False
+
+
+def test_allowlist_refuses_to_overwrite_corrupt_file(bridge, node, tmp_path):
+    path = tmp_path / "allowlist.json"
+    path.write_text("{not json", encoding="utf-8")
+    before = path.read_bytes()
+
+    status, _, payload = _json(
+        bridge, "/api/allowlist/add", method="POST", body={"target": "alice"}
+    )
+    assert status == 400
+    assert "allow-list" in payload["error"]["message"]
+    # The file is untouched and the running node's in-memory list is
+    # unchanged by the failed edit.
+    assert path.read_bytes() == before
+    assert node.allowlist.enabled is False
+    assert node.allowlist.allow == frozenset()
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
