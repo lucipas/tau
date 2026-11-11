@@ -69,7 +69,7 @@ describe("PostCard delete control", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -91,7 +91,7 @@ describe("PostCard delete control", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -110,7 +110,7 @@ describe("PostCard delete control", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
 
@@ -126,6 +126,7 @@ describe("PostCard delete control", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
+        onEdit={async () => true}
         deleting
       />,
     );
@@ -134,6 +135,100 @@ describe("PostCard delete control", () => {
     expect(screen.queryByTitle("Delete this post")).toBeNull();
     fireEvent.click(screen.getByText("deleting…"));
     expect(onDelete).not.toHaveBeenCalled();
+  });
+});
+
+describe("PostCard edit control", () => {
+  function renderCard(post: TanPost, onEdit = vi.fn().mockResolvedValue(true)) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        onEdit={onEdit}
+        deleting={false}
+      />,
+    );
+    return onEdit;
+  }
+
+  it("opens a form prefilled with the post text and saves the edit", async () => {
+    const post = makePost();
+    const onEdit = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    expect((field as HTMLTextAreaElement).value).toBe("regret this");
+
+    fireEvent.change(field, { target: { value: "meant this" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledWith(post, "meant this");
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("keeps the form open when the save fails", async () => {
+    const onEdit = renderCard(makePost(), vi.fn().mockResolvedValue(false));
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    fireEvent.change(screen.getByLabelText("Edit post text"), {
+      target: { value: "new text" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("save"));
+    });
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("Edit post text")).toBeTruthy();
+  });
+
+  it("cancels without calling onEdit and disables save for empty text", () => {
+    const onEdit = renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText("Edit post text");
+    fireEvent.change(field, { target: { value: "   " } });
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByText("cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Edit post text")).toBeNull();
+  });
+
+  it("disables save while the text is unchanged", () => {
+    renderCard(makePost());
+
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    expect((screen.getByText("save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("hides the edit control on other authors' posts", () => {
+    renderCard(makePost({ own: false }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
+  });
+
+  it("preserves emoji-heavy posts instead of truncating by UTF-16 units", () => {
+    // The backend counts code points, not UTF-16 units: 1,200 emoji are
+    // 1,200 code points but 2,400 UTF-16 units, so a plain slice(0, 2000)
+    // would silently drop 199 emoji from a valid post on first edit.
+    renderCard(makePost({ text: "😀".repeat(1200) }));
+    fireEvent.click(screen.getByTitle("Edit this post"));
+    const field = screen.getByLabelText(
+      "Edit post text",
+    ) as HTMLTextAreaElement;
+    expect(field.value).toBe("😀".repeat(1200));
+
+    fireEvent.change(field, { target: { value: "😀".repeat(2001) } });
+    expect(field.value).toBe("😀".repeat(2000));
+  });
+
+  it("hides the edit control on your own quotes", () => {
+    // Quotes are not editable: create_edit only permits posts and replies,
+    // so the console must not offer the button for them.
+    renderCard(makePost({ kind: "quote", own: true }));
+
+    expect(screen.queryByTitle("Edit this post")).toBeNull();
   });
 });
 
@@ -146,7 +241,7 @@ describe("PostCard quote rendering", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
   }
@@ -261,7 +356,7 @@ describe("PostCard quote rendering", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.getByText("❝ 2")).toBeTruthy();
@@ -273,7 +368,7 @@ describe("PostCard quote rendering", () => {
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
-        deleting={false}
+        onEdit={async () => true} deleting={false}
       />,
     );
     expect(screen.queryByText(/❝/)).toBeNull();

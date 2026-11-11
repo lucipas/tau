@@ -49,6 +49,33 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
+describe("useTan editPost", () => {
+  it("posts the hash and text to /api/tan/edit and reloads the feed", async () => {
+    const mine = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    await act(async () => {
+      await result.current.editPost(mine.hash, "fixed typo");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/edit", {
+      target: mine.hash,
+      text: "fixed typo",
+    });
+    // The feed is reloaded after the edit, not just optimistically edited.
+    expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
+  });
+});
+
 
 describe("useTan mentions view", () => {
   it("loads mentions instead of the timeline when the view is selected", async () => {
@@ -224,6 +251,7 @@ describe("useTan saved posts", () => {
     expect(savedCalls).toBe(2);
   });
 });
+
 
 
 describe("useTan deletePost", () => {

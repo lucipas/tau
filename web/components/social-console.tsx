@@ -192,6 +192,19 @@ export function SocialConsole() {
     }
   }
 
+  // Returns false when the edit failed, so the card keeps its form open
+  // instead of closing on an error the user has not seen yet.
+  async function submitEdit(post: TanPost, text: string): Promise<boolean> {
+    setError(null);
+    try {
+      await tan.editPost(post.hash, text);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not edit");
+      return false;
+    }
+  }
+
   async function submitSync() {
     setError(null);
     setMessage(null);
@@ -730,7 +743,9 @@ export function SocialConsole() {
                       onQuote={(target) => {
                         setReplyTarget(null);
                         setQuoteTarget(target);
-                      }}                      onDelete={submitDelete}
+                      }}
+                      onDelete={submitDelete}
+                      onEdit={submitEdit}
                       deleting={deleting.has(post.hash)}
                       onMute={submitMute}
                       muting={muting.has(post.author)}
@@ -1097,6 +1112,7 @@ export function PostCard({
   onToggleSave,  onReply,
   onQuote,
   onDelete,
+  onEdit,
   deleting,
   onMute,
   muting,
@@ -1115,6 +1131,9 @@ export function PostCard({
   onToggleSave?: (post: TanPost) => void;  onReply: (post: TanPost) => void;
   onQuote?: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
+  // Optional like onQuote/onMute: views that do not wire editing (thread,
+  // saved, mentions) render the card without an edit button.
+  onEdit?: (post: TanPost, text: string) => Promise<boolean>;
   deleting: boolean;
   onMute?: (post: TanPost) => void;
   muting?: boolean;
@@ -1122,6 +1141,20 @@ export function PostCard({
 }) {
   const initial = (post.name || "?").slice(0, 1).toUpperCase();
   const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function submitEditForm() {
+    if (saving || !onEdit) return;
+    setSaving(true);
+    try {
+      const ok = await onEdit(post, editText.trim());
+      if (ok) setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
   // Thread entries indent by depth (capped, so a deep reply chain does
   // not squeeze the text away); timeline entries have no depth.
   const depth = Math.min(Math.max(post.depth ?? 0, 0), 6);
@@ -1197,17 +1230,60 @@ export function PostCard({
               )}
             </p>
           ) : null}
-                      {post.deleted ? (
-              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-                <span className="italic text-mist/70">
-                  This post was deleted.
-                </span>
-              </p>
-            ) : bodyText ? (
-              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
-                {bodyText}
-              </p>
-            ) : null}
+          {editing ? (
+            <div className="mt-1.5">
+              <textarea
+                value={editText}
+                disabled={saving}
+                // Code-point-aware cap: the backend counts Python code
+                // points (len), while slice/maxLength count UTF-16 units,
+                // so a plain slice would silently drop emoji from a valid
+                // existing post on the first keystroke.
+                onChange={(event) =>
+                  setEditText(
+                    [...event.target.value].slice(0, 2000).join(""),
+                  )
+                }
+                rows={3}
+                aria-label="Edit post text"
+                className="w-full resize-y rounded-lg border border-line/70 bg-void/60 px-2.5 py-2 text-[13px] leading-relaxed text-zinc-200 outline-none focus:border-signal/50"
+              />
+              <div className="mt-2 flex gap-2 font-mono text-[10px]">
+                <button
+                  type="button"
+                  disabled={
+                    saving ||
+                    !editText.trim() ||
+                    editText.trim() === post.text
+                  }
+                  onClick={() => void submitEditForm()}
+                  title="Save this edit"
+                  className="rounded border border-signal/40 bg-signal/10 px-1.5 py-0.5 text-signal transition-colors hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {saving ? "saving…" : "save"}
+                </button>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => setEditing(false)}
+                  title="Discard this edit"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100 disabled:opacity-50"
+                >
+                  cancel
+                </button>
+              </div>
+            </div>
+          ) : post.deleted ? (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              <span className="italic text-mist/70">
+                This post was deleted.
+              </span>
+            </p>
+          ) : bodyText ? (
+            <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">
+              {bodyText}
+            </p>
+          ) : null}
           {post.kind === "quote" ? (
             <p className="mt-1 whitespace-pre-wrap break-words text-[11px] text-mist/80">
               quoting{" "}
@@ -1315,6 +1391,19 @@ export function PostCard({
                 className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-signal"
               >
                 quote
+              </button>
+            ) : null}
+            {onEdit && post.own && post.kind !== "quote" && !editing && !deleting ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setEditText(post.text);
+                  setEditing(true);
+                }}
+                title="Edit this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:border-signal/40 hover:text-signal"
+              >
+                edit
               </button>
             ) : null}
             {!post.own && onMute ? (
