@@ -21,6 +21,7 @@ import type {
   OutboxResponse,
   Peer,
   PingResult,
+  ReactResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
@@ -866,6 +867,20 @@ export function useTau() {
     return result.unread;
   }, [applyUnread]);
 
+  const reactToMessage = useCallback(
+    async (target: string, reaction: string) => {
+      // The node records the outgoing reaction and the bridge re-sends
+      // the message as `message_updated`, so the bubble updates through
+      // the SSE stream — no local state change here.
+      return apiPost<ReactResponse>("/api/react", { target, reaction });
+    },
+    [],
+  );
+
+  const clearReaction = useCallback(async (target: string) => {
+    return apiPost<ReactResponse>("/api/react", { target, clear: true });
+  }, []);
+
   // A search is a view switch, like the Tan search: setting the query
   // fetches the search endpoint instead of showing the live feed.
   // Clearing it returns to the live traffic the same way.
@@ -952,6 +967,8 @@ export function useTau() {
     unblockPeer,
     announce,
     markRead,
+    reactToMessage,
+    clearReaction,
     createGroup,
     deleteGroup,
     refreshOutbox,

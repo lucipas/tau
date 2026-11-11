@@ -186,6 +186,14 @@ export function Console() {
                   setMode("peer");
                 }
               }}
+              onReact={async (message, reaction) => {
+                if (!message.wire_id) return;
+                if (reaction === null) {
+                  await tau.clearReaction(message.wire_id);
+                } else {
+                  await tau.reactToMessage(message.wire_id, reaction);
+                }
+              }}
             />
             {/* Stays mounted when the queue empties so a retry's result
                 line survives the last entry leaving; it renders nothing
