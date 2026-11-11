@@ -388,6 +388,73 @@ def test_backup_skips_symlinks_under_files(tmp_path, capsys):
     assert not any("dddddddd" in name for name in names)
 
 
+def test_backup_stores_hard_linked_received_files_as_regular_members(
+    tmp_path, capsys
+):
+    # Two received files sharing one inode (e.g. a deduplicating
+    # filesystem, or a sender dir hard-linked by hand) must both be
+    # archived as regular members: tarfile would otherwise emit the
+    # second as a hard-link member, which restore rejects outright.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    sender = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    linked = sender / "report-copy.pdf"
+    os.link(sender / "report.pdf", linked)
+    received["files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/report-copy.pdf"] = (
+        b"%PDF-1.4 fake\n"
+    )
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        names = tar.getnames()
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+        assert all(
+            tar.getmember(name).isreg()
+            for name in names
+            if name != MANIFEST_NAME
+        )
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+
+    node_b = tmp_path / "b"
+    assert (
+        cli.main(["restore", str(archive), "--data-dir", str(node_b), "--json"])
+        == 0
+    )
+    assert (node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / "report.pdf").read_bytes() == (
+        b"%PDF-1.4 fake\n"
+    )
+    assert (node_b / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" / "report-copy.pdf").read_bytes() == (
+        b"%PDF-1.4 fake\n"
+    )
+
+
+def test_backup_skips_unpublished_received_temp_files(tmp_path, capsys):
+    # A `.tau-received-*.tmp` file is a transfer interrupted before its
+    # content was linked into place — it was never a received file, so
+    # the backup leaves it out instead of archiving a partial file.
+    node_a = _init_node(tmp_path, "a", "alice")
+    received = _seed_state(node_a)
+    capsys.readouterr()
+    sender = node_a / "files" / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    (sender / ".tau-received-abc123.tmp").write_bytes(b"half-written")
+    archive = tmp_path / "backup.tar.gz"
+    assert cli.main(["backup", str(archive), "--data-dir", str(node_a)]) == 0
+    capsys.readouterr()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        manifest = json.loads(tar.extractfile(MANIFEST_NAME).read())
+    assert sorted(manifest["files"]) == sorted(
+        [name for name in BACKUP_FILES if (node_a / name).is_file()]
+        + sorted(received)
+    )
+
+
 def test_restore_force_removes_stale_groups_blocklist_files(tmp_path, capsys):
     # A --force restore replaces the whole node state, including the
     # newly backed-up files: groups, blocklist and received files the

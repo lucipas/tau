@@ -124,7 +124,10 @@ def _received_files(config: TauConfig) -> List[str]:
     symlinked sender directory, or a symlinked file is skipped, so a
     backup can never smuggle in a path outside the data directory.
     A directory that cannot be listed is an error, never an empty
-    result, so a backup cannot silently omit received files.
+    result, so a backup cannot silently omit received files.  A
+    leftover ``.tau-received-*.tmp`` file — a transfer interrupted
+    between the write and the link into place — is skipped: it was
+    never published as a received file.
     """
     files_dir = config.files_dir
     if files_dir.is_symlink() or not files_dir.is_dir():
@@ -145,6 +148,8 @@ def _received_files(config: TauConfig) -> List[str]:
             ) from exc
         for entry in entries:
             if entry.is_symlink() or not entry.is_file():
+                continue
+            if entry.name.startswith(".tau-received-"):
                 continue
             members.append(f"{FILES_DIR_NAME}/{sender_dir.name}/{entry.name}")
     return members
@@ -307,6 +312,20 @@ def create_backup(
                                 info = archive.gettarinfo(
                                     arcname=name, fileobj=handle_in
                                 )
+                                # A hard link to a file already in the
+                                # archive comes back as a link member,
+                                # which restore rejects — store the bytes
+                                # instead.  Only hard links are rewritten:
+                                # a symlink member is still archived as a
+                                # link and rejected on restore, as before.
+                                # gettarinfo reports size 0 for a link, so
+                                # the size comes from the open descriptor.
+                                if info.islnk():
+                                    info.type = tarfile.REGTYPE
+                                    info.linkname = ""
+                                    info.size = os.fstat(
+                                        handle_in.fileno()
+                                    ).st_size
                                 expanded += info.size
                                 if (
                                     info.size > MAX_MEMBER_BYTES

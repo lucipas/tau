@@ -18,7 +18,7 @@ from tau.config import (
     set_node_setting,
 )
 from tau.inbox import Inbox
-from tau.node import NodeError, TauNode
+from tau.node import NodeError, TauNode, _create_unique_file
 from tau.peers import PeerRegistry
 from tau.protocol import (
     APP_NAME,
@@ -117,6 +117,38 @@ def test_sanitize_file_name_rejects_unusable_names():
 
 def test_sanitize_file_name_drops_control_characters():
     assert sanitize_file_name("a\x00b\x1bc.txt") == "abc.txt"
+
+
+def test_create_unique_file_publishes_complete_file(tmp_path):
+    # The file appears under its final name only once its content is
+    # complete, and no temporary file is left behind.
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target == tmp_path / "notes.txt"
+    assert target.read_bytes() == b"hello file"
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_create_unique_file_numbers_suffixes_and_never_overwrites(tmp_path):
+    first = _create_unique_file(tmp_path, "notes.txt", b"one")
+    second = _create_unique_file(tmp_path, "notes.txt", b"two")
+    third = _create_unique_file(tmp_path, "notes.txt", b"three")
+    assert first.name == "notes.txt"
+    assert second.name == "notes-2.txt"
+    assert third.name == "notes-3.txt"
+    assert first.read_bytes() == b"one"
+    assert second.read_bytes() == b"two"
+    assert third.read_bytes() == b"three"
+
+
+def test_create_unique_file_skips_symlink_names(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (tmp_path / "notes.txt").symlink_to(outside)
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target.name == "notes-2.txt"
+    assert target.read_bytes() == b"hello file"
+    assert outside.read_text(encoding="utf-8") == "secret\n"
 
 
 # -- signed offers ---------------------------------------------------------

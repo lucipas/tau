@@ -10,6 +10,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -370,40 +371,42 @@ def _read_resource_data(resource: Any) -> Optional[bytes]:
 def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     """Write *data* to a new file in *directory*, never overwriting.
 
-    Each candidate is created with an exclusive open (``O_EXCL``), so
-    an existing name, including a symlink, is never opened for
-    writing; the next numbered name is tried instead.  The check and
-    the create are one syscall, so concurrent transfers cannot pick
-    the same destination.
+    The bytes go to a temporary file in the same directory first, then
+    the finished file is linked into place: a name appears only once
+    its content is complete, so a concurrent reader — a live backup,
+    the web console — never sees a half-written received file.  Each
+    candidate is linked with ``os.link``, so an existing name,
+    including a symlink, is never replaced; the next numbered name is
+    tried instead.  The check and the link are one syscall, so
+    concurrent transfers cannot pick the same destination.
     """
     stem = Path(name).stem
     suffix = Path(name).suffix
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=directory, prefix=".tau-received-", suffix=".tmp"
     )
-    counter = 1
-    while True:
-        candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
-        candidate = directory / candidate_name
-        try:
-            fd = os.open(candidate, flags, 0o600)
-        except FileExistsError:
-            counter += 1
-            continue
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-        except BaseException:
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        counter = 1
+        while True:
+            candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
+            candidate = directory / candidate_name
             try:
-                os.unlink(candidate)
-            except OSError:  # pragma: no cover - best effort
-                pass
-            raise
-        return candidate
+                os.link(tmp_name, candidate)
+            except FileExistsError:
+                counter += 1
+                continue
+            return candidate
+    finally:
+        # Best effort: a crash between link and unlink leaves a
+        # `.tau-received-*.tmp` file behind, which backup skips.
+        try:
+            os.unlink(tmp_name)
+        except OSError:  # pragma: no cover - best effort
+            pass
 
 
 class TauNode:
