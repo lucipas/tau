@@ -33,13 +33,20 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
-from .protocol import clean_in_reply_to
+from .protocol import (
+    DEFAULT_MESSAGE_KIND,
+    ProtocolError,
+    clean_in_reply_to,
+    normalize_message_kind,
+)
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
 
 INBOX_FILE_NAME = "inbox.json"
 MAX_INBOX = 500
+INBOX_EXPORT_FORMAT = "tau-messages-export"
+INBOX_EXPORT_VERSION = 1
 # Reactions are keyed by (target message, reactor): the latest entry per
 # pair wins, so the store stays small, but a hostile peer could still
 # spray reactions at made-up targets.  Cap the total and drop the
@@ -65,6 +72,10 @@ def _retain(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return kept
 
 
+class InboxError(ValueError):
+    """Raised when an inbox lookup or delete fails."""
+
+
 def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize one stored record, or ``None`` when it is unusable.
 
@@ -87,12 +98,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     received_at = raw.get("received_at")
     try:
         received_at = float(received_at) if received_at is not None else time.time()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(sent_at):
         sent_at = 0.0
@@ -160,6 +171,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["kind"] = "group"
         record["group"] = group_id.lower()
         record["group_name"] = str(raw.get("group_name") or "group")
+    else:
+        try:
+            kind = normalize_message_kind(raw.get("kind"))
+        except ProtocolError:
+            # A hand-edited record keeps its text; the kind falls back to
+            # plain chat rather than dropping the message.
+            kind = DEFAULT_MESSAGE_KIND
+        record["kind"] = kind
     return record
 
 
@@ -361,6 +380,53 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _record_error(raw: Any) -> Optional[str]:
+    """Why :func:`_valid_record` would reject ``raw``, or ``None``.
+
+    Import reports one reason per skipped entry instead of silently
+    dropping it, so this mirrors the validation above closely enough
+    to name the failing field.  A non-finite ``sent_at`` is normalized
+    to 0.0 by ``_valid_record`` and is not an error here either.
+    """
+    if not isinstance(raw, dict):
+        return "entry is not an object"
+    text = raw.get("text")
+    if not isinstance(text, str) or not text:
+        return "inbox record needs text"
+    try:
+        float(raw.get("sent_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid sent_at"
+    received_at = raw.get("received_at")
+    try:
+        received_at = float(received_at) if received_at is not None else time.time()
+    except (TypeError, ValueError, OverflowError):
+        return "invalid received_at"
+    if not math.isfinite(received_at):
+        return "invalid received_at"
+    return None
+
+
+def _dedupe_key(record: Dict[str, Any]) -> Any:
+    """Identity of a normalized record for import dedupe.
+
+    A record with a message id dedupes on that id; one without an id
+    (older stores predate ids) dedupes on sender, destination, text
+    and send time, so re-importing the same export is a no-op either
+    way.
+    """
+    message_id = record.get("id")
+    if message_id is not None and str(message_id):
+        return ("id", str(message_id))
+    return (
+        "content",
+        str(record.get("from") or ""),
+        str(record.get("destination") or ""),
+        str(record.get("text") or ""),
+        float(record.get("sent_at") or 0.0),
+    )
+
+
 class Inbox:
     """Received direct messages, persisted in the node data directory.
 
@@ -442,14 +508,17 @@ class Inbox:
         highest += [cursor["last_read_seq"] for cursor in self._read_cursors.values()]
         return max(highest, default=0) + 1
 
-    def _save(self) -> bool:
+
+    def _save(self, *, strict: bool = False) -> bool:
         """Persist the inbox; ``True`` when the write landed.
 
         A path-less (in-memory) inbox has nothing to write and reports
         success.  A failed write is logged and reported — callers that
         must not acknowledge unstored state (reaction handling) raise
         on ``False``; callers that must never break delivery (DM
-        appends) ignore the return value.
+        appends) ignore the return value.  :meth:`delete` passes
+        ``strict=True`` so a failed persist raises instead of
+        claiming success.
         """
         if self.path is None:
             return True
@@ -464,6 +533,8 @@ class Inbox:
                 mode=0o600,
             )
         except OSError as exc:
+            if strict:
+                raise
             log.warning("Could not persist inbox to %s: %s", self.path, exc)
             return False
         return True
@@ -510,6 +581,62 @@ class Inbox:
             self._messages = _retain(self._messages)
             self._save()
         return entry
+
+    def delete(self, ref: str) -> Dict[str, Any]:
+        """Remove one stored message by full id or unique prefix.
+
+        Same convention as :meth:`Mailbox.resolve_outbox`: a full
+        32-character id matches exactly, a shorter prefix must match
+        exactly one stored message.  The removal runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this delete runs.  Only this
+        node's copy is removed — the sender keeps theirs, and sealed
+        copies already held by relays are unaffected.  Records with no
+        id (older stores predate ids) cannot be addressed this way.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            raise InboxError("message reference must not be empty")
+        value = ref.strip()
+        with self._transaction():
+            entries = list(self._messages)
+            # Peer-supplied ids are case-sensitive: an exact match wins
+            # outright; only then fall back to a case-folded prefix.
+            matches = [
+                entry for entry in entries if str(entry.get("id") or "") == value
+            ]
+            if not matches:
+                folded = value.lower()
+                if len(folded) == 32:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower() == folded
+                    ]
+                else:
+                    matches = [
+                        entry
+                        for entry in entries
+                        if str(entry.get("id") or "").lower().startswith(folded)
+                    ]
+            if not matches:
+                raise InboxError(f"unknown message: {ref!r}")
+            if len(matches) > 1:
+                raise InboxError(
+                    f"{len(matches)} messages match prefix {ref!r}"
+                )
+            removed = matches[0]
+            previous = self._messages
+            self._messages = [entry for entry in entries if entry is not removed]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous
+                raise InboxError(
+                    f"could not persist inbox; message was not deleted: {exc}"
+                ) from exc
+        return dict(removed)
+
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
@@ -703,22 +830,29 @@ class Inbox:
         *,
         limit: Optional[int] = None,
         peer: Optional[str] = None,
+        query: Optional[str] = None,
         group: Optional[str] = None,
+        kind: Optional[str] = None,
         direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``limit`` caps how many are returned
-        (``None`` means all of them).  Sent messages are recorded here
-        too — a reply quotes the sender's own earlier message as often
-        as the peer's — but they stay out of the default listing, which
-        is the received-message view ``tau messages`` has always shown;
-        pass ``direction="out"`` or ``direction=None`` to see them.
+        filters to one group id; ``kind`` filters to one message kind;
+        ``query`` keeps only messages whose
+        text contains it (case-insensitive substring); ``limit`` caps
+        how many are returned (``None`` means all of them).  Sent
+        messages are recorded here too — a reply quotes the sender's
+        own earlier message as often as the peer's — but they stay out
+        of the default listing, which is the received-message view
+        ``tau messages`` has always shown; pass ``direction="out"`` or
+        ``direction=None`` to see them.
         Each entry carries ``unread``: whether it arrived after its
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
         """
+        if direction is not None and direction not in ("in", "out"):
+            raise ValueError('direction must be "in" or "out"')
         with self._lock:
             entries = list(self._messages)
             cursors = {
@@ -733,12 +867,21 @@ class Inbox:
             entries = [item for item in entries if item.get("direction") == direction]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
+        if query is not None:
+            needle = query.casefold()
+            entries = [
+                item
+                for item in entries
+                if needle in str(item.get("text") or "").casefold()
+            ]
         if group is not None:
             entries = [
                 item
                 for item in entries
                 if item.get("kind") == "group" and item.get("group") == group
             ]
+        if kind is not None:
+            entries = [item for item in entries if item.get("kind") == kind]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
@@ -871,6 +1014,95 @@ class Inbox:
                 continue
             matches.append(dict(item))
         return matches
+
+    def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
+        """Return a portable backup of the stored messages.
+
+        Messages are in stored (oldest-first) order so an import replays
+        them in order; ``peer`` restricts the export to one sender
+        destination hash.  The document is the same shape
+        :meth:`import_messages` accepts.
+        """
+        with self._lock:
+            entries = [dict(item) for item in self._messages]
+        if peer is not None:
+            entries = [item for item in entries if item.get("destination") == peer]
+        return {
+            "format": INBOX_EXPORT_FORMAT,
+            "version": INBOX_EXPORT_VERSION,
+            "exported_at": time.time(),
+            "messages": entries,
+        }
+
+    def import_messages(self, document: Any) -> Dict[str, Any]:
+        """Merge every message in an export document into the inbox.
+
+        Returns ``{"imported": n, "present": n, "skipped": n, "errors":
+        [...]}``.  An entry that fails validation is skipped with its
+        error recorded; it never aborts the rest of the import, and
+        entries already in the inbox are counted as present rather than
+        stored twice.  The whole merge runs in one transaction, so a
+        concurrent ``tau serve`` cannot lose entries, and the
+        per-direction 500-record caps still apply.  Imported records
+        get local arrival sequences (an export carries the source
+        node's, which mean nothing here), and a failed persist raises
+        :class:`OSError` instead of reporting a restore that never
+        landed — the in-memory merge is rolled back with it.
+        """
+        if not isinstance(document, dict):
+            raise ValueError("export file must contain a JSON object")
+        if document.get("format") != INBOX_EXPORT_FORMAT:
+            raise ValueError(
+                f"unsupported export format: {document.get('format')!r}"
+            )
+        if document.get("version") != INBOX_EXPORT_VERSION:
+            raise ValueError(
+                f"unsupported export version: {document.get('version')!r}"
+            )
+        entries = document.get("messages")
+        if not isinstance(entries, list):
+            raise ValueError("export file has no messages list")
+
+        imported = present = skipped = 0
+        errors: List[Dict[str, Any]] = []
+        with self._transaction():
+            previous = list(self._messages)
+            seen = {_dedupe_key(item) for item in self._messages}
+            for entry in entries:
+                record = _valid_record(entry)
+                if record is None:
+                    ref = None
+                    if isinstance(entry, dict) and entry.get("id") is not None:
+                        ref = str(entry.get("id"))
+                    skipped += 1
+                    errors.append(
+                        {
+                            "id": ref,
+                            "error": _record_error(entry) or "invalid inbox record",
+                        }
+                    )
+                    continue
+                key = _dedupe_key(record)
+                if key in seen:
+                    present += 1
+                    continue
+                seen.add(key)
+                self._messages.append(record)
+                imported += 1
+            self._messages = _retain(self._messages)
+            _number_sequence(self._messages)
+            if not self._save():
+                # The merge lives in memory only; restore the pre-merge
+                # state so a later read does not show messages that were
+                # never stored.
+                self._messages = previous
+                raise OSError(f"could not persist inbox to {self.path}")
+        return {
+            "imported": imported,
+            "present": present,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
     def __len__(self) -> int:
         with self._lock:

@@ -62,6 +62,7 @@ from .identity import (
     load_public_key,
 )
 from .protocol import (
+    DEFAULT_MESSAGE_KIND,
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
@@ -69,7 +70,9 @@ from .protocol import (
     decode,
     encode,
     generate_message_id,
+    kind_from_wire,
     normalize_message,
+    normalize_message_kind,
     sanitize_group_name,
     sanitize_name,
 )
@@ -162,6 +165,7 @@ class OutboxEntry:
     created_at: float
     expires_at: float
     to_name: str = ""
+    kind: str = DEFAULT_MESSAGE_KIND
     attempts: int = 0
     last_attempt_at: Optional[float] = None
     last_error: Optional[str] = None
@@ -222,6 +226,7 @@ class OutboxEntry:
             "to": self.to_hex,
             "to_name": self.to_name,
             "text": self.text,
+            "kind": self.kind,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "attempts": self.attempts,
@@ -265,6 +270,12 @@ class OutboxEntry:
         if not isinstance(held_by, dict):
             held_by = {}
         attempts = raw.get("attempts")
+        try:
+            kind = normalize_message_kind(raw.get("kind"))
+        except ProtocolError:
+            # A hand-edited or corrupt entry keeps its text; the kind
+            # falls back to plain chat rather than dropping the message.
+            kind = DEFAULT_MESSAGE_KIND
         group_raw = raw.get("group")
         group_id: Optional[str] = None
         group_name = ""
@@ -326,6 +337,7 @@ class OutboxEntry:
             to_name=sanitize_name(raw.get("to_name"), fallback="")
             if isinstance(raw.get("to_name"), str)
             else "",
+            kind=kind,
             attempts=int(attempts) if isinstance(attempts, int) else 0,
             last_attempt_at=raw.get("last_attempt_at")
             if isinstance(raw.get("last_attempt_at"), (int, float))
@@ -528,6 +540,28 @@ class HeldEnvelope:
         )
 
 
+def _lock_file(handle: Any, timeout: Optional[float]) -> None:
+    """Take the exclusive flock on a mailbox lock file.
+
+    With no timeout this blocks, as before.  With a timeout the wait
+    is bounded by it: the lock is tried non-blocking in a short loop
+    and a ``TimeoutError`` is raised once the budget is spent, so a
+    stalled holder cannot block a caller that has its own deadline.
+    """
+    if timeout is None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("mailbox lock is held by another process")
+            time.sleep(0.005)
+
+
 class Mailbox:
     """Thread-safe store-and-forward storage, optionally JSON backed."""
 
@@ -550,15 +584,26 @@ class Mailbox:
             self.load()
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def _transaction(self, timeout: Optional[float] = None) -> Iterator[None]:
         """Serialise a read-modify-write of the mailbox across processes.
 
         ``tau serve`` and one-shot commands such as ``tau send`` share the
         same ``mailbox.json``.  Each mutation takes an exclusive ``flock`` on
         a sidecar lock file, reloads the latest on-disk state, and then
         applies its change, so a process never overwrites another's writes.
+
+        With ``timeout`` set, the wait for both the in-process lock and
+        the flock is bounded by it (a ``TimeoutError`` is raised once
+        the budget is spent), so a stalled holder cannot block a caller
+        that has its own deadline.  With no timeout the wait is
+        unbounded, as before.
         """
-        with self._lock:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        if deadline is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("mailbox lock is held by another thread")
+        try:
             if self._txn_depth:
                 # Nested transaction: the outer one already holds the
                 # flock and reloaded state, so just join it.  (A second
@@ -575,7 +620,10 @@ class Mailbox:
                 lock_path = self.path.with_name(self.path.name + ".lock")
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(lock_path, "a") as handle:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    _lock_file(
+                        handle,
+                        None if deadline is None else max(0.0, deadline - time.monotonic()),
+                    )
                     try:
                         self._apply_document()
                         yield
@@ -583,10 +631,12 @@ class Mailbox:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self._txn_depth = 0
+        finally:
+            self._lock.release()
 
-    def transaction(self) -> Iterator[None]:
+    def transaction(self, timeout: Optional[float] = None) -> Iterator[None]:
         """Public handle on the cross-process mailbox lock (see ``_transaction``)."""
-        return self._transaction()
+        return self._transaction(timeout=timeout)
 
     # -- persistence -------------------------------------------------------
 
@@ -795,6 +845,7 @@ class Mailbox:
                 to_hex = record.get("to")
                 sent_at = record.get("sent_at")
                 read_at = record.get("read_at")
+                delivered_at = record.get("delivered_at")
                 text = record.get("text")
                 if (
                     not isinstance(message_id, str)
@@ -805,6 +856,10 @@ class Mailbox:
                         read_at is not None
                         and not isinstance(read_at, (int, float))
                     )
+                    or (
+                        delivered_at is not None
+                        and not isinstance(delivered_at, (int, float))
+                    )
                     or not isinstance(text, str)
                 ):
                     continue
@@ -812,12 +867,24 @@ class Mailbox:
                     bytes.fromhex(to_hex)
                 except ValueError:
                     continue
-                sent[message_id] = {
+                parsed = {
                     "to": to_hex.lower(),
                     "sent_at": float(sent_at),
                     "read_at": float(read_at) if read_at is not None else None,
                     "text": text,
                 }
+                if "delivered_at" in record:
+                    # Delivery confirmation must survive a reload: the
+                    # queued-to-delivered flip and the sent-messages
+                    # display both read it after one. Records written
+                    # before it was tracked carry no such key and keep
+                    # counting as delivered.
+                    parsed["delivered_at"] = (
+                        float(delivered_at)
+                        if delivered_at is not None
+                        else None
+                    )
+                sent[message_id] = parsed
 
         receipts: Dict[str, ReceiptEntry] = {}
         raw_receipts = raw.get("receipts")
@@ -888,6 +955,7 @@ class Mailbox:
         to: bytes,
         text: str,
         to_name: str = "",
+        kind: Optional[str] = None,
         ttl: float = DEFAULT_TTL,
         message_id: Optional[str] = None,
         expires_at: Optional[float] = None,
@@ -911,6 +979,7 @@ class Mailbox:
             raise MailboxError("destination hash must be 16 bytes")
         timestamp = now if now is not None else time.time()
         clean_text = normalize_message(text)
+        clean_kind = normalize_message_kind(kind)
         entry_id = message_id or generate_message_id()
         group_id: Optional[str] = None
         group_name = ""
@@ -976,6 +1045,7 @@ class Mailbox:
                 to_name=sanitize_name(to_name, fallback="")
                 if to_name
                 else "",
+                kind=clean_kind,
                 group_id=group_id,
                 group_name=group_name,
                 group_creator=group_creator,
@@ -1015,25 +1085,50 @@ class Mailbox:
             )
         return matches[0]
 
-    def outbox_list(self, to: Optional[bytes] = None) -> List[OutboxEntry]:
-        with self._lock:
-            entries = list(self._outbox.values())
+    def outbox_list(
+        self, to: Optional[bytes] = None, *, timeout: Optional[float] = None
+    ) -> List[OutboxEntry]:
+        """Outbox entries, oldest first.
+
+        With ``timeout`` set, the wait for the in-process lock is bounded
+        by it (a ``TimeoutError`` is raised once the budget is spent), so
+        a caller with its own deadline — a delivery wait, say — is not
+        held past it by a stalled lock holder.  With no timeout the wait
+        is unbounded, as before.
+        """
+        if timeout is None:
+            with self._lock:
+                entries = list(self._outbox.values())
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            if not acquired:
+                raise TimeoutError("mailbox lock is held by another thread")
+            try:
+                entries = list(self._outbox.values())
+            finally:
+                self._lock.release()
         if to is not None:
             entries = [e for e in entries if e.to == to]
         entries.sort(key=lambda e: e.created_at)
         return entries
 
     def due_outbox(
-        self, to: Optional[bytes] = None, *, now: Optional[float] = None
+        self,
+        to: Optional[bytes] = None,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> List[OutboxEntry]:
         """Outbox entries whose delivery backoff has elapsed, oldest first."""
         timestamp = now if now is not None else time.time()
         return [
-            entry for entry in self.outbox_list(to=to) if entry.is_due(timestamp)
+            entry
+            for entry in self.outbox_list(to=to, timeout=timeout)
+            if entry.is_due(timestamp)
         ]
 
-    def remove_outbox(self, message_id: str) -> bool:
-        with self._transaction():
+    def remove_outbox(self, message_id: str, *, timeout: Optional[float] = None) -> bool:
+        with self._transaction(timeout=timeout):
             if message_id not in self._outbox:
                 return False
             del self._outbox[message_id]
@@ -1041,9 +1136,14 @@ class Mailbox:
             return True
 
     def record_attempt(
-        self, message_id: str, *, error: Optional[str] = None, now: Optional[float] = None
+        self,
+        message_id: str,
+        *,
+        error: Optional[str] = None,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> None:
-        with self._transaction():
+        with self._transaction(timeout=timeout):
             entry = self._outbox.get(message_id)
             if entry is None:
                 return
@@ -1053,9 +1153,14 @@ class Mailbox:
             self.save()
 
     def record_deposit(
-        self, message_id: str, holder_hexhash: str, *, now: Optional[float] = None
+        self,
+        message_id: str,
+        holder_hexhash: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> None:
-        with self._transaction():
+        with self._transaction(timeout=timeout):
             entry = self._outbox.get(message_id)
             if entry is None:
                 return
@@ -1111,10 +1216,14 @@ class Mailbox:
             self.save()
 
     def record_delivered(
-        self, message_id: str, *, now: Optional[float] = None
+        self,
+        message_id: str,
+        *,
+        now: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> None:
         """Mark a sent message as having reached its recipient."""
-        with self._transaction():
+        with self._transaction(timeout=timeout):
             record = self._sent.get(message_id)
             if record is None or record.get("delivered_at") is not None:
                 return
@@ -1513,10 +1622,17 @@ class Mailbox:
 
     # -- maintenance -----------------------------------------------------------
 
-    def prune(self, *, now: Optional[float] = None) -> Dict[str, int]:
-        """Drop expired outbox entries, held envelopes and stale seen ids."""
+    def prune(
+        self, *, now: Optional[float] = None, timeout: Optional[float] = None
+    ) -> Dict[str, int]:
+        """Drop expired outbox entries, held envelopes and stale seen ids.
+
+        With ``timeout`` set, the wait for the mailbox lock is bounded
+        by it (see ``_transaction``); with no timeout it is unbounded,
+        as before.
+        """
         timestamp = now if now is not None else time.time()
-        with self._transaction():
+        with self._transaction(timeout=timeout):
             dead_outbox = [
                 key
                 for key, entry in self._outbox.items()
@@ -1592,6 +1708,7 @@ def seal_message(
     group: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
+    kind: Optional[str] = None,
 ) -> bytes:
     """Encrypt *text* to a recipient and sign it as the sender.
 
@@ -1615,6 +1732,7 @@ def seal_message(
         "from_name": sanitize_name(sender_name),
         "from_key": sender_identity.get_public_key().hex(),
         "text": normalize_message(text),
+        "kind": normalize_message_kind(kind),
         "sent_at": float(sent_at),
     }
     if group is not None:
@@ -1836,6 +1954,10 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         text = normalize_message(payload.get("text"))
     except ProtocolError as exc:
         raise MailboxError(f"sealed message text is invalid: {exc}") from exc
+    try:
+        kind = kind_from_wire(payload)
+    except ProtocolError as exc:
+        raise MailboxError(f"sealed message kind is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
     expires_at = payload.get("expires_at")
     if expires_at is not None:
@@ -1856,6 +1978,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "from": payload["from"].lower(),
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
+        "kind": kind,
         "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
         "expires_at": expires_at,
         "in_reply_to": in_reply_to,

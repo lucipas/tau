@@ -169,6 +169,30 @@ def test_two_nodes_discover_and_exchange_a_message(tmp_path: Path) -> None:
         assert response["server"] == "alice"
         assert response["node"] == alice_hash
 
+        # --wait is a no-op when the peer answers at once: the same send
+        # reports delivered and carries how long was waited.
+        waited = run_tau(
+            "send",
+            "--data-dir",
+            str(bob_dir),
+            "--to",
+            alice_hash,
+            "hello again",
+            "--timeout",
+            "20",
+            "--discover-timeout",
+            "10",
+            "--wait",
+            "10",
+            "--json",
+            timeout=60.0,
+        )
+        waited_response = json.loads(require_ok(waited))
+        assert waited_response["ok"] is True
+        assert waited_response["delivered"] is True
+        assert waited_response["waited"] >= 0
+        assert waited_response["echo"] == "hello again"
+
         ping = json.loads(
             require_ok(
                 run_tau(

@@ -51,6 +51,7 @@ export function formatRtt(rtt: number | null | undefined): string {
   return `${rtt.toFixed(1)} ms`;
 }
 
+/** "12.4 KB" / "3.2 MB" for a file size in bytes. */
 export function formatFileSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "unknown size";
   if (bytes < 1024) return `${bytes} B`;

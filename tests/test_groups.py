@@ -850,7 +850,7 @@ def test_deliver_entry_re_encodes_group_payload(tmp_path):
     )
     seen = []
 
-    def fake_request(peer, path, payload, timeout):
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
         seen.append((path, parse_group_message(payload)))
         return {"ok": True}
 

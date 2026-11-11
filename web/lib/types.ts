@@ -82,9 +82,43 @@ export interface Peer {
   blocked?: boolean;
 }
 
+export interface BlockPeerResult {
+  peer: { destination: string; name: string };
+  blocked: boolean;
+  changed: boolean;
+}
+
+export interface BlockPeerResponse {
+  ok: boolean;
+  block: BlockPeerResult;
+}
+
 export interface InterfaceInfo {
   name: string;
   online: boolean;
+}
+
+// Mailbox counters from TauNode.info(): what the store-and-forward
+// layer is holding for this node and for other peers.
+export interface MailboxCounts {
+  outbox: number;
+  held: number;
+  seen: number;
+  sent: number;
+  receipts: number;
+}
+
+// LXMF store-and-forward state from TauNode.info().
+export interface LxmfInfo {
+  enabled: boolean;
+  delivery: string | null;
+}
+
+// Tan store state from the snapshot: whether Tan is enabled and how
+// many posts this node has cached locally.
+export interface SocialInfo {
+  enabled: boolean;
+  posts: number;
 }
 
 export interface NodeInfo {
@@ -96,6 +130,10 @@ export interface NodeInfo {
   uptime: number;
   peers: number;
   interfaces: InterfaceInfo[];
+  // Absent on snapshots from an older bridge; the panel hides the
+  // store rows instead of guessing.
+  mailbox?: MailboxCounts;
+  lxmf?: LxmfInfo;
 }
 
 export interface Counts {
@@ -133,6 +171,8 @@ export interface Snapshot {
   counts: Counts;
   unread: UnreadCounts;
   bridge: BridgeInfo;
+  // Absent on snapshots from an older bridge.
+  social?: SocialInfo;
 }
 
 export interface PingResult {
@@ -142,7 +182,51 @@ export interface PingResult {
   rtt_ms: number | null;
 }
 
+export interface SafetyNumberResult {
+  peer: string;
+  name: string;
+  // Pairwise safety number: compare it with the peer over another
+  // channel; showing it records nothing.
+  safety_number: string;
+}
+
+export interface SafetyNumberResponse {
+  ok: boolean;
+  safety_number: SafetyNumberResult;
+}
+
+export interface PeerVerifyResult {
+  peer: string;
+  name: string;
+  // Pairwise safety number: compare it with the peer over another
+  // channel; if it matches, the recorded key is theirs.
+  safety_number: string;
+  verified_at: number | null;
+  reverified: boolean;
+  fingerprint_changed: boolean;
+}
+
+export interface VerifyPeerResponse {
+  ok: boolean;
+  verify: PeerVerifyResult;
+}
+
+export interface VerifyState {
+  pending?: boolean;
+  // Number shown for comparison; present before the owner confirms
+  // it matches. Nothing is recorded while only this is set.
+  safetyNumber?: string;
+  result?: PeerVerifyResult;
+  error?: string;
+}
+
 export interface SendResponse {
+  ok: boolean;
+  message: TauMessage;
+  response: Record<string, unknown>;
+}
+
+export interface SendFileResponse {
   ok: boolean;
   message: TauMessage;
   response: Record<string, unknown>;
@@ -170,6 +254,49 @@ export interface OutboxResponse {
 export interface CancelOutboxResponse {
   ok: boolean;
   cancelled: OutboxEntry;
+}
+
+export interface RetryOutboxResponse {
+  ok: boolean;
+  delivered: number;
+  deposited: number;
+  received: number;
+  still_queued: number;
+  lock_busy: boolean;
+  target?: string;
+  target_delivered?: boolean;
+  target_still_queued?: boolean;
+}
+
+export interface HeldMailEntry {
+  id: string;
+  to: string;
+  to_name: string;
+  from: string;
+  from_name: string;
+  stored_at: number;
+  expires_at: number;
+  blob_bytes: number;
+}
+
+export interface HeldMailResponse {
+  held: HeldMailEntry[];
+  count: number;
+}
+
+export interface DropHeldResponse {
+  ok: boolean;
+  dropped: HeldMailEntry & { note: string };
+}
+
+export interface AllowlistEntry {
+  destination: string;
+  name: string;
+}
+
+export interface AllowlistResponse {
+  enabled: boolean;
+  entries: AllowlistEntry[];
 }
 
 export interface ApiErrorBody {
@@ -201,11 +328,20 @@ export interface TanPost {
   kind?: string;
   target?: string;
   reply_to?: TanReplyParent | null;
+  repost_of?: TanReplyParent | null;
   quoted?: TanReplyParent | null;
   likes?: number;
   liked?: boolean;
+  reposts?: number;
+  reposted?: boolean;
   quotes?: number;
   own?: boolean;
+  saved?: boolean;
+  saved_at?: number;
+  deleted?: boolean;
+  // Thread entries carry their depth (the root is 0); timeline entries
+  // have no depth.
+  depth?: number;
 }
 
 export interface TanFollow {
@@ -217,13 +353,62 @@ export interface TanFollow {
   last_post?: number;
 }
 
+export interface MessagesSearchResponse {
+  messages: TauMessage[];
+  count: number;
+}
+
 export interface TanTimelineResponse {
   posts: TanPost[];
   count: number;
 }
 
+export interface TanSavedResponse {
+  posts: TanPost[];
+  count: number;
+  next_offset: number | null;
+}
+
 export interface TanFollowingResponse {
   following: TanFollow[];
+  count: number;
+}
+
+export interface TanLiker {
+  author: string;
+  name: string;
+  liked_at: number;
+}
+
+export interface TanLikesResponse {
+  target: string;
+  likers: TanLiker[];
+  count: number;
+  total: number;
+}
+
+export interface TanMutedAuthor {
+  author: string;
+  name: string;
+  muted_at: number;
+  posts?: number;
+  seq?: number;
+  last_post?: number;
+}
+
+export interface TanMutedKeyword {
+  keyword: string;
+  display: string;
+  added_at: number;
+}
+
+export interface TanMutedResponse {
+  muted: TanMutedAuthor[];
+  count: number;
+}
+
+export interface TanMutedKeywordsResponse {
+  muted_keywords: TanMutedKeyword[];
   count: number;
 }
 
@@ -241,4 +426,29 @@ export interface TanSyncResponse {
     duplicates: number;
     errors: Array<{ peer: string; author: string; error: string }>;
   };
+}
+
+export interface TanExportDocument {
+  format: string;
+  version: number;
+  exported_at: number;
+  authors: string[];
+  entries: Array<Record<string, unknown>>;
+}
+
+export interface TanImportError {
+  hash: string;
+  error: string;
+}
+
+export interface TanImportResult {
+  imported: number;
+  present: number;
+  skipped: number;
+  errors: TanImportError[];
+}
+
+export interface TanImportResponse {
+  ok: boolean;
+  import: TanImportResult;
 }
