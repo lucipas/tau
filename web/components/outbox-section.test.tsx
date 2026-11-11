@@ -52,8 +52,10 @@ function renderSection(
       <OutboxSection
         entries={entries}
         heldForOthers={0}
+        held={[]}
         onCancel={onCancel}
         onRetry={onRetry}
+        onDropHeld={vi.fn(async () => undefined)}
       />,
     ),
   };
