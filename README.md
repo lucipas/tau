@@ -160,6 +160,8 @@ The same bridge is the local integration point for scripts:
 | `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
 | `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/settings` | GET | node settings (`accept_files`, `send_read_receipts`) |
+| `/api/settings` | POST | change one setting `{"setting": "accept_files", "value": true}` |
 | `/api/backup` | GET | download a backup archive of the data directory |
 | `/api/doctor` | GET | health verdicts for the data directory (`tau doctor`) |
 | `/api/tan/timeline` | GET | followed authors' posts (`?all=1` for every cached post) |

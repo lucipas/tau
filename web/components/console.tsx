@@ -14,6 +14,7 @@ import { MessageFeed } from "./message-feed";
 import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
+import { SettingsSection } from "./settings-section";
 
 export function Console() {
   const tau = useTau();
@@ -272,6 +273,13 @@ export function Console() {
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
+            <div className="mt-4">
+              <SettingsSection
+                settings={tau.settings}
+                loadError={tau.settingsError}
+                onToggle={tau.updateSetting}
+              />
+            </div>
           </div>
 
           <MessagesBackupSection

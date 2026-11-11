@@ -116,7 +116,12 @@ from .allowlist import AllowListError, clean_destination
 from .backup import BackupError, create_backup
 from .blocklist import BlockList, BlockListError, load_blocklist, save_blocklist
 from .bundle import BundleError, DEFAULT_MAX_BUNDLE_BYTES
-from .config import MESSAGES_FILE_NAME
+from .config import (
+    MESSAGES_FILE_NAME,
+    accept_files_enabled,
+    send_read_receipts_enabled,
+    set_node_setting,
+)
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
@@ -739,11 +744,11 @@ class WebBridge:
 
     # -- message history ---------------------------------------------------
 
-    def _resolve_messages_path(self) -> Optional[Path]:
-        """Data-dir path for persisted message history, or ``None``.
+    def _data_dir(self) -> Optional[Path]:
+        """This node's data directory, or ``None`` for a dataless node.
 
-        A node without a data directory (tests, embeds) keeps messages in
-        memory only.
+        A node without a data directory (tests, embeds) has no
+        ``node.json`` to read settings from or persist them to.
         """
         data_dir = getattr(self.node, "data_dir", None)
         if data_dir is None:
@@ -751,7 +756,52 @@ class WebBridge:
             data_dir = getattr(config, "data_dir", None)
         if data_dir is None:
             return None
-        return Path(data_dir) / MESSAGES_FILE_NAME
+        return Path(data_dir)
+
+    def settings(self) -> Dict[str, Any]:
+        """This node's own settings, as ``tau config`` manages them.
+
+        Read live from ``node.json`` on every call, so a change made on
+        the CLI is reflected by the next console read without a restart
+        — and a change made here is picked up by the running node the
+        same way, since it re-reads these keys on every use.
+        """
+        data_dir = self._data_dir()
+        if data_dir is None:
+            raise WebBridgeError("this node has no data directory")
+        return {
+            "accept_files": accept_files_enabled(data_dir),
+            "send_read_receipts": send_read_receipts_enabled(data_dir),
+        }
+
+    def update_setting(self, setting: str, value: bool) -> Dict[str, Any]:
+        """Change one node setting and return the fresh settings.
+
+        Only the keys ``tau config`` manages are accepted, and the value
+        must be a real boolean — anything else is a client error, not a
+        value to coerce. The write keeps the other settings (and the
+        node's name) in place.
+        """
+        if setting not in ("accept_files", "send_read_receipts"):
+            raise ValueError(f"unknown setting {setting!r}")
+        if not isinstance(value, bool):
+            raise ValueError(f"setting {setting!r} must be true or false")
+        data_dir = self._data_dir()
+        if data_dir is None:
+            raise WebBridgeError("this node has no data directory")
+        set_node_setting(data_dir, setting, value)
+        return self.settings()
+
+    def _resolve_messages_path(self) -> Optional[Path]:
+        """Data-dir path for persisted message history, or ``None``.
+
+        A node without a data directory (tests, embeds) keeps messages in
+        memory only.
+        """
+        data_dir = self._data_dir()
+        if data_dir is None:
+            return None
+        return data_dir / MESSAGES_FILE_NAME
 
     def _load_messages(self) -> None:
         """Load persisted message history into the in-memory log."""
@@ -3917,6 +3967,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/outbox":
                 self._send_json(self.bridge.outbox(), head_only)
                 return
+            if path == "/api/settings":
+                try:
+                    self._send_json(self.bridge.settings(), head_only)
+                except WebBridgeError as exc:
+                    self._send_json(
+                        {"error": {"message": str(exc)}}, head_only, 503
+                    )
+                return
             if path == "/api/backup":
                 try:
                     result = self.bridge.backup()
@@ -4203,6 +4261,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/outbox/cancel":
                 self._handle_outbox_cancel(body, head_only)
+                return
+            if path == "/api/settings":
+                self._handle_settings(body, head_only)
                 return
             if path == "/api/groups":
                 try:
@@ -5002,6 +5063,32 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "cancelled": cancelled}, head_only)
 
+    def _handle_settings(self, body: Dict[str, Any], head_only: bool) -> None:
+        setting = body.get("setting")
+        if not isinstance(setting, str) or not setting.strip():
+            self._send_json(
+                {"error": {"message": "field 'setting' is required"}},
+                head_only,
+                400,
+            )
+            return
+        if "value" not in body:
+            self._send_json(
+                {"error": {"message": "field 'value' is required"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            settings = self.bridge.update_setting(setting.strip(), body["value"])
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except WebBridgeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json({"ok": True, "settings": settings}, head_only)
+
     def _handle_outbox_retry(self, body: Dict[str, Any], head_only: bool) -> None:
         # An explicitly supplied target (even blank) must be valid; only
         # an absent one means "retry the whole queue".
@@ -5056,7 +5143,6 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json({"ok": True, "dropped": dropped}, head_only)
-
 
     def _handle_ping(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("to")

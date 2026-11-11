@@ -26,6 +26,7 @@ import type {
   MessagesResponse,
   MessagesSearchResponse,
   NodeInfo,
+  NodeSettings,
   OutboxEntry,
   OutboxResponse,
   Peer,
@@ -42,6 +43,7 @@ import type {
   TauGroup,
   TauMessage,
   UnreadCounts,
+  UpdateSettingsResponse,
   VerifyPeerResponse,
   VerifyState,
 } from "./types";
@@ -121,6 +123,8 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [settings, setSettings] = useState<NodeSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
@@ -377,6 +381,31 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const settingsSeq = useRef(0);
+
+  const refreshSettings = useCallback(async () => {
+    // Same polling shape as the outbox: a setting changed on the CLI
+    // shows up here without waiting for a reload.
+    const requestId = ++settingsSeq.current;
+    try {
+      const result = await apiGet<NodeSettings>("/api/settings");
+      if (requestId !== settingsSeq.current) return;
+      setSettings(result);
+      setSettingsError(null);
+    } catch (caught) {
+      // Record the failure so the section can explain why the switches
+      // are disabled, then rethrow for callers that care.
+      if (requestId === settingsSeq.current) {
+        setSettingsError(
+          caught instanceof Error && caught.message
+            ? caught.message
+            : "couldn't load settings",
+        );
+      }
+      throw caught;
+    }
+  }, []);
+
   const peersSeq = useRef(0);
   const forgottenPeers = useRef(new Map<string, number>());
 
@@ -391,7 +420,6 @@ export function useTau() {
   }, []);
 
   const refreshHeldSeq = useRef(0);
-
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -416,14 +444,15 @@ export function useTau() {
   useEffect(() => {
     if (connection !== "live") return;
     async function tick() {
-      // The three endpoints are independent: a failure on one must not
-      // stop the others from updating their state. The outbox is a side
-      // panel: a failed poll leaves the last known entries in place
-      // instead of flashing an error.
+      // The endpoints are independent: a failure on one must not stop
+      // the others from updating their state. Each is a side panel: a
+      // failed poll leaves the last known values in place instead of
+      // flashing an error.
       await Promise.allSettled([
         refreshOutbox(),
         refreshHeldMail(),
         refreshGroups(),
+        refreshSettings(),
       ]);
     }
     void tick();
@@ -431,7 +460,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings]);
 
   const allowlistSeq = useRef(0);
 
@@ -531,6 +560,26 @@ export function useTau() {
       return result.cancelled;
     },
     [refreshOutbox],
+  );
+
+  const updateSetting = useCallback(
+    async (setting: keyof NodeSettings, value: boolean) => {
+      const result = await apiPost<UpdateSettingsResponse>("/api/settings", {
+        setting,
+        value,
+      });
+      // The update already succeeded: apply the returned settings at
+      // once, and treat the follow-up refresh as best-effort so a
+      // failed GET cannot make a successful change look like a failure.
+      setSettings(result.settings);
+      try {
+        await refreshSettings();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.settings;
+    },
+    [refreshSettings],
   );
 
   const deleteMessage = useCallback(async (id: number) => {
@@ -1210,6 +1259,8 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    settings,
+    settingsError,
     heldMail,
     allowlist,
     bridge,
@@ -1244,6 +1295,8 @@ export function useTau() {
     deleteGroup,
     refreshOutbox,
     refreshGroups,
+    refreshSettings,
+    updateSetting,
     refreshPeers,
     refreshMessages,
     cancelOutbox,

@@ -4070,6 +4070,92 @@ def test_outbox_cancel_errors(bridge, node):
     assert "unknown queued message" in payload["error"]["message"]
 
 
+def test_settings_defaults(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/settings")
+        assert status == 200
+        # A fresh data directory has no node.json: the CLI defaults apply.
+        assert payload == {"accept_files": False, "send_read_receipts": True}
+        assert not (tmp_path / "node.json").exists()
+    finally:
+        bridge.stop()
+
+
+def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "accept_files", "value": True},
+        )
+        assert status == 200
+        assert payload == {
+            "ok": True,
+            "settings": {"accept_files": True, "send_read_receipts": True},
+        }
+
+        # Toggling the second setting keeps the first, on disk and on read.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "send_read_receipts", "value": False},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": True,
+            "send_read_receipts": False,
+        }
+        status, _, payload = _json(bridge, "/api/settings")
+        assert payload == {"accept_files": True, "send_read_receipts": False}
+        stored = json.loads(
+            (tmp_path / "node.json").read_text(encoding="utf-8")
+        )
+        assert stored["accept_files"] is True
+        assert stored["send_read_receipts"] is False
+    finally:
+        bridge.stop()
+
+
+def test_settings_update_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body, fragment in [
+            ({}, "setting"),
+            ({"setting": "accept_files"}, "value"),
+            ({"setting": "name", "value": "bob"}, "unknown setting"),
+            ({"setting": "accept_files", "value": "yes"}, "must be true or false"),
+            ({"setting": "accept_files", "value": 1}, "must be true or false"),
+            ({"setting": "accept_files", "value": None}, "must be true or false"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/settings", method="POST", body=body
+            )
+            assert status == 400
+            assert fragment in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_settings_without_data_dir(bridge, node):
+    # A bridge on a dataless node has nowhere to read or persist settings.
+    node.data_dir = None
+    status, _, payload = _json(bridge, "/api/settings")
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/settings",
+        method="POST",
+        body={"setting": "accept_files", "value": True},
+    )
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
+
+
 def test_outbox_retry_one_by_id_and_prefix(bridge, node):
     first = _queue(node, PEER_HASH, "first")
     second = _queue(node, PEER_HASH, "second")
@@ -4329,7 +4415,6 @@ def test_outbox_drop_held_errors(bridge, node):
     )
     assert status == 400
     assert "unknown held message" in payload["error"]["message"]
-
 
 
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):

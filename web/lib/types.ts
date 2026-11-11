@@ -296,6 +296,16 @@ export interface CancelOutboxResponse {
   cancelled: OutboxEntry;
 }
 
+export interface NodeSettings {
+  accept_files: boolean;
+  send_read_receipts: boolean;
+}
+
+export interface UpdateSettingsResponse {
+  ok: boolean;
+  settings: NodeSettings;
+}
+
 export interface DoctorCheck {
   name: string;
   status: "ok" | "warn" | "fail";
