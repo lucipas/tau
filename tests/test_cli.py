@@ -765,6 +765,33 @@ def test_group_topic_set_show_and_clear(tmp_path, capsys):
     assert "only the creator" in capsys.readouterr().err
 
 
+def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    # --file together with a positional text is rejected, not silently won.
+    assert cli.main([*base, "some text", "--file", "whatever.txt"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # --file together with --clear is rejected, not silently dropped.
+    assert cli.main([*base, "--file", "whatever.txt", "--clear"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # A blank file is rejected instead of silently clearing the topic.
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n", encoding="utf-8")
+    assert cli.main([*base, "--file", str(blank)]) == 1
+    assert "blank" in capsys.readouterr().err
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"]).get("topic", "")
+        == ""
+    )
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])

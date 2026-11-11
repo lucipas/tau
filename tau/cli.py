@@ -5776,12 +5776,20 @@ def cmd_group_topic(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if getattr(args, "clear", False) and getattr(args, "text", None) is not None:
         raise NodeError("pass a topic or --clear, not both")
+    if getattr(args, "file", None) and getattr(args, "text", None) is not None:
+        raise NodeError("pass a topic text or --file, not both")
+    if getattr(args, "file", None) and getattr(args, "clear", False):
+        raise NodeError("pass --file or --clear, not both")
     text = getattr(args, "text", None)
     if getattr(args, "file", None):
         try:
             text = Path(args.file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             raise NodeError(f"could not read {args.file}: {exc}") from exc
+        if not text.strip():
+            raise NodeError(
+                f"{args.file} is blank; pass --clear to remove the topic"
+            )
     registry = PeerRegistry(config.peers_path)
     if text is None and not getattr(args, "clear", False):
         described = _describe_group(group, registry)

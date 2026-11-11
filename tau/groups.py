@@ -159,7 +159,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
     if roster_sent_at is not None:
         try:
             roster_sent_at = float(roster_sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if not math.isfinite(roster_sent_at):
             return None
@@ -172,7 +172,7 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
     if topic_sent_at is not None:
         try:
             topic_sent_at = float(topic_sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if not math.isfinite(topic_sent_at):
             return None
@@ -526,7 +526,7 @@ class GroupStore:
         if sent_at is not None:
             try:
                 sent_at = float(sent_at)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 sent_at = None
             if sent_at is not None and not math.isfinite(sent_at):
                 sent_at = None
@@ -539,7 +539,7 @@ class GroupStore:
         if topic_sent_at is not None:
             try:
                 topic_sent_at = float(topic_sent_at)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 topic_sent_at = None
             if topic_sent_at is not None and not math.isfinite(topic_sent_at):
                 topic_sent_at = None
@@ -615,6 +615,44 @@ class GroupStore:
                             for other in superseded
                             if other not in stale_for
                         ]
+                if superseded:
+                    # The topic is judged independently of the roster:
+                    # a successor whose message omits the topic, or
+                    # carries an older one, must not wipe a newer topic
+                    # a predecessor already holds.  Take the newest
+                    # topic among the predecessors being replaced and
+                    # adopt it when the incoming one is older or absent
+                    # (an unstamped incoming topic cannot prove itself
+                    # newer; a tie keeps the incoming message, like the
+                    # same-id rule below).  The candidate is only stored
+                    # when it is a new id; when it re-pins an existing
+                    # one the branch below decides instead.
+                    best_topic = None
+                    best_at = float("-inf")
+                    for other in superseded:
+                        if other.get("topic") is None:
+                            continue
+                        other_at = other.get("topic_sent_at")
+                        other_key = (
+                            other_at
+                            if isinstance(other_at, (int, float))
+                            else float("-inf")
+                        )
+                        if best_topic is None or other_key > best_at:
+                            best_topic = other["topic"]
+                            best_at = other_key
+                    cand_at = (
+                        topic_sent_at
+                        if isinstance(topic_sent_at, (int, float))
+                        else float("-inf")
+                    )
+                    if best_topic is not None and (
+                        topic is None or cand_at < best_at
+                    ):
+                        candidate["topic"] = best_topic
+                        candidate["topic_sent_at"] = (
+                            None if best_at == float("-inf") else best_at
+                        )
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
                 if learned - len(superseded) >= MAX_LEARNED_GROUPS:
@@ -649,7 +687,10 @@ class GroupStore:
                     # it.  A message with no sent_at cannot prove
                     # staleness, so it pins the text but leaves the
                     # stamp alone — clearing it would let an older
-                    # queued copy win afterwards.
+                    # queued copy win afterwards.  An update that
+                    # changes neither the text nor the stamp writes
+                    # nothing, so an ordinary creator message does not
+                    # rewrite the groups file.
                     existing_topic_at = existing.get("topic_sent_at")
                     stale = (
                         existing_topic_at is not None
@@ -658,7 +699,10 @@ class GroupStore:
                     )
                     if not stale and (
                         existing.get("topic", "") != topic
-                        or topic_sent_at is not None
+                        or (
+                            topic_sent_at is not None
+                            and topic_sent_at != existing_topic_at
+                        )
                     ):
                         updates["topic"] = topic
                         if topic_sent_at is not None:

@@ -416,7 +416,7 @@ def encode_group_message(
     if group_topic_sent_at is not None:
         try:
             topic_at = float(group_topic_sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             topic_at = None
         if topic_at is not None and math.isfinite(topic_at):
             payload["group_topic_sent_at"] = topic_at
@@ -457,9 +457,17 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         topic is not None
         and isinstance(raw_topic_at, (int, float))
         and not isinstance(raw_topic_at, bool)
-        and math.isfinite(raw_topic_at)
     ):
-        topic_sent_at = float(raw_topic_at)
+        # Convert before the finiteness check: math.isfinite() on a
+        # huge JSON integer raises OverflowError before it can return
+        # False, which would fail parsing before any sender policy
+        # check runs.
+        try:
+            topic_sent_at = float(raw_topic_at)
+        except OverflowError:
+            topic_sent_at = None
+        if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+            topic_sent_at = None
     return {
         "text": text,
         "sent_at": sent_at,

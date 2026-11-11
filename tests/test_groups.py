@@ -24,6 +24,7 @@ from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     MAX_GROUP_TOPIC_LENGTH,
+    PROTOCOL_VERSION,
     ProtocolError,
     clean_group_topic,
     decode,
@@ -589,6 +590,225 @@ def test_group_store_record_topic_judged_by_its_own_timestamp(tmp_path):
         )["topic"]
         == "new plan"
     )
+
+
+def _topic_successor_setup(tmp_path):
+    """A store holding a predecessor group with a topic set at 200.
+
+    The successor shares the name but drops a member, so its id differs
+    and the creator's message supersedes the predecessor by name.
+    """
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    old_id = derive_group_id(OWN_HASH, "weekend", members)
+    pinned = store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="old plan",
+        topic_sent_at=200.0,
+    )
+    assert pinned is not None and pinned["topic"] == "old plan"
+    new_members = [OWN_HASH, OTHER_HASH]
+    new_id = derive_group_id(OWN_HASH, "weekend", new_members)
+    return store, members, new_members, old_id, new_id
+
+
+def test_group_store_record_successor_adopts_missing_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # The successor's message omits the topic: the predecessor's newer
+    # one survives the replacement.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_successor_keeps_newer_predecessor_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # The successor carries an older topic: the predecessor's newer one
+    # wins, even though the successor's roster is the live one.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="older plan",
+        topic_sent_at=100.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_successor_keeps_its_newer_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="new plan",
+        topic_sent_at=300.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "new plan"
+    assert successor["topic_sent_at"] == 300.0
+    assert store.get(old_id) is None
+    # And a clear with a newer stamp still clears it.
+    cleared = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=160.0,
+        topic="",
+        topic_sent_at=300.0,
+    )
+    assert cleared is not None and cleared["topic"] == ""
+
+
+def test_group_store_record_same_topic_skips_write(tmp_path):
+    path = tmp_path / "groups.json"
+    store = GroupStore(path)
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert pinned is not None
+    # The identical creator message changes neither the text nor the
+    # stamp, so the groups file must not be rewritten at all.
+    calls = []
+    original_save = store._save
+
+    def counting_save():
+        calls.append(1)
+        return original_save()
+
+    store._save = counting_save
+    again = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert again is not None and again["topic"] == "planning the meetup"
+    assert calls == []
+
+
+def test_group_store_record_ignores_huge_timestamps(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    huge = 10**400
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=huge,
+        topic="planning the meetup",
+        topic_sent_at=huge,
+    )
+    assert pinned is not None
+    assert pinned["topic"] == "planning the meetup"
+    assert pinned["topic_sent_at"] is None
+    assert pinned.get("roster_sent_at") is None
+    # The store still works afterwards.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=100.0,
+            topic="new plan",
+        )["topic"]
+        == "new plan"
+    )
+
+
+def test_group_message_huge_topic_timestamp_is_dropped():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    raw = json.dumps(
+        {
+            "type": "group_message",
+            "v": PROTOCOL_VERSION,
+            "text": "hello",
+            "sent_at": 100.0,
+            "client": "tau/0",
+            "group": derive_group_id(OWN_HASH, "weekend", members),
+            "group_name": "weekend",
+            "creator": OWN_HASH,
+            "members": members,
+            "id": "huge-topic-1",
+            "group_topic": "planning the meetup",
+            "group_topic_sent_at": 10**400,
+        }
+    ).encode()
+    parsed = parse_group_message(raw)
+    assert parsed["group_topic"] == "planning the meetup"
+    assert parsed["group_topic_sent_at"] is None
+
+
+def test_validated_sealed_message_ignores_huge_timestamps():
+    from tau.mailbox import _validated_sealed_message
+
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    payload = {
+        "id": "sealed-huge-1",
+        "text": "hello",
+        "from": OWN_HASH,
+        "from_name": "alice",
+        "sent_at": 10**400,
+        "group": {
+            "id": derive_group_id(OWN_HASH, "weekend", members),
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": members,
+            "topic": "planning the meetup",
+            "topic_sent_at": 10**400,
+        },
+    }
+    result = _validated_sealed_message(payload)
+    assert result["sent_at"] is None
+    assert result["group"]["topic"] == "planning the meetup"
+    assert "topic_sent_at" not in result["group"]
 
 
 def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
