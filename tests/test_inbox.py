@@ -1130,3 +1130,29 @@ def test_note_cursor_does_not_cover_peer_mail(tmp_path):
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["peer-1", note["id"]]
     assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_add_note_raises_when_persist_fails(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+
+    def _failing_save(*, strict=False):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(inbox, "_save", _failing_save)
+    with pytest.raises(OSError):
+        inbox.add_note("lost note", sender_name="alice", destination="cc" * 16)
+    # Nothing was kept in memory, and nothing landed on disk.
+    assert len(inbox) == 0
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert len(Inbox(tmp_path / "inbox.json")) == 0
+
+
+def test_unreceipted_excludes_notes(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    note = inbox.add_note("a note", sender_name="alice", destination="cc" * 16)
+    peer = inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
+    # Both displayed: the serving node's receipt sweep must only ever
+    # see the peer's message, never the note.
+    inbox.mark_read([note["id"], peer["id"]])
+    assert [item["id"] for item in inbox.read_unreceipted()] == ["peer-1"]
+    assert [item["id"] for item in inbox.unreceipted()] == ["peer-1"]

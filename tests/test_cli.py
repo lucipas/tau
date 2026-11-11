@@ -1857,6 +1857,19 @@ def test_note_rejects_empty_text(tmp_path, capsys):
     assert "must not be empty" in capsys.readouterr().err
 
 
+def test_react_to_note_is_refused(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    assert cli.main(["note", "--data-dir", str(data_dir), "a note", "--json"]) == 0
+    note_id = json.loads(capsys.readouterr().out)["note"]["id"]
+
+    # A note's destination is this node, not a remote author: there is
+    # no peer to react to, so refuse before starting a node.
+    code = cli.main(["react", "--data-dir", str(data_dir), note_id, "👍"])
+    assert code == 1
+    assert "cannot be reacted to" in capsys.readouterr().err
+
+
 def test_listing_notes_sends_no_receipt(tmp_path, capsys, monkeypatch):
     data_dir = _init_node(tmp_path, "node", "alice")
     capsys.readouterr()

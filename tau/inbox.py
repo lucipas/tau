@@ -1163,7 +1163,6 @@ class Inbox:
         added: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._messages)
-            previous_cursors = dict(self._read_cursors)
             seen = {_dedupe_key(item) for item in self._messages}
             for entry in entries:
                 record = _valid_record(entry)
@@ -1203,18 +1202,6 @@ class Inbox:
                 # the transaction would find none of them and the caller
                 # would mirror nothing.
                 kept = {id(item) for item in self._messages}
-                inserted.extend(item for item in added if id(item) in kept)
-        return {
-            "imported": imported,
-            "present": present,
-            "skipped": skipped,
-            "errors": errors,
-        }
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._messages)
-tem) for item in self._messages}
                 inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
