@@ -2,9 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { API_BASE } from "@/lib/api";
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
+  formatFileSize,
   formatRtt,
   formatTime,
   shortHash,
@@ -12,22 +14,44 @@ import {
 
 import { CopyButton, RadarIcon, SectionLabel } from "./ui";
 
+// One emoji or short text token per the protocol limit (32 chars);
+// a fixed picker keeps every reaction inside it by construction.
+export const REACT_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
 export function MessageFeed({
   messages,
   node,
   live,
   onReply,
   onDelete,
+  onReact,
+  searching,
+  searchQuery,
+  searchError,
+  onSearch,
+  onClearSearch,
+  quoteContext,
 }: {
   messages: TauMessage[];
   node: NodeInfo | null;
   live: boolean;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
+  // `reaction` null retracts the caller's reaction to the message.
+  onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
+  searching?: boolean;
+  searchQuery?: string | null;
+  searchError?: string | null;
+  onSearch?: (query: string) => Promise<unknown> | unknown;
+  onClearSearch?: () => void;
+  // History used to resolve reply quotes; defaults to `messages`. Search
+  // passes the live traffic here so originals outside the hits still resolve.
+  quoteContext?: TauMessage[];
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const [searchText, setSearchText] = useState("");
 
   const counts = useMemo(() => {
     let inbound = 0;
@@ -40,9 +64,18 @@ export function MessageFeed({
   }, [messages]);
 
   useEffect(() => {
-    if (!stickToBottom.current) return;
+    // Search results are newest first: sticking to the bottom would land
+    // on the oldest match, so only the live feed auto-scrolls.
+    if (searching || !stickToBottom.current) return;
     endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
-  }, [messages.length]);
+  }, [messages.length, searching]);
+
+  useEffect(() => {
+    // Show newest-first search hits from the top, not wherever a scrolled
+    // live feed left the container.
+    if (!searching || !scrollRef.current) return;
+    scrollRef.current.scrollTop = 0;
+  }, [searching, messages]);
 
   function onScroll() {
     const element = scrollRef.current;
@@ -52,24 +85,79 @@ export function MessageFeed({
     stickToBottom.current = distance < 140;
   }
 
+  async function submitSearch() {
+    if (!searchText.trim() || !onSearch) return;
+    await onSearch(searchText.trim());
+  }
+
+  function clearSearch() {
+    setSearchText("");
+    onClearSearch?.();
+  }
+
   return (
     <section className="flex min-h-0 flex-1 flex-col rounded-2xl border border-line/80 bg-panel/40">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
         <div className="flex items-center gap-3">
-          <SectionLabel>traffic</SectionLabel>
+          <SectionLabel>{searching ? "search results" : "traffic"}</SectionLabel>
           <span className="font-mono text-[10px] text-mist">
-            {counts.inbound} in / {counts.outbound} out
+            {searching
+              ? `${messages.length} match(es)`
+              : `${counts.inbound} in / ${counts.outbound} out`}
           </span>
         </div>
-        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-mist">
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              live ? "bg-signal" : "bg-amber"
-            }`}
-          />
-          {live ? "streaming" : "waiting for bridge"}
-        </span>
+        <div className="flex items-center gap-2">
+          {searching && onClearSearch ? (
+            <button
+              type="button"
+              onClick={clearSearch}
+              className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
+            >
+              clear search
+            </button>
+          ) : null}
+          <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-mist">
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                live ? "bg-signal" : "bg-amber"
+              }`}
+            />
+            {live ? "streaming" : "waiting for bridge"}
+          </span>
+        </div>
       </div>
+
+      {onSearch ? (
+        <form
+          className="flex gap-2 border-b border-line/60 px-4 py-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitSearch();
+          }}
+        >
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="Search stored messages…"
+            spellCheck={false}
+            aria-label="Search stored messages"
+            className="h-9 min-w-0 flex-1 rounded-lg border border-line bg-void/70 px-2.5 font-mono text-xs text-zinc-200 outline-none transition placeholder:text-mist/60 focus:border-signal/60 focus:ring-2 focus:ring-signal/20"
+          />
+          <button
+            type="submit"
+            disabled={!searchText.trim()}
+            className="rounded-lg border border-line bg-void/70 px-2.5 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+          >
+            search
+          </button>
+        </form>
+      ) : null}
+
+      {searchError ? (
+        <p className="border-b border-line/60 px-4 py-2 font-mono text-[11px] text-rose-400">
+          {searchError}
+        </p>
+      ) : null}
 
       <div
         ref={scrollRef}
@@ -79,21 +167,44 @@ export function MessageFeed({
         className="thin-scroll min-h-[320px] flex-1 space-y-4 overflow-y-auto px-4 py-5 lg:max-h-[calc(100dvh-330px)]"
       >
         {messages.length === 0 ? (
-          <EmptyState node={node} />
+          searching ? (
+            <SearchEmptyState query={searchQuery ?? ""} />
+          ) : (
+            <EmptyState node={node} />
+          )
         ) : (
           messages.map((message) => (
             <MessageBubble
               key={message.id}
               message={message}
-              messages={messages}
+              messages={quoteContext ?? messages}
+              node={node}
               onReply={onReply}
               onDelete={onDelete}
+              onReact={onReact}
             />
           ))
         )}
         <div ref={endRef} />
       </div>
     </section>
+  );
+}
+
+function SearchEmptyState({ query }: { query: string }) {
+  return (
+    <div className="flex h-full min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        τ
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No stored messages match “{query}”
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Search covers the text of stored messages, sent and received. Try a
+        different word, or clear the search to return to the live traffic.
+      </p>
+    </div>
   );
 }
 
@@ -173,13 +284,17 @@ export function resolveQuote(
 function MessageBubble({
   message,
   messages,
+  node,
   onReply,
   onDelete,
+  onReact,
 }: {
   message: TauMessage;
   messages: TauMessage[];
+  node: NodeInfo | null;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
+  onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
 }) {
   const outbound = message.direction === "out";
   const peerHash = message.peer ?? "";
@@ -205,6 +320,42 @@ function MessageBubble({
       setConfirmingDelete(false);
     } finally {
       setDeleting(false);
+    }
+  }
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [reactError, setReactError] = useState<string | null>(null);
+  const [reactPending, setReactPending] = useState(false);
+  // Synchronous guard so rapid clicks cannot start overlapping requests
+  // before the pending state has re-rendered.
+  const reactInFlight = useRef(false);
+  // The node's own destination hash is what the bridge records as the
+  // reactor, so this is how the console knows which reaction is mine.
+  const ownReaction =
+    node === null
+      ? undefined
+      : message.reactions?.find(
+          (reaction) => reaction.reactor === node.destination,
+        );
+
+  async function handleReact(reaction: string) {
+    if (!onReact || reactInFlight.current) return;
+    reactInFlight.current = true;
+    setReactPending(true);
+    setReactError(null);
+    try {
+      // Tapping the emoji already in use retracts it.
+      await onReact(
+        message,
+        ownReaction?.reaction === reaction ? null : reaction,
+      );
+      setPickerOpen(false);
+    } catch (error) {
+      setReactError(
+        error instanceof Error ? error.message : "reaction failed",
+      );
+    } finally {
+      reactInFlight.current = false;
+      setReactPending(false);
     }
   }
 
@@ -268,6 +419,33 @@ function MessageBubble({
           {message.text}
         </div>
 
+        {message.file ? (
+          <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-line/70 bg-void/50 px-2.5 py-1.5 font-mono text-[11px] text-zinc-300">
+            <span aria-hidden="true">📎</span>
+            <span className="min-w-0 flex-1 truncate" title={message.file.name}>
+              {message.file.name}
+            </span>
+            <span className="shrink-0 text-mist">
+              {formatFileSize(message.file.size)}
+            </span>
+            <span
+              className="hidden shrink-0 text-mist/70 sm:inline"
+              title={`SHA-256 ${message.file.sha256}`}
+            >
+              sha256 {shortHash(message.file.sha256, 8)}
+            </span>
+            {message.direction === "in" && message.peer ? (
+              <a
+                className="shrink-0 text-signal hover:underline"
+                href={`${API_BASE}/api/files/${message.peer}/${encodeURIComponent(message.file.name)}`}
+                download={message.file.name}
+              >
+                Download
+              </a>
+            ) : null}
+          </div>
+        ) : null}
+
         {message.reactions && message.reactions.length > 0 ? (
           <div
             className={`flex flex-wrap gap-1.5 px-1 pt-1.5 ${
@@ -299,7 +477,9 @@ function MessageBubble({
                 ? "queued"
                 : message.status === "read"
                   ? "read"
-                  : "delivered"
+                  : message.status === "failed"
+                    ? "failed"
+                    : "delivered"
               : "received"}
           </span>
           {message.rtt_ms !== undefined ? (
@@ -352,7 +532,70 @@ function MessageBubble({
           {deleteError ? (
             <span className="text-rose-300">{deleteError}</span>
           ) : null}
+          {onReact && message.wire_id ? (
+            <button
+              type="button"
+              title="React to this message"
+              aria-label="React to this message"
+              aria-expanded={pickerOpen}
+              onClick={() => {
+                setReactError(null);
+                setPickerOpen((open) => !open);
+              }}
+              className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+            >
+              ♡ react
+            </button>
+          ) : null}
         </div>
+
+        {pickerOpen ? (
+          <div
+            className={`flex flex-wrap gap-1 px-1 pt-1 ${
+              outbound ? "justify-end" : ""
+            }`}
+            role="group"
+            aria-label="Choose a reaction"
+          >
+            {REACT_OPTIONS.map((option) => {
+              const active = ownReaction?.reaction === option;
+              return (
+                <button
+                  key={option}
+                  type="button"
+                  title={
+                    active
+                      ? `Remove your ${option} reaction`
+                      : `React with ${option}`
+                  }
+                  aria-label={
+                    active
+                      ? `Remove your ${option} reaction`
+                      : `React with ${option}`
+                  }
+                  aria-pressed={active}
+                  disabled={reactPending}
+                  onClick={() => void handleReact(option)}
+                  className={`grid h-7 w-7 place-items-center rounded-lg border text-sm transition ${
+                    active
+                      ? "border-signal/50 bg-signal/15"
+                      : "border-line/80 bg-void/60 hover:border-signal/35 hover:bg-void"
+                  }`}
+                >
+                  <span aria-hidden="true">{option}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+        {reactError ? (
+          <p
+            className="px-1 pt-1 font-mono text-[10px] text-amber"
+            role="alert"
+          >
+            reaction failed: {reactError}
+          </p>
+        ) : null}
       </div>
     </article>
   );

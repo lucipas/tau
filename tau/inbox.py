@@ -33,7 +33,12 @@ try:  # POSIX only; the cross-process lock is a no-op without it.
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
 
-from .protocol import clean_in_reply_to
+from .protocol import (
+    DEFAULT_MESSAGE_KIND,
+    ProtocolError,
+    clean_in_reply_to,
+    normalize_message_kind,
+)
 from .util import atomic_write_json, read_json
 
 log = logging.getLogger(__name__)
@@ -166,6 +171,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["kind"] = "group"
         record["group"] = group_id.lower()
         record["group_name"] = str(raw.get("group_name") or "group")
+    else:
+        try:
+            kind = normalize_message_kind(raw.get("kind"))
+        except ProtocolError:
+            # A hand-edited record keeps its text; the kind falls back to
+            # plain chat rather than dropping the message.
+            kind = DEFAULT_MESSAGE_KIND
+        record["kind"] = kind
     return record
 
 
@@ -819,12 +832,14 @@ class Inbox:
         peer: Optional[str] = None,
         query: Optional[str] = None,
         group: Optional[str] = None,
+        kind: Optional[str] = None,
         direction: Optional[str] = "in",
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``query`` keeps only messages whose
+        filters to one group id; ``kind`` filters to one message kind;
+        ``query`` keeps only messages whose
         text contains it (case-insensitive substring); ``limit`` caps
         how many are returned (``None`` means all of them).  Sent
         messages are recorded here too — a reply quotes the sender's
@@ -865,6 +880,8 @@ class Inbox:
                 for item in entries
                 if item.get("kind") == "group" and item.get("group") == group
             ]
+        if kind is not None:
+            entries = [item for item in entries if item.get("kind") == kind]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]

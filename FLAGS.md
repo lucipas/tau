@@ -26,7 +26,7 @@ Global options may appear before or after the command:
 | `tau info --to PEER` | Fetch a remote node's information |
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
-| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
+| `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`, and while mail acknowledgements are owed). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
 | `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; listing marks shown messages read) |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
@@ -45,6 +45,8 @@ Global options may appear before or after the command:
 | `tau id` | Show this node's name, destination hash, LXMF delivery address, and safety number (fingerprint of this identity) |
 | `tau id export --to PATH` | Back up the node identity to a file |
 | `tau id import --from PATH` | Restore the node identity from a backup |
+| `tau backup FILE` | Back up the data directory (identity, peers, outbox, inbox, Tan) to one archive; excludes groups, the blocklist, and received files |
+| `tau restore FILE` | Restore a backup archive into a data directory |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
 | `tau tan quote POST TEXT` | Quote a post with your own comment (signed entry on your chain) |
@@ -53,6 +55,7 @@ Global options may appear before or after the command:
 | `tau tan delete POST` | Delete one of your own posts |
 | `tau tan timeline` | Show your posts and the authors you follow |
 | `tau tan thread POST` | Show a post with its replies as a nested thread |
+| `tau tan likes POST` | Show who currently likes a post |
 | `tau tan search TEXT` | Search stored posts by keyword (local only) |
 | `tau tan mentions` | Show replies to your own posts |
 | `tau tan follow PEER` | Follow a peer or destination hash |
