@@ -8,6 +8,7 @@ import stat
 import pytest
 
 from tau.inbox import Inbox
+from tau.protocol import ProtocolError
 
 
 def _record(**overrides):
@@ -1688,3 +1689,96 @@ def test_reload_caps_each_direction(tmp_path, monkeypatch):
 
     entries = Inbox(path).list_messages(direction=None)
     assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]
+
+
+def test_add_note_stores_a_read_note_from_self(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    own = "cc" * 16
+    entry = inbox.add_note(
+        "  buy milk on the way home  ", sender_name="alice", destination=own
+    )
+
+    assert entry["kind"] == "note"
+    assert entry["direction"] == "in"
+    assert entry["from"] == "alice"
+    assert entry["destination"] == own
+    assert entry["text"] == "buy milk on the way home"
+    assert entry["id"] and len(entry["id"]) == 32
+
+    # Read the moment it is written: no unread marker, no count.
+    listed = inbox.list_messages()
+    assert [item["id"] for item in listed] == [entry["id"]]
+    assert listed[0]["unread"] is False
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+    # Found by the kind filter and by search, hidden by other kinds.
+    assert [item["id"] for item in inbox.list_messages(kind="note")] == [
+        entry["id"]
+    ]
+    assert inbox.list_messages(kind="chat") == []
+    assert [item["id"] for item in inbox.list_messages(query="MILK")] == [
+        entry["id"]
+    ]
+
+
+def test_add_note_rejects_empty_text(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ProtocolError):
+        inbox.add_note("   ", sender_name="alice", destination="cc" * 16)
+    assert len(inbox) == 0
+
+
+def test_note_survives_export_import(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    entry = source.add_note("remember the mesh node", sender_name="alice", destination="cc" * 16)
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(source.export_document())
+    assert result == {"imported": 1, "present": 0, "skipped": 0, "errors": []}
+    imported = target.list_messages(kind="note")
+    assert [item["id"] for item in imported] == [entry["id"]]
+    assert imported[0]["text"] == "remember the mesh node"
+    # Read state does not travel with an export — cursors are not in
+    # the document — so an imported note is unread in the new inbox,
+    # like any other imported message; listing it marks it read.
+    assert imported[0]["unread"] is True
+    target.mark_read(peer="cc" * 16)
+    assert target.list_messages(kind="note")[0]["unread"] is False
+
+
+def test_note_cursor_does_not_cover_peer_mail(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    note = inbox.add_note("a note", sender_name="alice", destination="cc" * 16)
+    inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
+
+    # The note's own-hash cursor advanced, the peer's did not.
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["peer-1", note["id"]]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_add_note_raises_when_persist_fails(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+
+    def _failing_save(*, strict=False):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(inbox, "_save", _failing_save)
+    with pytest.raises(OSError):
+        inbox.add_note("lost note", sender_name="alice", destination="cc" * 16)
+    # Nothing was kept in memory, and nothing landed on disk.
+    assert len(inbox) == 0
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert len(Inbox(tmp_path / "inbox.json")) == 0
+
+
+def test_unreceipted_excludes_notes(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    note = inbox.add_note("a note", sender_name="alice", destination="cc" * 16)
+    peer = inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
+    # Both displayed: the serving node's receipt sweep must only ever
+    # see the peer's message, never the note.
+    inbox.mark_read([note["id"], peer["id"]])
+    assert [item["id"] for item in inbox.read_unreceipted()] == ["peer-1"]
+    assert [item["id"] for item in inbox.unreceipted()] == ["peer-1"]

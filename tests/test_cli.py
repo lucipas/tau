@@ -1878,6 +1878,164 @@ def test_messages_kind_filter_and_tag(tmp_path, capsys):
     assert "message kind" in capsys.readouterr().err
 
 
+def test_parser_note_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["note", "buy milk"])
+    assert args.command == "note"
+    assert args.message == "buy milk"
+    assert args.file is None
+
+    args = parser.parse_args(["note", "--file", "notes.txt"])
+    assert args.message is None
+    assert str(args.file) == "notes.txt"
+
+
+def test_note_saves_and_lists(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+
+    code = cli.main(["note", "--data-dir", str(data_dir), "buy milk on the way home"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "note saved #" in out
+    assert "[note]" in out
+    assert "buy milk on the way home" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "buy milk on the way home" in out
+    assert "[note]" in out
+    assert "alice" in out
+    # A note is read the moment it is written: no unread marker.
+    assert "●" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "note"])
+    assert code == 0
+    assert "buy milk on the way home" in capsys.readouterr().out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "chat"])
+    assert code == 0
+    assert "buy milk on the way home" not in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--search", "MILK"]
+    )
+    assert code == 0
+    assert "buy milk on the way home" in capsys.readouterr().out
+
+
+def test_note_json_and_file(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    note_file = tmp_path / "note.txt"
+    note_file.write_text("call bob about the mesh node\n", encoding="utf-8")
+
+    code = cli.main(
+        ["note", "--data-dir", str(data_dir), "--file", str(note_file), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["note"]["kind"] == "note"
+    assert payload["note"]["text"] == "call bob about the mesh node"
+    assert payload["note"]["from"] == "alice"
+    assert payload["note"]["direction"] == "in"
+
+
+def test_note_requires_identity(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    code = cli.main(["note", "--data-dir", str(data_dir), "hello"])
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
+
+
+def test_note_rejects_empty_text(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+
+    code = cli.main(["note", "--data-dir", str(data_dir), "   "])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_react_to_note_is_refused(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    assert cli.main(["note", "--data-dir", str(data_dir), "a note", "--json"]) == 0
+    note_id = json.loads(capsys.readouterr().out)["note"]["id"]
+
+    # A note's destination is this node, not a remote author: there is
+    # no peer to react to, so refuse before starting a node.
+    code = cli.main(["react", "--data-dir", str(data_dir), note_id, "👍"])
+    assert code == 1
+    assert "cannot be reacted to" in capsys.readouterr().err
+
+
+def test_listing_notes_sends_no_receipt(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    assert cli.main(["note", "--data-dir", str(data_dir), "just a note"]) == 0
+    capsys.readouterr()
+
+    started = []
+    receipted = []
+
+    class _RecordingNode:
+        def __init__(self, *args, **kwargs):
+            started.append(True)
+
+        def start(self, **kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+        def send_read_receipts(self, peer_hash, ids):
+            receipted.append((peer_hash, list(ids)))
+            return {"ids": list(ids), "ok": True}
+
+    monkeypatch.setattr(cli, "TauNode", _RecordingNode)
+
+    # Listing a note-only inbox must not start a node at all: there is
+    # no peer to receipt, and receipting our own destination would make
+    # the node discover itself.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "just a note" in capsys.readouterr().out
+    assert started == []
+    assert receipted == []
+
+    # Control: the same listing with a real peer message does reach
+    # for a node, so the skip above proves the filter, not a dead path.
+    data_dir2 = _init_node(tmp_path, "node2", "bob")
+    capsys.readouterr()
+    config2 = TauConfig.resolve(data_dir=data_dir2, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry2 = PeerRegistry(config2.peers_path)
+    registry2.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry2.save()
+    Inbox(config2.inbox_path).append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "hello bob",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir2)])
+    assert code == 0
+    assert "hello bob" in capsys.readouterr().out
+    assert started == [True]
+    assert receipted == [(sender_hash.hex(), ["m-1"])]
+
+
 def test_messages_json_and_peer_filter(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
 

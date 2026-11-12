@@ -259,10 +259,12 @@ def test_message_without_kind_parses_as_chat():
         "１",
         "١",
         # Reserved inbox record types, never a DM kind: a message
-        # tagged "group" or "file" could never be stored in the
+        # tagged "group", "file" or "note" could never be stored in the
         # recipient's inbox.
         "group",
         "file",
+        "note",
+        "NOTE",
         "GROUP",
     ],
 )
