@@ -4875,6 +4875,29 @@ def test_annotated_pinned_posts_newest_first(identities, tmp_path):
     assert next_offset is None
 
 
+def test_annotated_pinned_posts_applies_edits(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    post = create_post(conn, alice, "original", name="alice", now=1000)
+    pin_post(conn, post["hash"], owner=owner, now=2000)
+
+    # The pinned list shows the current edit, not the original text.
+    create_edit(conn, alice, post["hash"], "fixed", name="alice", now=1001)
+    posts, _ = annotated_pinned_posts(conn, viewer=owner)
+    assert len(posts) == 1
+    assert posts[0]["text"] == "fixed"
+    assert posts[0]["edited"] is True
+
+    # ... and an edit that landed before a delete stays blanked.
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    posts, _ = annotated_pinned_posts(conn, viewer=owner)
+    assert len(posts) == 1
+    assert posts[0]["text"] == ""
+    assert posts[0]["deleted"] is True
+    assert posts[0]["edited"] is False
+
+
 def test_cli_tan_pin(tmp_path, capsys):
     data_dir = tmp_path / "alice"
     assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0

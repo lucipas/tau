@@ -3997,6 +3997,7 @@ def annotated_pinned_posts(
             # Edits replace the stored text, so re-blank deleted entries.
             if post.get("deleted"):
                 post["text"] = ""
+                post["edited"] = False
             post["pinned"] = True
         batch = [
             post
