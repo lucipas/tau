@@ -719,6 +719,15 @@ def parse_edit(raw: Any) -> Dict[str, Any]:
     sent_at = payload.get("sent_at")
     if not isinstance(sent_at, (int, float)):
         sent_at = None
+    else:
+        # A huge JSON integer parses fine but cannot become a float
+        # timestamp; reject it here rather than crash the handler.
+        try:
+            sent_at = float(sent_at)
+        except OverflowError as exc:
+            raise ProtocolError("edit sent_at is out of range") from exc
+        if not math.isfinite(sent_at):
+            raise ProtocolError("edit sent_at must be a finite timestamp")
     message_id = payload.get("id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
         message_id = None
