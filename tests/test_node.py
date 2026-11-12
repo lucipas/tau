@@ -231,6 +231,155 @@ def test_send_message_records_nothing_when_peer_refuses(tmp_path, monkeypatch):
     assert len(node.inbox) == 0
 
 
+def _group_reaction_node(tmp_path):
+    """A node with a signing identity and a crew group to react in."""
+    import types
+
+    node = make_node(tmp_path)
+    identity = RNS.Identity()
+    node.identity = identity
+    own_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT).hex()
+    # A bare destination stand-in: only the hexhash is consulted, and
+    # building a live RNS destination needs a running Reticulum.
+    node.destination = types.SimpleNamespace(hexhash=own_hash)
+    alice = make_peer("alice")
+    bob = make_peer("bob")
+    for peer in (alice, bob):
+        node.registry.upsert(
+            peer.destination_hash, peer.public_key, name=peer.name, now=1.0
+        )
+    group = node.groups.create(
+        "crew",
+        [alice.hexhash, bob.hexhash, own_hash],
+        created_by=alice.hexhash,
+    )
+    return node, group, alice, bob
+
+
+def test_send_group_reaction_fans_out_one_signed_payload(tmp_path, monkeypatch):
+    import base64
+
+    from tau.protocol import REQUEST_REACT, parse_reaction, reaction_unsigned_bytes
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    assert response["ok"] is True
+    assert response["group"] == group["id"]
+    assert response["target"] == "m-1"
+    assert response["reaction"] == "👍"
+    assert response["cleared"] is False
+    # Both members got a leg; this node never reacts to itself.
+    # The roster is in sorted-hash order, so compare as a set.
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert all(r.get("delivered") for r in response["results"])
+    assert len(calls) == 2
+    assert all(path == REQUEST_REACT for _, path, _ in calls)
+    # One signed payload, one reaction id, for every leg.
+    assert calls[0][2] == calls[1][2]
+    payload = parse_reaction(calls[0][2])
+    assert payload["target"] == "m-1"
+    assert payload["reaction"] == "👍"
+    assert payload["id"] == response["id"]
+    assert node.identity.validate(
+        base64.b64decode(payload["sig"]),
+        reaction_unsigned_bytes(calls[0][2]),
+    )
+    # The local copy is recorded exactly once, under the same id.
+    stored = node.inbox.reactions_for("m-1")
+    assert len(stored) == 1
+    assert stored[0]["id"] == response["id"]
+    assert stored[0]["reaction"] == "👍"
+
+
+def test_send_group_reaction_reports_failed_leg(tmp_path, monkeypatch):
+    node, _, alice, bob = _group_reaction_node(tmp_path)
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            raise NotAllowedError("peer rejected the request: not allowed")
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("error") == "not_allowed"
+    # One delivered leg is enough for the local copy, recorded once.
+    stored = node.inbox.reactions_for("m-1")
+    assert len(stored) == 1
+    assert stored[0]["id"] == response["id"]
+
+
+def test_send_group_reaction_records_nothing_when_every_leg_fails(
+    tmp_path, monkeypatch
+):
+    node, _, _, _ = _group_reaction_node(tmp_path)
+
+    def _fail(*args, **kwargs):
+        raise NodeError("no route to peer")
+
+    monkeypatch.setattr(node, "_request", _fail)
+
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    assert response["ok"] is False
+    assert all(r.get("error") == "no route to peer" for r in response["results"])
+    assert node.inbox.reactions_for("m-1") == []
+
+
+def test_send_group_reaction_clear_fans_out_retraction(tmp_path, monkeypatch):
+    node, _, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_reaction("crew", "m-1", "", timeout=5.0)
+
+    assert response["ok"] is True
+    assert response["cleared"] is True
+    assert response["reaction"] == ""
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    from tau.protocol import parse_reaction
+
+    assert parse_reaction(calls[0])["reaction"] == ""
+
+
+def test_send_group_reaction_rejects_unknown_and_solo_groups(tmp_path):
+    node, group, _, _ = _group_reaction_node(tmp_path)
+    with pytest.raises(ValueError, match="unknown group"):
+        node.send_group_reaction("nope", "m-1", "👍")
+    # A group whose only member is this node cannot be created
+    # (groups need at least 2 members), so pass the record directly.
+    solo = {
+        "id": "00" * 16,
+        "name": "solo",
+        "members": [node.destination.hexhash],
+        "creator": node.destination.hexhash,
+    }
+    with pytest.raises(NodeError, match="no other members"):
+        node.send_group_reaction(solo, "m-1", "👍")
+
+
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):
     node = make_node(tmp_path)
     node._shutdown = True

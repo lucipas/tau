@@ -5882,6 +5882,37 @@ def cmd_group_send(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _report_group_reaction(
+    args: argparse.Namespace,
+    response: Dict[str, Any],
+    token: str,
+    target: Dict[str, Any],
+) -> int:
+    """Report a group-reaction fan-out: per-member results in both modes."""
+    results = response.get("results") or []
+    failed_legs = [r for r in results if not r.get("delivered")]
+    if _json_mode(args):
+        _emit(response, True)
+        return _EXIT_ERROR if failed_legs else _EXIT_OK
+    if not token:
+        print(
+            "retracted your reaction to the group message "
+            f"{_safe_id_prefix(str(target['id']))}"
+        )
+    else:
+        print(
+            f"reacted {token} to the group message "
+            f"{_safe_id_prefix(str(target['id']))}"
+        )
+    for result in results:
+        name = result.get("to_name") or (result.get("to") or "")[:8]
+        if result.get("delivered"):
+            print(f"delivered to {name}")
+        else:
+            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+    return _EXIT_ERROR if failed_legs else _EXIT_OK
+
+
 def cmd_react(args: argparse.Namespace) -> int:
     if bool(getattr(args, "clear", False)) == bool(getattr(args, "reaction", None)):
         raise NodeError("give a reaction, or --clear to retract it (not both)")
@@ -5894,9 +5925,6 @@ def cmd_react(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if not target.get("id"):
         raise NodeError("that message has no id to react to")
-    author = target.get("destination") or ""
-    if not author:
-        raise NodeError("that message has no known sender to react to")
     if getattr(args, "clear", False):
         token = ""
     else:
@@ -5909,6 +5937,33 @@ def cmd_react(args: argparse.Namespace) -> int:
     node = TauNode(config, name=config.name)
     node.start()
     try:
+        if target.get("kind") == "group":
+            # A group message reacts to every member, not just the
+            # author: the same signed reaction fans out, one leg per
+            # member, and the per-member results are the report.
+            group_id = target.get("group")
+            if not isinstance(group_id, str) or not group_id:
+                raise NodeError("that group message has no group to react to")
+            try:
+                response = node.send_group_reaction(
+                    group_id,
+                    str(target["id"]),
+                    token,
+                    timeout=float(getattr(args, "timeout", 20.0)),
+                    discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                )
+            except NodeError as exc:
+                # Reactions ride the live link only in v1 — there is
+                # no outbox queue for them yet — so an unreachable
+                # member is a plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver group reaction: {exc} "
+                    "(reactions need the peer online in v1)"
+                ) from exc
+            return _report_group_reaction(args, response, token, target)
+        author = target.get("destination") or ""
+        if not author:
+            raise NodeError("that message has no known sender to react to")
         try:
             response = node.send_reaction(
                 author,

@@ -3676,6 +3676,91 @@ def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
     assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
 
 
+def _seed_group_message(tmp_path):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+        }
+    )
+    return data_dir, sender_hash
+
+
+def test_react_fans_out_to_group_members(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "reacted 👍 to the group message" in out
+    assert "delivered to alice" in out
+    assert "delivered to bob" in out
+    node = _FakeReactNode.instances[0]
+    assert node.sent == []
+    assert node.group_sent == [("ab" * 16, "g-1", "👍")]
+
+
+def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "delivered": True,
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "ok": False,
+                "error": "no route to peer",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == cli._EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "failed for bob: no route to peer" in out
+
+
+def test_react_group_json_and_clear(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["react", "--data-dir", str(data_dir), "g-1", "--clear", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "g-1"
+    assert payload["group"] == "ab" * 16
+    assert payload["cleared"] is True
+    assert payload["reaction"] == ""
+    assert len(payload["results"]) == 2
+    assert _FakeReactNode.instances[0].group_sent == [("ab" * 16, "g-1", "")]
+
+
 def _seed_sent_message(tmp_path):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
@@ -3870,10 +3955,13 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
 
 class _FakeReactNode:
     instances = []
+    # Tests may override the fan-out results (monkeypatch restores it).
+    group_results = None
 
     def __init__(self, config, name=None):
         self.config = config
         self.sent = []
+        self.group_sent = []
         self.started = False
         type(self).instances.append(self)
 
@@ -3888,3 +3976,35 @@ class _FakeReactNode:
     ):
         self.sent.append((target, message_id, reaction))
         return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
+
+    def send_group_reaction(
+        self, group, message_id, reaction, *, timeout=20.0, discover_timeout=None
+    ):
+        self.group_sent.append((group, message_id, reaction))
+        results = type(self).group_results
+        if results is None:
+            results = [
+                {
+                    "to": "aa" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "r-group-1",
+                },
+                {
+                    "to": "bb" * 16,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "r-group-1",
+                },
+            ]
+        return {
+            "ok": all(r.get("delivered") for r in results),
+            "v": 1,
+            "group": group,
+            "name": "crew",
+            "target": message_id,
+            "reaction": reaction,
+            "cleared": not reaction,
+            "id": "r-group-1",
+            "results": results,
+        }

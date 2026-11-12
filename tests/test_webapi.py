@@ -178,6 +178,7 @@ class FakeNode:
         )
         self.sent = []
         self.group_sent = []
+        self.group_reactions = []
         self.group_refusals = set()
         self.groups = GroupStore(groups_path)
         self.groups.create(
@@ -363,6 +364,57 @@ class FakeNode:
             "results": results,
         }
 
+    def send_group_reaction(
+        self, group, message_id, reaction, *, timeout=20.0, discover_timeout=None
+    ):
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        self.group_reactions.append((group["name"], message_id, reaction))
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_refusals:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": "not_allowed",
+                        "id": "react-1",
+                    }
+                )
+            elif member == BOB_HASH:
+                # Offline member: reactions have no outbox in v1.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "bob",
+                        "ok": False,
+                        "error": "no route to peer",
+                        "id": "react-1",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "id": "react-1",
+                        "rtt": 0.009,
+                    }
+                )
+        return {
+            "ok": all(result.get("delivered") for result in results),
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "target": message_id,
+            "reaction": reaction,
+            "cleared": not reaction,
+            "id": "react-1",
+            "results": results,
+        }
 
     def send_file(
         self,
@@ -6435,6 +6487,93 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     )
     assert status == 400
     assert "unknown message" in payload["error"]["message"]
+
+
+def test_react_endpoint_fans_out_to_group_members(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["target"] == "wire-g"
+    assert payload["group"] == group_id
+    assert payload["cleared"] is False
+    assert node.group_reactions == [("crew", "wire-g", "👍")]
+    # The offline member's leg fails instead of queueing: reactions
+    # are live-only in v1, and the member results come back.
+    assert payload["ok"] is False
+    assert [bool(r.get("delivered")) for r in payload["results"]] == [True, False]
+    assert payload["results"][1]["error"] == "no route to peer"
+
+
+def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
+    # The message is past the console's window, so the bridge resolves
+    # it from the node inbox instead of its history.
+    group_id = node.groups.list_groups()[0]["id"]
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "🎉"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [("crew", "wire-g", "🎉")]
+
+
+def test_react_endpoint_group_gone_is_a_404(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    assert node.groups.delete(group_id) is True
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "👍"},
+    )
+    assert status == 404
+    assert "unknown group" in payload["error"]["message"]
 
 
 def test_react_accepts_oversized_timeout(bridge, node):

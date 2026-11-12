@@ -15,7 +15,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
 
 import RNS
 
@@ -3917,16 +3917,7 @@ class TauNode:
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
             raise NodeError("reaction target must be a message id of 1-64 characters")
-        if self.identity is None:
-            raise NodeError("node has not been started")
-        reaction_id = generate_message_id()
-        payload = reaction_dict(target_id, token, message_id=reaction_id)
-        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        signature = self.identity.sign(canonical)
-        if signature is None:  # pragma: no cover - identity without private keys
-            raise NodeError("could not sign reaction")
-        payload["sig"] = base64.b64encode(signature).decode("ascii")
-        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        payload_bytes, reaction_id = self._signed_reaction_payload(target_id, token)
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
@@ -3936,7 +3927,37 @@ class TauNode:
         response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
         # Record the outgoing reaction locally, so the reactor sees it
         # under the message in their own inbox and console.
-        record = {
+        self._record_reaction(
+            self._outgoing_reaction_record(target_id, token, reaction_id)
+        )
+        return dict(response, id=reaction_id)
+
+    def _signed_reaction_payload(
+        self, target_id: str, token: str
+    ) -> Tuple[bytes, str]:
+        """Build and sign one reaction payload.
+
+        Returns ``(payload_bytes, reaction_id)``.  The reaction id is
+        part of the signed payload, so a fan-out that reuses these
+        bytes sends every member the same reaction — one id, one
+        signature — instead of a fresh reaction per leg.
+        """
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        reaction_id = generate_message_id()
+        payload = reaction_dict(target_id, token, message_id=reaction_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign reaction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        return encode(payload, max_bytes=MAX_REQUEST_BYTES), reaction_id
+
+    def _outgoing_reaction_record(
+        self, target_id: str, token: str, reaction_id: str
+    ) -> Dict[str, Any]:
+        """The local inbox record for a reaction this node sent."""
+        return {
             "target": target_id,
             "reaction": token,
             "from": self.name,
@@ -3947,8 +3968,133 @@ class TauNode:
             "received_at": time.time(),
             "id": reaction_id,
         }
-        self._record_reaction(record)
-        return dict(response, id=reaction_id)
+
+    def send_group_reaction(
+        self,
+        group: Union[str, Dict[str, Any]],
+        message_id: str,
+        reaction: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a reaction to a group message out to every member.
+
+        *group* is a group id, id prefix, name, or group record.
+        The reaction is built and signed once — one reaction id —
+        and the same bytes go to every member except this node, one
+        leg per member with the same per-leg timeout a group send
+        uses, so one slow member cannot starve the rest.  The local
+        copy is recorded once, when at least one leg delivered.
+
+        A failed leg reports an ``error`` instead of queueing: like
+        DM reactions, group reactions are live-only in v1.  Returns
+        a per-member result list; ``ok`` is true only when every
+        member received the reaction.
+        """
+        token = clean_reaction(reaction)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("reaction target must be a message id of 1-64 characters")
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if not members:
+            raise NodeError("group has no other members to react to")
+        payload_bytes, reaction_id = self._signed_reaction_payload(
+            target_id, token
+        )
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            # One deadline bounds each leg, exactly as in
+            # send_group_message: the stages of a single delivery
+            # share the leg's budget, but one member's leg must not
+            # consume another's.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group reaction time limit reached",
+                        "id": reaction_id,
+                    }
+                )
+                continue
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                response = self._request(
+                    peer,
+                    REQUEST_REACT,
+                    payload_bytes,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "id": reaction_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; a
+                # reaction has no outbox to queue into, so the leg
+                # is simply reported as failed.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "id": reaction_id,
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "id": reaction_id,
+                    }
+                )
+        if any(result.get("delivered") for result in results):
+            # Record the outgoing reaction once, so the reactor sees
+            # it under the message in their own inbox and console —
+            # the same id every member recorded.
+            self._record_reaction(
+                self._outgoing_reaction_record(target_id, token, reaction_id)
+            )
+        all_ok = all(result.get("delivered") for result in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "target": target_id,
+            "reaction": token,
+            "cleared": not token,
+            "id": reaction_id,
+            "results": results,
+        }
 
     def send_retraction(
         self,

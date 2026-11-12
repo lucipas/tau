@@ -2691,6 +2691,10 @@ class WebBridge:
         outgoing reaction is recorded locally by the node, so the
         console annotates the entry through the same ``message_updated``
         event as an inbound reaction.
+
+        A group message fans out instead: the same signed reaction
+        goes to every member except this node, and the per-member
+        results come back in the response.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target message id is required")
@@ -2701,12 +2705,16 @@ class WebBridge:
         token = clean_reaction("" if clear else reaction)
         target = target.strip()
         peer: Optional[str] = None
+        group_id: Optional[str] = None
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
                     peer = message.get("peer")
+                    group = message.get("group")
+                    if isinstance(group, str):
+                        group_id = group
                     break
-        if peer is None:
+        if group_id is None and peer is None:
             inbox = getattr(self.node, "inbox", None)
             if inbox is None:
                 raise ValueError(f"unknown message: {target!r}")
@@ -2714,7 +2722,20 @@ class WebBridge:
                 record = inbox.resolve(target)
             except ValueError as exc:
                 raise ValueError(f"unknown message: {target!r}") from exc
-            peer = record.get("destination")
+            if record.get("kind") == "group" and isinstance(
+                record.get("group"), str
+            ):
+                group_id = record["group"]
+            else:
+                peer = record.get("destination")
+        if group_id is not None:
+            # Reload the persisted store first: a group created or
+            # deleted by another process (``tau group``) must be seen
+            # by this reaction.
+            self.node.groups.list_groups()
+            return self.node.send_group_reaction(
+                group_id, target, token, timeout=timeout
+            )
         if not peer:
             raise ValueError("that message has no known peer to react to")
         response = self.node.send_reaction(peer, target, token, timeout=timeout)
@@ -5472,7 +5493,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             result = self.bridge.react(
                 target.strip(), reaction, clear=clear, timeout=timeout
             )
-        except (ValueError, ProtocolError) as exc:
+        except ValueError as exc:
+            # GroupStore.find raises ValueError for both an unknown
+            # group and an ambiguous query; only the unknown case is
+            # a 404, the ambiguous one stays a 400.
+            status = 404 if str(exc).startswith("unknown group:") else 400
+            self._send_json({"error": {"message": str(exc)}}, head_only, status)
+            return
+        except ProtocolError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         except PeerError as exc:
