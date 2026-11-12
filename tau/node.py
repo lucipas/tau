@@ -49,6 +49,8 @@ from .instance_lock import (
     instance_lock_holder,
 )
 from .lxmf import (
+    LXMF_FIELD_TAU_MESSAGE_ID,
+    MAX_TAU_MESSAGE_ID_LENGTH,
     LXMFError,
     build_lxmf_message,
     lxmf_router_delivery_hash,
@@ -897,13 +899,37 @@ class TauNode:
                 caller_hash,
             )
             return
+        # A tau DM sent over LXMF carries its tau message id in the
+        # message fields (see build_lxmf_message).  When present and
+        # well-formed, the copy is stored under that id, so it is the
+        # same message as the direct-path copy: a retraction marker
+        # keyed by the tau id covers it, a later retract finds and
+        # deletes it, and a direct copy dedupes against it.  A
+        # malformed field is ignored — a forged or truncated id must
+        # never displace the hash id — and a message without one (a
+        # non-tau LXMF client, or an older tau sender) keeps the
+        # hash id as before.
+        tau_message_id = None
+        fields = getattr(message, "fields", None)
+        if isinstance(fields, dict):
+            carried = fields.get(LXMF_FIELD_TAU_MESSAGE_ID)
+            if (
+                isinstance(carried, str)
+                and carried
+                and len(carried) <= MAX_TAU_MESSAGE_ID_LENGTH
+            ):
+                tau_message_id = carried
         # A propagation copy can redeliver the same message after a
         # router restart, so dedupe on the LXMF hash exactly like the
         # DM path dedupes relayed copies on the tau message id.
         # Tau message ids are capped at 64 characters on the wire, so the
         # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
         # still collision-free in practice).
-        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
+        message_id = (
+            tau_message_id
+            if tau_message_id is not None
+            else f"lxmf:{bytes(message_hash).hex()[:59]}"
+        )
         # The router can invoke this callback concurrently for two
         # copies of one message (direct + propagation), and each copy
         # passes the router's own duplicate check first — so the
@@ -922,6 +948,20 @@ class TauNode:
                 # Stored earlier but interrupted before it was marked seen.
                 self.mailbox.mark_seen(message_id)
                 log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            if tau_message_id is not None and self.mailbox.is_retracted(
+                caller_hash, tau_message_id
+            ):
+                # The sender retracted this DM before the LXMF copy
+                # arrived: drop it the way the direct path drops a
+                # retracted message, and leave it unseen so a
+                # redelivery re-checks the marker instead of being
+                # mistaken for a new message.
+                log.info(
+                    "Dropping retracted LXMF message %s from %s",
+                    tau_message_id,
+                    caller_hash,
+                )
                 return
             try:
                 sent_at = float(getattr(message, "timestamp", None) or 0.0)
@@ -2685,7 +2725,10 @@ class TauNode:
             return False
         try:
             message = build_lxmf_message(
-                self.identity, recipient.public_key, entry.text
+                self.identity,
+                recipient.public_key,
+                entry.text,
+                tau_message_id=entry.id,
             )
             return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
         except (LXMFError, ValueError) as exc:
