@@ -29,6 +29,7 @@ from tau.tangents.tan import (
     annotate_reactions,
     annotate_replies,
     annotated_pinned_posts,
+    annotated_saved_posts,
     author_stats,
     author_timeline,
     create_delete,
@@ -4768,6 +4769,38 @@ def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     assert saved[0]["hash"] == keep["hash"]
     assert saved[0]["deleted"] is True
     assert saved[0]["text"] == ""
+
+
+def test_annotated_saved_posts_applies_edits(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    post = create_post(conn, bob, "original", name="bob", now=1000)
+    save_post(conn, post["hash"], now=2000)
+
+    # The saved list shows the current edit, not the original text.
+    create_edit(conn, bob, post["hash"], "fixed", name="bob", now=1001)
+    posts, _ = annotated_saved_posts(conn)
+    assert len(posts) == 1
+    assert posts[0]["text"] == "fixed"
+    assert posts[0]["edited"] is True
+
+    # ... and an edit that adds a muted keyword drops the post from
+    # the view, because the filter now sees the edited text.
+    mute_keyword(conn, "crypto")
+    create_edit(
+        conn, bob, post["hash"], "crypto to the moon", name="bob", now=1002
+    )
+    posts, _ = annotated_saved_posts(conn)
+    assert posts == []
+
+    # ... and an edit that landed before a delete stays blanked.
+    unmute_keyword(conn, "crypto")
+    create_delete(conn, bob, post["hash"], name="bob", now=1003)
+    posts, _ = annotated_saved_posts(conn)
+    assert len(posts) == 1
+    assert posts[0]["text"] == ""
+    assert posts[0]["deleted"] is True
+    assert posts[0]["edited"] is False
 
 
 def test_pin_post_round_trip(identities, tmp_path):

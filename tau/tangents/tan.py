@@ -3757,13 +3757,13 @@ def annotated_saved_posts(
 ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     """Saved posts with the timeline's annotations and muting applied.
 
-    Reaction counts, reply parents, quote counts and quoted originals
-    are attached exactly as :func:`timeline` does: a reply parent or
-    quoted original from a muted author is redacted, and a parent
-    matching a muted keyword has its text blanked.  Posts by muted
-    authors or matching a muted keyword are dropped from the view —
-    muting is display-only, so the saves stay stored and unmuting
-    restores them.  Each returned post carries ``saved`` and
+    Reaction counts, edits, reply parents, quote counts and quoted
+    originals are attached exactly as :func:`timeline` does: a reply
+    parent or quoted original from a muted author is redacted, and a
+    parent matching a muted keyword has its text blanked.  Posts by
+    muted authors or matching a muted keyword are dropped from the
+    view — muting is display-only, so the saves stay stored and
+    unmuting restores them.  Each returned post carries ``saved`` and
     ``saved_at``.
 
     Returns ``(posts, next_offset)``: up to *limit* visible posts
@@ -3789,7 +3789,9 @@ def annotated_saved_posts(
                 conn,
                 annotate_replies(
                     conn,
-                    annotate_reactions(conn, batch, viewer=viewer),
+                    annotate_edits(
+                        conn, annotate_reactions(conn, batch, viewer=viewer)
+                    ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
                 ),
@@ -3799,6 +3801,10 @@ def annotated_saved_posts(
         )
         annotate_repost_counts(conn, batch, viewer=viewer)
         for post in batch:
+            # Edits replace the stored text, so re-blank deleted entries.
+            if post.get("deleted"):
+                post["text"] = ""
+                post["edited"] = False
             post["saved"] = True
         batch = [post for post in batch if post["author"] not in silenced]
         batch = without_muted_keywords(conn, batch, keywords)
