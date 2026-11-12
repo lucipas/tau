@@ -459,6 +459,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     react.set_defaults(func=cmd_react)
 
+    retract = subparsers.add_parser(
+        "retract",
+        parents=[common],
+        help="retract a sent message from the recipient's inbox",
+    )
+    retract.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    retract.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    retract.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    retract.set_defaults(func=cmd_retract)
+
     edit = subparsers.add_parser(
         "edit",
         parents=[common],
@@ -3584,6 +3604,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
         node.on_peer = on_peer
         node.on_message = on_message
         node.on_file = on_file
+
+        def on_retract(record: Dict[str, Any]) -> None:
+            # The node already deleted the inbox record; drop the
+            # console's own copy so a retracted DM leaves the feed
+            # and never comes back after a restart.
+            bridge.delete_by_wire_id(str(record.get("id") or ""))
+
+        node.on_retract = on_retract
     # The data-directory lock is the more specific guard, so probe it
     # before the port check: a second serve on the same directory
     # reports the instance error even though it would also trip the
@@ -3704,7 +3732,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             send_server = SendServer(
                 config.data_dir,
-                lambda **request: _send_local_message(node, **request),
+                lambda **request: _dispatch_local_send(node, **request),
             )
         except Exception:
             # The send socket is best-effort: a data directory too long
@@ -4573,6 +4601,40 @@ def _send_local_message(
     return result
 
 
+def _retract_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Retract one DM on the running node, for the local send server."""
+    return node.send_retraction(
+        target,
+        message_id,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
+
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send or a retraction.
+
+    The socket carries both, distinguished by ``op``: ``"send"`` (the
+    default, so older one-shot clients keep working) runs
+    :func:`_send_local_message`, while ``"retract"`` runs the
+    retraction on the serving node, so ``tau retract`` works while
+    ``tau serve`` holds the data directory.
+    """
+    op = request.pop("op", "send")
+    if op == "retract":
+        return _retract_local_message(node, **request)
+    if op == "send":
+        return _send_local_message(node, **request)
+    raise NodeError(f"unknown local send operation: {op!r}")
+
+
 def _send_via_local_node(
     args: argparse.Namespace,
     config: TauConfig,
@@ -4688,6 +4750,33 @@ def _send_via_running_node(
             reply_ids[target] = reply_id
         results.append(result)
     return results
+
+
+def _retract_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Retract through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="retract",
+            target=recipient,
+            message_id=message_id,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
 
 
 #: How long a one-shot send waits for a serving node's socket to appear
@@ -5886,6 +5975,121 @@ def cmd_react(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to retract")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be retracted"
+        )
+    if target.get("kind") == "group":
+        raise NodeError("group messages cannot be retracted in v1")
+    recipient = target.get("destination") or ""
+    if not recipient:
+        raise NodeError("that message has no known recipient to retract from")
+    # A message still in the outbox has not reached its recipient yet; a
+    # retract answered "not found" would let the queued copy arrive later.
+    # Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it instead"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: retract through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _retract_via_running_node(
+                config,
+                recipient,
+                str(target["id"]),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Retracts ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver retract: {exc} "
+                "(retracts need the peer online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_retraction(
+                    recipient,
+                    str(target["id"]),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Retracts ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver retract: {exc} "
+                    "(retracts need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    # The peer confirmed (or already had it gone): drop this node's own
+    # sent copy too, so the message is gone on both sides.  A local
+    # delete failure is reported, not hidden — the retract itself
+    # already succeeded.
+    try:
+        inbox.delete(str(target["id"]))
+    except InboxError as exc:
+        raise NodeError(
+            "retract delivered but the local copy could not be deleted:"
+            f" {exc}"
+        ) from exc
+    # The sent record lives in mailbox.json, not the inbox: drop it
+    # too, or `tau messages --sent` keeps showing the retracted text.
+    # Only after the retract and the inbox delete succeeded, so a
+    # failed retract never erases the sent record.
+    Mailbox(config.mailbox_path).discard_sent(str(target["id"]))
+
+    peer = registry.get(recipient)
+    name = peer.display_name if peer is not None else short_hash(recipient)
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": recipient,
+                "to_name": name,
+                "deleted": bool(response.get("deleted")),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("deleted"):
+        print(
+            f"retracted your message {_safe_id_prefix(str(target['id']))}"
+            f" from {name}'s inbox"
+        )
+    else:
+        print(
+            f"{name} had no copy of {_safe_id_prefix(str(target['id']))}"
+            " to retract"
+        )
+    return _EXIT_OK
+
 def cmd_edit(args: argparse.Namespace) -> int:
     text = _read_message(args)
     try:
@@ -5907,9 +6111,22 @@ def cmd_edit(args: argparse.Namespace) -> int:
         )
     if target.get("kind") == "file":
         raise NodeError("a file record has no text to edit")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be edited"
+        )
     author = target.get("destination") or ""
     if not author:
         raise NodeError("that message has no known recipient to edit it for")
+    # A message still in the outbox has not reached its recipient yet; an
+    # edit answered "not found" would let the queued copy arrive later
+    # with the old text. Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it and send a new message instead"
+        )
     node = TauNode(config, name=config.name)
     node.start()
     try:

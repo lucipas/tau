@@ -696,6 +696,26 @@ reaction whose target this node has never seen is still stored (the target
 may arrive later over a relay), but it is only rendered under a message the
 inbox actually holds.
 
+### DM retracts
+
+`tau retract <message-id>` takes back a message you sent: it sends a
+signed retract (`/tau/dm/retract`) to the recipient, who deletes their
+stored copy, then deletes your own sent copy — so the message is gone
+on both sides. The payload is signed with the sender's Reticulum
+identity and verified by the receiver against the link identity, like a
+reaction, and the receiver only deletes a message the caller actually
+sent: a retract from anyone else fails with `not_sender`, and a retract
+for an id the receiver never held answers ok with nothing deleted, so
+retries are safe. Group messages cannot be retracted in v1 — a group
+message lives in every member's inbox, and deleting it from one member
+alone would silently half-retract it.
+
+Retracts are delivered live in v1, like reactions: the peer must be
+online. A message still queued in the outbox is cancelled with
+`tau outbox cancel` instead. A peer running a version that predates
+retracts rejects the unknown path, so a retract to an old peer fails
+instead of silently succeeding.
+
 ### DM edits
 
 `tau edit <message-id> <text>` fixes a message you already sent, in place:
