@@ -2084,6 +2084,13 @@ class TauNode:
                 resolved = self.inbox.resolve(target_id)
             except ValueError:
                 resolved = None
+            if resolved is not None:
+                # A reaction may name a group leg id rather than the
+                # stored record's canonical id (or a prefix of it):
+                # resolve matched the record, so store the reaction
+                # under the canonical id — otherwise it never
+                # displays under the message listing.
+                target_id = str(resolved["id"])
             if (
                 resolved is None
                 and reaction.get("group") is not None

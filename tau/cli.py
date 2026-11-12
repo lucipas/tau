@@ -7377,7 +7377,9 @@ def cmd_react(args: argparse.Namespace) -> int:
         # remote author, so there is no peer to react to.
         raise NodeError("notes are local-only and cannot be reacted to")
     author = target.get("destination") or ""
-    if not author:
+    if not author and not (
+        target.get("kind") == "group" and target.get("direction") == "out"
+    ):
         raise NodeError("that message has no known sender to react to")
     if getattr(args, "clear", False):
         token = ""
@@ -7409,6 +7411,10 @@ def cmd_react(args: argparse.Namespace) -> int:
             if group is None:
                 raise NodeError(f"unknown group: {group_id!r}")
             author = target.get("destination")
+            if not author and target.get("direction") == "out":
+                # An outbound group message names no single
+                # destination: its author is this node.
+                author = node.destination_hexhash
             sent_at = target.get("sent_at")
             try:
                 response = node.send_group_reaction(

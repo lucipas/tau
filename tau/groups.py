@@ -873,13 +873,16 @@ def visible_reactions(
     can sit in the inbox from a reactor who is not on the group's
     pinned roster.  It must never be displayed on that message, so
     readers filter stored reactions here instead of trusting them.
-    *members* is ``None`` when no roster is pinned: there is
-    nothing to check against, so the reactions pass through
-    unchanged.  A reaction record carries its reactor under
-    ``reactor`` (console overlay) or ``destination`` (inbox).
+    *members* is ``None`` when no roster is pinned: there is no
+    membership to verify, so nothing is displayed — a reaction on
+    a message whose group was deleted, or whose copy was imported
+    without its roster, stays hidden until a roster pins.  This is
+    the same fail-closed rule the handler applies on receipt.  A
+    reaction record carries its reactor under ``reactor`` (console
+    overlay) or ``destination`` (inbox).
     """
     if members is None:
-        return list(reactions)
+        return []
     return [
         reaction
         for reaction in reactions

@@ -1527,6 +1527,57 @@ def test_group_reaction_recheck_voids_when_namesake_masks_deleted_group(
     assert node.inbox.reactions_for("local-copy-1") == []
 
 
+def test_group_reaction_naming_a_leg_id_stores_under_canonical_id(
+    tmp_path,
+):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids.  A reaction naming the other leg
+    # must resolve to the stored record and be stored under the
+    # canonical id, or it never displays under the message listing.
+    # The target here is the author's own outbound record, whose
+    # destination is empty — so the signed-context lookup misses it
+    # too, and only the leg-aware resolve saves the reaction.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = "ab" * 16
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, reactor_hash],
+        creator="ab" * 16,
+    )
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": "",
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "g-1",
+            "leg_ids": ["g-1", "g-2"],
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "g-2", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    reactions = node.inbox.reactions_for("g-1")
+    assert [r["reaction"] for r in reactions] == ["👍"]
+    assert node.inbox.reactions_for("g-2") == []
+
+
 def test_group_reaction_final_check_refuses_when_group_deleted(
     tmp_path, monkeypatch
 ):

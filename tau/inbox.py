@@ -1463,6 +1463,14 @@ class Inbox:
             for entry in self._messages:
                 if entry.get("id") == value:
                     return dict(entry)
+            # A group send stores one leg id as the record id and the
+            # rest in leg_ids: a reaction naming any leg must resolve
+            # to the same record, exactly as find() already does.  An
+            # exact leg match beats a prefix match on a canonical id.
+            for entry in reversed(self._messages):
+                legs = entry.get("leg_ids")
+                if isinstance(legs, list) and value in legs:
+                    return dict(entry)
             matches = [
                 entry
                 for entry in self._messages

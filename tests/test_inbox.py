@@ -1769,6 +1769,19 @@ def test_resolve_exact_id_beats_a_longer_prefix(tmp_path):
     assert inbox.resolve("abcdef")["text"] == "long"
 
 
+def test_resolve_matches_a_group_leg_id(tmp_path):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids — resolve must match any leg, exactly
+    # as find() already does, or a reaction naming the other leg
+    # never resolves to the stored record.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="g-1", leg_ids=["g-1", "g-2"]))
+    assert inbox.resolve("g-2")["id"] == "g-1"
+    assert inbox.resolve("g-1")["id"] == "g-1"
+    with pytest.raises(ValueError, match="unknown message"):
+        inbox.resolve("g-3")
+
+
 def _reaction(**overrides):
     record = {
         "target": "msg-1",
