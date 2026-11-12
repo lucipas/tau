@@ -1331,6 +1331,52 @@ def test_group_reaction_to_known_id_checked_for_non_member(tmp_path):
     assert node.inbox.reactions_for("local-copy-1") == []
 
 
+def test_group_reaction_reloads_before_resolving_imported_copy(tmp_path):
+    # CodeRabbit Major (node.py:1835): resolve() reads the cached
+    # inbox, so a group-message copy imported by another process is
+    # invisible to it — a reaction naming that id would skip both
+    # roster checks.  The handler reloads first, mirroring
+    # _handle_retract.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    # Another process imports the copy; this node's cache is stale.
+    other = Inbox(node.inbox.path)
+    other.append(
+        {
+            "from": "alice",
+            "destination": author,
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "local-copy-1",
+        }
+    )
+    with pytest.raises(ValueError):
+        node.inbox.resolve("local-copy-1")
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
 def test_group_reaction_to_known_id_accepted_for_member(tmp_path):
     # The same direct reaction, from a reactor the roster names, is
     # stored under the message as before.

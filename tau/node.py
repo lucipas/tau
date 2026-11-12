@@ -1831,6 +1831,21 @@ class TauNode:
         duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
             target_id = reaction["target"]
+            # Reload first: another process (a one-shot CLI import)
+            # may have persisted the target after this node's
+            # in-memory copy was read.  Without it, resolve() can
+            # miss a just-imported group-message copy, and a
+            # reaction naming it would skip both roster checks
+            # below — the same reason _handle_retract reloads
+            # before resolving.  A failed reload fails closed: the
+            # sender can retry, instead of the reaction being
+            # stored against a stale view of the inbox.
+            try:
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
             try:
                 resolved = self.inbox.resolve(target_id)
             except ValueError:
