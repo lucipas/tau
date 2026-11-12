@@ -2706,7 +2706,8 @@ class WebBridge:
         target = target.strip()
         peer: Optional[str] = None
         group_id: Optional[str] = None
-        group_target = target
+        target_author: Optional[str] = None
+        target_sent_at: Optional[float] = None
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
@@ -2714,6 +2715,13 @@ class WebBridge:
                     group = message.get("group")
                     if isinstance(group, str):
                         group_id = group
+                        if isinstance(peer, str):
+                            target_author = peer
+                        sent_at = message.get("sent_at")
+                        if isinstance(sent_at, (int, float)) and not isinstance(
+                            sent_at, bool
+                        ):
+                            target_sent_at = sent_at
                     break
         if group_id is None and peer is None:
             inbox = getattr(self.node, "inbox", None)
@@ -2727,10 +2735,14 @@ class WebBridge:
                 record.get("group"), str
             ):
                 group_id = record["group"]
-                # The caller may have sent a unique prefix; recipients
-                # key the reaction by the full id, so sign that.
-                if isinstance(record.get("id"), str) and record["id"]:
-                    group_target = record["id"]
+                author = record.get("destination")
+                if isinstance(author, str):
+                    target_author = author
+                sent_at = record.get("sent_at")
+                if isinstance(sent_at, (int, float)) and not isinstance(
+                    sent_at, bool
+                ):
+                    target_sent_at = sent_at
             else:
                 peer = record.get("destination")
         if group_id is not None:
@@ -2739,7 +2751,12 @@ class WebBridge:
             # by this reaction.
             self.node.groups.list_groups()
             return self.node.send_group_reaction(
-                group_id, target, token, timeout=timeout
+                group_id,
+                target,
+                token,
+                timeout=timeout,
+                target_author=target_author,
+                target_sent_at=target_sent_at,
             )
         if not peer:
             raise ValueError("that message has no known peer to react to")

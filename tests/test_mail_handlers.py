@@ -987,6 +987,140 @@ def test_reaction_dedupes_by_id(tmp_path):
     assert len(node.inbox.reactions_for("msg-1")) == 1
 
 
+def _signed_group_reaction(
+    sender, target, token, message_id, *, group, author, sent_at
+):
+    """A group reaction payload signed by *sender*, as the fan-out builds it."""
+    import base64
+
+    payload = reaction_dict(
+        target,
+        token,
+        message_id=message_id,
+        group=group,
+        target_author=author,
+        target_sent_at=sent_at,
+    )
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _seed_group_copy(node, *, group, author, sent_at, message_id):
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": author,
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": sent_at,
+            "received_at": sent_at + 1.0,
+            "id": message_id,
+        }
+    )
+
+
+def test_group_reaction_resolves_local_copy_from_context(tmp_path):
+    # Group sends carry a different wire id per leg: the reactor's
+    # target names a copy this node never held.  The signed group
+    # context resolves this node's own copy instead, so the reaction
+    # displays under the message here too.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    group = "cd" * 16
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    reactor = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    stored = node.inbox.reactions_for("local-copy-1")
+    assert len(stored) == 1
+    assert stored[0]["reaction"] == "👍"
+    assert stored[0]["id"] == "react-1"
+    # Nothing is stored under the foreign wire id.
+    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_without_context_stays_on_unknown_target(tmp_path):
+    # No group context, no local copy under the target: the reaction
+    # is stored as-is (the author can still display it from their
+    # sent record), never guessed onto another message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    _seed_group_copy(
+        node,
+        group="cd" * 16,
+        author=author,
+        sent_at=100.0,
+        message_id="local-copy-1",
+    )
+    reactor = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "other-leg-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
+def test_group_reaction_unresolvable_context_stays_on_target(tmp_path):
+    # Group context that matches no local copy — a copy that arrived
+    # through an outbox retry, re-stamped — degrades the same way:
+    # stored under the wire target, displayed for the author.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    _seed_group_copy(
+        node,
+        group="cd" * 16,
+        author=author,
+        sent_at=100.0,
+        message_id="local-copy-1",
+    )
+    reactor = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group="cd" * 16,
+            author=author,
+            sent_at=999.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
 def test_reaction_denied_by_allow_list(tmp_path):
     from tau.allowlist import AllowList, save_allowlist
 

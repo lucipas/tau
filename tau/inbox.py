@@ -849,6 +849,41 @@ class Inbox:
         with self._transaction():
             return [dict(item) for item in self._reactions]
 
+    def find_group_message(
+        self, group: str, author: str, sent_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """This node's copy of one group message, by shared identity.
+
+        Group sends carry a different wire id per recipient leg, so a
+        reaction that names another member's copy cannot be resolved by
+        id here.  All legs of one send share the group, the author and
+        the send time, so those three identify the local copy:
+        ``sent_at`` is a float timestamp, so two distinct sends never
+        share one; when several records match (a copy stored twice),
+        the most recently received wins.  Returns ``None`` when no copy
+        matches (for example a copy that arrived through an outbox
+        retry, which re-stamps the send time).
+        """
+        try:
+            wanted_at = float(sent_at)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            matches = [
+                entry
+                for entry in self._messages
+                if entry.get("kind") == "group"
+                and entry.get("group") == group
+                and entry.get("destination") == author
+                and isinstance(entry.get("sent_at"), (int, float))
+                and not isinstance(entry.get("sent_at"), bool)
+                and float(entry["sent_at"]) == wanted_at
+            ]
+        if not matches:
+            return None
+        matches.sort(key=lambda entry: entry.get("received_at") or 0)
+        return dict(matches[-1])
+
     def resolve(self, ref: str) -> Dict[str, Any]:
         """Resolve a full message id or a unique prefix to its record.
 

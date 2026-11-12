@@ -3697,7 +3697,7 @@ def _seed_group_message(tmp_path):
 
 
 def test_react_fans_out_to_group_members(tmp_path, capsys, monkeypatch):
-    data_dir, _ = _seed_group_message(tmp_path)
+    data_dir, sender_hash = _seed_group_message(tmp_path)
     monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
     _FakeReactNode.instances.clear()
 
@@ -3709,7 +3709,11 @@ def test_react_fans_out_to_group_members(tmp_path, capsys, monkeypatch):
     assert "delivered to bob" in out
     node = _FakeReactNode.instances[0]
     assert node.sent == []
-    assert node.group_sent == [("ab" * 16, "g-1", "👍")]
+    # The author and send time of the reacted-to copy travel with the
+    # fan-out, so each member can resolve its own copy.
+    assert node.group_sent == [
+        ("ab" * 16, "g-1", "👍", sender_hash.hex(), 12.0)
+    ]
 
 
 def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
@@ -3743,8 +3747,43 @@ def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
     assert "failed for bob: no route to peer" in out
 
 
-def test_react_group_json_and_clear(tmp_path, capsys, monkeypatch):
+def test_react_group_strips_terminal_escapes_from_leg_errors(
+    tmp_path, capsys, monkeypatch
+):
+    # A failed leg's error can carry a peer's text; escapes in it must
+    # never reach the operator's terminal.
     data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "delivered": True,
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "ok": False,
+                "error": "\x1b[31mrefused\x1b[0m",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == cli._EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "failed for bob: refused" in out
+
+
+def test_react_group_json_and_clear(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_group_message(tmp_path)
     monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
     _FakeReactNode.instances.clear()
 
@@ -3758,7 +3797,9 @@ def test_react_group_json_and_clear(tmp_path, capsys, monkeypatch):
     assert payload["cleared"] is True
     assert payload["reaction"] == ""
     assert len(payload["results"]) == 2
-    assert _FakeReactNode.instances[0].group_sent == [("ab" * 16, "g-1", "")]
+    assert _FakeReactNode.instances[0].group_sent == [
+        ("ab" * 16, "g-1", "", sender_hash.hex(), 12.0)
+    ]
 
 
 def _seed_sent_message(tmp_path):
@@ -3978,9 +4019,19 @@ class _FakeReactNode:
         return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
 
     def send_group_reaction(
-        self, group, message_id, reaction, *, timeout=20.0, discover_timeout=None
+        self,
+        group,
+        message_id,
+        reaction,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_author=None,
+        target_sent_at=None,
     ):
-        self.group_sent.append((group, message_id, reaction))
+        self.group_sent.append(
+            (group, message_id, reaction, target_author, target_sent_at)
+        )
         results = type(self).group_results
         if results is None:
             results = [

@@ -365,11 +365,21 @@ class FakeNode:
         }
 
     def send_group_reaction(
-        self, group, message_id, reaction, *, timeout=20.0, discover_timeout=None
+        self,
+        group,
+        message_id,
+        reaction,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_author=None,
+        target_sent_at=None,
     ):
         if isinstance(group, str):
             group = self.groups.find(group)
-        self.group_reactions.append((group["name"], message_id, reaction))
+        self.group_reactions.append(
+            (group["name"], message_id, reaction, target_author, target_sent_at)
+        )
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -6514,7 +6524,11 @@ def test_react_endpoint_fans_out_to_group_members(bridge, node):
     assert payload["target"] == "wire-g"
     assert payload["group"] == group_id
     assert payload["cleared"] is False
-    assert node.group_reactions == [("crew", "wire-g", "👍")]
+    # The author and send time of the reacted-to copy travel with the
+    # fan-out, so each member can resolve its own copy.
+    assert node.group_reactions == [
+        ("crew", "wire-g", "👍", PEER_HASH, 100.0)
+    ]
     # The offline member's leg fails instead of queueing: reactions
     # are live-only in v1, and the member results come back.
     assert payload["ok"] is False
@@ -6547,7 +6561,7 @@ def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
     )
     assert status == 200
     assert payload["group"] == group_id
-    assert node.group_reactions == [("crew", "wire-g", "🎉")]
+    assert node.group_reactions == [("crew", "wire-g", "🎉", PEER_HASH, 100.0)]
 
 
 def test_react_endpoint_group_gone_is_a_404(bridge, node):

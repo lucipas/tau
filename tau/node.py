@@ -1809,8 +1809,35 @@ class TauNode:
         seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
         duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
+            target_id = reaction["target"]
+            if (
+                reaction.get("group") is not None
+                and reaction.get("target_author") is not None
+                and reaction.get("target_sent_at") is not None
+            ):
+                # Group sends carry a different wire id per leg, so
+                # this target names the reactor's copy, not this
+                # node's.  When this node does not hold the target,
+                # resolve its own copy from the signed group context
+                # instead — the context is covered by the signature
+                # verified above, so a relay cannot retarget the
+                # reaction onto a different message.  A copy that
+                # arrived through an outbox retry carries a re-stamped
+                # send time and cannot resolve; the reaction is still
+                # stored under the wire target, and shows for the
+                # author, exactly as before.
+                try:
+                    self.inbox.resolve(target_id)
+                except ValueError:
+                    local = self.inbox.find_group_message(
+                        reaction["group"],
+                        reaction["target_author"],
+                        reaction["target_sent_at"],
+                    )
+                    if local is not None:
+                        target_id = str(local["id"])
             record = {
-                "target": reaction["target"],
+                "target": target_id,
                 "reaction": reaction["reaction"],
                 "from": caller_name,
                 "destination": caller_hash,
@@ -3538,6 +3565,11 @@ class TauNode:
         }
         results: List[Dict[str, Any]] = []
         any_queued = False
+        # One send time for every leg: the wire id still differs per
+        # leg, but the legs share the send time, so a reaction can name
+        # the logical message by (group, author, sent_at) and every
+        # member can resolve its own copy (see _handle_reaction).
+        sent_at = time.time()
         # Check the full group request size once, before any leg is sent
         # or queued, so an oversized message fails cleanly up front rather
         # than aborting the fan-out partway through.
@@ -3545,6 +3577,7 @@ class TauNode:
             encode_group_message(
                 normalized,
                 message_id=generate_message_id(),
+                sent_at=sent_at,
                 group_id=group["id"],
                 group_name=group["name"],
                 creator=creator,
@@ -3560,6 +3593,7 @@ class TauNode:
             payload = encode_group_message(
                 normalized,
                 message_id=message_id,
+                sent_at=sent_at,
                 group_id=group["id"],
                 group_name=group["name"],
                 creator=creator,
@@ -3933,7 +3967,13 @@ class TauNode:
         return dict(response, id=reaction_id)
 
     def _signed_reaction_payload(
-        self, target_id: str, token: str
+        self,
+        target_id: str,
+        token: str,
+        *,
+        group: Optional[str] = None,
+        target_author: Optional[str] = None,
+        target_sent_at: Optional[float] = None,
     ) -> Tuple[bytes, str]:
         """Build and sign one reaction payload.
 
@@ -3941,11 +3981,24 @@ class TauNode:
         part of the signed payload, so a fan-out that reuses these
         bytes sends every member the same reaction — one id, one
         signature — instead of a fresh reaction per leg.
+
+        ``group`` / ``target_author`` / ``target_sent_at`` name the
+        group message being reacted to, when the target is one: group
+        sends carry a different wire id per leg, so the target id
+        alone only matches the reactor's copy and the author's sent
+        record, and a receiver needs the context to find its own copy.
         """
         if self.identity is None:
             raise NodeError("node has not been started")
         reaction_id = generate_message_id()
-        payload = reaction_dict(target_id, token, message_id=reaction_id)
+        payload = reaction_dict(
+            target_id,
+            token,
+            message_id=reaction_id,
+            group=group,
+            target_author=target_author,
+            target_sent_at=target_sent_at,
+        )
         canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
         signature = self.identity.sign(canonical)
         if signature is None:  # pragma: no cover - identity without private keys
@@ -3977,6 +4030,8 @@ class TauNode:
         *,
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
+        target_author: Optional[str] = None,
+        target_sent_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan a reaction to a group message out to every member.
 
@@ -3986,6 +4041,18 @@ class TauNode:
         leg per member with the same per-leg timeout a group send
         uses, so one slow member cannot starve the rest.  The local
         copy is recorded once, when at least one leg delivered.
+
+        Group sends carry a different wire id per leg, so the target
+        id alone would only match the reactor's copy and the author's
+        sent record.  The signed payload therefore also carries the
+        message's group, author and send time (``target_author`` /
+        ``target_sent_at``: the author and ``sent_at`` of the copy
+        being reacted to), and a receiver that does not hold the
+        target id resolves its own copy from that context instead —
+        see :meth:`_handle_reaction`.  Copies that arrived through an
+        outbox retry carry a re-stamped send time and cannot resolve
+        this way; their reaction is still stored, and shows for the
+        author, exactly as a DM reaction to an unknown target would.
 
         A failed leg reports an ``error`` instead of queueing: like
         DM reactions, group reactions are live-only in v1.  Returns
@@ -4001,9 +4068,16 @@ class TauNode:
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         if not members:
-            raise NodeError("group has no other members to react to")
+            # A usage error, not a delivery failure: the console maps
+            # it to a 400 and the CLI prints it plain, instead of a
+            # 502 / a misleading "peer offline" suffix.
+            raise ValueError("group has no other members to react to")
         payload_bytes, reaction_id = self._signed_reaction_payload(
-            target_id, token
+            target_id,
+            token,
+            group=group["id"],
+            target_author=target_author,
+            target_sent_at=target_sent_at,
         )
         results: List[Dict[str, Any]] = []
         for member in members:

@@ -370,14 +370,69 @@ def test_send_group_reaction_rejects_unknown_and_solo_groups(tmp_path):
         node.send_group_reaction("nope", "m-1", "👍")
     # A group whose only member is this node cannot be created
     # (groups need at least 2 members), so pass the record directly.
+    # A usage error, not a delivery failure: the console maps it to a
+    # 400 and the CLI prints it plain.
     solo = {
         "id": "00" * 16,
         "name": "solo",
         "members": [node.destination.hexhash],
         "creator": node.destination.hexhash,
     }
-    with pytest.raises(NodeError, match="no other members"):
+    with pytest.raises(ValueError, match="no other members"):
         node.send_group_reaction(solo, "m-1", "👍")
+
+
+def test_send_group_message_uses_one_send_time_for_all_legs(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_group_message
+
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message("crew", "hi all")
+
+    assert response["ok"] is True
+    assert len(payloads) == 2
+    # The wire ids still differ per leg, but the send time is one
+    # value for the whole send — that shared time is what lets a
+    # reaction name the logical message for every member.
+    sent_ats = {parse_group_message(payload)["sent_at"] for payload in payloads}
+    assert len(sent_ats) == 1
+
+
+def test_send_group_reaction_signs_group_context(tmp_path, monkeypatch):
+    from tau.protocol import REQUEST_REACT, parse_reaction
+
+    node, group, alice, _ = _group_reaction_node(tmp_path)
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    node.send_group_reaction(
+        "crew",
+        "other-leg-1",
+        "👍",
+        target_author=alice.hexhash,
+        target_sent_at=100.0,
+    )
+
+    assert len(calls) == 2
+    payload = parse_reaction(calls[0])
+    assert payload["group"] == group["id"]
+    assert payload["target_author"] == alice.hexhash
+    assert payload["target_sent_at"] == 100.0
+    assert payload["target"] == "other-leg-1"
 
 
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):

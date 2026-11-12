@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -5909,7 +5910,10 @@ def _report_group_reaction(
         if result.get("delivered"):
             print(f"delivered to {name}")
         else:
-            print(f"failed for {name}: {result.get('error') or 'unknown error'}")
+            print(
+                f"failed for {name}: "
+                f"{_safe_text(str(result.get('error') or 'unknown error'))}"
+            )
     return _EXIT_ERROR if failed_legs else _EXIT_OK
 
 
@@ -5940,10 +5944,15 @@ def cmd_react(args: argparse.Namespace) -> int:
         if target.get("kind") == "group":
             # A group message reacts to every member, not just the
             # author: the same signed reaction fans out, one leg per
-            # member, and the per-member results are the report.
+            # member, and the per-member results are the report.  The
+            # author and send time of this copy travel in the signed
+            # payload so each member can resolve its own copy — group
+            # sends carry a different wire id per leg.
             group_id = target.get("group")
             if not isinstance(group_id, str) or not group_id:
                 raise NodeError("that group message has no group to react to")
+            author = target.get("destination")
+            sent_at = target.get("sent_at")
             try:
                 response = node.send_group_reaction(
                     group_id,
@@ -5951,6 +5960,13 @@ def cmd_react(args: argparse.Namespace) -> int:
                     token,
                     timeout=float(getattr(args, "timeout", 20.0)),
                     discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    target_author=author if isinstance(author, str) else None,
+                    target_sent_at=(
+                        sent_at
+                        if isinstance(sent_at, (int, float))
+                        and not isinstance(sent_at, bool)
+                        else None
+                    ),
                 )
             except NodeError as exc:
                 # Reactions ride the live link only in v1 — there is
@@ -6142,6 +6158,22 @@ def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """
     cleaned = "".join(char for char in ref if char.isprintable())
     return cleaned[:length]
+
+
+_ANSI_SEQUENCE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _safe_text(text: str) -> str:
+    """Printable characters of *text* only.
+
+    Error text can arrive from remote peers and may contain terminal
+    escapes; never print it verbatim.  Whole ANSI sequences are
+    removed first — dropping just the ESC would leave their printable
+    remnants behind — then any other non-printable character is
+    dropped.  JSON output keeps the raw text.
+    """
+    stripped = _ANSI_SEQUENCE.sub("", text)
+    return "".join(char for char in stripped if char.isprintable())
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:
