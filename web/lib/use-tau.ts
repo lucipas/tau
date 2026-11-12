@@ -10,6 +10,7 @@ import type {
   BundleExportResponse,
   BundleImportResponse,
   CancelOutboxResponse,
+  ChangeGroupMembersResponse,
   CreateGroupResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
@@ -121,6 +122,12 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [groups, setGroups] = useState<TauGroup[]>([]);
+  // The latest roster swap: the console uses it to keep a selected old
+  // group id pointing at its successor.
+  const [groupSwap, setGroupSwap] = useState<{
+    from: string;
+    to: string;
+  } | null>(null);
   const [messages, setMessages] = useState<TauMessage[]>([]);
   // The search the feed is showing, or null for the live traffic. Kept
   // beside `messages` so a search result list is never mixed into the
@@ -971,6 +978,58 @@ export function useTau() {
     [refreshGroups],
   );
 
+  const changeGroupMembers = useCallback(
+    async (group: string, members: string[], adding: boolean) => {
+      const result = await apiPost<ChangeGroupMembersResponse>(
+        adding ? "/api/groups/add-member" : "/api/groups/remove-member",
+        { group, members },
+      );
+      // A roster change is a successor group: swap the old id for the
+      // new one at once, then refresh best-effort so a failed GET
+      // cannot leave the stale roster on screen.
+      const updated = result.group;
+      const previousId = result.previous_id;
+      groupEdits.current += 1;
+      setGroups((previous) => {
+        // A snapshot may already list the successor: keep one entry per
+        // id, placed where the old group was.
+        const rest = previous.filter(
+          (entry) => entry.id !== previousId && entry.id !== updated.id,
+        );
+        const index = previous.findIndex((entry) => entry.id === previousId);
+        if (index === -1) return [...rest, updated];
+        const before = previous
+          .slice(0, index)
+          .filter(
+            (entry) => entry.id !== previousId && entry.id !== updated.id,
+          ).length;
+        return [...rest.slice(0, before), updated, ...rest.slice(before)];
+      });
+      // Same batch as the swap, so the console can move a selected old
+      // id to its successor before the missing-target fallback runs.
+      setGroupSwap({ from: previousId, to: updated.id });
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups],
+  );
+
+  const addGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, true),
+    [changeGroupMembers],
+  );
+
+  const removeGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, false),
+    [changeGroupMembers],
+  );
+
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
       setBlocks((previous) => ({
@@ -1374,8 +1433,11 @@ export function useTau() {
     clearReaction,
     createGroup,
     deleteGroup,
+    addGroupMembers,
+    removeGroupMembers,
     refreshOutbox,
     refreshGroups,
+    groupSwap,
     refreshSettings,
     updateSetting,
     refreshPeers,

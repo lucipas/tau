@@ -365,6 +365,115 @@ describe("useTau group management", () => {
     });
     expect(result.current.groups).toEqual([]);
   });
+
+  it("swaps in the successor group when members are added", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [
+        { hash: PEER_HASH, name: "alice" },
+        { hash: BOB_HASH, name: "bob" },
+        { hash: "cd".repeat(16), name: "carol" },
+      ],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
+    let returned:
+      | { ok: boolean; group: TauGroup; previous_id: string }
+      | undefined;
+    await act(async () => {
+      returned = await result.current.addGroupMembers(created.id, [
+        "cd".repeat(16),
+      ]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/add-member", {
+      group: created.id,
+      members: ["cd".repeat(16)],
+    });
+    expect(returned).toEqual({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
+    expect(result.current.groups).toEqual([successor]);
+  });
+
+  it("swaps in the successor group when members are removed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/remove-member", {
+      group: created.id,
+      members: [BOB_HASH],
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
+    expect(result.current.groups).toEqual([successor]);
+  });
+
+  it("does not duplicate a group when the successor is already listed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    expect(source).toBeTruthy();
+    // A poll landed with the successor before the POST came back.
+    act(() => {
+      source.emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [], [created, successor]),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(2));
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(result.current.groups).toEqual([successor]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
