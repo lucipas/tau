@@ -4363,7 +4363,9 @@ def test_group_messages_quote_falls_back_to_excerpt(tmp_path, capsys):
     )
     assert code == 0
     out = capsys.readouterr().out
-    assert "↩ alice: original thought" in out
+    # Two quote lines: `seconded` via its exact-id reference and
+    # `agreed, different leg` via the excerpt fallback.
+    assert out.count("↩ alice: original thought") == 2
     assert "agreed, different leg" in out
 
 
