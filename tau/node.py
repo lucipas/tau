@@ -11,6 +11,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -40,7 +41,7 @@ from .identity import (
     load_or_create_identity,
     load_public_key,
 )
-from .inbox import Inbox
+from .inbox import Inbox, InboxError
 from .instance_lock import (
     InstanceAlreadyRunning,
     InstanceLock,
@@ -89,6 +90,7 @@ from .protocol import (
     REQUEST_PING,
     REQUEST_READ,
     REQUEST_REACT,
+    REQUEST_RETRACT,
     ProtocolError,
     build_announce,
     build_file_offer,
@@ -113,8 +115,11 @@ from .protocol import (
     parse_message,
     parse_read_receipt,
     parse_reaction,
+    parse_retract,
     reaction_dict,
     reaction_unsigned_bytes,
+    retract_dict,
+    retract_unsigned_bytes,
     response_error,
     response_ok,
     sanitize_file_name,
@@ -216,6 +221,8 @@ class NotAMemberError(NodeError):
     A changed roster or a non-member sender is a permanent refusal, so
     the group leg is not queued for retry.
     """
+
+
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
@@ -369,40 +376,53 @@ def _read_resource_data(resource: Any) -> Optional[bytes]:
 def _create_unique_file(directory: Path, name: str, data: bytes) -> Path:
     """Write *data* to a new file in *directory*, never overwriting.
 
-    Each candidate is created with an exclusive open (``O_EXCL``), so
-    an existing name, including a symlink, is never opened for
-    writing; the next numbered name is tried instead.  The check and
-    the create are one syscall, so concurrent transfers cannot pick
-    the same destination.
+    The bytes go to a temporary file first, then the finished file is
+    linked into place: a name appears only once its content is
+    complete, so a concurrent reader — a live backup, the web console —
+    never sees a half-written received file.  The temporary file lives
+    in a fresh staging directory inside the sender directory: that
+    keeps the staging file on the sender directory's own mount (a
+    ``files/<sender>`` mount point would make a cross-device link
+    fail) while keeping it out of backups, which only enumerate files
+    directly inside sender directories.  The staging directory gets a
+    unique random suffix, so it can never collide with a received
+    file's name, and it is removed once the transfer is published.
+    Each candidate is linked with ``os.link``, so an existing name,
+    including a symlink, is never replaced; the next numbered name is
+    tried instead.  The check and the link are one syscall, so
+    concurrent transfers cannot pick the same destination.
     """
     stem = Path(name).stem
     suffix = Path(name).suffix
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-    counter = 1
-    while True:
-        candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
-        candidate = directory / candidate_name
-        try:
-            fd = os.open(candidate, flags, 0o600)
-        except FileExistsError:
-            counter += 1
-            continue
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-        except BaseException:
+    staging = Path(tempfile.mkdtemp(prefix=".tau-tmp-", dir=directory))
+    fd, tmp_name = tempfile.mkstemp(dir=staging, prefix=".tau-received-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        counter = 1
+        while True:
+            candidate_name = name if counter == 1 else f"{stem}-{counter}{suffix}"
+            candidate = directory / candidate_name
             try:
-                os.unlink(candidate)
-            except OSError:  # pragma: no cover - best effort
-                pass
-            raise
-        return candidate
+                os.link(tmp_name, candidate)
+            except FileExistsError:
+                counter += 1
+                continue
+            return candidate
+    finally:
+        # Best effort: a crash between link and cleanup leaves a
+        # staging directory behind, which is never enumerated as a
+        # received file.
+        try:
+            os.unlink(tmp_name)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        try:
+            staging.rmdir()
+        except OSError:  # pragma: no cover - best effort
+            pass
 
 
 class TauNode:
@@ -426,6 +446,7 @@ class TauNode:
         on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -441,6 +462,7 @@ class TauNode:
         self.on_file = on_file
         self.on_read = on_read
         self.on_reaction = on_reaction
+        self.on_retract = on_retract
         # Ids whose delivery this node confirmed by a successful send,
         # newest last, capped so a long-lived node does not grow the
         # record without bound.  An outbox entry that disappears without
@@ -707,6 +729,7 @@ class TauNode:
             REQUEST_FILE: self._handle_file,
             REQUEST_READ: self._handle_read,
             REQUEST_REACT: self._handle_reaction,
+            REQUEST_RETRACT: self._handle_retract,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -1309,6 +1332,20 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_retraction(
+        self, sender_hash: str, message_id: str, *, confirmed: bool = False
+    ) -> None:
+        """Persist a retraction marker.
+
+        The marker is the durable half of a retract, so a failure to
+        persist it propagates: the caller must report the retract as
+        failed rather than confirm one a relayed copy could undo.
+        With ``confirmed=True`` the retract deleted a stored copy, so
+        the marker is confirmed — a flood of unknown-ID markers cannot
+        evict it at the cap.
+        """
+        self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
+
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
 
@@ -1404,41 +1441,68 @@ class TauNode:
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
-        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         # A delayed direct request past the sender's deadline is dropped
         # unrecorded (and not marked seen), so it is never shown.
         expires_at = message.get("expires_at")
         expired = expires_at is not None and expires_at <= received_at
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
-        if not duplicate and not expired:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
-            record = {
-                "from": caller_name,
-                "destination": caller_hash,
-                "text": message["text"],
-                "kind": message["kind"],
-                "sent_at": message["sent_at"],
-                "received_at": received_at,
-                "id": message_id,
-                "expires_at": message.get("expires_at"),
-                "direction": "in",
-            }
-            if message.get("in_reply_to") is not None:
-                record["in_reply_to"] = message["in_reply_to"]
-            log.info(
-                "Message from %s (%s): %s",
-                caller_name,
-                caller_hash or "anonymous",
-                message["text"],
+        stored_record: Optional[Dict[str, Any]] = None
+        # The seen and retraction checks and the insert run under one
+        # mailbox transaction, so a concurrent retract cannot land
+        # between the marker check and the append.  Marking seen and
+        # recording the message are one delivery: holding the mailbox
+        # transaction across both means a live backup never restores a
+        # seen marker with no inbox entry (the message would then be
+        # rejected as already seen and lost).  The record step takes
+        # the inbox transaction inside this one; the order is mailbox
+        # first everywhere.
+        with self.mailbox.transaction():
+            # Re-check inside the transaction: a duplicate delivery
+            # that landed while this one was in flight already marked
+            # the id seen, and the transaction reloaded that mark —
+            # without the re-check both copies would be stored, and a
+            # later retract would leave one behind.
+            duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+            # A message its sender retracted is dropped the same way: the
+            # marker outlives the seen cache, so a copy that arrives after
+            # the id was evicted still loses to the retract.
+            retracted = bool(
+                message_id
+                and caller_hash
+                and self.mailbox.is_retracted(caller_hash, message_id)
             )
-            self._record_received(record)
-            if self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            if retracted:
+                log.info("Dropping retracted message %s from %s", message_id, caller_hash)
+            if not duplicate and not expired and not retracted:
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                record = {
+                    "from": caller_name,
+                    "destination": caller_hash,
+                    "text": message["text"],
+                    "kind": message["kind"],
+                    "sent_at": message["sent_at"],
+                    "received_at": received_at,
+                    "id": message_id,
+                    "expires_at": message.get("expires_at"),
+                    "direction": "in",
+                }
+                if message.get("in_reply_to") is not None:
+                    record["in_reply_to"] = message["in_reply_to"]
+                log.info(
+                    "Message from %s (%s): %s",
+                    caller_name,
+                    caller_hash or "anonymous",
+                    message["text"],
+                )
+                self._record_received(record)
+                stored_record = record
+        if stored_record is not None and self.on_message is not None:
+            try:
+                self.on_message(stored_record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
 
         return response_ok(
             echo=message["text"],
@@ -1448,10 +1512,15 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
             expired=expired,
+            retracted=retracted,
         )
 
     def _accept_group_message(
-        self, sender_hash: str, group: Dict[str, Any]
+        self,
+        sender_hash: str,
+        group: Dict[str, Any],
+        *,
+        sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -1464,6 +1533,15 @@ class TauNode:
         the sealed envelope's signature (relayed), never by the payload;
         the id derivation is what binds the roster to the id, so a
         member cannot fork an id onto a recipient that has not seen it.
+        The sender is also passed through, so a successor roster only
+        replaces a learned group when the creator themself sent it —
+        the creator field is only a claim, and any member could
+        otherwise forge a successor and hijack sends by group name.
+        ``sent_at`` is the message's send time on the sender's clock;
+        it is what tells a queued creator message carrying an outdated
+        roster (sent before the successor was learned) from an
+        intentional creator restore (sent after), so the stale copy
+        pins alongside instead of replacing the successor.
         """
         members = group.get("members") or []
         own_hash = self.destination_hexhash
@@ -1476,7 +1554,12 @@ class TauNode:
         except (ProtocolError, ValueError):
             return None
         return self.groups.record(
-            group["id"], group.get("name") or "group", members, creator=creator
+            group["id"],
+            group.get("name") or "group",
+            members,
+            creator=creator,
+            sender=sender_hash or "",
+            sent_at=sent_at,
         )
 
     def _handle_group_message(
@@ -1531,6 +1614,7 @@ class TauNode:
                 "creator": message["creator"],
                 "members": message["members"],
             },
+            sent_at=message.get("sent_at"),
         )
         if group is None:
             log.info(
@@ -1548,8 +1632,6 @@ class TauNode:
         message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
-            if message_id:
-                self.mailbox.mark_seen(message_id)
             record = {
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1568,7 +1650,13 @@ class TauNode:
                 group["name"],
                 message["text"],
             )
-            self._record_received(record)
+            # One delivery: mark seen and record under the mailbox
+            # transaction, so a live backup never restores a seen
+            # marker with no inbox entry (see _handle_message).
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1783,6 +1871,198 @@ class TauNode:
             received_at=received_at,
             duplicate=duplicate,
         )
+
+    def _handle_retract(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        try:
+            retract = parse_retract(data)
+        except ProtocolError as exc:
+            return response_error("invalid_retraction", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # A retract deletes someone else's stored copy: without an
+            # authenticated link identity there is no sender to check
+            # against the message, and an anonymous retract could
+            # delete anyone's message.
+            return response_error(
+                "unidentified", "identify on the link to retract"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Retracts are signed entries, like reactions: the signature
+        # covers the whole payload and is verified against the link
+        # identity, so attribution does not depend on trusting the
+        # transport — a relayed or replayed retract still has to prove
+        # its sender.  (parse_retract already checked the base64.)
+        signature_text = retract.get("sig")
+        if not signature_text:
+            return response_error(
+                "invalid_retraction", "retraction is missing its signature"
+            )
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = retract_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_retraction", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_retraction", f"could not verify retraction: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_retraction", "retraction signature does not verify"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Retraction from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+
+        # Only the message's original sender may retract it: the stored
+        # copy's sender hash must match the caller.  An unknown id is
+        # not an error — the message may already be deleted or never
+        # have arrived — so a retried retract answers ok with
+        # deleted False instead of failing.  The match must be exact:
+        # resolve also matches unique prefixes, and a short target
+        # must never delete a different message from the same sender.
+        # The mailbox transaction is held across the marker decision and
+        # the inbox mutation, so a concurrent delivery or import cannot
+        # check for the marker, miss this retract, and insert afterwards.
+        # Lock order is mailbox, then inbox, everywhere.
+        with self.mailbox.transaction():
+            # Reload first: another process (a one-shot CLI import) may
+            # have persisted the target after this node's in-memory copy
+            # was read.
+            try:
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            try:
+                stored = self.inbox.resolve(retract["target"])
+            except ValueError:
+                stored = None
+            if stored is None or stored.get("id") != retract["target"]:
+                # No stored copy to check the sender against — the message
+                # may already be deleted or never have arrived.  Record the
+                # marker anyway: the retract is authenticated, and a copy
+                # arriving later (a relayed copy, or one that outlives the
+                # seen cache) must still lose to it.  The key carries the
+                # caller's own hash, so a sender can only ever suppress
+                # their own messages this way.  If the marker cannot be
+                # persisted the retract is not confirmed.
+                try:
+                    self._record_retraction(caller_hash, retract["target"])
+                except Exception as exc:
+                    log.warning(
+                        "Could not record retraction marker for %s",
+                        retract["target"][:8],
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed", f"could not record retraction: {exc}"
+                    )
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # Only a received record counts: an outgoing record also has the
+            # caller's hash in ``destination`` (the recipient), so without the
+            # direction check a recipient could delete the sender's own copy.
+            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+                return response_error(
+                    "not_sender", "only the message's sender can retract it"
+                )
+            if stored.get("kind") == "file":
+                # A saved file lives on disk; Inbox.delete drops only the
+                # record, so retracting it would leave the file behind.
+                return response_error(
+                    "not_supported",
+                    "file transfers cannot be retracted",
+                )
+            if stored.get("kind") == "group":
+                # A group message lives in every member's inbox; deleting
+                # it from one member alone would silently half-retract it.
+                # Group fan-out retract is a follow-up, not v1.
+                return response_error(
+                    "not_supported",
+                    "group messages cannot be retracted in v1",
+                )
+            # Record the marker before deleting the copy: if it cannot be
+            # persisted, nothing is deleted and the retract fails cleanly.
+            # (A refused retract records nothing: the message stays, so it
+            # must stay deliverable.)  The marker is confirmed: the
+            # retract was honoured against a stored copy, so a flood of
+            # unknown-ID markers must not evict it at the cap.
+            try:
+                self._record_retraction(
+                    caller_hash, retract["target"], confirmed=True
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not record retraction marker for %s",
+                    retract["target"][:8],
+                    exc_info=True,
+                )
+                return response_error(
+                    "storage_failed", f"could not record retraction: {exc}"
+                )
+            # Authorize and delete as one exact-ID operation: the checks
+            # above pick the error code, but the delete itself re-verifies
+            # the exact id, direction, and sender inside the same inbox
+            # transaction, so two concurrent retracts of one short id can
+            # never reselect a different record by prefix.  Kind is
+            # immutable after append, so the kind checks above cannot go
+            # stale between here and the delete.
+            try:
+                removed = self.inbox.delete_authorized(
+                    retract["target"], direction="in", destination=caller_hash
+                )
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not retract message: {exc}"
+                )
+            if removed is None:
+                # A concurrent retract deleted it first: the message is
+                # already gone, so answer the same as "not found".
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # The inbox record is gone; a serving console keeps its own
+            # copy of the message, so tell it to drop that too — otherwise
+            # /api/messages keeps showing the retracted text, including
+            # after a restart.  A failing console callback must not fail
+            # the retraction itself: the inbox delete already landed.
+            if self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            log.info(
+                "Retraction from %s deleted %s",
+                caller_hash[:8],
+                retract["target"][:8],
+            )
+            return response_ok(
+                target=retract["target"],
+                received_at=received_at,
+                deleted=True,
+            )
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -2823,7 +3103,9 @@ class TauNode:
         if group is not None:
             sender = message.get("from")
             pinned = self._accept_group_message(
-                sender if isinstance(sender, str) else "", group
+                sender if isinstance(sender, str) else "",
+                group,
+                sent_at=message.get("sent_at"),
             )
             if pinned is None:
                 log.info(
@@ -2832,7 +3114,6 @@ class TauNode:
                     sender or "unknown",
                 )
                 return False
-        self.mailbox.mark_seen(message["id"])
         record = {
             "from": message["from_name"],
             "destination": message["from"],
@@ -2857,13 +3138,39 @@ class TauNode:
             message["from"],
             message["text"],
         )
-        self._record_received(record)
-        if self.on_message is not None:
+        # One delivery: mark seen and record under the mailbox
+        # transaction, so a live backup never restores a seen marker
+        # with no inbox entry (see _handle_message).  Re-check inside
+        # the transaction, as there: a duplicate that landed while
+        # this one was in flight already marked the id seen.  The
+        # retraction check runs inside the same transaction, so a
+        # concurrent retract cannot land between the marker check and
+        # the append — the marker outlives the seen cache, so a relayed
+        # copy arriving after the id was evicted still loses to it.
+        # Group messages are not retractable in v1, so they never
+        # match a marker.
+        recorded = False
+        with self.mailbox.transaction():
+            if self.mailbox.is_seen(message["id"]):
+                pass
+            elif message.get("group") is None and self.mailbox.is_retracted(
+                sender if isinstance(sender, str) else "", message["id"]
+            ):
+                # A retract the sender issued after this copy was sealed
+                # still wins: the marker outlives the seen cache, so a
+                # relayed copy is dropped, never stored.  Group messages
+                # are not retractable in v1, so they never match a marker.
+                log.info("Dropping retracted relayed message %s", message["id"])
+            else:
+                self.mailbox.mark_seen(message["id"])
+                self._record_received(record)
+                recorded = True
+        if recorded and self.on_message is not None:
             try:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
-        return True
+        return recorded
 
     # -- application layer -------------------------------------------------
 
@@ -3392,8 +3699,12 @@ class TauNode:
         leg is a ``/tau/group`` request carrying the roster; a member
         that cannot be reached is queued in the outbox (with the group
         context, so a retry re-sends the group payload) unless it
-        explicitly refused the message.  Returns a per-member result
-        list: ``delivered``, ``queued``, or an ``error`` for that leg.
+        explicitly refused the message.  Each leg is bounded by
+        ``timeout``: the stages of one delivery share that leg's
+        budget, and a leg the deadline leaves no time to attempt is
+        queued the same way instead of dropped.  Returns a
+        per-member result list: ``delivered``, ``queued``, or an
+        ``error`` for that leg.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3441,16 +3752,103 @@ class TauNode:
                 members=list(group["members"]),
             )
             peer: Optional[Peer] = None
+            # One deadline bounds each leg, and the budget is per leg:
+            # the stages of a single delivery (resolve, path, link,
+            # response) share the leg's budget instead of each taking
+            # the full timeout, but one member's leg must not consume
+            # another's.  The roster is in sorted-hash order, so who
+            # runs first is arbitrary — with a single fan-out-wide
+            # deadline, an offline member sorted first burned the whole
+            # budget waiting for a path that could never appear, and
+            # every later (reachable) member was queued without an
+            # attempt.  A per-leg deadline reserves the full attempt
+            # window for every member while keeping each leg capped at
+            # ``timeout``.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                # Out of time for another attempt — but the leg must
+                # not be dropped to the deadline: queueing is local
+                # disk I/O, so the member still gets the message on a
+                # later retry, exactly as if the attempt had failed to
+                # reach them.
+                if not queue or not self.started:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": "not attempted: group send time limit reached",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=bytes.fromhex(member),
+                        text=normalized,
+                        to_name="",
+                        message_id=message_id,
+                        group=context,
+                    )
+                except MailboxError as queue_exc:
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "error": f"could not queue: {queue_exc}",
+                            "id": message_id,
+                        }
+                    )
+                    continue
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                any_queued = True
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "queued": True,
+                        "id": entry.id,
+                        "expires_at": entry.expires_at,
+                    }
+                )
+                continue
             try:
                 peer = self.resolve_peer(
                     member,
-                    timeout=discover_timeout
-                    if discover_timeout is not None
-                    else min(timeout, 10.0),
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
                 )
+                # Remember the leg before the request so a read receipt
+                # from this member verifies; a refused or unqueued leg
+                # is forgotten below.
+                self.mailbox.record_sent(
+                    message_id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                )
+                # Pass the leg's deadline through: without it, path
+                # discovery, link establishment and the response could
+                # each consume the leg's budget on a slow link, and
+                # one leg could take close to three timeouts.
                 response = self._request(
-                    peer, REQUEST_GROUP_MESSAGE, payload, timeout
+                    peer,
+                    REQUEST_GROUP_MESSAGE,
+                    payload,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
                 )
+                self.mailbox.record_delivered(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3463,6 +3861,7 @@ class TauNode:
             except (NotAllowedError, NotAMemberError) as exc:
                 # The member is online and explicitly refused; queueing
                 # would retry a refusal until its TTL expires.
+                self.mailbox.discard_sent(message_id)
                 results.append(
                     {
                         "to": member,
@@ -3476,6 +3875,7 @@ class TauNode:
                 )
             except NodeError as exc:
                 if not queue or not self.started:
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3498,6 +3898,7 @@ class TauNode:
                     # The outbox is full (or the write failed): record the
                     # leg as failed and keep going, so the legs already
                     # delivered or queued are not lost with the exception.
+                    self.mailbox.discard_sent(message_id)
                     results.append(
                         {
                             "to": member,
@@ -3508,6 +3909,19 @@ class TauNode:
                         }
                     )
                     continue
+                # A queued leg is registered under its outbox id, like
+                # a queued peer DM, so a receipt for it verifies. When
+                # resolve already succeeded the wire id was registered
+                # above (the outbox reuses it as its id, so this is a
+                # no-op); when resolve failed, this is the leg's only
+                # record, and without it the receipt would be rejected
+                # as unknown.
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=bytes.fromhex(member),
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "
@@ -3721,6 +4135,52 @@ class TauNode:
         }
         self._record_reaction(record)
         return dict(response, id=reaction_id)
+
+    def send_retraction(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Ask a peer to delete one of this node's sent DMs, and return
+        the decoded response.
+
+        ``message_id`` names the sent message.  The retract is its own
+        signed message kind: the payload is signed with this node's
+        Reticulum identity and verified by the receiver against the link
+        identity, exactly like a reaction — and the receiver only deletes
+        a message this node actually sent.  A retract for an unknown id
+        answers ok with ``deleted`` False, so retries are safe.
+
+        Retracts are delivered live in v1: unlike ``send_message``
+        there is no outbox queue, because the sealed-mail path is
+        text-shaped throughout.  An unreachable peer raises
+        :class:`NodeError`; queueing retracts for offline peers is a
+        follow-up once the mailbox can carry non-text kinds.
+        """
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("retract target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        retract_id = generate_message_id()
+        payload = retract_dict(target_id, message_id=retract_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign retraction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
+        return dict(response, id=retract_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""
