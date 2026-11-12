@@ -4022,6 +4022,30 @@ def test_edit_applies_the_senders_own_edit(tmp_path):
     assert entry["edited_at"] == 30.0
 
 
+def test_edit_notifies_the_console_callback(tmp_path):
+    # A serving console keeps its own copy of the message: the node
+    # tells it the new text so the console shows the edit too.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    seen = []
+    node.on_edit = seen.append
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed here", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["edited"] is True
+    assert len(seen) == 1
+    assert seen[0]["target"] == "msg-1"
+    assert seen[0]["text"] == "fixed here"
+    assert seen[0]["edited_at"] == 30.0
+    assert seen[0]["destination"] == destination_hash(sender).hex()
+
+
 def test_edit_unknown_id_answers_ok_without_editing(tmp_path):
     node = make_node(tmp_path)
     node.destination = SimpleNamespace(

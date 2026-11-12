@@ -293,6 +293,71 @@ def test_live_backup_survives_concurrent_state_replacement(tmp_path, capsys):
         writer.join(timeout=5)
 
 
+def test_live_backup_keeps_post_publishing_mid_backup(tmp_path, capsys, monkeypatch):
+    # A post that publishes between the Tan database snapshot and the
+    # queue capture must survive in one of the two: the backup holds
+    # the scheduled-posts lock across both, and the publish pass holds
+    # the same lock across creating the post and removing the entry.
+    # Without the lock the publish lands between the two reads and the
+    # archive holds neither the signed post nor the queued entry.
+    from types import SimpleNamespace
+
+    from tau import backup
+    from tau.scheduled_posts import publish_due_scheduled_posts, schedule_post
+    from tau.tangents.tan import TanApp
+
+    node = _init_node(tmp_path, "node", "alice")
+    _seed_state(node)
+    capsys.readouterr()
+    config = TauConfig.resolve(data_dir=node)
+    queue_path = node / "scheduled-posts.json"
+    schedule_post(queue_path, text="good morning", publish_at=1000.0, now=900.0)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    class _SucceedingNode:
+        registry = SimpleNamespace(all=lambda: [])
+
+        def request(self, *args, **kwargs):
+            return None
+
+    app.node = _SucceedingNode()
+
+    snapshot_done = threading.Event()
+    publish_done = threading.Event()
+    real_snapshot = backup._snapshot_sqlite
+
+    def snapshot_then_publish(source, dest):
+        result = real_snapshot(source, dest)
+        # The database copy is taken; now let the publish run while the
+        # backup goes on to read the queue.
+        snapshot_done.set()
+        publish_done.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(backup, "_snapshot_sqlite", snapshot_then_publish)
+
+    def publish():
+        snapshot_done.wait(timeout=10)
+        publish_due_scheduled_posts(queue_path, app, now=2000.0)
+        publish_done.set()
+
+    publisher = threading.Thread(target=publish, daemon=True)
+    publisher.start()
+    try:
+        archive = tmp_path / "backup.tar.gz"
+        create_backup(config, archive, live=True)
+    finally:
+        publisher.join(timeout=10)
+    assert not publisher.is_alive()
+
+    with tarfile.open(archive, mode="r:gz") as tar:
+        member = tar.extractfile("scheduled-posts.json")
+        assert member is not None
+        queued = json.loads(member.read())
+    assert len(queued["posts"]) == 1
+    assert queued["posts"][0]["text"] == "good morning"
+
+
 def test_backup_captures_uncheckpointed_wal_rows(tmp_path, capsys):
     # A row committed to the Tan database while the only writer holds
     # its connection open lives in tan.sqlite3-wal, not in the main

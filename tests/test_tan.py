@@ -136,6 +136,47 @@ def test_create_post_chains_and_verifies(identities, tmp_path):
     ]
 
 
+def test_concurrent_create_post_does_not_fork_the_chain(identities, tmp_path):
+    # Two writers racing the head read used to append siblings with the
+    # same seq — a fork.  The head read and the append are one atomic
+    # step now, so concurrent creates (separate connections, as the
+    # web, CLI and scheduled publisher each open) form one chain.
+    import threading
+
+    alice, _ = identities
+    db_path = tmp_path / "tan.sqlite3"
+    init_db(db_path).close()
+    errors = []
+
+    def create_many(tag, start):
+        try:
+            conn = init_db(db_path)
+            try:
+                for i in range(10):
+                    create_post(conn, alice, f"{tag}-{i}", name="alice", now=1000 + start + i)
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 - collected and asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=create_many, args=("a", 0)),
+        threading.Thread(target=create_many, args=("b", 100)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    conn = init_db(db_path)
+    rows = conn.execute("SELECT prev, seq, linked FROM posts").fetchall()
+    assert len(rows) == 20
+    assert sorted(int(row["seq"]) for row in rows) == list(range(1, 21))
+    assert len({str(row["prev"]) for row in rows if str(row["prev"])}) == 19
+    assert all(bool(row["linked"]) for row in rows)
+    assert max_seq(conn, author_of(alice)) == 20
+
+
 def test_verify_post_tolerates_none_returning_load(
     identities, tmp_path, load_public_key_without_return
 ):

@@ -3715,6 +3715,214 @@ def test_tan_saved_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_pinned_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "pin me", name="tester", now=1000)
+        theirs = create_post(conn, other, "not mine", name="other", now=1001)
+        extra = [
+            create_post(
+                conn, identity, f"pin me {index}", name="tester", now=1010 + index
+            )
+            for index in range(10)
+        ]
+    finally:
+        conn.close()
+    # The pin owner is the node's own author hash, so the Tan app must
+    # be attached before pinning — the same identity authored "mine".
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline flags pinned posts so the console can show pin
+        # state on each card.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["pin me"]["pinned"] is False
+
+        # Pinning requires a target, and an unknown hash cannot be pinned.
+        status, _, payload = _json(
+            bridge, "/api/tan/pin", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/pin", method="POST", body={"target": "ff" * 32}
+        )
+        assert status == 400
+
+        # Only your own posts can be pinned.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["pin"]["hash"] == mine["hash"]
+        assert payload["pin"]["already_pinned"] is False
+
+        # Pinning again is a no-op that reports the original pin.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["pin"]["already_pinned"] is True
+
+        # The shelf holds ten posts: the nine extra pins fill it, and
+        # an eleventh own post is refused.
+        for post in extra[:9]:
+            status, _, payload = _json(
+                bridge,
+                "/api/tan/pin",
+                method="POST",
+                body={"target": post["hash"]},
+            )
+            assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": extra[9]["hash"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["pin me"]["pinned"] is True
+        assert by_text["not mine"]["pinned"] is False
+
+        # Pinned posts come back newest pin first, flagged as pinned.
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            f"pin me {index}" for index in range(8, -1, -1)
+        ] + ["pin me"]
+        assert all(item["pinned"] is True for item in payload["posts"])
+        assert all("pinned_at" in item for item in payload["posts"])
+
+        # The list pages through older pins instead of stopping at the
+        # first page. The resume offset comes from the response: it
+        # counts raw rows, so filtering never shifts it.
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["pin me 8"]
+        assert payload["next_offset"] == 1
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1&offset=1")
+        assert [item["text"] for item in payload["posts"]] == ["pin me 7"]
+        assert payload["next_offset"] == 2
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1&offset=10")
+        assert payload["posts"] == []
+        assert payload["next_offset"] is None
+
+        # Unpinning removes it from the list; unpinning again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unpin",
+            method="POST",
+            body={"target": extra[0]["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["pin"]["unpinned"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unpin",
+            method="POST",
+            body={"target": extra[0]["hash"]},
+        )
+        assert status == 200
+        assert payload["pin"]["unpinned"] is False
+
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert [item["text"] for item in payload["posts"]].count("pin me 0") == 0
+
+        # Other surfaces carry the pinned flag too, so a pin made in
+        # one view shows up in the rest: search and top flag it, and a
+        # saved pinned post carries its saved flag in the pinned list.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        pinned = {item["hash"]: item for item in payload["posts"]}
+        assert pinned[mine["hash"]]["saved"] is True
+        status, _, payload = _json(bridge, "/api/tan/search?q=pin")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[mine["hash"]]["pinned"] is True
+        assert by_hash[extra[9]["hash"]]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/tan/top?limit=100")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[mine["hash"]]["pinned"] is True
+        assert by_hash[theirs["hash"]]["pinned"] is False
+
+        # A post deleted after being pinned stays in the list with its
+        # text blanked, so the pin is not silently lost.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert status == 200
+        pinned = {item["hash"]: item for item in payload["posts"]}
+        assert pinned[mine["hash"]]["text"] == ""
+        assert pinned[mine["hash"]]["deleted"] is True
+        assert pinned[mine["hash"]]["pinned"] is True
+    finally:
+        bridge.stop()
+
+
+def test_tan_pin_without_identity_returns_400(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # No identity is a permanent setup state, not a temporary
+        # outage: the pin fails as a 400 that says how to fix it,
+        # like the mentions endpoint does.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": "ab" * 32},
+        )
+        assert status == 400
+        assert "tau init" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
 def test_tan_saved_annotations_and_muting(tmp_path):
     import RNS
 
@@ -8578,6 +8786,29 @@ def test_pin_message_endpoint_pins_inbox_and_annotates_feed(bridge, node):
     assert updated_events[0]["message"]["pinned"] is True
 
 
+def test_pin_message_endpoint_writes_exactly_one_response(bridge, node, monkeypatch):
+    # A merge left two _send_json calls at the end of the pin handler:
+    # on a persistent connection the second response is read as the
+    # answer to the client's next request.
+    import tau.webapi as webapi
+
+    _seed_pinnable_message(bridge, node)
+    calls = []
+    original = webapi._WebHandler._send_json
+
+    def counting(self, payload, head_only=False, status=200):
+        calls.append(payload)
+        return original(self, payload, head_only, status)
+
+    monkeypatch.setattr(webapi._WebHandler, "_send_json", counting)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["id"] == 1
+    assert len(calls) == 1
+
+
 def test_pin_message_endpoint_is_a_noop_when_already_pinned(bridge, node):
     _seed_pinnable_message(bridge, node)
     status, _, payload = _json(
@@ -8955,6 +9186,615 @@ def test_delete_message_rejects_queued_entry(bridge, node):
     assert "still queued" in payload["error"]["message"]
     _, _, feed = _json(bridge, "/api/messages")
     assert len(feed["messages"]) == 1
+
+
+def _send_for_edit(bridge, node, *, text="typo here"):
+    """A delivered outbound console entry, with its inbox record, ready to edit."""
+    message, _ = bridge.send_message("alice", text)
+    node.inbox.append(
+        {
+            "id": message["wire_id"],
+            "destination": PEER_HASH,
+            "from": "tester",
+            "text": text,
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "direction": "out",
+        }
+    )
+    return message
+
+
+def _stub_send_edit(node, *, edited=True, edited_at=200.0):
+    """Stand in for the node's live-link edit, mirroring its local recording."""
+    calls = []
+
+    def send_edit(peer, message_id, text, *, timeout=20.0, discover_timeout=None):
+        calls.append((peer, message_id, text, timeout))
+        if edited:
+            node.inbox.apply_edit(
+                message_id, text, edited_at=edited_at, newer_than_existing=True
+            )
+        return {
+            "ok": True,
+            "target": message_id,
+            "edited": edited,
+            "received_at": 201.0,
+            "id": "edit-1",
+            "sent_at": edited_at,
+        }
+
+    node.send_edit = send_edit
+    return calls
+
+
+def test_edit_message_endpoint_updates_the_bubble(bridge, node):
+    from tau.protocol import excerpt_hash
+
+    message = _send_for_edit(bridge, node)
+    calls = _stub_send_edit(node)
+    wire_id = message["wire_id"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["edited"] is True
+    assert payload["id"] == "edit-1"
+    assert payload["message"]["id"] == message["id"]
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
+    assert payload["message"]["excerpt_hash"] == excerpt_hash("fixed here")
+    assert calls == [(PEER_HASH, wire_id, "fixed here", 20.0)]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+    assert feed["messages"][0]["edited_at"] == 200.0
+    # The node inbox copy carries the edit too (the stub mirrors
+    # send_edit), so `tau messages` agrees with the console.
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["text"] == "fixed here"
+
+
+def test_edit_message_endpoint_leaves_the_bubble_when_the_peer_has_no_copy(
+    bridge, node
+):
+    message = _send_for_edit(bridge, node)
+    _stub_send_edit(node, edited=False)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is False
+    assert payload["message"] is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+    assert "edited_at" not in feed["messages"][0]
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+
+
+def test_edit_message_endpoint_rejects_guards(bridge, node):
+    message = _send_for_edit(bridge, node)
+    _stub_send_edit(node)
+
+    # Unknown console id.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 99, "text": "fixed"},
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    # A received message is not the node's to edit.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-in",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 2, "text": "fixed"},
+    )
+    assert status == 400
+    assert "only your own sent" in payload["error"]["message"]
+
+    # Non-string and empty replacement text.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": 42},
+    )
+    assert status == 400
+    assert "must be a string" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "   "},
+    )
+    assert status == 400
+    assert "must not be empty" in payload["error"]["message"]
+
+    # A group message cannot be edited in v1.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="group typo",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-group",
+        group="crew",
+        group_name="crew",
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 3, "text": "fixed"},
+    )
+    assert status == 400
+    assert "group messages cannot be edited" in payload["error"]["message"]
+
+    # A file record has no text to edit.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-file",
+        file={
+            "name": "notes.txt",
+            "size": 4,
+            "sha256": "ab" * 32,
+            "kind": "file",
+        },
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 4, "text": "fixed"},
+    )
+    assert status == 400
+    assert "file transfers cannot be edited" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_rejects_a_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+    _stub_send_edit(node)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 1, "text": "fixed"},
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_rejects_a_message_still_in_the_outbox(
+    bridge, node
+):
+    # The bubble says delivered, but the mailbox still holds the send:
+    # an edit answered "not found" would let the queued copy arrive
+    # later with the old text.
+    message = _send_for_edit(bridge, node)
+    node.mailbox.enqueue(
+        to=bytes.fromhex(PEER_HASH),
+        text="typo here",
+        message_id=message["wire_id"],
+    )
+    _stub_send_edit(node)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed"},
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_keeps_the_bubble_when_the_peer_is_unreachable(
+    bridge, node
+):
+    message = _send_for_edit(bridge, node)
+
+    def send_edit(peer, message_id, text, **kwargs):
+        raise NodeError("peer is unreachable")
+
+    node.send_edit = send_edit
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 502
+    assert "unreachable" in payload["error"]["message"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+
+
+def test_record_edit_applies_an_inbound_edit(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert updated["edited_at"] == 200.0
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+    assert feed["messages"][0]["edited_at"] == 200.0
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+
+    # A replayed older edit must not rewind the newer one.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-1",
+                "text": "older text",
+                "edited_at": 150.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+    # An edit for a message outside this console's history, and a
+    # malformed record, are dropped quietly.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-missing",
+                "text": "fixed",
+                "edited_at": 300.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    assert (
+        bridge.record_edit({"target": "wire-1", "edited_at": 300.0}) is None
+    )
+
+
+def test_record_edit_keeps_cli_made_reactions(bridge, node):
+    # A reaction made from the CLI lives only in the shared inbox; the
+    # edit's message_updated event must carry it, or the open tab loses
+    # the reaction until reload.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    node.inbox.record_reaction(
+        {
+            "target": "wire-1",
+            "destination": BOB_HASH,
+            "reaction": "👍",
+            "from": "bob",
+            "sent_at": 150.0,
+            "received_at": 151.0,
+            "id": "react-1",
+        }
+    )
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["reactions"] == [
+        {"reactor": BOB_HASH, "name": "bob", "reaction": "👍"}
+    ]
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["reactions"] == updated["reactions"]
+
+
+def test_record_edit_does_not_publish_a_blocked_senders_edit(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    # The edit was accepted, then the sender was blocked before the
+    # bridge published it: the stored copy keeps the new text, but no
+    # live tab learns it while the block stands.
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    # Unblocking restores the updated history.
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+
+def test_edit_survives_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        message = _send_for_edit(bridge, node)
+        _stub_send_edit(node)
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/edit",
+            method="POST",
+            body={"id": message["id"], "text": "fixed here"},
+        )
+        assert status == 200
+        assert payload["edited"] is True
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert len(messages) == 1
+        assert messages[0]["text"] == "fixed here"
+        assert messages[0]["edited_at"] == 200.0
+    finally:
+        bridge2.stop()
+
+
+def test_edit_message_endpoint_adopts_a_newer_inbox_edit(bridge, node):
+    # A newer edit already landed in the inbox (e.g. the peer's own
+    # re-send raced this one): the console shows the newest text, not
+    # the older text this request carried.
+    message = _send_for_edit(bridge, node)
+    node.inbox.apply_edit(
+        message["wire_id"],
+        "newer text",
+        edited_at=250.0,
+        newer_than_existing=True,
+    )
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "newer text"
+    assert payload["message"]["edited_at"] == 250.0
+
+
+def test_edit_message_endpoint_ignores_an_inbound_record_with_the_same_wire_id(
+    bridge, node
+):
+    # The sent inbox copy was pruned, and a peer's inbound message
+    # reused the wire id and carries a newer edit.  The console must
+    # show this request's text, not the peer's: the inbox copy only
+    # speaks for the edit when it is our own sent copy to this peer.
+    message, _ = bridge.send_message("alice", "typo here")
+    node.inbox.append(
+        {
+            "id": message["wire_id"],
+            "destination": PEER_HASH,
+            "from": PEER_HASH,
+            "text": "peer text",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "direction": "in",
+        }
+    )
+    node.inbox.apply_edit(
+        message["wire_id"],
+        "peer edit",
+        edited_at=250.0,
+        newer_than_existing=True,
+    )
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
+
+
+def test_edit_message_endpoint_uses_the_signed_time_without_an_inbox_copy(
+    bridge, node
+):
+    # The inbox record is gone (pruned since the send): the console
+    # still shows the edit, ordered by the edit's signed time.
+    message, _ = bridge.send_message("alice", "typo here")
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
+
+
+def test_record_edit_is_scoped_to_direction_and_peer(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    edit = {
+        "target": "wire-1",
+        "text": "fixed here",
+        "edited_at": 200.0,
+        "from": "alice",
+        "destination": PEER_HASH,
+    }
+    # A local edit (direction out) may not rewrite an inbound entry.
+    assert bridge.record_edit({**edit, "direction": "out"}) is None
+    # Neither may an edit naming a different peer, or no peer at all:
+    # a wire id alone must not let one peer rewrite another's message.
+    assert (
+        bridge.record_edit({**edit, "destination": "ff" * 16}) is None
+    )
+    assert bridge.record_edit({k: v for k, v in edit.items() if k != "destination"}) is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+    # The correctly scoped edit still lands.
+    assert bridge.record_edit(edit) is not None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+
+def test_record_edit_buffers_an_edit_for_a_message_not_yet_appended(bridge):
+    # The edit overtook the callback that appends its target: it is
+    # buffered, not dropped, and lands when the entry arrives.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-9",
+                "text": "fixed here",
+                "edited_at": 200.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    # An unrelated message does not consume the buffered edit.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "other",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-8",
+        }
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "other"
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-9",
+        }
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][1]["text"] == "fixed here"
+    assert feed["messages"][1]["edited_at"] == 200.0
 
 
 def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):

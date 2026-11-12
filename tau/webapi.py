@@ -100,6 +100,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
+    GET  /api/tan/pinned   pinned posts, newest pin first
+    POST /api/tan/pin      pin one of your own posts
+    POST /api/tan/unpin    remove a post from the pinned list
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -186,6 +189,9 @@ MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
 MAX_EARLY_DELIVERIES = 128
+# Previous excerpt hashes kept per history entry, so a reply that quoted
+# a message before it was edited still resolves after the edit.
+MAX_EXCERPT_HASHES = 8
 # Wire ids removed from console history (by retraction or a console
 # delete), remembered so a delivery callback already in flight when
 # the removal landed cannot append the message back afterwards.
@@ -540,6 +546,17 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(read_at, (int, float)) or isinstance(read_at, bool):
             return None
         message["read_at"] = float(read_at)
+    edited_at = entry.get("edited_at")
+    if edited_at is not None:
+        if not isinstance(edited_at, (int, float)) or isinstance(edited_at, bool):
+            return None
+        try:
+            edited_at = float(edited_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
+        message["edited_at"] = edited_at
     mail_id = entry.get("mail_id")
     if isinstance(mail_id, str):
         # Kept so a message still queued across a restart can be matched
@@ -591,6 +608,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     # after the UTF-8 check above, because hashing a lone surrogate
     # would raise instead of dropping the entry.
     message["excerpt_hash"] = excerpt_hash(text)
+    # Previous hashes, kept by edits so replies that quoted the message
+    # before an edit still resolve; only strings survive, capped.
+    hashes = entry.get("excerpt_hashes")
+    if isinstance(hashes, list):
+        kept = [item for item in hashes if isinstance(item, str) and item]
+        if kept:
+            message["excerpt_hashes"] = kept[-MAX_EXCERPT_HASHES:]
     return message
 
 
@@ -618,6 +642,38 @@ def _public_peer_info(response: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(lxmf, dict) and isinstance(lxmf.get("enabled"), bool):
         info["lxmf_enabled"] = lxmf["enabled"]
     return info
+
+
+def _apply_edit(message: Dict[str, Any], text: str, edited_at: float) -> bool:
+    """Apply an edit to one history entry unless it is not newer.
+
+    Returns ``False`` (leaving the entry alone) when the entry already
+    carries an edit at or after ``edited_at``.  The previous excerpt
+    hash is kept (capped) so replies that quoted the message before
+    the edit still resolve.
+    """
+    previous = message.get("edited_at")
+    if (
+        isinstance(previous, (int, float))
+        and not isinstance(previous, bool)
+        and edited_at <= float(previous)
+    ):
+        return False
+    previous_hash = message.get("excerpt_hash")
+    if isinstance(previous_hash, str) and previous_hash:
+        hashes = message.get("excerpt_hashes")
+        kept = (
+            [item for item in hashes if isinstance(item, str)]
+            if isinstance(hashes, list)
+            else []
+        )
+        if previous_hash not in kept:
+            kept.append(previous_hash)
+        message["excerpt_hashes"] = kept[-MAX_EXCERPT_HASHES:]
+    message["text"] = text
+    message["edited_at"] = edited_at
+    message["excerpt_hash"] = excerpt_hash(text)
+    return True
 
 
 class WebBridge:
@@ -696,6 +752,20 @@ class WebBridge:
 
         node.on_reaction = _on_reaction
 
+        # Edits arrive on the same node callback pattern: chain any edit
+        # callback the node already has, then update the console history
+        # entry the edit targets.
+        previous_on_edit = getattr(node, "on_edit", None)
+
+        def _on_edit(record: Dict[str, Any]) -> None:
+            try:
+                if callable(previous_on_edit):
+                    previous_on_edit(record)
+            finally:
+                self.record_edit(record)
+
+        node.on_edit = _on_edit
+
         self.bus = EventBus()
         self._lock = threading.Lock()
         # A full-store audit verifies every signature, so only one runs
@@ -737,6 +807,12 @@ class WebBridge:
         # Verified read receipts whose console record was not appended yet,
         # keyed by (reader, wire id); send_message reconciles them on append.
         self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
+        # Inbound edits whose target entry was not appended yet, keyed by
+        # (sender, wire id) -> (text, edited_at); record_inbound applies
+        # them when the entry arrives instead of dropping the edit.
+        self._early_edits: OrderedDict[Tuple[str, str], Tuple[str, float]] = (
+            OrderedDict()
+        )
         # Receipt ids currently being dispatched, so overlapping triggers
         # (SSE reconnects, re-lists) do not send the same receipt twice.
         self._receipts_in_flight: Set[str] = set()
@@ -1043,6 +1119,16 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # An edit that overtook this callback was buffered by record_edit;
+        # apply it now so the appended entry shows the current text.
+        if isinstance(wire_id, str) and peer_hash:
+            with self._lock:
+                pending = self._early_edits.pop((peer_hash, wire_id), None)
+                applied = pending is not None and _apply_edit(
+                    message, pending[0], pending[1]
+                )
+            if applied:
+                self._save_messages()
         # A group reaction can arrive before its target copy: the inbox
         # retargets it onto this copy when it lands (see
         # Inbox.append_group_message), but the bridge's own cache still
@@ -1181,8 +1267,7 @@ class WebBridge:
         # Persist the flip like any other log change, so a restart does
         # not resurrect the message as queued.
         self._save_messages()
-        self._publish_message_updated(updated)
-        return updated
+        return self._publish_message_updated(updated)
 
     def record_read(
         self,
@@ -1228,9 +1313,7 @@ class WebBridge:
         if not updated:
             return updated
         self._save_messages()
-        for message in updated:
-            self._publish_message_updated(message)
-        return updated
+        return [self._publish_message_updated(message) for message in updated]
 
     def mark_displayed_read(self) -> None:
         """Send read receipts for inbound messages shown in the thread view.
@@ -1321,6 +1404,22 @@ class WebBridge:
             target=_send, name="tau-read-receipts", daemon=True
         ).start()
 
+    def _publish_message_updated(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Annotate one history entry like :meth:`messages` does, then publish it.
+
+        The entry is copied, overlaid with the node inbox's reaction
+        and pin state (which holds CLI-made reactions the bridge never
+        heard live), and group-filtered like the listing — so a live tab
+        never loses reactions when a ``message_updated`` event replaces
+        its bubble, and a pinned bubble never reads as unpinned.
+        Returns the annotated copy.
+        """
+        annotated = self._inbox_annotated(message)
+        self.bus.publish({"type": "message_updated", "message": annotated})
+        return annotated
+
     def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Attach a reaction to the console history entry it targets.
 
@@ -1388,8 +1487,101 @@ class WebBridge:
         if updated is None:
             return None
         self._save_messages()
-        self._publish_message_updated(updated)
-        return updated
+        return self._publish_message_updated(updated)
+
+    def record_edit(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply an edit to the console history entry it targets.
+
+        Edits name their target by wire id, like reactions — and, like
+        reactions, by conversation side: an inbound edit (the default)
+        names the sender as ``destination`` and may only rewrite their
+        inbound entry; a local edit passes ``direction="out"`` and the
+        recipient, and rewrites only our own sent entry.  Matching by
+        wire id alone would let a peer reuse one of our ids and
+        overwrite a different message.  The entry's text is replaced
+        and ``edited_at`` stamped, so the console shows the new text
+        with an edited marker; the excerpt hash is recomputed from the
+        new text, and the previous hash is kept so replies that quoted
+        it before the edit still resolve.  A stale edit — one whose
+        ``edited_at`` does not beat the entry's — is dropped, so a
+        replayed older edit cannot rewind a newer one.  An edit whose
+        target is not in this console's history yet is buffered: the
+        edit can overtake the callback that appends its target, and
+        record_inbound applies the newest buffered edit when the entry
+        arrives instead of dropping it.  (An edit for a message this
+        console never shows — sent from the CLI, or predating wire ids
+        — still drops: the node inbox keeps it, so ``tau messages``
+        shows it.)  The updated entry is re-sent as ``message_updated``,
+        which the console already renders in place; the published copy
+        carries the inbox reaction overlay, like :meth:`messages` does,
+        so a CLI-made reaction is not lost when the bubble is replaced.
+        An inbound edit whose sender is blocked by the time it is
+        applied is stored — unblocking restores the updated history —
+        but its text is not fanned out live while the block stands.
+        """
+        target = record.get("target")
+        text = record.get("text")
+        raw_edited_at = record.get("edited_at")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(text, str)
+            or not text
+            or not isinstance(raw_edited_at, (int, float))
+            or isinstance(raw_edited_at, bool)
+        ):
+            return None
+        try:
+            edited_at = float(raw_edited_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
+        # The edit is scoped to one conversation side: an inbound edit
+        # (the default) names the sender as ``destination`` and may only
+        # rewrite their inbound entry; a local edit passes
+        # ``direction="out"`` and the recipient, and rewrites only our
+        # own sent entry.
+        direction = record.get("direction", "in")
+        peer = record.get("destination")
+        if direction not in ("in", "out") or not isinstance(peer, str) or not peer:
+            return None
+        updated: Optional[Dict[str, Any]] = None
+        with self._lock:
+            for message in self._messages:
+                if (
+                    message.get("wire_id") != target
+                    or message.get("direction") != direction
+                    or message.get("peer") != peer
+                ):
+                    continue
+                if not _apply_edit(message, text, edited_at):
+                    return None
+                updated = dict(message)
+                break
+            if updated is None and direction == "in":
+                # The edit can overtake the callback that appends its
+                # target (the node stores the DM before calling back).
+                # Keep the newest such edit so record_inbound applies it
+                # when the entry arrives instead of dropping it.
+                key = (peer, target)
+                pending = self._early_edits.get(key)
+                if pending is None or edited_at > pending[1]:
+                    self._early_edits[key] = (text, edited_at)
+                    self._early_edits.move_to_end(key)
+                    while len(self._early_edits) > MAX_EARLY_DELIVERIES:
+                        self._early_edits.popitem(last=False)
+        if updated is None:
+            return None
+        self._save_messages()
+        if direction == "in":
+            # The edit was accepted before the block landed; the stored
+            # copy keeps it, but the replacement text must not reach
+            # live subscribers while the sender is blocked.
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is not None and blocklist.is_blocked(peer):
+                return updated
+        return self._publish_message_updated(updated)
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
@@ -1425,6 +1617,7 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_pinned,
             annotate_quote_counts,
             annotate_quotes,
             annotate_reactions,
@@ -1486,6 +1679,7 @@ class WebBridge:
                     exclude_all=exclude_all,
                 )
             annotate_saved(conn, posts)
+            annotate_pinned(conn, posts)
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1614,6 +1808,7 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             TanError,
+            annotate_pinned,
             apply_display_rules,
             resolve_author,
             search_posts,
@@ -1655,6 +1850,7 @@ class WebBridge:
                 )
             except TanError as exc:
                 raise RequestError(str(exc)) from exc
+            annotate_pinned(conn, posts)
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1676,7 +1872,12 @@ class WebBridge:
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import apply_display_rules, resolve_author, top_posts
+        from .tangents.tan import (
+            annotate_pinned,
+            apply_display_rules,
+            resolve_author,
+            top_posts,
+        )
 
         # Same block-list snapshot as the timeline: the console hides
         # posts by blocked authors, and a failed-closed list hides all.
@@ -1717,6 +1918,7 @@ class WebBridge:
                 ruleset=ruleset,
                 exclude_authors=blocked,
             )
+            annotate_pinned(conn, posts)
             return apply_display_rules(posts, ruleset)
         finally:
             conn.close()
@@ -2189,12 +2391,48 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_pin(self, target: str) -> Dict[str, Any]:
+        # Pins are local-only: no signed entry and no gossip, so the
+        # social app is not needed — the same as `tau tan pin`.
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import pin_post
+
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                owner = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                owner = (
+                    destination_hash(identity).hex()
+                    if identity is not None
+                    else None
+                )
+            if owner is None:
+                raise RequestError(
+                    "this node has no identity, so nothing of yours can be "
+                    "pinned; run `tau init` to create one"
+                )
+            return pin_post(conn, target, owner=owner)
+        finally:
+            conn.close()
+
+    def tan_unpin(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unpin_post
+
+        conn = self._tan_conn()
+        try:
+            return unpin_post(conn, target)
+        finally:
+            conn.close()
+
     def tan_saved(
         self, *, limit: int = 30, offset: int = 0
     ) -> Dict[str, Any]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import annotated_saved_posts
+        from .tangents.tan import annotate_pinned, annotated_saved_posts
 
         conn = self._tan_conn()
         try:
@@ -2218,6 +2456,58 @@ class WebBridge:
             posts, next_offset = annotated_saved_posts(
                 conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
             )
+            annotate_pinned(conn, posts)
+            return {"posts": posts, "next_offset": next_offset}
+        finally:
+            conn.close()
+
+    def tan_pinned(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
+        """Pinned posts, newest pin first, with the timeline's annotations.
+
+        Mirrors :func:`tau.cli.cmd_tan_pinned`: the same selection and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same store — including the node's block-list,
+        which hides blocked authors' posts here the same way the
+        timeline hides them.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import annotate_saved, annotated_pinned_posts
+
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            posts, next_offset = annotated_pinned_posts(
+                conn,
+                limit=limit,
+                offset=offset,
+                viewer=viewer,
+                ruleset=ruleset,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
+            annotate_saved(conn, posts)
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
@@ -3091,6 +3381,139 @@ class WebBridge:
             },
         }
 
+    def edit_message(
+        self, target: int, text: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Edit one of this node's sent DMs, from the console.
+
+        Mirrors ``tau edit``: the peer is asked to replace the sent
+        message's text, and the local copies update too (console history
+        entry, through :meth:`record_edit`; the node inbox copy and sent
+        record are updated by :meth:`TauNode.send_edit` itself), so the
+        bubble shows the new text with an edited marker.  A peer who had
+        no copy answers ``edited`` False, which is not an error — but
+        unlike a retract, the local copy is left alone: applying the new
+        text locally while the peer keeps the old one would split the
+        two histories.
+
+        Only your own sent DMs can be edited: group messages are not
+        editable in v1, a file transfer has no text to edit, and a
+        message still queued has not reached its recipient yet (cancel
+        it from the outbox instead).  Edits ride the live link only, so
+        an unreachable peer is a failure, not a silent queue.
+
+        Ordering keeps every failure retryable from the console: the
+        edit goes first, so a failed edit never rewrites the local
+        copy; the console entry is updated last, through the same
+        ``message_updated`` event an inbound edit uses, so other tabs
+        learn.  A retry after a failure re-sends the edit (idempotent —
+        the peer answers ``edited`` False for a stale one) and retries
+        the local update.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        if not isinstance(text, str):
+            raise ValueError("field 'text' must be a string")
+        cleaned = normalize_message(text)
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("direction") != "out":
+                raise ValueError("only your own sent messages can be edited")
+            if entry.get("group"):
+                raise ValueError("group messages cannot be edited in v1")
+            if entry.get("file"):
+                raise ValueError("file transfers cannot be edited")
+            if entry.get("status") == "queued":
+                # An edit answered "not found" would let the queued
+                # copy arrive later with the old text, so cancellation
+                # has to go through the outbox first.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = entry.get("wire_id")
+            peer = entry.get("peer")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("that message has no id to edit")
+        if not isinstance(peer, str) or not peer:
+            raise ValueError("that message has no known recipient to edit from")
+        with self.node.mailbox.transaction():
+            if self.node.mailbox.get_outbox(wire_id) is not None:
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+        response = self.node.send_edit(peer, wire_id, cleaned, timeout=timeout)
+        if response.get("edited") is False:
+            # The peer had no copy (or a newer edit already landed):
+            # leave the local copy alone and report it, so the console
+            # can say so instead of showing the new text one-sidedly.
+            return {
+                "ok": True,
+                "edited": False,
+                "message": None,
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+            }
+        # Order by the edit's signed time, not when this request finished,
+        # so two overlapping edits keep their send order.
+        signed_at = response.get("sent_at")
+        if isinstance(signed_at, (int, float)) and not isinstance(signed_at, bool):
+            edited_at = float(signed_at)
+        else:
+            edited_at = time.time()
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                record = inbox.resolve(wire_id)
+            except ValueError:
+                record = None
+            # The inbox copy speaks for the edit only when it holds this
+            # edit or a newer one — and only when it is this node's own
+            # sent copy to this peer.  Otherwise the local inbox write did
+            # not land, and the text we were given is the accepted version.
+            # (An inbound record can reuse the wire id once the sent copy
+            # is pruned; its text must never replace our sent bubble.)
+            raw_edited = record.get("edited_at") if record is not None else None
+            if (
+                record is not None
+                and record.get("id") == wire_id
+                and record.get("direction") == "out"
+                and (record.get("destination") or "") == peer
+                and isinstance(record.get("text"), str)
+                and isinstance(raw_edited, (int, float))
+                and not isinstance(raw_edited, bool)
+                and float(raw_edited) >= edited_at
+            ):
+                cleaned = record["text"]
+                edited_at = float(raw_edited)
+        updated = self.record_edit(
+            {
+                "target": wire_id,
+                "text": cleaned,
+                "edited_at": edited_at,
+                "direction": "out",
+                "destination": peer,
+            }
+        )
+        return {
+            "ok": True,
+            "edited": True,
+            "message": updated,
+            "id": response.get("id")
+            if isinstance(response.get("id"), str)
+            else None,
+        }
+
+
     def retract_message(self, target: int, *, timeout: float = 20.0) -> Dict[str, Any]:
         """Retract one of this node's sent DMs, from the console.
 
@@ -3411,6 +3834,7 @@ class WebBridge:
         else:
             state["was_pinned"] = changed
         return {"ok": True, "pinned" if pinned else "unpinned": state}
+
 
     def _remove_history_entry(
         self, target: int, removed: Dict[str, Any], *, publish_unread: bool
@@ -4801,18 +5225,6 @@ class WebBridge:
             pinned_ids,
         )
 
-    def _publish_message_updated(self, message: Dict[str, Any]) -> None:
-        """Publish a ``message_updated`` carrying the inbox's overlays.
-
-        Every update goes through here so the reaction and pin state the
-        inbox holds rides on the event too.  Otherwise a receipt or a
-        reaction would replace a pinned bubble with a payload that reads
-        as unpinned in every open tab.
-        """
-        self.bus.publish(
-            {"type": "message_updated", "message": self._inbox_annotated(message)}
-        )
-
     def counts(self) -> Dict[str, int]:
         with self._lock:
             message_count = len(self._messages)
@@ -5447,6 +5859,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/tan/pinned":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
+                try:
+                    result = self.bridge.tan_pinned(limit=limit, offset=offset)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load pinned Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load pinned posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
+                    head_only,
+                )
+                return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
                 posts = self.bridge.tan_posts(limit=limit)
@@ -5536,6 +5975,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
+                return
+            if path == "/api/messages/edit":
+                self._handle_edit_message(body, head_only)
                 return
             if path == "/api/messages/retract":
                 self._handle_retract_message(body, head_only)
@@ -6038,6 +6480,36 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "save": result}, head_only)
                 return
+            if path in ("/api/tan/pin", "/api/tan/unpin"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unpin"):
+                        result = self.bridge.tan_unpin(target.strip())
+                    else:
+                        result = self.bridge.tan_pin(target.strip())
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a pinned Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update pinned posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json({"ok": True, "pin": result}, head_only)
+                return
             if path == "/api/tan/sync":
                 try:
                     result = self.bridge.tan_sync(
@@ -6452,6 +6924,43 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
+
+    def _handle_edit_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        text = body.get("text")
+        if not isinstance(text, str):
+            self._send_json(
+                {"error": {"message": "field 'text' must be a string"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.edit_message(target, text, timeout=timeout)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+
 
     def _handle_retract_message(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("id")

@@ -16,6 +16,7 @@ import type {
   DeleteMessageResponse,
   DoctorResponse,
   DropHeldResponse,
+  EditMessageResponse,
   ForgetPeerResponse,
   ForwardMessageResponse,
   GroupsResponse,
@@ -93,6 +94,11 @@ function predatesForget(
 ): boolean {
   const cutoff = forgotten.get(peer.destination);
   return cutoff !== undefined && peer.last_seen <= cutoff;
+}
+
+/** True when the held copy carries a newer edit than an incoming version. */
+function holdsNewerEdit(held: TauMessage, incoming: TauMessage): boolean {
+  return (held.edited_at ?? 0) > (incoming.edited_at ?? 0);
 }
 
 function readEventData<T>(event: Event): T | null {
@@ -209,6 +215,15 @@ export function useTau() {
 
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
+  // Set to the search runner once it is defined below, so edit handlers
+  // can re-run an active search and keep its hits in step with the text.
+  const runSearchRef = useRef<((trimmed: string) => Promise<void>) | null>(
+    null,
+  );
+  const refreshActiveSearch = useCallback(() => {
+    const query = searchQueryRef.current;
+    if (query) void runSearchRef.current?.(query);
+  }, []);
   // Console ids removed by a delete or retract in this tab. A search
   // that ran before the removal keeps its stale hits in state, and a
   // search re-run after it still lists the record until the inbox
@@ -336,12 +351,16 @@ export function useTau() {
           : message;
       // A queued message that the mail sweep has since delivered: the
       // server re-sends the same console id with status "delivered".
-      // Replace it in place rather than appending a duplicate.
+      // Replace it in place rather than appending a duplicate.  A
+      // version older than the held edit (a late event) is ignored.
       setMessages((previous) =>
         previous.map((entry) =>
-          entry.id === message.id ? withPinState(entry) : entry,
+          entry.id === message.id && !holdsNewerEdit(entry, message)
+            ? withPinState(entry)
+            : entry,
         ),
       );
+      if (message.edited_at !== undefined) refreshActiveSearch();
       // Search hits show the same bubble, so they follow pin changes too.
       setSearchResults((previous) =>
         previous.some((entry) => entry.id === message.id)
@@ -478,7 +497,7 @@ export function useTau() {
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread, refreshGroups, refreshNode]);
+  }, [applyUnread, refreshGroups, refreshNode, refreshActiveSearch]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -706,6 +725,32 @@ export function useTau() {
     );
     return result.deleted;
   }, []);
+
+  const editMessage = useCallback(async (id: number, text: string) => {
+    const result = await apiPost<EditMessageResponse>("/api/messages/edit", {
+      id,
+      text,
+    });
+    // The edit already succeeded: swap the new text in at once, and
+    // let the message_updated event reconcile other tabs. When the
+    // peer had no copy the server reports edited false and leaves the
+    // bubble alone — the caller says so instead of showing new text
+    // one-sidedly.
+    // A late response older than a version already received over the
+    // event stream must not rewind the bubble.
+    const edited = result.message;
+    if (result.edited && edited) {
+      setMessages((previous) =>
+        previous.map((entry) =>
+          entry.id === edited.id && !holdsNewerEdit(entry, edited)
+            ? edited
+            : entry,
+        ),
+      );
+      refreshActiveSearch();
+    }
+    return result;
+  }, [refreshActiveSearch]);
 
   const retractMessage = useCallback(async (id: number) => {
     const result = await apiPost<RetractMessageResponse>(
@@ -1504,6 +1549,10 @@ export function useTau() {
     }
   }, []);
 
+  useEffect(() => {
+    runSearchRef.current = runSearch;
+  }, [runSearch]);
+
   const search = useCallback(
     async (query: string) => {
       const trimmed = query.trim();
@@ -1605,6 +1654,7 @@ export function useTau() {
     importing,
     send,
     deleteMessage,
+    editMessage,
     retractMessage,
     forwardMessage,
     sendGroup,
