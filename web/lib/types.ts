@@ -35,6 +35,10 @@ export interface TauMessage {
   wire_id?: string;
   // Latest reaction per reactor, oldest first.
   reactions?: MessageReaction[];
+  // Pinned in the node inbox (`tau pin`): a local-only flag, never sent.
+  // Absent reads as unpinned, the same way an absent `reactions` reads
+  // as no reactions.
+  pinned?: boolean;
   // Short hash of this message's text, for checking a reply's quoted
   // excerpt against it; see resolveQuote in message-feed.tsx.
   excerpt_hash?: string;
@@ -352,6 +356,20 @@ export interface DoctorResponse {
 export interface DeleteMessageResponse {
   ok: boolean;
   deleted: { id: number; wire_id?: string | null };
+}
+
+// POST /api/messages/pin: the pinned console id and wire id, plus
+// whether the pin already existed (a re-pin is a no-op, not an error).
+export interface PinMessageResponse {
+  ok: boolean;
+  pinned: { id: number; wire_id: string; already_pinned: boolean };
+}
+
+// POST /api/messages/unpin: the unpinned console id and wire id, plus
+// whether a pin was actually removed.
+export interface UnpinMessageResponse {
+  ok: boolean;
+  unpinned: { id: number; wire_id: string; was_pinned: boolean };
 }
 export interface RetryOutboxResponse {
   ok: boolean;
