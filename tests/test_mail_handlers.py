@@ -1782,11 +1782,13 @@ def test_group_reaction_purge_clears_console_cache_for_relayed_copy(tmp_path):
         bridge.stop()
 
 
-def test_group_message_not_published_when_purge_fails(tmp_path, monkeypatch):
+def test_group_message_refused_when_purge_fails(tmp_path, monkeypatch):
     # CodeRabbit follow-up (node.py:1664): if the purge fails, the
-    # voided reaction is still stored and still cached, so publishing
-    # the live event would display it.  The arrival fails closed:
-    # the message is recorded durably, but no live event is published.
+    # voided reaction is still stored and still cached, so recording
+    # the message would leave the reaction readable through
+    # reactions_for.  The arrival fails closed: the delivery is
+    # refused and nothing is recorded or marked seen — the sender
+    # retries once the store is healthy.
     from tau.webapi import WebBridge
 
     node = make_node(tmp_path)
@@ -1833,10 +1835,124 @@ def test_group_message_not_published_when_purge_fails(tmp_path, monkeypatch):
             ),
             remote_identity=author,
         )
+        assert delivered["ok"] is False
+        assert delivered["error"]["code"] == "storage_failed"
+        assert published == []
+        assert node.inbox.list_messages() == []
+        assert not node.mailbox.is_seen("local-copy-1")
+        # The reaction is still stored — but with no message holding
+        # its target, it is readable nowhere.
+        assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    finally:
+        bridge.stop()
+
+
+def test_relayed_message_refused_when_purge_fails(tmp_path, monkeypatch):
+    # The same fail-closed refusal on the relayed path: nothing is
+    # marked seen, so another holder's copy can deliver it later.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(node.inbox, "purge_non_member_reactions", _fail)
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is False
+    assert node.inbox.list_messages() == []
+    assert not node.mailbox.is_seen("local-copy-1")
+
+
+def test_group_message_recorded_but_not_published_when_fan_out_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit follow-up (node.py:1664): if the console cache
+    # update fails, the bridge still holds the stale reaction and
+    # would seed it into the live entry.  The message still records
+    # — the inbox purge succeeded, so the reaction is voided there —
+    # but the live event is withheld.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id("ab" * 16, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+
+        def _raise(record):
+            raise RuntimeError("console callback failed")
+
+        monkeypatch.setattr(node, "on_reaction", _raise)
+        delivered = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "crew hello",
+                message_id="local-copy-1",
+                group_id=group,
+                group_name="crew",
+                creator="ab" * 16,
+                members=members,
+                sent_at=100.0,
+            ),
+            remote_identity=author,
+        )
         assert delivered["ok"] is True
         assert published == []
         assert len(node.inbox.list_messages()) == 1
-        assert len(node.inbox.reactions_for("local-copy-1")) == 1
+        assert node.inbox.reactions_for("local-copy-1") == []
     finally:
         bridge.stop()
 

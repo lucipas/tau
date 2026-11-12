@@ -1359,21 +1359,26 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_reaction callback failed", exc_info=True)
 
-    def _publish_reaction(self, record: Dict[str, Any]) -> None:
+    def _publish_reaction(self, record: Dict[str, Any]) -> bool:
         """Fan one reaction record out to the console, best effort.
 
         The record is already persisted — this is only the callback
         half of :meth:`_record_reaction`, for tombstones the purge
         wrote itself.  The console bridge keeps its own reaction
         cache, seeded into messages appended afterwards, so a void
-        that never reaches it would still display.  A failing callback
-        never breaks delivery.
+        that never reaches it would still display.  Returns ``True``
+        when the callback ran (or there is no console to tell), and
+        ``False`` when it raised, so the caller can withhold the
+        live event instead of publishing with a stale cache.
         """
-        if self.on_reaction is not None:
-            try:
-                self.on_reaction(record)
-            except Exception:  # pragma: no cover - user callback
-                log.warning("on_reaction callback failed", exc_info=True)
+        if self.on_reaction is None:
+            return True
+        try:
+            self.on_reaction(record)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_reaction callback failed", exc_info=True)
+            return False
+        return True
 
     def _record_sent(self, record: Dict[str, Any]) -> None:
         """Persist an outgoing DM to the inbox; never break sending.
@@ -1641,21 +1646,29 @@ class TauNode:
             # One delivery: mark seen and record under the mailbox
             # transaction, so a live backup never restores a seen
             # marker with no inbox entry (see _handle_message).
-            with self.mailbox.transaction():
-                if message_id:
-                    self.mailbox.mark_seen(message_id)
-                self._record_received(record)
-            # A reaction can outrun the message it names — legs fan
-            # out one member at a time — and was stored under the
+            # The authorization cleanup runs BEFORE the record: a
+            # reaction can outrun the message it names — legs fan out
+            # one member at a time — and was stored under the
             # reactor's foreign wire id with its signed group context
             # retained.  Now that this copy is here, move those
             # reactions onto it; only reactors on this group's roster
-            # move, so an outsider's reaction never surfaces.  Never
-            # breaks delivery: a failed reconcile leaves the
-            # reactions stored (and invisible) exactly as before.
-            # The purge below is a separate attempt: a reconcile
-            # failure must not skip it.
-            purge_ok = True
+            # move, so an outsider's reaction never surfaces.  And
+            # void any stored reaction on this id from a reactor the
+            # roster does not name (a no-context reaction stored
+            # before its target arrived, when no roster check could
+            # run).  If the purge fails, the delivery is refused and
+            # nothing is recorded or marked seen: the reaction would
+            # otherwise be readable through reactions_for, and the
+            # sender retries with the same id once the store is
+            # healthy.  A failed reconcile is different — it only
+            # leaves legitimate reactions stranded (invisible) — so
+            # it never breaks delivery.  The voids are fanned out to
+            # the console before the record too: the bridge caches
+            # reactions separately and seeds appended messages from
+            # that cache, so a void that never reaches it would still
+            # display.  If a fan-out fails, the message still records
+            # (the inbox is clean) but the live event is withheld.
+            publish_ok = True
             if message_id:
                 try:
                     self.inbox.reconcile_group_reactions(
@@ -1669,36 +1682,28 @@ class TauNode:
                     log.warning(
                         "Could not reconcile group reactions", exc_info=True
                     )
-                # A reaction can also be stored before its target
-                # arrives with no group context at all — the target
-                # was unknown, so no roster check could run — and
-                # then surface under this exact id now that the copy
-                # is here.  Void any stored reaction on it from a
-                # reactor the roster does not name.  The void is
-                # fanned out to the console too: the bridge caches
-                # reactions separately and seeds appended messages
-                # from that cache, so a void that never reaches it
-                # would still display.
                 try:
                     voided = self.inbox.purge_non_member_reactions(
                         message_id,
                         members=set(group.get("members") or []),
                     )
-                    for tombstone in voided:
-                        self._publish_reaction(tombstone)
                 except Exception:  # pragma: no cover - storage failure
                     log.warning(
                         "Could not purge non-member group reactions",
                         exc_info=True,
                     )
-                    purge_ok = False
-            # Fail closed on a purge failure: the voided reaction is
-            # still stored and still cached by the bridge, so
-            # publishing the live event would display it.  The
-            # message itself is already recorded durably — it stays
-            # visible in the inbox — only the live console event is
-            # withheld until the store is healthy again.
-            if purge_ok and self.on_message is not None:
+                    return response_error(
+                        "storage_failed",
+                        "could not authorize group reactions",
+                    )
+                for tombstone in voided:
+                    if not self._publish_reaction(tombstone):
+                        publish_ok = False
+            with self.mailbox.transaction():
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                self._record_received(record)
+            if publish_ok and self.on_message is not None:
                 try:
                     self.on_message(record)
                 except Exception:  # pragma: no cover - user callback
@@ -3329,25 +3334,18 @@ class TauNode:
         # with no inbox entry (see _handle_message).  Re-check inside
         # the transaction, as there: a duplicate that landed while
         # this one was in flight already marked the id seen.
-        recorded = False
-        with self.mailbox.transaction():
-            if not self.mailbox.is_seen(message["id"]):
-                self.mailbox.mark_seen(message["id"])
-                self._record_received(record)
-                recorded = True
-        # A relayed copy is an arrival too: reconcile stored
-        # reactions onto it and void non-members' reactions on it,
-        # exactly as a direct group message does.  The voids are
-        # fanned out to the console too, before on_message runs, so
-        # the bridge cache cannot seed them into the appended entry.
-        # The reconcile and the purge are separate attempts: a
-        # reconcile failure must not skip the purge.  A storage
-        # failure here never un-delivers the message — it is already
-        # recorded — but a failed purge withholds the live event:
-        # the reaction is still stored and still cached, so
-        # publishing it would display an unauthorized reaction.
-        purge_ok = True
-        if recorded and pinned is not None:
+        # The authorization cleanup runs BEFORE the record, exactly
+        # as a direct group message does: if the purge fails, the
+        # delivery is refused and nothing is marked seen — another
+        # holder's copy can deliver it later, and the reaction can
+        # never become readable through reactions_for.  The reconcile
+        # and the purge are separate attempts, so a reconcile failure
+        # never skips the purge; a failed reconcile only leaves
+        # legitimate reactions stranded.  If a fan-out fails, the
+        # message still records (the inbox is clean) but the live
+        # event is withheld.
+        publish_ok = True
+        if pinned is not None:
             try:
                 self.inbox.reconcile_group_reactions(
                     pinned["id"],
@@ -3366,15 +3364,22 @@ class TauNode:
                     message["id"],
                     members=set(pinned.get("members") or []),
                 )
-                for tombstone in voided:
-                    self._publish_reaction(tombstone)
             except Exception:  # pragma: no cover - storage failure
                 log.warning(
                     "Could not purge relayed non-member group reactions",
                     exc_info=True,
                 )
-                purge_ok = False
-        if recorded and purge_ok and self.on_message is not None:
+                return False
+            for tombstone in voided:
+                if not self._publish_reaction(tombstone):
+                    publish_ok = False
+        recorded = False
+        with self.mailbox.transaction():
+            if not self.mailbox.is_seen(message["id"]):
+                self.mailbox.mark_seen(message["id"])
+                self._record_received(record)
+                recorded = True
+        if recorded and publish_ok and self.on_message is not None:
             try:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
