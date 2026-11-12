@@ -937,7 +937,12 @@ class TauNode:
         # below run under one lock.  Without it both copies could
         # pass the checks before either stored anything and the
         # message would land in the inbox twice.
-        with self._lxmf_delivery_lock:
+        # The mailbox transaction is held across the retraction check and
+        # the append, so a retract that records its marker concurrently
+        # either lands first (and the check sees it) or waits until this
+        # copy is stored (and then deletes it).  Lock order is delivery
+        # lock, then mailbox, then inbox — the same as the retract path.
+        with self._lxmf_delivery_lock, self.mailbox.transaction():
             if self.mailbox.is_seen(message_id):
                 log.info("Ignoring duplicate LXMF message %s", message_id)
                 return
