@@ -2519,6 +2519,66 @@ def test_messages_unread_filter_and_json_flags(tmp_path, capsys):
     assert [item["unread"] for item in payload["messages"]] == [True, False, False]
 
 
+def test_parser_messages_unread_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "unread", "alice"])
+    assert args.peer == "alice"
+    assert args.all is False
+
+    args = parser.parse_args(["messages", "unread", "alice", "--all"])
+    assert args.all is True
+
+
+def test_messages_unread_marks_newest_message_unread_again(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    # Listing marks both messages read.
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(["messages", "unread", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "marked 1 message from alice unread" in capsys.readouterr().out
+
+    # Only the newest message is unread again; the older one stays read.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["text"] == "second hello"
+
+
+def test_messages_unread_all_marks_whole_conversation_unread(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "messages",
+            "unread",
+            "alice",
+            "--all",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"peer": sender_hash.hex(), "unread": 2, "total": 2}
+
+
+def test_messages_unread_unknown_peer(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "unread", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
 def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
 

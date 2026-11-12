@@ -1074,6 +1074,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_delete.set_defaults(func=cmd_messages_delete)
 
+    messages_unread = messages_sub.add_parser(
+        "unread",
+        parents=[common],
+        help="mark a conversation unread again so it shows in the unread view",
+    )
+    messages_unread.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    messages_unread.add_argument(
+        "--all",
+        action="store_true",
+        help="mark the whole conversation unread instead of just the newest message",
+    )
+    messages_unread.set_defaults(func=cmd_messages_unread)
+
     messages_export = messages_sub.add_parser(
         "export",
         parents=[common],
@@ -6128,6 +6145,25 @@ def cmd_messages_delete(args: argparse.Namespace) -> int:
             " theirs, and sealed copies already held by relays are"
             " unaffected."
         )
+    return _EXIT_OK
+
+
+def cmd_messages_unread(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    counts = inbox.mark_unread(peer_hash, all=getattr(args, "all", False))
+    if counts is None:
+        raise NodeError(f"no stored messages from {args.peer!r}")
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    unread = counts["per_peer"].get(peer_hash, 0)
+    if _json_mode(args):
+        _emit({"peer": peer_hash, "unread": unread, "total": counts["total"]}, True)
+    else:
+        noun = "message" if unread == 1 else "messages"
+        print(f"marked {unread} {noun} from {name} unread")
     return _EXIT_OK
 
 
