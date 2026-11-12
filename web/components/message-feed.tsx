@@ -14,11 +14,17 @@ import {
 
 import { CopyButton, RadarIcon, SectionLabel } from "./ui";
 
+// One emoji or short text token per the protocol limit (32 chars);
+// a fixed picker keeps every reaction inside it by construction.
+export const REACT_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
 export function MessageFeed({
   messages,
   node,
   live,
   onReply,
+  onDelete,
+  onReact,
   searching,
   searchQuery,
   searchError,
@@ -30,6 +36,9 @@ export function MessageFeed({
   node: NodeInfo | null;
   live: boolean;
   onReply?: (message: TauMessage) => void;
+  onDelete?: (message: TauMessage) => Promise<void>;
+  // `reaction` null retracts the caller's reaction to the message.
+  onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   searching?: boolean;
   searchQuery?: string | null;
   searchError?: string | null;
@@ -169,7 +178,10 @@ export function MessageFeed({
               key={message.id}
               message={message}
               messages={quoteContext ?? messages}
+              node={node}
               onReply={onReply}
+              onDelete={onDelete}
+              onReact={onReact}
             />
           ))
         )}
@@ -272,17 +284,80 @@ export function resolveQuote(
 function MessageBubble({
   message,
   messages,
+  node,
   onReply,
+  onDelete,
+  onReact,
 }: {
   message: TauMessage;
   messages: TauMessage[];
+  node: NodeInfo | null;
   onReply?: (message: TauMessage) => void;
+  onDelete?: (message: TauMessage) => Promise<void>;
+  onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
 }) {
   const outbound = message.direction === "out";
   const peerHash = message.peer ?? "";
   const initial = (message.peer_name || "?").slice(0, 1).toUpperCase();
   const expiry = formatExpiresIn(message.expires_at);
   const quote = resolveQuote(messages, message);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  async function handleConfirmDelete() {
+    if (!onDelete || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await onDelete(message);
+    } catch (error) {
+      // A failed delete keeps the bubble, with the reason inline and
+      // the plain delete button back so the user can retry.
+      setDeleteError(
+        error instanceof Error ? error.message : "delete failed",
+      );
+      setConfirmingDelete(false);
+    } finally {
+      setDeleting(false);
+    }
+  }
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [reactError, setReactError] = useState<string | null>(null);
+  const [reactPending, setReactPending] = useState(false);
+  // Synchronous guard so rapid clicks cannot start overlapping requests
+  // before the pending state has re-rendered.
+  const reactInFlight = useRef(false);
+  // The node's own destination hash is what the bridge records as the
+  // reactor, so this is how the console knows which reaction is mine.
+  const ownReaction =
+    node === null
+      ? undefined
+      : message.reactions?.find(
+          (reaction) => reaction.reactor === node.destination,
+        );
+
+  async function handleReact(reaction: string) {
+    if (!onReact || reactInFlight.current) return;
+    reactInFlight.current = true;
+    setReactPending(true);
+    setReactError(null);
+    try {
+      // Tapping the emoji already in use retracts it.
+      await onReact(
+        message,
+        ownReaction?.reaction === reaction ? null : reaction,
+      );
+      setPickerOpen(false);
+    } catch (error) {
+      setReactError(
+        error instanceof Error ? error.message : "reaction failed",
+      );
+    } finally {
+      reactInFlight.current = false;
+      setReactPending(false);
+    }
+  }
 
   return (
     <article
@@ -402,7 +477,9 @@ function MessageBubble({
                 ? "queued"
                 : message.status === "read"
                   ? "read"
-                  : "delivered"
+                  : message.status === "failed"
+                    ? "failed"
+                    : "delivered"
               : "received"}
           </span>
           {message.rtt_ms !== undefined ? (
@@ -419,7 +496,106 @@ function MessageBubble({
               ↩ reply
             </button>
           ) : null}
+          {onDelete && message.status !== "queued" ? (
+            deleting ? (
+              <span className="px-1 py-0.5 text-mist/60">deleting…</span>
+            ) : confirmingDelete ? (
+              <>
+                <button
+                  type="button"
+                  title="Delete this message"
+                  onClick={() => void handleConfirmDelete()}
+                  className="rounded px-1 py-0.5 text-rose-300 transition hover:bg-rose-400/10"
+                >
+                  confirm delete
+                </button>
+                <button
+                  type="button"
+                  title="Keep this message"
+                  onClick={() => setConfirmingDelete(false)}
+                  className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+                >
+                  keep
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                title="Delete this message"
+                onClick={() => setConfirmingDelete(true)}
+                className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-rose-300"
+              >
+                delete
+              </button>
+            )
+          ) : null}
+          {deleteError ? (
+            <span className="text-rose-300">{deleteError}</span>
+          ) : null}
+          {onReact && message.wire_id ? (
+            <button
+              type="button"
+              title="React to this message"
+              aria-label="React to this message"
+              aria-expanded={pickerOpen}
+              onClick={() => {
+                setReactError(null);
+                setPickerOpen((open) => !open);
+              }}
+              className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+            >
+              ♡ react
+            </button>
+          ) : null}
         </div>
+
+        {pickerOpen ? (
+          <div
+            className={`flex flex-wrap gap-1 px-1 pt-1 ${
+              outbound ? "justify-end" : ""
+            }`}
+            role="group"
+            aria-label="Choose a reaction"
+          >
+            {REACT_OPTIONS.map((option) => {
+              const active = ownReaction?.reaction === option;
+              return (
+                <button
+                  key={option}
+                  type="button"
+                  title={
+                    active
+                      ? `Remove your ${option} reaction`
+                      : `React with ${option}`
+                  }
+                  aria-label={
+                    active
+                      ? `Remove your ${option} reaction`
+                      : `React with ${option}`
+                  }
+                  aria-pressed={active}
+                  disabled={reactPending}
+                  onClick={() => void handleReact(option)}
+                  className={`grid h-7 w-7 place-items-center rounded-lg border text-sm transition ${
+                    active
+                      ? "border-signal/50 bg-signal/15"
+                      : "border-line/80 bg-void/60 hover:border-signal/35 hover:bg-void"
+                  }`}
+                >
+                  <span aria-hidden="true">{option}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+        {reactError ? (
+          <p
+            className="px-1 pt-1 font-mono text-[10px] text-amber"
+            role="alert"
+          >
+            reaction failed: {reactError}
+          </p>
+        ) : null}
       </div>
     </article>
   );
