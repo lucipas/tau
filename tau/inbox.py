@@ -26,7 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Collection, Dict, Iterator, List, Optional, Tuple, Union
 
 try:  # POSIX only; the cross-process lock is a no-op without it.
     import fcntl
@@ -35,8 +35,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     ProtocolError,
     clean_in_reply_to,
+    excerpt_hash,
+    generate_message_id,
+    normalize_message,
     normalize_message_kind,
 )
 from .util import atomic_write_json, read_json
@@ -131,6 +135,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if not math.isfinite(read_at):
             return None
+    edited_at = raw.get("edited_at")
+    if edited_at is not None:
+        try:
+            edited_at = float(edited_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
     expires_at = raw.get("expires_at")
     if expires_at is not None:
         try:
@@ -167,12 +179,35 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["receipt_sent_at"] = receipt_sent_at
     if read_at is not None:
         record["read_at"] = read_at
+    if edited_at is not None:
+        record["edited_at"] = edited_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    leg_ids = raw.get("leg_ids")
+    if isinstance(leg_ids, list):
+        # One record per group send keeps every leg id, so any leg can
+        # be quoted; the list is cleaned like an id, and a record with
+        # no usable leg id keeps none.
+        cleaned_legs = []
+        for leg in leg_ids:
+            if (
+                isinstance(leg, str)
+                and leg
+                and len(leg) <= 64
+                and leg not in cleaned_legs
+            ):
+                cleaned_legs.append(leg)
+        if cleaned_legs:
+            record["leg_ids"] = cleaned_legs
     if raw.get("pinned"):
         record["pinned"] = True
     kind = raw.get("kind")
-    if kind == "group":
+    if kind == NOTE_KIND:
+        # A note to self (``tau note``): local-only, written straight
+        # into the inbox, never received from a peer — the wire parser
+        # rejects it, so a stored ``note`` record is always our own.
+        record["kind"] = NOTE_KIND
+    elif kind == "group":
         group_id = raw.get("group")
         if not isinstance(group_id, str) or len(group_id) != 32:
             return None
@@ -293,7 +328,7 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
-    return {
+    entry = {
         "target": target,
         "destination": destination,
         "from": str(raw.get("from") or "unknown"),
@@ -302,6 +337,28 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
     }
+    # A group reaction carries the signed context that names the
+    # logical message — group, author, send time — so a reaction that
+    # arrives before its target copy can be reconciled onto the copy
+    # when it lands (see reconcile_group_reactions).  The context is
+    # advisory only: malformed values are dropped, never a reason to
+    # reject the reaction.
+    group = raw.get("group")
+    target_author = raw.get("target_author")
+    target_sent_at = raw.get("target_sent_at")
+    if (
+        isinstance(group, str)
+        and len(group) == 32
+        and isinstance(target_author, str)
+        and len(target_author) == 32
+        and isinstance(target_sent_at, (int, float))
+        and not isinstance(target_sent_at, bool)
+        and math.isfinite(target_sent_at)
+    ):
+        entry["group"] = group
+        entry["target_author"] = target_author
+        entry["target_sent_at"] = float(target_sent_at)
+    return entry
 
 
 def reaction_order(entry: Dict[str, Any]) -> Tuple[float, str]:
@@ -500,7 +557,8 @@ class Inbox:
         # A read-only inbox (dry runs) filters expired messages in memory
         # but never persists the automatic expiry purge.
         self._read_only = read_only
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._txn_depth = 0
         self._messages: List[Dict[str, Any]] = []
         self._reactions: List[Dict[str, Any]] = []
         self._read_cursors: Dict[str, Dict[str, Any]] = {}
@@ -616,22 +674,43 @@ class Inbox:
         state, and then applies its change, so a process never
         overwrites another's entries.  Mirrors
         :meth:`Mailbox._transaction`.
+
+        Nested transactions join the outer one (the lock is
+        reentrant, and the depth counter skips a second flock and
+        reload): a handler that must check and store atomically —
+        the reaction handler's final roster check and persist — can
+        hold one transaction across both, so no other process can
+        import the target between the check and the store.  A second
+        flock from this process would block on the first.
         """
-        with self._lock:
-            if self.path is None or fcntl is None:
-                if self.path is not None:
-                    self._load()
+        self._lock.acquire()
+        try:
+            if self._txn_depth:
+                # Nested transaction: the outer one already holds the
+                # flock and reloaded state, so just join it.  (A second
+                # flock from this process would block on the first.)
                 yield
                 return
-            lock_path = self.path.with_name(self.path.name + ".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    self._load()
+            self._txn_depth = 1
+            try:
+                if self.path is None or fcntl is None:
+                    if self.path is not None:
+                        self._load()
                     yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    return
+                lock_path = self.path.with_name(self.path.name + ".lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(lock_path, "a") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        self._load()
+                        yield
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._txn_depth = 0
+        finally:
+            self._lock.release()
 
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record one message, dropping the oldest past its direction's cap."""
@@ -644,6 +723,69 @@ class Inbox:
             self._messages = _retain(self._messages)
             self._save()
         return entry
+
+    def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
+        """Store a private note to self in the inbox and return it.
+
+        A note is an inbox record with kind ``note``, from this node to
+        itself: it shows in the received-message listing, is found by
+        search and the ``note`` kind filter, and is deleted, pruned,
+        exported and imported like any other stored message.  It never
+        touches the wire — no send, no queue, no announce.  The text
+        is validated like a message body (empty and over-long notes are
+        refused).  The note is read the moment it is written: the read
+        cursor for this node's own destination is advanced past it, so
+        it never counts as unread and never shows the unread marker.
+        The cursor is keyed by destination, and no peer message ever
+        carries our own hash, so the advance touches notes only.
+        """
+        cleaned = normalize_message(text)
+        now = time.time()
+        record = _valid_record(
+            {
+                "from": sender_name,
+                "destination": destination,
+                "text": cleaned,
+                "sent_at": now,
+                "received_at": now,
+                "id": generate_message_id(),
+                "direction": "in",
+                "kind": NOTE_KIND,
+            }
+        )
+        if record is None:
+            raise ValueError("inbox record needs text")
+        # Store and read in one transaction: a note is never persisted
+        # without its read cursor, and a failed write raises instead of
+        # reporting a saved note.
+        with self._transaction():
+            previous_messages = list(self._messages)
+            previous_cursors = dict(self._read_cursors)
+            record["seq"] = self._next_seq()
+            self._messages.append(record)
+            self._messages = _retain(self._messages)
+            self._advance_own_cursor(record)
+            try:
+                self._save(strict=True)
+            except OSError:
+                self._messages = previous_messages
+                self._read_cursors = previous_cursors
+                raise
+        return record
+
+    def _advance_own_cursor(self, entry: Dict[str, Any]) -> None:
+        """Move this node's read cursor up to a note (caller holds the lock).
+
+        The cursor is keyed by destination, and no peer message carries
+        our own hash, so this only ever marks notes read.
+        """
+        destination = entry.get("destination") or ""
+        current = self._read_cursors.get(destination)
+        if current is None or current["last_read_seq"] < entry["seq"]:
+            self._read_cursors[destination] = {
+                "last_read_seq": entry["seq"],
+                "last_read_id": entry.get("id"),
+            }
 
     def delete(self, ref: str) -> Dict[str, Any]:
         """Remove one stored message by full id or unique prefix.
@@ -843,6 +985,77 @@ class Inbox:
             return None
 
 
+    def apply_edit(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        edited_at: float,
+        direction: Optional[str] = None,
+        destination: Optional[str] = None,
+        newer_than_existing: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Replace one stored message's text, marking when it was edited.
+
+        Returns the updated record, or ``None`` when no stored message
+        has that id.  The id matches exactly — callers resolve a prefix
+        to the full id first.  File records carry no text, so an edit
+        naming one is refused with :class:`InboxError` instead of
+        silently rewriting a file entry.  The write runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this edit runs.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise InboxError("message id must not be empty")
+        if not isinstance(text, str) or not text:
+            raise InboxError("edited text must not be empty")
+        with self._transaction():
+            target = None
+            for entry in self._messages:
+                if entry.get("id") == message_id:
+                    target = entry
+                    break
+            if target is None:
+                return None
+            if target.get("kind") == "file":
+                raise InboxError("a file record has no text to edit")
+            if direction is not None or destination is not None:
+                # Re-check ownership inside the transaction: a snapshot
+                # taken by the caller can be stale under a racing edit.
+                if target.get("kind") == "group":
+                    return None
+                if direction is not None and target.get("direction") != direction:
+                    return None
+                if destination is not None and (
+                    target.get("destination") or ""
+                ) != destination:
+                    return None
+            if newer_than_existing:
+                # Never let an older edit overwrite a newer stored one.
+                stored_edited_at = target.get("edited_at")
+                if (
+                    isinstance(stored_edited_at, (int, float))
+                    and float(edited_at) <= float(stored_edited_at)
+                ):
+                    return None
+            previous_text = target.get("text")
+            previous_edited_at = target.get("edited_at")
+            target["text"] = text
+            target["edited_at"] = float(edited_at)
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                target["text"] = previous_text
+                if previous_edited_at is None:
+                    target.pop("edited_at", None)
+                else:
+                    target["edited_at"] = previous_edited_at
+                raise InboxError(
+                    f"could not persist inbox; message was not edited: {exc}"
+                ) from exc
+        return dict(target)
+
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
 
@@ -851,9 +1064,15 @@ class Inbox:
         serving sweep reloads before deciding what is owed.  Safe to
         call any time: every append persists immediately, so the file
         is never behind the cache.
+
+        The reload runs inside the cross-process transaction: a plain
+        load can purge expired messages and write the purged snapshot
+        back, and another process committing between that read and
+        write would have its entries overwritten.  Under the flock the
+        purge write is serialised with every other commit.
         """
-        with self._lock:
-            self._load()
+        with self._transaction():
+            pass
 
     def _stamp_read_ids(
         self, message_ids: List[str], *, at: Optional[float] = None
@@ -894,6 +1113,8 @@ class Inbox:
                 and item.get("id")
                 and item.get("read_at") is not None
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
 
     def mark_receipt_sent(
@@ -934,6 +1155,8 @@ class Inbox:
                 if isinstance(item.get("id"), str)
                 and item.get("id")
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1001,6 +1224,309 @@ class Inbox:
         with self._transaction():
             return [dict(item) for item in self._reactions]
 
+    def find_group_message(
+        self, group: str, author: str, sent_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """This node's copy of one group message, by shared identity.
+
+        Group sends carry a different wire id per recipient leg, so a
+        reaction that names another member's copy cannot be resolved by
+        id here.  All legs of one send share the group, the author and
+        the send time, so those three identify the local copy:
+        ``sent_at`` is a float timestamp, so two distinct sends never
+        share one; when several records match (a copy stored twice),
+        the most recently received wins.  Returns ``None`` when no copy
+        matches — for example a copy queued before the shared send
+        time was recorded, which still carries its enqueue time.
+        """
+        try:
+            wanted_at = float(sent_at)
+        except (TypeError, ValueError):
+            return None
+        # Read through the transaction path, like reactions(): a copy
+        # imported by another process (``tau import`` while ``tau
+        # serve`` runs) must be visible here, or a reaction naming
+        # that copy's wire id resolves against the stale cache and is
+        # stored under a foreign id instead.
+        with self._transaction():
+            matches = [
+                entry
+                for entry in self._messages
+                if entry.get("kind") == "group"
+                and entry.get("group") == group
+                and entry.get("destination") == author
+                and isinstance(entry.get("sent_at"), (int, float))
+                and not isinstance(entry.get("sent_at"), bool)
+                and float(entry["sent_at"]) == wanted_at
+            ]
+        if not matches:
+            return None
+        matches.sort(key=lambda entry: entry.get("received_at") or 0)
+        return dict(matches[-1])
+
+    def reconcile_group_reactions(
+        self,
+        group: str,
+        author: str,
+        sent_at: float,
+        message_id: str,
+        *,
+        members: Optional[Collection[str]] = None,
+    ) -> int:
+        """Retarget stored group reactions onto a newly arrived copy.
+
+        A reaction can arrive before the message it names — legs fan
+        out one member at a time, so an early reactor's reaction lands
+        while another member's copy is still in flight — and it is
+        stored under the reactor's foreign wire id with its signed
+        group context retained.  When this node's copy arrives, move
+        those reactions onto it so they display under the message
+        instead of staying invisible forever.
+
+        Only reactions whose stored context matches this copy exactly
+        (group, author, send time) and whose target no message in the
+        inbox holds are moved.  When *members* is given, only
+        reactions from a reactor on that roster move: an allow-listed
+        outsider's reaction is never associated with the message.
+        Retargeting runs through :func:`merge_reaction`, so a newer
+        reaction the same reactor already left on this copy wins and
+        the older retargeted one is dropped.  Returns how many
+        reactions were retargeted.  Raises :class:`OSError` when the
+        retargeted state cannot be persisted.
+        """
+        try:
+            wanted_at = float(sent_at)
+        except (TypeError, ValueError):
+            return 0
+        if (
+            not isinstance(group, str)
+            or not group
+            or not isinstance(author, str)
+            or not author
+            or not isinstance(message_id, str)
+            or not message_id
+            or not math.isfinite(wanted_at)
+        ):
+            return 0
+        allowed = None if members is None else set(members)
+        retargeted = 0
+        with self._transaction():
+            previous = list(self._reactions)
+            retargeted = self._reconcile_group_reactions_locked(
+                group, author, wanted_at, message_id, allowed
+            )
+            if retargeted:
+                if not self._save():
+                    self._reactions = previous
+                    raise OSError(f"could not persist inbox to {self.path}")
+        return retargeted
+
+    def _reconcile_group_reactions_locked(
+        self,
+        group: str,
+        author: str,
+        wanted_at: float,
+        message_id: str,
+        allowed: Optional[Collection[str]],
+    ) -> int:
+        """Retarget stored group reactions onto a newly arrived copy.
+
+        Caller holds the inbox transaction (state already reloaded):
+        the reconcile mutates ``self._reactions`` in place and never
+        saves.  ``allowed`` is the pinned roster, or ``None`` for no
+        roster filter.  See :meth:`reconcile_group_reactions` for the
+        matching rules.
+        """
+        held = {
+            entry.get("id")
+            for entry in self._messages
+            if isinstance(entry.get("id"), str)
+        }
+        pending = [
+            entry
+            for entry in self._reactions
+            if entry.get("group") == group
+            and entry.get("target_author") == author
+            and isinstance(entry.get("target_sent_at"), (int, float))
+            and not isinstance(entry.get("target_sent_at"), bool)
+            and float(entry["target_sent_at"]) == wanted_at
+            and entry.get("target") not in held
+            and (allowed is None or entry.get("destination") in allowed)
+        ]
+        retargeted = 0
+        for entry in pending:
+            moved = dict(entry)
+            moved["target"] = message_id
+            self._reactions.remove(entry)
+            if merge_reaction(self._reactions, moved):
+                retargeted += 1
+        if retargeted:
+            self._reactions = self._reactions[-MAX_REACTIONS:]
+        return retargeted
+
+    def append_group_message(
+        self,
+        record: Dict[str, Any],
+        *,
+        group: str,
+        author: str,
+        sent_at: float,
+        members: Collection[str],
+    ) -> List[Dict[str, Any]]:
+        """Record one group message with its reaction authorization.
+
+        A group message's arrival has three inbox effects — retargeting
+        stored reactions onto it, voiding stored reactions from
+        non-members, and appending the message itself — and they must
+        land together: the purge used to run in one transaction and
+        the append in the next, so a non-member's reaction stored
+        between them never saw the target, skipped every roster
+        check, and became readable once the message appended.  Here
+        all three run under a single cross-process lock with a single
+        persist, so no reaction can slip between the purge and the
+        append, and no second ``Inbox._transaction`` is nested inside
+        the first.
+
+        A failed reconcile never breaks the arrival — it only strands
+        legitimate reactions, which stay invisible — so it is logged
+        and the purge and append still run.  A failed persist raises
+        :class:`OSError` and the in-memory state is restored, so the
+        caller can refuse the delivery and the sender can retry it.
+        Returns the tombstones written, one per voided reaction, so
+        the caller can fan them out to any reaction cache.
+        """
+        entry = _valid_record(record)
+        if entry is None:
+            raise ValueError("inbox record needs text")
+        try:
+            wanted_at: Optional[float] = float(sent_at)
+        except (TypeError, ValueError):
+            wanted_at = None
+        message_id = entry.get("id")
+        allowed = set(members)
+        voided: List[Dict[str, Any]] = []
+        with self._transaction():
+            previous_reactions = list(self._reactions)
+            previous_messages = list(self._messages)
+            try:
+                if (
+                    wanted_at is not None
+                    and math.isfinite(wanted_at)
+                    and isinstance(group, str)
+                    and group
+                    and isinstance(author, str)
+                    and author
+                    and isinstance(message_id, str)
+                    and message_id
+                ):
+                    try:
+                        self._reconcile_group_reactions_locked(
+                            group, author, wanted_at, message_id, allowed
+                        )
+                    except Exception:
+                        # A failed reconcile only strands legitimate
+                        # reactions (invisible); it never breaks the
+                        # arrival, and the purge below still runs.
+                        log.warning(
+                            "Could not reconcile group reactions",
+                            exc_info=True,
+                        )
+                voided = self._purge_non_member_reactions_locked(
+                    message_id if isinstance(message_id, str) else "",
+                    allowed,
+                    time.time(),
+                )
+                if isinstance(message_id, str) and message_id and any(
+                    m.get("id") == message_id for m in self._messages
+                ):
+                    # A retry after a failed seen-marker write: the
+                    # copy is already here.  Skip the append so the
+                    # retry does not store a second copy — at the cap
+                    # that duplicate would evict unrelated history —
+                    # but still persist the reconcile/purge above and
+                    # return the tombstones, so the caller can finish
+                    # mark_seen and the delivery resolves.
+                    pass
+                else:
+                    entry["seq"] = self._next_seq()
+                    self._messages.append(entry)
+                    self._messages = _retain(self._messages)
+                if not self._save():
+                    raise OSError(f"could not persist inbox to {self.path}")
+            except OSError:
+                self._reactions = previous_reactions
+                self._messages = previous_messages
+                raise
+        return voided
+
+    def purge_non_member_reactions(
+        self, message_id: str, *, members: Collection[str]
+    ) -> List[Dict[str, Any]]:
+        """Void stored reactions on one group message from non-members.
+
+        A reaction can be stored before its target arrives — the target
+        was unknown then, so no roster check could run — and then
+        surface under the exact message id when the copy lands, without
+        any authorization ever running.  When a group message arrives,
+        void every stored reaction on it whose reactor is not on the
+        pinned roster, so only members' reactions display.
+
+        Voiding is a tombstone, not a deletion: its ``(sent_at, id)``
+        is strictly newer than the reaction it voids, so a replayed
+        copy of the voided reaction cannot resurrect it, while a later
+        reaction from the same reactor — for example after joining the
+        group — replaces the tombstone.  Returns the tombstones
+        written, one per voided reaction, so the caller can fan them
+        out to any reaction cache (the console bridge keeps its own).
+        Raises :class:`OSError` when the voided state cannot be
+        persisted.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            return []
+        allowed = set(members)
+        voided: List[Dict[str, Any]] = []
+        with self._transaction():
+            previous = list(self._reactions)
+            voided = self._purge_non_member_reactions_locked(
+                message_id, allowed, time.time()
+            )
+            if voided:
+                if not self._save():
+                    self._reactions = previous
+                    raise OSError(f"could not persist inbox to {self.path}")
+        return voided
+
+    def _purge_non_member_reactions_locked(
+        self,
+        message_id: str,
+        allowed: Collection[str],
+        now: float,
+    ) -> List[Dict[str, Any]]:
+        """Void stored reactions on one group message from non-members.
+
+        Caller holds the inbox transaction: the tombstones are merged
+        into ``self._reactions`` in place and never saved here.  See
+        :meth:`purge_non_member_reactions` for the tombstone rules.
+        """
+        voided: List[Dict[str, Any]] = []
+        for entry in list(self._reactions):
+            if (
+                entry.get("target") == message_id
+                and entry.get("reaction")
+                and entry.get("destination") not in allowed
+            ):
+                tombstone = dict(entry)
+                tombstone["reaction"] = ""
+                tombstone["sent_at"] = (
+                    max(float(entry.get("sent_at") or 0.0), now) + 1.0
+                )
+                tombstone["received_at"] = now
+                if merge_reaction(self._reactions, tombstone):
+                    voided.append(tombstone)
+        if voided:
+            self._reactions = self._reactions[-MAX_REACTIONS:]
+        return voided
+
     def resolve(self, ref: str) -> Dict[str, Any]:
         """Resolve a full message id or a unique prefix to its record.
 
@@ -1017,6 +1543,14 @@ class Inbox:
         with self._lock:
             for entry in self._messages:
                 if entry.get("id") == value:
+                    return dict(entry)
+            # A group send stores one leg id as the record id and the
+            # rest in leg_ids: a reaction naming any leg must resolve
+            # to the same record, exactly as find() already does.  An
+            # exact leg match beats a prefix match on a canonical id.
+            for entry in reversed(self._messages):
+                legs = entry.get("leg_ids")
+                if isinstance(legs, list) and value in legs:
                     return dict(entry)
             matches = [
                 entry
@@ -1036,7 +1570,7 @@ class Inbox:
         limit: Optional[int] = None,
         peer: Optional[str] = None,
         query: Optional[str] = None,
-        group: Optional[str] = None,
+        group: Optional[Union[str, List[str]]] = None,
         kind: Optional[str] = None,
         direction: Optional[str] = "in",
         pinned_only: bool = False,
@@ -1044,8 +1578,9 @@ class Inbox:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``kind`` filters to one message kind;
-        ``query`` keeps only messages whose
+        filters to one group id, or to several (a group plus its rename
+        predecessors, so history spans renames); ``kind`` filters to
+        one message kind; ``query`` keeps only messages whose
         text contains it (case-insensitive substring); ``limit`` caps
         how many are returned (``None`` means all of them).  Sent
         messages are recorded here too — a reply quotes the sender's
@@ -1085,10 +1620,11 @@ class Inbox:
                 if needle in str(item.get("text") or "").casefold()
             ]
         if group is not None:
+            group_ids = {group} if isinstance(group, str) else set(group)
             entries = [
                 item
                 for item in entries
-                if item.get("kind") == "group" and item.get("group") == group
+                if item.get("kind") == "group" and item.get("group") in group_ids
             ]
         if kind is not None:
             entries = [item for item in entries if item.get("kind") == kind]
@@ -1249,12 +1785,22 @@ class Inbox:
                     raise
             return self._unread_counts_locked()
 
-    def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+
+    def find(
+        self,
+        message_id: str,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
 
         Quote resolution is scoped to the conversation: a reply
         reference only resolves against a message with the same peer,
-        so a reference to another peer's message never renders.
+        so a reference to another peer's message never renders.  For
+        a group message the conversation is the group instead: pass
+        ``group`` and the match is scoped to that group's messages,
+        from any member.
         """
         if not isinstance(message_id, str) or not message_id:
             return None
@@ -1262,19 +1808,24 @@ class Inbox:
             entries = list(self._messages)
         for item in reversed(entries):
             if item.get("id") != message_id:
-                continue
+                legs = item.get("leg_ids")
+                if not (isinstance(legs, list) and message_id in legs):
+                    continue
             if peer is not None and item.get("destination") != peer:
+                continue
+            if group is not None and item.get("group") != group:
                 continue
             return dict(item)
         return None
 
     def find_prefix(
-        self, prefix: str, *, peer: Optional[str] = None
+        self, prefix: str, *, peer: Optional[str] = None, group: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Records whose wire id starts with *prefix*, newest first.
 
         Used to resolve ``tau send --reply-to``: the prefix must match
-        exactly one message in the conversation.
+        exactly one message in the conversation.  ``group`` scopes the
+        match to one group's messages instead of one peer's.
         """
         if not isinstance(prefix, str) or not prefix:
             return []
@@ -1286,12 +1837,58 @@ class Inbox:
             message_id = item.get("id")
             if not isinstance(message_id, str):
                 continue
-            if not message_id.lower().startswith(value):
+            legs = item.get("leg_ids")
+            leg_match = isinstance(legs, list) and any(
+                isinstance(leg, str) and leg.lower().startswith(value)
+                for leg in legs
+            )
+            if not message_id.lower().startswith(value) and not leg_match:
                 continue
             if peer is not None and item.get("destination") != peer:
                 continue
+            if group is not None and item.get("group") != group:
+                continue
             matches.append(dict(item))
         return matches
+
+    def find_by_excerpt(
+        self, excerpt: str, *, group: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Newest record whose text hashes to *excerpt*, optionally in one group.
+
+        Group legs carry per-member ids, so the member who quoted a
+        message may name a leg id this node never held — but every
+        member holds the same text, so the excerpt hash (see
+        :func:`tau.protocol.excerpt_hash`) still identifies the quoted
+        message within the group.  Used to render a group quote whose
+        leg id is not in the local inbox.  When several messages in
+        the group share the text under different authors, the quote
+        cannot be attributed — ``None`` instead of naming the wrong
+        author.
+        """
+        if not isinstance(excerpt, str) or not excerpt:
+            return None
+        wanted = excerpt.strip().lower()
+        with self._lock:
+            entries = list(self._messages)
+        matches = []
+        for item in reversed(entries):
+            if group is not None and item.get("group") != group:
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            if excerpt_hash(text) == wanted:
+                matches.append(item)
+        if not matches:
+            return None
+        authors = {
+            (str(item.get("destination") or ""), item.get("direction"))
+            for item in matches
+        }
+        if len(authors) > 1:
+            return None
+        return dict(matches[0])
 
     def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.

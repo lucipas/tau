@@ -132,6 +132,7 @@ MAX_MUTED = 512
 MAX_MUTED_KEYWORDS = 256
 MAX_KEYWORD_LENGTH = 100
 MAX_SAVED_POSTS = 512
+MAX_PINNED_POSTS = 10
 MAX_GOSSIP_TTL = 3
 GOSSIP_FANOUT = 3
 MAX_SYNC_PAGES = 32
@@ -494,6 +495,11 @@ CREATE TABLE IF NOT EXISTS muted_authors (
 CREATE TABLE IF NOT EXISTS saved_posts (
     hash TEXT PRIMARY KEY,
     saved_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pinned_posts (
+    hash TEXT PRIMARY KEY,
+    pinned_at REAL NOT NULL
 );
 """
 
@@ -1443,6 +1449,29 @@ def annotate_saved(
         saved = {str(row["hash"]) for row in rows}
     for post in posts:
         post["saved"] = str(post.get("hash")) in saved
+    return posts
+
+
+def annotate_pinned(
+    conn: sqlite3.Connection,
+    posts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Attach a ``pinned`` flag to post dicts, in place.
+
+    Mirrors :func:`annotate_saved`: a display surface uses it to show
+    pin state on each card without a second request.
+    """
+    hashes = [str(post["hash"]) for post in posts if post.get("hash")]
+    pinned: Set[str] = set()
+    if hashes:
+        placeholders = ", ".join("?" for _ in hashes)
+        rows = conn.execute(
+            f"SELECT hash FROM pinned_posts WHERE hash IN ({placeholders})",
+            hashes,
+        ).fetchall()
+        pinned = {str(row["hash"]) for row in rows}
+    for post in posts:
+        post["pinned"] = str(post.get("hash")) in pinned
     return posts
 
 
@@ -3606,7 +3635,8 @@ def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
         except ValueError:
             raise TanError(f"unknown post: {ref!r}") from None
         rows = conn.execute(
-            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "SELECT hash FROM posts WHERE kind IN "
+            f"({TIMELINE_KINDS_SQL}) "
             "AND hash LIKE ? LIMIT 8",
             (value + "%",),
         ).fetchall()
@@ -3787,6 +3817,207 @@ def annotated_saved_posts(
     return kept, raw_offset if raw_offset < int(total) else None
 
 
+def pin_post(
+    conn: sqlite3.Connection,
+    ref: str,
+    *,
+    owner: str,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Pin one of the node's own posts to the top of its pinned shelf.
+
+    Pins are private to this node — no signed entry, nothing gossiped.
+    The target must be a cached, linked post or reply authored by
+    *owner* (the node's own destination hash) that has not been
+    deleted; pinning the same post twice is a no-op that reports the
+    original pin time.  The shelf holds at most ``MAX_PINNED_POSTS``
+    entries: a pin shelf is curated, not a second archive.
+    """
+    post = resolve_post(conn, ref)
+    if not post.get("linked"):
+        raise TanError("post has not linked yet; sync its chain before pinning")
+    owner = _require_hex(owner, AUTHOR_HEX_LENGTH, "owner")
+    author = str(post["author"])
+    if author.lower() != owner.lower():
+        raise TanError("only your own posts can be pinned")
+    digest = str(post["hash"])
+    timestamp = float(now if now is not None else time.time())
+    # Take the write lock before checking for an existing pin and the
+    # capacity, so a competing pin cannot slip in between check and insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT pinned_at FROM pinned_posts WHERE hash = ?", (digest,)
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return {
+                "hash": digest,
+                "author": author,
+                "name": str(post.get("name") or ""),
+                "pinned_at": float(existing["pinned_at"]),
+                "already_pinned": True,
+            }
+        count = conn.execute("SELECT COUNT(*) AS n FROM pinned_posts").fetchone()["n"]
+        if int(count) >= MAX_PINNED_POSTS:
+            raise TanError(f"pinned posts are limited to {MAX_PINNED_POSTS} entries")
+        conn.execute(
+            "INSERT INTO pinned_posts(hash, pinned_at) VALUES(?, ?)",
+            (digest, timestamp),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return {
+        "hash": digest,
+        "author": author,
+        "name": str(post.get("name") or ""),
+        "pinned_at": timestamp,
+        "already_pinned": False,
+    }
+
+
+def unpin_post(conn: sqlite3.Connection, ref: str) -> Dict[str, Any]:
+    """Remove a post from the local pinned shelf.
+
+    Returns the resolved post hash with whether a pin was removed, so
+    callers — including ``--json`` output — can identify the post even
+    when *ref* was a short prefix.
+    """
+    # The saved-post resolver is shared: it resolves any cached
+    # post/reply reference, including one deleted after pinning, so
+    # unpinning keeps working after the pin's target is deleted.
+    digest = _resolve_saved_ref(conn, ref)
+    with conn:
+        cursor = conn.execute("DELETE FROM pinned_posts WHERE hash = ?", (digest,))
+    return {"hash": digest, "unpinned": cursor.rowcount > 0}
+
+
+def pinned_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Pinned posts, newest pin first.
+
+    A post deleted after being pinned stays in the list with its text
+    blanked and ``deleted`` set, so the pin is not silently lost.
+    *offset* pages through the list in pin order, so a caller can
+    reach pins older than one page.
+    """
+    count = max(1, min(int(limit), MAX_PINNED_POSTS))
+    start = max(0, int(offset))
+    rows = conn.execute(
+        "SELECT p.*, s.pinned_at FROM pinned_posts s "
+        "JOIN posts p ON p.hash = s.hash "
+        "ORDER BY s.pinned_at DESC, s.hash DESC LIMIT ? OFFSET ?",
+        (count, start),
+    ).fetchall()
+    deleted = deleted_targets(conn)
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        post = _row_to_post(row)
+        post["pinned_at"] = float(row["pinned_at"])
+        if str(post["hash"]) in deleted:
+            post["deleted"] = True
+            post["text"] = ""
+        records.append(post)
+    return records
+
+
+def annotated_pinned_posts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_FEED_LIMIT,
+    offset: int = 0,
+    viewer: Optional[str] = None,
+    ruleset: Optional[Ruleset] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Pinned posts with the timeline's annotations and muting applied.
+
+    Reaction counts, edits, reply parents, quote counts, quoted
+    originals and repost originals are attached exactly as
+    :func:`timeline` does: a reply parent, quoted or repost original
+    from a muted or blocked author is redacted or dropped, and a parent
+    matching a muted keyword has its text blanked.  Posts by muted
+    authors or matching a muted keyword are dropped from the view —
+    muting is display-only, so the pins stay stored and unmuting
+    restores them.  ``exclude_authors`` hides blocked authors' words
+    the same way, and ``exclude_all`` hides everything when the
+    blocklist could not be read.  Each returned post carries ``pinned``
+    and ``pinned_at``.
+
+    Returns ``(posts, next_offset)``: up to *limit* visible posts
+    starting at raw offset *offset*, and the raw offset to resume
+    paging from, or ``None`` when the pinned list is exhausted.  Muted
+    entries and entries hidden by *ruleset* never shrink a page: raw
+    rows are read until *limit* visible posts are collected or the
+    list is exhausted, so a caller must page with the returned
+    ``next_offset``, not with the number of posts it received.
+    """
+    if exclude_all:
+        return [], None
+    silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
+    keywords = _muted_keyword_list(conn)
+    kept: List[Dict[str, Any]] = []
+    raw_offset = max(0, int(offset))
+    while len(kept) < limit:
+        batch = pinned_posts(conn, limit=limit - len(kept), offset=raw_offset)
+        if not batch:
+            break
+        raw_offset += len(batch)
+        batch = annotate_reposts(
+            conn,
+            annotate_repost_counts(
+                conn,
+                annotate_quotes(
+                    conn,
+                    annotate_quote_counts(
+                        conn,
+                        annotate_replies(
+                            conn,
+                            annotate_edits(
+                                conn, annotate_reactions(conn, batch, viewer=viewer)
+                            ),
+                            muted_keywords=keywords,
+                            exclude_authors=silenced,
+                            blocked_authors=blocked,
+                        ),
+                    ),
+                    muted_keywords=keywords,
+                    exclude_authors=silenced,
+                    blocked_authors=blocked,
+                ),
+                viewer=viewer,
+            ),
+            muted_keywords=keywords,
+            exclude_authors=silenced,
+            blocked_authors=blocked,
+        )
+        for post in batch:
+            # Edits replace the stored text, so re-blank deleted entries.
+            if post.get("deleted"):
+                post["text"] = ""
+                post["edited"] = False
+            post["pinned"] = True
+        batch = [
+            post
+            for post in batch
+            if post["author"] not in silenced and post["author"] not in blocked
+        ]
+        batch = without_muted_keywords(conn, batch, keywords)
+        if ruleset is not None:
+            batch = apply_display_rules(batch, ruleset)
+        kept.extend(batch)
+    if len(kept) < limit:
+        return kept, None
+    total = conn.execute("SELECT COUNT(*) AS n FROM pinned_posts").fetchone()["n"]
+    return kept, raw_offset if raw_offset < int(total) else None
 
 
 def author_stats(conn: sqlite3.Connection, author: str) -> Dict[str, Any]:

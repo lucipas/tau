@@ -48,6 +48,10 @@ MAX_MESSAGE_CHARS = 2000
 # message a receiver can filter on.  The wire field is optional so old
 # peers keep working: a payload without a kind is a chat message.
 DEFAULT_MESSAGE_KIND = "chat"
+# A private note to self (``tau note``): stored in the local inbox, never
+# sent, so it is a record kind like ``group``/``file`` rather than a wire
+# kind — see ``_RESERVED_MESSAGE_KINDS`` below.
+NOTE_KIND = "note"
 MAX_MESSAGE_KIND_LENGTH = 32
 # ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
 # would break the documented slug grammar for consumers that enforce it.
@@ -58,8 +62,12 @@ _MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 # and be silently lost — `_record_received` swallows the failure while
 # the sender already got success and the seen-id blocks a retry.  So
 # they are reserved here, at the one choke point every kind passes
-# through, and the wire parser rejects them the same way.
-_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
+# through, and the wire parser rejects them the same way.  ``note`` is
+# reserved the same way: a note is local-only by design (``tau note``
+# writes it straight into the inbox), so a peer must not be able to
+# send one — a note-kind payload on the wire is rejected, and
+# `tau send --kind note` is refused.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file", "note"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -91,6 +99,7 @@ REQUEST_FILE = "/tau/file"
 REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
 REQUEST_RETRACT = "/tau/dm/retract"
+REQUEST_DM_EDIT = "/tau/dm/edit"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
@@ -103,6 +112,7 @@ REQUEST_PATHS = (
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
+    REQUEST_DM_EDIT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
@@ -158,9 +168,9 @@ def normalize_message_kind(kind: Any) -> str:
 
     A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
     at most 32 characters) so it is safe to print, compare and filter
-    on.  ``None`` — the local default — means plain chat.  ``group``
-    and ``file`` are reserved: they name inbox record types, and a
-    direct message carrying either could never be stored.
+    on.  ``None`` — the local default — means plain chat.  ``group``,
+    ``file`` and ``note`` are reserved: they name inbox record types,
+    and a direct message carrying any of them could never be stored.
     """
     if kind is None:
         return DEFAULT_MESSAGE_KIND
@@ -339,6 +349,23 @@ def sanitize_group_name(name: Any, fallback: str = "group") -> str:
     return cleaned or fallback
 
 
+MAX_GROUP_TOPIC_LENGTH = 140
+
+
+def clean_group_topic(value: Any) -> str:
+    """Normalise a group topic: short printable single-line text.
+
+    Anything absent, blank or non-text cleans to ``""`` (no topic); a
+    longer value is truncated, mirroring :func:`sanitize_group_name`.
+    Callers that must refuse an over-long topic instead check the
+    length before cleaning.
+    """
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(_clean_text(value).split())
+    return cleaned[:MAX_GROUP_TOPIC_LENGTH].strip()
+
+
 def _clean_member_list(value: Any) -> List[str]:
     """Validate a group roster: 2-32 unique 32-hex destination hashes."""
     if not isinstance(value, list):
@@ -359,6 +386,24 @@ def _clean_member_list(value: Any) -> List[str]:
     return members
 
 
+def _clean_renamed_from(value: Any) -> List[str]:
+    """Validate a rename lineage: predecessor group ids, newest first.
+
+    An absent lineage is ``[]``; a malformed one raises
+    :class:`ProtocolError`, like a malformed roster.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ProtocolError("renamed_from must be a list of group ids")
+    cleaned: List[str] = []
+    for entry in value:
+        cleaned.append(_clean_hexhash(entry, "renamed_from"))
+    if len(set(cleaned)) != len(cleaned):
+        raise ProtocolError("renamed_from must not repeat a group id")
+    return cleaned
+
+
 def encode_group_message(
     text: str,
     *,
@@ -368,6 +413,10 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    group_topic: Optional[str] = None,
+    group_topic_sent_at: Optional[float] = None,
+    renamed_from: Optional[List[str]] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
@@ -377,7 +426,19 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
-    the id it claims.
+    the id it claims.  ``group_topic`` rides along when given (``""``
+    clears it); ``None`` omits it, for senders that predate topics.
+    ``group_topic_sent_at`` is the time the topic was set on the
+    sender's clock, so the recipient judges the topic by its own
+    timestamp rather than the message's send time; ``None`` omits it
+    and the recipient falls back to ``sent_at``.
+    the id it claims.  ``renamed_from`` carries the group's rename
+    lineage (predecessor ids, newest first) when the group was renamed:
+    a member that still holds a predecessor learns from this message
+    that it was superseded, so it does not keep sending to an id the
+    creator retired.  ``in_reply_to`` optionally names the earlier
+    message in the group this one quotes, exactly like a direct
+    message (see :func:`clean_in_reply_to`).
 
     ``expires_at`` is an optional sender-set expiry (epoch seconds),
     exactly like a direct message: the receiver shows the deadline and
@@ -394,8 +455,23 @@ def encode_group_message(
         "creator": _clean_hexhash(creator, "creator"),
         "members": _clean_member_list(members),
     }
+    if group_topic is not None:
+        payload["group_topic"] = clean_group_topic(group_topic)
+    if group_topic_sent_at is not None:
+        try:
+            topic_at = float(group_topic_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            topic_at = None
+        if topic_at is not None and math.isfinite(topic_at):
+            payload["group_topic_sent_at"] = topic_at
     if message_id:
         payload["id"] = message_id
+    lineage = _clean_renamed_from(renamed_from)
+    if lineage:
+        payload["renamed_from"] = lineage
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
     cleaned_expires_at = _clean_expires_at(expires_at)
     if cleaned_expires_at is not None:
         payload["expires_at"] = cleaned_expires_at
@@ -422,6 +498,29 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         raise ProtocolError("group creator must be a member of the group")
     if derive_group_id(creator, group_name, members) != group:
         raise ProtocolError("group id does not match its creator and roster")
+    raw_topic = payload.get("group_topic")
+    # ``None`` — the field absent, or non-text — means the sender
+    # predates topics (or sent garbage): the local topic is left alone.
+    # A present string, including "", is authoritative: the creator
+    # clearing a topic sends "".
+    topic = clean_group_topic(raw_topic) if isinstance(raw_topic, str) else None
+    raw_topic_at = payload.get("group_topic_sent_at")
+    topic_sent_at = None
+    if (
+        topic is not None
+        and isinstance(raw_topic_at, (int, float))
+        and not isinstance(raw_topic_at, bool)
+    ):
+        # Convert before the finiteness check: math.isfinite() on a
+        # huge JSON integer raises OverflowError before it can return
+        # False, which would fail parsing before any sender policy
+        # check runs.
+        try:
+            topic_sent_at = float(raw_topic_at)
+        except OverflowError:
+            topic_sent_at = None
+        if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+            topic_sent_at = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -430,6 +529,10 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "group_topic": topic,
+        "group_topic_sent_at": topic_sent_at,
+        "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
     }
 
@@ -462,6 +565,9 @@ def reaction_dict(
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
     signature: Optional[str] = None,
+    group: Optional[str] = None,
+    target_author: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The ``/tau/react`` payload as a dict, unsigned unless signed.
 
@@ -470,6 +576,13 @@ def reaction_dict(
     encoding of the payload without ``"sig"`` and attaches the base64
     signature, so the receiver can verify attribution against the link
     identity independently of the transport.
+
+    ``group`` / ``target_author`` / ``target_sent_at`` name the group
+    message being reacted to: group messages carry a different wire id
+    per recipient leg, so the target id alone only matches the reactor's
+    own copy and the author's sent record.  A receiver that does not
+    hold the target id can resolve its own copy from this context
+    instead (see :func:`tau.node.TauNode._handle_reaction`).
     """
     target = _clean_message_id(target)
     payload: Dict[str, Any] = {
@@ -482,6 +595,16 @@ def reaction_dict(
     }
     if message_id:
         payload["id"] = message_id
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
+    if target_author is not None:
+        payload["target_author"] = _clean_hexhash(target_author, "target_author")
+    if target_sent_at is not None:
+        if not isinstance(target_sent_at, (int, float)) or isinstance(
+            target_sent_at, bool
+        ):
+            raise ProtocolError("target_sent_at must be a number")
+        payload["target_sent_at"] = target_sent_at
     if signature is not None:
         payload["sig"] = signature
     return payload
@@ -539,12 +662,40 @@ def parse_reaction(raw: Any) -> Dict[str, Any]:
             raise ProtocolError(
                 "reaction signature is not valid base64"
             ) from exc
+    # Group context is advisory: it lets a receiver resolve its own
+    # copy of a group message when the target id is not one it holds.
+    # Malformed context is dropped, never a reason to reject the
+    # reaction — the target id alone is still a valid reaction.
+    group = payload.get("group")
+    if not isinstance(group, str):
+        group = None
+    else:
+        try:
+            group = _clean_hexhash(group, "group")
+        except ProtocolError:
+            group = None
+    target_author = payload.get("target_author")
+    if not isinstance(target_author, str):
+        target_author = None
+    else:
+        try:
+            target_author = _clean_hexhash(target_author, "target_author")
+        except ProtocolError:
+            target_author = None
+    target_sent_at = payload.get("target_sent_at")
+    if not isinstance(target_sent_at, (int, float)) or isinstance(
+        target_sent_at, bool
+    ):
+        target_sent_at = None
     return {
         "target": target,
         "reaction": reaction,
         "sent_at": sent_at,
         "id": message_id,
         "sig": signature,
+        "group": group,
+        "target_author": target_author,
+        "target_sent_at": target_sent_at,
     }
 
 
@@ -648,6 +799,117 @@ def parse_retract(raw: Any) -> Dict[str, Any]:
 
 def retract_unsigned_bytes(raw: Any) -> bytes:
     """Canonical bytes of a retract payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+def edit_dict(
+    target: str,
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/dm/edit`` payload as a dict, unsigned unless signed.
+
+    The signature — when present — covers every other field, exactly
+    like a reaction: the sender signs the canonical encoding of the
+    payload without ``"sig"`` and attaches the base64 signature, so
+    the receiver can verify attribution against the link identity
+    independently of the transport.
+    """
+    target = _clean_message_id(target)
+    payload: Dict[str, Any] = {
+        "type": "dm_edit",
+        "v": PROTOCOL_VERSION,
+        "target": target,
+        "text": normalize_message(text),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if message_id:
+        payload["id"] = message_id
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_edit(
+    target: str,
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM edit for the ``/tau/dm/edit`` request.
+
+    ``target`` names the edited message id, ``text`` is the replacement
+    body.  ``signature`` is the base64 signature over the canonical
+    unsigned payload; see :func:`edit_dict`.
+    """
+    return encode(
+        edit_dict(
+            target,
+            text,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_edit(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/dm/edit`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "dm_edit":
+        raise ProtocolError("expected a dm_edit payload")
+    target = _clean_message_id(payload.get("target"))
+    text = normalize_message(payload.get("text"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    else:
+        # A huge JSON integer parses fine but cannot become a float
+        # timestamp; reject it here rather than crash the handler.
+        try:
+            sent_at = float(sent_at)
+        except OverflowError as exc:
+            raise ProtocolError("edit sent_at is out of range") from exc
+        if not math.isfinite(sent_at):
+            raise ProtocolError("edit sent_at must be a finite timestamp")
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("edit signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "edit signature is not valid base64"
+            ) from exc
+    return {
+        "target": target,
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "sig": signature,
+    }
+
+
+def edit_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of an edit payload without its signature.
 
     Used to verify the signature: the signer signs exactly these bytes,
     and the deterministic encoder reproduces them from the received

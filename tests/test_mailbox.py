@@ -63,6 +63,55 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
     assert entries[0].created_at == 1000.0
 
 
+def test_enqueue_sent_at_survives_reload(tmp_path):
+    # A group fan-out records its shared send time on the queued leg,
+    # which is earlier than the enqueue time: it must survive the
+    # on-disk round trip, not collapse back to created_at.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="crew hello", now=2000.0, sent_at=100.0)
+    assert entry.sent_at == 100.0
+    assert entry.wire_sent_at == 100.0
+    assert entry.to_dict()["sent_at"] == 100.0
+
+    reloaded = Mailbox(path)
+    assert reloaded.outbox_list()[0].sent_at == 100.0
+    assert reloaded.outbox_list()[0].wire_sent_at == 100.0
+
+
+def test_enqueue_without_sent_at_uses_created_at(tmp_path):
+    # A single-leg send records no logical time: the enqueue time is
+    # the send time, before and after a reload.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(to=BOB, text="hello bob", now=1000.0)
+    assert entry.sent_at is None
+    assert entry.wire_sent_at == 1000.0
+
+    assert Mailbox(path).outbox_list()[0].wire_sent_at == 1000.0
+
+
+def test_outbox_entry_without_sent_at_loads_with_created_at(tmp_path):
+    # An entry written before the field existed carries no sent_at:
+    # loading it must not fail, and its wire time is its enqueue time.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.enqueue(to=BOB, text="old entry", now=1000.0)
+    raw = json.loads(path.read_text())
+    del raw["outbox"][0]["sent_at"]
+    path.write_text(json.dumps(raw))
+
+    loaded = Mailbox(path).outbox_list()[0]
+    assert loaded.sent_at is None
+    assert loaded.wire_sent_at == 1000.0
+
+
+def test_enqueue_rejects_invalid_sent_at(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError):
+        box.enqueue(to=BOB, text="hello", sent_at=float("inf"))
+
+
 def test_enqueue_kind_survives_reload(tmp_path):
     path = tmp_path / "mailbox.json"
     box = Mailbox(path)
@@ -131,6 +180,42 @@ def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
     path.write_text(json.dumps(raw))
     reloaded = Mailbox(path)
     assert "delivered_at" not in reloaded.sent_record("m2")
+
+
+def test_update_sent_text_ignores_a_stale_edit(tmp_path):
+    """Two overlapping edit sends can finish out of order: the older
+    one's local write must not rewind the newer one's text."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="original", sent_at=1000.0)
+
+    box.update_sent_text("m1", "newer text", edited_at=200.0)
+    assert box.sent_record("m1")["text"] == "newer text"
+
+    box.update_sent_text("m1", "older text", edited_at=100.0)
+    assert box.sent_record("m1")["text"] == "newer text"
+    assert box.sent_record("m1")["edited_at"] == 200.0
+
+    box.update_sent_text("m1", "newest text", edited_at=300.0)
+    assert box.sent_record("m1")["text"] == "newest text"
+    assert box.sent_record("m1")["edited_at"] == 300.0
+
+
+def test_sent_record_keeps_edited_at_through_reload(tmp_path):
+    """`edited_at` must survive a reload: the staleness check in
+    update_sent_text compares against it after the transaction
+    reloads the document."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="original", sent_at=1000.0)
+    box.update_sent_text("m1", "newer text", edited_at=200.0)
+
+    reloaded = Mailbox(path)
+    assert reloaded.sent_record("m1")["edited_at"] == 200.0
+
+    # A stale edit arriving after the reload is still rejected.
+    reloaded.update_sent_text("m1", "older text", edited_at=100.0)
+    assert reloaded.sent_record("m1")["text"] == "newer text"
 
 
 def test_load_dedupes_duplicate_message_ids(tmp_path):
