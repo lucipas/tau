@@ -17,6 +17,7 @@ import type {
   DoctorResponse,
   DropHeldResponse,
   ForgetPeerResponse,
+  ForwardMessageResponse,
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
@@ -722,6 +723,37 @@ export function useTau() {
     );
     return result;
   }, []);
+
+  const forwardMessage = useCallback(
+    async (id: number, to: string) => {
+      const result = await apiPost<ForwardMessageResponse>(
+        "/api/messages/forward",
+        { id, to },
+      );
+      // The forwarded copy is a new outbound entry: append it locally
+      // at once, like `send`, and let the SSE event reconcile other tabs.
+      setMessages((previous) => {
+        if (previous.some((entry) => entry.id === result.message.id)) {
+          return previous;
+        }
+        return [...previous, result.message].sort((a, b) => a.id - b.id);
+      });
+      snapshotMax.current = Math.max(
+        snapshotMax.current,
+        result.message.id,
+      );
+      // A queued forward lands in the outbox; refresh so it shows at
+      // once instead of waiting for the next poll. Best-effort: a
+      // failed refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      return result.message;
+    },
+    [refreshOutbox],
+  );
 
   const pinMessage = useCallback(async (id: number) => {
     // The node records the pin and the bridge re-sends the message as
@@ -1574,6 +1606,7 @@ export function useTau() {
     send,
     deleteMessage,
     retractMessage,
+    forwardMessage,
     sendGroup,
     sendFile,
     ping,

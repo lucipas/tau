@@ -367,6 +367,14 @@ export interface RetractMessageResponse {
   id?: string | null;
 }
 
+// POST /api/messages/forward: the forwarded copy, as recorded by the
+// bridge's send path, plus the node's send response.
+export interface ForwardMessageResponse {
+  ok: boolean;
+  message: TauMessage;
+  response: Record<string, unknown>;
+}
+
 // POST /api/messages/pin: the pinned console id and wire id, plus
 // whether the pin already existed (a re-pin is a no-op, not an error).
 export interface PinMessageResponse {

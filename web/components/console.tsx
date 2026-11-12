@@ -235,6 +235,7 @@ export function Console() {
                   : tau.pinnedMessages ?? tau.messages
               }
               node={tau.node}
+              peers={tau.peers}
               live={tau.connection === "live"}
               searching={tau.searchQuery !== null}
               searchQuery={tau.searchQuery}
@@ -258,6 +259,9 @@ export function Console() {
               }}
               onRetract={async (message) => {
                 await tau.retractMessage(message.id);
+              }}
+              onForward={async (message, to) => {
+                await tau.forwardMessage(message.id, to);
               }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;

@@ -42,6 +42,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/retract retract ``{"id": <console message id>}``: ask
                            the peer to delete your sent DM, then drop the
                            local copies too (``tau retract`` from the console)
+    POST /api/messages/forward forward ``{"id": <console message id>, "to": "<peer>"}``:
+                           send the message on as a new DM prefixed with
+                           ``Forwarded from <name>:`` (``tau forward`` from
+                           the console)
     POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
@@ -3200,6 +3204,101 @@ class WebBridge:
             "deleted": bool(response.get("deleted")),
             "id": response.get("id") if isinstance(response.get("id"), str) else None,
         }
+
+    def forward_message(
+        self, target: int, to: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Forward one stored DM to another peer, from the console.
+
+        Mirrors ``tau forward``: the forwarded text is the original
+        prefixed with one attribution line, so the recipient sees who
+        said it on any transport with no protocol change.  Delivery
+        reuses :meth:`send_message` wholesale — the forward is a new
+        message, so it carries no expiry, kind, or reply chain from the
+        original, and the new outbound entry appears in the feed like
+        any other send.
+
+        Same guards as the CLI: group messages cannot be forwarded
+        (they would leak the group's text to a nonmember), file
+        transfers cannot be forwarded (they have no text), and a
+        received message from a blocked peer cannot be forwarded.  An
+        unreadable block-list fails closed for received messages,
+        matching the CLI.  Forwarding your own sent message attributes
+        it as "you"; a received message is re-resolved against the
+        registry so a newer alias wins, falling back to the name
+        recorded when the message arrived.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        if not isinstance(to, str) or not to.strip():
+            raise ValueError("target peer is required")
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("group"):
+                raise ValueError("group messages cannot be forwarded")
+            if entry.get("file"):
+                raise ValueError("file transfers cannot be forwarded")
+            text = entry.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError("message has no text to forward")
+            direction = entry.get("direction")
+            peer_hash = entry.get("peer")
+            peer_name = entry.get("peer_name")
+        if direction == "out":
+            label = "you"
+        else:
+            # Messages hidden by the block-list are hidden from the
+            # feed and must not be forwarded either.  An unreadable
+            # block-list fails closed, matching `tau forward`.
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is None:
+                raise ValueError("cannot forward: the block-list could not be read")
+            if (
+                isinstance(peer_hash, str)
+                and peer_hash
+                and blocklist.is_blocked(peer_hash)
+            ):
+                raise ValueError("cannot forward a message from a blocked peer")
+            label = None
+            if isinstance(peer_hash, str) and peer_hash:
+                registry = getattr(self.node, "registry", None)
+                if registry is not None:
+                    try:
+                        found = registry.get(peer_hash)
+                    except Exception:  # pragma: no cover - defensive
+                        found = None
+                    if found is not None:
+                        label = found.display_name
+            if not label:
+                label = (
+                    peer_name
+                    if isinstance(peer_name, str) and peer_name
+                    else None
+                )
+            if not label:
+                label = (
+                    short_hash(peer_hash)
+                    if isinstance(peer_hash, str) and peer_hash
+                    else "unknown"
+                )
+        forwarded = f"Forwarded from {label}:\n{text}"
+        if len(forwarded) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"message is too long to forward "
+                f"({len(forwarded)} > {MAX_MESSAGE_CHARS} characters)"
+            )
+        message, response = self.send_message(to.strip(), forwarded, timeout=timeout)
+        return {"ok": True, "message": message, "response": response}
+
     def pin_message(self, target: int) -> Dict[str, Any]:
         """Pin one stored DM from the console history, by console id.
 
@@ -5420,6 +5519,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages/retract":
                 self._handle_retract_message(body, head_only)
                 return
+            if path == "/api/messages/forward":
+                self._handle_forward_message(body, head_only)
+                return
             if path == "/api/messages/pin":
                 self._handle_pin_message(body, head_only, pinned=True)
                 return
@@ -6357,6 +6459,45 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json(result, head_only)
+
+    def _handle_forward_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        to = body.get("to")
+        if not isinstance(to, str) or not to.strip():
+            self._send_json(
+                {"error": {"message": "field 'to' is required"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.forward_message(
+                target, to.strip(), timeout=timeout
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+
     def _handle_pin_message(
         self, body: Dict[str, Any], head_only: bool, *, pinned: bool
     ) -> None:
