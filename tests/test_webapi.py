@@ -6531,6 +6531,56 @@ def test_delete_message_endpoint_removes_history_and_inbox_entry(bridge, node):
     assert deleted_events[0]["message_id"] == 1
 
 
+def test_delete_by_wire_id_never_touches_a_different_inbox_record(bridge, node):
+    # The retract handler already deleted the exact inbox record; a
+    # console-only removal must not re-delete by wire id, or a prefix
+    # match would drop another sender's message sharing the prefix.
+    node.inbox.append(
+        {
+            "id": "msg-123",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "another sender's message",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "msg-1",
+        }
+    )
+    result = bridge.delete_by_wire_id("msg-1")
+    assert result == {"ok": True, "deleted": {"id": 1, "wire_id": "msg-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert [entry["id"] for entry in node.inbox.list_messages()] == ["msg-123"]
+
+
+def test_retract_before_delivery_does_not_resurrect(bridge):
+    # The retraction landed while the delivery callback was still in
+    # flight: no console entry existed to remove, but the id is
+    # remembered, so the late append is refused.
+    assert bridge.delete_by_wire_id("wire-1") is None
+    assert bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    ) is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
 def test_delete_message_endpoint_removes_console_only_entry(bridge):
     bridge.record_inbound(
         {
@@ -6662,6 +6712,68 @@ def test_retract_removes_the_recipients_console_copy(tmp_path):
             if event.get("type") == "message_deleted"
         ]
         assert len(deleted_events) == 1
+    finally:
+        bridge.stop()
+
+
+def test_retract_before_pending_delivery_does_not_resurrect(tmp_path):
+    # The delivery persisted the DM to the inbox but its console
+    # callback had not run yet when the retract landed: the callback
+    # must not write the message into console history afterwards.
+    import base64
+
+    from tau.identity import destination_hash
+    from tau.node import TauNode
+    from tau.peers import PeerRegistry
+    from tau.protocol import decode, encode, retract_dict
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="holder")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    try:
+        node.on_message = bridge.record_inbound
+        node.on_retract = lambda record: bridge.delete_by_wire_id(
+            str(record.get("id") or "")
+        )
+        sender = RNS.Identity()
+        sender_hash = destination_hash(sender).hex()
+        node.destination = SimpleNamespace(
+            hexhash="ab" * 16, hash=b"\xab" * 16
+        )
+        record = {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "msg-1",
+            "direction": "in",
+        }
+        # Phase 1 of the delivery: persisted to the inbox, console
+        # callback still pending.
+        node.inbox.append(record)
+        node.mailbox.mark_seen("msg-1")
+        # The retract lands before the callback runs.
+        retract_payload = retract_dict("msg-1", message_id="retract-1")
+        signature = sender.sign(encode(retract_payload))
+        retract_payload["sig"] = base64.b64encode(signature).decode("ascii")
+        response = decode(
+            node._handle_retract(
+                "/tau/test", encode(retract_payload), b"request-id", sender, time.time()
+            )
+        )
+        assert response["ok"] is True
+        assert response["deleted"] is True
+        assert node.inbox.list_messages() == []
+        # Phase 2: the pending delivery callback finally runs.
+        assert bridge.record_inbound(record) is None
+        _, _, feed = _json(bridge, "/api/messages")
+        assert feed["messages"] == []
     finally:
         bridge.stop()
 

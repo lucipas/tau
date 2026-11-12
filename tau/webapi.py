@@ -167,6 +167,10 @@ MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
 MAX_EARLY_DELIVERIES = 128
+# Wire ids removed from console history (by retraction or a console
+# delete), remembered so a delivery callback already in flight when
+# the removal landed cannot append the message back afterwards.
+MAX_REMOVED_WIRE_IDS = 512
 MAX_EVENT_LOG = 500
 
 # Most likers one /api/tan/likes response carries. The full count is
@@ -698,6 +702,12 @@ class WebBridge:
         # OrderedDict used as a bounded set (its popitem(last=False)
         # evicts the oldest report; a plain dict has no such call).
         self._early_deliveries: OrderedDict[str, None] = OrderedDict()
+        # Wire ids removed from console history (by retraction or a
+        # console delete).  A delivery callback already in flight when
+        # the removal landed must not append the message back
+        # afterwards; record_inbound drops those ids.  An OrderedDict
+        # used as a bounded set, like _early_deliveries.
+        self._removed_wire_ids: OrderedDict[str, None] = OrderedDict()
         # Verified read receipts whose console record was not appended yet,
         # keyed by (reader, wire id); send_message reconciles them on append.
         self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
@@ -948,7 +958,18 @@ class WebBridge:
     def record_peer(self, peer: Peer) -> None:
         self.bus.publish({"type": "peer", "peer": self._local_peer_payload(peer)})
 
-    def record_inbound(self, record: Dict[str, Any]) -> Dict[str, Any]:
+    def _remember_removed_wire_id(self, wire_id: str) -> None:
+        """Remember a wire id whose console entry is gone (caller holds the lock).
+
+        A delivery callback already in flight when the entry was
+        removed must not append the message back afterwards; see
+        :meth:`record_inbound`.  Bounded: the oldest ids evict first.
+        """
+        self._removed_wire_ids[wire_id] = None
+        while len(self._removed_wire_ids) > MAX_REMOVED_WIRE_IDS:
+            self._removed_wire_ids.popitem(last=False)
+
+    def record_inbound(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         peer_hash = str(record.get("destination") or "")
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
@@ -976,7 +997,14 @@ class WebBridge:
             wire_id=wire_id if isinstance(wire_id, str) else None,
             in_reply_to=record.get("in_reply_to"),
             file=record.get("file"),
+            reject_removed_wire_id=True,
         )
+        if message is None:
+            # A retraction (or console delete) already removed this
+            # message; the delivery callback was in flight when it
+            # landed, and appending now would resurrect it after a
+            # successful retraction.
+            return None
         # The node appends to its inbox before this callback runs, so
         # the unread total already includes the new message.
         self.bus.publish(
@@ -2753,6 +2781,35 @@ class WebBridge:
                     # entry in place, so the delete can be retried.
                     if not str(exc).startswith("unknown message"):
                         raise
+        self._remove_history_entry(target, removed, publish_unread=inbox is not None)
+        return {
+            "ok": True,
+            "deleted": {
+                "id": target,
+                "wire_id": wire_id if isinstance(wire_id, str) else None,
+            },
+        }
+
+    def _remove_history_entry(
+        self, target: int, removed: Dict[str, Any], *, publish_unread: bool
+    ) -> None:
+        """Remove one console history entry and tell connected tabs.
+
+        The entry leaves the persisted log, its wire id is remembered
+        so a delivery callback already in flight cannot append the
+        message back afterwards (see :meth:`record_inbound`), and
+        other tabs learn through a ``message_deleted`` event.  The
+        caller owns the inbox side: console-initiated deletes remove
+        the inbox copy first (see :meth:`delete_message`), while the
+        retraction path never touches the inbox here — its record is
+        already gone, and re-deleting by wire id could prefix-match a
+        different message.  ``publish_unread`` re-publishes the unread
+        badge when the caller consulted the node inbox.  The wire id
+        stays remembered even when the save fails and the entry is
+        restored: the message is back in history, so a later append
+        of the same id would only duplicate it.
+        """
+        wire_id = removed.get("wire_id")
         # Hold the save lock across removal, strict persistence and
         # failure rollback: no other history save can persist the
         # transiently deleted deque between the failed write and the
@@ -2767,6 +2824,10 @@ class WebBridge:
                 ]
                 self._messages.clear()
                 self._messages.extend(kept)
+                if isinstance(wire_id, str) and wire_id:
+                    # Recorded under the same lock as the append
+                    # check, so the two cannot interleave.
+                    self._remember_removed_wire_id(wire_id)
             # Persist the console history strictly: a failed write
             # restores the entry and reports an error, so success is
             # never reported for a delete that a restart would undo.
@@ -2801,15 +2862,8 @@ class WebBridge:
         # would make other tabs drop whichever bubble shares the
         # event's sequence number.
         self.bus.publish({"type": "message_deleted", "message_id": target})
-        if inbox is not None:
+        if publish_unread:
             self.bus.publish({"type": "unread", "unread": self.unread()})
-        return {
-            "ok": True,
-            "deleted": {
-                "id": target,
-                "wire_id": wire_id if isinstance(wire_id, str) else None,
-            },
-        }
 
     def delete_by_wire_id(self, wire_id: str) -> Optional[Dict[str, Any]]:
         """Delete the console history entry for one retracted DM, by wire id.
@@ -2820,27 +2874,38 @@ class WebBridge:
         event as a console delete, so a retracted message never
         survives in the console past a restart.  Only an inbound entry
         can match — a retract deletes a received record, never a sent
-        one.  Returns the delete result, or ``None`` when no inbound
-        entry carries that wire id (the console window may not cover
-        it).  The inbox record is already gone — the node's retract
-        handler deleted it first — so the inbox step inside
-        :meth:`delete_message` is a tolerated no-op.
+        one.  Console-only: the inbox record is already gone (the
+        node's retract handler deleted it first), and re-deleting by
+        wire id could prefix-match a different message.  Returns the
+        delete result, or ``None`` when no inbound entry carries that
+        wire id (the console window may not cover it) — the id is
+        still remembered, so a delivery callback already in flight
+        cannot append the message afterwards.
         """
         if not isinstance(wire_id, str) or not wire_id:
             return None
         with self._lock:
-            target = next(
+            removed = next(
                 (
-                    message.get("id")
+                    message
                     for message in self._messages
                     if message.get("direction") == "in"
                     and message.get("wire_id") == wire_id
                 ),
                 None,
             )
-        if target is None:
-            return None
-        return self.delete_message(target)
+            if removed is None:
+                # No entry to remove, but the retraction succeeded:
+                # remember the id so a pending delivery callback
+                # cannot append the message afterwards.
+                self._remember_removed_wire_id(wire_id)
+                return None
+            target = removed.get("id")
+        self._remove_history_entry(target, removed, publish_unread=True)
+        return {
+            "ok": True,
+            "deleted": {"id": target, "wire_id": wire_id},
+        }
 
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
@@ -4002,8 +4067,20 @@ class WebBridge:
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
         save: bool = True,
-    ) -> Dict[str, Any]:
+        reject_removed_wire_id: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         with self._lock:
+            if (
+                reject_removed_wire_id
+                and wire_id is not None
+                and wire_id in self._removed_wire_ids
+            ):
+                # The entry was removed (by retraction or a console
+                # delete) while this delivery callback was in flight;
+                # appending now would resurrect it.  The check runs
+                # under the same lock as the removal, so the two cannot
+                # interleave.
+                return None
             message = {
                 "id": self._next_message_id,
                 "direction": direction,
