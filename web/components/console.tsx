@@ -256,6 +256,9 @@ export function Console() {
               onDelete={async (message) => {
                 await tau.deleteMessage(message.id);
               }}
+              onRetract={async (message) => {
+                await tau.retractMessage(message.id);
+              }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;
                 if (reaction === null) {

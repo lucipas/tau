@@ -133,6 +133,152 @@ describe("MessageFeed delete", () => {
   });
 });
 
+describe("MessageFeed retract", () => {
+  const sent = (overrides: Partial<TauMessage> = {}) =>
+    makeMessage({
+      direction: "out",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+      ...overrides,
+    });
+
+  it("shows no retract button without an onRetract handler", () => {
+    render(<MessageFeed messages={[sent()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("asks for confirmation before retracting", async () => {
+    const message = sent();
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    expect(onRetract).not.toHaveBeenCalled();
+    expect(screen.getByText("confirm retract")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("confirm retract"));
+    expect(onRetract).toHaveBeenCalledTimes(1);
+    expect(onRetract).toHaveBeenCalledWith(message);
+  });
+
+  it("keeps the message when the confirmation is cancelled", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    fireEvent.click(screen.getByText("keep"));
+    expect(onRetract).not.toHaveBeenCalled();
+    expect(screen.queryByText("confirm retract")).toBeNull();
+    expect(screen.getByTitle("Retract this message")).toBeTruthy();
+  });
+
+  it("reports a failed retract inline and keeps the message", async () => {
+    const onRetract = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    fireEvent.click(screen.getByText("confirm retract"));
+    expect(await screen.findByText("boom")).toBeTruthy();
+    // The bubble stays, with the plain retract button back for a retry.
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Retract this message")).toBeTruthy();
+  });
+
+  it("shows no retract button on received messages", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button on group messages", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ group: "ab".repeat(16), group_name: "crew" })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button on file entries", () => {
+    // The peer refuses retracts of saved files, so offering retract
+    // on a sent file would always fail.
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[
+          sent({
+            file: { name: "notes.txt", size: 10, sha256: "ab".repeat(32) },
+          }),
+        ]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button without a wire id", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ wire_id: undefined })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("hides the retract button while the message is still queued", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ status: "queued" })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+});
+
 describe("MessageFeed react picker", () => {
   const NODE: NodeInfo = {
     name: "me",

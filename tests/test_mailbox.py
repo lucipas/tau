@@ -182,6 +182,54 @@ def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
     assert "delivered_at" not in reloaded.sent_record("m2")
 
 
+def test_record_delivered_keeps_lxmf_after_direct_delivery(tmp_path):
+    """A later LXMF confirmation must win over a direct one: the
+    recipient now also holds an `lxmf:` copy, so a retract reading
+    the stale "direct" route would miss it. "lxmf" is sticky, and
+    the first delivery time stands."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_delivered("m1", now=1002.0, via="direct")
+    assert box.sent_record("m1")["delivered_via"] == "direct"
+    assert box.sent_record("m1")["delivered_at"] == 1002.0
+
+    box.record_delivered("m1", now=1003.0, via="lxmf")
+    assert box.sent_record("m1")["delivered_via"] == "lxmf"
+    assert box.sent_record("m1")["delivered_at"] == 1002.0
+
+    # A direct confirmation after the LXMF one must not erase it.
+    box.record_delivered("m1", now=1004.0, via="direct")
+    assert box.sent_record("m1")["delivered_via"] == "lxmf"
+    assert box.sent_record("m1")["delivered_at"] == 1002.0
+
+
+def test_sent_record_keeps_delivery_route_through_reload(tmp_path):
+    """`delivered_via` must survive a reload: a later retract reads it
+    to tell whether the recipient holds the copy under the tau wire
+    id or under an LXMF id."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0, via="lxmf")
+    box.record_delivered("m2", now=1003.0, via="direct")
+
+    reloaded = Mailbox(path)
+    assert reloaded.sent_record("m1")["delivered_via"] == "lxmf"
+    assert reloaded.sent_record("m2")["delivered_via"] == "direct"
+
+    # A record written before route tracking has no such key, and an
+    # unknown route value is dropped on load rather than trusted.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_via"]
+    raw["sent"]["m1"]["delivered_via"] = "carrier-pigeon"
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_via" not in reloaded.sent_record("m2")
+    assert "delivered_via" not in reloaded.sent_record("m1")
+
+
 def test_update_sent_text_ignores_a_stale_edit(tmp_path):
     """Two overlapping edit sends can finish out of order: the older
     one's local write must not rewind the newer one's text."""
