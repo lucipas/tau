@@ -2535,8 +2535,15 @@ class WebBridge:
         text: str,
         *,
         timeout: float = 20.0,
+        expires_at: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds),
+        exactly like a direct message: it travels in every leg's
+        payload, a queued leg expires at the same deadline, and the
+        receiver purges the message once it passes.  The outbound feed
+        entry carries it too, so the console can show the deadline.
 
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
@@ -2556,6 +2563,12 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                raise ValueError("expires_at must be a number")
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite number")
         # Normalise up front so the recorded text is exactly what gets
         # sent: the node normalises again before sending, so this cannot
         # change delivery.
@@ -2566,7 +2579,7 @@ class WebBridge:
         self.node.groups.list_groups()
         group_record = self.node.groups.find(group.strip())
         response = self.node.send_group_message(
-            group_record, text, timeout=timeout
+            group_record, text, timeout=timeout, expires_at=expires_at
         )
         messages: List[Dict[str, Any]] = []
         for result in response.get("results") or []:
@@ -2602,6 +2615,7 @@ class WebBridge:
                     mail_id=mail_id,
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
+                    expires_at=expires_at,
                     wire_id=wire_id,
                 )
                 with self._lock:
@@ -5455,9 +5469,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         head_only: bool,
     ) -> None:
         # A group send is addressed by group, not by peer, so the two
-        # forms are exclusive; the node group path supports neither
-        # reply quoting nor expiry, so those are rejected outright
-        # instead of silently dropped.
+        # forms are exclusive; the node group path supports no reply
+        # quoting, so that is rejected outright instead of silently
+        # dropped.
         if body.get("to") is not None:
             self._send_json(
                 {"error": {"message": "give 'to' or 'group', not both"}},
@@ -5485,17 +5499,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        expires_at = None
         if expires_in is not None:
-            self._send_json(
-                {
-                    "error": {
-                        "message": "group sends do not support 'expires_in'"
-                    }
-                },
-                head_only,
-                400,
-            )
-            return
+            if (
+                not isinstance(expires_in, (int, float))
+                or isinstance(expires_in, bool)
+                or not _valid_expires_in(expires_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'expires_in' must be a number of "
+                            "seconds between 0 and 30 days"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            expires_at = time.time() + float(expires_in)
         if body.get("reply_to") is not None:
             self._send_json(
                 {"error": {"message": "group sends do not support 'reply_to'"}},
@@ -5505,7 +5527,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             messages, response = self.bridge.send_group_message(
-                group.strip(), text, timeout=timeout
+                group.strip(), text, timeout=timeout, expires_at=expires_at
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

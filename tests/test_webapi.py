@@ -315,9 +315,11 @@ class FakeNode:
         }
 
     def send_group_message(
-        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True
+        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
+        expires_at=None,
     ):
         self.group_sent.append((group["name"], text))
+        self.last_group_expires_at = expires_at
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -839,6 +841,26 @@ def test_send_group_message_records_one_entry_per_leg(bridge, node):
     assert sum(1 for e in events if e["type"] == "message") == 2
 
 
+def test_send_group_message_accepts_expires_in(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "vanish soon", "expires_in": 3600},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    expires_at = node.last_group_expires_at
+    assert expires_at is not None
+    assert before + 3590 <= expires_at <= time.time() + 3610
+    # Every leg's feed entry carries the deadline, like a sent DM.
+    assert all(m["expires_at"] == expires_at for m in payload["messages"])
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert all(m["expires_at"] == expires_at for m in feed["messages"])
+
+
 def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     status, _, payload = _json(
@@ -943,7 +965,16 @@ def test_send_group_message_validation(bridge, node):
         bridge,
         "/api/messages",
         method="POST",
-        body={"group": "crew", "text": "hi", "expires_in": 60},
+        body={"group": "crew", "text": "hi", "expires_in": -5},
+    )
+    assert status == 400
+    assert "expires_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "expires_in": "soon"},
     )
     assert status == 400
     assert "expires_in" in payload["error"]["message"]

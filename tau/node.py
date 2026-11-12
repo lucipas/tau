@@ -1631,6 +1631,30 @@ class TauNode:
             peer = self.registry.get(caller_hash)
             caller_name = peer.display_name if peer is not None else caller_hash[:8]
 
+        # A delayed group request past the sender's deadline is dropped
+        # before the roster is pinned: an expired request must not add an
+        # unseen group or replace a saved roster, and it is never shown.
+        # The duplicate flag is still reported: a retry of a message
+        # already seen counts as delivered on the sender's side, even
+        # though the deadline has since passed.
+        message_id = message.get("id")
+        expires_at = message.get("expires_at")
+        if expires_at is not None and expires_at <= received_at:
+            log.info(
+                "Dropping expired group message %s from %s",
+                message_id,
+                caller_hash,
+            )
+            return response_ok(
+                echo=message["text"],
+                received_at=received_at,
+                server=self.name,
+                node=self.destination_hexhash,
+                group=message["group"],
+                duplicate=bool(message_id and self.mailbox.is_seen(message_id)),
+                expired=True,
+            )
+
         group = self._accept_group_message(
             caller_hash,
             {
@@ -1654,7 +1678,6 @@ class TauNode:
 
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
-        message_id = message.get("id")
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
             record = {
@@ -1667,6 +1690,7 @@ class TauNode:
                 "kind": "group",
                 "group": group["id"],
                 "group_name": group["name"],
+                "expires_at": message.get("expires_at"),
             }
             log.info(
                 "Group message from %s (%s) in %s: %s",
@@ -1695,6 +1719,7 @@ class TauNode:
             node=self.destination_hexhash,
             group=group["id"],
             duplicate=duplicate,
+            expired=False,
         )
 
     def _handle_file(
@@ -2580,6 +2605,7 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                expires_at=entry.message_expires_at,
             )
             if entry.group_id is not None
             else encode_message(
@@ -2595,7 +2621,7 @@ class TauNode:
             return False
         via_lxmf = False
         try:
-            self._request(
+            response = self._request(
                 peer,
                 REQUEST_GROUP_MESSAGE
                 if entry.group_id is not None
@@ -2604,6 +2630,38 @@ class TauNode:
                 timeout,
                 deadline=deadline,
             )
+            # A response is a dict; a stubbed request can return None,
+            # so guard the lookup.  Scoped to group legs: the direct
+            # message path keeps its established handling, where the
+            # CLI reports the receiver's expired note.
+            if (
+                entry.group_id is not None
+                and isinstance(response, dict)
+                and response.get("expired")
+                and not response.get("duplicate")
+            ):
+                # The receiver dropped the copy because the deadline passed
+                # in flight: this is not a confirmed delivery, and no
+                # retry can succeed — the receiver will drop it again —
+                # so the entry leaves the outbox now instead of lingering
+                # until the next prune.  A duplicate the receiver already
+                # saw still counts as delivered below.
+                log.info(
+                    "Dropping queued group message %s: receiver dropped "
+                    "it past its expiry",
+                    entry.id,
+                )
+                try:
+                    self.mailbox.remove_outbox(
+                        entry.id, timeout=_remaining(deadline)
+                    )
+                except TimeoutError:
+                    log.warning(
+                        "Expired queued message %s could not leave the "
+                        "outbox; the mailbox lock stayed busy",
+                        entry.id,
+                    )
+                return False
         except NotAMemberError as exc:
             # Permanent refusal: the recipient will not accept this roster,
             # so stop retrying rather than holding the leg until its TTL.
@@ -3734,6 +3792,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
 
@@ -3747,6 +3806,11 @@ class TauNode:
         queued the same way instead of dropped.  Returns a
         per-member result list: ``delivered``, ``queued``, or an
         ``error`` for that leg.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds),
+        exactly like a direct message: it travels in every leg's
+        payload, a queued leg expires at the same deadline, and the
+        receiver purges the message once it passes.
         """
         if isinstance(group, str):
             group = self.groups.find(group)
@@ -3777,6 +3841,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                expires_at=expires_at,
             )
         except ProtocolError as exc:
             raise NodeError(
@@ -3792,6 +3857,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                expires_at=expires_at,
             )
             peer: Optional[Peer] = None
             # One deadline bounds each leg, and the budget is per leg:
@@ -3814,6 +3880,23 @@ class TauNode:
                 # disk I/O, so the member still gets the message on a
                 # later retry, exactly as if the attempt had failed to
                 # reach them.
+                if expires_at is not None and expires_at <= time.time():
+                    # The deadline passed while reaching this member:
+                    # queueing would store a leg the next prune removes
+                    # undelivered, so report it as expired instead.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": "",
+                            "ok": False,
+                            "expired": True,
+                            "error": "expired: the deadline passed before "
+                            "this leg could be sent",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 if not queue or not self.started:
                     results.append(
                         {
@@ -3831,6 +3914,7 @@ class TauNode:
                         text=normalized,
                         to_name="",
                         message_id=message_id,
+                        expires_at=expires_at,
                         group=context,
                     )
                 except MailboxError as queue_exc:
@@ -3890,6 +3974,25 @@ class TauNode:
                     _remaining(deadline) or 0.0,
                     deadline=deadline,
                 )
+                if response.get("expired") and not response.get("duplicate"):
+                    # The receiver dropped the copy: the deadline passed
+                    # while the request was in flight. That is not a
+                    # delivery, and a queued retry would be dropped the
+                    # same way, so the leg fails here.  A duplicate the
+                    # receiver already saw still counts as delivered.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name,
+                            "ok": False,
+                            "expired": True,
+                            "error": "expired: the receiver dropped it — "
+                            "past its expiry",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 self.mailbox.record_delivered(message_id)
                 results.append(
                     {
@@ -3928,12 +4031,30 @@ class TauNode:
                         }
                     )
                     continue
+                if expires_at is not None and expires_at <= time.time():
+                    # The deadline passed during discovery or the
+                    # attempt: queueing would store a leg the next prune
+                    # removes undelivered, so report it as expired.
+                    self.mailbox.discard_sent(message_id)
+                    results.append(
+                        {
+                            "to": member,
+                            "to_name": peer.display_name if peer is not None else "",
+                            "ok": False,
+                            "expired": True,
+                            "error": "expired: the deadline passed before "
+                            "this leg could be sent",
+                            "id": message_id,
+                        }
+                    )
+                    continue
                 try:
                     entry = self.mailbox.enqueue(
                         to=bytes.fromhex(member),
                         text=normalized,
                         to_name=peer.display_name if peer is not None else "",
                         message_id=message_id,
+                        expires_at=expires_at,
                         group=context,
                     )
                 except MailboxError as queue_exc:
