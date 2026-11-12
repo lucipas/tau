@@ -18,6 +18,7 @@ from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.mailbox import Mailbox, open_message, seal_message
 from tau.peers import PeerRegistry
+from tau.protocol import derive_group_id
 from tau.tangents.rules import Ruleset
 from tau.tangents.tan import create_post, export_entries, follow, get_post, init_db
 
@@ -118,6 +119,52 @@ def test_bundle_roundtrip_held_and_outbox(tmp_path):
     assert again["imported"] == 0
     assert again["present"] == 2
     assert again["skipped"] == 0
+
+
+def test_bundle_export_queued_group_leg_keeps_shared_send_time(tmp_path):
+    # A queued group leg exported to a bundle must seal with the
+    # fan-out's shared send time and its group context, like a relay
+    # deposit — otherwise the copy arrives as a plain DM stamped with
+    # the enqueue time and a reaction on the live copy cannot resolve.
+    sender, recipient, _ = _identities()
+    members = [
+        destination_hash(sender).hex(),
+        destination_hash(recipient).hex(),
+    ]
+    group = derive_group_id(destination_hash(sender).hex(), "crew", members)
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": destination_hash(sender).hex(),
+            "members": members,
+        },
+        sent_at=100.0,
+        now=2000.0,
+    )
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=_registry_with(recipient),
+        now=2000.0,
+    )
+    assert summary["mail"] == 1
+    parsed = parse_bundle(serialize_bundle(document))
+    receiver_box = Mailbox(tmp_path / "receiver.json")
+    result = apply_bundle(
+        mailbox=receiver_box, tan_conn=None, document=parsed, now=2000.0
+    )
+    assert result["imported"] == 1
+    held = receiver_box.held_list()
+    assert len(held) == 1
+    message = open_message(recipient, held[0].blob)
+    assert message["sent_at"] == 100.0
+    assert message["group"]["id"] == group
 
 
 def test_bundle_tan_roundtrip(tmp_path):
