@@ -56,6 +56,12 @@ export function Composer({
     textareaRef.current?.focus();
   }, []);
 
+  // Group sends never take a delay: drop a peer delay picked before the
+  // switch so it cannot ride along (and the picker is gone anyway).
+  useEffect(() => {
+    if (groupMode) setSendSeconds(null);
+  }, [groupMode]);
+
   async function submit() {
     const trimmedTarget = target.trim();
     if (!trimmedTarget) {
@@ -328,7 +334,7 @@ export function Composer({
               ? "sending…"
               : file
                 ? "send file"
-                : sendSeconds === null
+                : groupMode || sendSeconds === null
                   ? "send"
                   : "schedule"}
           </span>
