@@ -50,6 +50,30 @@ describe("MessageFeed reactions", () => {
   });
 });
 
+describe("MessageFeed scheduled", () => {
+  it("shows the send time for a scheduled queued message", () => {
+    const message = makeMessage({
+      direction: "out",
+      status: "queued",
+      send_after: Date.now() / 1000 + 3601,
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+    expect(screen.getByText("sends in 1h")).toBeTruthy();
+    expect(screen.queryByText("queued")).toBeNull();
+  });
+
+  it("still shows plain queued for an unscheduled queued message", () => {
+    render(
+      <MessageFeed
+        messages={[makeMessage({ direction: "out", status: "queued" })]}
+        node={null}
+        live={true}
+      />,
+    );
+    expect(screen.getByText("queued")).toBeTruthy();
+  });
+});
+
 describe("MessageFeed delete", () => {
   it("shows no delete button without an onDelete handler", () => {
     render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);

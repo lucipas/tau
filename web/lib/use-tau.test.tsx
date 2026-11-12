@@ -935,6 +935,48 @@ describe("useTau rename", () => {
   });
 });
 
+describe("useTau send", () => {
+  it("posts a delay as send_in and appends the scheduled message", async () => {
+    const message = makeMessage({
+      direction: "out",
+      status: "queued",
+      send_after: Date.now() / 1000 + 3600,
+    });
+    mockedPost.mockResolvedValue({ ok: true, message, response: {} });
+
+    const { result } = renderHook(() => useTau());
+
+    let sent: TauMessage | undefined;
+    await act(async () => {
+      sent = await result.current.send(PEER_HASH, "later", undefined, undefined, 3600);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages", {
+      to: PEER_HASH,
+      text: "later",
+      send_in: 3600,
+    });
+    expect(sent).toEqual(message);
+    expect(result.current.messages).toContainEqual(message);
+  });
+
+  it("omits send_in when no delay is picked", async () => {
+    const message = makeMessage({ direction: "out", status: "delivered" });
+    mockedPost.mockResolvedValue({ ok: true, message, response: {} });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.send(PEER_HASH, "now");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages", {
+      to: PEER_HASH,
+      text: "now",
+    });
+  });
+});
+
 describe("useTau sendGroup", () => {
   it("posts the group and text and appends one entry per leg", async () => {
     const legs = [

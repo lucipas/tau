@@ -23,10 +23,12 @@ script) can read what arrives from the mesh and send messages back:
                            across the whole console log)
     GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
-                           ``"expires_in"`` seconds for a disappearing message)
+                           ``"expires_in"`` seconds for a disappearing message,
+                           ``"send_in"`` seconds to schedule it for later)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
                            (one outbound entry per member; replies are peer-DM-only,
-                           ``expires_in`` works for DM and group sends)
+                           ``expires_in`` works for DM and group sends,
+                           ``send_in`` is peer-DM-only)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -2909,6 +2911,7 @@ class WebBridge:
         *,
         timeout: float = 20.0,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
         reply_to: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(target, str) or not target.strip():
@@ -2923,6 +2926,27 @@ class WebBridge:
             expires_at = float(expires_at)
             if not math.isfinite(expires_at):
                 raise ValueError("expires_at must be a finite number")
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise ValueError("send_after must be a number")
+            send_after = float(send_after)
+            if not math.isfinite(send_after):
+                raise ValueError("send_after must be a finite number")
+            now = time.time()
+            if send_after <= now:
+                raise ValueError("send_after must be in the future")
+            if send_after > now + MAX_MAIL_TTL - 3600.0:
+                raise ValueError(
+                    "send_after must be at most 29d23h from now (the 30d "
+                    "mail TTL less an hour of delivery slack)"
+                )
+            if expires_at is not None and send_after >= expires_at:
+                raise ValueError(
+                    "send_after must be before the message expiry — the "
+                    "message would expire before it is sent"
+                )
         # Normalise up front so the recorded text is exactly what gets sent
         # (and is always UTF-8 encodable for the history file): the node
         # normalises again before sending, so this cannot change delivery.
@@ -2938,7 +2962,12 @@ class WebBridge:
         # buffers a report that beats the record, and the append below
         # reconciles it.
         response = self.node.send_message(
-            peer, text, timeout=timeout, in_reply_to=in_reply_to, expires_at=expires_at
+            peer,
+            text,
+            timeout=timeout,
+            in_reply_to=in_reply_to,
+            expires_at=expires_at,
+            send_after=send_after,
         )
         queued = bool(response.get("queued"))
         # The outbox id links this record to a later delivery; only
@@ -2959,6 +2988,7 @@ class WebBridge:
                 rtt=_as_float(response.get("_rtt")),
                 mail_id=mail_id,
                 expires_at=expires_at,
+                send_after=send_after,
                 wire_id=wire_id,
                 # A live send went out over the direct link by
                 # construction: a failed direct send queues instead.
@@ -5183,6 +5213,7 @@ class WebBridge:
         group: Optional[str] = None,
         group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
+        send_after: Optional[float] = None,
         wire_id: Optional[str] = None,
         delivered_via: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
@@ -5223,6 +5254,8 @@ class WebBridge:
                     message["group_name"] = group_name
             if expires_at is not None:
                 message["expires_at"] = expires_at
+            if send_after is not None:
+                message["send_after"] = send_after
             if wire_id is not None:
                 message["wire_id"] = wire_id
                 # A reaction may have arrived before this entry was
@@ -5344,6 +5377,21 @@ def _valid_expires_in(value: Any) -> bool:
     except OverflowError:
         return False
     return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL
+
+
+def _valid_send_in(value: Any) -> bool:
+    """True when ``value`` is a finite delay in (0, MAX_MAIL_TTL - 1h] seconds.
+
+    The cap mirrors the CLI's ``tau send --delay`` limit: a scheduled
+    message must leave at least an hour of delivery window before the
+    30-day mail TTL. Huge JSON integers overflow ``float()``, so the
+    conversion is guarded here instead of raising past the 400 response.
+    """
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return False
+    return math.isfinite(seconds) and 0 < seconds <= MAX_MAIL_TTL - 3600.0
 
 
 def _clamped_timeout(value: Any, default: float) -> float:
@@ -6476,7 +6524,19 @@ class _WebHandler(BaseHTTPRequestHandler):
         text = body.get("text")
         timeout = body.get("timeout", 20.0)
         expires_in = body.get("expires_in")
+        send_in = body.get("send_in")
         if group is not None:
+            if send_in is not None:
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "group sends do not support 'send_in'"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
             self._handle_group_send(body, group, text, timeout, expires_in, head_only)
             return
         if not isinstance(target, str) or not target.strip():
@@ -6519,12 +6579,45 @@ class _WebHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        send_after = None
+        if send_in is not None:
+            if (
+                not isinstance(send_in, (int, float))
+                or isinstance(send_in, bool)
+                or not _valid_send_in(send_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be a number of "
+                            "seconds between 0 and 29d23h"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            send_after = time.time() + float(send_in)
+            if expires_at is not None and send_after >= expires_at:
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'send_in' must be shorter than "
+                            "'expires_in' — the message would expire before "
+                            "it is sent"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
         try:
             message, response = self.bridge.send_message(
                 target,
                 text,
                 timeout=timeout,
                 expires_at=expires_at,
+                send_after=send_after,
                 reply_to=reply_to,
             )
         except (ValueError, ProtocolError) as exc:
@@ -6535,6 +6628,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except MailboxError as exc:
+            # A full outbox (or any other mailbox failure) is a
+            # capacity problem, not a bad request: 503, like the
+            # forward handler.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json(
             {"ok": True, "message": message, "response": response}, head_only

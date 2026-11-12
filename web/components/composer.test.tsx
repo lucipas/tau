@@ -116,9 +116,12 @@ describe("Composer group mode", () => {
     // The group picker lists the group with its member count.
     expect(screen.getByDisplayValue("crew · 2 members")).toBeTruthy();
     expect(screen.getByPlaceholderText("Write something to the group…")).toBeTruthy();
-    // Replies and expiry are peer-DM-only; the picker says so instead.
+    // Replies, expiry and scheduling are peer-DM-only; the picker says so instead.
     expect(screen.queryByLabelText("Message expiry")).toBeNull();
-    expect(screen.getByText("replies and expiry are peer DMs only")).toBeTruthy();
+    expect(screen.queryByLabelText("Send later")).toBeNull();
+    expect(
+      screen.getByText("replies, expiry and scheduling are peer DMs only"),
+    ).toBeTruthy();
 
     fireEvent.change(screen.getByPlaceholderText("Write something to the group…"), {
       target: { value: "hi all" },
@@ -192,7 +195,41 @@ describe("Composer file attach", () => {
         "hello",
         undefined,
         undefined,
+        undefined,
       ),
     );
+  });
+});
+
+describe("Composer send later", () => {
+  it("passes the chosen delay to onSend and resets the picker", async () => {
+    const { onSend } = renderComposer();
+    fireEvent.change(screen.getByLabelText("Send later"), {
+      target: { value: "3600" },
+    });
+    expect(screen.getByRole("button", { name: /schedule/i })).toBeTruthy();
+
+    const textarea = screen.getByPlaceholderText(/Write something/);
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /schedule/i }));
+
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(
+        "ab".repeat(16),
+        "hello",
+        undefined,
+        undefined,
+        3600,
+      ),
+    );
+    // The delay applies to one send only: the picker is back to "now".
+    expect(
+      (screen.getByLabelText("Send later") as HTMLSelectElement).value,
+    ).toBe("");
+  });
+
+  it("shows the send-later picker for peer DMs", () => {
+    renderComposer();
+    expect(screen.getByLabelText("Send later")).toBeTruthy();
   });
 });

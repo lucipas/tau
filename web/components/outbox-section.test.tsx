@@ -17,6 +17,7 @@ function makeEntry(overrides: Partial<OutboxEntry> = {}): OutboxEntry {
     last_attempt_at: null,
     last_error: null,
     held_by: [],
+    send_after: null,
     ...overrides,
   };
 }
@@ -71,6 +72,18 @@ describe("OutboxSection retry", () => {
     expect(
       screen.getByRole("button", { name: "retry all" }),
     ).toBeTruthy();
+  });
+
+  it("shows when a scheduled entry will send", () => {
+    renderSection([
+      makeEntry({ send_after: Date.now() / 1000 + 3601 }),
+    ]);
+    expect(screen.getByText(/sends in 1h/)).toBeTruthy();
+  });
+
+  it("shows no schedule for an entry queued by an offline peer", () => {
+    renderSection([makeEntry()]);
+    expect(screen.queryByText(/sends in/)).toBeNull();
   });
 
   it("retries one entry by id and reports the delivery", async () => {
