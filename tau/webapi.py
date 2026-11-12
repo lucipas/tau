@@ -2868,6 +2868,8 @@ class WebBridge:
                 )
             if removed.get("group"):
                 raise ValueError("group messages cannot be retracted in v1")
+            if removed.get("file"):
+                raise ValueError("file transfers cannot be retracted")
             if removed.get("status") == "queued":
                 # A retract answered "not found" would let the queued
                 # copy arrive later, so cancellation has to go through
