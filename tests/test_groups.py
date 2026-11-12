@@ -1295,6 +1295,32 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned["creator"] == sender_hash
 
 
+def test_group_message_with_reply_stores_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "seconded",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+            in_reply_to=reply_to,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert received[0]["in_reply_to"] == reply_to
+    entry = node.inbox.list_messages()[0]
+    assert entry["in_reply_to"] == reply_to
+
+
 def test_group_message_expired_is_dropped_unrecorded(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -1703,6 +1729,42 @@ def test_relayed_group_message_delivered_as_group(tmp_path):
     assert node.groups.get(group_id) is not None
 
 
+def test_relayed_group_message_with_reply_keeps_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    members = [own, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    blob = seal_message(
+        sender,
+        sender_name="bob",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="gm-relay-2",
+        text="seconded, via a holder",
+        sent_at=99.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": sender_hash,
+            "members": members,
+        },
+        in_reply_to=reply_to,
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert len(received) == 1
+    assert received[0]["in_reply_to"] == reply_to
+    assert received[0]["kind"] == "group"
+
+
 def test_relayed_group_message_with_forked_roster_rejected(tmp_path):
     """A sealed envelope cannot fork an id either: the relayed group
     is validated against the derived id before delivery."""
@@ -1902,6 +1964,62 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert len(third_records) == 1
     assert third_records[0]["id"] == by_to[THIRD_HASH]["id"]
     assert third_records[0]["id"] == queued[0].id
+
+
+def test_send_group_message_with_reply_carries_reference_on_every_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    result = node.send_group_message(group, "seconded", in_reply_to=reply_to)
+    assert result["ok"] is True
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["queued"] is True
+    # The delivered leg carries the reference on the wire.
+    assert len(calls) == 1
+    assert parse_group_message(calls[0][2])["in_reply_to"] == reply_to
+    # The queued leg keeps the reference in the outbox, so a retry
+    # re-sends the quote.
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 1
+    assert queued[0].in_reply_to == reply_to
+    # One inbox record per send — not one per leg — so a wide fan-out
+    # cannot evict sent DMs from the shared sent cap; the record
+    # carries every leg id, so any leg can still be quoted.
+    out_records = [
+        entry
+        for entry in node.inbox.export_document()["messages"]
+        if entry.get("direction") == "out"
+    ]
+    assert len(out_records) == 1
+    sent = out_records[0]
+    assert sent["kind"] == "group"
+    assert sent["group"] == group["id"]
+    assert sent["in_reply_to"] == reply_to
+    leg_ids = {leg["id"] for leg in result["results"]}
+    assert set(sent["leg_ids"]) == leg_ids
+    for leg_id in leg_ids:
+        found = node.inbox.find(leg_id, group=group["id"])
+        assert found is not None
+        assert found["leg_ids"] == sent["leg_ids"]
+    # Sent legs stay out of the received listing.
+    assert node.inbox.list_messages() == []
 
 
 def test_send_group_message_carries_expiry_to_legs_and_queue(tmp_path):
@@ -2398,6 +2516,36 @@ def test_deliver_entry_re_encodes_group_payload(tmp_path):
     assert seen[0][1]["text"] == "retry me"
     assert seen[0][1]["group"] == group["id"]
     assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deliver_entry_re_encodes_group_reply_reference(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="seconded",
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+        in_reply_to=reply_to,
+    )
+    seen = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        seen.append((path, parse_group_message(payload)))
+        return {"ok": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
+    assert len(seen) == 1
+    assert seen[0][1]["in_reply_to"] == reply_to
 
 
 def test_deliver_entry_keeps_group_message_expiry(tmp_path):
