@@ -5796,7 +5796,9 @@ class TauNode:
             )
         except MailboxError as exc:
             log.warning("Could not update sent edit: %s", exc)
-        return dict(response, id=edit_id)
+        # The signed edit time lets the console order this edit and tell
+        # whether the inbox copy already holds it (or a newer one).
+        return dict(response, id=edit_id, sent_at=float(payload["sent_at"]))
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""

@@ -40,6 +40,9 @@ export interface TauMessage {
   // Short hash of this message's text, for checking a reply's quoted
   // excerpt against it; see resolveQuote in message-feed.tsx.
   excerpt_hash?: string;
+  // Previous excerpt hashes, kept when the message is edited so
+  // replies that quoted it before the edit still resolve.
+  excerpt_hashes?: string[];
   // Quoted message reference: wire id + short excerpt hash of the text
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.

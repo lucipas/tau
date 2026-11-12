@@ -272,8 +272,11 @@ export function resolveQuote(
   if (candidates.length === 0) return "unavailable";
   let quoted = candidates[0];
   if (ref.excerpt) {
+    const excerpt = ref.excerpt;
     const verified = candidates.find(
-      (entry) => entry.excerpt_hash === ref.excerpt,
+      (entry) =>
+        entry.excerpt_hash === excerpt ||
+        entry.excerpt_hashes?.includes(excerpt),
     );
     if (verified) {
       quoted = verified;

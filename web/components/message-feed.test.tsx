@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { NodeInfo, TauMessage } from "@/lib/types";
 
-import { MessageFeed } from "./message-feed";
+import { MessageFeed, resolveQuote } from "./message-feed";
 
 // jsdom does not implement scrollIntoView, which the feed calls to
 // stick to the newest message.
@@ -614,5 +614,42 @@ describe("MessageFeed outbound status", () => {
 
     expect(screen.getByText("failed")).toBeTruthy();
     expect(screen.getByText("crew")).toBeTruthy();
+  });
+});
+
+describe("resolveQuote", () => {
+  it("resolves a reply through the pre-edit hash", () => {
+    // The sender edited the message after the reply quoted it: the
+    // entry's current hash is the new text's, but the old hash is kept.
+    const edited = makeMessage({
+      wire_id: "a".repeat(32),
+      text: "fixed here",
+      excerpt_hash: "newhash",
+      excerpt_hashes: ["oldhash"],
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "noted",
+      in_reply_to: { id: "a".repeat(32), excerpt: "oldhash" },
+    });
+    expect(resolveQuote([edited], reply)).toEqual({
+      name: "alice",
+      text: "fixed here",
+    });
+  });
+
+  it("still reports unavailable when no kept hash matches", () => {
+    const edited = makeMessage({
+      wire_id: "a".repeat(32),
+      text: "fixed here",
+      excerpt_hash: "newhash",
+      excerpt_hashes: ["oldhash"],
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "noted",
+      in_reply_to: { id: "a".repeat(32), excerpt: "otherhash" },
+    });
+    expect(resolveQuote([edited], reply)).toBe("unavailable");
   });
 });

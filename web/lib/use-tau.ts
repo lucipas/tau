@@ -92,6 +92,11 @@ function predatesForget(
   return cutoff !== undefined && peer.last_seen <= cutoff;
 }
 
+/** True when the held copy carries a newer edit than an incoming version. */
+function holdsNewerEdit(held: TauMessage, incoming: TauMessage): boolean {
+  return (held.edited_at ?? 0) > (incoming.edited_at ?? 0);
+}
+
 function readEventData<T>(event: Event): T | null {
   try {
     return JSON.parse((event as MessageEvent).data) as T;
@@ -199,6 +204,15 @@ export function useTau() {
 
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
+  // Set to the search runner once it is defined below, so edit handlers
+  // can re-run an active search and keep its hits in step with the text.
+  const runSearchRef = useRef<((trimmed: string) => Promise<void>) | null>(
+    null,
+  );
+  const refreshActiveSearch = useCallback(() => {
+    const query = searchQueryRef.current;
+    if (query) void runSearchRef.current?.(query);
+  }, []);
 
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -306,10 +320,16 @@ export function useTau() {
       liveTouched.current.set(message.id, ++liveEpoch.current);
       // A queued message that the mail sweep has since delivered: the
       // server re-sends the same console id with status "delivered".
-      // Replace it in place rather than appending a duplicate.
+      // Replace it in place rather than appending a duplicate.  A
+      // version older than the held edit (a late event) is ignored.
       setMessages((previous) =>
-        previous.map((entry) => (entry.id === message.id ? message : entry)),
+        previous.map((entry) =>
+          entry.id === message.id && !holdsNewerEdit(entry, message)
+            ? message
+            : entry,
+        ),
       );
+      if (message.edited_at !== undefined) refreshActiveSearch();
     };
 
     const onMessageDeleted = (event: Event) => {
@@ -411,7 +431,7 @@ export function useTau() {
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread, refreshGroups, refreshNode]);
+  }, [applyUnread, refreshGroups, refreshNode, refreshActiveSearch]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -646,15 +666,21 @@ export function useTau() {
     // peer had no copy the server reports edited false and leaves the
     // bubble alone — the caller says so instead of showing new text
     // one-sidedly.
-    if (result.edited && result.message) {
+    // A late response older than a version already received over the
+    // event stream must not rewind the bubble.
+    const edited = result.message;
+    if (result.edited && edited) {
       setMessages((previous) =>
         previous.map((entry) =>
-          entry.id === result.message?.id ? result.message : entry,
+          entry.id === edited.id && !holdsNewerEdit(entry, edited)
+            ? edited
+            : entry,
         ),
       );
+      refreshActiveSearch();
     }
     return result;
-  }, []);
+  }, [refreshActiveSearch]);
   const retryOutbox = useCallback(
     async (id?: string) => {
       const result = await apiPost<RetryOutboxResponse>(
@@ -1373,6 +1399,10 @@ export function useTau() {
       );
     }
   }, []);
+
+  useEffect(() => {
+    runSearchRef.current = runSearch;
+  }, [runSearch]);
 
   const search = useCallback(
     async (query: string) => {

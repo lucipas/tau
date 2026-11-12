@@ -173,6 +173,9 @@ MAX_MESSAGE_LOG = 500
 # Delivery reports buffered while their console record does not exist
 # yet (the flush can deliver before send_message records the send).
 MAX_EARLY_DELIVERIES = 128
+# Previous excerpt hashes kept per history entry, so a reply that quoted
+# a message before it was edited still resolves after the edit.
+MAX_EXCERPT_HASHES = 8
 # Wire ids removed from console history (by retraction or a console
 # delete), remembered so a delivery callback already in flight when
 # the removal landed cannot append the message back afterwards.
@@ -582,6 +585,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
     # after the UTF-8 check above, because hashing a lone surrogate
     # would raise instead of dropping the entry.
     message["excerpt_hash"] = excerpt_hash(text)
+    # Previous hashes, kept by edits so replies that quoted the message
+    # before an edit still resolve; only strings survive, capped.
+    hashes = entry.get("excerpt_hashes")
+    if isinstance(hashes, list):
+        kept = [item for item in hashes if isinstance(item, str) and item]
+        if kept:
+            message["excerpt_hashes"] = kept[-MAX_EXCERPT_HASHES:]
     return message
 
 
@@ -609,6 +619,38 @@ def _public_peer_info(response: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(lxmf, dict) and isinstance(lxmf.get("enabled"), bool):
         info["lxmf_enabled"] = lxmf["enabled"]
     return info
+
+
+def _apply_edit(message: Dict[str, Any], text: str, edited_at: float) -> bool:
+    """Apply an edit to one history entry unless it is not newer.
+
+    Returns ``False`` (leaving the entry alone) when the entry already
+    carries an edit at or after ``edited_at``.  The previous excerpt
+    hash is kept (capped) so replies that quoted the message before
+    the edit still resolve.
+    """
+    previous = message.get("edited_at")
+    if (
+        isinstance(previous, (int, float))
+        and not isinstance(previous, bool)
+        and edited_at <= float(previous)
+    ):
+        return False
+    previous_hash = message.get("excerpt_hash")
+    if isinstance(previous_hash, str) and previous_hash:
+        hashes = message.get("excerpt_hashes")
+        kept = (
+            [item for item in hashes if isinstance(item, str)]
+            if isinstance(hashes, list)
+            else []
+        )
+        if previous_hash not in kept:
+            kept.append(previous_hash)
+        message["excerpt_hashes"] = kept[-MAX_EXCERPT_HASHES:]
+    message["text"] = text
+    message["edited_at"] = edited_at
+    message["excerpt_hash"] = excerpt_hash(text)
+    return True
 
 
 class WebBridge:
@@ -742,6 +784,12 @@ class WebBridge:
         # Verified read receipts whose console record was not appended yet,
         # keyed by (reader, wire id); send_message reconciles them on append.
         self._early_reads: OrderedDict[Tuple[str, str], float] = OrderedDict()
+        # Inbound edits whose target entry was not appended yet, keyed by
+        # (sender, wire id) -> (text, edited_at); record_inbound applies
+        # them when the entry arrives instead of dropping the edit.
+        self._early_edits: OrderedDict[Tuple[str, str], Tuple[str, float]] = (
+            OrderedDict()
+        )
         # Receipt ids currently being dispatched, so overlapping triggers
         # (SSE reconnects, re-lists) do not send the same receipt twice.
         self._receipts_in_flight: Set[str] = set()
@@ -1048,6 +1096,16 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # An edit that overtook this callback was buffered by record_edit;
+        # apply it now so the appended entry shows the current text.
+        if isinstance(wire_id, str) and peer_hash:
+            with self._lock:
+                pending = self._early_edits.pop((peer_hash, wire_id), None)
+                applied = pending is not None and _apply_edit(
+                    message, pending[0], pending[1]
+                )
+            if applied:
+                self._save_messages()
         # A voided reaction the bridge never heard about can still be
         # seeded from the cache into a fresh entry; the roster filters
         # it here, as the snapshot read and the import publish do, so
@@ -1324,17 +1382,27 @@ class WebBridge:
     def record_edit(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply an edit to the console history entry it targets.
 
-        Edits name their target by wire id, like reactions.  The entry's
-        text is replaced and ``edited_at`` stamped, so the console shows
-        the new text with an edited marker; the excerpt hash is
-        recomputed from the new text so replies quoting it still verify.
-        A stale edit — one whose ``edited_at`` does not beat the entry's
-        — is dropped, so a replayed older edit cannot rewind a newer
-        one.  An edit whose target is not in this console's history
-        (sent from the CLI, or predating wire ids) is dropped: the node
-        inbox still keeps it, so ``tau messages`` shows it.  The updated
-        entry is re-sent as ``message_updated``, which the console
-        already renders in place.
+        Edits name their target by wire id, like reactions — and, like
+        reactions, by conversation side: an inbound edit (the default)
+        names the sender as ``destination`` and may only rewrite their
+        inbound entry; a local edit passes ``direction="out"`` and the
+        recipient, and rewrites only our own sent entry.  Matching by
+        wire id alone would let a peer reuse one of our ids and
+        overwrite a different message.  The entry's text is replaced
+        and ``edited_at`` stamped, so the console shows the new text
+        with an edited marker; the excerpt hash is recomputed from the
+        new text, and the previous hash is kept so replies that quoted
+        it before the edit still resolve.  A stale edit — one whose
+        ``edited_at`` does not beat the entry's — is dropped, so a
+        replayed older edit cannot rewind a newer one.  An edit whose
+        target is not in this console's history yet is buffered: the
+        edit can overtake the callback that appends its target, and
+        record_inbound applies the newest buffered edit when the entry
+        arrives instead of dropping it.  (An edit for a message this
+        console never shows — sent from the CLI, or predating wire ids
+        — still drops: the node inbox keeps it, so ``tau messages``
+        shows it.)  The updated entry is re-sent as ``message_updated``,
+        which the console already renders in place.
         """
         target = record.get("target")
         text = record.get("text")
@@ -1354,23 +1422,40 @@ class WebBridge:
             return None
         if not math.isfinite(edited_at):
             return None
+        # The edit is scoped to one conversation side: an inbound edit
+        # (the default) names the sender as ``destination`` and may only
+        # rewrite their inbound entry; a local edit passes
+        # ``direction="out"`` and the recipient, and rewrites only our
+        # own sent entry.
+        direction = record.get("direction", "in")
+        peer = record.get("destination")
+        if direction not in ("in", "out") or not isinstance(peer, str) or not peer:
+            return None
         updated: Optional[Dict[str, Any]] = None
         with self._lock:
             for message in self._messages:
-                if message.get("wire_id") != target:
-                    continue
-                previous = message.get("edited_at")
                 if (
-                    isinstance(previous, (int, float))
-                    and not isinstance(previous, bool)
-                    and edited_at <= float(previous)
+                    message.get("wire_id") != target
+                    or message.get("direction") != direction
+                    or message.get("peer") != peer
                 ):
+                    continue
+                if not _apply_edit(message, text, edited_at):
                     return None
-                message["text"] = text
-                message["edited_at"] = edited_at
-                message["excerpt_hash"] = excerpt_hash(text)
                 updated = dict(message)
                 break
+            if updated is None and direction == "in":
+                # The edit can overtake the callback that appends its
+                # target (the node stores the DM before calling back).
+                # Keep the newest such edit so record_inbound applies it
+                # when the entry arrives instead of dropping it.
+                key = (peer, target)
+                pending = self._early_edits.get(key)
+                if pending is None or edited_at > pending[1]:
+                    self._early_edits[key] = (text, edited_at)
+                    self._early_edits.move_to_end(key)
+                    while len(self._early_edits) > MAX_EARLY_DELIVERIES:
+                        self._early_edits.popitem(last=False)
         if updated is None:
             return None
         self._save_messages()
@@ -3139,24 +3224,41 @@ class WebBridge:
                 if isinstance(response.get("id"), str)
                 else None,
             }
-        edited_at = time.time()
+        # Order by the edit's signed time, not when this request finished,
+        # so two overlapping edits keep their send order.
+        signed_at = response.get("sent_at")
+        if isinstance(signed_at, (int, float)) and not isinstance(signed_at, bool):
+            edited_at = float(signed_at)
+        else:
+            edited_at = time.time()
         inbox = getattr(self.node, "inbox", None)
         if inbox is not None:
             try:
                 record = inbox.resolve(wire_id)
             except ValueError:
                 record = None
-            if record is not None and record.get("id") == wire_id:
-                if isinstance(record.get("text"), str):
-                    cleaned = record["text"]
-                raw_edited = record.get("edited_at")
-                if (
-                    isinstance(raw_edited, (int, float))
-                    and not isinstance(raw_edited, bool)
-                ):
-                    edited_at = float(raw_edited)
+            # The inbox copy speaks for the edit only when it holds this
+            # edit or a newer one.  Otherwise the local inbox write did
+            # not land, and the text we were given is the accepted version.
+            raw_edited = record.get("edited_at") if record is not None else None
+            if (
+                record is not None
+                and record.get("id") == wire_id
+                and isinstance(record.get("text"), str)
+                and isinstance(raw_edited, (int, float))
+                and not isinstance(raw_edited, bool)
+                and float(raw_edited) >= edited_at
+            ):
+                cleaned = record["text"]
+                edited_at = float(raw_edited)
         updated = self.record_edit(
-            {"target": wire_id, "text": cleaned, "edited_at": edited_at}
+            {
+                "target": wire_id,
+                "text": cleaned,
+                "edited_at": edited_at,
+                "direction": "out",
+                "destination": peer,
+            }
         )
         return {
             "ok": True,

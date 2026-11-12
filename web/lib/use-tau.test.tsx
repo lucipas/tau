@@ -793,6 +793,63 @@ describe("useTau editMessage", () => {
     expect(response?.edited).toBe(false);
     expect(result.current.messages).toEqual([original]);
   });
+
+  it("ignores a stale message_updated event", async () => {
+    const original = makeMessage({
+      id: 1,
+      direction: "out",
+      text: "fixed here",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+      edited_at: 2000,
+    });
+    const { result, source } = await renderWithPeer(makePeer(), [original]);
+    await waitFor(() => expect(result.current.messages).toEqual([original]));
+
+    // A late event carrying an older edit must not rewind the bubble.
+    const stale = { ...original, text: "older text", edited_at: 1000 };
+    act(() => {
+      source.emit("message_updated", { message: stale });
+    });
+    expect(result.current.messages).toEqual([original]);
+  });
+
+  it("re-runs an active search after an edit", async () => {
+    const original = makeMessage({
+      id: 1,
+      direction: "out",
+      text: "typo here",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+    });
+    const edited = { ...original, text: "fixed here", edited_at: 2000 };
+    const { result } = await renderWithPeer(makePeer(), [original]);
+    await waitFor(() => expect(result.current.messages).toEqual([original]));
+
+    mockedGet.mockResolvedValue({ messages: [original], count: 1 });
+    await act(async () => {
+      await result.current.search("typo");
+    });
+    expect(result.current.searchQuery).toBe("typo");
+    const searchCalls = () =>
+      mockedGet.mock.calls.filter(([path]) =>
+        String(path).includes("/api/messages/search"),
+      );
+    expect(searchCalls()).toHaveLength(1);
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      edited: true,
+      message: edited,
+      id: "edit-1",
+    });
+    mockedGet.mockResolvedValue({ messages: [edited], count: 1 });
+    await act(async () => {
+      await result.current.editMessage(1, "fixed here");
+    });
+    await waitFor(() => expect(searchCalls()).toHaveLength(2));
+    expect(result.current.searchResults).toEqual([edited]);
+  });
 });
 
 describe("useTau rename", () => {

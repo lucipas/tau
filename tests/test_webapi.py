@@ -7757,6 +7757,7 @@ def _stub_send_edit(node, *, edited=True, edited_at=200.0):
             "edited": edited,
             "received_at": 201.0,
             "id": "edit-1",
+            "sent_at": edited_at,
         }
 
     node.send_edit = send_edit
@@ -8085,6 +8086,128 @@ def test_edit_survives_bridge_restart(node, tmp_path):
         assert messages[0]["edited_at"] == 200.0
     finally:
         bridge2.stop()
+
+
+def test_edit_message_endpoint_adopts_a_newer_inbox_edit(bridge, node):
+    # A newer edit already landed in the inbox (e.g. the peer's own
+    # re-send raced this one): the console shows the newest text, not
+    # the older text this request carried.
+    message = _send_for_edit(bridge, node)
+    node.inbox.apply_edit(
+        message["wire_id"],
+        "newer text",
+        edited_at=250.0,
+        newer_than_existing=True,
+    )
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "newer text"
+    assert payload["message"]["edited_at"] == 250.0
+
+
+def test_edit_message_endpoint_uses_the_signed_time_without_an_inbox_copy(
+    bridge, node
+):
+    # The inbox record is gone (pruned since the send): the console
+    # still shows the edit, ordered by the edit's signed time.
+    message, _ = bridge.send_message("alice", "typo here")
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
+
+
+def test_record_edit_is_scoped_to_direction_and_peer(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    edit = {
+        "target": "wire-1",
+        "text": "fixed here",
+        "edited_at": 200.0,
+        "from": "alice",
+        "destination": PEER_HASH,
+    }
+    # A local edit (direction out) may not rewrite an inbound entry.
+    assert bridge.record_edit({**edit, "direction": "out"}) is None
+    # Neither may an edit naming a different peer, or no peer at all:
+    # a wire id alone must not let one peer rewrite another's message.
+    assert (
+        bridge.record_edit({**edit, "destination": "ff" * 16}) is None
+    )
+    assert bridge.record_edit({k: v for k, v in edit.items() if k != "destination"}) is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+    # The correctly scoped edit still lands.
+    assert bridge.record_edit(edit) is not None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+
+def test_record_edit_buffers_an_edit_for_a_message_not_yet_appended(bridge):
+    # The edit overtook the callback that appends its target: it is
+    # buffered, not dropped, and lands when the entry arrives.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-9",
+                "text": "fixed here",
+                "edited_at": 200.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    # An unrelated message does not consume the buffered edit.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "other",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-8",
+        }
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "other"
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-9",
+        }
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][1]["text"] == "fixed here"
+    assert feed["messages"][1]["edited_at"] == 200.0
 
 
 def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
