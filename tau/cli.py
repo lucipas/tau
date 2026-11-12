@@ -2821,14 +2821,43 @@ def cmd_tan_scheduled(args: argparse.Namespace) -> int:
 def cmd_tan_cancel_scheduled(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    deleted_local = False
+
+    def _delete_stored_post(post: Any) -> None:
+        # A publish attempt already stored the signed post locally
+        # (see publish_due_scheduled_posts): dropping only the queue
+        # entry would leave it in the local timeline.  Remove it with
+        # the same local-only delete `tau tan delete --no-publish`
+        # writes, so the cancelled post stops being served.  Peers
+        # that received a copy before the failure keep theirs — a
+        # local delete cannot retract what already went out.
+        nonlocal deleted_local
+        if post.post_hash is None:
+            return
+        app = TanApp(config, _tan_identity(config), name=config.name)
+        try:
+            app.delete(post.post_hash)
+        except TanError as exc:
+            if "has been deleted" not in str(exc):
+                raise NodeError(str(exc)) from exc
+        else:
+            deleted_local = True
+
     try:
-        post = cancel_scheduled_post(config.scheduled_posts_path, args.target)
+        post = cancel_scheduled_post(
+            config.scheduled_posts_path, args.target, on_cancel=_delete_stored_post
+        )
     except ScheduledPostsError as exc:
         raise NodeError(str(exc)) from exc
     if json_output:
-        _emit({"cancelled": post.to_dict()}, True)
+        _emit(
+            {"cancelled": post.to_dict(), "deleted_local": deleted_local},
+            True,
+        )
     else:
         print(f"cancelled {post.id} — it will not be published")
+        if deleted_local:
+            print("  also removed the stored post from the local feed")
     return _EXIT_OK
 
 

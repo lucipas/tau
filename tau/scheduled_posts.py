@@ -382,11 +382,25 @@ def schedule_post(
     return post
 
 
-def cancel_scheduled_post(path: Union[str, Path], prefix: str) -> ScheduledPost:
-    """Drop one queued post by full id or unique prefix; returns it."""
+def cancel_scheduled_post(
+    path: Union[str, Path],
+    prefix: str,
+    *,
+    on_cancel: Optional[Callable[[ScheduledPost], None]] = None,
+) -> ScheduledPost:
+    """Drop one queued post by full id or unique prefix; returns it.
+
+    When *on_cancel* is given it runs under the queue lock, after the
+    entry is resolved and before it is removed — so a mail-loop pass
+    cannot publish the post between the callback and the removal.
+    The callback is how the CLI deletes the locally stored post for
+    an entry whose publish already created one.
+    """
     with scheduled_posts_lock(path):
         queue = load_scheduled_posts(path)
         post = queue.resolve(prefix)
+        if on_cancel is not None:
+            on_cancel(post)
         save_scheduled_posts(path, queue.with_removed(post.id))
     return post
 

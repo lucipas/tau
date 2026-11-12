@@ -368,3 +368,67 @@ def test_cli_schedule_json_output(tmp_path, capsys):
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["scheduled"]["text"] == "hello json"
+
+
+def test_cancel_removes_stored_post_after_failed_publish(tmp_path, capsys):
+    # A publish attempt already stored the signed post locally; cancelling
+    # must remove that stored post too, not just the queue entry.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp, deleted_targets, init_db
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    assert _run_cli(data_dir, ["tan", "post", "--delay", "5m", "good morning"]) == 0
+    queue_path = data_dir / "scheduled-posts.json"
+    post = load_scheduled_posts(queue_path).posts[0]
+    config = TauConfig.resolve(data_dir=data_dir)
+
+    # A real TanApp whose only peer never answers: create_post stores
+    # the post locally, publish fails, the entry stays queued.
+    peer = SimpleNamespace(hexhash="d" * 64)
+
+    class _FailingNode:
+        registry = SimpleNamespace(all=lambda: [peer])
+
+        def request(self, *args, **kwargs):
+            raise RuntimeError("no route")
+
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+    app.node = _FailingNode()
+    result = publish_due_scheduled_posts(
+        queue_path, app, now=post.publish_at + 1.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    stored_hash = load_scheduled_posts(queue_path).posts[0].post_hash
+    assert stored_hash is not None
+
+    assert _run_cli(data_dir, ["tan", "cancel-scheduled", post.id]) == 0
+    assert "removed the stored post" in capsys.readouterr().out
+    assert len(load_scheduled_posts(queue_path)) == 0
+    conn = init_db(config.social_db_path)
+    try:
+        assert stored_hash in deleted_targets(conn)
+    finally:
+        conn.close()
+
+
+def test_cancel_tolerates_already_deleted_post(tmp_path):
+    # The stored post was already deleted by hand: cancelling the
+    # queue entry still succeeds instead of failing on the delete.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+    created = app.create_post("doomed post")
+    app.delete(created["hash"])
+
+    path = data_dir / "scheduled-posts.json"
+    entry = _post(post_hash=created["hash"], publish_at=2000.0)
+    save_scheduled_posts(path, ScheduledPosts(posts=(entry,)))
+    assert _run_cli(data_dir, ["tan", "cancel-scheduled", entry.id]) == 0
+    assert len(load_scheduled_posts(path)) == 0
