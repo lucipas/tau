@@ -2544,8 +2544,39 @@ def _print_pinned_posts(
         if post.get("deleted"):
             print("  (deleted post)")
             continue
-        for line in str(post.get("text", "")).splitlines() or [""]:
-            print(f"  {line}")
+        if post.get("kind") == "repost":
+            original = post.get("repost_of")
+            if isinstance(original, dict):
+                if original.get("deleted"):
+                    print("  reposted a deleted post")
+                else:
+                    print(
+                        f"  reposted {original.get('name') or 'anonymous'} "
+                        f"({short_hash(str(original.get('author', '')))}):"
+                    )
+                    for line in str(original.get("text") or "").splitlines() or [""]:
+                        print(f"  {line}")
+            else:
+                print(
+                    f"  reposted {short_hash(str(post.get('target', '')))}"
+                    " (original not cached yet)"
+                )
+        else:
+            for line in str(post.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("blocked"):
+                    print("  quoting a blocked author's post")
+                elif quoted.get("deleted"):
+                    print("  quoting a deleted post")
+                else:
+                    print(f"  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"    {line}")
+            else:
+                print(f"  quoting {short_hash(str(post.get('target', '')))}")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3617,6 +3648,7 @@ def cmd_tan_unpin(args: argparse.Namespace) -> int:
 def cmd_tan_pinned(args: argparse.Namespace) -> int:
     config = _make_config(args)
     json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
     conn = init_db(config.social_db_path)
     try:
         display_ruleset = load_ruleset(config.tan_rules_path)
@@ -3626,7 +3658,12 @@ def cmd_tan_pinned(args: argparse.Namespace) -> int:
         identity = load_identity(config.identity_path)
         viewer = destination_hash(identity).hex() if identity is not None else None
         posts, _ = annotated_pinned_posts(
-            conn, limit=args.limit, viewer=viewer, ruleset=display_ruleset
+            conn,
+            limit=args.limit,
+            viewer=viewer,
+            ruleset=display_ruleset,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
         )
     finally:
         conn.close()

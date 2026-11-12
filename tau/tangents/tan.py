@@ -3635,7 +3635,8 @@ def _resolve_saved_ref(conn: sqlite3.Connection, ref: str) -> str:
         except ValueError:
             raise TanError(f"unknown post: {ref!r}") from None
         rows = conn.execute(
-            "SELECT hash FROM posts WHERE kind IN ('post', 'reply') "
+            "SELECT hash FROM posts WHERE kind IN "
+            f"({TIMELINE_KINDS_SQL}) "
             "AND hash LIKE ? LIMIT 8",
             (value + "%",),
         ).fetchall()
@@ -3927,17 +3928,22 @@ def annotated_pinned_posts(
     offset: int = 0,
     viewer: Optional[str] = None,
     ruleset: Optional[Ruleset] = None,
+    exclude_authors: Optional[Sequence[str]] = None,
+    exclude_all: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
     """Pinned posts with the timeline's annotations and muting applied.
 
-    Reaction counts, reply parents, quote counts and quoted originals
-    are attached exactly as :func:`timeline` does: a reply parent or
-    quoted original from a muted author is redacted, and a parent
+    Reaction counts, edits, reply parents, quote counts, quoted
+    originals and repost originals are attached exactly as
+    :func:`timeline` does: a reply parent, quoted or repost original
+    from a muted or blocked author is redacted or dropped, and a parent
     matching a muted keyword has its text blanked.  Posts by muted
     authors or matching a muted keyword are dropped from the view —
     muting is display-only, so the pins stay stored and unmuting
-    restores them.  Each returned post carries ``pinned`` and
-    ``pinned_at``.
+    restores them.  ``exclude_authors`` hides blocked authors' words
+    the same way, and ``exclude_all`` hides everything when the
+    blocklist could not be read.  Each returned post carries ``pinned``
+    and ``pinned_at``.
 
     Returns ``(posts, next_offset)``: up to *limit* visible posts
     starting at raw offset *offset*, and the raw offset to resume
@@ -3947,7 +3953,10 @@ def annotated_pinned_posts(
     list is exhausted, so a caller must page with the returned
     ``next_offset``, not with the number of posts it received.
     """
+    if exclude_all:
+        return [], None
     silenced = muted_author_set(conn)
+    blocked = set(_clean_excluded(exclude_authors))
     keywords = _muted_keyword_list(conn)
     kept: List[Dict[str, Any]] = []
     raw_offset = max(0, int(offset))
@@ -3956,24 +3965,44 @@ def annotated_pinned_posts(
         if not batch:
             break
         raw_offset += len(batch)
-        batch = annotate_quotes(
+        batch = annotate_reposts(
             conn,
-            annotate_quote_counts(
+            annotate_repost_counts(
                 conn,
-                annotate_replies(
+                annotate_quotes(
                     conn,
-                    annotate_reactions(conn, batch, viewer=viewer),
+                    annotate_quote_counts(
+                        conn,
+                        annotate_replies(
+                            conn,
+                            annotate_edits(
+                                conn, annotate_reactions(conn, batch, viewer=viewer)
+                            ),
+                            muted_keywords=keywords,
+                            exclude_authors=silenced,
+                            blocked_authors=blocked,
+                        ),
+                    ),
                     muted_keywords=keywords,
                     exclude_authors=silenced,
+                    blocked_authors=blocked,
                 ),
+                viewer=viewer,
             ),
             muted_keywords=keywords,
             exclude_authors=silenced,
+            blocked_authors=blocked,
         )
-        annotate_repost_counts(conn, batch, viewer=viewer)
         for post in batch:
+            # Edits replace the stored text, so re-blank deleted entries.
+            if post.get("deleted"):
+                post["text"] = ""
             post["pinned"] = True
-        batch = [post for post in batch if post["author"] not in silenced]
+        batch = [
+            post
+            for post in batch
+            if post["author"] not in silenced and post["author"] not in blocked
+        ]
         batch = without_muted_keywords(conn, batch, keywords)
         if ruleset is not None:
             batch = apply_display_rules(batch, ruleset)
