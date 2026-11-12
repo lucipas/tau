@@ -2444,9 +2444,20 @@ class WebBridge:
             group = record.get("group") if record.get("kind") == "group" else None
             wire_id = record.get("id")
             # A file record has no text: describe it the way the live
-            # file arrival does, so the feed shows the same line.
+            # file arrival does, so the feed shows the same line.  The
+            # metadata rides along like the live path passes it, so the
+            # restored entry is a file entry everywhere — the download
+            # link, the forward guard, and the feed's forward button
+            # all see it, instead of forwarding a fake "Received file"
+            # line as a DM.
+            file_meta = None
             if record.get("kind") == "file":
                 text = file_arrival_text(record)
+                file_meta = {
+                    "name": record.get("name"),
+                    "size": record.get("size"),
+                    "sha256": record.get("sha256"),
+                }
             else:
                 text = str(record.get("text") or "")
             message = self._append_message(
@@ -2471,6 +2482,7 @@ class WebBridge:
                 ),
                 wire_id=wire_id if isinstance(wire_id, str) else None,
                 in_reply_to=record.get("in_reply_to"),
+                file=file_meta,
                 save=False,
             )
             appended.append(message)
@@ -6501,6 +6513,12 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except NodeError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except MailboxError as exc:
+            # A full outbox (or a failed queue write) surfaces with its
+            # message instead of a bare 500: the forward never went out,
+            # and the user can retry once the queue drains.
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         except OSError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)

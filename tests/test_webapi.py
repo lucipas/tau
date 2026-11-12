@@ -8252,6 +8252,83 @@ def test_forward_message_endpoint_rejects_unknown_and_bad_input(bridge, node):
     assert node.sent == []
 
 
+def test_forward_message_endpoint_rejects_restored_file_entry(bridge, node):
+    # Regression test for the Qodo review finding: a file restored
+    # from a backup used to arrive in the feed without its file
+    # metadata, so the forward guard passed it and the peer got a
+    # fake "Received file: ..." line as a DM.
+    bridge._mirror_imported_messages(
+        [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "kind": "file",
+                "name": "photo.jpg",
+                "size": 12,
+                "sha256": "ab" * 32,
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-file-1",
+            }
+        ]
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["file"] == {
+        "name": "photo.jpg",
+        "size": 12,
+        "sha256": "ab" * 32,
+    }
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "file transfers cannot be forwarded" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_forward_message_endpoint_reports_full_outbox(bridge, node):
+    from tau.mailbox import MailboxFull
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+
+    def send_message(peer, text, **kwargs):
+        raise MailboxFull("outbox is full (100 messages)")
+
+    node.send_message = send_message
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 503
+    assert "outbox is full" in payload["error"]["message"]
+
+
+def test_forward_message_endpoint_refuses_expired_disappearing_message(
+    bridge, node
+):
+    # The Qodo autofix refuses forwarding past the expiry: the text
+    # was meant to vanish, so forwarding it would resurrect it.
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    entry = bridge._messages[0]
+    entry["expires_at"] = time.time() - 1.0
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+    assert node.sent == []
+
+
 def test_retract_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     status, _, payload = _json(
         bridge, "/api/messages/retract", method="POST", body={"id": 7}
