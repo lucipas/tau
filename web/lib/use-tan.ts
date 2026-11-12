@@ -21,6 +21,7 @@ import type {
   TanRules,
   TanRulesResponse,
   TanRulesUpdateResponse,
+  TanPinnedResponse,
   TanSavedResponse,
   TanSuggestResponse,
   TanSuggestion,
@@ -34,6 +35,9 @@ const POLL_INTERVAL_MS = 5000;
 // cadence than the feed and stays off the feed's poll critical path.
 const SUGGEST_INTERVAL_MS = 60000;
 const SAVED_PAGE_SIZE = 100;
+// Pinned posts load the same way as saved ones. The shelf holds at
+// most 10 pins, so one page normally covers the whole list.
+const PINNED_PAGE_SIZE = 100;
 // Authors per directory page, matching the API's default limit.
 const AUTHORS_PAGE_SIZE = 50;
 
@@ -70,6 +74,9 @@ export function useTan() {
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
+  const [pinned, setPinned] = useState<TanPost[]>([]);
+  const [pinnedLoading, setPinnedLoading] = useState(false);
+  const [pinnedHasMore, setPinnedHasMore] = useState(false);
   const [all, setAll] = useState(false);
   // Which ranking the feed shows: the chronological timeline, or the
   // most-liked posts. The top view ignores the following/everything
@@ -563,20 +570,159 @@ export function useTan() {
     }
   }, [reloadSaved]);
 
+
+  // A save or pin has already committed when these refreshes run, so a
+  // refresh failure must not be reported as the action failing.
+  const runRefreshes = useCallback(async (refreshes: Promise<unknown>[]) => {
+    const results = await Promise.allSettled(refreshes);
+    if (results.some((result) => result.status === "rejected")) {
+      setError("the change was saved, but the view could not refresh");
+    }
+  }, []);
+
+  // Pinned posts change only through this client's pin/unpin actions
+  // (or the CLI), so they load on demand instead of on every poll tick,
+  // exactly like saved posts.
+  const pinnedRef = useRef(pinned);
+  useEffect(() => {
+    pinnedRef.current = pinned;
+  }, [pinned]);
+  // The raw offset to resume paging from, as returned by the API.
+  // Muted and hidden entries never shrink a page server-side, so the
+  // next offset must come from the response — the filtered list length
+  // would re-fetch rows already seen.
+  const pinnedNextOffsetRef = useRef<number | null>(null);
+  // Monotonic generation of pinned loads, mirroring the feed's: a newer
+  // load supersedes an older one, so a slow response cannot restore a
+  // post that was unpinned after it started.
+  const pinnedGenerationRef = useRef(0);
+  // Whether the pinned list has been loaded at least once. Actions
+  // refresh it only then, so a pin from the timeline does not pay for
+  // a list nobody has opened.
+  const pinnedLoadedRef = useRef(false);
+
+  const fetchPinnedPage = async (
+    offset: number,
+    limit: number = PINNED_PAGE_SIZE,
+  ) => {
+    return apiGet<TanPinnedResponse>(
+      `/api/tan/pinned?limit=${limit}&offset=${offset}`,
+    );
+  };
+
+  const loadPinned = useCallback(async () => {
+    const generation = ++pinnedGenerationRef.current;
+    setPinnedLoading(true);
+    try {
+      const result = await fetchPinnedPage(0);
+      if (pinnedGenerationRef.current !== generation) return;
+      setPinned(result.posts);
+      pinnedNextOffsetRef.current = result.next_offset;
+      setPinnedHasMore(result.next_offset !== null);
+      pinnedLoadedRef.current = true;
+    } finally {
+      if (pinnedGenerationRef.current === generation) {
+        setPinnedLoading(false);
+      }
+    }
+  }, []);
+
+  const loadMorePinned = useCallback(async () => {
+    const offset = pinnedNextOffsetRef.current;
+    if (offset === null) return;
+    const generation = ++pinnedGenerationRef.current;
+    setPinnedLoading(true);
+    try {
+      const result = await fetchPinnedPage(offset);
+      if (pinnedGenerationRef.current !== generation) return;
+      setPinned((previous) => [...previous, ...result.posts]);
+      pinnedNextOffsetRef.current = result.next_offset;
+      setPinnedHasMore(result.next_offset !== null);
+    } finally {
+      if (pinnedGenerationRef.current === generation) {
+        setPinnedLoading(false);
+      }
+    }
+  }, []);
+
+  // Re-read every page currently shown, paging with the server's
+  // offsets. A pin or unpin shifts the offsets behind the shown
+  // pages, so refreshing only the first page would leave the rest
+  // stale.
+  const reloadPinned = useCallback(async () => {
+    // An empty shelf still fetches its first page: a pin from another
+    // view may have added posts to it.
+    const shown = pinnedRef.current.length;
+    const wanted = shown === 0 ? PINNED_PAGE_SIZE : shown;
+    const generation = ++pinnedGenerationRef.current;
+    setPinnedLoading(true);
+    try {
+      const all: TanPost[] = [];
+      let offset: number | null = 0;
+      while (all.length < wanted && offset !== null) {
+        const result = await fetchPinnedPage(
+          offset,
+          Math.min(PINNED_PAGE_SIZE, wanted - all.length),
+        );
+        if (pinnedGenerationRef.current !== generation) return;
+        all.push(...result.posts);
+        offset = result.next_offset;
+      }
+      if (pinnedGenerationRef.current !== generation) return;
+      setPinned(all);
+      pinnedNextOffsetRef.current = offset;
+      setPinnedHasMore(offset !== null);
+    } finally {
+      if (pinnedGenerationRef.current === generation) {
+        setPinnedLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshPinnedIfLoaded = useCallback(async () => {
+    if (pinnedLoadedRef.current) {
+      await reloadPinned();
+    }
+  }, [reloadPinned]);
+
+  const pin = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/pin", { target });
+      await runRefreshes([
+        load(),
+        refreshPinnedIfLoaded(),
+        refreshSavedIfLoaded(),
+      ]);
+    },
+    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
+  );
+
+  const unpin = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unpin", { target });
+      await runRefreshes([
+        load(),
+        refreshPinnedIfLoaded(),
+        refreshSavedIfLoaded(),
+      ]);
+    },
+    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
+  );
+
   const save = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/save", { target });
-      await Promise.all([load(), reloadSaved()]);
+      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
     },
-    [load, reloadSaved],
+    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
   );
 
   const unsave = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unsave", { target });
-      await Promise.all([load(), reloadSaved()]);
+      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
     },
-    [load, reloadSaved],
+    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
   );
   const openThread = useCallback(
     async (ref: string) => {
@@ -728,26 +874,26 @@ export function useTan() {
       // audit exactly like a post does.
       invalidateVerify();
       await apiPost("/api/tan/like", { target });
-      await Promise.all([load(), refreshSavedIfLoaded()]);
+      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
   );
 
   const unlike = useCallback(
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/unlike", { target });
-      await Promise.all([load(), refreshSavedIfLoaded()]);
+      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
   );
 
   const repost = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/repost", { target });
-      await Promise.all([load(), refreshSavedIfLoaded()]);
+      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, refreshSavedIfLoaded, refreshPinnedIfLoaded],
   );
   // Who liked one post, newest like first. Fetched on demand when the
   // liker list is opened, not with the timeline, so the feed payload
@@ -763,9 +909,9 @@ export function useTan() {
     async (target: string) => {
       invalidateVerify();
       await apiPost("/api/tan/delete", { target });
-      await Promise.all([load(), refreshSavedIfLoaded()]);
+      await Promise.all([load(), refreshSavedIfLoaded(), refreshPinnedIfLoaded()]);
     },
-    [load, invalidateVerify, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded, refreshPinnedIfLoaded],
   );
 
   const editPost = useCallback(
@@ -892,6 +1038,13 @@ export function useTan() {
     loadMoreSaved,
     save,
     unsave,
+    pinned,
+    pinnedLoading,
+    pinnedHasMore,
+    loadPinned,
+    loadMorePinned,
+    pin,
+    unpin,
     all,
     setAll,
     view,

@@ -96,6 +96,9 @@ script) can read what arrives from the mesh and send messages back:
     GET  /api/tan/saved    saved posts, newest save first
     POST /api/tan/save     save a post to read later
     POST /api/tan/unsave   remove a post from the saved list
+    GET  /api/tan/pinned   pinned posts, newest pin first
+    POST /api/tan/pin      pin one of your own posts
+    POST /api/tan/unpin    remove a post from the pinned list
 
 If a static build of the Next.js console exists (``web/out``), it is served
 from the same origin.  Everything binds to loopback by default because anyone
@@ -1421,6 +1424,7 @@ class WebBridge:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
+            annotate_pinned,
             annotate_quote_counts,
             annotate_quotes,
             annotate_reactions,
@@ -1482,6 +1486,7 @@ class WebBridge:
                     exclude_all=exclude_all,
                 )
             annotate_saved(conn, posts)
+            annotate_pinned(conn, posts)
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1610,6 +1615,7 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             TanError,
+            annotate_pinned,
             apply_display_rules,
             resolve_author,
             search_posts,
@@ -1651,6 +1657,7 @@ class WebBridge:
                 )
             except TanError as exc:
                 raise RequestError(str(exc)) from exc
+            annotate_pinned(conn, posts)
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1672,7 +1679,12 @@ class WebBridge:
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import apply_display_rules, resolve_author, top_posts
+        from .tangents.tan import (
+            annotate_pinned,
+            apply_display_rules,
+            resolve_author,
+            top_posts,
+        )
 
         # Same block-list snapshot as the timeline: the console hides
         # posts by blocked authors, and a failed-closed list hides all.
@@ -1713,6 +1725,7 @@ class WebBridge:
                 ruleset=ruleset,
                 exclude_authors=blocked,
             )
+            annotate_pinned(conn, posts)
             return apply_display_rules(posts, ruleset)
         finally:
             conn.close()
@@ -2185,12 +2198,48 @@ class WebBridge:
         finally:
             conn.close()
 
+    def tan_pin(self, target: str) -> Dict[str, Any]:
+        # Pins are local-only: no signed entry and no gossip, so the
+        # social app is not needed — the same as `tau tan pin`.
+        from .identity import destination_hash, load_identity
+        from .tangents.tan import pin_post
+
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                owner = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                owner = (
+                    destination_hash(identity).hex()
+                    if identity is not None
+                    else None
+                )
+            if owner is None:
+                raise RequestError(
+                    "this node has no identity, so nothing of yours can be "
+                    "pinned; run `tau init` to create one"
+                )
+            return pin_post(conn, target, owner=owner)
+        finally:
+            conn.close()
+
+    def tan_unpin(self, target: str) -> Dict[str, Any]:
+        from .tangents.tan import unpin_post
+
+        conn = self._tan_conn()
+        try:
+            return unpin_post(conn, target)
+        finally:
+            conn.close()
+
     def tan_saved(
         self, *, limit: int = 30, offset: int = 0
     ) -> Dict[str, Any]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import annotated_saved_posts
+        from .tangents.tan import annotate_pinned, annotated_saved_posts
 
         conn = self._tan_conn()
         try:
@@ -2214,6 +2263,58 @@ class WebBridge:
             posts, next_offset = annotated_saved_posts(
                 conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
             )
+            annotate_pinned(conn, posts)
+            return {"posts": posts, "next_offset": next_offset}
+        finally:
+            conn.close()
+
+    def tan_pinned(
+        self, *, limit: int = 30, offset: int = 0
+    ) -> Dict[str, Any]:
+        """Pinned posts, newest pin first, with the timeline's annotations.
+
+        Mirrors :func:`tau.cli.cmd_tan_pinned`: the same selection and
+        visibility rules, so the console shows exactly what the CLI
+        shows for the same store — including the node's block-list,
+        which hides blocked authors' posts here the same way the
+        timeline hides them.
+        """
+        from .identity import destination_hash, load_identity
+        from .tangents.rules import RulesError, Ruleset, load_ruleset
+        from .tangents.tan import annotate_saved, annotated_pinned_posts
+
+        blocklist = getattr(self.node, "blocklist", None)
+        blocked = blocklist.blocked if blocklist is not None else frozenset()
+        exclude_all = bool(blocklist is not None and blocklist.block_all)
+        conn = self._tan_conn()
+        try:
+            app = self._tan_app()
+            if app is not None:
+                viewer = app.author
+            else:
+                identity = load_identity(self.node.config.identity_path)
+                viewer = (
+                    destination_hash(identity).hex() if identity is not None else None
+                )
+            if app is not None:
+                ruleset = app.ruleset
+            else:
+                try:
+                    ruleset = load_ruleset(
+                        getattr(self.node.config, "tan_rules_path", None)
+                    )
+                except RulesError:
+                    ruleset = Ruleset()
+            posts, next_offset = annotated_pinned_posts(
+                conn,
+                limit=limit,
+                offset=offset,
+                viewer=viewer,
+                ruleset=ruleset,
+                exclude_authors=blocked,
+                exclude_all=exclude_all,
+            )
+            annotate_saved(conn, posts)
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
@@ -5327,6 +5428,33 @@ class _WebHandler(BaseHTTPRequestHandler):
                     head_only,
                 )
                 return
+            if path == "/api/tan/pinned":
+                limit = _int_param(query, "limit", default=30, minimum=1, maximum=200)
+                offset = _int_param(
+                    query, "offset", default=0, minimum=0, maximum=100000
+                )
+                try:
+                    result = self.bridge.tan_pinned(limit=limit, offset=offset)
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to load pinned Tan posts")
+                    self._send_json(
+                        {"error": {"message": "could not load pinned posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json(
+                    {
+                        "posts": result["posts"],
+                        "count": len(result["posts"]),
+                        "next_offset": result["next_offset"],
+                    },
+                    head_only,
+                )
+                return
             if path == "/api/tan/posts":
                 limit = _int_param(query, "limit", default=100, minimum=1, maximum=500)
                 posts = self.bridge.tan_posts(limit=limit)
@@ -5914,6 +6042,36 @@ class _WebHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self._send_json({"ok": True, "save": result}, head_only)
+                return
+            if path in ("/api/tan/pin", "/api/tan/unpin"):
+                target = body.get("target") or body.get("hash")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'target' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    if path.endswith("unpin"):
+                        result = self.bridge.tan_unpin(target.strip())
+                    else:
+                        result = self.bridge.tan_pin(target.strip())
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except ValueError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except Exception:
+                    log.exception("failed to update a pinned Tan post")
+                    self._send_json(
+                        {"error": {"message": "could not update pinned posts"}},
+                        head_only,
+                        500,
+                    )
+                    return
+                self._send_json({"ok": True, "pin": result}, head_only)
                 return
             if path == "/api/tan/sync":
                 try:
