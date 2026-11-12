@@ -1831,8 +1831,13 @@ class TauNode:
         duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
             target_id = reaction["target"]
+            try:
+                resolved = self.inbox.resolve(target_id)
+            except ValueError:
+                resolved = None
             if (
-                reaction.get("group") is not None
+                resolved is None
+                and reaction.get("group") is not None
                 and reaction.get("target_author") is not None
                 and reaction.get("target_sent_at") is not None
             ):
@@ -1847,41 +1852,59 @@ class TauNode:
                 # send time and cannot resolve; the reaction is still
                 # stored under the wire target, and shows for the
                 # author, exactly as before.
+                # The signed context names the logical message, but
+                # a valid signature only proves who chose the
+                # context, not that they belong to the group: an
+                # allow-listed outsider who learned a group id,
+                # author and send time could otherwise sign a
+                # reaction onto a message in a group they never
+                # joined.  The pinned roster is the trusted
+                # membership list — a group message pins it on
+                # arrival — so a reactor the roster does not name
+                # is refused here.  No roster is pinned yet when
+                # the reaction outruns the message; that reaction
+                # is stored with its context and can only surface
+                # through reconciliation when the message arrives,
+                # which checks the roster then.
                 try:
-                    self.inbox.resolve(target_id)
+                    pinned = self.groups.find(reaction["group"])
                 except ValueError:
-                    # The signed context names the logical message, but
-                    # a valid signature only proves who chose the
-                    # context, not that they belong to the group: an
-                    # allow-listed outsider who learned a group id,
-                    # author and send time could otherwise sign a
-                    # reaction onto a message in a group they never
-                    # joined.  The pinned roster is the trusted
-                    # membership list — a group message pins it on
-                    # arrival — so a reactor the roster does not name
-                    # is refused here.  No roster is pinned yet when
-                    # the reaction outruns the message; that reaction
-                    # is stored with its context and can only surface
-                    # through reconciliation when the message arrives,
-                    # which checks the roster then.
-                    try:
-                        pinned = self.groups.find(reaction["group"])
-                    except ValueError:
-                        pinned = None
-                    if pinned is not None and caller_hash not in (
-                        pinned.get("members") or []
-                    ):
-                        return response_error(
-                            "not_a_member",
-                            "sender is not a group member",
-                        )
-                    local = self.inbox.find_group_message(
-                        reaction["group"],
-                        reaction["target_author"],
-                        reaction["target_sent_at"],
+                    pinned = None
+                if pinned is not None and caller_hash not in (
+                    pinned.get("members") or []
+                ):
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
                     )
-                    if local is not None:
-                        target_id = str(local["id"])
+                local = self.inbox.find_group_message(
+                    reaction["group"],
+                    reaction["target_author"],
+                    reaction["target_sent_at"],
+                )
+                if local is not None:
+                    target_id = str(local["id"])
+                    resolved = local
+            if resolved is not None and resolved.get("kind") == "group":
+                # A resolved target bypasses the context check above,
+                # so check the roster here too: an allow-listed
+                # non-member naming a known local group-message id
+                # must not get their reaction stored or displayed —
+                # including reactions that carry no group context.
+                # No roster is pinned (group deleted, or message
+                # imported without one): there is nothing to check
+                # against, the same residual as the context path.
+                try:
+                    pinned = self.groups.find(resolved["group"])
+                except ValueError:
+                    pinned = None
+                if pinned is not None and caller_hash not in (
+                    pinned.get("members") or []
+                ):
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
             record = {
                 "target": target_id,
                 "reaction": reaction["reaction"],
@@ -1909,6 +1932,43 @@ class TauNode:
                 return response_error(
                     "storage_failed", f"could not store reaction: {exc}"
                 )
+            if resolved is None and reaction.get("group") is not None:
+                # The lookup above can race the message's arrival:
+                # the copy may have landed after find_group_message
+                # missed it but before this reaction was stored, and
+                # the message handler's reconcile already ran — so
+                # neither handler would move it again.  Recheck once:
+                # if the copy is here now, move the reaction onto it
+                # here.  Either order is now covered — a store before
+                # the message handler's reconcile is caught there, a
+                # store after it is caught here.  A failed recheck
+                # never breaks the acknowledged delivery; the reaction
+                # stays stored under the foreign id, as before.
+                local = self.inbox.find_group_message(
+                    reaction["group"],
+                    reaction["target_author"],
+                    reaction["target_sent_at"],
+                )
+                if local is not None:
+                    try:
+                        pinned = self.groups.find(reaction["group"])
+                    except ValueError:
+                        pinned = None
+                    if pinned is not None:
+                        try:
+                            self.inbox.reconcile_group_reactions(
+                                reaction["group"],
+                                reaction["target_author"],
+                                reaction["target_sent_at"],
+                                str(local["id"]),
+                                members=set(pinned.get("members") or []),
+                            )
+                        except Exception:  # pragma: no cover - storage failure
+                            log.warning(
+                                "Could not reconcile group reaction for %s",
+                                reaction["target"][:8],
+                                exc_info=True,
+                            )
             if seen_key:
                 self.mailbox.mark_seen(seen_key)
             log.info(

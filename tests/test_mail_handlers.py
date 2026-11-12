@@ -1301,6 +1301,113 @@ def test_group_reaction_not_reconciled_for_non_member(tmp_path):
     assert len(node.inbox.reactions_for("other-leg-1")) == 1
 
 
+def test_group_reaction_to_known_id_checked_for_non_member(tmp_path):
+    # CodeRabbit Major (node.py:1874): the roster check ran only when
+    # the target id did not resolve — an allow-listed non-member
+    # naming a known local group-message id directly, with no group
+    # context, slipped past it.  The resolved message's roster is
+    # checked too now.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_to_known_id_accepted_for_member(tmp_path):
+    # The same direct reaction, from a reactor the roster names, is
+    # stored under the message as before.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_rechecks_after_storing_unresolved(tmp_path, monkeypatch):
+    # CodeRabbit Major (node.py:1648): the reaction's lookup can race
+    # the message's arrival — the copy lands after find_group_message
+    # misses it but before the reaction is stored, and the message
+    # handler's reconcile already ran.  The handler rechecks once
+    # after storing, so the reaction still lands on the copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    real_find = node.inbox.find_group_message
+    calls = {"n": 0}
+
+    def _miss_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_find(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "find_group_message", _miss_once)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("other-leg-1") == []
+    stored = node.inbox.reactions_for("local-copy-1")
+    assert len(stored) == 1
+    assert stored[0]["reaction"] == "👍"
+
+
 def test_reaction_denied_by_allow_list(tmp_path):
     from tau.allowlist import AllowList, save_allowlist
 
