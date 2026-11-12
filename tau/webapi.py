@@ -536,6 +536,19 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         if not math.isfinite(expires_at):
             return None
         message["expires_at"] = expires_at
+    send_after = entry.get("send_after")
+    if send_after is not None:
+        # A scheduled DM still queued across a restart keeps its
+        # "sends in ..." label; the outbox retains the real deadline.
+        if isinstance(send_after, bool) or not isinstance(send_after, (int, float)):
+            return None
+        try:
+            send_after = float(send_after)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(send_after):
+            return None
+        message["send_after"] = send_after
     rtt_ms = entry.get("rtt_ms")
     if isinstance(rtt_ms, (int, float)) and not isinstance(rtt_ms, bool):
         message["rtt_ms"] = rtt_ms
@@ -2936,7 +2949,11 @@ class WebBridge:
                 raise ValueError("send_after must be a finite number")
             now = time.time()
             if send_after <= now:
-                raise ValueError("send_after must be in the future")
+                # A short relative delay (send_in) can elapse between the
+                # handler computing its deadline and this check. It is due
+                # now, so it takes the immediate-delivery path.
+                send_after = None
+        if send_after is not None:
             if send_after > now + MAX_MAIL_TTL - 3600.0:
                 raise ValueError(
                     "send_after must be at most 29d23h from now (the 30d "
@@ -3898,7 +3915,32 @@ class WebBridge:
                 raise MailboxError(
                     f"queued message {target.strip()!r} is no longer queued"
                 )
-            return self._describe_outbox_entry(entry)
+            described = self._describe_outbox_entry(entry)
+        self._clear_scheduled_mark(entry.id)
+        return described
+
+    def _clear_scheduled_mark(self, mail_id: str) -> None:
+        """Drop the "sends in ..." mark from console entries for a cancelled send.
+
+        The cancelled entry stays in the console history as a queued
+        message; without this it would keep counting down to a send
+        that no longer exists. Other tabs learn through the same
+        ``message_updated`` event an edit uses.
+        """
+        updated = []
+        with self._lock:
+            for message in self._messages:
+                if (
+                    message.get("direction") == "out"
+                    and message.get("mail_id") == mail_id
+                    and message.get("send_after") is not None
+                ):
+                    message.pop("send_after", None)
+                    updated.append(dict(message))
+            if updated:
+                self._save_messages()
+        for message in updated:
+            self._publish_message_updated(message)
 
     def doctor(self) -> Dict[str, Any]:
         """Health verdicts for this node's data directory.
