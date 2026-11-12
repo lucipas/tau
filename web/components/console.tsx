@@ -256,6 +256,10 @@ export function Console() {
               onDelete={async (message) => {
                 await tau.deleteMessage(message.id);
               }}
+              onEdit={async (message, text) => {
+                const result = await tau.editMessage(message.id, text);
+                return result.edited;
+              }}
               onRetract={async (message) => {
                 await tau.retractMessage(message.id);
               }}

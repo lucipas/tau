@@ -21,6 +21,8 @@ export interface TauMessage {
   rtt_ms?: number;
   // Unix time the recipient read this outbound message, when known.
   read_at?: number;
+  // Unix time the message text was last edited, when it has been.
+  edited_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
   // Group DM context, present on group messages (inbound, and
@@ -42,6 +44,9 @@ export interface TauMessage {
   // Short hash of this message's text, for checking a reply's quoted
   // excerpt against it; see resolveQuote in message-feed.tsx.
   excerpt_hash?: string;
+  // Previous excerpt hashes, kept when the message is edited so
+  // replies that quoted it before the edit still resolve.
+  excerpt_hashes?: string[];
   // Quoted message reference: wire id + short excerpt hash of the text
   // the sender quoted. The quote is rendered from local history only;
   // see resolveQuote in message-feed.tsx.
@@ -358,6 +363,18 @@ export interface DeleteMessageResponse {
   deleted: { id: number; wire_id?: string | null };
 }
 
+export interface EditMessageResponse {
+  ok: boolean;
+  // Whether the peer applied the edit; false (peer had no copy, or a
+  // newer edit already landed) is not an error, and the local copy is
+  // left alone in that case.
+  edited: boolean;
+  // The updated console entry, when it is in this console's history.
+  message?: TauMessage | null;
+  // The edit's own wire id, when the peer answered one.
+  id?: string | null;
+}
+
 export interface RetractMessageResponse {
   ok: boolean;
   retracted: { id: number; wire_id?: string | null };
@@ -380,6 +397,7 @@ export interface UnpinMessageResponse {
   ok: boolean;
   unpinned: { id: number; wire_id: string; was_pinned: boolean };
 }
+
 export interface RetryOutboxResponse {
   ok: boolean;
   delivered: number;

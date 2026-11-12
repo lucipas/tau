@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { API_BASE } from "@/lib/api";
+import { MAX_MESSAGE_CHARS } from "@/lib/constants";
 import type { NodeInfo, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
@@ -24,6 +25,7 @@ export function MessageFeed({
   live,
   onReply,
   onDelete,
+  onEdit,
   onRetract,
   onReact,
   onPin,
@@ -43,6 +45,9 @@ export function MessageFeed({
   live: boolean;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
+  // Resolves true when the edit landed on both sides; false keeps the
+  // editor open (the peer had no copy, or a newer edit landed).
+  onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
   // `reaction` null retracts the caller's reaction to the message.
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
@@ -225,6 +230,7 @@ export function MessageFeed({
               node={node}
               onReply={onReply}
               onDelete={onDelete}
+              onEdit={onEdit}
               onRetract={onRetract}
               onReact={onReact}
               onPin={onPin}
@@ -330,8 +336,11 @@ export function resolveQuote(
   if (candidates.length === 0) return "unavailable";
   let quoted = candidates[0];
   if (ref.excerpt) {
+    const excerpt = ref.excerpt;
     const verified = candidates.find(
-      (entry) => entry.excerpt_hash === ref.excerpt,
+      (entry) =>
+        entry.excerpt_hash === excerpt ||
+        entry.excerpt_hashes?.includes(excerpt),
     );
     if (verified) {
       quoted = verified;
@@ -351,6 +360,7 @@ function MessageBubble({
   node,
   onReply,
   onDelete,
+  onEdit,
   onRetract,
   onReact,
   onPin,
@@ -360,6 +370,7 @@ function MessageBubble({
   node: NodeInfo | null;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
+  onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
@@ -388,6 +399,32 @@ function MessageBubble({
       setConfirmingDelete(false);
     } finally {
       setDeleting(false);
+    }
+  }
+
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  async function submitEditForm() {
+    if (savingEdit || !onEdit) return;
+    setSavingEdit(true);
+    setEditError(null);
+    try {
+      const applied = await onEdit(message, editText.trim());
+      if (applied) {
+        setEditing(false);
+      } else {
+        // The peer had no copy (or a newer edit landed): the local
+        // text stays as it was, so say so and keep the editor open
+        // to retry.
+        setEditError("the peer no longer has this message");
+      }
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : "edit failed");
+    } finally {
+      setSavingEdit(false);
     }
   }
 
@@ -534,7 +571,59 @@ function MessageBubble({
               )}
             </span>
           ) : null}
-          {message.text}
+          {editing ? (
+            <span className="block">
+              <textarea
+                value={editText}
+                disabled={savingEdit}
+                // Code-point-aware cap: the backend counts Python code
+                // points (len), while slice/maxLength count UTF-16 units,
+                // so a plain slice would silently drop emoji from a valid
+                // existing message on the first keystroke.
+                onChange={(event) =>
+                  setEditText(
+                    [...event.target.value]
+                      .slice(0, MAX_MESSAGE_CHARS)
+                      .join(""),
+                  )
+                }
+                rows={3}
+                aria-label="Edit message text"
+                className="w-full resize-y rounded-lg border border-line/70 bg-void/60 px-2.5 py-2 text-[13px] leading-relaxed text-zinc-200 outline-none focus:border-signal/50"
+              />
+              <span className="mt-2 flex gap-2 font-mono text-[10px]">
+                <button
+                  type="button"
+                  disabled={
+                    savingEdit ||
+                    !editText.trim() ||
+                    editText.trim() === message.text
+                  }
+                  onClick={() => void submitEditForm()}
+                  title="Save this edit"
+                  className="rounded border border-signal/40 bg-signal/10 px-1.5 py-0.5 text-signal transition-colors hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {savingEdit ? "saving…" : "save"}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingEdit}
+                  onClick={() => setEditing(false)}
+                  title="Discard this edit"
+                  className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 text-mist/80 transition-colors hover:text-zinc-100 disabled:opacity-50"
+                >
+                  cancel
+                </button>
+              </span>
+              {editError ? (
+                <span className="mt-1 block font-mono text-[10px] text-rose-300">
+                  {editError}
+                </span>
+              ) : null}
+            </span>
+          ) : (
+            message.text
+          )}
         </div>
 
         {message.file ? (
@@ -600,6 +689,7 @@ function MessageBubble({
                     : "delivered"
               : "received"}
           </span>
+          {message.edited_at !== undefined ? <span>· edited</span> : null}
           {message.rtt_ms !== undefined ? (
             <span>· rtt {formatRtt(message.rtt_ms)}</span>
           ) : null}
@@ -649,6 +739,26 @@ function MessageBubble({
           ) : null}
           {deleteError ? (
             <span className="text-rose-300">{deleteError}</span>
+          ) : null}
+          {onEdit &&
+          outbound &&
+          !message.group &&
+          !message.file &&
+          message.wire_id &&
+          message.status !== "queued" &&
+          !editing ? (
+            <button
+              type="button"
+              title="Edit this message"
+              onClick={() => {
+                setEditText(message.text);
+                setEditError(null);
+                setEditing(true);
+              }}
+              className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+            >
+              edit
+            </button>
           ) : null}
           {onRetract &&
           outbound &&

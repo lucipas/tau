@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { NodeInfo, TauMessage } from "@/lib/types";
 
-import { MessageFeed } from "./message-feed";
+import { MessageFeed, resolveQuote } from "./message-feed";
 
 // jsdom does not implement scrollIntoView, which the feed calls to
 // stick to the newest message.
@@ -132,6 +132,202 @@ describe("MessageFeed delete", () => {
     expect(screen.queryByTitle("Delete this message")).toBeNull();
   });
 });
+
+describe("MessageFeed edit", () => {
+  const sent = (overrides: Partial<TauMessage> = {}) =>
+    makeMessage({
+      direction: "out",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+      ...overrides,
+    });
+
+  it("shows no edit button without an onEdit handler", () => {
+    render(<MessageFeed messages={[sent()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Edit this message")).toBeNull();
+  });
+
+  it("shows the edit button only on your own sent DMs", () => {
+    const onEdit = vi.fn(async () => true);
+    const { rerender } = render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    // A received message is the sender's to edit, not this node's.
+    expect(screen.queryByTitle("Edit this message")).toBeNull();
+
+    // Group, file, queued, and wire-id-less sent messages cannot be
+    // edited from the console either.
+    rerender(
+      <MessageFeed
+        messages={[sent({ group: "crew", group_name: "crew" })]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    expect(screen.queryByTitle("Edit this message")).toBeNull();
+    rerender(
+      <MessageFeed
+        messages={[sent({ status: "queued" })]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    expect(screen.queryByTitle("Edit this message")).toBeNull();
+    rerender(
+      <MessageFeed
+        messages={[sent({ wire_id: undefined })]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    expect(screen.queryByTitle("Edit this message")).toBeNull();
+  });
+
+  it("opens an editor prefilled with the text and saves through onEdit", async () => {
+    const message = sent();
+    const onEdit = vi.fn(async () => true);
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    const editor = screen.getByLabelText(
+      "Edit message text",
+    ) as HTMLTextAreaElement;
+    expect(editor.value).toBe("hello");
+    fireEvent.change(editor, { target: { value: "fixed here" } });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(onEdit).toHaveBeenCalledWith(message, "fixed here");
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Edit message text")).toBeNull(),
+    );
+  });
+
+  it("keeps the editor open when the peer had no copy", async () => {
+    const onEdit = vi.fn(async () => false);
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    fireEvent.change(screen.getByLabelText("Edit message text"), {
+      target: { value: "fixed here" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(
+      await screen.findByText("the peer no longer has this message"),
+    ).toBeTruthy();
+    expect(screen.getByLabelText("Edit message text")).toBeTruthy();
+  });
+
+  it("reports a failed edit inline and keeps the editor open", async () => {
+    const onEdit = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    fireEvent.change(screen.getByLabelText("Edit message text"), {
+      target: { value: "fixed here" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(await screen.findByText("boom")).toBeTruthy();
+    expect(screen.getByLabelText("Edit message text")).toBeTruthy();
+  });
+
+  it("disables save when the text is unchanged or empty", () => {
+    const onEdit = vi.fn(async () => true);
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    const save = screen.getByText("save") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Edit message text"), {
+      target: { value: "   " },
+    });
+    expect(save.disabled).toBe(true);
+  });
+
+  it("discards the edit on cancel", () => {
+    const onEdit = vi.fn(async () => true);
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    fireEvent.change(screen.getByLabelText("Edit message text"), {
+      target: { value: "fixed here" },
+    });
+    fireEvent.click(screen.getByText("cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Edit message text")).toBeNull();
+    expect(screen.getByText("hello")).toBeTruthy();
+  });
+
+  it("shows an edited marker on edited messages", () => {
+    const onEdit = vi.fn(async () => true);
+    const { rerender } = render(
+      <MessageFeed
+        messages={[sent({ edited_at: 2000 })]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    expect(screen.getByText("· edited")).toBeTruthy();
+    rerender(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onEdit={onEdit}
+      />,
+    );
+    expect(screen.queryByText("· edited")).toBeNull();
+  });
+});
+
 
 describe("MessageFeed retract", () => {
   const sent = (overrides: Partial<TauMessage> = {}) =>
@@ -278,6 +474,7 @@ describe("MessageFeed retract", () => {
     expect(screen.queryByTitle("Retract this message")).toBeNull();
   });
 });
+
 
 describe("MessageFeed react picker", () => {
   const NODE: NodeInfo = {
@@ -565,6 +762,43 @@ describe("MessageFeed outbound status", () => {
 
     expect(screen.getByText("failed")).toBeTruthy();
     expect(screen.getByText("crew")).toBeTruthy();
+  });
+});
+
+describe("resolveQuote", () => {
+  it("resolves a reply through the pre-edit hash", () => {
+    // The sender edited the message after the reply quoted it: the
+    // entry's current hash is the new text's, but the old hash is kept.
+    const edited = makeMessage({
+      wire_id: "a".repeat(32),
+      text: "fixed here",
+      excerpt_hash: "newhash",
+      excerpt_hashes: ["oldhash"],
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "noted",
+      in_reply_to: { id: "a".repeat(32), excerpt: "oldhash" },
+    });
+    expect(resolveQuote([edited], reply)).toEqual({
+      name: "alice",
+      text: "fixed here",
+    });
+  });
+
+  it("still reports unavailable when no kept hash matches", () => {
+    const edited = makeMessage({
+      wire_id: "a".repeat(32),
+      text: "fixed here",
+      excerpt_hash: "newhash",
+      excerpt_hashes: ["oldhash"],
+    });
+    const reply = makeMessage({
+      id: 2,
+      text: "noted",
+      in_reply_to: { id: "a".repeat(32), excerpt: "otherhash" },
+    });
+    expect(resolveQuote([edited], reply)).toBe("unavailable");
   });
 });
 
