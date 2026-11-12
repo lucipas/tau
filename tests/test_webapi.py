@@ -6794,6 +6794,109 @@ def test_group_message_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_imported_group_message_event_hides_non_member_reaction(node, tmp_path):
+    """A live import event never carries a non-member's reaction
+    (CodeRabbit round-12 follow-up).
+
+    Ordering: a no-context reaction arrives before its target, so
+    both lookups miss and the console caches it; the group message
+    is then imported, which seeds the entry from that cache and
+    publishes it live.  The roster is pinned throughout, so the
+    import event must drop the non-member reaction while keeping a
+    member's.  The snapshot read hides it too.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        # The reaction arrives before its target: no history entry
+        # matches, so nothing is published, but the console caches it.
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": OTHER_HASH,
+                    "from": "mallory",
+                    "reaction": "👎",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-1",
+                }
+            )
+            is None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-2",
+                }
+            )
+            is None
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": OTHER_HASH,
+                "from": "mallory",
+                "reaction": "👎",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        bridge._mirror_imported_messages(
+            [
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            ]
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-g1"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {

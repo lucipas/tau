@@ -2337,7 +2337,26 @@ class WebBridge:
         # the restored entries the same way, in feed order. Blocked
         # senders stay hidden like the messages API hides them: the
         # record is kept for unblocking, but no event shows it.
+        # A reaction cached before its target arrived — stored when
+        # both lookups missed — is seeded into the entry by
+        # _append_message; on a group message it may name a reactor
+        # who is not on the pinned roster, so the roster filters it
+        # here, before the event is published.  (The snapshot read in
+        # messages() filters the same way; the live event bypasses
+        # that read, so it needs its own filter.)
         blocklist = getattr(self.node, "blocklist", None)
+        groups = getattr(self.node, "groups", None)
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None:
+            rosters = pinned_rosters(
+                groups,
+                {
+                    str(message.get("group"))
+                    for message in appended
+                    if isinstance(message.get("group"), str)
+                    and message.get("group")
+                },
+            )
         for message in appended:
             if (
                 message.get("direction") == "in"
@@ -2347,6 +2366,16 @@ class WebBridge:
                 )
             ):
                 continue
+            group_id = message.get("group")
+            if (
+                isinstance(group_id, str)
+                and group_id
+                and rosters.get(group_id) is not None
+                and message.get("reactions")
+            ):
+                message["reactions"] = visible_reactions(
+                    message["reactions"], rosters[group_id]
+                )
             self.bus.publish({"type": "message", "message": message})
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
