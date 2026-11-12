@@ -506,9 +506,13 @@ def publish_due_scheduled_posts(
                     if unsent:
                         # The send paused mid-post (stop or budget): the
                         # peers never attempted stay queued for the next
-                        # pass; no attempt is burned.
+                        # pass, ahead of the peers that already failed
+                        # this pass — the next pass reaches the fresh
+                        # peers first instead of burning its budget
+                        # re-trying the ones that just timed out.
+                        # No attempt is burned.
                         failed = tuple(str(err.get("peer") or "") for err in errors)
-                        pending = tuple(dict.fromkeys([*failed, *unsent]))
+                        pending = tuple(dict.fromkeys([*unsent, *failed]))
                         if not all(p and p != "?" for p in pending):
                             pending = ()
                         post = replace(post, pending_peers=pending)

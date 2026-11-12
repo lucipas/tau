@@ -462,6 +462,56 @@ def test_mail_loop_still_publishes_scheduled_posts_when_flush_fails(tmp_path):
     assert published == [True]
 
 
+def test_publish_pass_resumes_unsent_peers_before_failed_ones(tmp_path):
+    # A paused pass keeps unsent peers ahead of peers that already
+    # failed this pass: the next pass reaches the never-attempted
+    # peers first instead of burning its budget re-trying the ones
+    # that just timed out.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    queue_path = data_dir / "scheduled-posts.json"
+    schedule_post(
+        queue_path, text="good morning", publish_at=1000.0,
+        to=["alice", "bob", "carol"], now=900.0,
+    )
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    stop = {"set": False}
+
+    class _FailingFirstNode:
+        def request(self, peer, path, payload, *, timeout=15.0):
+            if peer.hexhash == "a" * 64:
+                stop["set"] = True
+                raise RuntimeError("no route")
+            return None
+
+    app.node = _FailingFirstNode()
+    by_name_or_hash = {
+        "alice": SimpleNamespace(hexhash="a" * 64),
+        "bob": SimpleNamespace(hexhash="b" * 64),
+        "carol": SimpleNamespace(hexhash="c" * 64),
+        "a" * 64: SimpleNamespace(hexhash="a" * 64),
+        "b" * 64: SimpleNamespace(hexhash="b" * 64),
+        "c" * 64: SimpleNamespace(hexhash="c" * 64),
+    }
+    result = publish_due_scheduled_posts(
+        queue_path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        should_stop=lambda: stop["set"],
+        now=2000.0,
+    )
+    assert result == {"published": 0, "kept": 1}
+    queued = load_scheduled_posts(queue_path).posts[0]
+    assert queued.pending_peers == ("b" * 64, "c" * 64, "a" * 64)
+    assert queued.attempts == 0
+
+
 def test_publish_pass_keeps_unsent_peers_when_stopping(tmp_path):
     # A stop mid-send leaves the peers never attempted queued for the
     # next pass — no attempt burned, and the retry sends only to them.
