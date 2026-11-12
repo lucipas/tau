@@ -1359,6 +1359,22 @@ class TauNode:
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_reaction callback failed", exc_info=True)
 
+    def _publish_reaction(self, record: Dict[str, Any]) -> None:
+        """Fan one reaction record out to the console, best effort.
+
+        The record is already persisted — this is only the callback
+        half of :meth:`_record_reaction`, for tombstones the purge
+        wrote itself.  The console bridge keeps its own reaction
+        cache, seeded into messages appended afterwards, so a void
+        that never reaches it would still display.  A failing callback
+        never breaks delivery.
+        """
+        if self.on_reaction is not None:
+            try:
+                self.on_reaction(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_reaction callback failed", exc_info=True)
+
     def _record_sent(self, record: Dict[str, Any]) -> None:
         """Persist an outgoing DM to the inbox; never break sending.
 
@@ -1655,13 +1671,19 @@ class TauNode:
                 # was unknown, so no roster check could run — and
                 # then surface under this exact id now that the copy
                 # is here.  Void any stored reaction on it from a
-                # reactor the roster does not name.  Same never-breaks
-                # guarantee as the reconcile above.
+                # reactor the roster does not name.  The void is
+                # fanned out to the console too: the bridge caches
+                # reactions separately and seeds appended messages
+                # from that cache, so a void that never reaches it
+                # would still display.  Same never-breaks guarantee
+                # as the reconcile above.
                 try:
-                    self.inbox.purge_non_member_reactions(
+                    voided = self.inbox.purge_non_member_reactions(
                         message_id,
                         members=set(group.get("members") or []),
                     )
+                    for tombstone in voided:
+                        self._publish_reaction(tombstone)
                 except Exception:  # pragma: no cover - storage failure
                     log.warning(
                         "Could not purge non-member group reactions",
@@ -2058,6 +2080,12 @@ class TauNode:
                                     reaction["target"][:8],
                                     exc_info=True,
                                 )
+                            else:
+                                # The void is fanned out too: the
+                                # bridge cached the reaction when it
+                                # was stored, and a void that never
+                                # reaches it would still display.
+                                self._publish_reaction(tombstone)
             if seen_key:
                 self.mailbox.mark_seen(seen_key)
             log.info(
@@ -3301,8 +3329,11 @@ class TauNode:
         if recorded and pinned is not None:
             # A relayed copy is an arrival too: reconcile stored
             # reactions onto it and void non-members' reactions on
-            # it, exactly as a direct group message does.  A storage
-            # failure here never un-delivers the message.
+            # it, exactly as a direct group message does.  The voids
+            # are fanned out to the console too, before on_message
+            # runs, so the bridge cache cannot seed them into the
+            # appended entry.  A storage failure here never
+            # un-delivers the message.
             try:
                 self.inbox.reconcile_group_reactions(
                     pinned["id"],
@@ -3311,10 +3342,12 @@ class TauNode:
                     message["id"],
                     members=set(pinned.get("members") or []),
                 )
-                self.inbox.purge_non_member_reactions(
+                voided = self.inbox.purge_non_member_reactions(
                     message["id"],
                     members=set(pinned.get("members") or []),
                 )
+                for tombstone in voided:
+                    self._publish_reaction(tombstone)
             except Exception:  # pragma: no cover - storage failure
                 log.warning(
                     "Could not reconcile relayed group reactions",

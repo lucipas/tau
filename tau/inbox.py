@@ -721,9 +721,15 @@ class Inbox:
         serving sweep reloads before deciding what is owed.  Safe to
         call any time: every append persists immediately, so the file
         is never behind the cache.
+
+        The reload runs inside the cross-process transaction: a plain
+        load can purge expired messages and write the purged snapshot
+        back, and another process committing between that read and
+        write would have its entries overwritten.  Under the flock the
+        purge write is serialised with every other commit.
         """
-        with self._lock:
-            self._load()
+        with self._transaction():
+            pass
 
     def _stamp_read_ids(
         self, message_ids: List[str], *, at: Optional[float] = None
@@ -990,7 +996,7 @@ class Inbox:
 
     def purge_non_member_reactions(
         self, message_id: str, *, members: Collection[str]
-    ) -> int:
+    ) -> List[Dict[str, Any]]:
         """Void stored reactions on one group message from non-members.
 
         A reaction can be stored before its target arrives — the target
@@ -1004,14 +1010,16 @@ class Inbox:
         is strictly newer than the reaction it voids, so a replayed
         copy of the voided reaction cannot resurrect it, while a later
         reaction from the same reactor — for example after joining the
-        group — replaces the tombstone.  Returns how many reactions
-        were voided.  Raises :class:`OSError` when the voided state
-        cannot be persisted.
+        group — replaces the tombstone.  Returns the tombstones
+        written, one per voided reaction, so the caller can fan them
+        out to any reaction cache (the console bridge keeps its own).
+        Raises :class:`OSError` when the voided state cannot be
+        persisted.
         """
         if not isinstance(message_id, str) or not message_id:
-            return 0
+            return []
         allowed = set(members)
-        voided = 0
+        voided: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._reactions)
             now = time.time()
@@ -1028,7 +1036,7 @@ class Inbox:
                     )
                     tombstone["received_at"] = now
                     if merge_reaction(self._reactions, tombstone):
-                        voided += 1
+                        voided.append(tombstone)
             if voided:
                 self._reactions = self._reactions[-MAX_REACTIONS:]
                 if not self._save():

@@ -1237,3 +1237,35 @@ def test_reload_caps_each_direction(tmp_path, monkeypatch):
 
     entries = Inbox(path).list_messages(direction=None)
     assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]
+
+
+def test_reload_runs_under_the_cross_process_lock(tmp_path):
+    # CodeRabbit Major: reload() read inbox.json and wrote the purged
+    # snapshot back without the cross-process flock — another process
+    # committing an entry between that read and write lost it.  The
+    # reload runs inside the transaction now, so holding the flock
+    # externally must block it until the lock is released.
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only lock
+        pytest.skip("fcntl is unavailable")
+    import threading
+
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1"))
+    lock_path = path.with_name(path.name + ".lock")
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        finished = threading.Event()
+
+        def _reload() -> None:
+            inbox.reload()
+            finished.set()
+
+        worker = threading.Thread(target=_reload, daemon=True)
+        worker.start()
+        assert not finished.wait(timeout=1.0)
+    assert finished.wait(timeout=5.0)
+    worker.join(timeout=5.0)
+    assert len(inbox) == 1
