@@ -7078,6 +7078,80 @@ def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_pin_event_hides_non_member_group_reaction(bridge, node, tmp_path):
+    """Pinning a group message must not leak a non-member reaction
+    (CodeRabbit Major on PR #303).
+
+    The pin endpoint publishes a ``message_updated`` carrying the
+    inbox's overlays; it overlaid reactions without the group-roster
+    filter that :meth:`messages` applies, so an open tab learned of
+    a CLI-made reaction a fresh read hides.  The event must agree
+    with the listing.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+    node.inbox = Inbox(inbox_path)
+    cli_inbox = Inbox(inbox_path)
+    group = node.groups.find("crew")
+    message = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group["id"],
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-g1",
+    }
+    node.inbox.append(dict(message))
+    assert bridge.record_inbound(dict(message)) is not None
+    # CLI-made reactions, written by a second process: one from a
+    # non-member, one from a member.
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": OTHER_HASH,
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-1",
+        }
+    )
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "reaction": "👍",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-2",
+        }
+    )
+    status, _, _ = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    updates = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+        and event.get("message", {}).get("wire_id") == "wire-g1"
+    ]
+    assert len(updates) == 1
+    assert updates[0]["message"]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+    assert updates[0]["message"]["pinned"] is True
+    assert bridge.messages()[0]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {

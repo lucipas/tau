@@ -4449,8 +4449,14 @@ class WebBridge:
         """
         by_target = self._inbox_reactions_by_target()
         pinned_ids = self._inbox_pinned_ids()
+        groups = getattr(self.node, "groups", None)
+        group_id = message.get("group")
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None and isinstance(group_id, str) and group_id:
+            rosters = pinned_rosters(groups, [group_id])
         return self._with_inbox_pinned(
-            self._with_inbox_reactions(dict(message), by_target), pinned_ids
+            self._with_inbox_reactions(dict(message), by_target, rosters),
+            pinned_ids,
         )
 
     def _publish_message_updated(self, message: Dict[str, Any]) -> None:
