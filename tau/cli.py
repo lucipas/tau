@@ -603,6 +603,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retract.set_defaults(func=cmd_retract)
 
+    edit = subparsers.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a message you sent",
+    )
+    edit.add_argument(
+        "target",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    edit.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    edit.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    edit.set_defaults(func=cmd_edit)
+
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
     )
@@ -5208,18 +5232,39 @@ def _retract_local_message(
     )
 
 
-def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send or a retraction.
+def _edit_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    text: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Edit one DM on the running node, for the local send server."""
+    return node.send_edit(
+        target,
+        message_id,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
 
-    The socket carries both, distinguished by ``op``: ``"send"`` (the
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send, a retraction, or an edit.
+
+    The socket carries all three, distinguished by ``op``: ``"send"`` (the
     default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"`` runs the
-    retraction on the serving node, so ``tau retract`` works while
-    ``tau serve`` holds the data directory.
+    :func:`_send_local_message`, while ``"retract"`` and ``"edit"`` run the
+    retraction and the edit on the serving node, so ``tau retract`` and
+    ``tau edit`` work while ``tau serve`` holds the data directory.
     """
     op = request.pop("op", "send")
     if op == "retract":
         return _retract_local_message(node, **request)
+    if op == "edit":
+        return _edit_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -5370,6 +5415,35 @@ def _retract_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _edit_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    text: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Edit through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="edit",
+            target=recipient,
+            message_id=message_id,
+            text=text,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-edit; retry the edit"
         ) from exc
 
 
@@ -6241,7 +6315,8 @@ def _print_message_entry(
         if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
         else ""
     )
-    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}")
+    edited_suffix = " (edited)" if entry.get("edited_at") else ""
+    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}{edited_suffix}")
     if entry.get("kind") == "file":
         print(
             f"  file: {entry.get('name')} "
@@ -7821,6 +7896,114 @@ def cmd_retract(args: argparse.Namespace) -> int:
             f"{name} had no copy of {_safe_id_prefix(str(target['id']))}"
             " to retract"
         )
+    return _EXIT_OK
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    try:
+        cleaned = normalize_message(text)
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.target)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to edit")
+    if target.get("kind") == "group":
+        raise NodeError(
+            "group messages cannot be edited; send a new message instead"
+        )
+    if target.get("kind") == "file":
+        raise NodeError("a file record has no text to edit")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be edited"
+        )
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known recipient to edit it for")
+    # A message still in the outbox has not reached its recipient yet; an
+    # edit answered "not found" would let the queued copy arrive later
+    # with the old text. Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it and send a new message instead"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: edit through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _edit_via_running_node(
+                config,
+                author,
+                str(target["id"]),
+                cleaned,
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Edits ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver edit: {exc} "
+                "(edits need the peer online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_edit(
+                    author,
+                    str(target["id"]),
+                    cleaned,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Edits ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver edit: {exc} "
+                    "(edits need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "text": cleaned,
+                "edited": bool(response.get("edited", True)),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("edited") is False:
+        print(
+            f"edit was not applied to {name}'s copy of "
+            f"{_safe_id_prefix(str(target['id']))} "
+            "(unknown message, or a newer edit already applied)"
+        )
+    else:
+        print(f"edited your message to {name} {_safe_id_prefix(str(target['id']))}")
     return _EXIT_OK
 
 

@@ -91,6 +91,7 @@ from .protocol import (
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
+    REQUEST_DM_EDIT,
     ProtocolError,
     build_announce,
     build_file_offer,
@@ -101,6 +102,8 @@ from .protocol import (
     clean_reaction,
     decode,
     derive_group_id,
+    edit_dict,
+    edit_unsigned_bytes,
     encode_group_message,
     encode,
     encode_message,
@@ -108,6 +111,7 @@ from .protocol import (
     normalize_message,
     normalize_message_kind,
     parse_announce,
+    parse_edit,
     parse_group_message,
     parse_file_offer,
     parse_mail_fetch,
@@ -755,6 +759,7 @@ class TauNode:
             REQUEST_READ: self._handle_read,
             REQUEST_REACT: self._handle_reaction,
             REQUEST_RETRACT: self._handle_retract,
+            REQUEST_DM_EDIT: self._handle_dm_edit,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -2133,6 +2138,181 @@ class TauNode:
                 received_at=received_at,
                 deleted=True,
             )
+
+
+    def _handle_dm_edit(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Apply a signed edit for a DM this node received."""
+        try:
+            edit = parse_edit(data)
+        except ProtocolError as exc:
+            return response_error("invalid_edit", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # An edit is state keyed by its editor: without an
+            # authenticated link identity there is no editor to key on,
+            # and an anonymous edit could rewrite anyone's message.
+            return response_error(
+                "unidentified", "identify on the link to edit"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Edits are signed entries, like reactions: the signature covers
+        # the whole payload and is verified against the link identity, so
+        # attribution does not depend on trusting the transport — a
+        # relayed or replayed edit still has to prove its editor.
+        # (parse_edit already checked the base64.)
+        signature_text = edit.get("sig")
+        if not signature_text:
+            return response_error("invalid_edit", "edit is missing its signature")
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = edit_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_edit", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_edit", f"could not verify edit: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_edit", "edit signature does not verify"
+            )
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins, so a blocked sender cannot rewrite
+            # a message already sitting in the inbox either.
+            log.info(
+                "Edit from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Edit from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        target_id = edit["target"]
+        try:
+            record = self.inbox.resolve(target_id)
+        except ValueError:
+            # An unknown id answers ok with edited: false, so a retried
+            # edit is safe (idempotent) — the sender can retry with the
+            # same id and it will apply when the message arrives.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        if record.get("id") != target_id:
+            # resolve() also matches unique prefixes; an edit must name
+            # the full id, so a prefix match is not an edit target.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        if record.get("kind") == "group":
+            # A group message has a different id on every member's
+            # copy, so one edit cannot name them all; refuse instead of
+            # rewriting a single member's copy.
+            return response_error(
+                "group_message",
+                "group messages cannot be edited; send a new message instead",
+            )
+        if record.get("kind") == "file":
+            return response_error(
+                "file_message", "a file record has no text to edit"
+            )
+        if record.get("direction") != "in":
+            # Only an inbound record names its sender in
+            # ``destination``: an outbound record is this node's own
+            # sent message, and no remote peer may rewrite it.
+            return response_error(
+                "not_sender", "only the message's sender may edit it"
+            )
+        if (record.get("destination") or "") != caller_hash:
+            return response_error(
+                "not_sender", "only the message's sender may edit it"
+            )
+        edit_sent_at = edit.get("sent_at")
+        if edit_sent_at is None:
+            # The signed sent_at is the edit's ordering key.  Falling
+            # back to receipt time would let a replayed older edit look
+            # new and rewind a newer one.
+            return response_error(
+                "invalid_edit", "edit is missing its signed sent_at"
+            )
+        effective_at = float(edit_sent_at)
+        previous_edited_at = record.get("edited_at")
+        if (
+            isinstance(previous_edited_at, (int, float))
+            and effective_at <= float(previous_edited_at)
+        ):
+            # A replayed or retried older edit must not rewind a newer
+            # one; the sender's retry with the same id is harmless.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        try:
+            # The ownership and ordering checks above read a snapshot;
+            # the inbox repeats them atomically so racing edits cannot
+            # apply out of order.
+            applied = self.inbox.apply_edit(
+                target_id,
+                edit["text"],
+                edited_at=effective_at,
+                direction="in",
+                destination=caller_hash,
+                newer_than_existing=True,
+            )
+        except InboxError as exc:
+            # Do not acknowledge an edit that was not stored, so the
+            # sender can retry with the same id and it will apply then.
+            return response_error(
+                "storage_failed", f"could not store edit: {exc}"
+            )
+        if applied is None:
+            # The record went away between the lookup and the edit (a
+            # concurrent delete or retract): report it as not applied
+            # rather than acknowledging an edit that landed nowhere.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        log.info(
+            "Edit from %s (%s) on %s",
+            caller_name,
+            caller_hash or "anonymous",
+            target_id[:8],
+        )
+        return response_ok(
+            target=target_id,
+            edited=True,
+            received_at=received_at,
+        )
+
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -4622,6 +4802,82 @@ class TauNode:
         )
         response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
         return dict(response, id=retract_id)
+
+
+    def send_edit(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send an edit for a DM this node sent and return the decoded response.
+
+        ``message_id`` names the edited message, ``text`` is the
+        replacement body.  Edits are their own signed message kind:
+        the payload is signed with this node's Reticulum identity and
+        verified by the receiver against the link identity, exactly like
+        a reaction — and the receiver applies it only when the editor is
+        the message's original sender.
+
+        Edits are delivered live in v1: unlike ``send_message`` there is
+        no outbox queue, because the sealed-mail path is text-shaped
+        throughout.  An unreachable peer raises :class:`NodeError`;
+        queueing edits for offline peers is a follow-up once the
+        mailbox can carry non-text kinds.
+        """
+        cleaned = normalize_message(text)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("edit target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        edit_id = generate_message_id()
+        payload = edit_dict(target_id, cleaned, message_id=edit_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign edit")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
+        if response.get("edited") is False:
+            # The receiver answered ok without applying the edit — an
+            # unknown id, or a stale edit that lost to a newer one — so
+            # the local copy must not change either.
+            return dict(response, id=edit_id)
+        # Update the local sent copy, so the editor sees the new text
+        # under the message in their own inbox and console.  A missing
+        # local copy (pruned since the send) is not a delivery failure.
+        # The guard keeps an overlapping older edit from rewinding a
+        # newer one that already landed locally.
+        try:
+            self.inbox.apply_edit(
+                target_id,
+                cleaned,
+                edited_at=float(payload["sent_at"]),
+                newer_than_existing=True,
+            )
+        except InboxError as exc:
+            log.warning("Could not record sent edit: %s", exc)
+        # ``tau messages --sent`` reads the mailbox, not the inbox: the
+        # sent record needs the new text too, or the editor's own history
+        # keeps showing the original.
+        try:
+            self.mailbox.update_sent_text(
+                target_id, cleaned, edited_at=float(payload["sent_at"])
+            )
+        except MailboxError as exc:
+            log.warning("Could not update sent edit: %s", exc)
+        return dict(response, id=edit_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""
