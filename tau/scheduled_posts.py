@@ -165,6 +165,13 @@ class ScheduledPost:
     post_hash: Optional[str] = None
     attempts: int = 0
     next_attempt_at: float = 0.0
+    # When a publish pass last paused on this entry (stop or budget):
+    # 0.0 means it never paused.  A pass starts with entries that have
+    # never paused (or paused longest ago), so one post whose peers
+    # keep stalling cannot monopolize the queue and starve later due
+    # posts — the pause is scheduling state, not a failure, so it
+    # leaves attempts and the retry limit untouched.
+    paused_at: float = 0.0
     # Destination hashes that still owe delivery after a partial
     # failure; empty means "all of ``to`` (or every peer)".
     pending_peers: Tuple[str, ...] = ()
@@ -183,6 +190,7 @@ class ScheduledPost:
         object.__setattr__(self, "post_hash", _clean_reply_to(self.post_hash))
         object.__setattr__(self, "attempts", _clean_attempts(self.attempts))
         object.__setattr__(self, "next_attempt_at", _clean_retry_at(self.next_attempt_at))
+        object.__setattr__(self, "paused_at", _clean_retry_at(self.paused_at))
         object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -197,6 +205,7 @@ class ScheduledPost:
             "post_hash": self.post_hash,
             "attempts": self.attempts,
             "next_attempt_at": self.next_attempt_at,
+            "paused_at": self.paused_at,
             "pending_peers": list(self.pending_peers),
         }
 
@@ -215,6 +224,7 @@ class ScheduledPost:
             post_hash=_clean_reply_to(data.get("post_hash")),
             attempts=_clean_attempts(data.get("attempts", 0)),
             next_attempt_at=_clean_retry_at(data.get("next_attempt_at", 0.0)),
+            paused_at=_clean_retry_at(data.get("paused_at", 0.0)),
             pending_peers=_clean_targets(data.get("pending_peers")),
         )
 
@@ -422,7 +432,9 @@ class _PassPaused(Exception):
     """Internal: the publish pass ends early — node stopping, or the
     pass budget elapsed.  Raised instead of recording a publish
     failure, so the entry being worked on keeps its attempts and its
-    unsent peers stay queued for the next pass.
+    unsent peers stay queued for the next pass.  The handler records
+    the pause on the entry (``paused_at``) so the next pass starts
+    with posts that have not paused, instead of this one again.
     """
 
 
@@ -452,7 +464,11 @@ def publish_due_scheduled_posts(
     queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
     is no longer retried automatically but stays queued for the user to
     inspect or cancel.  A pass stops starting new entries once
-    ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.
+    ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.  A pass that pauses
+    on an entry remembers the pause on it, so the next pass starts
+    with entries that have not paused — a post whose peers keep
+    stalling cannot starve later due posts, and it is still retried
+    once they have had their turn.
 
     When ``should_stop`` is given (the node's stop event), a pass ends
     early — between posts, between peer resolutions, and between
@@ -482,6 +498,12 @@ def publish_due_scheduled_posts(
             for post in queue.due(at)
             if post.next_attempt_at <= at and post.attempts < MAX_PUBLISH_ATTEMPTS
         ]
+        # Fairness across passes: entries that have never paused — or
+        # paused longest ago — go first, so a post whose peers keep
+        # stalling the pass does not monopolize the queue while later
+        # due posts wait.  A paused entry is still attempted in the
+        # same pass once the fresher entries have had their turn.
+        candidates.sort(key=lambda post: (post.paused_at, post.publish_at))
         published = 0
         try:
             for post in candidates:
@@ -548,7 +570,16 @@ def publish_due_scheduled_posts(
                         )
                 except _PassPaused:
                     # Not a publish failure: end the pass without burning
-                    # an attempt on the entry being worked on.
+                    # an attempt on the entry being worked on — but
+                    # remember the pause, so the next pass starts with
+                    # posts that have not paused instead of this one
+                    # again.  A post that keeps pausing yields to later
+                    # due posts and is retried once they have had
+                    # their turn; its attempts and retry limit are
+                    # untouched.
+                    post = replace(post, paused_at=at)
+                    queue = queue.with_replaced(post)
+                    save_scheduled_posts(path, queue)
                     raise
                 except Exception as exc:  # noqa: BLE001 - a failed publish retries
                     attempts = post.attempts + 1

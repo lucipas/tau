@@ -624,6 +624,80 @@ def test_publish_pass_keeps_unsent_peers_when_stopping(tmp_path):
     assert sent == ["a" * 64, "b" * 64]
 
 
+def test_paused_post_yields_to_later_due_posts(tmp_path):
+    # A post whose peers keep stalling the pass used to monopolize the
+    # queue: every pass started with it, burned its budget, and later
+    # due posts never published.  A pause is now remembered on the
+    # entry, so the next pass starts with posts that have not paused.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    queue_path = data_dir / "scheduled-posts.json"
+    schedule_post(
+        queue_path, text="stalled post", publish_at=1000.0,
+        to=["alice", "bob", "carol"], now=900.0,
+    )
+    schedule_post(
+        queue_path, text="later post", publish_at=1001.0,
+        to=["bob"], now=900.0,
+    )
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    sent = []
+    stop = {"set": False}
+    calls = {"n": 0}
+
+    class _StallingNode:
+        def request(self, peer, path, payload, *, timeout=15.0):
+            sent.append(peer.hexhash)
+            calls["n"] += 1
+            if peer.hexhash == "a" * 64 and calls["n"] == 1:
+                stop["set"] = True
+                raise RuntimeError("no route")
+            return None
+
+    app.node = _StallingNode()
+    by_name_or_hash = {
+        "alice": SimpleNamespace(hexhash="a" * 64),
+        "bob": SimpleNamespace(hexhash="b" * 64),
+        "carol": SimpleNamespace(hexhash="c" * 64),
+        "a" * 64: SimpleNamespace(hexhash="a" * 64),
+        "b" * 64: SimpleNamespace(hexhash="b" * 64),
+        "c" * 64: SimpleNamespace(hexhash="c" * 64),
+    }
+    # Pass 1 pauses on the stalled post; the later post never gets a turn.
+    result = publish_due_scheduled_posts(
+        queue_path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        should_stop=lambda: stop["set"],
+        now=2000.0,
+    )
+    assert result == {"published": 0, "kept": 2}
+    stalled, later = load_scheduled_posts(queue_path).posts
+    assert stalled.text == "stalled post"
+    assert stalled.attempts == 0
+    assert stalled.paused_at == 2000.0
+    assert later.paused_at == 0.0
+
+    # Pass 2 starts with the post that has not paused, then retries the
+    # stalled one once it has had its turn.
+    stop["set"] = False
+    result = publish_due_scheduled_posts(
+        queue_path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        should_stop=lambda: stop["set"],
+        now=2100.0,
+    )
+    assert result == {"published": 2, "kept": 0}
+    assert sent == ["a" * 64, "b" * 64, "b" * 64, "c" * 64, "a" * 64]
+
+
 def test_tan_publish_reports_unsent_peers_past_deadline(tmp_path):
     # TanApp.publish checks the deadline between sends: with a
     # deadline already past, nothing is sent and every peer is unsent.

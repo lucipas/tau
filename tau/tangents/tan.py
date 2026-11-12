@@ -87,6 +87,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
@@ -669,6 +670,32 @@ def head(conn: sqlite3.Connection, author: str) -> Optional[str]:
     return str(row["hash"]) if row is not None else None
 
 
+@contextmanager
+def _chain_write(conn: sqlite3.Connection) -> Iterator[None]:
+    """Hold the database write lock across a head read and its append.
+
+    Every local author-chain writer reads the chain head and then
+    appends: two writers racing that window both read the same head
+    and append siblings with the same ``seq`` — a fork no later check
+    repairs.  ``BEGIN IMMEDIATE`` takes the write lock before the head
+    read and releases it only once the append has committed, so the
+    read and the append are one atomic step.  The append itself commits
+    through :func:`store_post`, so the exit only commits when the
+    append took the duplicate-hash early return and left the
+    transaction open.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    else:
+        if conn.in_transaction:
+            conn.commit()
+
+
 def max_seq(conn: sqlite3.Connection, author: str) -> int:
     """Return the highest linked sequence number known for *author*."""
     author = _require_hex(author, AUTHOR_HEX_LENGTH, "author")
@@ -823,27 +850,30 @@ def create_post(
     author = _author_from_identity(identity)
     clean_name = sanitize_name(name)
     clean_text = normalize_message(text)
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": clean_name,
-        "text": clean_text,
-        "created_at": timestamp,
-        "prev": prev,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": clean_name,
+            "text": clean_text,
+            "created_at": timestamp,
+            "prev": prev,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -868,29 +898,32 @@ def create_reaction(
     target = _require_hex(target, HASH_HEX_LENGTH, "target")
     timestamp = round(float(now if now is not None else time.time()), 3)
     author = _author_from_identity(identity)
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": "",
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_LIKE if liked else KIND_UNLIKE,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": "",
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_LIKE if liked else KIND_UNLIKE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -933,29 +966,32 @@ def create_reply(
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
     clean_text = normalize_message(text)
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": clean_text,
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_REPLY,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": clean_text,
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_REPLY,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -1001,29 +1037,32 @@ def create_quote(
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
     clean_text = normalize_message(text)
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": clean_text,
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_QUOTE,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": clean_text,
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_QUOTE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -1057,29 +1096,32 @@ def create_delete(
             raise TanError("cannot delete a post you did not author")
         if _is_deleted(conn, existing):
             raise TanError("post has been deleted")
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": "",
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_DELETE,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": "",
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_DELETE,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -1134,29 +1176,32 @@ def create_repost(
     for row in standing:
         if not _is_deleted(conn, {"hash": str(row["hash"]), "author": str(row["author"])}):
             raise TanError("post has already been reposted")
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": "",
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_REPOST,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": "",
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_REPOST,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
@@ -1200,29 +1245,32 @@ def create_edit(
     if _is_deleted(conn, existing):
         raise TanError("post has been deleted")
     clean_text = normalize_message(text)
-    prev = previous
-    if prev is None:
-        prev = head(conn, author) or ""
-    prev = prev.strip().lower()
-    if prev:
-        _require_hex(prev, HASH_HEX_LENGTH, "prev")
+    # The head read and the append must be one atomic step: see
+    # _chain_write — two writers racing this window would fork the chain.
+    with _chain_write(conn):
+        prev = previous
+        if prev is None:
+            prev = head(conn, author) or ""
+        prev = prev.strip().lower()
+        if prev:
+            _require_hex(prev, HASH_HEX_LENGTH, "prev")
 
-    body = {
-        "v": TAN_VERSION,
-        "author": author,
-        "key": identity.get_public_key().hex(),
-        "name": sanitize_name(name),
-        "text": clean_text,
-        "created_at": timestamp,
-        "prev": prev,
-        "kind": KIND_EDIT,
-        "target": target,
-    }
-    digest = hash(body, previous=prev)
-    mesg = dict(body)
-    mesg["hash"] = digest
-    mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
-    record, _ = store_post(conn, mesg, now=timestamp)
+        body = {
+            "v": TAN_VERSION,
+            "author": author,
+            "key": identity.get_public_key().hex(),
+            "name": sanitize_name(name),
+            "text": clean_text,
+            "created_at": timestamp,
+            "prev": prev,
+            "kind": KIND_EDIT,
+            "target": target,
+        }
+        digest = hash(body, previous=prev)
+        mesg = dict(body)
+        mesg["hash"] = digest
+        mesg["sig"] = identity.sign(bytes.fromhex(digest)).hex()
+        record, _ = store_post(conn, mesg, now=timestamp)
     return record
 
 
