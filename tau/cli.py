@@ -66,6 +66,14 @@ from .identity import (
     save_identity,
 )
 from .groups import GroupStore
+from .ignored_groups import (
+    IgnoredGroups,
+    IgnoredGroupsError,
+    ignored_groups_lock,
+    load_ignored_group_ids,
+    load_ignored_groups,
+    save_ignored_groups,
+)
 from .inbox import Inbox, InboxError
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
@@ -1047,6 +1055,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print per-peer unread counts instead of listing messages",
     )
+    messages.add_argument(
+        "--ignored",
+        action="store_true",
+        help="only show messages from ignored groups",
+    )
     messages.set_defaults(func=cmd_messages)
 
     messages_sub = messages.add_subparsers(metavar="COMMAND")
@@ -1139,6 +1152,33 @@ def build_parser() -> argparse.ArgumentParser:
         "group", metavar="GROUP", help="group id, id prefix or name"
     )
     group_delete.set_defaults(func=cmd_group_delete)
+
+    group_ignore = group_sub.add_parser(
+        "ignore",
+        parents=[common],
+        help="hide a group's messages from the default `tau messages` listing",
+    )
+    group_ignore.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_ignore.set_defaults(func=cmd_group_ignore)
+
+    group_unignore = group_sub.add_parser(
+        "unignore",
+        parents=[common],
+        help="show an ignored group's messages in `tau messages` again",
+    )
+    group_unignore.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unignore.set_defaults(func=cmd_group_unignore)
+
+    group_ignored = group_sub.add_parser(
+        "ignored",
+        parents=[common],
+        help="list ignored groups",
+    )
+    group_ignored.set_defaults(func=cmd_group_ignored)
 
     group_add_member = group_sub.add_parser(
         "add-member",
@@ -5850,34 +5890,66 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
-    # Archive membership is a direct-message concern only: a group
-    # post from an archived sender is still that group's mail, and
-    # groups keep their current listing.  --archived is an explicit
-    # archived-only view, so it applies even to searches and group
-    # listings; the default hiding (and its unread count) stays
-    # limited to plain listings, where a search is an explicit
-    # lookup that still finds archived mail.
+    # Ignoring a group is a display preference only: its posts stay
+    # stored and keep arriving, and an explicit view (--group, --search,
+    # --ignored) still shows them.  Archive membership is likewise a
+    # direct-message concern only: a group post from an archived sender
+    # is still that group's mail, and groups keep their current listing.
+    # --archived is an explicit archived-only view, so it applies even
+    # to searches and group listings.  The default hiding (and its unread
+    # count) stays limited to plain listings, where a search is an
+    # explicit lookup that still finds ignored-group or archived mail.
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
+    show_ignored = getattr(args, "ignored", False)
+    ignored_unread = 0
     archived_unread = 0
-    if show_archived:
+    if show_ignored and show_archived:
         entries = [
             entry
             for entry in entries
-            if entry.get("kind") != "group"
-            and entry.get("destination") in archived
+            if (entry.get("kind") == "group"
+                and str(entry.get("group") or "") in ignored)
+            or (entry.get("kind") != "group"
+                and entry.get("destination") in archived)
         ]
-    elif query is None and group_id is None and archived:
-        hidden = [
-            entry
-            for entry in entries
-            if entry.get("kind") != "group"
-            and entry.get("destination") in archived
-        ]
-        archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+    elif show_ignored:
         entries = [
             entry
             for entry in entries
             if entry.get("kind") == "group"
-            or entry.get("destination") not in archived
+            and str(entry.get("group") or "") in ignored
+        ]
+    elif show_archived:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+    elif query is None and group_id is None:
+        if ignored:
+            hidden = [
+                entry
+                for entry in entries
+                if entry.get("kind") == "group"
+                and str(entry.get("group") or "") in ignored
+            ]
+            ignored_unread = sum(1 for entry in hidden if entry.get("unread"))
+        if archived:
+            hidden = [
+                entry
+                for entry in entries
+                if entry.get("kind") != "group"
+                and entry.get("destination") in archived
+            ]
+            archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+        entries = [
+            entry
+            for entry in entries
+            if (entry.get("kind") != "group"
+                or str(entry.get("group") or "") not in ignored)
+            and (entry.get("kind") == "group"
+                or entry.get("destination") not in archived)
         ]
     # Filter before limiting, so --unread finds older unread mail even
     # when newer messages from the same listing are already read.
@@ -5898,6 +5970,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 "messages": shown,
                 "count": len(shown),
                 "more_unread": more_unread,
+                "ignored_unread": ignored_unread,
                 "archived_unread": archived_unread,
             },
             True,
@@ -5911,6 +5984,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             print(
                 "No unread messages." if unread_only else "No messages received yet."
             )
+        if ignored_unread:
+            _print_ignored_unread(ignored_unread)
         if archived_unread:
             _print_archived_unread(archived_unread)
     else:
@@ -5918,6 +5993,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             _print_message_entry(inbox, registry, entry)
         if more_unread:
             _print_more_unread(registry, more_unread)
+        if ignored_unread:
+            _print_ignored_unread(ignored_unread)
         if archived_unread:
             _print_archived_unread(archived_unread)
     # Reading a conversation advances its cursor to the newest message
@@ -5943,11 +6020,14 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 newest_shown.get(destination, 0), int(entry["seq"])
             )
         # A read cursor is per-sender, shared by DMs and group posts,
-        # so showing a group post would otherwise mark an older hidden
-        # DM read without the owner ever seeing it.  Cap each
-        # destination's advance just before its oldest unread message
-        # that this listing did not show — archived mail, or mail a
-        # filtered view (group, --archived) left out.  The capped
+        # A read cursor is per-sender, shared by DMs and group posts,
+        # so showing a DM would otherwise mark an older hidden group
+        # post read, and showing a group post would otherwise mark an
+        # older hidden DM read, without the owner ever seeing it.  Cap
+        # each destination's advance just before its oldest unread
+        # message that this listing did not show — ignored-group mail,
+        # archived mail, or mail a filtered view (group, --ignored,
+        # --archived) left out.  The capped
         # message stays unread until the owner displays it; the next
         # listing that does advances past it.
         shown_seqs = {int(entry["seq"]) for entry in shown}
@@ -6331,7 +6411,10 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     config = _make_config(args)
     store = GroupStore(config.groups_path)
     registry = PeerRegistry(config.peers_path)
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
     groups = [_describe_group(group, registry) for group in store.list_groups()]
+    for group in groups:
+        group["ignored"] = group["id"] in ignored
     if _json_mode(args):
         _emit({"groups": groups, "count": len(groups)}, True)
         return _EXIT_OK
@@ -6340,7 +6423,8 @@ def cmd_group_list(args: argparse.Namespace) -> int:
         return _EXIT_OK
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
-        print(f"{group['name']} ({group['id'][:8]}) — {names}")
+        ignored_suffix = " [ignored]" if group["ignored"] else ""
+        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}")
     return _EXIT_OK
 
 
@@ -6354,6 +6438,187 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
         _emit({"deleted": group["id"], "name": group["name"]}, True)
         return _EXIT_OK
     print(f"deleted group {group['name']} ({group['id'][:8]})")
+    return _EXIT_OK
+
+
+def cmd_group_ignore(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_id = group["id"]
+    # Reload inside the lock: two ignore commands racing must not
+    # discard each other's change to a different group.
+    with ignored_groups_lock(config.ignored_groups_path):
+        try:
+            ignored = load_ignored_groups(config.ignored_groups_path)
+        except IgnoredGroupsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        already = ignored.is_ignored(group_id)
+        if not already:
+            ignored = ignored.with_added(group_id)
+            save_ignored_groups(config.ignored_groups_path, ignored)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": group_id,
+                "name": group["name"],
+                "ignored": True,
+                "changed": not already,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if already:
+        print(
+            f"Group {group['name']} ({group_id[:8]}) is already ignored."
+        )
+    else:
+        print(
+            f"Ignored group {group['name']} ({group_id[:8]}). "
+            "Its messages keep arriving; `tau group unignore` restores the view."
+        )
+    return _EXIT_OK
+
+
+def _stored_group_matches(store: GroupStore, query: str) -> bool:
+    """True when any stored group matches *query* by id, id prefix, or name.
+
+    Mirrors :meth:`tau.groups.GroupStore.find`: a full id matches by
+    lookup, a shorter query by exact (case-insensitive) name or by an
+    id prefix of at least four characters.  Used to tell an ambiguous
+    lookup apart from one that found nothing at all.
+    """
+    needle = query.strip()
+    if len(needle) == 32:
+        return store.get(needle) is not None
+    lowered = needle.lower()
+    for group in store.list_groups():
+        if group["name"].casefold() == needle.casefold():
+            return True
+        if len(needle) >= 4 and group["id"].startswith(lowered):
+            return True
+    return False
+
+
+def _ignored_id_for_query(ignored: IgnoredGroups, query: str) -> Optional[str]:
+    """The ignored id *query* names when no stored group record does.
+
+    Accepts a full 32-character id or a unique id prefix of at least
+    four characters, as ``GroupStore.find`` does.  Returns ``None``
+    when nothing matches; raises :class:`ValueError` when a prefix
+    matches several ignored ids.
+    """
+    needle = query.strip().lower()
+    if len(needle) == 32:
+        return needle if ignored.is_ignored(needle) else None
+    if len(needle) < 4:
+        return None
+    matches = sorted(group_id for group_id in ignored.ignored if group_id.startswith(needle))
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} ignored groups match the id prefix {query!r}")
+    return matches[0] if matches else None
+
+
+def cmd_group_unignore(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    # The group record can be gone (deleted, or a backup restored the
+    # ignore list without groups.json).  The id must still be removable,
+    # or its posts stay hidden with no way out.
+    find_error: Optional[ValueError] = None
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        group = None
+        find_error = exc
+    # Reload inside the lock: two ignore commands racing must not
+    # discard each other's change to a different group.
+    with ignored_groups_lock(config.ignored_groups_path):
+        try:
+            ignored = load_ignored_groups(config.ignored_groups_path)
+        except IgnoredGroupsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if group is not None:
+            group_id = group["id"]
+            name = group["name"]
+        else:
+            # The orphan fallback is only for a lookup that found no
+            # stored group at all: an ambiguous name or id prefix must
+            # still be rejected, not silently resolved against an
+            # orphaned ignored id that happens to share the prefix.
+            if _stored_group_matches(store, args.group):
+                raise find_error
+            try:
+                resolved = _ignored_id_for_query(ignored, args.group)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return _EXIT_ERROR
+            if resolved is None:
+                raise find_error
+            group_id = resolved
+            name = ""
+        was_ignored = ignored.is_ignored(group_id)
+        if was_ignored:
+            ignored = ignored.with_removed(group_id)
+            save_ignored_groups(config.ignored_groups_path, ignored)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": group_id,
+                "name": name,
+                "ignored": False,
+                "changed": was_ignored,
+            },
+            True,
+        )
+        return _EXIT_OK
+    label = name or "unknown"
+    if was_ignored:
+        print(
+            f"Restored group {label} ({group_id[:8]}) to `tau messages`."
+        )
+    else:
+        print(f"Group {label} ({group_id[:8]}) was not ignored.")
+    return _EXIT_OK
+
+
+def cmd_group_ignored(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    inbox = Inbox(config.inbox_path)
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
+    counts: Dict[str, int] = {}
+    for entry in inbox.list_messages(limit=None):
+        # Only group posts belong to an ignored group; a DM id never
+        # collides with a group id, but the kind check keeps the count
+        # honest if a future kind reuses the field.
+        if entry.get("kind") == "group" and str(entry.get("group") or "") in ignored:
+            group_id = str(entry.get("group"))
+            counts[group_id] = counts.get(group_id, 0) + 1
+
+    def describe(group_id: str) -> Dict[str, Any]:
+        group = store.get(group_id)
+        return {
+            "id": group_id,
+            "name": group["name"] if group is not None else "",
+            "messages": counts.get(group_id, 0),
+        }
+
+    entries = [describe(group_id) for group_id in sorted(ignored)]
+    if _json_mode(args):
+        _emit({"ignored": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No ignored groups — hide one with `tau group ignore GROUP`.")
+        return _EXIT_OK
+    for entry in entries:
+        name = entry["name"] or "unknown"
+        print(
+            f"{name} ({entry['id'][:8]}): "
+            f"{entry['messages']} message(s)"
+        )
     return _EXIT_OK
 
 
@@ -6719,6 +6984,14 @@ def _print_more_unread(
             f"{count} more unread from {name} ({short_hash(destination)})"
             " — raise --limit to see them."
         )
+
+
+def _print_ignored_unread(ignored_unread: int) -> None:
+    """Hint line for unread mail hidden in ignored groups."""
+    print(
+        f"{ignored_unread} unread in ignored groups"
+        " — see them with `tau messages --ignored`."
+    )
 
 
 def _print_archived_unread(archived_unread: int) -> None:
