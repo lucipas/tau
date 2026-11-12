@@ -1462,6 +1462,71 @@ def test_group_reaction_refused_when_namesake_masks_deleted_group(tmp_path):
     assert node.inbox.reactions_for("local-copy-1") == []
 
 
+def test_group_reaction_recheck_voids_when_namesake_masks_deleted_group(
+    tmp_path, monkeypatch
+):
+    # Same finding, second net: the post-store recheck re-reads the
+    # roster, so a group deleted (and masked by a namesake) between
+    # the pre-store check and the recheck must void the stored
+    # reaction instead of letting the namesake's roster keep it.  A
+    # missing roster fails closed here too.  The copy arrives between
+    # the check and the recheck, so the reaction is stored with
+    # group context first and only the recheck sees the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, reactor_hash],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    # Swap the roster between the pre-store resolve and the
+    # post-store recheck: the copy lands, the real group is deleted,
+    # and a namesake (named after the deleted id) that still lists
+    # the reactor is pinned.
+    calls = {"n": 0}
+    real_resolve = node.inbox.resolve
+
+    def swapping_resolve(target_id):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            node.inbox._messages.append(dict(copy))
+            assert node.groups.delete(group) is True
+            node.groups.create(
+                group,
+                [reactor_hash, destination_hash(RNS.Identity()).hex()],
+                created_by=reactor_hash,
+            )
+        return real_resolve(target_id)
+
+    monkeypatch.setattr(node.inbox, "resolve", swapping_resolve)
+    call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "local-copy-1", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
 def test_group_reaction_final_check_refuses_when_group_deleted(
     tmp_path, monkeypatch
 ):

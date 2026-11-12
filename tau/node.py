@@ -2264,10 +2264,10 @@ class TauNode:
                     reaction["target_sent_at"],
                 )
                 if local is not None:
-                    try:
-                        pinned = self.groups.find(reaction["group"])
-                    except ValueError:
-                        pinned = None
+                    # Exact-id lookup: a retired id that is also
+                    # another group's name must not supply the
+                    # roster the reconciliation filters against.
+                    pinned = pinned_group(self.groups, reaction["group"])
                     if pinned is not None:
                         try:
                             self.inbox.reconcile_group_reactions(
@@ -2325,11 +2325,19 @@ class TauNode:
                         now_resolved is not None
                         and now_resolved.get("kind") == "group"
                     ):
-                        try:
-                            pinned = self.groups.find(now_resolved["group"])
-                        except ValueError:
-                            pinned = None
-                        if pinned is not None and caller_hash not in (
+                        # Exact-id lookup: a retired id that is also
+                        # another group's name must not supply the
+                        # roster this void check runs against.  A
+                        # missing roster fails closed here too: the
+                        # target resolved at check time, so the only
+                        # way no roster is pinned now is that the
+                        # group was deleted between the check and the
+                        # store — and a deleted group has no members
+                        # left to authorize.
+                        pinned = pinned_group(
+                            self.groups, now_resolved["group"]
+                        )
+                        if pinned is None or caller_hash not in (
                             pinned.get("members") or []
                         ):
                             tombstone = {
