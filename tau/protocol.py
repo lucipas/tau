@@ -347,6 +347,23 @@ def sanitize_group_name(name: Any, fallback: str = "group") -> str:
     return cleaned or fallback
 
 
+MAX_GROUP_TOPIC_LENGTH = 140
+
+
+def clean_group_topic(value: Any) -> str:
+    """Normalise a group topic: short printable single-line text.
+
+    Anything absent, blank or non-text cleans to ``""`` (no topic); a
+    longer value is truncated, mirroring :func:`sanitize_group_name`.
+    Callers that must refuse an over-long topic instead check the
+    length before cleaning.
+    """
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(_clean_text(value).split())
+    return cleaned[:MAX_GROUP_TOPIC_LENGTH].strip()
+
+
 def _clean_member_list(value: Any) -> List[str]:
     """Validate a group roster: 2-32 unique 32-hex destination hashes."""
     if not isinstance(value, list):
@@ -394,6 +411,8 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    group_topic: Optional[str] = None,
+    group_topic_sent_at: Optional[float] = None,
     renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
@@ -405,6 +424,12 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
+    the id it claims.  ``group_topic`` rides along when given (``""``
+    clears it); ``None`` omits it, for senders that predate topics.
+    ``group_topic_sent_at`` is the time the topic was set on the
+    sender's clock, so the recipient judges the topic by its own
+    timestamp rather than the message's send time; ``None`` omits it
+    and the recipient falls back to ``sent_at``.
     the id it claims.  ``renamed_from`` carries the group's rename
     lineage (predecessor ids, newest first) when the group was renamed:
     a member that still holds a predecessor learns from this message
@@ -428,6 +453,15 @@ def encode_group_message(
         "creator": _clean_hexhash(creator, "creator"),
         "members": _clean_member_list(members),
     }
+    if group_topic is not None:
+        payload["group_topic"] = clean_group_topic(group_topic)
+    if group_topic_sent_at is not None:
+        try:
+            topic_at = float(group_topic_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            topic_at = None
+        if topic_at is not None and math.isfinite(topic_at):
+            payload["group_topic_sent_at"] = topic_at
     if message_id:
         payload["id"] = message_id
     lineage = _clean_renamed_from(renamed_from)
@@ -462,6 +496,29 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         raise ProtocolError("group creator must be a member of the group")
     if derive_group_id(creator, group_name, members) != group:
         raise ProtocolError("group id does not match its creator and roster")
+    raw_topic = payload.get("group_topic")
+    # ``None`` — the field absent, or non-text — means the sender
+    # predates topics (or sent garbage): the local topic is left alone.
+    # A present string, including "", is authoritative: the creator
+    # clearing a topic sends "".
+    topic = clean_group_topic(raw_topic) if isinstance(raw_topic, str) else None
+    raw_topic_at = payload.get("group_topic_sent_at")
+    topic_sent_at = None
+    if (
+        topic is not None
+        and isinstance(raw_topic_at, (int, float))
+        and not isinstance(raw_topic_at, bool)
+    ):
+        # Convert before the finiteness check: math.isfinite() on a
+        # huge JSON integer raises OverflowError before it can return
+        # False, which would fail parsing before any sender policy
+        # check runs.
+        try:
+            topic_sent_at = float(raw_topic_at)
+        except OverflowError:
+            topic_sent_at = None
+        if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+            topic_sent_at = None
     return {
         "text": text,
         "sent_at": sent_at,
@@ -470,6 +527,8 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "group_topic": topic,
+        "group_topic_sent_at": topic_sent_at,
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),

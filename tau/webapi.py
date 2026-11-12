@@ -3753,6 +3753,7 @@ class WebBridge:
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
+            "topic": group.get("topic", ""),
             # The console only offers member changes on groups this
             # node created; the store refuses anyone else.  A learned
             # group only claims its creator in the message, so it never

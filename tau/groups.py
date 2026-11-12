@@ -35,6 +35,12 @@ The superseded predecessor is only deleted, not retired, because the
 old roster may still be live elsewhere and its messages should be able
 to pin it again.
 
+The creator can also set a short topic (:meth:`GroupStore.set_topic`,
+``tau group topic``): it is metadata, not part of the group id, so it
+survives a roster change into the successor, and it travels in group
+messages — a recipient pins it only from the creator, with the same
+``sent_at`` staleness rule as the roster, so a queued copy cannot
+overwrite a newer topic.
 A member can leave a group they did not create with
 :meth:`GroupStore.leave` (``tau group leave``): the record is deleted
 and the id is remembered as left, so a later group message for it
@@ -73,8 +79,10 @@ except ImportError:  # pragma: no cover - POSIX
 
 from .protocol import (
     MAX_GROUP_MEMBERS,
+    MAX_GROUP_TOPIC_LENGTH,
     MIN_GROUP_MEMBERS,
     ProtocolError,
+    clean_group_topic,
     derive_group_id,
     sanitize_group_name,
 )
@@ -182,9 +190,22 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
     if roster_sent_at is not None:
         try:
             roster_sent_at = float(roster_sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if not math.isfinite(roster_sent_at):
+            return None
+    # The creator-set topic, and the sent_at of the creator message that
+    # last pinned it (None when never set or set locally before any
+    # message carried it).  Same staleness rule as the roster: only a
+    # creator message stamps it, so a queued copy sent before a newer
+    # topic cannot overwrite the newer one.
+    topic_sent_at = raw.get("topic_sent_at")
+    if topic_sent_at is not None:
+        try:
+            topic_sent_at = float(topic_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(topic_sent_at):
             return None
     # Rename lineage: predecessor ids, newest first.  The lineage is
     # not part of the id derivation, so a stored record with a malformed
@@ -213,6 +234,8 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "created_by": creator,
         "local": bool(raw.get("local", False)),
         "roster_sent_at": roster_sent_at,
+        "topic": clean_group_topic(raw.get("topic")),
+        "topic_sent_at": topic_sent_at,
         "renamed_from": renamed_from,
     }
 
@@ -472,6 +495,10 @@ class GroupStore:
                     "creator": existing["creator"],
                     "created_by": existing["creator"],
                     "local": True,
+                    # A roster change is the same group continuing: the
+                    # topic carries into the successor.
+                    "topic": existing.get("topic", ""),
+                    "topic_sent_at": existing.get("topic_sent_at"),
                     "renamed_from": existing.get("renamed_from") or [],
                 }
             )
@@ -494,6 +521,51 @@ class GroupStore:
                 self._restore(snapshot)
                 raise
         return dict(candidate)
+
+    def set_topic(
+        self, group_id: str, topic: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Set the topic of a group this node created (``""`` clears it).
+
+        Only the creator can set it, mirroring roster changes: a
+        member, or the creator of a learned group, is refused.  An
+        over-long topic is refused rather than silently truncated.
+        The local clock stamps the change, so the next message the
+        creator sends carries a newer ``sent_at`` and recipients accept
+        it over any older topic they hold.
+
+        Raises :class:`ValueError` when the group is unknown, was not
+        created by this node, or the topic is too long, and
+        :class:`OSError` when the write fails (the store is left as it
+        was on disk).
+        """
+        if not isinstance(topic, str):
+            raise ValueError("topic must be text")
+        if len(" ".join(topic.split())) > MAX_GROUP_TOPIC_LENGTH:
+            raise ValueError(
+                f"topic is longer than {MAX_GROUP_TOPIC_LENGTH} characters"
+            )
+        cleaned = clean_group_topic(topic)
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can change a group's topic")
+            if existing.get("topic", "") == cleaned:
+                return dict(existing)
+            snapshot = self._snapshot()
+            self._groups[existing["id"]] = {
+                **existing,
+                "topic": cleaned,
+                "topic_sent_at": time.time(),
+            }
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(self._groups[group_id.lower()])
 
     def rename(
         self, group_id: str, new_name: str, *, created_by: str
@@ -589,6 +661,8 @@ class GroupStore:
         creator: str,
         sender: str = "",
         sent_at: Optional[float] = None,
+        topic: Optional[str] = None,
+        topic_sent_at: Optional[float] = None,
         renamed_from: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
@@ -642,14 +716,42 @@ class GroupStore:
         none, cannot prove staleness and is superseded as before, so
         an intentional creator restore (sent after the change, with a
         newer ``sent_at``) still replaces the successor.
+
+        ``topic`` is the topic the message carried, or ``None`` when
+        the sender predates topics.  It is pinned only from the
+        creator: a member's message carries whatever topic that member
+        knows, which must not let a member set the group's topic.  The
+        same staleness rule applies — a queued creator copy sent before
+        a newer topic was set must not overwrite it — with the stamp
+        left alone when the message carries no ``sent_at``.
+        ``topic_sent_at`` is the time the carried topic was set on the
+        sender's clock (``None`` falls back to ``sent_at``): a retried
+        message re-reads the current topic, whose set time can postdate
+        the queued message's send time, so the topic is judged by its
+        own timestamp, not the message's.
         """
         if sent_at is not None:
             try:
                 sent_at = float(sent_at)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 sent_at = None
             if sent_at is not None and not math.isfinite(sent_at):
                 sent_at = None
+        # Normalize the carried topic the same way the wire does: a
+        # non-text value is not a topic at all, and a present string
+        # (including "") is authoritative.
+        topic = clean_group_topic(topic) if isinstance(topic, str) else None
+        # A retried topic carries the time it was set, which can be later
+        # than the queued message's send time; the topic is judged by that.
+        if topic_sent_at is not None:
+            try:
+                topic_sent_at = float(topic_sent_at)
+            except (TypeError, ValueError, OverflowError):
+                topic_sent_at = None
+            if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+                topic_sent_at = None
+        if topic_sent_at is None:
+            topic_sent_at = sent_at
         candidate = _valid_group(
             {
                 "id": group_id,
@@ -679,6 +781,11 @@ class GroupStore:
             # comparison is only meaningful between two timestamps from
             # the creator's own clock.
             candidate["roster_sent_at"] = sent_at
+            if topic is not None:
+                # A first sighting from the creator carries the topic;
+                # one from a member keeps "" — members cannot set it.
+                candidate["topic"] = topic
+                candidate["topic_sent_at"] = topic_sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
             restored = False
@@ -778,6 +885,55 @@ class GroupStore:
                             for other in predecessors
                             if other not in stale_for
                         ]
+                if superseded:
+                    # The topic is judged independently of the roster:
+                    # a successor whose message omits the topic, or
+                    # carries an older one, must not wipe a newer topic
+                    # a predecessor already holds.  Take the newest
+                    # topic among the predecessors being replaced and
+                    # adopt it when the incoming one is older or absent
+                    # (an unstamped incoming topic cannot prove itself
+                    # newer; a tie keeps the incoming message, like the
+                    # same-id rule below).  The candidate is only stored
+                    # when it is a new id; when it re-pins an existing
+                    # one the branch below decides instead.
+                    best_topic = None
+                    best_at = float("-inf")
+                    for other in superseded:
+                        if other.get("topic") is None:
+                            continue
+                        other_at = other.get("topic_sent_at")
+                        other_key = (
+                            other_at
+                            if isinstance(other_at, (int, float))
+                            else float("-inf")
+                        )
+                        if best_topic is None or other_key > best_at:
+                            best_topic = other["topic"]
+                            best_at = other_key
+                    cand_at = (
+                        topic_sent_at
+                        if isinstance(topic_sent_at, (int, float))
+                        else float("-inf")
+                    )
+                    if best_topic is not None and (
+                        topic is None or cand_at < best_at
+                    ):
+                        candidate["topic"] = best_topic
+                        candidate["topic_sent_at"] = (
+                            None if best_at == float("-inf") else best_at
+                        )
+                        # The same reconciled topic governs the
+                        # existing branch below: a successor pinned
+                        # earlier by a member message carries no topic
+                        # of its own, so without this the branch would
+                        # keep the incoming older (or empty) topic
+                        # while the predecessor holding the newer one
+                        # is deleted.
+                        topic = best_topic
+                        topic_sent_at = (
+                            None if best_at == float("-inf") else best_at
+                        )
             # A group named in both lists is replaced once: a
             # predecessor that also shares the successor's name
             # (a rename back) must not be deleted twice or counted
@@ -803,6 +959,7 @@ class GroupStore:
                         del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
             if existing is not None:
                 refreshed = False
+                updates: Dict[str, Any] = {}
                 if (
                     creator_authorized
                     and sent_at is not None
@@ -816,10 +973,35 @@ class GroupStore:
                     # older roster cannot replace it — including one the
                     # node first learned from a member-carried message,
                     # which carries no creator timestamp of its own.
-                    self._groups[existing["id"]] = {
-                        **existing,
-                        "roster_sent_at": sent_at,
-                    }
+                    updates["roster_sent_at"] = sent_at
+                if creator_authorized and topic is not None:
+                    # Only the creator sets the topic, and a queued copy
+                    # sent before the topic now held must not overwrite
+                    # it.  A message with no sent_at cannot prove
+                    # staleness, so it pins the text but leaves the
+                    # stamp alone — clearing it would let an older
+                    # queued copy win afterwards.  An update that
+                    # changes neither the text nor the stamp writes
+                    # nothing, so an ordinary creator message does not
+                    # rewrite the groups file.
+                    existing_topic_at = existing.get("topic_sent_at")
+                    stale = (
+                        existing_topic_at is not None
+                        and topic_sent_at is not None
+                        and topic_sent_at < existing_topic_at
+                    )
+                    if not stale and (
+                        existing.get("topic", "") != topic
+                        or (
+                            topic_sent_at is not None
+                            and topic_sent_at != existing_topic_at
+                        )
+                    ):
+                        updates["topic"] = topic
+                        if topic_sent_at is not None:
+                            updates["topic_sent_at"] = topic_sent_at
+                if updates:
+                    self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True
                 if creator_authorized and renamed_from:
                     # A creator message carries the authoritative
