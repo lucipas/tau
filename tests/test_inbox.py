@@ -994,6 +994,29 @@ def test_new_messages_are_unread_until_marked_read(tmp_path):
     assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
 
 
+def test_unread_counts_ignore_sent_records(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="a2", destination="aa" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    # A sent record past the cursor is your own mail, never unread
+    # for you — it must not inflate the counts.
+    inbox.append(
+        _record(
+            id="sent-1",
+            destination="aa" * 16,
+            received_at=3.0,
+            direction="out",
+        )
+    )
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+    # Received mail after the sent record still counts.
+    inbox.append(_record(id="a3", destination="aa" * 16, received_at=4.0))
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
 def test_mark_read_advances_only_to_up_to(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))
