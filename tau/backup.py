@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from . import __version__
-from .config import ARCHIVED_FILE_NAME, FILES_DIR_NAME, TauConfig
+from .config import ARCHIVED_FILE_NAME, FILES_DIR_NAME, SCHEDULED_POSTS_FILE_NAME, TauConfig
 from .instance_lock import BackupError, InstanceLock
 from .util import atomic_write_json, ensure_dir, read_json
 
@@ -64,6 +64,7 @@ BACKUP_FILES = (
     "allowlist.json",
     "ignored-groups.json",
     ARCHIVED_FILE_NAME,
+    SCHEDULED_POSTS_FILE_NAME,
     "groups.json",
     "blocklist.json",
     RNS_CONFIG_MEMBER,
