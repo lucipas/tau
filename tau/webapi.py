@@ -2834,7 +2834,10 @@ class WebBridge:
         Only messages with a stored inbox copy can be pinned: a queued
         message has no wire id yet, so pinning it would record a pin
         with nothing to attach to.  Other tabs learn through a
-        ``message_updated`` event carrying the annotated entry.
+        ``message_updated`` event carrying the annotated entry — unless
+        the message is from a blocked sender, whose text the listing
+        hides: then no event is published and tabs reconcile on their
+        next poll.
 
         Returns the pinned console id, its wire id, and whether the pin
         is new — pinning an already-pinned message is a no-op, not an
@@ -2893,7 +2896,19 @@ class WebBridge:
         # Set the flag explicitly both ways: clients keep the previous pin
         # state when an update omits it, so an unpin must send false.
         updated["pinned"] = pinned
-        self.bus.publish({"type": "message_updated", "message": updated})
+        # A retained message from a blocked sender stays hidden from the
+        # listing (see messages()); publishing its full text here would
+        # let a remote client read it back from /api/events by pinning
+        # its console id. The pin itself still succeeds — the response
+        # carries no text — and other tabs reconcile on their next poll.
+        blocklist = getattr(self.node, "blocklist", None)
+        hidden = (
+            blocklist is not None
+            and entry.get("direction") == "in"
+            and blocklist.is_blocked(entry.get("destination") or entry.get("peer"))
+        )
+        if not hidden:
+            self._publish_message_updated(updated)
         state = {"id": target, "wire_id": wire_id}
         if pinned:
             state["already_pinned"] = not changed
@@ -4009,7 +4024,7 @@ class WebBridge:
                 )
             ]
         by_target = self._inbox_reactions_by_target()
-        pinned_ids = self._inbox_pinned_ids()
+        pinned_ids = self._inbox_pinned_ids(strict=strict_pins)
         return [
             self._with_inbox_pinned(
                 self._with_inbox_reactions(dict(item), by_target), pinned_ids
@@ -4239,6 +4254,20 @@ class WebBridge:
             message["pinned"] = True
         return message
 
+    def _inbox_annotated(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy *message* with the inbox's reaction and pin overlays.
+
+        The inbox is the durable authority for both, so a copy annotated
+        here agrees with what :meth:`messages` serves — a pin made from
+        the CLI, or a reaction recorded by the node, rides on the event
+        too instead of being silently dropped from the payload.
+        """
+        by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids()
+        return self._with_inbox_pinned(
+            self._with_inbox_reactions(dict(message), by_target), pinned_ids
+        )
+
     def _publish_message_updated(self, message: Dict[str, Any]) -> None:
         """Publish a ``message_updated`` carrying the inbox's overlays.
 
@@ -4247,12 +4276,9 @@ class WebBridge:
         reaction would replace a pinned bubble with a payload that reads
         as unpinned in every open tab.
         """
-        by_target = self._inbox_reactions_by_target()
-        pinned_ids = self._inbox_pinned_ids()
-        updated = self._with_inbox_pinned(
-            self._with_inbox_reactions(dict(message), by_target), pinned_ids
+        self.bus.publish(
+            {"type": "message_updated", "message": self._inbox_annotated(message)}
         )
-        self.bus.publish({"type": "message_updated", "message": updated})
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
@@ -6320,13 +6346,3 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
-   return default
-    return max(minimum, min(value, maximum))
-   return max(minimum, min(value, maximum))
-lues[0])
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(value, maximum))
-   return default
-    return max(minimum, min(value, maximum))
-   return max(minimum, min(value, maximum))

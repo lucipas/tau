@@ -1013,6 +1013,29 @@ describe("useTau pinned view", () => {
     expect(result.current.pinnedMessages).toEqual([]);
   });
 
+  it("inserts a newly pinned message into an open pinned view", async () => {
+    const older = makeMessage({ id: 1, text: "older pin", pinned: true });
+    const newer = makeMessage({ id: 2, text: "newer pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [older], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+    expect(result.current.pinnedMessages).toEqual([older]);
+
+    // Another tab pinned a message this view does not list yet: the pin
+    // event inserts it newest first instead of waiting for a reopen.
+    act(() => {
+      FakeEventSource.instances[0].emit("message_updated", {
+        message: newer,
+      });
+    });
+
+    expect(result.current.pinnedMessages).toEqual([newer, older]);
+  });
+
   it("keeps the pin on an update that omits the pinned flag", async () => {
     const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
     mockedGet.mockResolvedValue({ messages: [pin], count: 1 });

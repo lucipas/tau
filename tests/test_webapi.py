@@ -7104,6 +7104,43 @@ def test_pin_message_endpoint_rejects_queued_entry(bridge, node):
     assert "still queued" in payload["error"]["message"]
 
 
+def test_pin_message_does_not_publish_blocked_message(bridge, node):
+    # A message received before its sender was blocked is retained but
+    # hidden from the listing; pinning it must not publish its text to
+    # /api/events, where a remote client could read it back by id.
+    _seed_pinnable_message(bridge, node)
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["already_pinned"] is False
+    # The pin itself landed — only the event is suppressed.
+    assert [
+        entry["id"] for entry in node.inbox.list_messages(pinned_only=True)
+    ] == ["wire-1"]
+    assert [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ] == []
+
+
+def test_messages_pinned_reports_inbox_read_failure(bridge, node, monkeypatch):
+    _seed_pinnable_message(bridge, node)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("inbox unreadable")
+
+    monkeypatch.setattr(node.inbox, "list_messages", _boom)
+    # The pinned view reports the failure instead of an empty pin list.
+    with pytest.raises(RuntimeError, match="inbox unreadable"):
+        bridge.messages(limit=-1, strict_pins=True)
+    # The live feed stays up: a failed pin overlay degrades to no pins.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "pinned" not in feed["messages"][0]
+
+
 def test_delete_by_wire_id_removes_the_console_copy(bridge):
     bridge.record_inbound(
         {

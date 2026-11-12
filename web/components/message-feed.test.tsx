@@ -429,7 +429,7 @@ describe("MessageFeed pins", () => {
   });
 
   it("pins an unpinned message", async () => {
-    const message = makeMessage();
+    const message = makeMessage({ wire_id: "a".repeat(32) });
     const onPin = vi.fn(async () => {});
     render(
       <MessageFeed
@@ -446,7 +446,7 @@ describe("MessageFeed pins", () => {
   });
 
   it("marks a pinned message and offers to unpin it", async () => {
-    const message = makeMessage({ pinned: true });
+    const message = makeMessage({ pinned: true, wire_id: "a".repeat(32) });
     const onPin = vi.fn(async () => {});
     render(
       <MessageFeed
@@ -480,13 +480,28 @@ describe("MessageFeed pins", () => {
     expect(screen.queryByTitle("Pin this message")).toBeNull();
   });
 
+  it("hides the pin button when the message has no stored copy", () => {
+    // A console entry from before wire ids existed has no inbox record
+    // to pin; the button stays hidden instead of offering a pin the
+    // bridge would refuse.
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onPin={vi.fn(async () => {})}
+      />,
+    );
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
   it("reports a failed pin inline and keeps the message", async () => {
     const onPin = vi.fn(async () => {
       throw new Error("boom");
     });
     render(
       <MessageFeed
-        messages={[makeMessage()]}
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
         node={null}
         live={true}
         onPin={onPin}
