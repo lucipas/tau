@@ -12,11 +12,14 @@ from tau.protocol import (
     ProtocolError,
     build_announce,
     decode,
+    derive_group_id,
     encode,
+    encode_group_message,
     encode_message,
     excerpt_hash,
     normalize_message,
     parse_announce,
+    parse_group_message,
     parse_message,
     response_error,
     response_ok,
@@ -161,6 +164,65 @@ def test_message_rejects_malformed_reply():
         )
 
 
+def test_group_message_roundtrip_with_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    data = encode_group_message(
+        "seconded",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        in_reply_to=reply_to,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "seconded"
+    assert parsed["id"] == "b" * 32
+    assert parsed["in_reply_to"] == reply_to
+
+
+def test_group_message_without_reply_has_no_reference():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    data = encode_group_message(
+        "hello all",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+    )
+    assert parse_group_message(data)["in_reply_to"] is None
+
+
+def test_group_message_rejects_malformed_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    group_id = derive_group_id(members[0], "weekend", members)
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=group_id,
+            group_name="weekend",
+            creator=members[0],
+            members=members,
+            in_reply_to={"id": ""},
+        )
+    with pytest.raises(ProtocolError):
+        parse_group_message(
+            encode(
+                {
+                    "type": "group_message",
+                    "text": "hi",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "creator": members[0],
+                    "members": members,
+                    "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
 def test_excerpt_hash_is_stable_short_hex():
     assert excerpt_hash("original thought") == excerpt_hash("original thought")
     assert len(excerpt_hash("original thought")) == 16
@@ -197,10 +259,12 @@ def test_message_without_kind_parses_as_chat():
         "１",
         "١",
         # Reserved inbox record types, never a DM kind: a message
-        # tagged "group" or "file" could never be stored in the
+        # tagged "group", "file" or "note" could never be stored in the
         # recipient's inbox.
         "group",
         "file",
+        "note",
+        "NOTE",
         "GROUP",
     ],
 )

@@ -315,9 +315,11 @@ class FakeNode:
         }
 
     def send_group_message(
-        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True
+        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
+        expires_at=None,
     ):
         self.group_sent.append((group["name"], text))
+        self.last_group_expires_at = expires_at
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -839,6 +841,26 @@ def test_send_group_message_records_one_entry_per_leg(bridge, node):
     assert sum(1 for e in events if e["type"] == "message") == 2
 
 
+def test_send_group_message_accepts_expires_in(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "vanish soon", "expires_in": 3600},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    expires_at = node.last_group_expires_at
+    assert expires_at is not None
+    assert before + 3590 <= expires_at <= time.time() + 3610
+    # Every leg's feed entry carries the deadline, like a sent DM.
+    assert all(m["expires_at"] == expires_at for m in payload["messages"])
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert all(m["expires_at"] == expires_at for m in feed["messages"])
+
+
 def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     status, _, payload = _json(
@@ -943,7 +965,16 @@ def test_send_group_message_validation(bridge, node):
         bridge,
         "/api/messages",
         method="POST",
-        body={"group": "crew", "text": "hi", "expires_in": 60},
+        body={"group": "crew", "text": "hi", "expires_in": -5},
+    )
+    assert status == 400
+    assert "expires_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "expires_in": "soon"},
     )
     assert status == 400
     assert "expires_in" in payload["error"]["message"]
@@ -1219,6 +1250,7 @@ def test_api_groups_lists_known_groups(bridge, node, tmp_path):
     assert payload["count"] == 1
     group = payload["groups"][0]
     assert group["name"] == "weekend"
+    assert group["topic"] == ""
     assert [member["hash"] for member in group["members"]] == [
         PEER_HASH,
         OTHER_HASH,
@@ -1339,6 +1371,277 @@ def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     assert payload["deleted"] == {"id": created["id"], "name": "weekend"}
     _, _, listed = _json(bridge, "/api/groups")
     assert listed["count"] == 0
+
+
+def _add_carol_to_registry(node):
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="carol",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+
+
+def test_api_groups_add_member_returns_successor_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # The roster changed, so the group is a successor with a new id.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert payload["group"]["name"] == "weekend"
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, OTHER_HASH, node.destination_hexhash])
+    assert payload["group"]["created_by_me"] is True
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == payload["group"]["id"]
+
+
+def test_api_groups_remove_member_drops_offline_member(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    # Carol goes offline: she leaves the registry, but the roster hash
+    # is enough to drop her without a lookup.
+    node.registry._peers = [
+        peer for peer in node.registry._peers if peer.hexhash != OTHER_HASH
+    ]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, node.destination_hexhash])
+
+
+def test_api_groups_add_member_accepts_a_name(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": ["carol"]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_change_members_refuses_ambiguous_names(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    # A second peer asserts the same name: neither add nor remove may
+    # guess which carol the caller means.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex("99" * 16),
+            name="carol",
+            public_key=b"\x03" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    for path in ("/api/groups/add-member", "/api/groups/remove-member"):
+        status, _, payload = _json(
+            bridge,
+            path,
+            method="POST",
+            body={"group": "weekend", "members": ["carol"]},
+        )
+        assert status == 400, path
+        assert "are named" in payload["error"]["message"], path
+    # The roster hash still removes exactly one carol, unambiguously.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_learned_group_is_not_created_by_me(bridge, node, tmp_path):
+    from tau.groups import GroupStore, derive_group_id
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    # A group learned from the mesh that merely claims this node as
+    # its creator: the console must not offer member changes for it.
+    group_id = derive_group_id(
+        node.destination_hexhash,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+    )
+    assert node.groups.record(
+        group_id,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+        creator=node.destination_hexhash,
+        sender=PEER_HASH,
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "learned"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "learned", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
+def test_api_groups_change_members_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    cases = [
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": ["00" * 16]},
+            "unknown peer",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [PEER_HASH]},
+            "already a member",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "already a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [OTHER_HASH]},
+            "is not a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "cannot remove the creator",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": []},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend"},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"members": [OTHER_HASH]},
+            "field 'group' is required",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "nope", "members": [OTHER_HASH]},
+            "unknown group",
+        ),
+    ]
+    for path, body, message in cases:
+        status, _, payload = _json(bridge, path, method="POST", body=body)
+        assert status == 400, (path, body)
+        assert message in payload["error"]["message"], (path, body)
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == created["id"]
+
+
+def test_api_groups_change_members_refuses_non_creator(bridge, node):
+    # The fixture group "crew" was created by alice, not this node.
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "crew"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "crew", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "crew", "members": [PEER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
 
 
 def test_api_groups_delete_sees_group_created_by_another_store(
@@ -7412,11 +7715,12 @@ def test_messages_export_import_via_api(bridge, node):
         assert payload["import"]["present"] == 0
         assert payload["import"]["skipped"] == 0
         assert payload["import"]["errors"] == []
-        # Restored mail advances the unread counts: both entries sit
-        # after the (absent) read cursor, so the fresh counts ride
-        # along with the import result.
-        assert payload["import"]["unread"]["total"] == 2
-        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 2}
+        # Restored mail advances the unread counts: the received entry
+        # sits after the (absent) read cursor, so the fresh counts ride
+        # along with the import result.  The restored sent reply does
+        # not count — sent mail is never unread for its owner.
+        assert payload["import"]["unread"]["total"] == 1
+        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 1}
         _, _, feed = _json(bridge2, "/api/messages")
         assert [m["text"] for m in feed["messages"]] == ["hello", "reply back"]
         assert feed["messages"][0]["direction"] == "in"
@@ -7444,6 +7748,45 @@ def test_messages_export_import_via_api(bridge, node):
         )
         assert status == 200
         assert payload["import"]["skipped"] == 0
+    finally:
+        bridge2.stop()
+
+
+def test_messages_import_skips_a_retracted_message(bridge, node, tmp_path):
+    # Regression test for the CodeRabbit Major: the console import
+    # must apply the retraction markers like the CLI does, or an old
+    # export resurrects a message its sender retracted — and mirrors
+    # it into the console feed.
+    _inbound_record(node)
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": PEER_HASH,
+            "text": "reply back",
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "m-2",
+            "direction": "out",
+        }
+    )
+    _, _, document = _json(bridge, "/api/messages/export")
+
+    node2 = FakeNode(tmp_path / "mailbox2.json")
+    bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+    bridge2.start()
+    try:
+        node2.mailbox.record_retraction(PEER_HASH, "m-1")
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 1
+        assert payload["import"]["skipped"] == 1
+        assert payload["import"]["errors"] == [
+            {"id": "m-1", "error": "message was retracted by its sender"}
+        ]
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert [m["text"] for m in feed["messages"]] == ["reply back"]
     finally:
         bridge2.stop()
 

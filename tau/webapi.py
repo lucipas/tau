@@ -14,12 +14,17 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/peers/block   block ``{"target": "<name, hash or prefix>"}``
     POST /api/peers/unblock unblock ``{"target": "<name, hash or prefix>"}``
     GET  /api/groups       known group DMs with their member lists
+    POST /api/groups       create ``{"name": "...", "members": ["<hash>", ...]}``
+    POST /api/groups/delete delete ``{"group": "<id | prefix | name>"}``
+    POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
+    POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     GET  /api/messages     recent inbound/outbound messages
     GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
-                           (one outbound entry per member; replies and expiry are peer-DM-only)
+                           (one outbound entry per member; replies are peer-DM-only,
+                           ``expires_in`` works for DM and group sends)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -2210,7 +2215,9 @@ class WebBridge:
         with its error recorded and never aborts the rest. Newly
         imported entries are also mirrored into the console feed, so
         restored messages show up right away instead of landing in
-        the inbox only.
+        the inbox only. A message its sender retracted is skipped
+        like on the command line, so an old export cannot resurrect
+        it — or mirror it into the feed.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
@@ -2218,7 +2225,19 @@ class WebBridge:
         # The inbox reports the records this call stored, so a concurrent
         # import or live arrival can never make the same entry mirror twice.
         inserted: List[Dict[str, Any]] = []
-        result = inbox.import_messages(document, inserted=inserted)
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is not None:
+            # Like the CLI import: hold the mailbox transaction across
+            # the import so a retract persisted by a running node is
+            # seen, and it cannot land between the check and the insert.
+            with mailbox.transaction():
+                result = inbox.import_messages(
+                    document,
+                    inserted=inserted,
+                    is_retracted=mailbox.is_retracted,
+                )
+        else:
+            result = inbox.import_messages(document, inserted=inserted)
         # An invalid entry's id comes from untrusted JSON and may hold
         # a lone surrogate, which the UTF-8 response encoder cannot
         # write. Replace unencodable characters so the counts still
@@ -2517,8 +2536,15 @@ class WebBridge:
         text: str,
         *,
         timeout: float = 20.0,
+        expires_at: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Send a message to every member of a group from the console.
+
+        ``expires_at`` is an optional sender-set expiry (epoch seconds),
+        exactly like a direct message: it travels in every leg's
+        payload, a queued leg expires at the same deadline, and the
+        receiver purges the message once it passes.  The outbound feed
+        entry carries it too, so the console can show the deadline.
 
         The group is resolved by id, id prefix, or exact name through
         ``GroupStore.find`` (unknown or ambiguous queries raise
@@ -2538,6 +2564,12 @@ class WebBridge:
             raise ValueError("message text is required")
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is longer than {MAX_MESSAGE_CHARS} characters")
+        if expires_at is not None:
+            if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+                raise ValueError("expires_at must be a number")
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                raise ValueError("expires_at must be a finite number")
         # Normalise up front so the recorded text is exactly what gets
         # sent: the node normalises again before sending, so this cannot
         # change delivery.
@@ -2548,7 +2580,7 @@ class WebBridge:
         self.node.groups.list_groups()
         group_record = self.node.groups.find(group.strip())
         response = self.node.send_group_message(
-            group_record, text, timeout=timeout
+            group_record, text, timeout=timeout, expires_at=expires_at
         )
         messages: List[Dict[str, Any]] = []
         for result in response.get("results") or []:
@@ -2584,6 +2616,7 @@ class WebBridge:
                     mail_id=mail_id,
                     group=group_record["id"],
                     group_name=group_record.get("name") or "",
+                    expires_at=expires_at,
                     wire_id=wire_id,
                 )
                 with self._lock:
@@ -3721,6 +3754,13 @@ class WebBridge:
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
+            "topic": group.get("topic", ""),
+            # The console only offers member changes on groups this
+            # node created; the store refuses anyone else.  A learned
+            # group only claims its creator in the message, so it never
+            # counts, even when it names this node.
+            "created_by_me": bool(group.get("local"))
+            and group.get("creator") == self.node.destination_hexhash,
         }
 
     def create_group(self, name: str, members: List[str]) -> Dict[str, Any]:
@@ -3766,6 +3806,90 @@ class WebBridge:
         if not self.node.groups.delete(group["id"]):
             raise ValueError(f"unknown group: {query.strip()!r}")
         return {"id": group["id"], "name": group["name"]}
+
+    def change_group_members(
+        self, query: str, members: List[str], *, adding: bool
+    ) -> Dict[str, Any]:
+        """Add peers to, or remove peers from, a group from the console.
+
+        Mirrors ``tau group add-member`` / ``tau group remove-member``:
+        only the group's creator can change its members, adding refuses
+        an unknown peer before the roster changes, and removing only
+        needs the hash already in the roster, so an offline member can
+        still be dropped.  The id derives from the roster, so the change
+        is a successor group (same name, new id); the old id is reported
+        as ``previous_id``.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("field 'group' is required")
+        if (
+            not isinstance(members, list)
+            or not members
+            or any(
+                not isinstance(member, str) or not member.strip()
+                for member in members
+            )
+        ):
+            raise ValueError("field 'members' must be a non-empty list")
+        group = self.node.groups.find(query.strip())
+        own_hash = self.node.destination_hexhash
+        if not group["local"] or group["creator"] != own_hash:
+            raise ValueError("only the creator can change a group's members")
+        roster = list(group["members"])
+        for target in members:
+            cleaned = target.strip().lower()
+            if adding:
+                # The creator is always a member, so this is refused
+                # before the registry lookup: the node's own hash is
+                # not in the registry.
+                if cleaned == own_hash:
+                    raise ValueError("the creator is already a member")
+                try:
+                    peer = self.node.registry.resolve(cleaned)
+                except PeerError as exc:
+                    raise ValueError(str(exc)) from exc
+                if peer is None:
+                    raise ValueError(f"unknown peer: {cleaned}")
+                resolved = peer.destination_hash.hex()
+                if resolved in roster:
+                    raise ValueError(
+                        f"{peer.display_name} is already a member of"
+                        f" {group['name']!r}"
+                    )
+                roster.append(resolved)
+            else:
+                # A roster hash drops the member without a registry
+                # lookup, so an offline member can still be removed.
+                # Anything else resolves through the registry first,
+                # so the picker can pass a name as well as a hash.
+                if len(cleaned) == 32 and cleaned in roster:
+                    resolved = cleaned
+                else:
+                    try:
+                        peer = self.node.registry.resolve(cleaned)
+                    except PeerError as exc:
+                        raise ValueError(str(exc)) from exc
+                    if peer is None:
+                        raise ValueError(
+                            f"{target.strip()} is not a member of"
+                            f" {group['name']!r}"
+                        )
+                    resolved = peer.destination_hash.hex()
+                    if resolved not in roster:
+                        raise ValueError(
+                            f"{peer.display_name} is not a member of"
+                            f" {group['name']!r}"
+                        )
+                if resolved == own_hash:
+                    raise ValueError("cannot remove the creator from the group")
+                roster.remove(resolved)
+        new_group = self.node.groups.update_members(
+            group["id"], roster, created_by=own_hash
+        )
+        return {
+            "group": self._describe_group(new_group),
+            "previous_id": group["id"],
+        }
 
     def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
@@ -4761,6 +4885,32 @@ class _WebHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "deleted": deleted}, head_only)
                 return
+            if path in (
+                "/api/groups/add-member",
+                "/api/groups/remove-member",
+            ):
+                target = body.get("group")
+                if not isinstance(target, str) or not target.strip():
+                    self._send_json(
+                        {"error": {"message": "field 'group' is required"}},
+                        head_only,
+                        400,
+                    )
+                    return
+                try:
+                    changed = self.bridge.change_group_members(
+                        target.strip(),
+                        body.get("members"),
+                        adding=(path == "/api/groups/add-member"),
+                    )
+                except (ValueError, ProtocolError) as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+                    return
+                except OSError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                    return
+                self._send_json({"ok": True, **changed}, head_only)
+                return
             if path == "/api/outbox/retry":
                 self._handle_outbox_retry(body, head_only)
                 return
@@ -5321,9 +5471,9 @@ class _WebHandler(BaseHTTPRequestHandler):
         head_only: bool,
     ) -> None:
         # A group send is addressed by group, not by peer, so the two
-        # forms are exclusive; the node group path supports neither
-        # reply quoting nor expiry, so those are rejected outright
-        # instead of silently dropped.
+        # forms are exclusive; the node group path supports no reply
+        # quoting, so that is rejected outright instead of silently
+        # dropped.
         if body.get("to") is not None:
             self._send_json(
                 {"error": {"message": "give 'to' or 'group', not both"}},
@@ -5351,17 +5501,25 @@ class _WebHandler(BaseHTTPRequestHandler):
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             timeout = 20.0
         timeout = max(1.0, min(float(timeout), 120.0))
+        expires_at = None
         if expires_in is not None:
-            self._send_json(
-                {
-                    "error": {
-                        "message": "group sends do not support 'expires_in'"
-                    }
-                },
-                head_only,
-                400,
-            )
-            return
+            if (
+                not isinstance(expires_in, (int, float))
+                or isinstance(expires_in, bool)
+                or not _valid_expires_in(expires_in)
+            ):
+                self._send_json(
+                    {
+                        "error": {
+                            "message": "field 'expires_in' must be a number of "
+                            "seconds between 0 and 30 days"
+                        }
+                    },
+                    head_only,
+                    400,
+                )
+                return
+            expires_at = time.time() + float(expires_in)
         if body.get("reply_to") is not None:
             self._send_json(
                 {"error": {"message": "group sends do not support 'reply_to'"}},
@@ -5371,7 +5529,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             messages, response = self.bridge.send_group_message(
-                group.strip(), text, timeout=timeout
+                group.strip(), text, timeout=timeout, expires_at=expires_at
             )
         except ValueError as exc:
             # GroupStore.find raises ValueError for both an unknown

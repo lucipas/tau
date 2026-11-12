@@ -353,6 +353,8 @@ Global options may appear before or after the command:
 | `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
 | `tau peers unalias PEER` | Remove a peer's local alias |
 | `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
+| `tau note TEXT` | Save a private note to self in the local inbox (never sent; list with `tau messages --kind note`) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -706,7 +708,14 @@ identity and verified by the receiver against the link identity, like a
 reaction, and the receiver only deletes a message the caller actually
 sent: a retract from anyone else fails with `not_sender`, and a retract
 for an id the receiver never held answers ok with nothing deleted, so
-retries are safe. Group messages cannot be retracted in v1 — a group
+retries are safe. A retract also leaves a marker keyed by (sender,
+message id) that lives for the message's delivery lifetime (7 days),
+unless the marker cap is reached first — at the cap the
+earliest-expiry markers are evicted, even unexpired ones — so a
+sealed relay copy that arrives after the retract — or after the
+id leaves the receiver's seen cache — is dropped instead of stored,
+and `tau messages import` skips the message instead of resurrecting
+it. Group messages cannot be retracted in v1 — a group
 message lives in every member's inbox, and deleting it from one member
 alone would silently half-retract it.
 
@@ -974,6 +983,12 @@ unlinked, and stall sync at the gap.
   group that includes you, gated by the DM allow-list like a direct message.
   Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
+  Manage groups with `tau group create NAME --peer ...`, `tau group list`,
+  `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
+  `tau group rename GROUP NEW-NAME` (creator only; a rename is a successor
+  group, so members learn the new name — and retire the old one — from the
+  next message sent to it, and `tau messages --group` history spans the
+  rename), and `tau group delete`.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts, edit their own posts, and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
