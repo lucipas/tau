@@ -358,6 +358,15 @@ export interface DeleteMessageResponse {
   deleted: { id: number; wire_id?: string | null };
 }
 
+export interface RetractMessageResponse {
+  ok: boolean;
+  retracted: { id: number; wire_id?: string | null };
+  // Whether the peer had a copy to delete; false is not an error.
+  deleted: boolean;
+  // The retract's own wire id, when the peer answered one.
+  id?: string | null;
+}
+
 // POST /api/messages/pin: the pinned console id and wire id, plus
 // whether the pin already existed (a re-pin is a no-op, not an error).
 export interface PinMessageResponse {

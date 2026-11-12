@@ -38,6 +38,7 @@ import type {
   PinMessageResponse,
   ReactResponse,
   RenameResponse,
+  RetractMessageResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
@@ -207,6 +208,11 @@ export function useTau() {
 
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
+  // Console ids removed by a delete or retract in this tab. A search
+  // that ran before the removal keeps its stale hits in state, and a
+  // search re-run after it still lists the record until the inbox
+  // copy is gone — either way the removed id must not come back.
+  const removedMessageIds = useRef(new Set<number>());
   const pinnedSeq = useRef(0);
   // Bumped on every live pin or unpin, so a pinned GET that raced one
   // is asked again rather than overwriting the newer event.
@@ -368,7 +374,11 @@ export function useTau() {
       // console id arrives under `message_id` instead.
       const payload = readEventData<{ message_id: number }>(event);
       if (!payload || typeof payload.message_id !== "number") return;
+      removedMessageIds.current.add(payload.message_id);
       setMessages((previous) =>
+        previous.filter((entry) => entry.id !== payload.message_id),
+      );
+      setSearchResults((previous) =>
         previous.filter((entry) => entry.id !== payload.message_id),
       );
       setPinnedMessages((previous) =>
@@ -689,7 +699,28 @@ export function useTau() {
     setMessages((previous) =>
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
+    removedMessageIds.current.add(result.deleted.id);
+    setSearchResults((previous) =>
+      previous.filter((entry) => entry.id !== result.deleted.id),
+    );
     return result.deleted;
+  }, []);
+
+  const retractMessage = useCallback(async (id: number) => {
+    const result = await apiPost<RetractMessageResponse>(
+      "/api/messages/retract",
+      { id },
+    );
+    // The retract already succeeded: drop the bubble locally at once,
+    // and let the message_deleted event reconcile other tabs.
+    removedMessageIds.current.add(result.retracted.id);
+    setMessages((previous) =>
+      previous.filter((entry) => entry.id !== result.retracted.id),
+    );
+    setSearchResults((previous) =>
+      previous.filter((entry) => entry.id !== result.retracted.id),
+    );
+    return result;
   }, []);
 
   const pinMessage = useCallback(async (id: number) => {
@@ -1427,7 +1458,11 @@ export function useTau() {
         `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
       );
       if (seq !== searchSeq.current) return;
-      setSearchResults(result.messages);
+      setSearchResults(
+        result.messages.filter(
+          (entry) => !removedMessageIds.current.has(entry.id),
+        ),
+      );
       setSearchError(null);
     } catch (caught) {
       if (seq !== searchSeq.current) return;
@@ -1538,6 +1573,7 @@ export function useTau() {
     importing,
     send,
     deleteMessage,
+    retractMessage,
     sendGroup,
     sendFile,
     ping,
