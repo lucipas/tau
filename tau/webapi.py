@@ -1063,7 +1063,7 @@ class WebBridge:
         # Persist the flip like any other log change, so a restart does
         # not resurrect the message as queued.
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_read(
@@ -1111,7 +1111,7 @@ class WebBridge:
             return updated
         self._save_messages()
         for message in updated:
-            self.bus.publish({"type": "message_updated", "message": message})
+            self._publish_message_updated(message)
         return updated
 
     def mark_displayed_read(self) -> None:
@@ -1251,7 +1251,7 @@ class WebBridge:
         if updated is None:
             return None
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2530,9 +2530,7 @@ class WebBridge:
                 self._save_messages()
         self.bus.publish({"type": "message", "message": message})
         if flipped:
-            self.bus.publish(
-                {"type": "message_updated", "message": dict(message)}
-            )
+            self._publish_message_updated(message)
         return message, response
 
     def send_group_message(
@@ -2643,9 +2641,7 @@ class WebBridge:
                     self._save_messages()
             self.bus.publish({"type": "message", "message": message})
             if flipped:
-                self.bus.publish(
-                    {"type": "message_updated", "message": dict(message)}
-                )
+                self._publish_message_updated(message)
             messages.append(message)
         return messages, response
 
@@ -2893,9 +2889,10 @@ class WebBridge:
             )
         except InboxError as exc:
             raise ValueError(str(exc)) from exc
-        updated = self._with_inbox_pinned(
-            dict(entry), self._inbox_pinned_ids()
-        )
+        updated = self._inbox_annotated(entry)
+        # Set the flag explicitly both ways: clients keep the previous pin
+        # state when an update omits it, so an unpin must send false.
+        updated["pinned"] = pinned
         self.bus.publish({"type": "message_updated", "message": updated})
         state = {"id": target, "wire_id": wire_id}
         if pinned:
@@ -3971,7 +3968,9 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
-    def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def messages(
+        self, limit: int = 200, *, strict_pins: bool = False
+    ) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -4194,13 +4193,17 @@ class WebBridge:
         message["reactions"] = list(merged.values())
         return message
 
-    def _inbox_pinned_ids(self) -> Set[str]:
+    def _inbox_pinned_ids(self, *, strict: bool = False) -> Set[str]:
         """Wire ids of pinned inbox messages, reloaded once per read.
 
         One reload serves the whole listing, like
         :meth:`_inbox_reactions_by_target`: the inbox is the durable
         authority for pins, so a pin made from another process (``tau
         pin`` from the CLI) shows up on the next read.
+
+        A read failure is logged and treated as no pin overlay for the
+        live stream; with ``strict`` it propagates, so the pinned view
+        reports the error instead of an empty pin list.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
@@ -4209,7 +4212,10 @@ class WebBridge:
             pinned = inbox.list_messages(
                 pinned_only=True, direction=None, limit=None
             )
-        except Exception:  # pragma: no cover - defensive
+        except Exception:
+            if strict:
+                raise
+            log.warning("Could not read inbox pins", exc_info=True)
             return set()
         return {
             str(entry.get("id"))
@@ -4232,6 +4238,21 @@ class WebBridge:
         if wire_id and wire_id in pinned_ids:
             message["pinned"] = True
         return message
+
+    def _publish_message_updated(self, message: Dict[str, Any]) -> None:
+        """Publish a ``message_updated`` carrying the inbox's overlays.
+
+        Every update goes through here so the reaction and pin state the
+        inbox holds rides on the event too.  Otherwise a receipt or a
+        reaction would replace a pinned bubble with a payload that reads
+        as unpinned in every open tab.
+        """
+        by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids()
+        updated = self._with_inbox_pinned(
+            self._with_inbox_reactions(dict(message), by_target), pinned_ids
+        )
+        self.bus.publish({"type": "message_updated", "message": updated})
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
@@ -4586,7 +4607,7 @@ class _WebHandler(BaseHTTPRequestHandler):
                     if pinned_only
                     else _int_param(query, "limit", default=200, minimum=1, maximum=500)
                 )
-                items = self.bridge.messages(limit)
+                items = self.bridge.messages(limit, strict_pins=pinned_only)
                 if pinned_only:
                     items = [item for item in items if item.get("pinned")]
                 self._send_json({"messages": items}, head_only)
@@ -6299,3 +6320,13 @@ def _int_param(
     except (TypeError, ValueError):
         return default
     return max(minimum, min(value, maximum))
+   return default
+    return max(minimum, min(value, maximum))
+   return max(minimum, min(value, maximum))
+lues[0])
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+   return default
+    return max(minimum, min(value, maximum))
+   return max(minimum, min(value, maximum))

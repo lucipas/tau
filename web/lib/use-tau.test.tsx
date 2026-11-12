@@ -1002,13 +1002,36 @@ describe("useTau pinned view", () => {
     expect(result.current.pinnedMessages).toEqual([pin]);
 
     // The bridge re-sends the message as `message_updated` after an
-    // unpin; the pinned view must drop it, not leave a stale bubble.
+    // unpin, with `pinned: false`; the pinned view must drop it, not
+    // leave a stale bubble.
     act(() => {
       FakeEventSource.instances[0].emit("message_updated", {
-        message: { ...pin, pinned: undefined },
+        message: { ...pin, pinned: false },
       });
     });
 
     expect(result.current.pinnedMessages).toEqual([]);
+  });
+
+  it("keeps the pin on an update that omits the pinned flag", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+
+    // A delivery-style update without `pinned` must not clear the pin.
+    act(() => {
+      FakeEventSource.instances[0].emit("message_updated", {
+        message: { ...pin, pinned: undefined, status: "read" },
+      });
+    });
+
+    expect(result.current.pinnedMessages).toEqual([
+      { ...pin, pinned: true, status: "read" },
+    ]);
   });
 });
