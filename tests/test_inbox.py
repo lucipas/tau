@@ -1635,6 +1635,258 @@ def test_reactions_persist_across_instances(tmp_path):
     assert reloaded.reactions_for("msg-1")[0]["reaction"] == "👍"
 
 
+def _group_copy(**overrides):
+    record = _record(
+        kind="group",
+        group="cd" * 16,
+        group_name="crew",
+        destination="aa" * 16,
+        sent_at=100.0,
+        received_at=101.0,
+        id="local-copy-1",
+    )
+    record.update(overrides)
+    return record
+
+
+def test_find_group_message_sees_copy_imported_by_another_process(tmp_path):
+    # A copy imported by a second process (``tau import`` while ``tau
+    # serve`` runs) must be visible to the lookup: the serving inbox's
+    # in-memory cache alone would miss it and strand the reaction
+    # under a foreign wire id.
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    assert inbox.find_group_message("cd" * 16, "aa" * 16, 100.0) is None
+    Inbox(path).append(_group_copy())
+    found = inbox.find_group_message("cd" * 16, "aa" * 16, 100.0)
+    assert found is not None
+    assert found["id"] == "local-copy-1"
+
+
+def test_group_reaction_context_survives_a_reload(tmp_path):
+    path = tmp_path / "inbox.json"
+    Inbox(path).record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    reloaded = Inbox(path)
+    stored = reloaded.all_reactions()
+    assert len(stored) == 1
+    assert stored[0]["group"] == "cd" * 16
+    assert stored[0]["target_author"] == "aa" * 16
+    assert stored[0]["target_sent_at"] == 100.0
+
+
+def test_reconcile_group_reactions_retargets_onto_arriving_copy(tmp_path):
+    # The reaction arrived before the message: stored under the
+    # reactor's foreign wire id, invisible.  When the copy lands, it
+    # moves onto the local id so it displays under the message.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    assert inbox.reactions_for("foreign-leg-1") != []
+    assert inbox.reactions_for("local-copy-1") == []
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1",
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert moved == 1
+    assert inbox.reactions_for("foreign-leg-1") == []
+    shown = inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+
+
+def test_reconcile_group_reactions_skips_non_members(tmp_path):
+    # An allow-listed outsider's reaction stays stranded: it was
+    # stored before the group was pinned, and the roster on arrival
+    # does not name the reactor, so it must never surface.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            destination="ff" * 16,
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1",
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert moved == 0
+    assert inbox.reactions_for("local-copy-1") == []
+    assert len(inbox.reactions_for("foreign-leg-1")) == 1
+
+
+def test_reconcile_group_reactions_keeps_newer_reaction_on_copy(tmp_path):
+    # The reactor reacted again after the copy arrived, so the copy
+    # already carries their newer reaction: retargeting the older
+    # pre-arrival one must not override it.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="local-copy-1",
+            sent_at=30.0,
+            received_at=31.0,
+            id="react-new",
+            reaction="❤️",
+        )
+    )
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            sent_at=20.0,
+            received_at=21.0,
+            id="react-old",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1"
+    )
+    assert moved == 0
+    assert [item["reaction"] for item in inbox.reactions_for("local-copy-1")] == [
+        "❤️"
+    ]
+
+
+def test_append_group_message_purges_and_appends_in_one_persist(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:1702): the purge used to run in one
+    # transaction and the append in the next, so a non-member's
+    # reaction stored between them skipped every roster check and
+    # became readable once the message appended.  The arrival is one
+    # locked step now: the stored reaction is voided and the message
+    # appended under a single persist.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            destination="ab" * 16,
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    saves = []
+    original_save = inbox._save
+
+    def _counting_save(*args, **kwargs):
+        saves.append(1)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(inbox, "_save", _counting_save)
+    voided = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert len(voided) == 1
+    assert voided[0]["destination"] == "ff" * 16
+    assert voided[0]["reaction"] == ""
+    assert len(saves) == 1
+    assert len(inbox.list_messages()) == 1
+    # The member's context reaction moved onto the copy; the
+    # non-member's is a tombstone and never displays.
+    shown = inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["destination"] == "ab" * 16
+
+
+def test_append_group_message_skips_duplicate_id(tmp_path):
+    # CodeRabbit Major (inbox.py:1267): the append persisted before
+    # the seen marker, with no id check — a retry after a failed
+    # seen-marker write appended a second copy, which at the cap
+    # evicted unrelated history.  A duplicate id now skips the
+    # append (the reconcile/purge still run, and the tombstones
+    # return) so the retry can finish mark_seen.
+    inbox = Inbox(tmp_path / "inbox.json")
+    members = {"ab" * 16, "aa" * 16}
+    first = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert first == []
+    assert len(inbox.list_messages()) == 1
+    again = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert again == []
+    assert len(inbox.list_messages()) == 1
+    assert inbox.find("local-copy-1") is not None
+
+
+def test_append_group_message_reconcile_failure_does_not_break_arrival(
+    tmp_path, monkeypatch
+):
+    # A failed reconcile only strands legitimate reactions: the purge
+    # and the append still run, so the arrival is not refused.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(inbox, "_reconcile_group_reactions_locked", _fail)
+    voided = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert len(voided) == 1
+    assert len(inbox.list_messages()) == 1
+    assert inbox.reactions_for("local-copy-1") == []
+
+
+def test_append_group_message_save_failure_restores_state(tmp_path, monkeypatch):
+    # A failed persist raises and leaves nothing behind: no message
+    # recorded, no reaction voided, so the sender can retry the
+    # delivery once the store is healthy.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+    monkeypatch.setattr(inbox, "_save", lambda *args, **kwargs: False)
+    with pytest.raises(OSError):
+        inbox.append_group_message(
+            _group_copy(),
+            group="cd" * 16,
+            author="aa" * 16,
+            sent_at=100.0,
+            members={"ab" * 16, "aa" * 16},
+        )
+    assert inbox.list_messages() == []
+    kept = inbox.reactions_for("local-copy-1")
+    assert len(kept) == 1
+    assert kept[0]["reaction"] == "👍"
+
+
 def test_resolve_ambiguous_prefix(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="abcdef01" + "0" * 24))
@@ -1662,6 +1914,19 @@ def test_resolve_exact_id_beats_a_longer_prefix(tmp_path):
     inbox.append(_record(id="abcdef", text="long"))
     assert inbox.resolve("abc")["text"] == "short"
     assert inbox.resolve("abcdef")["text"] == "long"
+
+
+def test_resolve_matches_a_group_leg_id(tmp_path):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids — resolve must match any leg, exactly
+    # as find() already does, or a reaction naming the other leg
+    # never resolves to the stored record.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="g-1", leg_ids=["g-1", "g-2"]))
+    assert inbox.resolve("g-2")["id"] == "g-1"
+    assert inbox.resolve("g-1")["id"] == "g-1"
+    with pytest.raises(ValueError, match="unknown message"):
+        inbox.resolve("g-3")
 
 
 def _reaction(**overrides):
@@ -1836,6 +2101,55 @@ def test_reload_caps_each_direction(tmp_path, monkeypatch):
 
     entries = Inbox(path).list_messages(direction=None)
     assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]
+
+
+def test_transaction_nests_without_deadlock(tmp_path):
+    # The transaction is reentrant (RLock + depth counter, mirroring
+    # Mailbox): a handler that must check and store atomically — the
+    # reaction handler's final roster check and persist — can hold
+    # one transaction across both, instead of deadlocking on the
+    # lock or the flock.  The inner append and resolve join the
+    # outer transaction; the outer persist still lands on disk.
+    inbox = Inbox(tmp_path / "inbox.json")
+    with inbox.transaction():
+        inbox.append(_record(id="nested-1"))
+        assert inbox.resolve("nested-1")["id"] == "nested-1"
+    assert inbox.resolve("nested-1")["id"] == "nested-1"
+    assert [e["id"] for e in Inbox(tmp_path / "inbox.json").list_messages()] == [
+        "nested-1"
+    ]
+
+
+def test_reload_runs_under_the_cross_process_lock(tmp_path):
+    # CodeRabbit Major: reload() read inbox.json and wrote the purged
+    # snapshot back without the cross-process flock — another process
+    # committing an entry between that read and write lost it.  The
+    # reload runs inside the transaction now, so holding the flock
+    # externally must block it until the lock is released.
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only lock
+        pytest.skip("fcntl is unavailable")
+    import threading
+
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1"))
+    lock_path = path.with_name(path.name + ".lock")
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        finished = threading.Event()
+
+        def _reload() -> None:
+            inbox.reload()
+            finished.set()
+
+        worker = threading.Thread(target=_reload, daemon=True)
+        worker.start()
+        assert not finished.wait(timeout=1.0)
+    assert finished.wait(timeout=5.0)
+    worker.join(timeout=5.0)
+    assert len(inbox) == 1
 
 
 def test_add_note_stores_a_read_note_from_self(tmp_path):

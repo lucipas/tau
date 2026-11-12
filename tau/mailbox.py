@@ -1667,6 +1667,24 @@ class Mailbox:
             self.save()
             return True
 
+    def is_held(self, message_id: str, *, to: Optional[bytes] = None) -> bool:
+        """Whether a held envelope is still stored, without dropping it.
+
+        The local-held sweep checks this before delivering a copy it
+        listed: the owner may have dropped the envelope after the
+        listing, and a delivered copy must not be surfaced once it
+        is no longer held.  Unlike :meth:`drop_held` this leaves the
+        copy in place, so a delivery that fails transiently can keep
+        it held for a later sweep.
+        """
+        with self._lock:
+            envelope = self._held.get(message_id)
+            if envelope is None:
+                return False
+            if to is not None and envelope.to != to:
+                return False
+            return True
+
     def held_for(self, to: bytes) -> List[HeldEnvelope]:
         with self._lock:
             envelopes = [e for e in self._held.values() if e.to == to]
