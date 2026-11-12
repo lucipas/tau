@@ -12,6 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
+    RETRACTED_CLOCK_SKEW_TOLERANCE,
     RETRACTED_RETENTION,
     Mailbox,
     MailboxError,
@@ -797,6 +798,29 @@ def test_confirmed_markers_survive_unknown_flood(tmp_path, monkeypatch):
     box.record_retraction(other, "junk-6", now=2002.0)
     box.record_retraction(other, "junk-7", now=2003.0)
     assert box.is_retracted(sender, "real", now=2003.0) is True
+
+
+def test_retraction_markers_survive_a_backward_clock_correction(tmp_path):
+    # Regression test for the CodeRabbit Major: a marker is written as
+    # now + RETRACTED_RETENTION, so if the wall clock moves backward
+    # after the write, a reload must not drop the still-live marker —
+    # only markers past the bounded skew tolerance are malformed.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    now = time.time()
+    # The clock stood an hour ahead when the first marker was recorded,
+    # then moved back: its expiry sits past now + RETRACTED_RETENTION.
+    box.record_retraction(sender, "kept", now=now + 3600.0)
+    # Two days ahead is past the tolerance: malformed, not a correction.
+    box.record_retraction(sender, "dropped", now=now + 2 * 24 * 60 * 60)
+    assert box.is_retracted(sender, "kept", now=now) is True
+    assert RETRACTED_CLOCK_SKEW_TOLERANCE == 24 * 60 * 60
+
+    reloaded = Mailbox(path)
+    assert reloaded.is_retracted(sender, "kept", now=now) is True
+    assert reloaded.is_retracted(sender, "dropped", now=now) is False
+    assert reloaded.counts()["retracted"] == 1
 
 
 def test_confirmed_markers_evict_oldest_when_all_confirmed(

@@ -89,6 +89,13 @@ SEEN_RETENTION = 30 * 24 * 60 * 60
 # marker outlives both, for the possible delivery lifetime of the
 # message (the 7-day mail TTL), then expires.
 RETRACTED_RETENTION = DEFAULT_TTL
+# How far past now + RETRACTED_RETENTION a persisted marker may sit
+# and still load: a backward wall-clock correction after the marker
+# was written leaves it that far past the bound. One day covers an
+# NTP step or a manual clock change while keeping the sanity check
+# meaningful — a marker suppresses a message at most a day past its
+# delivery lifetime, and anything further out is still malformed.
+RETRACTED_CLOCK_SKEW_TOLERANCE = 24 * 60 * 60
 MAX_OUTBOX = 256
 MAX_HELD_TOTAL = 512
 MAX_HELD_PER_RECIPIENT = 64
@@ -119,12 +126,16 @@ def _parse_retraction_markers(raw_value: Any) -> Dict[str, float]:
     A marker is written as now + RETRACTED_RETENTION, so any expiry
     beyond that (or non-finite, or too large to convert) is malformed:
     drop it rather than let it suppress a message indefinitely or
-    abort the load.
+    abort the load. A bounded backward wall-clock correction (an NTP
+    step, a manual change) can leave a live marker slightly past
+    that bound, so allow RETRACTED_CLOCK_SKEW_TOLERANCE of slack —
+    a marker can then outlive its delivery lifetime by at most that
+    much, and anything further out is still dropped.
     """
     markers: Dict[str, float] = {}
     if not isinstance(raw_value, dict):
         return markers
-    latest = time.time() + RETRACTED_RETENTION
+    latest = time.time() + RETRACTED_RETENTION + RETRACTED_CLOCK_SKEW_TOLERANCE
     for key, value in raw_value.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
@@ -1669,8 +1680,10 @@ class Mailbox:
         The marker lives for the possible delivery lifetime of the
         message (RETRACTED_RETENTION), independently of the bounded
         seen-id cache, so a relayed copy arriving after the retract —
-        or after the id leaves the seen cache — is still dropped.
-        Recording the same retraction again refreshes the marker.
+        or after the id leaves the seen cache — is still dropped,
+        unless the marker is evicted early when the marker cap is
+        reached (see :meth:`_evict_retracted`). Recording the same
+        retraction again refreshes the marker.
 
         With ``confirmed=True`` the retract deleted a stored copy, so
         the marker goes in the confirmed pool; otherwise it guards an
