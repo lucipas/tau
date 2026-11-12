@@ -1524,6 +1524,7 @@ class WebBridge:
         from .tangents.rules import RulesError, Ruleset, load_ruleset
         from .tangents.tan import (
             TanError,
+            annotate_pinned,
             apply_display_rules,
             resolve_author,
             search_posts,
@@ -1565,6 +1566,7 @@ class WebBridge:
                 )
             except TanError as exc:
                 raise RequestError(str(exc)) from exc
+            annotate_pinned(conn, posts)
             if app is not None:
                 ruleset = app.ruleset
             else:
@@ -1586,7 +1588,12 @@ class WebBridge:
     ) -> List[Dict[str, Any]]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import apply_display_rules, resolve_author, top_posts
+        from .tangents.tan import (
+            annotate_pinned,
+            apply_display_rules,
+            resolve_author,
+            top_posts,
+        )
 
         # Same block-list snapshot as the timeline: the console hides
         # posts by blocked authors, and a failed-closed list hides all.
@@ -1627,6 +1634,7 @@ class WebBridge:
                 ruleset=ruleset,
                 exclude_authors=blocked,
             )
+            annotate_pinned(conn, posts)
             return apply_display_rules(posts, ruleset)
         finally:
             conn.close()
@@ -2118,7 +2126,10 @@ class WebBridge:
                     else None
                 )
             if owner is None:
-                raise WebBridgeError("this node has no identity")
+                raise RequestError(
+                    "this node has no identity, so nothing of yours can be "
+                    "pinned; run `tau init` to create one"
+                )
             return pin_post(conn, target, owner=owner)
         finally:
             conn.close()
@@ -2137,7 +2148,7 @@ class WebBridge:
     ) -> Dict[str, Any]:
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import annotated_saved_posts
+        from .tangents.tan import annotate_pinned, annotated_saved_posts
 
         conn = self._tan_conn()
         try:
@@ -2161,6 +2172,7 @@ class WebBridge:
             posts, next_offset = annotated_saved_posts(
                 conn, limit=limit, offset=offset, viewer=viewer, ruleset=ruleset
             )
+            annotate_pinned(conn, posts)
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
@@ -2178,7 +2190,7 @@ class WebBridge:
         """
         from .identity import destination_hash, load_identity
         from .tangents.rules import RulesError, Ruleset, load_ruleset
-        from .tangents.tan import annotated_pinned_posts
+        from .tangents.tan import annotate_saved, annotated_pinned_posts
 
         blocklist = getattr(self.node, "blocklist", None)
         blocked = blocklist.blocked if blocklist is not None else frozenset()
@@ -2211,6 +2223,7 @@ class WebBridge:
                 exclude_authors=blocked,
                 exclude_all=exclude_all,
             )
+            annotate_saved(conn, posts)
             return {"posts": posts, "next_offset": next_offset}
         finally:
             conn.close()
@@ -5621,8 +5634,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                         result = self.bridge.tan_unpin(target.strip())
                     else:
                         result = self.bridge.tan_pin(target.strip())
-                except WebBridgeError as exc:
-                    self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+                except RequestError as exc:
+                    self._send_json({"error": {"message": str(exc)}}, head_only, 400)
                     return
                 except ValueError as exc:
                     self._send_json({"error": {"message": str(exc)}}, head_only, 400)

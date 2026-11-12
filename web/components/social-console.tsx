@@ -940,11 +940,16 @@ export function SocialConsole() {
                           post={post}
                           onToggleLike={toggleLike}
                           onRepost={submitRepost}
+                          onToggleLikers={toggleLikers}
+                          likersOpen={likersOpen === post.hash}
+                          likers={likersOpen === post.hash ? likers : null}
+                          likersTotal={likersOpen === post.hash ? likersTotal : 0}
                           onToggleSave={toggleSave}
                           onTogglePin={togglePin}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
+                          onOpenThread={(target) => void tan.openThread(target.hash)}
                         />
                       ))}
                       {tan.pinnedHasMore ? (

@@ -1070,6 +1070,7 @@ describe("SocialConsole pinned view", () => {
       text: "keep me on top",
       pinned: true,
       pinned_at: 2000,
+      likes: 1,
     });
     const state = hookState({ posts: [timelinePost], pinned: [pinnedPost] });
     mockedUseTan.mockReturnValue(state);
@@ -1085,6 +1086,10 @@ describe("SocialConsole pinned view", () => {
     expect(screen.queryByText("timeline post")).toBeNull();
     expect(screen.getByText("keep me on top")).toBeTruthy();
     expect(screen.getByText("📌 pinned")).toBeTruthy();
+    // Pinned cards wire the same likers and thread controls as the
+    // timeline cards, not a cut-down set.
+    expect(screen.getByTitle("Show who liked this post")).toBeTruthy();
+    expect(screen.getByTitle("Open this thread")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "following" }));
     expect(state.setView).toHaveBeenCalledWith("timeline");

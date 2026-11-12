@@ -570,21 +570,15 @@ export function useTan() {
     }
   }, [reloadSaved]);
 
-  const save = useCallback(
-    async (target: string) => {
-      await apiPost("/api/tan/save", { target });
-      await Promise.all([load(), reloadSaved()]);
-    },
-    [load, reloadSaved],
-  );
 
-  const unsave = useCallback(
-    async (target: string) => {
-      await apiPost("/api/tan/unsave", { target });
-      await Promise.all([load(), reloadSaved()]);
-    },
-    [load, reloadSaved],
-  );
+  // A save or pin has already committed when these refreshes run, so a
+  // refresh failure must not be reported as the action failing.
+  const runRefreshes = useCallback(async (refreshes: Promise<unknown>[]) => {
+    const results = await Promise.allSettled(refreshes);
+    if (results.some((result) => result.status === "rejected")) {
+      setError("the change was saved, but the view could not refresh");
+    }
+  }, []);
 
   // Pinned posts change only through this client's pin/unpin actions
   // (or the CLI), so they load on demand instead of on every poll tick,
@@ -656,17 +650,19 @@ export function useTan() {
   // pages, so refreshing only the first page would leave the rest
   // stale.
   const reloadPinned = useCallback(async () => {
+    // An empty shelf still fetches its first page: a pin from another
+    // view may have added posts to it.
     const shown = pinnedRef.current.length;
-    if (shown === 0) return;
+    const wanted = shown === 0 ? PINNED_PAGE_SIZE : shown;
     const generation = ++pinnedGenerationRef.current;
     setPinnedLoading(true);
     try {
       const all: TanPost[] = [];
       let offset: number | null = 0;
-      while (all.length < shown && offset !== null) {
+      while (all.length < wanted && offset !== null) {
         const result = await fetchPinnedPage(
           offset,
-          Math.min(PINNED_PAGE_SIZE, shown - all.length),
+          Math.min(PINNED_PAGE_SIZE, wanted - all.length),
         );
         if (pinnedGenerationRef.current !== generation) return;
         all.push(...result.posts);
@@ -692,17 +688,41 @@ export function useTan() {
   const pin = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/pin", { target });
-      await Promise.all([load(), reloadPinned()]);
+      await runRefreshes([
+        load(),
+        refreshPinnedIfLoaded(),
+        refreshSavedIfLoaded(),
+      ]);
     },
-    [load, reloadPinned],
+    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
   );
 
   const unpin = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unpin", { target });
-      await Promise.all([load(), reloadPinned()]);
+      await runRefreshes([
+        load(),
+        refreshPinnedIfLoaded(),
+        refreshSavedIfLoaded(),
+      ]);
     },
-    [load, reloadPinned],
+    [load, refreshPinnedIfLoaded, refreshSavedIfLoaded, runRefreshes],
+  );
+
+  const save = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/save", { target });
+      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
+    },
+    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
+  );
+
+  const unsave = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/unsave", { target });
+      await runRefreshes([load(), reloadSaved(), refreshPinnedIfLoaded()]);
+    },
+    [load, reloadSaved, refreshPinnedIfLoaded, runRefreshes],
   );
   const openThread = useCallback(
     async (ref: string) => {

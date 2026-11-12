@@ -3855,6 +3855,30 @@ def test_tan_pinned_via_api(tmp_path):
         status, _, payload = _json(bridge, "/api/tan/pinned")
         assert [item["text"] for item in payload["posts"]].count("pin me 0") == 0
 
+        # Other surfaces carry the pinned flag too, so a pin made in
+        # one view shows up in the rest: search and top flag it, and a
+        # saved pinned post carries its saved flag in the pinned list.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/save",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        pinned = {item["hash"]: item for item in payload["posts"]}
+        assert pinned[mine["hash"]]["saved"] is True
+        status, _, payload = _json(bridge, "/api/tan/search?q=pin")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[mine["hash"]]["pinned"] is True
+        assert by_hash[extra[9]["hash"]]["pinned"] is False
+        status, _, payload = _json(bridge, "/api/tan/top?limit=100")
+        assert status == 200
+        by_hash = {item["hash"]: item for item in payload["posts"]}
+        assert by_hash[mine["hash"]]["pinned"] is True
+        assert by_hash[theirs["hash"]]["pinned"] is False
+
         # A post deleted after being pinned stays in the list with its
         # text blanked, so the pin is not silently lost.
         status, _, payload = _json(
@@ -3870,6 +3894,30 @@ def test_tan_pinned_via_api(tmp_path):
         assert pinned[mine["hash"]]["text"] == ""
         assert pinned[mine["hash"]]["deleted"] is True
         assert pinned[mine["hash"]]["pinned"] is True
+    finally:
+        bridge.stop()
+
+
+def test_tan_pin_without_identity_returns_400(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # No identity is a permanent setup state, not a temporary
+        # outage: the pin fails as a 400 that says how to fix it,
+        # like the mentions endpoint does.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": "ab" * 32},
+        )
+        assert status == 400
+        assert "tau init" in payload["error"]["message"]
     finally:
         bridge.stop()
 
