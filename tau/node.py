@@ -2139,14 +2139,17 @@ class TauNode:
                 # non-member naming a known local group-message id
                 # must not get their reaction stored or displayed —
                 # including reactions that carry no group context.
-                # No roster is pinned (group deleted, or message
-                # imported without one): there is nothing to check
-                # against, the same residual as the context path.
+                # A missing roster fails closed: the group was deleted
+                # (or the message was imported without one), so there
+                # is no membership to verify — and a deleted group has
+                # no members left to authorize.  Treating the missing
+                # roster as permission let an outsider who learned a
+                # message id react to a retained copy.
                 try:
                     pinned = self.groups.find(resolved["group"])
                 except ValueError:
                     pinned = None
-                if pinned is not None and caller_hash not in (
+                if pinned is None or caller_hash not in (
                     pinned.get("members") or []
                 ):
                     self._void_stored_reaction(target_id, caller_hash)
@@ -2204,7 +2207,10 @@ class TauNode:
                                 pinned = self.groups.find(final["group"])
                             except ValueError:
                                 pinned = None
-                            if pinned is not None and caller_hash not in (
+                            # A missing roster fails closed, as above:
+                            # the group was deleted, so no membership
+                            # can be verified.
+                            if pinned is None or caller_hash not in (
                                 pinned.get("members") or []
                             ):
                                 authorized = False

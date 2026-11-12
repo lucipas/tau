@@ -1207,11 +1207,22 @@ def test_group_reaction_resolves_local_copy_from_context(tmp_path):
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     author = destination_hash(RNS.Identity()).hex()
-    group = "cd" * 16
+    reactor = RNS.Identity()
+    # A copy that arrived through the handler pins its roster, so a
+    # retained copy with no pinned group is a deleted group — and a
+    # reaction to it fails closed (see the deleted-group tests
+    # below).  Pin the group here, with the reactor as a member, so
+    # this test models a live group and keeps asserting the
+    # context resolution itself.  The id derives from the roster,
+    # so the group is pinned first and the copy seeded under it.
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
     _seed_group_copy(
         node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
     )
-    reactor = RNS.Identity()
     response = call_handler(
         node._handle_reaction,
         _signed_group_reaction(
@@ -1374,6 +1385,84 @@ def test_group_reaction_refused_for_non_member(tmp_path):
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_refused_when_group_deleted(tmp_path):
+    # Qodo Critical (flagged by the user from the stacked PR #297's
+    # reviews): a failed group-roster lookup used to count as
+    # permission, so after a group is deleted an allow-listed
+    # non-member who knows a retained message id could get a
+    # reaction stored and displayed.  A missing roster for a
+    # resolved group message now fails closed.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    assert node.groups.delete(group) is True
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_final_check_refuses_when_group_deleted(
+    tmp_path, monkeypatch
+):
+    # The same fail-closed rule in the atomic final check: a
+    # no-context reaction whose target lands between the first
+    # lookup and the final check, on a group that was deleted
+    # before the check runs.  The copy is stubbed into the final
+    # lookup because a real import cannot land inside the
+    # transaction — the flock is held there, and a second Inbox
+    # import would deadlock (the round-11 lesson).
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    assert node.groups.delete(group) is True
+    real_resolve = node.inbox.resolve
+    calls = {"n": 0}
+
+    def flaky_resolve(ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The first lookup: the copy has not landed yet.
+            return real_resolve(ref)
+        # The final check, inside the transaction: the copy is here
+        # now, on a group whose roster is gone.
+        return {"id": "local-copy-1", "kind": "group", "group": group}
+
+    monkeypatch.setattr(node.inbox, "resolve", flaky_resolve)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert calls["n"] == 2
     assert node.inbox.reactions_for("local-copy-1") == []
     assert node.inbox.reactions_for("other-leg-1") == []
 
