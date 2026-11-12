@@ -72,6 +72,82 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert node.inbox.path.exists()
 
 
+def test_direct_group_delivery_skips_when_competitor_marks_seen(
+    tmp_path, monkeypatch
+):
+    """A direct group delivery rechecks seen-ness inside the
+    transaction (CodeRabbit review, flagged on the stacked PR #295).
+
+    Two direct deliveries can both pass the pre-check, then both
+    append and notify.  The relayed path already rechecks inside
+    the mailbox transaction; the direct group path did not.  Here a
+    competing delivery stores its copy and marks the id seen after
+    the pre-check — this delivery must skip both the append and the
+    notification, and report the duplicate.
+    """
+    from tau.inbox import Inbox
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    real_is_seen = node.mailbox.is_seen
+    calls = {"n": 0}
+
+    def flaky_is_seen(message_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The pre-check: not seen yet.  A competing delivery
+            # lands now — it stores its copy and marks the id seen
+            # via its own handles, then this handler's transaction
+            # reloads and must see the mark.
+            other_inbox = Inbox(node.config.inbox_path)
+            other_inbox.append(
+                {
+                    "from": "alice",
+                    "destination": author_hash,
+                    "text": "crew hello",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "race-1",
+                    "kind": "group",
+                    "group": group,
+                    "group_name": "crew",
+                }
+            )
+            Mailbox(node.config.mailbox_path).mark_seen("race-1")
+            return False
+        return real_is_seen(message_id)
+
+    monkeypatch.setattr(node.mailbox, "is_seen", flaky_is_seen)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="race-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert response["ok"] is True
+    assert response["duplicate"] is True
+    assert received == []
+    assert calls["n"] == 2
+    # Exactly one copy is stored: the competitor's, not a second one.
+    fresh = Inbox(node.config.inbox_path)
+    assert [m["id"] for m in fresh.list_messages()] == ["race-1"]
+
+
 def test_direct_message_keeps_kind(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)

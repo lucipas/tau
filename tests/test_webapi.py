@@ -6897,6 +6897,82 @@ def test_imported_group_message_event_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
+    """A delayed live reaction never reaches the console unfiltered
+    (CodeRabbit round-13 follow-up on the import-event fix).
+
+    Ordering: the group message is already in the console history
+    when a non-member's no-context reaction reaches the callback —
+    it passed the handler's final lookup before the copy arrived,
+    so the callback is the first roster check it meets.  The
+    message_updated event must drop the non-member reaction while
+    keeping a member's, and the stored entry must not keep it either.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        group = node.groups.find("crew")
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            )
+            is not None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": OTHER_HASH,
+                    "from": "mallory",
+                    "reaction": "👎",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-1",
+                }
+            )
+            is not None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-2",
+                }
+            )
+            is not None
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_updated"
+            and event.get("message", {}).get("wire_id") == "wire-g1"
+        ]
+        assert len(events) == 2
+        assert events[0]["message"]["reactions"] == []
+        assert events[1]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {

@@ -1765,17 +1765,27 @@ class TauNode:
             # display.  If a fan-out fails, the message still records
             # (the inbox is clean) but the live event is withheld.
             publish_ok = True
+            voided: List[Dict[str, Any]] = []
             if message_id:
                 try:
                     with self.mailbox.transaction():
-                        voided = self.inbox.append_group_message(
-                            record,
-                            group=group["id"],
-                            author=caller_hash,
-                            sent_at=message.get("sent_at"),
-                            members=set(group.get("members") or []),
-                        )
-                        self.mailbox.mark_seen(message_id)
+                        if self.mailbox.is_seen(message_id):
+                            # A competing delivery marked this id seen
+                            # after the pre-check: the transaction
+                            # reloaded the mailbox, so this reads the
+                            # current on-disk state — skip the append
+                            # and the notification, exactly as the
+                            # relayed path does (see _deliver_collected).
+                            duplicate = True
+                        else:
+                            voided = self.inbox.append_group_message(
+                                record,
+                                group=group["id"],
+                                author=caller_hash,
+                                sent_at=message.get("sent_at"),
+                                members=set(group.get("members") or []),
+                            )
+                            self.mailbox.mark_seen(message_id)
                 except OSError:
                     log.warning(
                         "Could not authorize group reactions",
@@ -1785,13 +1795,14 @@ class TauNode:
                         "storage_failed",
                         "could not authorize group reactions",
                     )
-                for tombstone in voided:
-                    if not self._publish_reaction(tombstone):
-                        publish_ok = False
+                if not duplicate:
+                    for tombstone in voided:
+                        if not self._publish_reaction(tombstone):
+                            publish_ok = False
             else:
                 with self.mailbox.transaction():
                     self._record_received(record)
-            if publish_ok and self.on_message is not None:
+            if not duplicate and publish_ok and self.on_message is not None:
                 try:
                     self.on_message(record)
                 except Exception:  # pragma: no cover - user callback
@@ -4698,7 +4709,9 @@ class TauNode:
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
             raise NodeError("reaction target must be a message id of 1-64 characters")
-        payload_bytes, reaction_id = self._signed_reaction_payload(target_id, token)
+        payload_bytes, reaction_id, sent_at = self._signed_reaction_payload(
+            target_id, token
+        )
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
@@ -4709,7 +4722,9 @@ class TauNode:
         # Record the outgoing reaction locally, so the reactor sees it
         # under the message in their own inbox and console.
         self._record_reaction(
-            self._outgoing_reaction_record(target_id, token, reaction_id)
+            self._outgoing_reaction_record(
+                target_id, token, reaction_id, sent_at
+            )
         )
         return dict(response, id=reaction_id)
 
@@ -4721,13 +4736,19 @@ class TauNode:
         group: Optional[str] = None,
         target_author: Optional[str] = None,
         target_sent_at: Optional[float] = None,
-    ) -> Tuple[bytes, str]:
+    ) -> Tuple[bytes, str, float]:
         """Build and sign one reaction payload.
 
-        Returns ``(payload_bytes, reaction_id)``.  The reaction id is
-        part of the signed payload, so a fan-out that reuses these
-        bytes sends every member the same reaction — one id, one
-        signature — instead of a fresh reaction per leg.
+        Returns ``(payload_bytes, reaction_id, sent_at)``.  The
+        reaction id is part of the signed payload, so a fan-out that
+        reuses these bytes sends every member the same reaction — one
+        id, one signature — instead of a fresh reaction per leg.  The
+        signed ``sent_at`` is returned too, so the local record uses
+        the time the payload was signed, not the moment the legs
+        finished: a reaction signed before a clear but recorded after
+        it would otherwise carry the later time and its local copy
+        would replace the clear, while receivers — who order by the
+        signed time — keep it.
 
         ``group`` / ``target_author`` / ``target_sent_at`` name the
         group message being reacted to, when the target is one: group
@@ -4738,10 +4759,12 @@ class TauNode:
         if self.identity is None:
             raise NodeError("node has not been started")
         reaction_id = generate_message_id()
+        sent_at = time.time()
         payload = reaction_dict(
             target_id,
             token,
             message_id=reaction_id,
+            sent_at=sent_at,
             group=group,
             target_author=target_author,
             target_sent_at=target_sent_at,
@@ -4751,12 +4774,18 @@ class TauNode:
         if signature is None:  # pragma: no cover - identity without private keys
             raise NodeError("could not sign reaction")
         payload["sig"] = base64.b64encode(signature).decode("ascii")
-        return encode(payload, max_bytes=MAX_REQUEST_BYTES), reaction_id
+        return encode(payload, max_bytes=MAX_REQUEST_BYTES), reaction_id, sent_at
 
     def _outgoing_reaction_record(
-        self, target_id: str, token: str, reaction_id: str
+        self, target_id: str, token: str, reaction_id: str, sent_at: float
     ) -> Dict[str, Any]:
-        """The local inbox record for a reaction this node sent."""
+        """The local inbox record for a reaction this node sent.
+
+        ``sent_at`` is the signed send time from the payload builder,
+        so the local copy orders the same way receivers order it (see
+        :meth:`_signed_reaction_payload`); ``received_at`` is when the
+        legs finished.
+        """
         return {
             "target": target_id,
             "reaction": token,
@@ -4764,7 +4793,7 @@ class TauNode:
             "destination": self.destination_hexhash
             if self.destination is not None
             else "",
-            "sent_at": time.time(),
+            "sent_at": sent_at,
             "received_at": time.time(),
             "id": reaction_id,
         }
@@ -4819,7 +4848,7 @@ class TauNode:
             # it to a 400 and the CLI prints it plain, instead of a
             # 502 / a misleading "peer offline" suffix.
             raise ValueError("group has no other members to react to")
-        payload_bytes, reaction_id = self._signed_reaction_payload(
+        payload_bytes, reaction_id, sent_at = self._signed_reaction_payload(
             target_id,
             token,
             group=group["id"],
@@ -4902,7 +4931,9 @@ class TauNode:
             # it under the message in their own inbox and console —
             # the same id every member recorded.
             self._record_reaction(
-                self._outgoing_reaction_record(target_id, token, reaction_id)
+                self._outgoing_reaction_record(
+                    target_id, token, reaction_id, sent_at
+                )
             )
         all_ok = all(result.get("delivered") for result in results)
         return {

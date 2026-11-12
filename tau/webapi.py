@@ -1241,6 +1241,25 @@ class WebBridge:
                 message["reactions"] = _with_reaction(
                     message.get("reactions") or [], reactor, entry
                 )
+                # A reaction can reach this callback after its target
+                # was appended — it passed the handler's final lookup
+                # before the copy arrived — and the merge above does
+                # not check the roster.  Filter the live entry here,
+                # as the snapshot read and the import publish already
+                # do, so the message_updated event never carries a
+                # non-member's reaction to the live console.
+                group_id = message.get("group")
+                if (
+                    isinstance(group_id, str)
+                    and group_id
+                    and message.get("reactions")
+                ):
+                    groups = getattr(self.node, "groups", None)
+                    if groups is not None:
+                        rosters = pinned_rosters(groups, [group_id])
+                        message["reactions"] = visible_reactions(
+                            message["reactions"], rosters.get(group_id)
+                        )
                 updated = dict(message)
                 break
         if updated is None:
