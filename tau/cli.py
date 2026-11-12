@@ -5142,6 +5142,11 @@ def cmd_forward(args: argparse.Namespace) -> int:
         record = inbox.resolve(args.message)
     except ValueError as exc:
         raise NodeError(str(exc)) from exc
+    if record.get("kind") == "group":
+        # Group messages live in the same inbox but belong to the group:
+        # forwarding one would leak the group's text as a DM to any
+        # --to recipient, including a nonmember.
+        raise NodeError("cannot forward a group message: forward a DM instead")
     # Messages hidden by the block-list are hidden from `tau messages`
     # and must not be forwarded either.  An unreadable block-list fails
     # closed, matching the listing.  Sent messages carry the *recipient*

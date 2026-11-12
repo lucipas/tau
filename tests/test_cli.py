@@ -3808,6 +3808,30 @@ def test_forward_file_message_is_an_error(tmp_path, capsys, monkeypatch):
     assert _FakeSendNode.instances == []
 
 
+def test_forward_group_message_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "group secret",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "6" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "6666"])
+    assert code == 1
+    assert "group message" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
 def test_forward_too_long_is_an_error(tmp_path, capsys, monkeypatch):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
