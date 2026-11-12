@@ -27,6 +27,13 @@ from .allowlist import (
     load_allowlist_or_deny_all,
     save_allowlist,
 )
+from .archive import (
+    ArchiveError,
+    archive_lock,
+    load_archive,
+    load_archived_set,
+    save_archive,
+)
 from .backup import create_backup, restore_backup
 from .blocklist import (
     BlockListError,
@@ -76,6 +83,7 @@ from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
     MAX_MAIL_TTL,
+    MAX_MESSAGE_CHARS,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
@@ -124,6 +132,7 @@ from .tangents.tan import (
     save_post,
     search_posts,
     suggest_authors,
+    tags,
     thread,
     timeline,
     top_posts,
@@ -398,7 +407,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing message: purge it from the receiver's inbox "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
+    send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     send.set_defaults(func=cmd_send)
+
+    # `tau forward` shares `tau send`'s delivery flags: a forward is a
+    # new message carrying the original text plus an attribution line.
+    forward = subparsers.add_parser(
+        "forward",
+        parents=[common],
+        help="forward a stored message to a peer",
+    )
+    forward.add_argument(
+        "--to",
+        action="append",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: forward to several peers)",
+    )
+    forward.add_argument(
+        "message",
+        metavar="ID|PREFIX",
+        help="message id or unique prefix (see tau messages)",
+    )
+    forward.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    forward.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    forward.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    forward.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    forward.set_defaults(func=cmd_forward)
 
     # `send --file` already means "read the message text from a file",
     # so file transfer gets its own subcommand instead of overloading it.
@@ -459,6 +516,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     react.set_defaults(func=cmd_react)
 
+    pin = subparsers.add_parser(
+        "pin",
+        parents=[common],
+        help="pin a stored message so it stays easy to find",
+    )
+    pin.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    pin.set_defaults(func=cmd_pin)
+
+    unpin = subparsers.add_parser(
+        "unpin",
+        parents=[common],
+        help="remove the pin from a stored message",
+    )
+    unpin.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    unpin.set_defaults(func=cmd_unpin)
+
+    pinned = subparsers.add_parser(
+        "pinned",
+        parents=[common],
+        help="list pinned stored messages",
+    )
+    pinned.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only show pins from this peer (name, hash or hash prefix)",
+    )
+    pinned.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="show the newest N pinned messages (default 30)",
+    )
+    pinned.set_defaults(func=cmd_pinned)
     retract = subparsers.add_parser(
         "retract",
         parents=[common],
@@ -868,6 +968,29 @@ def build_parser() -> argparse.ArgumentParser:
     unblock.add_argument("peer", help="peer name, destination hash or hash prefix")
     unblock.set_defaults(func=cmd_block, block_command="remove")
 
+    archive = subparsers.add_parser(
+        "archive",
+        parents=[common],
+        help="hide a peer's conversation from `tau messages` (history kept)",
+    )
+    archive.add_argument("peer", help="peer name, destination hash or hash prefix")
+    archive.set_defaults(func=cmd_archive)
+
+    unarchive = subparsers.add_parser(
+        "unarchive",
+        parents=[common],
+        help="restore an archived conversation to `tau messages`",
+    )
+    unarchive.add_argument("peer", help="peer name, destination hash or hash prefix")
+    unarchive.set_defaults(func=cmd_unarchive)
+
+    archived = subparsers.add_parser(
+        "archived",
+        parents=[common],
+        help="list archived conversations",
+    )
+    archived.set_defaults(func=cmd_archived)
+
 
     messages = subparsers.add_parser(
         "messages",
@@ -914,6 +1037,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--unread",
         action="store_true",
         help="only show messages not yet read",
+    )
+    messages.add_argument(
+        "--archived",
+        action="store_true",
+        help="only show conversations archived with `tau archive`",
     )
     messages.add_argument(
         "--count",
@@ -1271,6 +1399,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--author", metavar="NAME|HASH", help="show one author's posts"
     )
     tan_timeline.add_argument(
+        "--tag", metavar="TAG", help="show only posts carrying this tag"
+    )
+    tan_timeline.add_argument(
         "--limit", type=int, default=30, metavar="N", help="maximum posts"
     )
     tan_timeline.set_defaults(func=cmd_tan_timeline)
@@ -1309,6 +1440,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts (default 10)",
     )
     tan_top.set_defaults(func=cmd_tan_top)
+
+    tan_tags = tan_sub.add_parser(
+        "tags",
+        parents=[common],
+        help="list hashtags used in stored posts, most-used first",
+    )
+    tan_tags.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="maximum tags (default 30)",
+    )
+    tan_tags.set_defaults(func=cmd_tan_tags)
 
     tan_verify = tan_sub.add_parser(
         "verify",
@@ -1754,12 +1899,22 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
+def _next_try_at(entry: Any) -> Optional[float]:
+    """When an outbox entry may next be attempted: the later of its
+    delivery backoff and its scheduled send time, if either is set."""
+    next_try = entry.next_attempt_at
+    send_after = getattr(entry, "send_after", None)
+    if send_after is not None and (next_try is None or send_after > next_try):
+        return send_after
+    return next_try
+
+
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
 
-def _parse_duration(value: str) -> float:
-    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _parse_duration(value: str, *, flag: str = "--expire") -> float:
+    """Parse a ``--expire``/``--delay`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
@@ -1768,7 +1923,7 @@ def _parse_duration(value: str) -> float:
     """
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{flag} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -1777,13 +1932,13 @@ def _parse_duration(value: str) -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {flag} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError("--expire duration must be positive")
+        raise ValueError(f"{flag} duration must be positive")
     if seconds > MAX_MAIL_TTL:
-        raise ValueError("--expire duration must be at most 30d")
+        raise ValueError(f"{flag} duration must be at most 30d")
     return seconds
 
 def _print_peer_table(
@@ -2573,6 +2728,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         elif getattr(args, "all", False):
             posts = timeline(
@@ -2582,6 +2738,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         else:
             authors = [record["author"] for record in following(conn)]
@@ -2591,6 +2748,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 conn, authors, limit=args.limit, viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
     finally:
         conn.close()
@@ -2671,6 +2829,32 @@ def cmd_tan_top(args: argparse.Namespace) -> int:
         json_output=json_output,
         empty_message="No stored posts yet.",
     )
+    return _EXIT_OK
+
+
+def cmd_tan_tags(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
+    conn = init_db(config.social_db_path)
+    try:
+        entries = tags(
+            conn,
+            limit=args.limit,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"tags": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No hashtags in stored posts yet.")
+        return _EXIT_OK
+    width = max(len(str(entry["count"])) for entry in entries)
+    for entry in entries:
+        print(f"{entry['count']:>{width}}  #{entry['tag']}")
     return _EXIT_OK
 
 
@@ -4538,6 +4722,7 @@ def _send_local_message(
     reply_to: Optional[str] = None,
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -4564,6 +4749,7 @@ def _send_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         kind=kind,
+        send_after=send_after,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -4620,6 +4806,7 @@ def _send_via_local_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     node = TauNode(config, name=config.name)
@@ -4653,6 +4840,7 @@ def _send_via_local_node(
                     in_reply_to=reply_to,
                     expires_at=expires_at,
                     kind=kind,
+                    send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -4692,6 +4880,7 @@ def _send_via_running_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -4711,6 +4900,7 @@ def _send_via_running_node(
                 reply_to=getattr(args, "reply_to", None),
                 kind=kind,
                 wait=wait,
+                send_after=send_after,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -4935,18 +5125,44 @@ def cmd_send(args: argparse.Namespace) -> int:
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
-
+    send_after = None
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_queue", False):
+            print(
+                "error: --delay cannot be combined with --no-queue",
+                file=sys.stderr,
+            )
+            return 2
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+        if expires_at is not None and send_after >= expires_at:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "message would expire before it is sent",
+                file=sys.stderr,
+            )
+            return 2
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
     # A serving node owns the data directory: send through it instead of
     # starting a second Reticulum instance on the same identity.
     if _send_routes_via_running_node(config):
         results = _send_via_running_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
     else:
         results = _send_via_local_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -4998,6 +5214,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                 waited = result.get("waited")
                 if waited is not None:
                     print(f"still queued for {target} after {waited:.1f}s")
+                elif result.get("send_after"):
+                    print(
+                        f"scheduled for {target} — sends in "
+                        f"{_ago(result['send_after'] - time.time())}"
+                    )
                 else:
                     print(f"queued for {target} — they are unreachable right now")
                 print(f"  id:      {result['id']}")
@@ -5033,12 +5254,89 @@ def cmd_send(args: argparse.Namespace) -> int:
                     print("  the receiver dropped it — past its expiry")
                 if expires_at is not None:
                     print(f"  disappears in {_ago(expires_at - time.time())}")
-        if any(result.get("queued") for result in results):
-            print("  it will be delivered automatically when they are heard from;")
+        queued = [result for result in results if result.get("queued")]
+        if queued:
+            if all(result.get("send_after") for result in queued):
+                print("  it will be delivered at its scheduled time;")
+            else:
+                print(
+                    "  it will be delivered automatically when they are heard from;"
+                )
             print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
 
 
+def cmd_forward(args: argparse.Namespace) -> int:
+    """Forward a stored message to another peer, attributed to its sender.
+
+    The forwarded text is the original prefixed with one attribution
+    line, so the recipient sees who said it on any transport with no
+    protocol change.  Delivery reuses :func:`cmd_send` wholesale — the
+    forward is a new message, so it carries no expiry, kind, or reply
+    chain from the original.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    try:
+        record = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if record.get("kind") == "group":
+        # Group messages live in the same inbox but belong to the group:
+        # forwarding one would leak the group's text as a DM to any
+        # --to recipient, including a nonmember.
+        raise NodeError("cannot forward a group message: forward a DM instead")
+    # Messages hidden by the block-list are hidden from `tau messages`
+    # and must not be forwarded either.  An unreadable block-list fails
+    # closed, matching the listing.  Sent messages carry the *recipient*
+    # in `destination`, so the check only applies to received ones —
+    # forwarding your own message must not trip on its old recipient.
+    if record.get("direction") != "out":
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            raise NodeError("cannot forward: the block-list could not be read")
+        if record.get("destination") in blocked:
+            raise NodeError("cannot forward a message from a blocked peer")
+    text = record.get("text")
+    if not text:
+        # File records carry no text (see inbox._valid_record).
+        raise NodeError("cannot forward a file message: it has no text to send")
+    if record.get("direction") == "out":
+        # The message is one this node sent; the recipient already knows
+        # the forwarder, so the attribution names the forwarder as "you".
+        label = "you"
+    else:
+        # Inbox records already store the sender's display name as known
+        # when the message arrived; re-resolve it so a newer alias wins,
+        # falling back to the stored label (a name, or the short hash).
+        sender_hash = record.get("destination")
+        stored_name = record.get("from")
+        if not stored_name or stored_name == "unknown":
+            # No real name was ever recorded: attribute by short hash.
+            label = (
+                short_hash(sender_hash)
+                if isinstance(sender_hash, str) and sender_hash
+                else "unknown"
+            )
+        else:
+            label = str(stored_name)
+        peer = (
+            PeerRegistry(config.peers_path).get(sender_hash)
+            if isinstance(sender_hash, str) and sender_hash
+            else None
+        )
+        if peer is not None:
+            label = peer.display_name
+    forwarded = f"Forwarded from {label}:\n{text}"
+    if len(forwarded) > MAX_MESSAGE_CHARS:
+        raise NodeError(
+            f"message is too long to forward "
+            f"({len(forwarded)} > {MAX_MESSAGE_CHARS} characters)"
+        )
+    # `cmd_send` reads its text from `args.message`; hand it the
+    # attributed text and let it own delivery, queueing, and output.
+    args.message = forwarded
+    return cmd_send(args)
 
 
 def cmd_send_file(args: argparse.Namespace) -> int:
@@ -5118,7 +5416,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             for entry in entries:
                 peer = registry.get(entry.to)
                 name = peer.display_name if peer is not None else entry.to_name
-                next_try = entry.next_attempt_at
+                next_try = _next_try_at(entry)
                 if next_try is None or next_try <= now:
                     next_try_text = "now"
                 else:
@@ -5164,7 +5462,12 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
-def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> str:
+def _resolve_inbox_peer(
+    inbox: Inbox,
+    registry: PeerRegistry,
+    target: str,
+    direction: Optional[str] = "in",
+) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
@@ -5173,6 +5476,8 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
     prefix shared by two distinct senders is ambiguous, even when one
     of them is registered and the other is not (pruned, or never
     discovered — a direct message needs no prior announce).
+    ``direction`` picks which inbox records are searched: ``"in"`` for
+    received messages (the default), ``None`` for both directions.
     """
     target = target.strip()
     if _is_hex32(target):
@@ -5190,7 +5495,7 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
         senders = {peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)}
         senders |= {
             str(entry.get("destination") or "").casefold()
-            for entry in inbox.list_messages(limit=None)
+            for entry in inbox.list_messages(limit=None, direction=direction)
             if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
         if len(senders) == 1:
@@ -5373,6 +5678,84 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
     return f"↩ {name}: {first_line}"
 
 
+def _message_peer_label(registry: PeerRegistry, entry: Dict[str, Any]) -> str:
+    """Who a stored message is from — or, for one this node sent, to."""
+    destination = str(entry.get("destination") or "")
+    peer = registry.get(destination)
+    if entry.get("direction") == "out":
+        name = peer.display_name if peer is not None else "unknown"
+        return f"to {name}"
+    name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+    return f"from {name}"
+
+
+def _print_message_entry(
+    inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]
+) -> None:
+    """Print one stored message the way `tau messages` does.
+
+    Shared by `tau messages` and `tau pinned` so a pinned message
+    reads the same in both listings.  A message this node sent is
+    shown as from you, to its recipient; a received one as from its
+    sender.  Pinned entries carry a 📌 marker, like the ● unread one.
+    """
+    destination = str(entry.get("destination") or "")
+    peer = registry.get(destination)
+    sender = short_hash(destination)
+    if entry.get("direction") == "out":
+        name = peer.display_name if peer is not None else "unknown"
+        who = f"you → {name} ({sender})"
+    else:
+        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+        who = f"{name} ({sender})"
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    # Unread is a received-message state; a sent message is never unread.
+    marker = "● " if entry.get("unread") and entry.get("direction") != "out" else ""
+    pin_marker = "📌 " if entry.get("pinned") else ""
+    # The short id is what `tau react` takes: without it the
+    # listing gives the user no way to name a message to react to.
+    message_id = entry.get("id")
+    id_suffix = (
+        f" #{_safe_id_prefix(str(message_id))}"
+        if isinstance(message_id, str) and message_id
+        else ""
+    )
+    group_suffix = ""
+    if entry.get("kind") == "group":
+        group_suffix = f" in {entry.get('group_name') or 'group'}"
+    entry_kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
+    kind_tag = (
+        f" [{entry_kind}]"
+        if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
+        else ""
+    )
+    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}")
+    if entry.get("kind") == "file":
+        print(
+            f"  file: {entry.get('name')} "
+            f"({entry.get('size')} bytes, "
+            f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
+        )
+        print(f"  saved to {entry.get('path')}")
+        return
+    quote = _quote_line(inbox, registry, entry)
+    if quote is not None:
+        print(f"  {quote}")
+    for line in str(entry.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    for reaction in entry.get("reactions") or []:
+        reactor = registry.get(str(reaction.get("destination") or ""))
+        reactor_name = (
+            reactor.display_name
+            if reactor is not None
+            else str(reaction.get("from") or "unknown")
+        )
+        print(f"  {reaction.get('reaction')} {reactor_name}")
+    entry_expires_at = entry.get("expires_at")
+    if isinstance(entry_expires_at, (int, float)) and float(entry_expires_at) > time.time():
+        print(f"  disappears in {_ago(float(entry_expires_at) - time.time())}")
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -5418,6 +5801,39 @@ def cmd_messages(args: argparse.Namespace) -> int:
     query = getattr(args, "search", None)
     if query is not None and not query.strip():
         raise NodeError("--search must not be empty")
+    archived = load_archived_set(config.archived_path)
+    show_archived = getattr(args, "archived", False)
+    if (
+        peer_hash is not None
+        and not show_archived
+        and query is None
+        and group_id is None
+        and not getattr(args, "sent", False)
+        and peer_hash in archived
+    ):
+        # An archived peer's thread is hidden from the default
+        # listing; say so instead of showing an empty list.
+        peer = registry.get(peer_hash)
+        name = peer.display_name if peer is not None else "unknown"
+        unread = inbox.unread_counts()["per_peer"].get(peer_hash, 0)
+        if _json_mode(args):
+            _emit(
+                {
+                    "messages": [],
+                    "count": 0,
+                    "more_unread": {},
+                    "archived_unread": unread,
+                    "archived": True,
+                },
+                True,
+            )
+            return _EXIT_OK
+        print(
+            f"Conversation with {name} ({short_hash(peer_hash)}) is archived — "
+            f"see it with `tau messages --archived --peer {args.peer}` "
+            f"or restore it with `tau unarchive {args.peer}`."
+        )
+        return _EXIT_OK
     if getattr(args, "sent", False):
         return _cmd_messages_sent(args, config, registry, limit)
     # Blocked senders' history stays stored but is hidden locally;
@@ -5435,6 +5851,35 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
+    # Archive membership is a direct-message concern only: a group
+    # post from an archived sender is still that group's mail, and
+    # groups keep their current listing.  --archived is an explicit
+    # archived-only view, so it applies even to searches and group
+    # listings; the default hiding (and its unread count) stays
+    # limited to plain listings, where a search is an explicit
+    # lookup that still finds archived mail.
+    archived_unread = 0
+    if show_archived:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+    elif query is None and group_id is None and archived:
+        hidden = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+        archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") == "group"
+            or entry.get("destination") not in archived
+        ]
     # Filter before limiting, so --unread finds older unread mail even
     # when newer messages from the same listing are already read.
     unread_only = getattr(args, "unread", False)
@@ -5450,7 +5895,12 @@ def cmd_messages(args: argparse.Namespace) -> int:
             more_unread[destination] = more_unread.get(destination, 0) + 1
     if _json_mode(args):
         _emit(
-            {"messages": shown, "count": len(shown), "more_unread": more_unread},
+            {
+                "messages": shown,
+                "count": len(shown),
+                "more_unread": more_unread,
+                "archived_unread": archived_unread,
+            },
             True,
         )
     elif not shown:
@@ -5462,63 +5912,15 @@ def cmd_messages(args: argparse.Namespace) -> int:
             print(
                 "No unread messages." if unread_only else "No messages received yet."
             )
+        if archived_unread:
+            _print_archived_unread(archived_unread)
     else:
         for entry in shown:
-            peer = registry.get(entry.get("destination") or "")
-            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
-            sender = short_hash(str(entry.get("destination") or ""))
-            when = _format_message_time(float(entry.get("received_at", 0)))
-            marker = "● " if entry.get("unread") else ""
-            # The short id is what `tau react` takes: without it the
-            # listing gives the user no way to name a message to react to.
-            message_id = entry.get("id")
-            id_suffix = (
-                f" #{_safe_id_prefix(str(message_id))}"
-                if isinstance(message_id, str) and message_id
-                else ""
-            )
-            group_suffix = ""
-            if entry.get("kind") == "group":
-                group_suffix = f" in {entry.get('group_name') or 'group'}"
-            entry_kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
-            kind_tag = (
-                f" [{entry_kind}]"
-                if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
-                else ""
-            )
-            print(
-                f"{marker}[{when}] {name} ({sender}){id_suffix}{kind_tag}{group_suffix}"
-            )
-            if entry.get("kind") == "file":
-                print(
-                    f"  file: {entry.get('name')} "
-                    f"({entry.get('size')} bytes, "
-                    f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
-                )
-                print(f"  saved to {entry.get('path')}")
-                continue
-            quote = _quote_line(inbox, registry, entry)
-            if quote is not None:
-                print(f"  {quote}")
-            for line in str(entry.get("text", "")).splitlines() or [""]:
-                print(f"  {line}")
-            for reaction in entry.get("reactions") or []:
-                reactor = registry.get(str(reaction.get("destination") or ""))
-                reactor_name = (
-                    reactor.display_name
-                    if reactor is not None
-                    else str(reaction.get("from") or "unknown")
-                )
-                print(f"  {reaction.get('reaction')} {reactor_name}")
-            entry_expires_at = entry.get("expires_at")
-            if isinstance(entry_expires_at, (int, float)) and float(
-                entry_expires_at
-            ) > time.time():
-                print(
-                    f"  disappears in {_ago(float(entry_expires_at) - time.time())}"
-                )
+            _print_message_entry(inbox, registry, entry)
         if more_unread:
             _print_more_unread(registry, more_unread)
+        if archived_unread:
+            _print_archived_unread(archived_unread)
     # Reading a conversation advances its cursor to the newest message
     # just shown, so the next listing only flags what arrived since.  A
     # conversation with unread mail omitted by --limit is left alone:
@@ -5541,7 +5943,31 @@ def cmd_messages(args: argparse.Namespace) -> int:
             newest_shown[destination] = max(
                 newest_shown.get(destination, 0), int(entry["seq"])
             )
+        # A read cursor is per-sender, shared by DMs and group posts,
+        # so showing a group post would otherwise mark an older hidden
+        # DM read without the owner ever seeing it.  Cap each
+        # destination's advance just before its oldest unread message
+        # that this listing did not show — archived mail, or mail a
+        # filtered view (group, --archived) left out.  The capped
+        # message stays unread until the owner displays it; the next
+        # listing that does advances past it.
+        shown_seqs = {int(entry["seq"]) for entry in shown}
+        hidden_floor: Dict[str, int] = {}
+        for entry in inbox.list_messages(limit=None):
+            destination = str(entry.get("destination") or "")
+            if destination not in newest_shown:
+                continue
+            if not entry.get("unread"):
+                continue
+            if int(entry["seq"]) in shown_seqs:
+                continue
+            seq = int(entry["seq"])
+            if destination not in hidden_floor or seq < hidden_floor[destination]:
+                hidden_floor[destination] = seq
         for destination, up_to_seq in newest_shown.items():
+            floor = hidden_floor.get(destination)
+            if floor is not None:
+                up_to_seq = min(up_to_seq, floor - 1)
             inbox.mark_read(peer=destination, up_to_seq=up_to_seq)
         # Listing a DM is reading it: send the sender a receipt, unless
         # this node opted out.  Best-effort — failures stay silent.
@@ -5582,6 +6008,96 @@ def cmd_messages_delete(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def cmd_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry, changed = inbox.pin(args.message)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"pinned": entry, "already_pinned": not changed}, True)
+        return _EXIT_OK
+    short = _safe_id_prefix(str(entry.get("id") or ""))
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    state = "pinned" if changed else "already pinned"
+    print(f"{state} [{short}] {_message_peer_label(registry, entry)} ({when})")
+    if changed:
+        print(
+            "note: pins are local-only; the peer's copy is unaffected"
+            " and the pin is never sent."
+        )
+    return _EXIT_OK
+
+
+def cmd_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry, changed = inbox.unpin(args.message)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"unpinned": entry, "was_pinned": changed}, True)
+        return _EXIT_OK
+    short = _safe_id_prefix(str(entry.get("id") or ""))
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    state = "unpinned" if changed else "was not pinned"
+    print(f"{state} [{short}] {_message_peer_label(registry, entry)} ({when})")
+    return _EXIT_OK
+
+
+def cmd_pinned(args: argparse.Namespace) -> int:
+    """List pinned messages, received and sent.
+
+    A read-only lookup, like `tau messages --search`: it never
+    advances the read cursor and never sends read receipts.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        # The listing covers sent pins too, so the lookup must search
+        # recipients as well as senders.
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None
+        )
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    entries = inbox.list_messages(
+        limit=None, peer=peer_hash, pinned_only=True, direction=None
+    )
+    # Blocked senders' history stays stored but is hidden locally,
+    # like `tau messages`; unblocking restores the view.  The filter
+    # applies to received pins only: sent pins are this node's own
+    # messages, not a blocked sender's, so blocking the recipient
+    # never hides them — and an unreadable list hides received pins
+    # (fail closed) while leaving sent ones visible.
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        entries = [entry for entry in entries if entry.get("direction") == "out"]
+    elif blocked:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("direction") == "out"
+            or entry.get("destination") not in blocked
+        ]
+    shown = entries if limit is None else entries[:limit]
+    if _json_mode(args):
+        _emit({"messages": shown, "count": len(shown)}, True)
+    elif not shown:
+        print("No pinned messages.")
+    else:
+        for entry in shown:
+            _print_message_entry(inbox, registry, entry)
+    return _EXIT_OK
+
+
 def cmd_messages_export(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -5613,7 +6129,12 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         raise NodeError(f"export file is not valid JSON: {exc}") from exc
     inbox = Inbox(config.inbox_path)
-    result = inbox.import_messages(document)
+    mailbox = Mailbox(config.mailbox_path)
+    # Hold the mailbox transaction across the import: it reloads the
+    # markers from disk, so a retract persisted by a running `tau serve`
+    # is seen, and it cannot land between the check and the insert.
+    with mailbox.transaction():
+        result = inbox.import_messages(document, is_retracted=mailbox.is_retracted)
     if _json_mode(args):
         _emit(result, True)
     else:
@@ -5626,6 +6147,128 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             ref = error["id"] if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    # Reload inside the lock: two archive commands racing must not
+    # discard each other's change to a different peer.
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        already = destination in archive.archived
+        if not already:
+            archive = archive.with_added(destination)
+            save_archive(config.archived_path, archive)
+    if _json_mode(args):
+        _emit(
+            {
+                "destination": destination,
+                "name": name,
+                "archived": True,
+                "changed": not already,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if already:
+        print(
+            f"Conversation with {name} ({short_hash(destination)}) "
+            "is already archived."
+        )
+    else:
+        print(
+            f"Archived conversation with {name} ({short_hash(destination)}). "
+            "Messages keep arriving; `tau unarchive` restores the view."
+        )
+    return _EXIT_OK
+
+
+def cmd_unarchive(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    destination = _resolve_inbox_peer(inbox, registry, args.peer)
+    peer = registry.get(destination)
+    name = peer.display_name if peer is not None else "unknown"
+    # Reload inside the lock: two archive commands racing must not
+    # discard each other's change to a different peer.
+    with archive_lock(config.archived_path):
+        try:
+            archive = load_archive(config.archived_path)
+        except ArchiveError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        was_archived = destination in archive.archived
+        if was_archived:
+            archive = archive.with_removed(destination)
+            save_archive(config.archived_path, archive)
+    if _json_mode(args):
+        _emit(
+            {
+                "destination": destination,
+                "name": name,
+                "archived": False,
+                "changed": was_archived,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if was_archived:
+        print(
+            f"Restored conversation with {name} ({short_hash(destination)}) "
+            "to `tau messages`."
+        )
+    else:
+        print(
+            f"Conversation with {name} ({short_hash(destination)}) "
+            "was not archived."
+        )
+    return _EXIT_OK
+
+
+def cmd_archived(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    archived = load_archived_set(config.archived_path)
+    counts: Dict[str, int] = {}
+    for entry in inbox.list_messages(limit=None):
+        destination = str(entry.get("destination") or "")
+        # Group posts are never part of an archived conversation.
+        if entry.get("kind") != "group" and destination in archived:
+            counts[destination] = counts.get(destination, 0) + 1
+
+    def describe(destination: str) -> Dict[str, Any]:
+        peer = registry.get(destination)
+        return {
+            "destination": destination,
+            "name": peer.display_name if peer is not None else "",
+            "messages": counts.get(destination, 0),
+        }
+
+    entries = [describe(destination) for destination in sorted(archived)]
+    if _json_mode(args):
+        _emit({"archived": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No archived conversations — hide one with `tau archive PEER`.")
+        return _EXIT_OK
+    for entry in entries:
+        name = entry["name"] or "unknown"
+        print(
+            f"{name} ({short_hash(entry['destination'])}): "
+            f"{entry['messages']} message(s)"
+        )
+    return _EXIT_OK
 
 
 def _describe_group(
@@ -6147,6 +6790,16 @@ def _print_more_unread(
             f"{count} more unread from {name} ({short_hash(destination)})"
             " — raise --limit to see them."
         )
+
+
+def _print_archived_unread(archived_unread: int) -> None:
+    """Hint line for unread mail hidden in archived conversations."""
+    print(
+        f"{archived_unread} unread in archived conversations"
+        " — see `tau messages --archived`."
+    )
+
+
 def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """First *length* printable characters of *ref*.
 
@@ -6474,7 +7127,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         payload["target_delivered"] = target_entry.id in delivered_ids
         if fresh is not None:
             payload["target_attempts"] = fresh.attempts
-            payload["target_next_attempt_at"] = fresh.next_attempt_at
+            payload["target_next_attempt_at"] = _next_try_at(fresh)
 
     if _json_mode(args):
         _emit(payload, True)
@@ -6489,7 +7142,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 " delivered by another process)"
             )
         else:
-            next_try = fresh.next_attempt_at
+            next_try = _next_try_at(fresh)
             if next_try is None or next_try <= time.time():
                 next_text = "now"
             else:

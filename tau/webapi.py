@@ -2210,7 +2210,9 @@ class WebBridge:
         with its error recorded and never aborts the rest. Newly
         imported entries are also mirrored into the console feed, so
         restored messages show up right away instead of landing in
-        the inbox only.
+        the inbox only. A message its sender retracted is skipped
+        like on the command line, so an old export cannot resurrect
+        it — or mirror it into the feed.
         """
         inbox = getattr(self.node, "inbox", None)
         if inbox is None:
@@ -2218,7 +2220,19 @@ class WebBridge:
         # The inbox reports the records this call stored, so a concurrent
         # import or live arrival can never make the same entry mirror twice.
         inserted: List[Dict[str, Any]] = []
-        result = inbox.import_messages(document, inserted=inserted)
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is not None:
+            # Like the CLI import: hold the mailbox transaction across
+            # the import so a retract persisted by a running node is
+            # seen, and it cannot land between the check and the insert.
+            with mailbox.transaction():
+                result = inbox.import_messages(
+                    document,
+                    inserted=inserted,
+                    is_retracted=mailbox.is_retracted,
+                )
+        else:
+            result = inbox.import_messages(document, inserted=inserted)
         # An invalid entry's id comes from untrusted JSON and may hold
         # a lone surrogate, which the UTF-8 response encoder cannot
         # write. Replace unencodable characters so the counts still

@@ -6,6 +6,7 @@ import base64
 import errno
 import hashlib
 import logging
+import math
 import os
 import random
 import socket
@@ -1345,6 +1346,20 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_retraction(
+        self, sender_hash: str, message_id: str, *, confirmed: bool = False
+    ) -> None:
+        """Persist a retraction marker.
+
+        The marker is the durable half of a retract, so a failure to
+        persist it propagates: the caller must report the retract as
+        failed rather than confirm one a relayed copy could undo.
+        With ``confirmed=True`` the retract deleted a stored copy, so
+        the marker is confirmed — a flood of unknown-ID markers cannot
+        evict it at the cap.
+        """
+        self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
+
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
 
@@ -1461,56 +1476,68 @@ class TauNode:
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
-        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         # A delayed direct request past the sender's deadline is dropped
         # unrecorded (and not marked seen), so it is never shown.
         expires_at = message.get("expires_at")
         expired = expires_at is not None and expires_at <= received_at
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
-        if not duplicate and not expired:
-            record = {
-                "from": caller_name,
-                "destination": caller_hash,
-                "text": message["text"],
-                "kind": message["kind"],
-                "sent_at": message["sent_at"],
-                "received_at": received_at,
-                "id": message_id,
-                "expires_at": message.get("expires_at"),
-                "direction": "in",
-            }
-            if message.get("in_reply_to") is not None:
-                record["in_reply_to"] = message["in_reply_to"]
-            log.info(
-                "Message from %s (%s): %s",
-                caller_name,
-                caller_hash or "anonymous",
-                message["text"],
-            )
-            # Marking seen and recording the message are one delivery:
-            # hold the mailbox transaction across both, so a live
-            # backup never restores a seen marker with no inbox entry
-            # (the message would then be rejected as already seen and
-            # lost).  The record step takes the inbox transaction
-            # inside this one; the order is mailbox first everywhere.
+        stored_record: Optional[Dict[str, Any]] = None
+        # The seen and retraction checks and the insert run under one
+        # mailbox transaction, so a concurrent retract cannot land
+        # between the marker check and the append.  Marking seen and
+        # recording the message are one delivery: holding the mailbox
+        # transaction across both means a live backup never restores a
+        # seen marker with no inbox entry (the message would then be
+        # rejected as already seen and lost).  The record step takes
+        # the inbox transaction inside this one; the order is mailbox
+        # first everywhere.
+        with self.mailbox.transaction():
             # Re-check inside the transaction: a duplicate delivery
             # that landed while this one was in flight already marked
             # the id seen, and the transaction reloaded that mark —
             # without the re-check both copies would be stored, and a
             # later retract would leave one behind.
-            recorded = False
-            with self.mailbox.transaction():
-                if not message_id or not self.mailbox.is_seen(message_id):
-                    if message_id:
-                        self.mailbox.mark_seen(message_id)
-                    self._record_received(record)
-                    recorded = True
-            if recorded and self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+            # A message its sender retracted is dropped the same way: the
+            # marker outlives the seen cache, so a copy that arrives after
+            # the id was evicted still loses to the retract.
+            retracted = bool(
+                message_id
+                and caller_hash
+                and self.mailbox.is_retracted(caller_hash, message_id)
+            )
+            if retracted:
+                log.info("Dropping retracted message %s from %s", message_id, caller_hash)
+            if not duplicate and not expired and not retracted:
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                record = {
+                    "from": caller_name,
+                    "destination": caller_hash,
+                    "text": message["text"],
+                    "kind": message["kind"],
+                    "sent_at": message["sent_at"],
+                    "received_at": received_at,
+                    "id": message_id,
+                    "expires_at": message.get("expires_at"),
+                    "direction": "in",
+                }
+                if message.get("in_reply_to") is not None:
+                    record["in_reply_to"] = message["in_reply_to"]
+                log.info(
+                    "Message from %s (%s): %s",
+                    caller_name,
+                    caller_hash or "anonymous",
+                    message["text"],
+                )
+                self._record_received(record)
+                stored_record = record
+        if stored_record is not None and self.on_message is not None:
+            try:
+                self.on_message(stored_record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
 
         return response_ok(
             echo=message["text"],
@@ -1520,6 +1547,7 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
             expired=expired,
+            retracted=retracted,
         )
 
     def _accept_group_message(
@@ -2190,89 +2218,133 @@ class TauNode:
         # deleted False instead of failing.  The match must be exact:
         # resolve also matches unique prefixes, and a short target
         # must never delete a different message from the same sender.
-        # Reload first: another process (a one-shot CLI import) may have
-        # persisted the target after this node's in-memory copy was read.
-        try:
-            self.inbox.reload()
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not read inbox: {exc}"
-            )
-        try:
-            stored = self.inbox.resolve(retract["target"])
-        except ValueError:
-            stored = None
-        if stored is None or stored.get("id") != retract["target"]:
-            return response_ok(
-                target=retract["target"],
-                received_at=received_at,
-                deleted=False,
-            )
-        # Only a received record counts: an outgoing record also has the
-        # caller's hash in ``destination`` (the recipient), so without the
-        # direction check a recipient could delete the sender's own copy.
-        if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
-            return response_error(
-                "not_sender", "only the message's sender can retract it"
-            )
-        if stored.get("kind") == "file":
-            # A saved file lives on disk; Inbox.delete drops only the
-            # record, so retracting it would leave the file behind.
-            return response_error(
-                "not_supported",
-                "file transfers cannot be retracted",
-            )
-        if stored.get("kind") == "group":
-            # A group message lives in every member's inbox; deleting
-            # it from one member alone would silently half-retract it.
-            # Group fan-out retract is a follow-up, not v1.
-            return response_error(
-                "not_supported",
-                "group messages cannot be retracted in v1",
-            )
-        # Authorize and delete as one exact-ID operation: the checks
-        # above pick the error code, but the delete itself re-verifies
-        # the exact id, direction, and sender inside the same inbox
-        # transaction, so two concurrent retracts of one short id can
-        # never reselect a different record by prefix.  Kind is
-        # immutable after append, so the kind checks above cannot go
-        # stale between here and the delete.
-        try:
-            removed = self.inbox.delete_authorized(
-                retract["target"], direction="in", destination=caller_hash
-            )
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not retract message: {exc}"
-            )
-        if removed is None:
-            # A concurrent retract deleted it first: the message is
-            # already gone, so answer the same as "not found".
-            return response_ok(
-                target=retract["target"],
-                received_at=received_at,
-                deleted=False,
-            )
-        # The inbox record is gone; a serving console keeps its own
-        # copy of the message, so tell it to drop that too — otherwise
-        # /api/messages keeps showing the retracted text, including
-        # after a restart.  A failing console callback must not fail
-        # the retraction itself: the inbox delete already landed.
-        if self.on_retract is not None:
+        # The mailbox transaction is held across the marker decision and
+        # the inbox mutation, so a concurrent delivery or import cannot
+        # check for the marker, miss this retract, and insert afterwards.
+        # Lock order is mailbox, then inbox, everywhere.
+        with self.mailbox.transaction():
+            # Reload first: another process (a one-shot CLI import) may
+            # have persisted the target after this node's in-memory copy
+            # was read.
             try:
-                self.on_retract(removed)
-            except Exception:  # pragma: no cover - console callback
-                log.warning("on_retract callback failed", exc_info=True)
-        log.info(
-            "Retraction from %s deleted %s",
-            caller_hash[:8],
-            retract["target"][:8],
-        )
-        return response_ok(
-            target=retract["target"],
-            received_at=received_at,
-            deleted=True,
-        )
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            try:
+                stored = self.inbox.resolve(retract["target"])
+            except ValueError:
+                stored = None
+            if stored is None or stored.get("id") != retract["target"]:
+                # No stored copy to check the sender against — the message
+                # may already be deleted or never have arrived.  Record the
+                # marker anyway: the retract is authenticated, and a copy
+                # arriving later (a relayed copy, or one that outlives the
+                # seen cache) must still lose to it.  The key carries the
+                # caller's own hash, so a sender can only ever suppress
+                # their own messages this way.  If the marker cannot be
+                # persisted the retract is not confirmed.
+                try:
+                    self._record_retraction(caller_hash, retract["target"])
+                except Exception as exc:
+                    log.warning(
+                        "Could not record retraction marker for %s",
+                        retract["target"][:8],
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed", f"could not record retraction: {exc}"
+                    )
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # Only a received record counts: an outgoing record also has the
+            # caller's hash in ``destination`` (the recipient), so without the
+            # direction check a recipient could delete the sender's own copy.
+            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+                return response_error(
+                    "not_sender", "only the message's sender can retract it"
+                )
+            if stored.get("kind") == "file":
+                # A saved file lives on disk; Inbox.delete drops only the
+                # record, so retracting it would leave the file behind.
+                return response_error(
+                    "not_supported",
+                    "file transfers cannot be retracted",
+                )
+            if stored.get("kind") == "group":
+                # A group message lives in every member's inbox; deleting
+                # it from one member alone would silently half-retract it.
+                # Group fan-out retract is a follow-up, not v1.
+                return response_error(
+                    "not_supported",
+                    "group messages cannot be retracted in v1",
+                )
+            # Record the marker before deleting the copy: if it cannot be
+            # persisted, nothing is deleted and the retract fails cleanly.
+            # (A refused retract records nothing: the message stays, so it
+            # must stay deliverable.)  The marker is confirmed: the
+            # retract was honoured against a stored copy, so a flood of
+            # unknown-ID markers must not evict it at the cap.
+            try:
+                self._record_retraction(
+                    caller_hash, retract["target"], confirmed=True
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not record retraction marker for %s",
+                    retract["target"][:8],
+                    exc_info=True,
+                )
+                return response_error(
+                    "storage_failed", f"could not record retraction: {exc}"
+                )
+            # Authorize and delete as one exact-ID operation: the checks
+            # above pick the error code, but the delete itself re-verifies
+            # the exact id, direction, and sender inside the same inbox
+            # transaction, so two concurrent retracts of one short id can
+            # never reselect a different record by prefix.  Kind is
+            # immutable after append, so the kind checks above cannot go
+            # stale between here and the delete.
+            try:
+                removed = self.inbox.delete_authorized(
+                    retract["target"], direction="in", destination=caller_hash
+                )
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not retract message: {exc}"
+                )
+            if removed is None:
+                # A concurrent retract deleted it first: the message is
+                # already gone, so answer the same as "not found".
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # The inbox record is gone; a serving console keeps its own
+            # copy of the message, so tell it to drop that too — otherwise
+            # /api/messages keeps showing the retracted text, including
+            # after a restart.  A failing console callback must not fail
+            # the retraction itself: the inbox delete already landed.
+            if self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            log.info(
+                "Retraction from %s deleted %s",
+                caller_hash[:8],
+                retract["target"][:8],
+            )
+            return response_ok(
+                target=retract["target"],
+                received_at=received_at,
+                deleted=True,
+            )
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -2650,6 +2722,12 @@ class TauNode:
             )
         if message_id is not None:
             due = [entry for entry in due if entry.id == message_id]
+        # A scheduled message never goes early: the not-before time is
+        # the sender's instruction, not retry pacing, so even a
+        # backoff-ignoring round (a fresh announce, `tau outbox retry`,
+        # a delivery wait) leaves it queued until its time comes.
+        now = time.time()
+        due = [entry for entry in due if not entry.is_scheduled(now)]
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
@@ -2668,13 +2746,17 @@ class TauNode:
             if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                 moved["delivered"] += 1
 
-        now = time.time()
         for entry in self.mailbox.outbox_list(timeout=_remaining(deadline)):
             if _past(deadline):
                 return moved
             if entry.to == peer.destination_hash:
                 continue
             if message_id is not None and entry.id != message_id:
+                continue
+            if entry.is_scheduled(now):
+                # A sealed copy deposited early could reach the
+                # recipient before the scheduled time, so scheduled
+                # entries are never deposited ahead of schedule either.
                 continue
             holders = {
                 holder: deposited_at
@@ -3399,7 +3481,12 @@ class TauNode:
         # reconcile never breaks delivery — it only leaves
         # legitimate reactions stranded.  If a fan-out fails, the
         # message still records (the inbox is clean) but the live
-        # event is withheld.
+        # event is withheld.  The retraction check runs inside the
+        # same transaction, so a concurrent retract cannot land
+        # between the marker check and the append — the marker
+        # outlives the seen cache, so a relayed copy arriving after
+        # the id was evicted still loses to it.  Group messages are
+        # not retractable in v1, so they never match a marker.
         publish_ok = True
         recorded = False
         if pinned is not None:
@@ -3436,7 +3523,17 @@ class TauNode:
             recorded = True
         else:
             with self.mailbox.transaction():
-                if not self.mailbox.is_seen(message["id"]):
+                if self.mailbox.is_seen(message["id"]):
+                    pass
+                elif message.get("group") is None and self.mailbox.is_retracted(
+                    sender if isinstance(sender, str) else "", message["id"]
+                ):
+                    # A retract the sender issued after this copy was sealed
+                    # still wins: the marker outlives the seen cache, so a
+                    # relayed copy is dropped, never stored.  Group messages
+                    # are not retractable in v1, so they never match a marker.
+                    log.info("Dropping retracted relayed message %s", message["id"])
+                else:
                     self.mailbox.mark_seen(message["id"])
                     self._record_received(record)
                     recorded = True
@@ -3709,6 +3806,7 @@ class TauNode:
         expires_at: Optional[float] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
+        send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -3732,10 +3830,41 @@ class TauNode:
         The reference travels the direct and the store-and-forward
         paths alike, and the sent message is recorded in the inbox so
         the peer's reply to it can be rendered from local history.
+
+        ``send_after`` schedules the message (epoch seconds): instead
+        of attempting delivery now, the message is queued with a
+        not-before time and the outbox delivers it once that time
+        arrives — even when the peer is reachable.  The scheduled
+        time is local only; the recipient sees a normal message.
         """
         normalized = normalize_message(text)
         reply_to = clean_in_reply_to(in_reply_to)
         clean_kind = normalize_message_kind(kind)
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+            try:
+                send_after = float(send_after)
+            except (OverflowError, ValueError) as exc:
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                ) from exc
+            if not math.isfinite(send_after):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+        if send_after is not None and not queue:
+            # A scheduled message is queued by definition: with queueing
+            # refused there is nowhere for it to wait until its time, so
+            # refuse the combination before anything is recorded.
+            raise NodeError(
+                "cannot schedule a message without queueing: "
+                "send_after requires queue=True"
+            )
         message_id = generate_message_id()
         payload = encode_message(
             normalized,
@@ -3761,6 +3890,70 @@ class TauNode:
                 to=peer.destination_hash,
                 text=normalized,
             )
+            if send_after is not None:
+                # Scheduled: no delivery attempt now, even when the peer
+                # is reachable — the entry leaves the outbox only once
+                # its time arrives (every flush path honours it).
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=peer.destination_hash,
+                        text=normalized,
+                        to_name=peer.display_name,
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        in_reply_to=reply_to,
+                        kind=clean_kind,
+                        send_after=send_after,
+                    )
+                except MailboxError:
+                    # Nothing was queued: forget the sent record made
+                    # above, so a rejected schedule does not linger in
+                    # sent history as a message that never went anywhere.
+                    self.mailbox.discard_sent(message_id)
+                    raise
+                if self.registry.get(peer.destination_hash) is None:
+                    # A caller can hand send_message a Peer that never
+                    # entered the registry (resolve_peer returns Peer
+                    # objects as-is); flush_outbox only visits registry
+                    # peers, so register it now or the scheduled message
+                    # would wait until another path registers the peer.
+                    self.registry.upsert(
+                        peer.destination_hash, peer.public_key, name=peer.name
+                    )
+                self._record_sent(
+                    {
+                        "from": self.name,
+                        "destination": peer.hexhash,
+                        "text": normalized,
+                        "kind": clean_kind,
+                        "sent_at": time.time(),
+                        "received_at": time.time(),
+                        "id": message_id,
+                        "direction": "out",
+                        **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    }
+                )
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=peer.destination_hash,
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                log.info(
+                    "Scheduled message %s for %s at %s",
+                    entry.id,
+                    peer.destination_hash.hex(),
+                    entry.send_after,
+                )
+                return {
+                    "ok": True,
+                    "v": PROTOCOL_VERSION,
+                    "queued": True,
+                    "id": entry.id,
+                    "to": entry.to_hex,
+                    "expires_at": entry.expires_at,
+                    "send_after": entry.send_after,
+                }
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
             self.mailbox.record_delivered(message_id)
             if isinstance(response, dict):
@@ -3831,6 +4024,10 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=reply_to,
                 kind=clean_kind,
+                # A scheduled send to an undiscovered peer queues here:
+                # the not-before time must survive the fallback, or the
+                # message would go out as soon as the peer is heard from.
+                send_after=send_after,
             )
             self._record_sent(
                 {
@@ -3869,6 +4066,11 @@ class TauNode:
                 "id": entry.id,
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
+                **(
+                    {"send_after": entry.send_after}
+                    if entry.send_after is not None
+                    else {}
+                ),
             }
 
     def send_group_message(

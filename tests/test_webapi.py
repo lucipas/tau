@@ -7633,6 +7633,45 @@ def test_messages_export_import_via_api(bridge, node):
         bridge2.stop()
 
 
+def test_messages_import_skips_a_retracted_message(bridge, node, tmp_path):
+    # Regression test for the CodeRabbit Major: the console import
+    # must apply the retraction markers like the CLI does, or an old
+    # export resurrects a message its sender retracted — and mirrors
+    # it into the console feed.
+    _inbound_record(node)
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": PEER_HASH,
+            "text": "reply back",
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "m-2",
+            "direction": "out",
+        }
+    )
+    _, _, document = _json(bridge, "/api/messages/export")
+
+    node2 = FakeNode(tmp_path / "mailbox2.json")
+    bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+    bridge2.start()
+    try:
+        node2.mailbox.record_retraction(PEER_HASH, "m-1")
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 1
+        assert payload["import"]["skipped"] == 1
+        assert payload["import"]["errors"] == [
+            {"id": "m-1", "error": "message was retracted by its sender"}
+        ]
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert [m["text"] for m in feed["messages"]] == ["reply back"]
+    finally:
+        bridge2.stop()
+
+
 # -- received-file downloads -------------------------------------------------
 
 SENDER_HASH = "ab" * 16

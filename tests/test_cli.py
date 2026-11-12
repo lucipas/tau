@@ -11,6 +11,7 @@ import pytest
 import RNS
 
 from tau import cli
+from tau.blocklist import BlockList, save_blocklist
 from tau.config import TauConfig, write_node_metadata
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
@@ -76,6 +77,102 @@ def test_parser_send_to_is_repeatable():
     assert args.to == ["alice", "bob"]
 
 
+def test_parser_send_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(["send", "--to", "alice", "--delay", "5m", "hello"])
+    assert args.delay == "5m"
+
+
+def test_send_delay_schedules_without_delivery(tmp_path, capsys, monkeypatch):
+    before = time.time()
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", "later"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert len(node.send_kwargs) == 1
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    out = capsys.readouterr().out
+    assert "scheduled for alice" in out
+    assert "sends in 1h" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_send_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--json", "--to", "alice", "--delay", "5m", "later"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued"] is True
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+
+
+def test_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "5m", "--no-queue", "hi"],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", "--expire", "1h", "hi"],
+    )
+    assert code == 2
+    assert "--delay must be shorter than --expire" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "soon", "hi"]
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "31d", "hi"]
+    )
+    assert code == 1
+    assert "--delay duration must be at most 30d" in capsys.readouterr().err
+    # 30d is past the effective maximum: the mail TTL less an hour
+    # of delivery slack. 29d fits and queues.
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "30d", "hi"]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "29d", "hi"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+
+
+def test_outbox_lists_scheduled_entry_next_try(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="dd" + "44" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(["outbox", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "in 1h" in capsys.readouterr().out
+
+
 class _FakeSendNode:
     """Stub TauNode for `tau send`: per-target behaviour drives whether
     a recipient is delivered, queued (a real outbox entry is written,
@@ -95,6 +192,7 @@ class _FakeSendNode:
         self.started = False
         self.calls: list = []
         self.sent: list = []
+        self.send_kwargs: list = []
         self.flush_calls: list = []
         self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
         _FakeSendNode.instances.append(self)
@@ -116,6 +214,7 @@ class _FakeSendNode:
 
         self.calls.append((target, text))
         self.sent.append((target, text, kwargs.get("in_reply_to")))
+        self.send_kwargs.append(kwargs)
         mode = _FakeSendNode.behaviour.get(target, "delivered")
         if mode == "error":
             raise NodeError(f"no path to {target}")
@@ -139,6 +238,7 @@ class _FakeSendNode:
                 to=b"\xbb" * 16,
                 text=text,
                 message_id=f"{len(self.calls):032x}",
+                send_after=kwargs.get("send_after"),
             )
             # The real node records the send when it queues (see
             # TauNode.send_message), so the sent record exists for the
@@ -149,6 +249,11 @@ class _FakeSendNode:
                 "queued": True,
                 "id": entry.id,
                 "to": entry.to_hex,
+                **(
+                    {"send_after": entry.send_after}
+                    if entry.send_after is not None
+                    else {}
+                ),
             }
         return {"ok": True, "echo": text, "_rtt": 0.05}
 
@@ -2057,6 +2162,206 @@ def test_messages_delete_json_and_errors(tmp_path, capsys):
     assert payload["deleted"]["text"] == "first hello"
 
 
+def test_parser_pin_unpin_pinned_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["pin", "abcd1234"])
+    assert args.message == "abcd1234"
+    assert args.func is cli.cmd_pin
+
+    args = parser.parse_args(["unpin", "abcd1234"])
+    assert args.message == "abcd1234"
+    assert args.func is cli.cmd_unpin
+
+    args = parser.parse_args(["pinned", "--peer", "alice", "--limit", "5"])
+    assert args.peer == "alice"
+    assert args.limit == 5
+    assert args.func is cli.cmd_pinned
+
+    defaults = parser.parse_args(["pinned"])
+    assert defaults.peer is None
+    assert defaults.limit == 30
+
+
+def test_pin_unpin_round_trip(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["pin", "m-2", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "pinned [m-2] from alice" in out
+    assert "pins are local-only" in out
+
+    # The pin survives a fresh process and shows in both listings.
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "second hello" in out
+    assert "first hello" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "📌" in out
+    assert "#m-2" in out
+
+    code = cli.main(["unpin", "m-2", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "unpinned [m-2] from alice" in capsys.readouterr().out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No pinned messages." in capsys.readouterr().out
+
+
+def test_pin_json_and_errors(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    # Ambiguous prefix: both seeded ids start with "m-".
+    code = cli.main(["pin", "m-", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "2 messages match prefix" in capsys.readouterr().err
+
+    # Unknown id.
+    code = cli.main(["pin", "nope", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown message" in capsys.readouterr().err
+
+    code = cli.main(["pin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pinned"]["id"] == "m-1"
+    assert payload["already_pinned"] is False
+
+    # Pinning twice reports the pin was already there.
+    code = cli.main(["pin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_pinned"] is True
+
+    code = cli.main(["unpin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unpinned"]["id"] == "m-1"
+    assert payload["was_pinned"] is True
+
+    # Unpinning an unpinned message is a no-op, not an error.
+    code = cli.main(["unpin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["was_pinned"] is False
+
+
+def test_pinned_peer_filter_and_json(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No pinned messages." in capsys.readouterr().out
+
+    cli.main(["pin", "m-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    code = cli.main(["pinned", "--peer", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "first hello" in capsys.readouterr().out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "m-1"
+    assert payload["messages"][0]["pinned"] is True
+
+
+def test_pinned_peer_prefix_finds_sent_pin(tmp_path, capsys):
+    """A pinned sent message is findable by its recipient's hash prefix.
+
+    The recipient is not in the registry and never sent anything, so
+    only the sent record names them — the peer lookup must search
+    sent pins too.
+    """
+    data_dir, _ = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    code = cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(["pinned", "--peer", "cdcdcdcd", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "sent pinned note" in out
+    # Sent pins render as from you, never as unread.
+    assert "you →" in out
+    assert "●" not in out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    sent = [item for item in payload["messages"] if item["id"] == "s-1"]
+    assert sent and sent[0]["unread"] is False
+
+
+def test_pinned_blocked_filter_applies_to_received_only(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    cli.main(["pin", "m-1", "--data-dir", str(data_dir)])
+    cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    def _pinned_text():
+        code = cli.main(["pinned", "--data-dir", str(data_dir)])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received pin, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [sender_hash.hex()]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+    # Blocking the recipient hides nothing: sent pins are your own.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [recipient]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" in out
+    assert "sent pinned note" in out
+
+    # An unreadable list hides received pins (fail closed) but keeps sent ones.
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+
 def test_parser_messages_unread_and_count_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--unread", "--count"])
@@ -3319,6 +3624,34 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
 
 
+def test_messages_import_skips_retracted_messages(tmp_path, capsys):
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    export_path = tmp_path / "messages-backup.json"
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--output", str(export_path)]
+    )
+    assert code == 0
+
+    target_dir = tmp_path / "other-node"
+    # The sender retracted m-1 on the target node before the import.
+    mailbox = Mailbox(target_dir / "mailbox.json")
+    mailbox.record_retraction(sender_hash.hex(), "m-1")
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "Imported 1 messages (0 already present, 1 skipped)" in out
+    assert "skipped m-1: message was retracted by its sender" in out
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2"]
+
+
 def test_messages_export_to_stdout_and_peer_filter(tmp_path, capsys):
     source_dir, sender_hash = _seed_messages(tmp_path)
     code = cli.main(["messages", "export", "--data-dir", str(source_dir)])
@@ -3570,6 +3903,258 @@ def test_send_reply_to_unknown_reference_is_an_error(
     assert code == 1
     assert "no message" in capsys.readouterr().err
     assert _FakeSendNode.instances[0].sent == []
+
+
+def _run_forward(tmp_path, monkeypatch, argv):
+    monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
+    _FakeSendNode.instances.clear()
+    _FakeSendNode.behaviour = {}
+    _FakeSendNode.deliver_on_flush = False
+    return cli.main(["forward", "--data-dir", str(tmp_path / "node"), *argv])
+
+
+def test_parser_forward_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["forward", "--to", "bob", "abcdef12"])
+    assert args.command == "forward"
+    assert args.to == ["bob"]
+    assert args.message == "abcdef12"
+    assert args.timeout == 20.0
+    assert args.wait is None
+    assert args.no_queue is False
+
+    multi = parser.parse_args(
+        ["forward", "--to", "alice", "--to", "bob", "--wait", "5", "abcdef12"]
+    )
+    assert multi.to == ["alice", "bob"]
+    assert multi.wait == 5.0
+
+
+def test_forward_sends_attributed_text(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "aaaa"])
+    assert code == 0
+    node = _FakeSendNode.instances[0]
+    assert len(node.sent) == 1
+    target, text, _ = node.sent[0]
+    assert target == "bob"
+    assert text == "Forwarded from alice:\noriginal thought"
+    assert "delivered to bob" in capsys.readouterr().out
+
+
+def test_forward_prefers_registry_alias_for_sender_label(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.set_alias(sender_hash, "ally")
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "hello there",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "c" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "cccc"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from ally:\nhello there"
+    )
+
+
+def test_forward_own_sent_message_labels_you(tmp_path, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "my earlier note",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "d" * 32,
+            "direction": "out",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "dddd"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from you:\nmy earlier note"
+    )
+
+
+def test_forward_blocked_sender_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({"ab" * 16})))
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "aaaa"])
+    assert code == 1
+    assert "blocked peer" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_unknown_sender_uses_short_hash(tmp_path, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "unknown",
+            "destination": "ab" * 16,
+            "text": "nameless hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "2" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "2222"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from abababab:\nnameless hello"
+    )
+
+
+def test_forward_own_sent_message_ignores_blocked_recipient(
+    tmp_path, monkeypatch
+):
+    # A sent message carries its *recipient* in `destination`: blocking
+    # that recipient must not stop the owner forwarding their own words.
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    save_blocklist(config.blocklist_path, BlockList(blocked=frozenset({"ab" * 16})))
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "my earlier note",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "d" * 32,
+            "direction": "out",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "carol", "dddd"])
+    assert code == 0
+    assert (
+        _FakeSendNode.instances[0].sent[0][1]
+        == "Forwarded from you:\nmy earlier note"
+    )
+
+
+def test_forward_unknown_reference_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_reply_conversation(tmp_path)
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "zzzz"])
+    assert code == 1
+    assert "unknown message: 'zzzz'" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_ambiguous_prefix_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    for message_id in ("e" * 31 + "1", "e" * 31 + "2"):
+        inbox.append(
+            {
+                "from": "alice",
+                "destination": "ab" * 16,
+                "text": "shared prefix",
+                "sent_at": 10.0,
+                "received_at": 20.0,
+                "id": message_id,
+                "direction": "in",
+            }
+        )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "eeee"])
+    assert code == 1
+    assert "messages match prefix" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_file_message_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "name": "photo.jpg",
+            "size": 42,
+            "sha256": "f" * 64,
+            "path": "received/photo.jpg",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "f" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "ffff"])
+    assert code == 1
+    assert "no text to send" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_group_message_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "group secret",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "6" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "6666"])
+    assert code == 1
+    assert "group message" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
+
+
+def test_forward_too_long_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "ab" * 16,
+            "text": "x" * 1990,
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "1" * 32,
+            "direction": "in",
+        }
+    )
+    code = _run_forward(tmp_path, monkeypatch, ["--to", "bob", "1111"])
+    assert code == 1
+    assert "too long to forward" in capsys.readouterr().err
+    assert _FakeSendNode.instances == []
 
 
 def test_messages_renders_reactions(tmp_path, capsys):
