@@ -1062,6 +1062,12 @@ class WebBridge:
         before this was tracked — simply age out of that buffer.
         """
         updated: Optional[Dict[str, Any]] = None
+        # The route read takes the mailbox lock, so fetch it before
+        # any bridge lock: an inbound retraction takes the locks in
+        # the opposite order (mailbox transaction, then the bridge
+        # lock through on_retract), and the two paths would deadlock
+        # if they overlapped.
+        route = self._delivery_route(mail_id)
         with self._send_lock:
             with self._lock:
                 for message in self._messages:
@@ -1075,7 +1081,6 @@ class WebBridge:
                         # mailbox sent record can be evicted while
                         # this entry remains retractable, and only the
                         # entry outlives that eviction.
-                        route = self._delivery_route(mail_id)
                         if route is not None:
                             message["delivered_via"] = route
                         updated = dict(message)
@@ -2542,11 +2547,17 @@ class WebBridge:
                 delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
             )
+            # The route read takes the mailbox lock, so fetch it
+            # before the bridge lock (same deadlock as record_delivery).
+            route = (
+                self._delivery_route(mail_id)
+                if mail_id is not None
+                else None
+            )
             with self._lock:
                 if mail_id is not None and mail_id in self._early_deliveries:
                     del self._early_deliveries[mail_id]
                     message["status"] = "delivered"
-                    route = self._delivery_route(mail_id)
                     if route is not None:
                         message["delivered_via"] = route
                     flipped = True

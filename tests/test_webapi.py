@@ -5689,6 +5689,57 @@ def test_record_delivery_flips_queued_message_and_publishes(bridge, node):
     assert updates[0]["message"]["status"] == "delivered"
 
 
+def test_record_delivery_reads_route_before_bridge_lock(bridge, node):
+    # CodeRabbit Major: _delivery_route takes the mailbox lock, so
+    # it must not run while the bridge lock is held — an inbound
+    # retraction takes the locks in the opposite order (mailbox
+    # transaction, then the bridge lock through on_retract), and the
+    # two paths would deadlock if they overlapped.
+    _queue_send(node)
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+    seen = []
+    real_sent_record = node.mailbox.sent_record
+
+    def spy(message_id):
+        seen.append(bridge._lock.locked())
+        return real_sent_record(message_id)
+
+    node.mailbox.sent_record = spy
+    try:
+        updated = bridge.record_delivery("mail-1")
+    finally:
+        node.mailbox.sent_record = real_sent_record
+    assert updated is not None
+    assert updated["status"] == "delivered"
+    assert seen == [False]
+
+
+def test_send_message_flip_reads_route_before_bridge_lock(bridge, node):
+    # Same lock-order finding, second path: a delivery report that
+    # arrived before the send is reconciled in send_message's
+    # early-delivery flip, which also read the route under the
+    # bridge lock.
+    _queue_send(node)
+    bridge._early_deliveries["mail-1"] = None
+    seen = []
+    real_sent_record = node.mailbox.sent_record
+
+    def spy(message_id):
+        seen.append(bridge._lock.locked())
+        return real_sent_record(message_id)
+
+    node.mailbox.sent_record = spy
+    try:
+        _, _, sent = _json(
+            bridge, "/api/messages", method="POST",
+            body={"to": "alice", "text": "hi"},
+        )
+    finally:
+        node.mailbox.sent_record = real_sent_record
+    assert sent["message"]["status"] == "delivered"
+    assert seen == [False]
+
+
 def test_record_delivery_ignores_unknown_id(bridge, node):
     _queue_send(node)
     _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
