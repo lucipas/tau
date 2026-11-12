@@ -10,6 +10,7 @@ import type {
   BundleExportResponse,
   BundleImportResponse,
   CancelOutboxResponse,
+  ChangeGroupMembersResponse,
   CreateGroupResponse,
   DeleteGroupResponse,
   DeleteMessageResponse,
@@ -26,12 +27,16 @@ import type {
   MessagesResponse,
   MessagesSearchResponse,
   NodeInfo,
+  NodeSettings,
   OutboxEntry,
   OutboxResponse,
   Peer,
+  PeerInfo,
+  PeerInfoResult,
   PeersResponse,
   PingResult,
   ReactResponse,
+  RenameResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
@@ -42,6 +47,7 @@ import type {
   TauGroup,
   TauMessage,
   UnreadCounts,
+  UpdateSettingsResponse,
   VerifyPeerResponse,
   VerifyState,
 } from "./types";
@@ -56,6 +62,12 @@ export const EMPTY_UNREAD: UnreadCounts = { per_peer: {}, total: 0 };
 export interface PingState {
   pending?: boolean;
   rtt_ms?: number | null;
+  error?: string;
+}
+
+export interface PeerInfoState {
+  pending?: boolean;
+  info?: PeerInfo;
   error?: string;
 }
 
@@ -110,6 +122,12 @@ export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [groups, setGroups] = useState<TauGroup[]>([]);
+  // The latest roster swap: the console uses it to keep a selected old
+  // group id pointing at its successor.
+  const [groupSwap, setGroupSwap] = useState<{
+    from: string;
+    to: string;
+  } | null>(null);
   const [messages, setMessages] = useState<TauMessage[]>([]);
   // The search the feed is showing, or null for the live traffic. Kept
   // beside `messages` so a search result list is never mixed into the
@@ -121,12 +139,15 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [settings, setSettings] = useState<NodeSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [social, setSocial] = useState<SocialInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [infos, setInfos] = useState<Record<string, PeerInfoState>>({});
   const [verifications, setVerifications] = useState<
     Record<string, VerifyState>
   >({});
@@ -195,6 +216,19 @@ export function useTau() {
     [],
   );
 
+  // The node's identity and name live on the snapshot; a rename (or an
+  // announce) publishes a `status` event instead of a full snapshot, so
+  // a status event re-reads the snapshot's node record on its own.
+  // Only the newest node update may apply: a refresh issued before a
+  // rename or snapshot that resolves late must not restore an old name.
+  const nodeSeq = useRef(0);
+  const refreshNode = useCallback(async () => {
+    const requestId = ++nodeSeq.current;
+    const snapshot = await apiGet<Snapshot>("/api/status");
+    if (requestId !== nodeSeq.current) return;
+    setNode(snapshot.node);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     // Edits made before this connection opened are in its snapshot;
@@ -215,6 +249,7 @@ export function useTau() {
         snapshot.messages.length > 0
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
+      nodeSeq.current += 1;
       setNode(snapshot.node);
       peerEventSeq.current += 1;
       snapshotRevision.current = peerEventSeq.current;
@@ -341,6 +376,13 @@ export function useTau() {
       applyUnread(payload.unread);
     };
 
+    const onStatus = () => {
+      // A rename or announce in another tab: re-read the node record
+      // rather than waiting for the next snapshot. A failed refresh
+      // leaves the last known name in place until the next one.
+      void refreshNode().catch(() => undefined);
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -352,6 +394,7 @@ export function useTau() {
     source.addEventListener("message_deleted", onMessageDeleted);
     source.addEventListener("peer", onPeer);
     source.addEventListener("unread", onUnread);
+    source.addEventListener("status", onStatus);
     source.addEventListener("error", onError);
 
     return () => {
@@ -363,10 +406,11 @@ export function useTau() {
       source.removeEventListener("message_deleted", onMessageDeleted);
       source.removeEventListener("peer", onPeer);
       source.removeEventListener("unread", onUnread);
+      source.removeEventListener("status", onStatus);
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread, refreshGroups]);
+  }, [applyUnread, refreshGroups, refreshNode]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -377,6 +421,31 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const settingsSeq = useRef(0);
+
+  const refreshSettings = useCallback(async () => {
+    // Same polling shape as the outbox: a setting changed on the CLI
+    // shows up here without waiting for a reload.
+    const requestId = ++settingsSeq.current;
+    try {
+      const result = await apiGet<NodeSettings>("/api/settings");
+      if (requestId !== settingsSeq.current) return;
+      setSettings(result);
+      setSettingsError(null);
+    } catch (caught) {
+      // Record the failure so the section can explain why the switches
+      // are disabled, then rethrow for callers that care.
+      if (requestId === settingsSeq.current) {
+        setSettingsError(
+          caught instanceof Error && caught.message
+            ? caught.message
+            : "couldn't load settings",
+        );
+      }
+      throw caught;
+    }
+  }, []);
+
   const peersSeq = useRef(0);
   const forgottenPeers = useRef(new Map<string, number>());
 
@@ -391,7 +460,6 @@ export function useTau() {
   }, []);
 
   const refreshHeldSeq = useRef(0);
-
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -416,14 +484,15 @@ export function useTau() {
   useEffect(() => {
     if (connection !== "live") return;
     async function tick() {
-      // The three endpoints are independent: a failure on one must not
-      // stop the others from updating their state. The outbox is a side
-      // panel: a failed poll leaves the last known entries in place
-      // instead of flashing an error.
+      // The endpoints are independent: a failure on one must not stop
+      // the others from updating their state. Each is a side panel: a
+      // failed poll leaves the last known values in place instead of
+      // flashing an error.
       await Promise.allSettled([
         refreshOutbox(),
         refreshHeldMail(),
         refreshGroups(),
+        refreshSettings(),
       ]);
     }
     void tick();
@@ -431,7 +500,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings]);
 
   const allowlistSeq = useRef(0);
 
@@ -531,6 +600,26 @@ export function useTau() {
       return result.cancelled;
     },
     [refreshOutbox],
+  );
+
+  const updateSetting = useCallback(
+    async (setting: keyof NodeSettings, value: boolean) => {
+      const result = await apiPost<UpdateSettingsResponse>("/api/settings", {
+        setting,
+        value,
+      });
+      // The update already succeeded: apply the returned settings at
+      // once, and treat the follow-up refresh as best-effort so a
+      // failed GET cannot make a successful change look like a failure.
+      setSettings(result.settings);
+      try {
+        await refreshSettings();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.settings;
+    },
+    [refreshSettings],
   );
 
   const deleteMessage = useCallback(async (id: number) => {
@@ -733,6 +822,29 @@ export function useTau() {
     }
   }, []);
 
+  const fetchInfo = useCallback(async (destination: string) => {
+    setInfos((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<PeerInfoResult>("/api/info", {
+        to: destination,
+      });
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: { info: result.info },
+      }));
+    } catch (error) {
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "info failed",
+        },
+      }));
+    }
+  }, []);
+
   const announce = useCallback(async () => {
     setAnnouncing(true);
     try {
@@ -741,6 +853,29 @@ export function useTau() {
       setAnnouncing(false);
     }
   }, []);
+
+  const renameNode = useCallback(
+    async (name: string) => {
+      const result = await apiPost<RenameResponse>("/api/id/rename", {
+        name,
+      });
+      // The rename already succeeded: show the new name at once, and
+      // treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful rename look like a failure. Invalidate
+      // any refresh still in flight so it cannot restore the old name.
+      nodeSeq.current += 1;
+      setNode((previous) =>
+        previous ? { ...previous, name: result.name } : previous,
+      );
+      try {
+        await refreshNode();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result;
+    },
+    [refreshNode],
+  );
 
   const backup = useCallback(async () => {
     // A failed download leaves the error on the button until the next
@@ -841,6 +976,58 @@ export function useTau() {
       return result.deleted;
     },
     [refreshGroups],
+  );
+
+  const changeGroupMembers = useCallback(
+    async (group: string, members: string[], adding: boolean) => {
+      const result = await apiPost<ChangeGroupMembersResponse>(
+        adding ? "/api/groups/add-member" : "/api/groups/remove-member",
+        { group, members },
+      );
+      // A roster change is a successor group: swap the old id for the
+      // new one at once, then refresh best-effort so a failed GET
+      // cannot leave the stale roster on screen.
+      const updated = result.group;
+      const previousId = result.previous_id;
+      groupEdits.current += 1;
+      setGroups((previous) => {
+        // A snapshot may already list the successor: keep one entry per
+        // id, placed where the old group was.
+        const rest = previous.filter(
+          (entry) => entry.id !== previousId && entry.id !== updated.id,
+        );
+        const index = previous.findIndex((entry) => entry.id === previousId);
+        if (index === -1) return [...rest, updated];
+        const before = previous
+          .slice(0, index)
+          .filter(
+            (entry) => entry.id !== previousId && entry.id !== updated.id,
+          ).length;
+        return [...rest.slice(0, before), updated, ...rest.slice(before)];
+      });
+      // Same batch as the swap, so the console can move a selected old
+      // id to its successor before the missing-target fallback runs.
+      setGroupSwap({ from: previousId, to: updated.id });
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result;
+    },
+    [refreshGroups],
+  );
+
+  const addGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, true),
+    [changeGroupMembers],
+  );
+
+  const removeGroupMembers = useCallback(
+    (group: string, members: string[]) =>
+      changeGroupMembers(group, members, false),
+    [changeGroupMembers],
   );
 
   const editBlock = useCallback(
@@ -997,7 +1184,6 @@ export function useTau() {
       return next;
     });
   }, []);
-
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -1210,12 +1396,15 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    settings,
+    settingsError,
     heldMail,
     allowlist,
     bridge,
     social,
     connection,
     pings,
+    infos,
     verifications,
     blocks,
     announcing,
@@ -1228,12 +1417,14 @@ export function useTau() {
     sendGroup,
     sendFile,
     ping,
+    fetchInfo,
     showSafetyNumber,
     verifyPeer,
     clearVerification,
     blockPeer,
     unblockPeer,
     announce,
+    renameNode,
     backup,
     runDoctor,
     markRead,
@@ -1242,8 +1433,13 @@ export function useTau() {
     clearReaction,
     createGroup,
     deleteGroup,
+    addGroupMembers,
+    removeGroupMembers,
     refreshOutbox,
     refreshGroups,
+    groupSwap,
+    refreshSettings,
+    updateSetting,
     refreshPeers,
     refreshMessages,
     cancelOutbox,

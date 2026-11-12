@@ -14,6 +14,7 @@ import { MessageFeed } from "./message-feed";
 import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
+import { SettingsSection } from "./settings-section";
 
 export function Console() {
   const tau = useTau();
@@ -37,6 +38,14 @@ export function Console() {
     // A refresh can remove the selected group: never keep submitting its
     // stale id. Fall back to a remaining group, then to a peer.
     if (mode === "group" && !tau.groups.some((group) => group.id === target)) {
+      // A roster edit replaces the id: follow the successor, not a
+      // fallback group.
+      const successor =
+        tau.groupSwap?.from === target ? tau.groupSwap.to : null;
+      if (successor && tau.groups.some((group) => group.id === successor)) {
+        setTarget(successor);
+        return;
+      }
       if (tau.groups.length > 0) {
         setTarget(tau.groups[0].id);
       } else if (tau.peers.length > 0) {
@@ -57,7 +66,7 @@ export function Console() {
         setTarget(tau.groups[0].id);
       }
     }
-  }, [tau.peers, tau.groups, target, mode]);
+  }, [tau.peers, tau.groups, tau.groupSwap, target, mode]);
 
   function changeMode(next: "peer" | "custom" | "group") {
     customPicked.current = next === "custom";
@@ -133,6 +142,9 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          onRename={async (name) => {
+            await tau.renameNode(name);
+          }}
           backingUp={tau.backingUp}
           backupError={tau.backupError}
           onBackup={() => {
@@ -156,12 +168,16 @@ export function Console() {
             bridge={tau.bridge}
             social={tau.social}
             pings={tau.pings}
+            infos={tau.infos}
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
             selected={target}
             onPing={(destination) => {
               void tau.ping(destination);
+            }}
+            onInfo={(destination) => {
+              void tau.fetchInfo(destination);
             }}
             onForgetPeer={async (destination, force) => {
               const removed = await tau.forgetPeer(destination, force);
@@ -196,6 +212,12 @@ export function Console() {
             onSelectPeer={selectPeer}
             onCreateGroup={(name, members) => tau.createGroup(name, members)}
             onDeleteGroup={(group) => tau.deleteGroup(group)}
+            onAddGroupMembers={(group, members) =>
+              tau.addGroupMembers(group, members)
+            }
+            onRemoveGroupMembers={(group, members) =>
+              tau.removeGroupMembers(group, members)
+            }
           />
             <AllowlistSection
               allowlist={tau.allowlist}
@@ -272,6 +294,13 @@ export function Console() {
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
+            <div className="mt-4">
+              <SettingsSection
+                settings={tau.settings}
+                loadError={tau.settingsError}
+                onToggle={tau.updateSetting}
+              />
+            </div>
           </div>
 
           <MessagesBackupSection

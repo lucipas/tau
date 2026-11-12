@@ -58,6 +58,9 @@ export interface TauGroup {
   name: string;
   members: TauGroupMember[];
   created_at: number;
+  // Absent on snapshots from an older bridge; only groups this node
+  // created offer member changes in the console.
+  created_by_me?: boolean;
 }
 
 export interface GroupsResponse {
@@ -73,6 +76,12 @@ export interface CreateGroupResponse {
 export interface DeleteGroupResponse {
   ok: boolean;
   deleted: { id: string; name: string };
+}
+
+export interface ChangeGroupMembersResponse {
+  ok: boolean;
+  group: TauGroup;
+  previous_id: string;
 }
 
 export interface Peer {
@@ -206,6 +215,29 @@ export interface PingResult {
   rtt_ms: number | null;
 }
 
+export interface RenameResponse {
+  ok: boolean;
+  name: string;
+  previous_name: string;
+  changed: boolean;
+}
+
+export interface PeerInfo {
+  name?: string;
+  version?: string;
+  rns_version?: string;
+  protocol?: number;
+  uptime?: number;
+  peers?: number;
+  lxmf_enabled?: boolean;
+}
+
+export interface PeerInfoResult {
+  ok: boolean;
+  peer: Peer;
+  info: PeerInfo;
+}
+
 export interface SafetyNumberResult {
   peer: string;
   name: string;
@@ -294,6 +326,16 @@ export interface OutboxResponse {
 export interface CancelOutboxResponse {
   ok: boolean;
   cancelled: OutboxEntry;
+}
+
+export interface NodeSettings {
+  accept_files: boolean;
+  send_read_receipts: boolean;
+}
+
+export interface UpdateSettingsResponse {
+  ok: boolean;
+  settings: NodeSettings;
 }
 
 export interface DoctorCheck {
@@ -486,6 +528,21 @@ export interface TanFollowingResponse {
   count: number;
 }
 
+export interface TanAuthor {
+  author: string;
+  name: string;
+  posts: number;
+  last_post: number;
+  followed: boolean;
+}
+
+export interface TanAuthorsResponse {
+  authors: TanAuthor[];
+  count: number;
+  // How many authors the directory holds behind the returned page.
+  total: number;
+}
+
 export interface TanSuggestion {
   author: string;
   name: string;
@@ -552,6 +609,26 @@ export interface TanSyncResponse {
     duplicates: number;
     errors: Array<{ peer: string; author: string; error: string }>;
   };
+}
+
+export interface TanRules {
+  default: "allow" | "deny";
+  allow_authors: string[];
+  block_authors: string[];
+  allow_followed: boolean;
+  // null means every kind is displayed; a list names the kinds shown.
+  // Display-only: every kind from an admitted author is still stored.
+  kinds: string[] | null;
+}
+
+export interface TanRulesResponse {
+  rules: TanRules;
+  available_kinds: string[];
+}
+
+export interface TanRulesUpdateResponse {
+  ok: boolean;
+  rules: TanRules;
 }
 
 export interface TanVerifyProblem {

@@ -26,6 +26,7 @@ from tau.groups import GroupStore
 from tau.identity import destination_hash, load_identity
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox
+from tau.node import NodeError
 from tau.peers import AmbiguousPeer, Peer, PeerError
 from tau.webapi import (
     PeerForgetBlocked,
@@ -288,7 +289,8 @@ class FakeNode:
     def resolve_peer(self, target, *, timeout=10.0):
         if target in ("alice", PEER_HASH):
             return self.registry.all()[0]
-        raise ValueError(f"unknown peer: {target}")
+        # Mirror TauNode.resolve_peer: an unknown name is a NodeError.
+        raise NodeError(f"unknown peer: {target}")
 
     def send_message(
         self,
@@ -313,9 +315,11 @@ class FakeNode:
         }
 
     def send_group_message(
-        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True
+        self, group, text, *, timeout=20.0, discover_timeout=None, queue=True,
+        expires_at=None,
     ):
         self.group_sent.append((group["name"], text))
+        self.last_group_expires_at = expires_at
         names = {PEER_HASH: "alice", BOB_HASH: "bob"}
         results = []
         for member in group["members"]:
@@ -388,6 +392,20 @@ class FakeNode:
 
     def ping(self, peer, *, timeout=15.0, discover_timeout=None):
         return {"ok": True, "pong": True, "server": self.name, "_rtt": 0.004}
+
+    def request_info(self, peer, *, timeout=15.0, discover_timeout=None):
+        return {
+            "ok": True,
+            "name": peer.name,
+            "destination": peer.destination_hash.hex(),
+            "protocol": 1,
+            "version": "0.2.0",
+            "rns_version": "0.9.0",
+            "uptime": 3600.0,
+            "peers": 3,
+            "lxmf": {"enabled": True, "delivery": "ab" * 16},
+            "caller": "tester",
+        }
 
     def announce(self):
         self.announced += 1
@@ -823,6 +841,26 @@ def test_send_group_message_records_one_entry_per_leg(bridge, node):
     assert sum(1 for e in events if e["type"] == "message") == 2
 
 
+def test_send_group_message_accepts_expires_in(bridge, node):
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "vanish soon", "expires_in": 3600},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    expires_at = node.last_group_expires_at
+    assert expires_at is not None
+    assert before + 3590 <= expires_at <= time.time() + 3610
+    # Every leg's feed entry carries the deadline, like a sent DM.
+    assert all(m["expires_at"] == expires_at for m in payload["messages"])
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert all(m["expires_at"] == expires_at for m in feed["messages"])
+
+
 def test_send_group_message_resolves_by_id_and_prefix(bridge, node):
     group_id = node.groups.list_groups()[0]["id"]
     status, _, payload = _json(
@@ -927,7 +965,16 @@ def test_send_group_message_validation(bridge, node):
         bridge,
         "/api/messages",
         method="POST",
-        body={"group": "crew", "text": "hi", "expires_in": 60},
+        body={"group": "crew", "text": "hi", "expires_in": -5},
+    )
+    assert status == 400
+    assert "expires_in" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "expires_in": "soon"},
     )
     assert status == 400
     assert "expires_in" in payload["error"]["message"]
@@ -1325,6 +1372,277 @@ def test_api_groups_delete_removes_group(bridge, node, tmp_path):
     assert listed["count"] == 0
 
 
+def _add_carol_to_registry(node):
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex(OTHER_HASH),
+            name="carol",
+            public_key=b"\x02" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+
+
+def test_api_groups_add_member_returns_successor_group(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    # The roster changed, so the group is a successor with a new id.
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert payload["group"]["name"] == "weekend"
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, OTHER_HASH, node.destination_hexhash])
+    assert payload["group"]["created_by_me"] is True
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == payload["group"]["id"]
+
+
+def test_api_groups_remove_member_drops_offline_member(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    # Carol goes offline: she leaves the registry, but the roster hash
+    # is enough to drop her without a lookup.
+    node.registry._peers = [
+        peer for peer in node.registry._peers if peer.hexhash != OTHER_HASH
+    ]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["previous_id"] == created["id"]
+    assert payload["group"]["id"] != created["id"]
+    assert sorted(
+        member["hash"] for member in payload["group"]["members"]
+    ) == sorted([PEER_HASH, node.destination_hexhash])
+
+
+def test_api_groups_add_member_accepts_a_name(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "weekend", "members": ["carol"]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_change_members_refuses_ambiguous_names(
+    bridge, node, tmp_path
+):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    # A second peer asserts the same name: neither add nor remove may
+    # guess which carol the caller means.
+    node.registry._peers.append(
+        Peer(
+            destination_hash=bytes.fromhex("99" * 16),
+            name="carol",
+            public_key=b"\x03" * 32,
+            first_seen=1000.0,
+            last_seen=time.time(),
+            hops=1,
+        )
+    )
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH, OTHER_HASH]},
+    )[2]["group"]
+    for path in ("/api/groups/add-member", "/api/groups/remove-member"):
+        status, _, payload = _json(
+            bridge,
+            path,
+            method="POST",
+            body={"group": "weekend", "members": ["carol"]},
+        )
+        assert status == 400, path
+        assert "are named" in payload["error"]["message"], path
+    # The roster hash still removes exactly one carol, unambiguously.
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "weekend", "members": [OTHER_HASH]},
+    )
+    assert status == 200
+    assert payload["previous_id"] == created["id"]
+    assert OTHER_HASH not in [
+        member["hash"] for member in payload["group"]["members"]
+    ]
+
+
+def test_api_groups_learned_group_is_not_created_by_me(bridge, node, tmp_path):
+    from tau.groups import GroupStore, derive_group_id
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    # A group learned from the mesh that merely claims this node as
+    # its creator: the console must not offer member changes for it.
+    group_id = derive_group_id(
+        node.destination_hexhash,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+    )
+    assert node.groups.record(
+        group_id,
+        "learned",
+        [PEER_HASH, node.destination_hexhash],
+        creator=node.destination_hexhash,
+        sender=PEER_HASH,
+    )
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "learned"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "learned", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
+def test_api_groups_change_members_rejects_bad_input(bridge, node, tmp_path):
+    from tau.groups import GroupStore
+
+    node.groups = GroupStore(tmp_path / "groups.json")
+    _add_carol_to_registry(node)
+    created = _json(
+        bridge,
+        "/api/groups",
+        method="POST",
+        body={"name": "weekend", "members": [PEER_HASH]},
+    )[2]["group"]
+    cases = [
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": ["00" * 16]},
+            "unknown peer",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [PEER_HASH]},
+            "already a member",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "already a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [OTHER_HASH]},
+            "is not a member",
+        ),
+        (
+            "/api/groups/remove-member",
+            {"group": "weekend", "members": [node.destination_hexhash]},
+            "cannot remove the creator",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend", "members": []},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "weekend"},
+            "field 'members' must be a non-empty list",
+        ),
+        (
+            "/api/groups/add-member",
+            {"members": [OTHER_HASH]},
+            "field 'group' is required",
+        ),
+        (
+            "/api/groups/add-member",
+            {"group": "nope", "members": [OTHER_HASH]},
+            "unknown group",
+        ),
+    ]
+    for path, body, message in cases:
+        status, _, payload = _json(bridge, path, method="POST", body=body)
+        assert status == 400, (path, body)
+        assert message in payload["error"]["message"], (path, body)
+    _, _, listed = _json(bridge, "/api/groups")
+    assert listed["count"] == 1
+    assert listed["groups"][0]["id"] == created["id"]
+
+
+def test_api_groups_change_members_refuses_non_creator(bridge, node):
+    # The fixture group "crew" was created by alice, not this node.
+    status, _, payload = _json(bridge, "/api/groups")
+    assert status == 200
+    assert payload["groups"][0]["name"] == "crew"
+    assert payload["groups"][0]["created_by_me"] is False
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/add-member",
+        method="POST",
+        body={"group": "crew", "members": [OTHER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/groups/remove-member",
+        method="POST",
+        body={"group": "crew", "members": [PEER_HASH]},
+    )
+    assert status == 400
+    assert "only the creator" in payload["error"]["message"]
+
+
 def test_api_groups_delete_sees_group_created_by_another_store(
     bridge, node, tmp_path
 ):
@@ -1473,6 +1791,17 @@ def test_send_validation(bridge):
     assert "to" in payload["error"]["message"]
 
 
+def test_send_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "hi", "timeout": 10**400},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+
+
 def test_invalid_json_is_a_bad_request(bridge):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _request(
@@ -1490,6 +1819,110 @@ def test_ping_peer(bridge):
     assert status == 200
     assert payload["rtt_ms"] == 4.0
     assert payload["peer"]["destination"] == PEER_HASH
+
+
+def test_ping_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge, "/api/ping", method="POST", body={"to": "alice", "timeout": 10**400}
+    )
+    assert status == 200
+    assert payload["rtt_ms"] == 4.0
+
+
+def test_ping_accepts_non_finite_timeout(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/ping",
+        method="POST",
+        body={"to": "alice", "timeout": float("nan")},
+    )
+    assert status == 200
+    assert payload["rtt_ms"] == 4.0
+
+
+def test_clamped_timeout():
+    from tau.webapi import _clamped_timeout
+
+    assert _clamped_timeout(5, 20.0) == 5.0
+    assert _clamped_timeout(0.5, 20.0) == 1.0
+    assert _clamped_timeout(10**400, 20.0) == 120.0
+    assert _clamped_timeout(-(10**400), 20.0) == 1.0
+    assert _clamped_timeout(10**6, 15.0) == 120.0
+    assert _clamped_timeout("soon", 20.0) == 20.0
+    assert _clamped_timeout(True, 20.0) == 20.0
+    assert _clamped_timeout(float("nan"), 20.0) == 20.0
+    assert _clamped_timeout(float("inf"), 20.0) == 20.0
+
+
+def test_ping_unknown_peer(bridge):
+    status, _, _ = _json(bridge, "/api/ping", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info(bridge):
+    status, _, payload = _json(bridge, "/api/info", method="POST", body={"to": "alice"})
+    assert status == 200
+    assert payload["peer"]["destination"] == PEER_HASH
+    assert payload["info"]["version"] == "0.2.0"
+    assert payload["info"]["protocol"] == 1
+    assert payload["info"]["uptime"] == 3600.0
+    assert payload["info"]["peers"] == 3
+    assert payload["info"]["lxmf_enabled"] is True
+
+
+def test_peer_info_unknown_peer(bridge):
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info_missing_target(bridge):
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={})
+    assert status == 400
+
+
+def test_peer_info_unknown_name_from_real_resolver(bridge, node, monkeypatch):
+    from tau.node import NodeError
+
+    def resolve(target, *, timeout=10.0):
+        raise NodeError(f"unknown peer: {target!r}")
+
+    monkeypatch.setattr(node, "resolve_peer", resolve)
+    status, _, _ = _json(bridge, "/api/info", method="POST", body={"to": "nobody"})
+    assert status == 404
+
+
+def test_peer_info_accepts_oversized_timeout(bridge):
+    status, _, payload = _json(
+        bridge, "/api/info", method="POST", body={"to": "alice", "timeout": 10**400}
+    )
+    assert status == 200
+    assert payload["info"]["version"] == "0.2.0"
+
+
+def test_public_peer_info_drops_non_finite_numbers():
+    from tau.webapi import _public_peer_info
+
+    info = _public_peer_info(
+        {"protocol": float("nan"), "uptime": float("inf"), "peers": 2}
+    )
+    assert info == {"peers": 2}
+
+
+def test_public_peer_info_drops_unexpected_types():
+    from tau.webapi import _public_peer_info
+
+    info = _public_peer_info(
+        {
+            "name": "bob",
+            "version": 3,
+            "rns_version": "0.9.0",
+            "protocol": 2,
+            "uptime": "soon",
+            "peers": True,
+            "lxmf": {"enabled": "yes"},
+        }
+    )
+    assert info == {"name": "bob", "rns_version": "0.9.0", "protocol": 2}
 
 
 def test_forget_peer(bridge, node):
@@ -1590,6 +2023,88 @@ def test_announce(bridge, node):
     assert status == 200
     assert payload["ok"] is True
     assert node.announced == 1
+
+
+def test_id_rename_via_api(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    node.app = SimpleNamespace(name="tester")
+    status, _, payload = _json(
+        bridge, "/api/id/rename", method="POST", body={"name": "  renamed  "}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "name": "renamed",
+        "previous_name": "tester",
+        "changed": True,
+    }
+    # The live node takes the new name at once: announces, DMs and new
+    # Tan posts all read it from memory.
+    assert node.name == "renamed"
+    assert node.app.name == "renamed"
+    assert node.announced == 1
+    stored = json.loads((tmp_path / "node.json").read_text(encoding="utf-8"))
+    assert stored["name"] == "renamed"
+    status, _, payload = _json(bridge, "/api/status")
+    assert payload["node"]["name"] == "renamed"
+
+
+def test_id_rename_concurrent_renames_stay_consistent(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    errors = []
+
+    def rename(name):
+        try:
+            bridge.id_rename(name)
+        except Exception as exc:  # noqa: BLE001 - collected, asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=rename, args=(name,))
+        for name in ("alpha", "beta")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    # Both renames landed in some order; disk and the live node agree on
+    # whichever ran second. (Regression: the serialising lock must exist.)
+    assert node.name in ("alpha", "beta")
+    stored = json.loads((tmp_path / "node.json").read_text(encoding="utf-8"))
+    assert stored["name"] == node.name
+
+
+def test_id_rename_same_name_is_a_noop(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    status, _, payload = _json(
+        bridge, "/api/id/rename", method="POST", body={"name": "tester"}
+    )
+    assert status == 200
+    assert payload["changed"] is False
+    assert payload["previous_name"] == "tester"
+    assert node.announced == 0
+    assert not (tmp_path / "node.json").exists()
+
+
+def test_id_rename_rejects_blank_and_missing_names(bridge, node, tmp_path):
+    from types import SimpleNamespace
+
+    node.config = SimpleNamespace(data_dir=tmp_path)
+    for body in ({"name": "   "}, {"name": ""}, {}, {"name": 42}):
+        status, _, payload = _json(
+            bridge, "/api/id/rename", method="POST", body=body
+        )
+        assert status == 400
+        assert "name" in payload["error"]["message"]
+    assert node.name == "tester"
+    assert node.announced == 0
 
 
 def test_backup_name_is_filename_safe():
@@ -1989,6 +2504,137 @@ def test_tan_timeline_and_follow(tmp_path):
         )
         assert status == 503
         assert "not enabled" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_tan_authors_via_api(tmp_path):
+    import RNS
+    from types import SimpleNamespace
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice = RNS.Identity()
+    bob = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "first", name="alice", now=1000)
+        create_post(conn, alice, "second", name="alice", now=1001)
+        bob_post = create_post(conn, bob, "hello", name="bob", now=1002)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Default sort is most recent first; both authors listed with
+        # post counts, last-post times and followed state, plus the
+        # directory total behind the page.
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload["count"] == 2
+        assert payload["total"] == 2
+        assert [item["name"] for item in payload["authors"]] == ["bob", "alice"]
+        assert payload["authors"][1]["posts"] == 2
+        assert payload["authors"][1]["last_post"] == 1001
+        assert payload["authors"][1]["followed"] is False
+
+        # Sort by post count puts the prolific author first.
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=posts")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice", "bob"]
+
+        # Limit clamps to the page size, offset pages past it, and an
+        # unknown sort is a 400.
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=1")
+        assert status == 200
+        assert payload["count"] == 1
+        assert payload["total"] == 2
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=1&offset=1")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice"]
+        assert payload["total"] == 2
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=nope")
+        assert status == 400
+
+        # A blocked author is hidden from the directory, like the
+        # timeline hides their posts; a fail-closed list hides all.
+        node.blocklist = SimpleNamespace(
+            blocked=frozenset({bob_post["author"]}), block_all=False
+        )
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert [item["name"] for item in payload["authors"]] == ["alice"]
+        node.blocklist = SimpleNamespace(blocked=frozenset(), block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload == {"authors": [], "count": 0, "total": 0}
+    finally:
+        bridge.stop()
+
+
+def test_tan_authors_paging_beyond_first_page(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    conn = init_db(node.config.social_db_path)
+    try:
+        # 55 authors: more than the default page of 50, so the second
+        # page must exist and the total must count all of them.
+        for index in range(55):
+            create_post(
+                conn,
+                RNS.Identity(),
+                f"post {index}",
+                name=f"author {index:02d}",
+                now=1000 + index,
+            )
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload["count"] == 50
+        assert payload["total"] == 55
+        status, _, payload = _json(bridge, "/api/tan/authors?limit=50&offset=50")
+        assert status == 200
+        assert payload["count"] == 5
+        assert payload["total"] == 55
+        # The two pages together cover every author exactly once.
+        first = _json(bridge, "/api/tan/authors?limit=50")[2]["authors"]
+        second = payload["authors"]
+        assert len({item["author"] for item in first + second}) == 55
+    finally:
+        bridge.stop()
+
+
+def test_tan_authors_empty_store(tmp_path):
+    from tau.config import TauConfig
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # A read-only listing must not create the Tan store on a fresh
+        # data directory — but an unknown sort is still a 400 there.
+        status, _, payload = _json(bridge, "/api/tan/authors")
+        assert status == 200
+        assert payload == {"authors": [], "count": 0, "total": 0}
+        assert not node.config.social_db_path.exists()
+        status, _, payload = _json(bridge, "/api/tan/authors?sort=nope")
+        assert status == 400
+        assert not node.config.social_db_path.exists()
     finally:
         bridge.stop()
 
@@ -3311,6 +3957,238 @@ def test_tan_delete_via_api(tmp_path):
     ]
 
 
+def test_tan_repost_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, feed, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1000)
+        mine = create_post(conn, identity, "my own thought", name="tester", now=1001)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["repost"]["kind"] == "repost"
+        assert payload["repost"]["target"] == foreign["hash"]
+
+        # The timeline now carries the repost, and the original is
+        # marked as reposted by you.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["worth sharing"]["reposted"] is True
+        assert by_text["worth sharing"]["reposts"] == 1
+
+        # Reposting the same post again is refused while the first
+        # repost still stands.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": foreign["hash"]},
+        )
+        assert status == 400
+        assert "already been reposted" in payload["error"]["message"]
+
+        # Your own post cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 400
+        assert "own post" in payload["error"]["message"]
+
+        # A post this node has never seen cannot be reposted.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/repost",
+            method="POST",
+            body={"target": "cd" * 32},
+        )
+        assert status == 400
+        assert "unknown post" in payload["error"]["message"]
+
+        # A missing target is a bad request, not a server error.
+        status, _, payload = _json(
+            bridge, "/api/tan/repost", method="POST", body={}
+        )
+        assert status == 400
+        assert "target" in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+    conn = init_db(node.config.social_db_path)
+    try:
+        entries = feed(conn, author=foreign["author"])
+    finally:
+        conn.close()
+    assert [entry["kind"] for entry in entries] == ["post"]
+
+
+def test_tan_repost_state_on_mentions_and_saved(tmp_path):
+    # Regression test for the repost-annotation gap Qodo's review caught:
+    # mentions and saved posts did not carry repost counts, so a card
+    # there kept offering Repost for a post already reposted.
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, create_reply, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(
+            conn, identity, "original thought", name="tester", now=1000
+        )
+        reply = create_reply(
+            conn, other, mine["hash"], "seconded", name="other", now=1001
+        )
+        foreign = create_post(conn, other, "worth sharing", name="other", now=1002)
+    finally:
+        conn.close()
+
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(
+            bridge, "/api/tan/save", method="POST", body={"target": foreign["hash"]}
+        )
+        assert status == 200
+
+        for target in (reply["hash"], foreign["hash"]):
+            status, _, payload = _json(
+                bridge, "/api/tan/repost", method="POST", body={"target": target}
+            )
+            assert status == 200
+
+        status, _, payload = _json(bridge, "/api/tan/mentions")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["seconded"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+
+        status, _, payload = _json(bridge, "/api/tan/saved")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["worth sharing"]
+        assert payload["posts"][0]["reposted"] is True
+        assert payload["posts"][0]["reposts"] == 1
+    finally:
+        bridge.stop()
+
+
+def test_tan_rules_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The default ruleset admits everything.
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"] == {
+            "default": "allow",
+            "allow_authors": [],
+            "block_authors": [],
+            "allow_followed": False,
+            "kinds": None,
+        }
+        assert payload["available_kinds"] == [
+            "post",
+            "like",
+            "unlike",
+            "delete",
+            "repost",
+            "reply",
+            "edit",
+            "quote",
+        ]
+
+        # Cache the live app's ruleset first: the update below must
+        # reload it, not just be picked up on a lazy first load.
+        assert node.app.ruleset.default_allow is True
+
+        # A peer name resolves to its author hash, like `tau tan rules`.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/rules",
+            method="POST",
+            body={
+                "default": "deny",
+                "allow_authors": ["alice"],
+                "block_authors": [OTHER_HASH],
+                "allow_followed": True,
+                "kinds": ["post", "reply"],
+            },
+        )
+        assert status == 200
+        assert payload["rules"] == {
+            "default": "deny",
+            "allow_authors": [PEER_HASH],
+            "block_authors": [OTHER_HASH],
+            "allow_followed": True,
+            "kinds": ["post", "reply"],
+        }
+
+        # The saved ruleset persists, and the live app picked it up
+        # without a restart.
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert node.app.ruleset.default_allow is False
+        assert node.app.ruleset.allow_authors == frozenset({PEER_HASH})
+        assert node.app.ruleset.displays("post") is True
+        assert node.app.ruleset.displays("like") is False
+
+        # Bad input is a 400 and leaves the saved ruleset untouched.
+        for body in (
+            {"default": "maybe"},
+            {"allow_authors": ["nobody-here"]},
+            {"block_authors": [OTHER_HASH], "kinds": ["poke"]},
+            {"allow_authors": "alice"},
+            ["not", "an", "object"],
+        ):
+            status, _, payload = _json(
+                bridge, "/api/tan/rules", method="POST", body=body
+            )
+            assert status == 400
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+    finally:
+        bridge.stop()
+
+
 def test_tan_edit_via_api(tmp_path):
     import RNS
 
@@ -3551,6 +4429,35 @@ def test_tan_export_import_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_rules_without_tan_app(tmp_path):
+    # No Tan app attached: the rules file is still readable.
+    from tau.config import TauConfig
+    from tau.tangents.rules import Ruleset, save_ruleset
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    save_ruleset(
+        node.config.tan_rules_path,
+        Ruleset(default_allow=False, allow_followed=True),
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert payload["rules"]["allow_followed"] is True
+
+        # A rules file that cannot be parsed fails closed, like admission.
+        node.config.tan_rules_path.write_text("not json", encoding="utf-8")
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 200
+        assert payload["rules"]["default"] == "deny"
+        assert payload["rules"]["allow_authors"] == []
+    finally:
+        bridge.stop()
+
+
 def _likers_setup(tmp_path):
     """A node with one post by bob, liked by alice, carol and dave.
 
@@ -3648,6 +4555,24 @@ def test_tan_likers_via_api(tmp_path):
     finally:
         bridge.stop()
 
+
+def test_tan_rules_without_data_dir(tmp_path):
+    # The node has no config, so there is no rules file to read. (The
+    # fixture node always carries a config now, so build one here and
+    # take it away instead of relying on the shared bridge fixture.)
+    node = FakeNode(tmp_path / "mailbox.json")
+    del node.config
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/rules")
+        assert status == 503
+        status, _, payload = _json(
+            bridge, "/api/tan/rules", method="POST", body={"default": "deny"}
+        )
+        assert status == 503
+    finally:
+        bridge.stop()
 
 def test_tan_export_import_requires_social(tmp_path):
     import RNS
@@ -3913,8 +4838,6 @@ def test_tan_likers_server_error_is_500(tmp_path, monkeypatch):
         bridge.stop()
 
 
-
-
 def _queue(node, to_hex, text, message_id=None):
     return node.mailbox.enqueue(
         to=bytes.fromhex(to_hex),
@@ -4068,6 +4991,92 @@ def test_outbox_cancel_errors(bridge, node):
     )
     assert status == 404
     assert "unknown queued message" in payload["error"]["message"]
+
+
+def test_settings_defaults(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(bridge, "/api/settings")
+        assert status == 200
+        # A fresh data directory has no node.json: the CLI defaults apply.
+        assert payload == {"accept_files": False, "send_read_receipts": True}
+        assert not (tmp_path / "node.json").exists()
+    finally:
+        bridge.stop()
+
+
+def test_settings_update_persists_and_keeps_the_other(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "accept_files", "value": True},
+        )
+        assert status == 200
+        assert payload == {
+            "ok": True,
+            "settings": {"accept_files": True, "send_read_receipts": True},
+        }
+
+        # Toggling the second setting keeps the first, on disk and on read.
+        status, _, payload = _json(
+            bridge,
+            "/api/settings",
+            method="POST",
+            body={"setting": "send_read_receipts", "value": False},
+        )
+        assert status == 200
+        assert payload["settings"] == {
+            "accept_files": True,
+            "send_read_receipts": False,
+        }
+        status, _, payload = _json(bridge, "/api/settings")
+        assert payload == {"accept_files": True, "send_read_receipts": False}
+        stored = json.loads(
+            (tmp_path / "node.json").read_text(encoding="utf-8")
+        )
+        assert stored["accept_files"] is True
+        assert stored["send_read_receipts"] is False
+    finally:
+        bridge.stop()
+
+
+def test_settings_update_rejects_bad_input(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        for body, fragment in [
+            ({}, "setting"),
+            ({"setting": "accept_files"}, "value"),
+            ({"setting": "name", "value": "bob"}, "unknown setting"),
+            ({"setting": "accept_files", "value": "yes"}, "must be true or false"),
+            ({"setting": "accept_files", "value": 1}, "must be true or false"),
+            ({"setting": "accept_files", "value": None}, "must be true or false"),
+        ]:
+            status, _, payload = _json(
+                bridge, "/api/settings", method="POST", body=body
+            )
+            assert status == 400
+            assert fragment in payload["error"]["message"]
+    finally:
+        bridge.stop()
+
+
+def test_settings_without_data_dir(bridge, node):
+    # A bridge on a dataless node has nowhere to read or persist settings.
+    node.data_dir = None
+    status, _, payload = _json(bridge, "/api/settings")
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/settings",
+        method="POST",
+        body={"setting": "accept_files", "value": True},
+    )
+    assert status == 503
+    assert "no data directory" in payload["error"]["message"]
 
 
 def test_outbox_retry_one_by_id_and_prefix(bridge, node):
@@ -4329,7 +5338,6 @@ def test_outbox_drop_held_errors(bridge, node):
     )
     assert status == 400
     assert "unknown held message" in payload["error"]["message"]
-
 
 
 def test_outbox_sees_entries_queued_by_another_process(bridge, node, tmp_path):
@@ -5463,6 +6471,157 @@ def test_tan_timeline_hides_blocked_authors(tmp_path):
         bridge.stop()
 
 
+def test_tan_top_via_api(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import create_post, create_reaction, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        create_post(conn, alice, "fresh flop", name="alice", now=1003)
+        hit = create_post(conn, bob, "old hit", name="bob", now=1000)
+        create_reaction(conn, alice, hit["hash"], liked=True, name="alice", now=1004)
+        create_reaction(conn, carol, hit["hash"], liked=True, name="carol", now=1005)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "old hit",
+            "fresh flop",
+        ]
+        assert payload["count"] == 2
+        assert payload["posts"][0]["likes"] == 2
+
+        status, _, payload = _json(bridge, "/api/tan/top?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["old hit"]
+
+        status, _, payload = _json(
+            bridge, f"/api/tan/top?author={destination_hash(alice).hex()}"
+        )
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["fresh flop"]
+
+        status, _, payload = _json(bridge, "/api/tan/top?author=nope")
+        assert status == 400
+
+        # Blocked authors never rank, and a failed-closed list hides all.
+        node.blocklist = BlockList(blocked=frozenset({destination_hash(bob).hex()}))
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["fresh flop"]
+
+        node.blocklist = BlockList(block_all=True)
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
+def test_tan_top_matches_timeline_annotations(tmp_path):
+    import RNS
+
+    from tau.blocklist import BlockList
+    from tau.config import TauConfig
+    from tau.identity import destination_hash
+    from tau.tangents.tan import (
+        create_edit,
+        create_post,
+        create_quote,
+        create_reaction,
+        create_reply,
+        create_repost,
+        init_db,
+        mute_keyword,
+    )
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    alice, bob = RNS.Identity(), RNS.Identity()
+    carol = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        hit = create_post(conn, bob, "old hit", name="bob", now=1000)
+        draft = create_post(conn, alice, "rough draft", name="alice", now=1001)
+        create_reply(conn, alice, hit["hash"], "agreed", name="alice", now=1002)
+        create_post(conn, alice, "fresh flop", name="alice", now=1003)
+        create_reaction(conn, alice, hit["hash"], liked=True, name="alice", now=1004)
+        create_reaction(conn, carol, hit["hash"], liked=True, name="carol", now=1005)
+        create_reaction(conn, bob, draft["hash"], liked=True, name="bob", now=1006)
+        create_edit(conn, alice, draft["hash"], "polished post", name="alice", now=1007)
+        create_repost(conn, carol, hit["hash"], name="carol", now=1008)
+        create_quote(conn, carol, hit["hash"], "second this", name="carol", now=1009)
+        # An edit that introduces a muted keyword hides the post: the
+        # keyword test sees the edited text, as in the timeline.
+        bait = create_post(conn, alice, "clean post", name="alice", now=1010)
+        mute_keyword(conn, "crypto")
+        create_edit(conn, alice, bait["hash"], "crypto post", name="alice", now=1011)
+    finally:
+        conn.close()
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            "old hit",
+            "polished post",
+            "fresh flop",
+            "agreed",
+        ]
+        ranked = {item["text"]: item for item in payload["posts"]}
+        assert ranked["polished post"]["edited"] is True
+        assert ranked["old hit"]["reposts"] == 1
+        assert ranked["old hit"]["quotes"] == 1
+        # The edit that introduced the muted keyword hid the post.
+        assert "crypto post" not in ranked
+
+        # A blocked top-ranked author never takes a result slot: with
+        # limit=1 the next visible post ranks instead.
+        node.blocklist = BlockList(blocked=frozenset({destination_hash(bob).hex()}))
+        status, _, payload = _json(bridge, "/api/tan/top?limit=1")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == ["polished post"]
+
+        # A visible reply to a blocked author's post keeps its parent
+        # redacted — no name, hash or text leaks through the preview.
+        status, _, payload = _json(bridge, "/api/tan/top")
+        assert status == 200
+        reply = next(item for item in payload["posts"] if item["text"] == "agreed")
+        assert reply["reply_to"] == {
+            "hash": hit["hash"],
+            "author": "",
+            "name": "",
+            "text": "",
+            "deleted": False,
+            "blocked": True,
+        }
+
+        # An explicit lookup of a blocked author shows nothing, as in
+        # author_timeline.
+        status, _, payload = _json(
+            bridge, f"/api/tan/top?author={destination_hash(bob).hex()}"
+        )
+        assert status == 200
+        assert payload["posts"] == []
+    finally:
+        bridge.stop()
+
+
 def test_messages_reconciles_cli_made_reactions(node, tmp_path):
     """A reaction written to the shared inbox by another process (the
     CLI) shows up on the next read of the console history.
@@ -5579,6 +6738,32 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     assert status == 400
     assert "unknown message" in payload["error"]["message"]
 
+
+def test_react_accepts_oversized_timeout(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+
+    def send_reaction(peer, target, token, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "reaction": token, "target": target, "id": "react-1"}
+
+    node.send_reaction = send_reaction
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-1", "reaction": "👍", "timeout": 10**400},
+    )
+    assert status == 200
+    assert payload["reaction"] == "👍"
+
     bridge.record_inbound(
         {
             "from": "alice",
@@ -5648,6 +6833,56 @@ def test_delete_message_endpoint_removes_history_and_inbox_entry(bridge, node):
     assert deleted_events[0]["message_id"] == 1
 
 
+def test_delete_by_wire_id_never_touches_a_different_inbox_record(bridge, node):
+    # The retract handler already deleted the exact inbox record; a
+    # console-only removal must not re-delete by wire id, or a prefix
+    # match would drop another sender's message sharing the prefix.
+    node.inbox.append(
+        {
+            "id": "msg-123",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "another sender's message",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "msg-1",
+        }
+    )
+    result = bridge.delete_by_wire_id("msg-1")
+    assert result == {"ok": True, "deleted": {"id": 1, "wire_id": "msg-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert [entry["id"] for entry in node.inbox.list_messages()] == ["msg-123"]
+
+
+def test_retract_before_delivery_does_not_resurrect(bridge):
+    # The retraction landed while the delivery callback was still in
+    # flight: no console entry existed to remove, but the id is
+    # remembered, so the late append is refused.
+    assert bridge.delete_by_wire_id("wire-1") is None
+    assert bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    ) is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
 def test_delete_message_endpoint_removes_console_only_entry(bridge):
     bridge.record_inbound(
         {
@@ -5687,6 +6922,162 @@ def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     )
     assert status == 400
     assert "field 'id'" in payload["error"]["message"]
+
+
+def test_delete_by_wire_id_removes_the_console_copy(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "keep me",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "wire-2",
+        }
+    )
+    assert bridge.delete_by_wire_id("missing") is None
+    assert bridge.delete_by_wire_id("") is None
+
+    result = bridge.delete_by_wire_id("wire-1")
+    assert result == {"ok": True, "deleted": {"id": 1, "wire_id": "wire-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["wire-2"]
+    deleted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(deleted_events) == 1
+    assert deleted_events[0]["message_id"] == 1
+
+
+def test_retract_removes_the_recipients_console_copy(tmp_path):
+    # End to end: a retract accepted by the node also drops the
+    # console's copy, so /api/messages stops showing the text.
+    import base64
+
+    from tau.node import TauNode
+    from tau.peers import PeerRegistry
+    from tau.protocol import decode, encode, encode_message, retract_dict
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="holder")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    try:
+        node.on_message = bridge.record_inbound
+        node.on_retract = lambda record: bridge.delete_by_wire_id(
+            str(record.get("id") or "")
+        )
+        sender = RNS.Identity()
+        node.destination = SimpleNamespace(
+            hexhash="ab" * 16, hash=b"\xab" * 16
+        )
+        payload = encode_message("take this back", message_id="msg-1")
+        response = decode(
+            node._handle_message("/tau/test", payload, b"request-id", sender, time.time())
+        )
+        assert response["ok"] is True
+        _, _, feed = _json(bridge, "/api/messages")
+        assert len(feed["messages"]) == 1
+
+        retract_payload = retract_dict("msg-1", message_id="retract-1")
+        signature = sender.sign(encode(retract_payload))
+        retract_payload["sig"] = base64.b64encode(signature).decode("ascii")
+        response = decode(
+            node._handle_retract(
+                "/tau/test", encode(retract_payload), b"request-id", sender, time.time()
+            )
+        )
+        assert response["ok"] is True
+        assert response["deleted"] is True
+        assert node.inbox.list_messages() == []
+        _, _, feed = _json(bridge, "/api/messages")
+        assert feed["messages"] == []
+        deleted_events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_deleted"
+        ]
+        assert len(deleted_events) == 1
+    finally:
+        bridge.stop()
+
+
+def test_retract_before_pending_delivery_does_not_resurrect(tmp_path):
+    # The delivery persisted the DM to the inbox but its console
+    # callback had not run yet when the retract landed: the callback
+    # must not write the message into console history afterwards.
+    import base64
+
+    from tau.identity import destination_hash
+    from tau.node import TauNode
+    from tau.peers import PeerRegistry
+    from tau.protocol import decode, encode, retract_dict
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="holder")
+    node = TauNode(config, registry=PeerRegistry(config.peers_path))
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge.start()
+    try:
+        node.on_message = bridge.record_inbound
+        node.on_retract = lambda record: bridge.delete_by_wire_id(
+            str(record.get("id") or "")
+        )
+        sender = RNS.Identity()
+        sender_hash = destination_hash(sender).hex()
+        node.destination = SimpleNamespace(
+            hexhash="ab" * 16, hash=b"\xab" * 16
+        )
+        record = {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "take this back",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "msg-1",
+            "direction": "in",
+        }
+        # Phase 1 of the delivery: persisted to the inbox, console
+        # callback still pending.
+        node.inbox.append(record)
+        node.mailbox.mark_seen("msg-1")
+        # The retract lands before the callback runs.
+        retract_payload = retract_dict("msg-1", message_id="retract-1")
+        signature = sender.sign(encode(retract_payload))
+        retract_payload["sig"] = base64.b64encode(signature).decode("ascii")
+        response = decode(
+            node._handle_retract(
+                "/tau/test", encode(retract_payload), b"request-id", sender, time.time()
+            )
+        )
+        assert response["ok"] is True
+        assert response["deleted"] is True
+        assert node.inbox.list_messages() == []
+        # Phase 2: the pending delivery callback finally runs.
+        assert bridge.record_inbound(record) is None
+        _, _, feed = _json(bridge, "/api/messages")
+        assert feed["messages"] == []
+    finally:
+        bridge.stop()
 
 
 def test_delete_message_survives_bridge_restart(node, tmp_path):
@@ -6323,11 +7714,12 @@ def test_messages_export_import_via_api(bridge, node):
         assert payload["import"]["present"] == 0
         assert payload["import"]["skipped"] == 0
         assert payload["import"]["errors"] == []
-        # Restored mail advances the unread counts: both entries sit
-        # after the (absent) read cursor, so the fresh counts ride
-        # along with the import result.
-        assert payload["import"]["unread"]["total"] == 2
-        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 2}
+        # Restored mail advances the unread counts: the received entry
+        # sits after the (absent) read cursor, so the fresh counts ride
+        # along with the import result.  The restored sent reply does
+        # not count — sent mail is never unread for its owner.
+        assert payload["import"]["unread"]["total"] == 1
+        assert payload["import"]["unread"]["per_peer"] == {PEER_HASH: 1}
         _, _, feed = _json(bridge2, "/api/messages")
         assert [m["text"] for m in feed["messages"]] == ["hello", "reply back"]
         assert feed["messages"][0]["direction"] == "in"
@@ -6355,6 +7747,45 @@ def test_messages_export_import_via_api(bridge, node):
         )
         assert status == 200
         assert payload["import"]["skipped"] == 0
+    finally:
+        bridge2.stop()
+
+
+def test_messages_import_skips_a_retracted_message(bridge, node, tmp_path):
+    # Regression test for the CodeRabbit Major: the console import
+    # must apply the retraction markers like the CLI does, or an old
+    # export resurrects a message its sender retracted — and mirrors
+    # it into the console feed.
+    _inbound_record(node)
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": PEER_HASH,
+            "text": "reply back",
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "m-2",
+            "direction": "out",
+        }
+    )
+    _, _, document = _json(bridge, "/api/messages/export")
+
+    node2 = FakeNode(tmp_path / "mailbox2.json")
+    bridge2 = WebBridge(node2, host="127.0.0.1", port=0)
+    bridge2.start()
+    try:
+        node2.mailbox.record_retraction(PEER_HASH, "m-1")
+        status, _, payload = _json(
+            bridge2, "/api/messages/import", method="POST", body=document
+        )
+        assert status == 200
+        assert payload["import"]["imported"] == 1
+        assert payload["import"]["skipped"] == 1
+        assert payload["import"]["errors"] == [
+            {"id": "m-1", "error": "message was retracted by its sender"}
+        ]
+        _, _, feed = _json(bridge2, "/api/messages")
+        assert [m["text"] for m in feed["messages"]] == ["reply back"]
     finally:
         bridge2.stop()
 

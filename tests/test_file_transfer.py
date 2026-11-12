@@ -18,7 +18,7 @@ from tau.config import (
     set_node_setting,
 )
 from tau.inbox import Inbox
-from tau.node import NodeError, TauNode
+from tau.node import NodeError, TauNode, _create_unique_file
 from tau.peers import PeerRegistry
 from tau.protocol import (
     APP_NAME,
@@ -117,6 +117,49 @@ def test_sanitize_file_name_rejects_unusable_names():
 
 def test_sanitize_file_name_drops_control_characters():
     assert sanitize_file_name("a\x00b\x1bc.txt") == "abc.txt"
+
+
+def test_create_unique_file_publishes_complete_file(tmp_path):
+    # The file appears under its final name only once its content is
+    # complete, and no temporary file or staging directory is left
+    # behind.
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target == tmp_path / "notes.txt"
+    assert target.read_bytes() == b"hello file"
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_create_unique_file_numbers_suffixes_and_never_overwrites(tmp_path):
+    first = _create_unique_file(tmp_path, "notes.txt", b"one")
+    second = _create_unique_file(tmp_path, "notes.txt", b"two")
+    third = _create_unique_file(tmp_path, "notes.txt", b"three")
+    assert first.name == "notes.txt"
+    assert second.name == "notes-2.txt"
+    assert third.name == "notes-3.txt"
+    assert first.read_bytes() == b"one"
+    assert second.read_bytes() == b"two"
+    assert third.read_bytes() == b"three"
+
+
+def test_create_unique_file_skips_symlink_names(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (tmp_path / "notes.txt").symlink_to(outside)
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target.name == "notes-2.txt"
+    assert target.read_bytes() == b"hello file"
+    assert outside.read_text(encoding="utf-8") == "secret\n"
+
+
+def test_create_unique_file_works_when_tau_tmp_is_a_received_file(tmp_path):
+    # `.tau-tmp` is itself a valid received filename: a file with that
+    # name must not break later transfers from the same sender.
+    (tmp_path / ".tau-tmp").write_bytes(b"a real received file")
+    target = _create_unique_file(tmp_path, "notes.txt", b"hello file")
+    assert target == tmp_path / "notes.txt"
+    assert target.read_bytes() == b"hello file"
+    assert (tmp_path / ".tau-tmp").read_bytes() == b"a real received file"
 
 
 # -- signed offers ---------------------------------------------------------
@@ -573,6 +616,46 @@ def test_send_file_never_loads_a_file_with_unbounded_reads(
     with pytest.raises(NodeError, match="outside the"):
         node.send_file("alice", big)
     assert reads == []
+
+
+def test_send_file_bytes_refuses_to_start_after_the_deadline(
+    tmp_path, monkeypatch
+):
+    """An offer answered at the cutoff must not start a doomed transfer.
+
+    The Resource wait has no time left once the deadline has passed,
+    so advertising it would start a transfer that can only be
+    cancelled — the leg must fail before the Resource is constructed.
+    """
+    import time
+
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    node.resolve_peer = lambda target, timeout=10.0: SimpleNamespace(  # type: ignore[method-assign]
+        destination_hash=bytes.fromhex(RECIPIENT_HASH),
+        hexhash=RECIPIENT_HASH,
+    )
+    node._open_link = lambda peer, timeout, deadline=None: SimpleNamespace(  # type: ignore[method-assign]
+        teardown=lambda: None
+    )
+    node._request_on_link = lambda link, path, payload, timeout, deadline=None: {  # type: ignore[method-assign]
+        "ok": True
+    }
+    built = []
+    monkeypatch.setattr(
+        RNS,
+        "Resource",
+        lambda *args, **kwargs: built.append((args, kwargs)),
+    )
+    with pytest.raises(NodeError, match="deadline passed before sending file"):
+        node._send_file_bytes(
+            RECIPIENT_HASH,
+            b"hello",
+            "notes.txt",
+            hashlib.sha256(b"hello").hexdigest(),
+            deadline=time.monotonic() - 1.0,
+        )
+    assert built == []
 
 
 # -- inbox file records ----------------------------------------------------
