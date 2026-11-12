@@ -12,7 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import MailboxError, open_message, seal_message
-from tau.node import NodeError, TauNode
+from tau.node import DeliveryDeferredError, NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     ProtocolError,
@@ -21,10 +21,13 @@ from tau.protocol import (
     decode,
     derive_group_id,
     encode,
+    encode_group_message,
     encode_message,
     encode_reaction,
     encode_retract,
     excerpt_hash,
+    parse_group_message,
+    parse_mail_store,
     parse_message,
     reaction_dict,
     retract_dict,
@@ -69,6 +72,82 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert len(node.inbox) == 1
     assert node.inbox.list_messages()[0]["text"] == "hello once"
     assert node.inbox.path.exists()
+
+
+def test_direct_group_delivery_skips_when_competitor_marks_seen(
+    tmp_path, monkeypatch
+):
+    """A direct group delivery rechecks seen-ness inside the
+    transaction (CodeRabbit review, flagged on the stacked PR #295).
+
+    Two direct deliveries can both pass the pre-check, then both
+    append and notify.  The relayed path already rechecks inside
+    the mailbox transaction; the direct group path did not.  Here a
+    competing delivery stores its copy and marks the id seen after
+    the pre-check — this delivery must skip both the append and the
+    notification, and report the duplicate.
+    """
+    from tau.inbox import Inbox
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    real_is_seen = node.mailbox.is_seen
+    calls = {"n": 0}
+
+    def flaky_is_seen(message_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The pre-check: not seen yet.  A competing delivery
+            # lands now — it stores its copy and marks the id seen
+            # via its own handles, then this handler's transaction
+            # reloads and must see the mark.
+            other_inbox = Inbox(node.config.inbox_path)
+            other_inbox.append(
+                {
+                    "from": "alice",
+                    "destination": author_hash,
+                    "text": "crew hello",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "race-1",
+                    "kind": "group",
+                    "group": group,
+                    "group_name": "crew",
+                }
+            )
+            Mailbox(node.config.mailbox_path).mark_seen("race-1")
+            return False
+        return real_is_seen(message_id)
+
+    monkeypatch.setattr(node.mailbox, "is_seen", flaky_is_seen)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="race-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert response["ok"] is True
+    assert response["duplicate"] is True
+    assert received == []
+    assert calls["n"] == 2
+    # Exactly one copy is stored: the competitor's, not a second one.
+    fresh = Inbox(node.config.inbox_path)
+    assert [m["id"] for m in fresh.list_messages()] == ["race-1"]
 
 
 def test_direct_message_keeps_kind(tmp_path):
@@ -842,7 +921,8 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
 
     # A second envelope, dropped by the owner (tau outbox drop-held) after
     # the sweep listed it, must not be surfaced. Simulate the drop by
-    # making drop_held report the envelope already gone.
+    # making is_held report the envelope already gone: the drop now
+    # happens after delivery, so the still-held check is the guard.
     blob2 = seal_message(
         sender,
         sender_name="alice",
@@ -857,9 +937,105 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
         message_id="self-2",
         expires_at=time.time() + 3600,
     )
-    monkeypatch.setattr(node.mailbox, "drop_held", lambda *a, **k: False)
+    monkeypatch.setattr(node.mailbox, "is_held", lambda *a, **k: False)
     assert node._process_local_held() == 0
     assert len(received) == 1
+
+
+def test_local_held_delivery_skips_envelope_dropped_by_another_process(
+    tmp_path,
+):
+    # CodeRabbit round-10 (fp4P): the pre-delivery is_held check
+    # reads the serving process's cached held pool, so a drop by
+    # another process (tau outbox drop-held) after the sweep listed
+    # the envelope was invisible to it — the message was stored and
+    # published anyway.  The delivery now rechecks ownership inside
+    # the mailbox transaction that guards the store, which reloads
+    # from disk.  Drop via a second Mailbox instance, exactly as the
+    # CLI would, and assert the serving process's stale cache still
+    # lists it — the pre-check passes, and only the in-transaction
+    # recheck stops the delivery.
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    sender = RNS.Identity()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-1",
+        text="dropped by another process",
+        sent_at=55.0,
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-1",
+        expires_at=time.time() + 3600,
+    )
+    other_process = Mailbox(node.config.mailbox_path)
+    assert other_process.drop_held("self-1") is True
+    assert node.mailbox.is_held("self-1", to=recipient_hash) is True
+    assert node._process_local_held() == 0
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+
+def test_local_held_group_delivery_skips_envelope_dropped_by_another_process(
+    tmp_path,
+):
+    # The group branch of _deliver_collected guards its store with
+    # its own mailbox transaction, so it rechecks held ownership
+    # there too — a group copy dropped by another process after the
+    # sweep listed it is not stored or published either.
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    own = recipient_hash.hex()
+    sender = RNS.Identity()
+    author_hash = destination_hash(sender).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-group-1",
+        expires_at=time.time() + 3600,
+    )
+    other_process = Mailbox(node.config.mailbox_path)
+    assert other_process.drop_held("self-group-1") is True
+    assert node.mailbox.is_held("self-group-1", to=recipient_hash) is True
+    assert node._process_local_held() == 0
+    assert received == []
+    assert node.inbox.list_messages() == []
 
 
 def test_fetch_ignores_envelope_dropped_by_another_process(tmp_path):
@@ -1082,6 +1258,2151 @@ def test_reaction_dedupes_by_id(tmp_path):
     assert first["duplicate"] is False
     assert second["duplicate"] is True
     assert len(node.inbox.reactions_for("msg-1")) == 1
+
+
+def _signed_group_reaction(
+    sender, target, token, message_id, *, group, author, sent_at
+):
+    """A group reaction payload signed by *sender*, as the fan-out builds it."""
+    import base64
+
+    payload = reaction_dict(
+        target,
+        token,
+        message_id=message_id,
+        group=group,
+        target_author=author,
+        target_sent_at=sent_at,
+    )
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _seed_group_copy(node, *, group, author, sent_at, message_id):
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": author,
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": sent_at,
+            "received_at": sent_at + 1.0,
+            "id": message_id,
+        }
+    )
+
+
+def test_group_reaction_resolves_local_copy_from_context(tmp_path):
+    # Group sends carry a different wire id per leg: the reactor's
+    # target names a copy this node never held.  The signed group
+    # context resolves this node's own copy instead, so the reaction
+    # displays under the message here too.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor = RNS.Identity()
+    # A copy that arrived through the handler pins its roster, so a
+    # retained copy with no pinned group is a deleted group — and a
+    # reaction to it fails closed (see the deleted-group tests
+    # below).  Pin the group here, with the reactor as a member, so
+    # this test models a live group and keeps asserting the
+    # context resolution itself.  The id derives from the roster,
+    # so the group is pinned first and the copy seeded under it.
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    stored = node.inbox.reactions_for("local-copy-1")
+    assert len(stored) == 1
+    assert stored[0]["reaction"] == "👍"
+    assert stored[0]["id"] == "react-1"
+    # Nothing is stored under the foreign wire id.
+    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_without_context_stays_on_unknown_target(tmp_path):
+    # No group context, no local copy under the target: the reaction
+    # is stored as-is (the author can still display it from their
+    # sent record), never guessed onto another message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    _seed_group_copy(
+        node,
+        group="cd" * 16,
+        author=author,
+        sent_at=100.0,
+        message_id="local-copy-1",
+    )
+    reactor = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "other-leg-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
+def test_group_reaction_unresolvable_context_stays_on_target(tmp_path):
+    # Group context that matches no local copy — a copy that arrived
+    # through an outbox retry, re-stamped — degrades the same way:
+    # stored under the wire target, displayed for the author.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    _seed_group_copy(
+        node,
+        group="cd" * 16,
+        author=author,
+        sent_at=100.0,
+        message_id="local-copy-1",
+    )
+    reactor = RNS.Identity()
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group="cd" * 16,
+            author=author,
+            sent_at=999.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
+def _pinned_group(node, *, members, creator):
+    group = derive_group_id(creator, "crew", members)
+    assert (
+        node.groups.record(group, "crew", members, creator=creator, sender=creator)
+        is not None
+    )
+    return group
+
+
+def test_group_reaction_from_member_resolves_on_pinned_group(tmp_path):
+    # The pinned roster names the reactor, so the signed context
+    # still resolves the node's own copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_refused_for_non_member(tmp_path):
+    # A valid signature proves who chose the context, not that they
+    # belong to the group: an allow-listed outsider who learned the
+    # group id, author and send time must not get a reaction onto a
+    # message in a group they never joined.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_refused_when_group_deleted(tmp_path):
+    # Qodo Critical (flagged by the user from the stacked PR #297's
+    # reviews): a failed group-roster lookup used to count as
+    # permission, so after a group is deleted an allow-listed
+    # non-member who knows a retained message id could get a
+    # reaction stored and displayed.  A missing roster for a
+    # resolved group message now fails closed.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    assert node.groups.delete(group) is True
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_refused_when_namesake_masks_deleted_group(tmp_path):
+    # CodeRabbit Major (node.py:2149, CWE-863): after a group is
+    # deleted, an outsider can deliver a group named after the
+    # deleted group's 32-character id — find() then returns the
+    # outsider's group by name, and the reaction passes the roster
+    # check against the wrong roster.  Authorization now uses an
+    # exact-id lookup, so the namesake does not substitute.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    # The outsider's group is named after the deleted group's id,
+    # and names the outsider as a member.
+    namesake = node.groups.create(
+        group, [reactor_hash, destination_hash(RNS.Identity()).hex()],
+        created_by=reactor_hash,
+    )
+    assert namesake["id"] != group
+    assert node.groups.delete(group) is True
+    # The name fallback still resolves the deleted id to the namesake.
+    assert node.groups.find(group)["id"] == namesake["id"]
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_recheck_voids_when_namesake_masks_deleted_group(
+    tmp_path, monkeypatch
+):
+    # Same finding, second net: the post-store recheck re-reads the
+    # roster, so a group deleted (and masked by a namesake) between
+    # the pre-store check and the recheck must void the stored
+    # reaction instead of letting the namesake's roster keep it.  A
+    # missing roster fails closed here too.  The copy arrives between
+    # the check and the recheck, so the reaction is stored with
+    # group context first and only the recheck sees the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, reactor_hash],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    # Swap the roster between the pre-store resolve and the
+    # post-store recheck: the copy lands, the real group is deleted,
+    # and a namesake (named after the deleted id) that still lists
+    # the reactor is pinned.
+    calls = {"n": 0}
+    real_resolve = node.inbox.resolve
+
+    def swapping_resolve(target_id):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            node.inbox._messages.append(dict(copy))
+            assert node.groups.delete(group) is True
+            node.groups.create(
+                group,
+                [reactor_hash, destination_hash(RNS.Identity()).hex()],
+                created_by=reactor_hash,
+            )
+        return real_resolve(target_id)
+
+    monkeypatch.setattr(node.inbox, "resolve", swapping_resolve)
+    call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "local-copy-1", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_naming_a_leg_id_stores_under_canonical_id(
+    tmp_path,
+):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids.  A reaction naming the other leg
+    # must resolve to the stored record and be stored under the
+    # canonical id, or it never displays under the message listing.
+    # The target here is the author's own outbound record, whose
+    # destination is empty — so the signed-context lookup misses it
+    # too, and only the leg-aware resolve saves the reaction.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = "ab" * 16
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, reactor_hash],
+        creator="ab" * 16,
+    )
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": "",
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "g-1",
+            "leg_ids": ["g-1", "g-2"],
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "g-2", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    reactions = node.inbox.reactions_for("g-1")
+    assert [r["reaction"] for r in reactions] == ["👍"]
+    assert node.inbox.reactions_for("g-2") == []
+
+
+def test_group_reaction_final_check_refuses_when_group_deleted(
+    tmp_path, monkeypatch
+):
+    # The same fail-closed rule in the atomic final check: a
+    # no-context reaction whose target lands between the first
+    # lookup and the final check, on a group that was deleted
+    # before the check runs.  The copy is stubbed into the final
+    # lookup because a real import cannot land inside the
+    # transaction — the flock is held there, and a second Inbox
+    # import would deadlock (the round-11 lesson).
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    assert node.groups.delete(group) is True
+    real_resolve = node.inbox.resolve
+    calls = {"n": 0}
+
+    def flaky_resolve(ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The first lookup: the copy has not landed yet.
+            return real_resolve(ref)
+        # The final check, inside the transaction: the copy is here
+        # now, on a group whose roster is gone.
+        return {"id": "local-copy-1", "kind": "group", "group": group}
+
+    monkeypatch.setattr(node.inbox, "resolve", flaky_resolve)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
+    # The reaction outruns the message: stored under the reactor's
+    # foreign wire id, invisible.  When the copy lands, it moves onto
+    # the local id so it displays under the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = ["ab" * 16, author_hash, reactor_hash]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    assert node.inbox.reactions_for("local-copy-1") == []
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_group_reaction_reconciles_when_relayed_copy_arrives_late(tmp_path):
+    # The same late arrival, but the copy comes through sealed relay
+    # mail: _deliver_collected must reconcile the stored reaction onto
+    # the local copy id too, not just the direct /tau/group path.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    assert node.inbox.reactions_for("local-copy-1") == []
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_queued_group_leg_retry_reuses_shared_send_time(tmp_path):
+    # A queued leg was enqueued with the fan-out's shared send time;
+    # the retry must carry that time on the wire, not the later
+    # enqueue time — otherwise a reaction left on the live leg's copy
+    # can never reconcile onto the retried copy.
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    group = derive_group_id("ab" * 16, "crew", ["ab" * 16, "cd" * 16])
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16),
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=100.0,
+    )
+    assert entry.created_at != 100.0
+    assert node._deliver_entry(peer, entry, timeout=5) is True
+    assert len(calls) == 1
+    payload = parse_group_message(calls[0][2])
+    assert payload["sent_at"] == 100.0
+
+
+def test_queued_group_leg_relay_copy_carries_shared_send_time(tmp_path):
+    # One leg live, one queued: the queued leg's copy arrives through
+    # sealed relay mail.  The deposit must seal it with the fan-out's
+    # shared send time, so an early reaction left on the live copy's
+    # id reconciles onto the relayed copy instead of staying stranded.
+    (tmp_path / "recipient").mkdir()
+    (tmp_path / "sender").mkdir()
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient = RNS.Identity()
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        recipient_node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(recipient_node.inbox.reactions_for("other-leg-1")) == 1
+    assert recipient_node.inbox.reactions_for("local-copy-1") == []
+
+    sender_node = make_node(tmp_path / "sender")
+    sender_node.identity = author
+    holder = sender_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    sender_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+    calls, fake_request = _recorded_request()
+    sender_node._request = fake_request
+    entry = sender_node.mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="crew hello",
+        message_id="local-copy-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+        sent_at=100.0,
+    )
+    assert sender_node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    stored = parse_mail_store(calls[0][2])
+    message = open_message(recipient, stored["blob"])
+    assert recipient_node._deliver_collected(message) is True
+    assert recipient_node.inbox.reactions_for("other-leg-1") == []
+    shown = recipient_node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_group_reaction_not_reconciled_for_non_member(tmp_path):
+    # The same late arrival, but the reactor is not on the roster the
+    # message pins: the reaction stays stranded under the foreign id
+    # and never surfaces under the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
+def test_group_reaction_to_known_id_checked_for_non_member(tmp_path):
+    # CodeRabbit Major (node.py:1874): the roster check ran only when
+    # the target id did not resolve — an allow-listed non-member
+    # naming a known local group-message id directly, with no group
+    # context, slipped past it.  The resolved message's roster is
+    # checked too now.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_reloads_before_resolving_imported_copy(tmp_path):
+    # CodeRabbit Major (node.py:1835): resolve() reads the cached
+    # inbox, so a group-message copy imported by another process is
+    # invisible to it — a reaction naming that id would skip both
+    # roster checks.  The handler reloads first, mirroring
+    # _handle_retract.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    # Another process imports the copy; this node's cache is stale.
+    other = Inbox(node.inbox.path)
+    other.append(
+        {
+            "from": "alice",
+            "destination": author,
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "local-copy-1",
+        }
+    )
+    with pytest.raises(ValueError):
+        node.inbox.resolve("local-copy-1")
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_to_known_id_accepted_for_member(tmp_path):
+    # The same direct reaction, from a reactor the roster names, is
+    # stored under the message as before.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_rechecks_after_storing_unresolved(tmp_path, monkeypatch):
+    # CodeRabbit Major (node.py:1648): the reaction's lookup can race
+    # the message's arrival — the copy lands after find_group_message
+    # misses it but before the reaction is stored, and the message
+    # handler's reconcile already ran.  The handler rechecks once
+    # after storing, so the reaction still lands on the copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    real_find = node.inbox.find_group_message
+    calls = {"n": 0}
+
+    def _miss_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_find(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "find_group_message", _miss_once)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("other-leg-1") == []
+    stored = node.inbox.reactions_for("local-copy-1")
+    assert len(stored) == 1
+    assert stored[0]["reaction"] == "👍"
+
+
+def test_group_reaction_voided_when_message_imported_mid_handler(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit follow-up (node.py:1850): a copy can be imported
+    # after the reaction is stored but before the post-store recheck
+    # runs — the handler rechecks after storing and voids a
+    # non-member's reaction on the imported copy.  (The final check
+    # and the persist now hold one transaction, so the copy can no
+    # longer land between them — the import is forced between the
+    # store and the recheck instead, via the recheck's reload.)
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    # A replay of the voided reaction cannot resurrect it: the
+    # tombstone is strictly newer than the original, so merging the
+    # original back is a no-op.  (Replaying through the handler
+    # would dedupe on the reaction id instead, so replay at the
+    # inbox level, with the monkeypatch removed.)
+    monkeypatch.undo()
+    node.inbox.record_reaction(
+        {
+            "target": "local-copy-1",
+            "reaction": "👍",
+            "from": "unknown",
+            "destination": destination_hash(reactor).hex(),
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "react-1",
+        }
+    )
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_final_check_refuses_when_copy_lands_before_store(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit round-9 follow-up (node.py:2032): a no-context
+    # reaction can miss the target in the first lookup, then be
+    # stored and published before the post-store recheck runs — and
+    # if that recheck fails, the non-member's reaction stays
+    # visible.  The handler now re-checks authorization immediately
+    # before storing: a copy imported after the first lookup is
+    # caught here, and the reaction is refused before anything is
+    # stored or published.  The import is forced between the two
+    # lookups by a resolve that misses once, then delegates.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    Inbox(node.inbox.path).append(
+        {
+            "from": "alice",
+            "destination": author,
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "local-copy-1",
+        }
+    )
+    assert node.inbox.list_messages() == []
+    real_resolve = node.inbox.resolve
+    calls = {"n": 0}
+
+    def flaky_resolve(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "resolve", flaky_resolve)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_final_check_storage_failure_stores_nothing(
+    tmp_path, monkeypatch
+):
+    # The atomic final check + store reloads at the transaction
+    # entry; if that read fails, the reaction is refused with
+    # storage_failed and nothing is stored — it is never stored
+    # against a stale view of the inbox.
+    from tau.inbox import InboxError
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    reactor = RNS.Identity()
+    real_load = node.inbox._load
+    calls = {"n": 0}
+
+    def flaky_load(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise InboxError("boom")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "_load", flaky_load)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "unknown-target", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("unknown-target") == []
+
+
+def test_group_reaction_recheck_reload_failure_is_storage_failed(
+    tmp_path, monkeypatch
+):
+    # The post-store recheck is the backstop for a copy that lands
+    # between the final pre-store check and the persist.  If its
+    # reload fails, the handler answers storage_failed instead of
+    # acknowledging a reaction it could not verify — the sender
+    # retries, and the retry's refusal voids the orphan.  The
+    # reaction IS stored (the store already ran); only the
+    # acknowledgement is withheld.
+    from tau.inbox import Inbox, InboxError
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck; the
+            # recheck's reload then fails, so it cannot verify it.
+            # (The import happens here, not inside the store: the
+            # final check and the persist hold one transaction, so
+            # no other process can commit between them.)
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+            raise InboxError("boom")
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_recheck_tombstone_failure_is_storage_failed(
+    tmp_path, monkeypatch
+):
+    # Same ordering as the reload-failure test, but the failure is
+    # the tombstone write itself: the recheck finds the non-member
+    # and cannot void the reaction, so the handler answers
+    # storage_failed instead of acknowledging it.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_record = node.inbox.record_reaction
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def _fail_tombstone(record):
+        if record.get("reaction") == "":
+            raise OSError("disk full")
+        return real_record(record)
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck (see
+            # the reload-failure test: the import cannot happen
+            # inside the store, which holds the transaction).
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "record_reaction", _fail_tombstone)
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_retry_voids_orphan_after_failed_recheck(
+    tmp_path, monkeypatch
+):
+    # The fail-closed recheck leaves the orphan stored (the store
+    # already ran) but unacknowledged, so the sender retries with
+    # the same id.  The retry resolves the copy, is refused for
+    # membership, and the refusal voids the orphan — the reaction
+    # does not stay displayed.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_record = node.inbox.record_reaction
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def _fail_tombstone(record):
+        if record.get("reaction") == "":
+            raise OSError("disk full")
+        return real_record(record)
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck (see
+            # the reload-failure test).
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "record_reaction", _fail_tombstone)
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    payload = signed_reaction(
+        reactor, "local-copy-1", "👍", "react-1", sent_at=200.0
+    )
+    first = call_handler(node._handle_reaction, payload, remote_identity=reactor)
+    assert first["ok"] is False
+    assert first["error"]["code"] == "storage_failed"
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    monkeypatch.undo()
+    second = call_handler(node._handle_reaction, payload, remote_identity=reactor)
+    assert second["ok"] is False
+    assert second["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_not_published_when_recheck_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit round-11: publication must wait for authorization.
+    # A reaction whose post-store recheck fails is stored (the store
+    # already ran) but never fanned out to the live console — the
+    # sender retries instead of the console showing a reaction that
+    # was never verified.  The copy lands between the store and the
+    # recheck (via the recheck's reload, as in the reload-failure
+    # test); the recheck's reload then fails.  The stored reaction
+    # test); the recheck's reload then fails.  The stored reaction
+    # stays in the inbox (round-12 note: it is never displayed —
+    # the console and `tau messages` filter stored reactions against
+    # the pinned roster, see test_group_message_hides_non_member_
+    # reaction and test_messages_hides_non_member_group_reaction),
+    # and the retry's refusal voids it.
+    from tau.inbox import Inbox, InboxError
+
+    published = []
+    node = make_node(tmp_path, on_reaction=published.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+            raise InboxError("boom")
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert published == []
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_published_after_authorization(tmp_path):
+    # Control for the deferred publish: a member's reaction is
+    # fanned out live once authorization has completed.
+    published = []
+    node = make_node(tmp_path, on_reaction=published.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    member = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, member],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(published) == 1
+    assert published[0]["reaction"] == "👍"
+    assert published[0]["target"] == "local-copy-1"
+
+
+def test_group_reaction_final_check_and_store_hold_one_transaction(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit round-11: the final check and the persist hold one
+    # inbox transaction, so no other process can import the target
+    # between them.  Prove it by having each lookup attempt a
+    # non-blocking flock on the inbox lock file: the initial lookup
+    # and the recheck run outside any transaction (probe succeeds),
+    # but the final check runs inside the transaction that also
+    # stores the reaction (probe fails — this process already holds
+    # the flock).  In the old code the final check ran outside any
+    # transaction too, so every probe succeeded.
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only lock
+        pytest.skip("fcntl is unavailable")
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    reactor = RNS.Identity()
+    real_resolve = node.inbox.resolve
+    probes = []
+
+    def _resolve_and_probe(*args, **kwargs):
+        lock_path = node.inbox.path.with_name(node.inbox.path.name + ".lock")
+        with open(lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                probes.append(True)
+            else:
+                probes.append(False)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "resolve", _resolve_and_probe)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "unknown-target", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert probes == [False, True, False]
+
+
+def test_group_reaction_purged_when_message_arrives_after_it(tmp_path):
+    # CodeRabbit follow-up (node.py:1850): a reaction stored before
+    # its target arrives — no context, so no roster check could run
+    # — would surface under the exact id when the copy lands.  The
+    # message handler voids non-members' reactions on arrival.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_kept_when_member_reacts_before_arrival(tmp_path):
+    # The same early reaction, from a reactor the roster names, is
+    # kept when the message arrives.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = ["ab" * 16, author_hash, reactor_hash]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+
+
+def test_group_reaction_reconciles_when_relayed_copy_arrives(tmp_path):
+    # Issue #293: a group message arriving via sealed relay mail
+    # reconciles stored context reactions onto the relayed copy,
+    # exactly as a direct group message does.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_group_reaction_purge_also_clears_console_cache(tmp_path):
+    # CodeRabbit Major (node.py:1664): the inbox purge voids a
+    # non-member's early reaction, but the console bridge caches
+    # reactions separately and seeds appended messages from that
+    # cache — so the voided reaction still displayed on the live
+    # group message.  The purge fans its tombstones out through
+    # on_reaction, so the bridge cache is corrected before the
+    # message is appended.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Capture the live entry record_inbound publishes, not the
+        # snapshot serve: messages() reconciles against the inbox on
+        # read and would hide a stale seed, but the live push already
+        # showed it.
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id("ab" * 16, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        # The bridge cached the early reaction...
+        assert len(bridge._reaction_state) == 1
+        delivered = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "crew hello",
+                message_id="local-copy-1",
+                group_id=group,
+                group_name="crew",
+                creator="ab" * 16,
+                members=members,
+                sent_at=100.0,
+            ),
+            remote_identity=author,
+        )
+        assert delivered["ok"] is True
+        # ...but the live published entry carries no reaction.
+        assert len(published) == 1
+        assert published[0]["reactions"] == []
+        assert node.inbox.reactions_for("local-copy-1") == []
+    finally:
+        bridge.stop()
+
+
+def test_group_reaction_purge_clears_console_cache_for_relayed_copy(tmp_path):
+    # The same bridge-cache correction on the relayed arrival path:
+    # the purge runs before on_message, so the tombstone reaches
+    # the bridge before the entry is appended.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # Capture the live entry, as in the direct-path test: the
+        # snapshot serve reconciles against the inbox on read.
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="local-copy-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        message = open_message(recipient, blob)
+        assert node._deliver_collected(message) is True
+        assert len(published) == 1
+        assert published[0]["reactions"] == []
+        assert node.inbox.reactions_for("local-copy-1") == []
+    finally:
+        bridge.stop()
+
+
+def test_group_message_refused_when_purge_fails(tmp_path, monkeypatch):
+    # CodeRabbit follow-up (node.py:1664): if the purge fails, the
+    # voided reaction is still stored and still cached, so recording
+    # the message would leave the reaction readable through
+    # reactions_for.  The arrival fails closed: the delivery is
+    # refused and nothing is recorded or marked seen — the sender
+    # retries once the store is healthy.  The purge runs inside
+    # Inbox.append_group_message now, so the failure is injected at
+    # its locked helper.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id("ab" * 16, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+
+        def _fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            node.inbox, "_purge_non_member_reactions_locked", _fail
+        )
+        delivered = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "crew hello",
+                message_id="local-copy-1",
+                group_id=group,
+                group_name="crew",
+                creator="ab" * 16,
+                members=members,
+                sent_at=100.0,
+            ),
+            remote_identity=author,
+        )
+        assert delivered["ok"] is False
+        assert delivered["error"]["code"] == "storage_failed"
+        assert published == []
+        assert node.inbox.list_messages() == []
+        assert not node.mailbox.is_seen("local-copy-1")
+        # The reaction is still stored — but with no message holding
+        # its target, it is readable nowhere.
+        assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    finally:
+        bridge.stop()
+
+
+def test_relayed_message_refused_when_purge_fails(tmp_path, monkeypatch):
+    # The same fail-closed refusal on the relayed path, now as a
+    # distinct retryable outcome: _deliver_collected raises
+    # DeliveryDeferredError instead of returning False, so the
+    # callers keep the held copy and leave the envelope
+    # unacknowledged.  Nothing is recorded or marked seen, so a
+    # later sweep retries it.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    with pytest.raises(DeliveryDeferredError):
+        node._deliver_collected(message)
+    assert node.inbox.list_messages() == []
+    assert not node.mailbox.is_seen("local-copy-1")
+
+
+def test_group_message_recorded_but_not_published_when_fan_out_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit follow-up (node.py:1664): if the console cache
+    # update fails, the bridge still holds the stale reaction and
+    # would seed it into the live entry.  The message still records
+    # — the inbox purge succeeded, so the reaction is voided there —
+    # but the live event is withheld.  The console history is still
+    # but the live event is withheld.  The console history is still
+    # written, through the record-only callback: messages() reads
+    # only that history, so skipping it would leave the copy
+    # invisible in the console even though it is in the inbox.
+    # (CodeRabbit round-14 review, thread iB3I.)
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
+        node.on_message = _capture
+        node.on_message_record_only = _capture_record_only
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id("ab" * 16, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+
+        def _raise(record):
+            raise RuntimeError("console callback failed")
+
+        monkeypatch.setattr(node, "on_reaction", _raise)
+        delivered = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "crew hello",
+                message_id="local-copy-1",
+                group_id=group,
+                group_name="crew",
+                creator="ab" * 16,
+                members=members,
+                sent_at=100.0,
+            ),
+            remote_identity=author,
+        )
+        assert delivered["ok"] is True
+        assert published == []
+        assert len(node.inbox.list_messages()) == 1
+        assert node.inbox.reactions_for("local-copy-1") == []
+        # The live event was withheld, but the console history holds
+        # the copy — with the stale reaction filtered out of the
+        # stored entry — and no live message event was published.
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "local-copy-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "local-copy-1"
+        ] == []
+    finally:
+        bridge.stop()
+
+
+def test_relayed_group_message_recorded_when_fan_out_fails(
+    tmp_path, monkeypatch
+):
+    """The relayed path writes the console history too when a
+    voided-reaction fan-out fails (CodeRabbit round-14 review,
+    thread iB3I).
+
+    Same ordering as the direct path, delivered through the fetch
+    path instead: a non-member reaction is cached before its target
+    arrives, the purge voids it, the tombstone fan-out fails, and
+    the live event is withheld — but the copy is recorded and the
+    console history holds it, and the delivery still resolves (the
+    envelope is acked, not deferred).
+    """
+    import base64
+
+    from tau.webapi import WebBridge
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    own = destination_hash(node.identity).hex()
+    node.destination = SimpleNamespace(
+        hexhash=own, hash=destination_hash(node.identity)
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
+        node.on_message_record_only = _capture_record_only
+        holder = RNS.Identity()
+        holder_hash = destination_hash(holder)
+        peer = Peer(
+            destination_hash(holder_hash),
+            name="holder",
+            public_key=holder.get_public_key(),
+            first_seen=1.0,
+            last_seen=1.0,
+            caps=("message", "ping", "peers", "mail", "read"),
+        )
+        node.registry._peers[holder_hash] = peer
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "fetch-group-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+
+        def _raise(record):
+            raise RuntimeError("console callback failed")
+
+        monkeypatch.setattr(node, "on_reaction", _raise)
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=node.identity.get_public_key(),
+            message_id="fetch-group-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        node._request = lambda peer, path, payload, timeout, deadline=None: {
+            "ok": True,
+            "messages": [
+                {
+                    "id": "fetch-group-1",
+                    "blob": base64.b64encode(blob).decode("ascii"),
+                    "expires_at": time.time() + 3600,
+                }
+            ],
+            "count": 1,
+        }
+        assert node._collect_mail(peer, timeout=5.0) == 1
+        assert received == []
+        assert len(node.inbox.list_messages()) == 1
+        assert node.inbox.reactions_for("fetch-group-1") == []
+        assert node.mailbox.take_pending_acks(peer.hexhash) == [
+            "fetch-group-1"
+        ]
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "fetch-group-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "fetch-group-1"
+        ] == []
+    finally:
+        bridge.stop()
+
+
+def test_relayed_reconcile_failure_does_not_skip_purge(tmp_path, monkeypatch):
+    # CodeRabbit follow-up: on the relayed path the reconcile and the
+    # purge shared one try block, so a reconcile failure skipped the
+    # purge and the message published with the reaction.  The reconcile
+    # now runs inside Inbox.append_group_message and its failure is
+    # tolerated there, so the purge still runs and the live entry
+    # publishes clean.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+
+        def _fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            node.inbox, "_reconcile_group_reactions_locked", _fail
+        )
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="local-copy-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        message = open_message(recipient, blob)
+        assert node._deliver_collected(message) is True
+        assert node.inbox.reactions_for("local-copy-1") == []
+        assert len(published) == 1
+        assert published[0]["reactions"] == []
+    finally:
+        bridge.stop()
+
+
+def test_local_held_group_delivery_keeps_copy_when_purge_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:3372): the local-held sweep used to drop
+    # the copy before delivery, so a deferred delivery lost the only
+    # copy of a message nobody recorded.  The copy stays held until
+    # the delivery resolves, and a later sweep retries it.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    own = recipient_hash.hex()
+    sender = RNS.Identity()
+    author_hash = destination_hash(sender).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-group-1",
+        expires_at=time.time() + 3600,
+    )
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
+    assert node._process_local_held() == 0
+    assert received == []
+    assert not node.mailbox.is_seen("self-group-1")
+    held = node.mailbox.held_for(recipient_hash)
+    assert [envelope.id for envelope in held] == ["self-group-1"]
+    # Once the store is healthy, the next sweep delivers the kept copy.
+    monkeypatch.undo()
+    assert node._process_local_held() == 1
+    assert len(received) == 1
+    assert received[0]["text"] == "crew hello"
+    assert node.mailbox.held_for(recipient_hash) == []
+
+
+def test_collected_group_delivery_leaves_envelope_unacked_when_purge_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:3372): the fetch path used to ack an
+    # envelope before delivery, so a deferred delivery let the
+    # holder drop the only copy of a message nobody recorded.  The
+    # envelope is acked only once the delivery resolves; a deferred
+    # one stays unacknowledged and the next fetch retries it.
+    import base64
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    own = destination_hash(node.identity).hex()
+    node.destination = SimpleNamespace(
+        hexhash=own, hash=destination_hash(node.identity)
+    )
+    holder = RNS.Identity()
+    holder_hash = destination_hash(holder)
+    peer = Peer(
+        destination_hash=holder_hash,
+        name="holder",
+        public_key=holder.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+        caps=("message", "ping", "peers", "mail", "read"),
+    )
+    node.registry._peers[holder_hash] = peer
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="fetch-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node._request = lambda peer, path, payload, timeout, deadline=None: {
+        "ok": True,
+        "messages": [
+            {
+                "id": "fetch-group-1",
+                "blob": base64.b64encode(blob).decode("ascii"),
+                "expires_at": time.time() + 3600,
+            }
+        ],
+        "count": 1,
+    }
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
+    assert node._collect_mail(peer, timeout=5.0) == 0
+    assert received == []
+    assert node.mailbox.take_pending_acks(peer.hexhash) == []
+    # The envelope was never acked, so the next fetch serves it
+    # again; once the store is healthy it delivers and is acked.
+    monkeypatch.undo()
+    assert node._collect_mail(peer, timeout=5.0) == 1
+    assert len(received) == 1
+    assert received[0]["text"] == "crew hello"
+    assert node.mailbox.take_pending_acks(peer.hexhash) == ["fetch-group-1"]
 
 
 def test_reaction_denied_by_allow_list(tmp_path):

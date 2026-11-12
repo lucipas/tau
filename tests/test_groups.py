@@ -4521,6 +4521,22 @@ def test_messages_group_filter(tmp_path, capsys):
     assert code != 0
 
 
+def test_visible_reactions_hides_all_when_no_roster_pinned():
+    # CodeRabbit Major: with no roster pinned there is no membership
+    # to verify, so nothing displays — a stored reaction from a
+    # non-member must not surface through an imported copy just
+    # because the group was never pinned.  Once a roster pins, the
+    # filter keeps members and drops outsiders, as before.
+    from tau.groups import visible_reactions
+
+    reactions = [
+        {"reactor": "aa" * 16, "reaction": "👍"},
+        {"destination": "bb" * 16, "reaction": "👎"},
+    ]
+    assert visible_reactions(reactions, None) == []
+    assert visible_reactions(reactions, {"aa" * 16}) == [reactions[0]]
+
+
 def test_messages_group_filter_spans_rename(tmp_path, capsys):
     config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
     store = GroupStore(config.groups_path)

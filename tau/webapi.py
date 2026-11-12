@@ -19,6 +19,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     GET  /api/messages     recent inbound/outbound messages
+                           (``?pinned=1`` lists pinned messages only,
+                           across the whole console log)
     GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -40,6 +42,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/retract retract ``{"id": <console message id>}``: ask
                            the peer to delete your sent DM, then drop the
                            local copies too (``tau retract`` from the console)
+    POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
+                           inbox, so it shows in the console and in
+                           ``tau pinned`` (local only, never sent)
+    POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -135,6 +141,7 @@ from .config import (
     set_node_setting,
     write_node_metadata,
 )
+from .groups import pinned_rosters, visible_reactions
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
@@ -984,7 +991,19 @@ class WebBridge:
         while len(self._removed_wire_ids) > MAX_REMOVED_WIRE_IDS:
             self._removed_wire_ids.popitem(last=False)
 
-    def record_inbound(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def record_inbound(
+        self, record: Dict[str, Any], *, publish: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Record an inbound message in the console history.
+
+        With ``publish`` the entry is also fanned out live on the bus
+        (and a read receipt is sent when a console is subscribed);
+        with ``publish=False`` only the history write happens.  The
+        node uses the record-only form when a delivery's live event
+        is withheld — the copy is in the inbox and marked seen, and
+        ``messages()`` reads only this history, so skipping the
+        write would leave it invisible in the console.
+        """
         peer_hash = str(record.get("destination") or "")
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
@@ -1020,6 +1039,21 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # A voided reaction the bridge never heard about can still be
+        # seeded from the cache into a fresh entry; the roster filters
+        # it here, as the snapshot read and the import publish do, so
+        # the stored entry and (when published) the live event are
+        # both clean.
+        group_id = message.get("group")
+        if isinstance(group_id, str) and group_id and message.get("reactions"):
+            groups = getattr(self.node, "groups", None)
+            if groups is not None:
+                rosters = pinned_rosters(groups, [group_id])
+                message["reactions"] = visible_reactions(
+                    message["reactions"], rosters.get(group_id)
+                )
+        if not publish:
+            return message
         # The node appends to its inbox before this callback runs, so
         # the unread total already includes the new message.
         self.bus.publish(
@@ -1118,7 +1152,7 @@ class WebBridge:
         # Persist the flip like any other log change, so a restart does
         # not resurrect the message as queued.
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_read(
@@ -1166,7 +1200,7 @@ class WebBridge:
             return updated
         self._save_messages()
         for message in updated:
-            self.bus.publish({"type": "message_updated", "message": message})
+            self._publish_message_updated(message)
         return updated
 
     def mark_displayed_read(self) -> None:
@@ -1301,12 +1335,31 @@ class WebBridge:
                 message["reactions"] = _with_reaction(
                     message.get("reactions") or [], reactor, entry
                 )
+                # A reaction can reach this callback after its target
+                # was appended — it passed the handler's final lookup
+                # before the copy arrived — and the merge above does
+                # not check the roster.  Filter the live entry here,
+                # as the snapshot read and the import publish already
+                # do, so the message_updated event never carries a
+                # non-member's reaction to the live console.
+                group_id = message.get("group")
+                if (
+                    isinstance(group_id, str)
+                    and group_id
+                    and message.get("reactions")
+                ):
+                    groups = getattr(self.node, "groups", None)
+                    if groups is not None:
+                        rosters = pinned_rosters(groups, [group_id])
+                        message["reactions"] = visible_reactions(
+                            message["reactions"], rosters.get(group_id)
+                        )
                 updated = dict(message)
                 break
         if updated is None:
             return None
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2397,7 +2450,26 @@ class WebBridge:
         # the restored entries the same way, in feed order. Blocked
         # senders stay hidden like the messages API hides them: the
         # record is kept for unblocking, but no event shows it.
+        # A reaction cached before its target arrived — stored when
+        # both lookups missed — is seeded into the entry by
+        # _append_message; on a group message it may name a reactor
+        # who is not on the pinned roster, so the roster filters it
+        # here, before the event is published.  (The snapshot read in
+        # messages() filters the same way; the live event bypasses
+        # that read, so it needs its own filter.)
         blocklist = getattr(self.node, "blocklist", None)
+        groups = getattr(self.node, "groups", None)
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None:
+            rosters = pinned_rosters(
+                groups,
+                {
+                    str(message.get("group"))
+                    for message in appended
+                    if isinstance(message.get("group"), str)
+                    and message.get("group")
+                },
+            )
         for message in appended:
             if (
                 message.get("direction") == "in"
@@ -2407,6 +2479,15 @@ class WebBridge:
                 )
             ):
                 continue
+            group_id = message.get("group")
+            if (
+                isinstance(group_id, str)
+                and group_id
+                and message.get("reactions")
+            ):
+                message["reactions"] = visible_reactions(
+                    message["reactions"], rosters.get(group_id)
+                )
             self.bus.publish({"type": "message", "message": message})
 
     def tan_export(self, *, all_authors: bool = False) -> Dict[str, Any]:
@@ -2597,9 +2678,7 @@ class WebBridge:
                 self._save_messages()
         self.bus.publish({"type": "message", "message": message})
         if flipped:
-            self.bus.publish(
-                {"type": "message_updated", "message": dict(message)}
-            )
+            self._publish_message_updated(message)
         return message, response
 
     def send_group_message(
@@ -2654,6 +2733,15 @@ class WebBridge:
         response = self.node.send_group_message(
             group_record, text, timeout=timeout, expires_at=expires_at
         )
+        # Every leg shares one wire send time (the node's send_group_
+        # message returns it): record that on each outbound entry, not
+        # a post-delivery timestamp, so reacting to a leg from the
+        # console names the logical message every member holds.
+        wire_sent_at = response.get("sent_at")
+        if not isinstance(wire_sent_at, (int, float)) or isinstance(
+            wire_sent_at, bool
+        ):
+            wire_sent_at = None
         messages: List[Dict[str, Any]] = []
         for result in response.get("results") or []:
             member = str(result.get("to") or "")
@@ -2681,7 +2769,9 @@ class WebBridge:
                     peer=member or None,
                     peer_name=peer_name,
                     text=text,
-                    sent_at=time.time(),
+                    sent_at=(
+                        wire_sent_at if wire_sent_at is not None else time.time()
+                    ),
                     received_at=time.time(),
                     status=status,
                     rtt=_as_float(result.get("rtt")),
@@ -2710,9 +2800,7 @@ class WebBridge:
                     self._save_messages()
             self.bus.publish({"type": "message", "message": message})
             if flipped:
-                self.bus.publish(
-                    {"type": "message_updated", "message": dict(message)}
-                )
+                self._publish_message_updated(message)
             messages.append(message)
         return messages, response
 
@@ -2796,6 +2884,10 @@ class WebBridge:
         outgoing reaction is recorded locally by the node, so the
         console annotates the entry through the same ``message_updated``
         event as an inbound reaction.
+
+        A group message fans out instead: the same signed reaction
+        goes to every member except this node, and the per-member
+        results come back in the response.
         """
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target message id is required")
@@ -2806,12 +2898,37 @@ class WebBridge:
         token = clean_reaction("" if clear else reaction)
         target = target.strip()
         peer: Optional[str] = None
+        group_id: Optional[str] = None
+        target_author: Optional[str] = None
+        target_sent_at: Optional[float] = None
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
                     peer = message.get("peer")
+                    group = message.get("group")
+                    if isinstance(group, str):
+                        group_id = group
+                        if message.get("direction") == "out":
+                            # This entry is one leg of a send from this
+                            # node: the peer is the recipient, not the
+                            # author, and the send time is the shared
+                            # wire time (see send_group_message), not
+                            # a console-local timestamp.  An entry
+                            # recorded before that fix still carries a
+                            # post-delivery timestamp, which simply
+                            # fails to resolve on other members — the
+                            # pre-fix behaviour — instead of naming a
+                            # wrong author.
+                            target_author = self.node.destination_hexhash
+                        elif isinstance(peer, str):
+                            target_author = peer
+                        sent_at = message.get("sent_at")
+                        if isinstance(sent_at, (int, float)) and not isinstance(
+                            sent_at, bool
+                        ):
+                            target_sent_at = sent_at
                     break
-        if peer is None:
+        if group_id is None and peer is None:
             inbox = getattr(self.node, "inbox", None)
             if inbox is None:
                 raise ValueError(f"unknown message: {target!r}")
@@ -2819,7 +2936,45 @@ class WebBridge:
                 record = inbox.resolve(target)
             except ValueError as exc:
                 raise ValueError(f"unknown message: {target!r}") from exc
-            peer = record.get("destination")
+            if record.get("kind") == "group" and isinstance(
+                record.get("group"), str
+            ):
+                group_id = record["group"]
+                if record.get("direction") == "out":
+                    # An outbound record's destination is empty: the
+                    # author is this node, as the console-history
+                    # branch above already does.
+                    target_author = self.node.destination_hexhash
+                else:
+                    author = record.get("destination")
+                    if isinstance(author, str):
+                        target_author = author
+                sent_at = record.get("sent_at")
+                if isinstance(sent_at, (int, float)) and not isinstance(
+                    sent_at, bool
+                ):
+                    target_sent_at = sent_at
+            else:
+                peer = record.get("destination")
+        if group_id is not None:
+            # Reload the persisted store first: a group created or
+            # deleted by another process (``tau group``) must be seen
+            # by this reaction.  Resolve the stored id exactly: the
+            # fan-out takes a record, never a name lookup — a retired
+            # id that also matches a group name must not resolve to
+            # that other group and send the reaction to its members.
+            self.node.groups.list_groups()
+            group = self.node.groups.get(group_id)
+            if group is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            return self.node.send_group_reaction(
+                group,
+                target,
+                token,
+                timeout=timeout,
+                target_author=target_author,
+                target_sent_at=target_sent_at,
+            )
         if not peer:
             raise ValueError("that message has no known peer to react to")
         response = self.node.send_reaction(peer, target, token, timeout=timeout)
@@ -3020,6 +3175,97 @@ class WebBridge:
             "deleted": bool(response.get("deleted")),
             "id": response.get("id") if isinstance(response.get("id"), str) else None,
         }
+    def pin_message(self, target: int) -> Dict[str, Any]:
+        """Pin one stored DM from the console history, by console id.
+
+        The pin itself lives on the node inbox record (``Inbox.pin``),
+        so the CLI's ``tau pinned`` listing and this console agree:
+        pinning from either side shows up on the other, and the pin is
+        local only — the peer's copy is unaffected and nothing is sent.
+        Only messages with a stored inbox copy can be pinned: a queued
+        message has no wire id yet, so pinning it would record a pin
+        with nothing to attach to.  Other tabs learn through a
+        ``message_updated`` event carrying the annotated entry — unless
+        the message is from a blocked sender, whose text the listing
+        hides: then no event is published and tabs reconcile on their
+        next poll.
+
+        Returns the pinned console id, its wire id, and whether the pin
+        is new — pinning an already-pinned message is a no-op, not an
+        error, matching :meth:`Inbox.pin`.
+        """
+        return self._set_message_pinned(target, pinned=True)
+
+    def unpin_message(self, target: int) -> Dict[str, Any]:
+        """Remove the pin from one stored DM, by console id.
+
+        The mirror of :meth:`pin_message`: the inbox record loses its
+        pin flag and other tabs learn through a ``message_updated``
+        event.  Unpinning a message that was never pinned is a no-op,
+        not an error.
+        """
+        return self._set_message_pinned(target, pinned=False)
+
+    def _set_message_pinned(self, target: int, *, pinned: bool) -> Dict[str, Any]:
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("status") == "queued":
+                # A queued message has no stored inbox copy yet, so
+                # there is nothing to pin; pin it once it is delivered.
+                action = "pin" if pinned else "unpin"
+                raise ValueError(
+                    f"message {target!r} is still queued; {action} it once delivered"
+                )
+            wire_id = entry.get("wire_id")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError(
+                f"message {target!r} has no stored copy to pin"
+                if pinned
+                else f"message {target!r} has no stored copy to unpin"
+            )
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("this node has no inbox to pin in")
+        try:
+            _, changed = (
+                inbox.pin(wire_id) if pinned else inbox.unpin(wire_id)
+            )
+        except InboxError as exc:
+            raise ValueError(str(exc)) from exc
+        updated = self._inbox_annotated(entry)
+        # Set the flag explicitly both ways: clients keep the previous pin
+        # state when an update omits it, so an unpin must send false.
+        updated["pinned"] = pinned
+        # A retained message from a blocked sender stays hidden from the
+        # listing (see messages()); publishing its full text here would
+        # let a remote client read it back from /api/events by pinning
+        # its console id. The pin itself still succeeds — the response
+        # carries no text — and other tabs reconcile on their next poll.
+        blocklist = getattr(self.node, "blocklist", None)
+        hidden = (
+            blocklist is not None
+            and entry.get("direction") == "in"
+            and blocklist.is_blocked(entry.get("destination") or entry.get("peer"))
+        )
+        if not hidden:
+            self._publish_message_updated(updated)
+        state = {"id": target, "wire_id": wire_id}
+        if pinned:
+            state["already_pinned"] = not changed
+        else:
+            state["was_pinned"] = changed
+        return {"ok": True, "pinned" if pinned else "unpinned": state}
 
     def _remove_history_entry(
         self, target: int, removed: Dict[str, Any], *, publish_unread: bool
@@ -4089,7 +4335,9 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
-    def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def messages(
+        self, limit: int = 200, *, strict_pins: bool = False
+    ) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -4128,8 +4376,24 @@ class WebBridge:
                 )
             ]
         by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids(strict=strict_pins)
+        groups = getattr(self.node, "groups", None)
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None:
+            rosters = pinned_rosters(
+                groups,
+                {
+                    str(item.get("group"))
+                    for item in items
+                    if isinstance(item.get("group"), str) and item.get("group")
+                },
+            )
         return [
-            self._with_inbox_reactions(dict(item), by_target) for item in items
+            self._with_inbox_pinned(
+                self._with_inbox_reactions(dict(item), by_target, rosters),
+                pinned_ids,
+            )
+            for item in items
         ]
 
     def received_file(
@@ -4268,7 +4532,10 @@ class WebBridge:
         return by_target
 
     def _with_inbox_reactions(
-        self, message: Dict[str, Any], by_target: Dict[str, List[Dict[str, Any]]]
+        self,
+        message: Dict[str, Any],
+        by_target: Dict[str, List[Dict[str, Any]]],
+        rosters: Optional[Dict[str, Optional[Set[str]]]] = None,
     ) -> Dict[str, Any]:
         """Overlay the node inbox's reaction state on one history entry.
 
@@ -4281,32 +4548,125 @@ class WebBridge:
         the history shows the current state.  A live push to an already
         open console tab for a CLI-made reaction is still a follow-up:
         this reconciles reads, not the SSE stream.
+
+        *rosters* maps group ids to their pinned member sets (``None``
+        when nothing is pinned): a stored reaction from a reactor who
+        is not on the group's roster — stored before its target's copy
+        arrived, or left behind when an authorization recheck or its
+        cleanup failed — is dropped here, whether it was seeded live
+        or overlaid from the inbox, so it is never displayed.
         """
         wire_id = message.get("wire_id")
-        if not wire_id:
-            return message
-        stored = by_target.get(wire_id)
-        if not stored:
-            return message
-        merged: Dict[str, Dict[str, Any]] = {
-            str(item.get("reactor")): dict(item)
-            for item in message.get("reactions") or []
-            if item.get("reactor")
-        }
-        for entry in stored:
-            reactor = str(entry.get("destination") or "")
-            if not reactor:
-                continue
-            if entry.get("reaction"):
-                merged[reactor] = {
-                    "reactor": reactor,
-                    "name": str(entry.get("from") or "unknown"),
-                    "reaction": entry["reaction"],
+        if wire_id:
+            stored = by_target.get(wire_id)
+            if stored:
+                merged: Dict[str, Dict[str, Any]] = {
+                    str(item.get("reactor")): dict(item)
+                    for item in message.get("reactions") or []
+                    if item.get("reactor")
                 }
-            else:
-                merged.pop(reactor, None)
-        message["reactions"] = list(merged.values())
+                for entry in stored:
+                    reactor = str(entry.get("destination") or "")
+                    if not reactor:
+                        continue
+                    if entry.get("reaction"):
+                        merged[reactor] = {
+                            "reactor": reactor,
+                            "name": str(entry.get("from") or "unknown"),
+                            "reaction": entry["reaction"],
+                        }
+                    else:
+                        merged.pop(reactor, None)
+                message["reactions"] = list(merged.values())
+        group_id = message.get("group")
+        if (
+            isinstance(group_id, str)
+            and group_id
+            and rosters is not None
+            and message.get("reactions")
+        ):
+            message["reactions"] = visible_reactions(
+                message["reactions"], rosters.get(group_id)
+            )
         return message
+
+    def _inbox_pinned_ids(self, *, strict: bool = False) -> Set[str]:
+        """Wire ids of pinned inbox messages, reloaded once per read.
+
+        One reload serves the whole listing, like
+        :meth:`_inbox_reactions_by_target`: the inbox is the durable
+        authority for pins, so a pin made from another process (``tau
+        pin`` from the CLI) shows up on the next read.
+
+        A read failure is logged and treated as no pin overlay for the
+        live stream; with ``strict`` it propagates, so the pinned view
+        reports the error instead of an empty pin list.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return set()
+        try:
+            pinned = inbox.list_messages(
+                pinned_only=True, direction=None, limit=None
+            )
+        except Exception:
+            if strict:
+                raise
+            log.warning("Could not read inbox pins", exc_info=True)
+            return set()
+        return {
+            str(entry.get("id"))
+            for entry in pinned
+            if isinstance(entry.get("id"), str) and entry.get("id")
+        }
+
+    def _with_inbox_pinned(
+        self, message: Dict[str, Any], pinned_ids: Set[str]
+    ) -> Dict[str, Any]:
+        """Mark one history entry pinned when the inbox has it pinned.
+
+        Only pinned entries carry the flag — an absent ``pinned`` reads
+        as unpinned, the same way an absent ``reactions`` reads as no
+        reactions.  A live push to an already open console tab for a
+        CLI-made pin is still a follow-up: this reconciles reads, not
+        the SSE stream.
+        """
+        wire_id = message.get("wire_id")
+        if wire_id and wire_id in pinned_ids:
+            message["pinned"] = True
+        return message
+
+    def _inbox_annotated(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy *message* with the inbox's reaction and pin overlays.
+
+        The inbox is the durable authority for both, so a copy annotated
+        here agrees with what :meth:`messages` serves — a pin made from
+        the CLI, or a reaction recorded by the node, rides on the event
+        too instead of being silently dropped from the payload.
+        """
+        by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids()
+        groups = getattr(self.node, "groups", None)
+        group_id = message.get("group")
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None and isinstance(group_id, str) and group_id:
+            rosters = pinned_rosters(groups, [group_id])
+        return self._with_inbox_pinned(
+            self._with_inbox_reactions(dict(message), by_target, rosters),
+            pinned_ids,
+        )
+
+    def _publish_message_updated(self, message: Dict[str, Any]) -> None:
+        """Publish a ``message_updated`` carrying the inbox's overlays.
+
+        Every update goes through here so the reaction and pin state the
+        inbox holds rides on the event too.  Otherwise a receipt or a
+        reaction would replace a pinned bubble with a payload that reads
+        as unpinned in every open tab.
+        """
+        self.bus.publish(
+            {"type": "message_updated", "message": self._inbox_annotated(message)}
+        )
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
@@ -4655,8 +5015,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
             if path == "/api/messages":
-                limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
-                self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                pinned_only = query.get("pinned") == ["1"]
+                # A pinned view spans the whole console log, not just
+                # the newest 200 the live feed shows: a pin from long
+                # ago is exactly the one worth finding.
+                limit = (
+                    -1
+                    if pinned_only
+                    else _int_param(query, "limit", default=200, minimum=1, maximum=500)
+                )
+                items = self.bridge.messages(limit, strict_pins=pinned_only)
+                if pinned_only:
+                    items = [item for item in items if item.get("pinned")]
+                self._send_json({"messages": items}, head_only)
                 return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
@@ -5023,6 +5394,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/retract":
                 self._handle_retract_message(body, head_only)
+                return
+            if path == "/api/messages/pin":
+                self._handle_pin_message(body, head_only, pinned=True)
+                return
+            if path == "/api/messages/unpin":
+                self._handle_pin_message(body, head_only, pinned=False)
                 return
             if path == "/api/messages/read":
                 peer = body.get("peer")
@@ -5834,7 +6211,14 @@ class _WebHandler(BaseHTTPRequestHandler):
             result = self.bridge.react(
                 target.strip(), reaction, clear=clear, timeout=timeout
             )
-        except (ValueError, ProtocolError) as exc:
+        except ValueError as exc:
+            # GroupStore.find raises ValueError for both an unknown
+            # group and an ambiguous query; only the unknown case is
+            # a 404, the ambiguous one stays a 400.
+            status = 404 if str(exc).startswith("unknown group:") else 400
+            self._send_json({"error": {"message": str(exc)}}, head_only, status)
+            return
+        except ProtocolError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         except PeerError as exc:
@@ -5946,6 +6330,29 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         except OSError as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+    def _handle_pin_message(
+        self, body: Dict[str, Any], head_only: bool, *, pinned: bool
+    ) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = (
+                self.bridge.pin_message(target)
+                if pinned
+                else self.bridge.unpin_message(target)
+            )
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
 

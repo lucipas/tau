@@ -1930,6 +1930,179 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "alice" in out
 
 
+def test_messages_hides_non_member_group_reaction(tmp_path, capsys):
+    """A stored reaction from a non-member never prints on a group
+    message, even when the authorization recheck or its cleanup failed
+    and left it in the inbox (CodeRabbit round-11 follow-up).
+
+    The copy is appended directly and the reaction stored directly —
+    the way a copy imported by another process lands, with no
+    arrival purge running in this process — so the listing's roster
+    filter is the only thing standing between the stored reaction
+    and the display.  A member's reaction on the same message still
+    prints.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    member = RNS.Identity()
+    member_hash = destination_hash(member)
+    outsider = RNS.Identity()
+    outsider_hash = destination_hash(outsider)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.upsert(member_hash, member.get_public_key(), name="carol", now=100.0)
+    registry.upsert(
+        outsider_hash, outsider.get_public_key(), name="mallory", now=100.0
+    )
+    registry.save()
+    groups = GroupStore(config.groups_path)
+    members = [sender_hash.hex(), member_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    assert groups.record(
+        group_id,
+        "crew",
+        members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-g1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": outsider_hash.hex(),
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": member_hash.hex(),
+            "from": "carol",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-2",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "crew hello" in out
+    assert "👍 carol" in out
+    assert "👎" not in out
+    assert "mallory" not in out
+
+
+def test_messages_hides_all_reactions_when_no_roster_pinned(tmp_path, capsys):
+    """A group copy imported without its roster shows no reactions at
+    all — not even a member's — until the roster pins (CodeRabbit
+    Major, follow-up to the round-16 fail-closed rule).  With no
+    roster there is no membership to verify, so the listing hides
+    every stored reaction instead of trusting them; once the group
+    pins, the member's reaction prints and the outsider's stays
+    hidden.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    member = RNS.Identity()
+    member_hash = destination_hash(member)
+    outsider = RNS.Identity()
+    outsider_hash = destination_hash(outsider)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.upsert(member_hash, member.get_public_key(), name="carol", now=100.0)
+    registry.upsert(
+        outsider_hash, outsider.get_public_key(), name="mallory", now=100.0
+    )
+    registry.save()
+    members = [sender_hash.hex(), member_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-g1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": outsider_hash.hex(),
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": member_hash.hex(),
+            "from": "carol",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-2",
+        }
+    )
+    # No roster pinned: nothing prints, not even the member's.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "crew hello" in out
+    assert "👍" not in out
+    assert "👎" not in out
+    # Pin the roster: the member's reaction prints, the outsider's
+    # stays hidden.
+    groups = GroupStore(config.groups_path)
+    assert groups.record(
+        group_id,
+        "crew",
+        members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "👍 carol" in out
+    assert "👎" not in out
+    assert "mallory" not in out
+
+
 def test_messages_kind_filter_and_tag(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
@@ -5230,6 +5403,166 @@ def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
     assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
 
 
+def _seed_group_message(tmp_path):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+        }
+    )
+    return data_dir, sender_hash
+
+
+def test_react_fans_out_to_group_members(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "reacted 👍 to the group message" in out
+    assert "delivered to alice" in out
+    assert "delivered to bob" in out
+    node = _FakeReactNode.instances[0]
+    assert node.sent == []
+    # The author and send time of the reacted-to copy travel with the
+    # fan-out, so each member can resolve its own copy.
+    assert node.group_sent == [
+        ("ab" * 16, "g-1", "👍", sender_hash.hex(), 12.0)
+    ]
+
+
+def test_react_to_own_group_message_uses_local_identity(tmp_path, capsys, monkeypatch):
+    # CodeRabbit Major: an outbound group message names no single
+    # destination, so cmd_react refused it ("no known sender") and
+    # the signed payload would have carried an empty target_author.
+    # The author of your own group message is this node.
+    data_dir, _ = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+            "leg_ids": ["g-1", "g-2"],
+            "direction": "out",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    node = _FakeReactNode.instances[0]
+    assert node.group_sent == [
+        ("ab" * 16, "g-1", "👍", _FakeReactNode.destination_hexhash, 12.0)
+    ]
+
+
+def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "delivered": True,
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "ok": False,
+                "error": "no route to peer",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == cli._EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "delivered to alice" in out
+    assert "failed for bob: no route to peer" in out
+
+
+def test_react_group_strips_terminal_escapes_from_leg_errors(
+    tmp_path, capsys, monkeypatch
+):
+    # A failed leg's error can carry a peer's text; escapes in it must
+    # never reach the operator's terminal.
+    data_dir, _ = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    monkeypatch.setattr(
+        _FakeReactNode,
+        "group_results",
+        [
+            {
+                "to": "aa" * 16,
+                "to_name": "alice",
+                "delivered": True,
+                "id": "r-group-1",
+            },
+            {
+                "to": "bb" * 16,
+                "to_name": "bob",
+                "ok": False,
+                "error": "\x1b[31mrefused\x1b[0m",
+                "id": "r-group-1",
+            },
+        ],
+    )
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == cli._EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "failed for bob: refused" in out
+
+
+def test_react_group_json_and_clear(tmp_path, capsys, monkeypatch):
+    data_dir, sender_hash = _seed_group_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["react", "--data-dir", str(data_dir), "g-1", "--clear", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "g-1"
+    assert payload["group"] == "ab" * 16
+    assert payload["cleared"] is True
+    assert payload["reaction"] == ""
+    assert len(payload["results"]) == 2
+    assert _FakeReactNode.instances[0].group_sent == [
+        ("ab" * 16, "g-1", "", sender_hash.hex(), 12.0)
+    ]
+
+
 def _seed_sent_message(tmp_path):
     data_dir = tmp_path / "node"
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
@@ -5589,14 +5922,34 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
 
 
+class _FakeGroupStore:
+    """Stand-in for GroupStore.get: the seeded group only."""
+
+    def get(self, group_id):
+        if group_id == "ab" * 16:
+            return {
+                "id": "ab" * 16,
+                "name": "crew",
+                "members": ["aa" * 16, "bb" * 16],
+                "creator": "aa" * 16,
+            }
+        return None
+
+
 class _FakeReactNode:
     instances = []
+    # Tests may override the fan-out results (monkeypatch restores it).
+    group_results = None
+    # The local node's identity hash, as TauNode.destination_hexhash.
+    destination_hexhash = "ef" * 16
 
     def __init__(self, config, name=None):
         self.config = config
         self.sent = []
+        self.group_sent = []
         self.edited = []
         self.started = False
+        self.groups = _FakeGroupStore()
         type(self).instances.append(self)
 
     def start(self):
@@ -5610,6 +5963,51 @@ class _FakeReactNode:
     ):
         self.sent.append((target, message_id, reaction))
         return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
+
+    def send_group_reaction(
+        self,
+        group,
+        message_id,
+        reaction,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_author=None,
+        target_sent_at=None,
+    ):
+        # The real node takes a group record and returns its id; mirror
+        # that so the fan-out report reads the id, not the record.
+        group_id = group["id"] if isinstance(group, dict) else group
+        self.group_sent.append(
+            (group_id, message_id, reaction, target_author, target_sent_at)
+        )
+        results = type(self).group_results
+        if results is None:
+            results = [
+                {
+                    "to": "aa" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "r-group-1",
+                },
+                {
+                    "to": "bb" * 16,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "r-group-1",
+                },
+            ]
+        return {
+            "ok": all(r.get("delivered") for r in results),
+            "v": 1,
+            "group": group_id,
+            "name": "crew",
+            "target": message_id,
+            "reaction": reaction,
+            "cleared": not reaction,
+            "id": "r-group-1",
+            "results": results,
+        }
 
     def send_edit(
         self, target, message_id, text, *, timeout=20.0, discover_timeout=None
