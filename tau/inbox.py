@@ -514,7 +514,8 @@ class Inbox:
 
     def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
         self.path = Path(path).expanduser() if path is not None else None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._txn_depth = 0
         self._messages: List[Dict[str, Any]] = []
         self._reactions: List[Dict[str, Any]] = []
         self._read_cursors: Dict[str, Dict[str, Any]] = {}
@@ -630,22 +631,43 @@ class Inbox:
         state, and then applies its change, so a process never
         overwrites another's entries.  Mirrors
         :meth:`Mailbox._transaction`.
+
+        Nested transactions join the outer one (the lock is
+        reentrant, and the depth counter skips a second flock and
+        reload): a handler that must check and store atomically —
+        the reaction handler's final roster check and persist — can
+        hold one transaction across both, so no other process can
+        import the target between the check and the store.  A second
+        flock from this process would block on the first.
         """
-        with self._lock:
-            if self.path is None or fcntl is None:
-                if self.path is not None:
-                    self._load()
+        self._lock.acquire()
+        try:
+            if self._txn_depth:
+                # Nested transaction: the outer one already holds the
+                # flock and reloaded state, so just join it.  (A second
+                # flock from this process would block on the first.)
                 yield
                 return
-            lock_path = self.path.with_name(self.path.name + ".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    self._load()
+            self._txn_depth = 1
+            try:
+                if self.path is None or fcntl is None:
+                    if self.path is not None:
+                        self._load()
                     yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    return
+                lock_path = self.path.with_name(self.path.name + ".lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(lock_path, "a") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        self._load()
+                        yield
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._txn_depth = 0
+        finally:
+            self._lock.release()
 
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record one message, dropping the oldest past its direction's cap."""

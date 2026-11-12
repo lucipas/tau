@@ -1554,14 +1554,13 @@ def test_group_reaction_rechecks_after_storing_unresolved(tmp_path, monkeypatch)
 def test_group_reaction_voided_when_message_imported_mid_handler(
     tmp_path, monkeypatch
 ):
-    # CodeRabbit follow-up (node.py:1850): the reload fixes the
-    # stale-cache case, but a copy can still be imported after
-    # resolve() misses it and before record_reaction() stores the
-    # reaction — the storage transaction reloads the message but
-    # does not recheck the roster.  The handler rechecks after
-    # storing and voids a non-member's reaction on the imported
-    # copy.  The import is forced inside record_reaction to make
-    # the race deterministic.
+    # CodeRabbit follow-up (node.py:1850): a copy can be imported
+    # after the reaction is stored but before the post-store recheck
+    # runs — the handler rechecks after storing and voids a
+    # non-member's reaction on the imported copy.  (The final check
+    # and the persist now hold one transaction, so the copy can no
+    # longer land between them — the import is forced between the
+    # store and the recheck instead, via the recheck's reload.)
     from tau.inbox import Inbox
 
     node = make_node(tmp_path)
@@ -1586,14 +1585,17 @@ def test_group_reaction_voided_when_message_imported_mid_handler(
         "received_at": 101.0,
         "id": "local-copy-1",
     }
-    real_record = node.inbox.record_reaction
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
 
-    def _import_then_record(record):
-        other = Inbox(node.inbox.path)
-        other.append(copy)
-        return real_record(record)
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
 
-    monkeypatch.setattr(node.inbox, "record_reaction", _import_then_record)
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
     response = call_handler(
         node._handle_reaction,
         signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
@@ -1684,9 +1686,10 @@ def test_group_reaction_final_check_refuses_when_copy_lands_before_store(
 def test_group_reaction_final_check_storage_failure_stores_nothing(
     tmp_path, monkeypatch
 ):
-    # The final pre-store check reloads; if that reload fails, the
-    # reaction is refused with storage_failed and nothing is stored
-    # — it is never stored against a stale view of the inbox.
+    # The atomic final check + store reloads at the transaction
+    # entry; if that read fails, the reaction is refused with
+    # storage_failed and nothing is stored — it is never stored
+    # against a stale view of the inbox.
     from tau.inbox import InboxError
 
     node = make_node(tmp_path)
@@ -1694,16 +1697,16 @@ def test_group_reaction_final_check_storage_failure_stores_nothing(
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     reactor = RNS.Identity()
-    real_reload = node.inbox.reload
+    real_load = node.inbox._load
     calls = {"n": 0}
 
-    def flaky_reload(*args, **kwargs):
+    def flaky_load(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
             raise InboxError("boom")
-        return real_reload(*args, **kwargs)
+        return real_load(*args, **kwargs)
 
-    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    monkeypatch.setattr(node.inbox, "_load", flaky_load)
     response = call_handler(
         node._handle_reaction,
         signed_reaction(reactor, "unknown-target", "👍", "react-1"),
@@ -1749,23 +1752,22 @@ def test_group_reaction_recheck_reload_failure_is_storage_failed(
         "received_at": 101.0,
         "id": "local-copy-1",
     }
-    real_record = node.inbox.record_reaction
     real_reload = node.inbox.reload
-    state = {"fail_recheck": False}
-
-    def _import_then_record(record):
-        other = Inbox(node.inbox.path)
-        other.append(copy)
-        result = real_record(record)
-        state["fail_recheck"] = True
-        return result
+    calls = {"n": 0}
 
     def flaky_reload(*args, **kwargs):
-        if state["fail_recheck"]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck; the
+            # recheck's reload then fails, so it cannot verify it.
+            # (The import happens here, not inside the store: the
+            # final check and the persist hold one transaction, so
+            # no other process can commit between them.)
+            other = Inbox(node.inbox.path)
+            other.append(copy)
             raise InboxError("boom")
         return real_reload(*args, **kwargs)
 
-    monkeypatch.setattr(node.inbox, "record_reaction", _import_then_record)
     monkeypatch.setattr(node.inbox, "reload", flaky_reload)
     response = call_handler(
         node._handle_reaction,
@@ -1809,18 +1811,26 @@ def test_group_reaction_recheck_tombstone_failure_is_storage_failed(
         "id": "local-copy-1",
     }
     real_record = node.inbox.record_reaction
-    imported = {"done": False}
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
 
-    def _import_then_record(record):
-        if not imported["done"]:
-            other = Inbox(node.inbox.path)
-            other.append(copy)
-            imported["done"] = True
+    def _fail_tombstone(record):
         if record.get("reaction") == "":
             raise OSError("disk full")
         return real_record(record)
 
-    monkeypatch.setattr(node.inbox, "record_reaction", _import_then_record)
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck (see
+            # the reload-failure test: the import cannot happen
+            # inside the store, which holds the transaction).
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "record_reaction", _fail_tombstone)
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
     response = call_handler(
         node._handle_reaction,
         signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
@@ -1864,18 +1874,25 @@ def test_group_reaction_retry_voids_orphan_after_failed_recheck(
         "id": "local-copy-1",
     }
     real_record = node.inbox.record_reaction
-    imported = {"done": False}
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
 
-    def _import_then_record(record):
-        if not imported["done"]:
-            other = Inbox(node.inbox.path)
-            other.append(copy)
-            imported["done"] = True
+    def _fail_tombstone(record):
         if record.get("reaction") == "":
             raise OSError("disk full")
         return real_record(record)
 
-    monkeypatch.setattr(node.inbox, "record_reaction", _import_then_record)
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The copy lands between the store and the recheck (see
+            # the reload-failure test).
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "record_reaction", _fail_tombstone)
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
     payload = signed_reaction(
         reactor, "local-copy-1", "👍", "react-1", sent_at=200.0
     )
@@ -1888,6 +1905,141 @@ def test_group_reaction_retry_voids_orphan_after_failed_recheck(
     assert second["ok"] is False
     assert second["error"]["code"] == "not_a_member"
     assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_not_published_when_recheck_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit round-11: publication must wait for authorization.
+    # A reaction whose post-store recheck fails is stored (the store
+    # already ran) but never fanned out to the live console — the
+    # sender retries instead of the console showing a reaction that
+    # was never verified.  The copy lands between the store and the
+    # recheck (via the recheck's reload, as in the reload-failure
+    # test); the recheck's reload then fails.
+    from tau.inbox import Inbox, InboxError
+
+    published = []
+    node = make_node(tmp_path, on_reaction=published.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_reload = node.inbox.reload
+    calls = {"n": 0}
+
+    def flaky_reload(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            other = Inbox(node.inbox.path)
+            other.append(copy)
+            raise InboxError("boom")
+        return real_reload(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "reload", flaky_reload)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "storage_failed"
+    assert published == []
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+
+
+def test_group_reaction_published_after_authorization(tmp_path):
+    # Control for the deferred publish: a member's reaction is
+    # fanned out live once authorization has completed.
+    published = []
+    node = make_node(tmp_path, on_reaction=published.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    member = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, member],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(published) == 1
+    assert published[0]["reaction"] == "👍"
+    assert published[0]["target"] == "local-copy-1"
+
+
+def test_group_reaction_final_check_and_store_hold_one_transaction(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit round-11: the final check and the persist hold one
+    # inbox transaction, so no other process can import the target
+    # between them.  Prove it by having each lookup attempt a
+    # non-blocking flock on the inbox lock file: the initial lookup
+    # and the recheck run outside any transaction (probe succeeds),
+    # but the final check runs inside the transaction that also
+    # stores the reaction (probe fails — this process already holds
+    # the flock).  In the old code the final check ran outside any
+    # transaction too, so every probe succeeded.
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only lock
+        pytest.skip("fcntl is unavailable")
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    reactor = RNS.Identity()
+    real_resolve = node.inbox.resolve
+    probes = []
+
+    def _resolve_and_probe(*args, **kwargs):
+        lock_path = node.inbox.path.with_name(node.inbox.path.name + ".lock")
+        with open(lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                probes.append(True)
+            else:
+                probes.append(False)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(node.inbox, "resolve", _resolve_and_probe)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "unknown-target", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert probes == [False, True, False]
 
 
 def test_group_reaction_purged_when_message_arrives_after_it(tmp_path):

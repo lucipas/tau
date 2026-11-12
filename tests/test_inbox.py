@@ -1568,6 +1568,23 @@ def test_reload_caps_each_direction(tmp_path, monkeypatch):
     assert [e["id"] for e in entries] == ["out-2", "out-1", "in-3", "in-2"]
 
 
+def test_transaction_nests_without_deadlock(tmp_path):
+    # The transaction is reentrant (RLock + depth counter, mirroring
+    # Mailbox): a handler that must check and store atomically — the
+    # reaction handler's final roster check and persist — can hold
+    # one transaction across both, instead of deadlocking on the
+    # lock or the flock.  The inner append and resolve join the
+    # outer transaction; the outer persist still lands on disk.
+    inbox = Inbox(tmp_path / "inbox.json")
+    with inbox.transaction():
+        inbox.append(_record(id="nested-1"))
+        assert inbox.resolve("nested-1")["id"] == "nested-1"
+    assert inbox.resolve("nested-1")["id"] == "nested-1"
+    assert [e["id"] for e in Inbox(tmp_path / "inbox.json").list_messages()] == [
+        "nested-1"
+    ]
+
+
 def test_reload_runs_under_the_cross_process_lock(tmp_path):
     # CodeRabbit Major: reload() read inbox.json and wrote the purged
     # snapshot back without the cross-process flock — another process

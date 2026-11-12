@@ -1360,7 +1360,13 @@ class TauNode:
         """
         self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
 
-    def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
+    def _record_reaction(
+        self,
+        record: Dict[str, Any],
+        *,
+        strict: bool = False,
+        publish: bool = True,
+    ) -> None:
         """Persist a reaction and fan it out.
 
         A reaction whose target this node has never seen is still
@@ -1375,6 +1381,11 @@ class TauNode:
         local record is logged and delivery still succeeds — the
         sender's own copy is best-effort; the peer already accepted
         the reaction.
+
+        With ``publish=False`` (the receive handler) the reaction is
+        persisted but not fanned out yet: the handler publishes it
+        only once authorization has completed, so a reaction the
+        recheck refuses or cannot verify is never published live.
         """
         try:
             self.inbox.record_reaction(record)
@@ -1382,7 +1393,7 @@ class TauNode:
             log.warning("Could not record reaction", exc_info=True)
             if strict:
                 raise
-        if self.on_reaction is not None:
+        if publish and self.on_reaction is not None:
             try:
                 self.on_reaction(record)
             except Exception:  # pragma: no cover - user callback
@@ -2052,43 +2063,6 @@ class TauNode:
                         "not_a_member",
                         "sender is not a group member",
                     )
-            if resolved is None and reaction.get("group") is None:
-                # Final authorization look immediately before
-                # storing: the target may have landed after the
-                # lookup above (a cross-process import), and the
-                # store below would otherwise publish the reaction
-                # before the post-store recheck runs.  Reload and
-                # resolve once more against the current target; a
-                # group message the reactor is not a member of is
-                # refused here, before anything is stored or
-                # published.  A failed reload fails closed with
-                # storage_failed, so nothing is stored against a
-                # stale view.  The post-store recheck below stays
-                # as the backstop for the narrower window between
-                # this check and the persist.
-                try:
-                    self.inbox.reload()
-                except InboxError as exc:
-                    return response_error(
-                        "storage_failed", f"could not read inbox: {exc}"
-                    )
-                try:
-                    final = self.inbox.resolve(target_id)
-                except ValueError:
-                    final = None
-                if final is not None and final.get("kind") == "group":
-                    try:
-                        pinned = self.groups.find(final["group"])
-                    except ValueError:
-                        pinned = None
-                    if pinned is not None and caller_hash not in (
-                        pinned.get("members") or []
-                    ):
-                        self._void_stored_reaction(target_id, caller_hash)
-                        return response_error(
-                            "not_a_member",
-                            "sender is not a group member",
-                        )
             record = {
                 "target": target_id,
                 "reaction": reaction["reaction"],
@@ -2107,15 +2081,75 @@ class TauNode:
                 record["group"] = reaction["group"]
                 record["target_author"] = reaction.get("target_author")
                 record["target_sent_at"] = reaction.get("target_sent_at")
-            try:
-                self._record_reaction(record, strict=True)
-            except OSError as exc:
-                # Do not acknowledge a reaction that was not stored, and
-                # do not mark its id seen — the sender can retry with the
-                # same id and it will be recorded then.
-                return response_error(
-                    "storage_failed", f"could not store reaction: {exc}"
-                )
+            if resolved is None and reaction.get("group") is None:
+                # Final authorization AND storage under ONE inbox
+                # transaction: the lookup, the roster check and the
+                # persist hold the cross-process flock, so no other
+                # process can import the target between the check
+                # and the store.  Previously the check ran, the
+                # transaction was released, and a copy imported in
+                # between was stored before the post-store recheck
+                # could void it — and a failed recheck left the
+                # non-member's reaction stored and visible, cleaned
+                # up only if the sender happened to retry.  The
+                # transaction reloads at entry, so the resolve reads
+                # the current on-disk state; a failed entry reload
+                # fails closed with storage_failed and nothing is
+                # stored.  The post-store recheck below stays as the
+                # backstop for a copy that lands after the store.
+                # The reaction is persisted here but NOT published:
+                # it is fanned out only after the recheck passes
+                # (see below), so an unauthorized reaction never
+                # reaches the live console.
+                authorized = True
+                try:
+                    with self.inbox.transaction():
+                        try:
+                            final = self.inbox.resolve(target_id)
+                        except ValueError:
+                            final = None
+                        if final is not None and final.get("kind") == "group":
+                            try:
+                                pinned = self.groups.find(final["group"])
+                            except ValueError:
+                                pinned = None
+                            if pinned is not None and caller_hash not in (
+                                pinned.get("members") or []
+                            ):
+                                authorized = False
+                        if authorized:
+                            try:
+                                self.inbox.record_reaction(record)
+                            except OSError as exc:
+                                return response_error(
+                                    "storage_failed",
+                                    f"could not store reaction: {exc}",
+                                )
+                except InboxError as exc:
+                    return response_error(
+                        "storage_failed", f"could not read inbox: {exc}"
+                    )
+                if not authorized:
+                    # Refused before anything was stored; void any
+                    # orphan an earlier attempt left behind (its
+                    # recheck failed), after the transaction so the
+                    # fan-out does not run under the flock.
+                    self._void_stored_reaction(target_id, caller_hash)
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
+            else:
+                try:
+                    self._record_reaction(record, strict=True, publish=False)
+                except OSError as exc:
+                    # Do not acknowledge a reaction that was not stored, and
+                    # do not mark its id seen — the sender can retry with the
+                    # same id and it will be recorded then.
+                    return response_error(
+                        "storage_failed", f"could not store reaction: {exc}"
+                    )
+            recheck_voided = False
             if resolved is None and reaction.get("group") is not None:
                 # The lookup above can race the message's arrival:
                 # the copy may have landed after find_group_message
@@ -2154,24 +2188,26 @@ class TauNode:
                                 exc_info=True,
                             )
             if resolved is None:
-                # A second authorization look after storing: another
-                # process can import the target between the final
-                # pre-store check and record_reaction(), and the
-                # storage transaction reloads the message but does
-                # not recheck the roster — so a reaction naming an
-                # imported copy with no group context would surface
-                # without any roster check ever running.  Reload and
-                # resolve the stored target again; if it is now a
-                # group message and the reactor is not on its roster,
-                # void the reaction just stored with a tombstone, so
-                # a replay cannot resurrect it.  A failed recheck
+                # A second authorization look after storing: the
+                # target can still land after the atomic final
+                # check and persist above (the store is atomic with
+                # the check, not with a later arrival), so a
+                # reaction naming an imported copy with no group
+                # context would surface without any roster check
+                # ever running.  Reload and resolve the stored
+                # target again; if it is now a group message and
+                # the reactor is not on its roster, void the
+                # reaction just stored with a tombstone, so a
+                # replay cannot resurrect it.  A failed recheck
                 # fails closed with storage_failed instead of
                 # acknowledging a reaction that could not be
                 # verified: the sender retries, and the retry's
                 # refusal voids the orphan left behind (see
                 # _void_stored_reaction), so the reaction does not
                 # stay displayed.  The id is not marked seen, so
-                # the retry is processed, not deduped away.
+                # the retry is processed, not deduped away.  The
+                # reaction was not published live yet (see below),
+                # so a failed recheck also never publishes it.
                 try:
                     self.inbox.reload()
                 except InboxError as exc:
@@ -2228,7 +2264,21 @@ class TauNode:
                                 # bridge cached the reaction when it
                                 # was stored, and a void that never
                                 # reaches it would still display.
+                                # (With the deferred publish below,
+                                # the reaction itself was never
+                                # fanned out, so this only clears
+                                # state the bridge may have seeded
+                                # from the inbox.)
                                 self._publish_reaction(tombstone)
+                                recheck_voided = True
+            # Publish only once authorization has completed: the
+            # reaction was persisted above but not fanned out, so a
+            # reaction the recheck refused or could not verify never
+            # reaches the live console.  A reaction the recheck
+            # voided is not published here — only its tombstone
+            # was fanned out, above.
+            if not recheck_voided:
+                self._publish_reaction(record)
             if seen_key:
                 self.mailbox.mark_seen(seen_key)
             log.info(
