@@ -54,16 +54,22 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-try:  # POSIX only; the cross-process lock is a no-op without it.
+try:  # POSIX only; Windows locks through msvcrt instead (see below).
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the lock uses msvcrt there, as identity.py does.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 from .protocol import (
     MAX_GROUP_MEMBERS,
@@ -299,24 +305,46 @@ class GroupStore:
         """Serialise a read-modify-write of the store across processes.
 
         Mirrors :meth:`Inbox._transaction`: each mutation takes an
-        exclusive ``flock`` on a sidecar lock file and reloads the
-        latest on-disk state first.
+        exclusive lock on a sidecar lock file and reloads the latest
+        on-disk state first, so a serving process and a CLI command
+        cannot interleave a load and a save.  The lock is ``flock``
+        on POSIX and ``msvcrt.locking`` on the first byte on Windows,
+        as :mod:`tau.ignored_groups` does — without it, a ``record()``
+        that loaded before a concurrent ``leave()`` could save after
+        it and silently drop the left marker, letting the next
+        message re-pin the group.
         """
         with self._lock:
-            if self.path is None or fcntl is None:
-                if self.path is not None:
-                    self._load()
+            if self.path is None:
+                yield
+                return
+            if fcntl is None and msvcrt is None:
+                # pragma: no cover - neither platform offers a
+                # cross-process lock; best effort only.
+                self._load()
                 yield
                 return
             lock_path = self.path.with_name(self.path.name + ".lock")
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            with open(lock_path, "a+") as handle:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:  # pragma: no cover - exercised on Windows
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(" ")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 try:
                     self._load()
                     yield
                 finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    else:  # pragma: no cover - exercised on Windows
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
     def create(
         self, name: str, members: List[str], *, created_by: str = ""

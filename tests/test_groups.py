@@ -8,6 +8,7 @@ store-and-forward outbox.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -389,6 +390,118 @@ def test_group_store_leave_removes_and_refuses_repin(tmp_path):
     left = reloaded.left_groups()
     assert [entry["id"] for entry in left] == [group["id"]]
     assert isinstance(left[0]["left_at"], float)
+
+
+def test_group_store_transaction_uses_msvcrt_when_fcntl_missing(
+    tmp_path, monkeypatch
+):
+    """Without fcntl (Windows) the store still takes a cross-process lock.
+
+    Regression test for the CodeRabbit Major on PR #265: with only the
+    per-instance lock, a serving process's ``record()`` could save
+    after a concurrent CLI ``leave()`` and drop the left marker, so
+    the next message re-pinned the group.
+    """
+    import tau.groups as groups_mod
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            calls.append(mode)
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert calls == [FakeMsvcrt.LK_LOCK, FakeMsvcrt.LK_UNLCK]
+    assert (tmp_path / "groups.json.lock").exists()
+
+
+def test_group_store_leave_marker_survives_concurrent_record(
+    tmp_path, monkeypatch
+):
+    """A record() racing a leave() cannot drop the left marker.
+
+    Two stores on one path stand in for the serving process and the
+    CLI.  With fcntl missing, a fake msvcrt backed by a real lock
+    serialises the transactions; every interleaving must end with
+    the group left and unpinnable.
+    """
+    import tau.groups as groups_mod
+
+    gate = threading.Lock()
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == FakeMsvcrt.LK_LOCK:
+                gate.acquire()
+            else:
+                gate.release()
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    group_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    )
+    server = GroupStore(tmp_path / "groups.json")
+    cli_store = GroupStore(tmp_path / "groups.json")
+    assert (
+        server.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+
+    def hammer_record():
+        for _ in range(25):
+            server.record(
+                group_id,
+                "theirs",
+                [OWN_HASH, OTHER_HASH, THIRD_HASH],
+                creator=OTHER_HASH,
+            )
+
+    def hammer_leave():
+        for _ in range(25):
+            cli_store.leave(group_id)
+
+    first = threading.Thread(target=hammer_record)
+    second = threading.Thread(target=hammer_leave)
+    first.start()
+    second.start()
+    first.join(timeout=30)
+    second.join(timeout=30)
+    assert not first.is_alive() and not second.is_alive()
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group_id) is None
+    assert reloaded.is_left(group_id) is True
+    assert (
+        reloaded.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
 
 
 def test_group_store_leave_unknown_and_rejoin_never_left(tmp_path):
