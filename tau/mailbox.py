@@ -1236,6 +1236,25 @@ class Mailbox:
             if self._sent.pop(message_id, None) is not None:
                 self.save()
 
+    def update_sent_text(
+        self, message_id: str, text: str, *, edited_at: Optional[float] = None
+    ) -> None:
+        """Replace a sent record's text after an applied edit.
+
+        ``tau messages --sent`` reads its text from the sent record, not
+        the inbox, so an edit that only rewrote the inbox copy would
+        leave the sender's own history showing the original text.  A
+        missing record (pruned since the send) is not an error.
+        """
+        with self._transaction():
+            record = self._sent.get(message_id)
+            if record is None:
+                return
+            record["text"] = normalize_message(text)
+            if edited_at is not None:
+                record["edited_at"] = float(edited_at)
+            self.save()
+
     def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
         """A copy of one sent record, or ``None`` when unknown."""
         with self._lock:

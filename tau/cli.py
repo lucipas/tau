@@ -4618,18 +4618,39 @@ def _retract_local_message(
     )
 
 
-def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send or a retraction.
+def _edit_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    text: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Edit one DM on the running node, for the local send server."""
+    return node.send_edit(
+        target,
+        message_id,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
 
-    The socket carries both, distinguished by ``op``: ``"send"`` (the
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send, a retraction, or an edit.
+
+    The socket carries all three, distinguished by ``op``: ``"send"`` (the
     default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"`` runs the
-    retraction on the serving node, so ``tau retract`` works while
-    ``tau serve`` holds the data directory.
+    :func:`_send_local_message`, while ``"retract"`` and ``"edit"`` run the
+    retraction and the edit on the serving node, so ``tau retract`` and
+    ``tau edit`` work while ``tau serve`` holds the data directory.
     """
     op = request.pop("op", "send")
     if op == "retract":
         return _retract_local_message(node, **request)
+    if op == "edit":
+        return _edit_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -4776,6 +4797,35 @@ def _retract_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _edit_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    text: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Edit through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="edit",
+            target=recipient,
+            message_id=message_id,
+            text=text,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-edit; retry the edit"
         ) from exc
 
 
@@ -6127,16 +6177,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "that message is still queued for delivery;"
             " use `tau outbox cancel` to stop it and send a new message instead"
         )
-    node = TauNode(config, name=config.name)
-    node.start()
-    try:
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: edit through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
         try:
-            response = node.send_edit(
+            response = _edit_via_running_node(
+                config,
                 author,
                 str(target["id"]),
                 cleaned,
-                timeout=float(getattr(args, "timeout", 20.0)),
-                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
             )
         except NodeError as exc:
             # Edits ride the live link only in v1 — there is no
@@ -6146,8 +6201,28 @@ def cmd_edit(args: argparse.Namespace) -> int:
                 f"could not deliver edit: {exc} "
                 "(edits need the peer online in v1)"
             ) from exc
-    finally:
-        node.stop()
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_edit(
+                    author,
+                    str(target["id"]),
+                    cleaned,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Edits ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver edit: {exc} "
+                    "(edits need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
 
     peer = registry.get(author)
     name = peer.display_name if peer is not None else target.get("from") or author

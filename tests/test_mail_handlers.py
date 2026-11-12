@@ -1948,6 +1948,86 @@ def test_send_edit_leaves_the_local_copy_when_the_receiver_did_not_apply(
     assert "edited_at" not in node.inbox.list_messages(direction="out")[0]
 
 
+def test_send_edit_updates_the_sent_record(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent(
+        "msg-1", to=destination_hash(peer_identity), text="typo here"
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": True, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is True
+    # ``tau messages --sent`` reads the mailbox, not the inbox: the sent
+    # record must carry the new text too.
+    sent = node.mailbox.sent_record("msg-1")
+    assert sent is not None
+    assert sent["text"] == "fixed here"
+    assert sent["edited_at"]
+
+
+def test_send_edit_leaves_the_sent_record_when_the_receiver_did_not_apply(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent(
+        "msg-1", to=destination_hash(peer_identity), text="typo here"
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": False, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is False
+    sent = node.mailbox.sent_record("msg-1")
+    assert sent is not None
+    assert sent["text"] == "typo here"
+    assert "edited_at" not in sent
+
+
 def test_collected_message_drops_expired_arrival(tmp_path):
     import time as _time
 

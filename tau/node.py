@@ -4236,6 +4236,15 @@ class TauNode:
             )
         except InboxError as exc:
             log.warning("Could not record sent edit: %s", exc)
+        # ``tau messages --sent`` reads the mailbox, not the inbox: the
+        # sent record needs the new text too, or the editor's own history
+        # keeps showing the original.
+        try:
+            self.mailbox.update_sent_text(
+                target_id, cleaned, edited_at=float(payload["sent_at"])
+            )
+        except MailboxError as exc:
+            log.warning("Could not update sent edit: %s", exc)
         return dict(response, id=edit_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:

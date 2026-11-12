@@ -413,6 +413,68 @@ def test_apply_edit_rejects_empty_text(tmp_path):
     assert inbox.list_messages()[0]["text"] == "keep me"
 
 
+def test_apply_edit_rejects_a_stale_edit_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="newer text", edited_at=200.0)
+    )
+
+    # An edit older than the stored one must not overwrite it, even
+    # when the caller's snapshot check already passed — the transaction
+    # re-checks after its reload.
+    assert (
+        inbox.apply_edit(
+            "msg-1", "older text", edited_at=100.0, newer_than_existing=True
+        )
+        is None
+    )
+    assert inbox.list_messages()[0]["text"] == "newer text"
+    assert inbox.list_messages()[0]["edited_at"] == 200.0
+
+    updated = inbox.apply_edit(
+        "msg-1", "newest text", edited_at=300.0, newer_than_existing=True
+    )
+    assert updated is not None
+    assert updated["text"] == "newest text"
+    assert updated["edited_at"] == 300.0
+
+
+def test_apply_edit_rechecks_direction_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="msg-1",
+            text="mine",
+            direction="out",
+            destination="ab" * 16,
+        )
+    )
+
+    # A record that is not inbound to the caller cannot be edited by
+    # them, even when the caller's snapshot said otherwise.
+    assert (
+        inbox.apply_edit(
+            "msg-1",
+            "not yours",
+            edited_at=42.0,
+            direction="in",
+            destination="ab" * 16,
+        )
+        is None
+    )
+    assert inbox.list_messages(direction="out")[0]["text"] == "mine"
+
+    updated = inbox.apply_edit(
+        "msg-1",
+        "fixed here",
+        edited_at=42.0,
+        direction="out",
+        destination="ab" * 16,
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+
+
 def test_edited_at_survives_reload(tmp_path):
     path = tmp_path / "inbox.json"
     inbox = Inbox(path)
