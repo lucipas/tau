@@ -1,8 +1,14 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
-import type { NodeInfo, Peer, SocialInfo, TauGroup } from "@/lib/types";
+import type {
+  ChangeGroupMembersResponse,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+} from "@/lib/types";
 import type { PeerInfoState } from "@/lib/use-tau";
 
 import { PeerSidebar } from "./peer-sidebar";
@@ -55,6 +61,14 @@ type SidebarOptions = {
   groups?: TauGroup[];
   onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
   onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  onAddGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
+  onRemoveGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
   node?: NodeInfo | null;
   social?: SocialInfo | null;
   blocks?: Record<string, { pending?: boolean; error?: string }>;
@@ -126,6 +140,8 @@ function renderSidebar(
       onSetAlias={onSetAlias}
       onCreateGroup={options.onCreateGroup}
       onDeleteGroup={options.onDeleteGroup}
+      onAddGroupMembers={options.onAddGroupMembers}
+      onRemoveGroupMembers={options.onRemoveGroupMembers}
     />,
   );
 }
@@ -427,6 +443,206 @@ describe("PeerSidebar group management", () => {
 
     expect(screen.queryByRole("button", { name: "+ new group" })).toBeNull();
     expect(screen.queryByRole("button", { name: "delete" })).toBeNull();
+  });
+
+  it("offers member changes only on groups this node created", () => {
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({ created_by_me: true }),
+        makeGroup({ id: "22".repeat(16), name: "theirs" }),
+      ],
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    expect(
+      screen.getAllByRole("button", { name: "members" }),
+    ).toHaveLength(1);
+  });
+
+  it("adds a picked peer to a group and closes the panel", async () => {
+    const successor = makeGroup({
+      id: "22".repeat(16),
+      members: [
+        { hash: "ab".repeat(16), name: "alice" },
+        { hash: "cd".repeat(16), name: "bob" },
+      ],
+    });
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+
+    expect(onAddGroupMembers).toHaveBeenCalledWith("11".repeat(16), [
+      "cd".repeat(16),
+    ]);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "add selected" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("removes a picked member from a group", async () => {
+    const successor = makeGroup({
+      id: "22".repeat(16),
+      members: [{ hash: "ab".repeat(16), name: "alice" }],
+    });
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "remove selected" }));
+
+    expect(onRemoveGroupMembers).toHaveBeenCalledWith("11".repeat(16), [
+      "cd".repeat(16),
+    ]);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "remove selected" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("shows a member-change error instead of closing the panel", async () => {
+    const onAddGroupMembers = vi.fn(async () => {
+      throw new Error("only the creator can change a group's members");
+    });
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+
+    await screen.findByText("only the creator can change a group's members");
+    expect(
+      screen.getByRole("button", { name: "add selected" }),
+    ).toBeTruthy();
+  });
+
+  it("does not let a finished change discard another group's editor", async () => {
+    let resolveAdd: (value: ChangeGroupMembersResponse) => void = () => {};
+    const pending = new Promise<ChangeGroupMembersResponse>((resolve) => {
+      resolveAdd = resolve;
+    });
+    const onAddGroupMembers = vi.fn(() => pending);
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+        makeGroup({
+          id: "22".repeat(16),
+          name: "other",
+          created_by_me: true,
+          members: [
+            { hash: "ab".repeat(16), name: "alice" },
+            { hash: "cd".repeat(16), name: "bob" },
+          ],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    // Open the first group's editor and start adding bob.
+    fireEvent.click(screen.getAllByRole("button", { name: "members" })[0]);
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+    expect(onAddGroupMembers).toHaveBeenCalledTimes(1);
+
+    // Switch to the other group's editor while the change is pending
+    // and pick bob for removal there.
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+
+    // The first change lands: the new editor keeps its selection and
+    // stays open.
+    await act(async () => {
+      resolveAdd({
+        ok: true,
+        group: makeGroup({ id: "33".repeat(16) }),
+        previous_id: "11".repeat(16),
+      });
+    });
+    expect(
+      screen.getByRole("button", { name: "remove selected" }),
+    ).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("checkbox", {
+          name: /bob/,
+        }) as HTMLInputElement
+      ).checked,
+    ).toBe(true);
   });
 });
 
