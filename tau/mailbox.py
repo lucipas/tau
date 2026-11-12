@@ -244,10 +244,28 @@ class OutboxEntry:
     # not-before time is the sender's instruction, not retry pacing.
     send_after: Optional[float] = None
     in_reply_to: Optional[Dict[str, Any]] = None
+    # Logical send time every copy of this message carries on the wire.
+    # A group fan-out records its shared send time here (see
+    # ``TauNode.send_group_message``), so a reaction can name the
+    # logical message by (group, author, sent_at) and every leg's copy
+    # resolves to it.  ``None`` means no logical time was recorded —
+    # the send had a single leg, or the entry predates this field —
+    # and the enqueue time is the send time.
+    sent_at: Optional[float] = None
 
     @property
     def to_hex(self) -> str:
         return self.to.hex()
+
+    @property
+    def wire_sent_at(self) -> float:
+        """Timestamp a retry or relay sealing stamps on this message.
+
+        The logical send time recorded at enqueue time, else the
+        enqueue time — which is the send time for a single-leg message
+        and for entries written before the field existed.
+        """
+        return self.sent_at if self.sent_at is not None else self.created_at
 
     @property
     def next_attempt_at(self) -> Optional[float]:
@@ -302,6 +320,7 @@ class OutboxEntry:
             "held_by": dict(self.held_by),
             "message_expires_at": self.message_expires_at,
             "send_after": self.send_after,
+            "sent_at": self.sent_at,
         }
         if self.group_id is not None:
             payload["group"] = {
@@ -407,6 +426,18 @@ class OutboxEntry:
                 send_after = None
             if send_after is not None and not math.isfinite(send_after):
                 send_after = None
+        sent_at = raw.get("sent_at")
+        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+            # An entry written before the field existed, or a corrupt
+            # value: the enqueue time is the send time (see wire_sent_at).
+            sent_at = None
+        else:
+            try:
+                sent_at = float(sent_at)
+            except (OverflowError, ValueError):
+                sent_at = None
+            if sent_at is not None and not math.isfinite(sent_at):
+                sent_at = None
         return cls(
             id=message_id,
             to=destination,
@@ -435,6 +466,7 @@ class OutboxEntry:
             group_members=group_members,
             message_expires_at=message_expires_at,
             send_after=send_after,
+            sent_at=sent_at,
             in_reply_to=in_reply_to,
         )
 
@@ -1074,6 +1106,7 @@ class Mailbox:
         group: Optional[Dict[str, Any]] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         send_after: Optional[float] = None,
+        sent_at: Optional[float] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -1086,6 +1119,11 @@ class Mailbox:
         message expiry, so a queued ephemeral message — and any sealed
         copy a holder deposits from it — is dropped at its deadline
         instead of lingering for the full TTL.
+
+        ``sent_at`` is the message's logical send time (epoch seconds):
+        the timestamp every copy carries on the wire.  A group fan-out
+        passes its shared send time so all legs agree; otherwise the
+        enqueue time is the send time.
         """
         if len(to) != _DESTINATION_BYTES:
             raise MailboxError("destination hash must be 16 bytes")
@@ -1158,6 +1196,16 @@ class Mailbox:
                 raise MailboxError(
                     "send_after leaves no delivery window before the mail TTL"
                 )
+        sent_at_value: Optional[float] = None
+        if sent_at is not None:
+            if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+                raise MailboxError("sent_at must be a finite number")
+            try:
+                sent_at_value = float(sent_at)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError("sent_at must be a finite number") from exc
+            if not math.isfinite(sent_at_value):
+                raise MailboxError("sent_at must be a finite number")
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -1196,6 +1244,7 @@ class Mailbox:
                 group_members=group_members,
                 message_expires_at=expires_at,
                 send_after=send_after_value,
+                sent_at=sent_at_value,
                 in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry

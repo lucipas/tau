@@ -2172,10 +2172,12 @@ class TauNode:
                 # instead — the context is covered by the signature
                 # verified above, so a relay cannot retarget the
                 # reaction onto a different message.  A copy that
-                # arrived through an outbox retry carries a re-stamped
-                # send time and cannot resolve; the reaction is still
-                # stored under the wire target, and shows for the
-                # author, exactly as before.
+                # arrived through an outbox retry carries the shared
+                # send time and resolves the same way; only a copy
+                # queued before the shared time was recorded falls
+                # back to its enqueue time, and then the reaction is
+                # still stored under the wire target, and shows for
+                # the author, exactly as before.
                 # The signed context names the logical message, but
                 # a valid signature only proves who chose the
                 # context, not that they belong to the group: an
@@ -2189,6 +2191,7 @@ class TauNode:
                 # the reaction outruns the message; that reaction
                 # is stored with its context and can only surface
                 # through reconciliation when the message arrives,
+                # which checks the roster then.  The lookup is by
                 # which checks the roster then.  The lookup is by
                 # exact id: a retired id that is also another group's
                 # name must not resolve to that group.
@@ -2215,6 +2218,7 @@ class TauNode:
                 # non-member naming a known local group-message id
                 # must not get their reaction stored or displayed —
                 # including reactions that carry no group context.
+                # A missing roster fails closed: the group was deleted
                 # A missing roster fails closed: the group was deleted
                 # (or the message was imported without one), so there
                 # is no membership to verify — and a deleted group has
@@ -2279,6 +2283,7 @@ class TauNode:
                             final = None
                         if final is not None and final.get("kind") == "group":
                             # A missing roster fails closed, as above:
+                            # A missing roster fails closed, as above:
                             # the group was deleted, so no membership
                             # can be verified.  The lookup is by exact
                             # id, so a retired id that is also another
@@ -2340,6 +2345,7 @@ class TauNode:
                 )
                 if local is not None:
                     # Exact-id lookup: a retired id that is also
+                    # Exact-id lookup: a retired id that is also
                     # another group's name must not supply the
                     # roster the reconciliation filters against.
                     pinned = pinned_group(self.groups, reaction["group"])
@@ -2400,6 +2406,7 @@ class TauNode:
                         now_resolved is not None
                         and now_resolved.get("kind") == "group"
                     ):
+                        # Exact-id lookup: a retired id that is also
                         # Exact-id lookup: a retired id that is also
                         # another group's name must not supply the
                         # roster this void check runs against.  A
@@ -3387,7 +3394,7 @@ class TauNode:
         if entry.group_id is not None:
             group_kwargs: Dict[str, Any] = dict(
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
@@ -3433,7 +3440,7 @@ class TauNode:
             payload = encode_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3673,7 +3680,7 @@ class TauNode:
                 recipient_public_key=recipient.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group=sealed_group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
@@ -4926,6 +4933,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -4943,7 +4951,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -5069,6 +5077,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -5097,7 +5106,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -5555,9 +5564,11 @@ class TauNode:
         being reacted to), and a receiver that does not hold the
         target id resolves its own copy from that context instead —
         see :meth:`_handle_reaction`.  Copies that arrived through an
-        outbox retry carry a re-stamped send time and cannot resolve
-        this way; their reaction is still stored, and shows for the
-        author, exactly as a DM reaction to an unknown target would.
+        outbox retry carry the shared send time and resolve the same
+        way; only a copy queued before the shared time was recorded
+        falls back to its enqueue time, and then its reaction is
+        still stored, and shows for the author, exactly as a DM
+        reaction to an unknown target would.
 
         A failed leg reports an ``error`` instead of queueing: like
         DM reactions, group reactions are live-only in v1.  Returns
