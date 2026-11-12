@@ -974,7 +974,19 @@ class WebBridge:
         while len(self._removed_wire_ids) > MAX_REMOVED_WIRE_IDS:
             self._removed_wire_ids.popitem(last=False)
 
-    def record_inbound(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def record_inbound(
+        self, record: Dict[str, Any], *, publish: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Record an inbound message in the console history.
+
+        With ``publish`` the entry is also fanned out live on the bus
+        (and a read receipt is sent when a console is subscribed);
+        with ``publish=False`` only the history write happens.  The
+        node uses the record-only form when a delivery's live event
+        is withheld — the copy is in the inbox and marked seen, and
+        ``messages()`` reads only this history, so skipping the
+        write would leave it invisible in the console.
+        """
         peer_hash = str(record.get("destination") or "")
         peer_name = str(record.get("from") or "")
         if not peer_name or peer_name == "unknown":
@@ -1010,6 +1022,21 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # A voided reaction the bridge never heard about can still be
+        # seeded from the cache into a fresh entry; the roster filters
+        # it here, as the snapshot read and the import publish do, so
+        # the stored entry and (when published) the live event are
+        # both clean.
+        group_id = message.get("group")
+        if isinstance(group_id, str) and group_id and message.get("reactions"):
+            groups = getattr(self.node, "groups", None)
+            if groups is not None:
+                rosters = pinned_rosters(groups, [group_id])
+                message["reactions"] = visible_reactions(
+                    message["reactions"], rosters.get(group_id)
+                )
+        if not publish:
+            return message
         # The node appends to its inbox before this callback runs, so
         # the unread total already includes the new message.
         self.bus.publish(

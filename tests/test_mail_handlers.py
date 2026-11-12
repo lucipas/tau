@@ -2511,7 +2511,11 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
     # update fails, the bridge still holds the stale reaction and
     # would seed it into the live entry.  The message still records
     # — the inbox purge succeeded, so the reaction is voided there —
-    # but the live event is withheld.
+    # but the live event is withheld.  The console history is still
+    # written, through the record-only callback: messages() reads
+    # only that history, so skipping it would leave the copy
+    # invisible in the console even though it is in the inbox.
+    # (CodeRabbit round-14 review, thread iB3I.)
     from tau.webapi import WebBridge
 
     node = make_node(tmp_path)
@@ -2528,7 +2532,11 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
             if message is not None:
                 published.append(message)
 
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
         node.on_message = _capture
+        node.on_message_record_only = _capture_record_only
         author = RNS.Identity()
         author_hash = destination_hash(author).hex()
         reactor = RNS.Identity()
@@ -2563,6 +2571,125 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
         assert published == []
         assert len(node.inbox.list_messages()) == 1
         assert node.inbox.reactions_for("local-copy-1") == []
+        # The live event was withheld, but the console history holds
+        # the copy — with the stale reaction filtered out of the
+        # stored entry — and no live message event was published.
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "local-copy-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "local-copy-1"
+        ] == []
+    finally:
+        bridge.stop()
+
+
+def test_relayed_group_message_recorded_when_fan_out_fails(
+    tmp_path, monkeypatch
+):
+    """The relayed path writes the console history too when a
+    voided-reaction fan-out fails (CodeRabbit round-14 review,
+    thread iB3I).
+
+    Same ordering as the direct path, delivered through the fetch
+    path instead: a non-member reaction is cached before its target
+    arrives, the purge voids it, the tombstone fan-out fails, and
+    the live event is withheld — but the copy is recorded and the
+    console history holds it, and the delivery still resolves (the
+    envelope is acked, not deferred).
+    """
+    import base64
+
+    from tau.webapi import WebBridge
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    own = destination_hash(node.identity).hex()
+    node.destination = SimpleNamespace(
+        hexhash=own, hash=destination_hash(node.identity)
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
+        node.on_message_record_only = _capture_record_only
+        holder = RNS.Identity()
+        holder_hash = destination_hash(holder)
+        peer = Peer(
+            destination_hash(holder_hash),
+            name="holder",
+            public_key=holder.get_public_key(),
+            first_seen=1.0,
+            last_seen=1.0,
+            caps=("message", "ping", "peers", "mail", "read"),
+        )
+        node.registry._peers[holder_hash] = peer
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "fetch-group-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+
+        def _raise(record):
+            raise RuntimeError("console callback failed")
+
+        monkeypatch.setattr(node, "on_reaction", _raise)
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=node.identity.get_public_key(),
+            message_id="fetch-group-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        node._request = lambda peer, path, payload, timeout, deadline=None: {
+            "ok": True,
+            "messages": [
+                {
+                    "id": "fetch-group-1",
+                    "blob": base64.b64encode(blob).decode("ascii"),
+                    "expires_at": time.time() + 3600,
+                }
+            ],
+            "count": 1,
+        }
+        assert node._collect_mail(peer, timeout=5.0) == 1
+        assert received == []
+        assert len(node.inbox.list_messages()) == 1
+        assert node.inbox.reactions_for("fetch-group-1") == []
+        assert node.mailbox.take_pending_acks(peer.hexhash) == [
+            "fetch-group-1"
+        ]
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "fetch-group-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "fetch-group-1"
+        ] == []
     finally:
         bridge.stop()
 

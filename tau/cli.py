@@ -3851,6 +3851,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
             console_message(record)
             bridge.record_inbound(record)
 
+        def on_message_record_only(record: Dict[str, Any]) -> None:
+            # The live event is withheld, so the terminal stays quiet
+            # too — but the console history is written, so the copy
+            # is not invisible there.
+            bridge.record_inbound(record, publish=False)
+
         def on_file(record: Dict[str, Any]) -> None:
             console_file(record)
             # The console lists messages, not files: record the arrival
@@ -3874,6 +3880,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
+        node.on_message_record_only = on_message_record_only
         node.on_file = on_file
 
         def on_retract(record: Dict[str, Any]) -> None:

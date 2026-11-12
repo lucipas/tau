@@ -480,6 +480,7 @@ class TauNode:
         name: Optional[str] = None,
         registry: Optional[PeerRegistry] = None,
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_message_record_only: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
         on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -496,6 +497,12 @@ class TauNode:
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
         self.on_message = on_message
+        # Record-only twin of on_message: the console history write
+        # without the live event.  A delivery whose live publication
+        # is withheld (a voided-reaction fan-out failed) still calls
+        # this one, so the copy is not invisible in the console even
+        # though it is in the inbox and marked seen.
+        self.on_message_record_only = on_message_record_only
         self.on_peer = on_peer
         self.on_delivered = on_delivered
         self.on_file = on_file
@@ -1445,6 +1452,32 @@ class TauNode:
             return False
         return True
 
+    def _notify_message(self, record: Dict[str, Any], *, publish_ok: bool) -> None:
+        """Deliver a recorded message to the console callbacks.
+
+        When ``publish_ok`` is False the live event is withheld (a
+        voided-reaction fan-out failed), but the console history is
+        still written via ``on_message_record_only`` when one is
+        wired: ``messages()`` reads only that history, so skipping
+        the callback would leave the copy invisible in the console
+        even though it is in the inbox and marked seen.  Without a
+        record-only callback there is nothing to write to, and the
+        live event stays withheld.
+        """
+        if publish_ok:
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+        elif self.on_message_record_only is not None:
+            try:
+                self.on_message_record_only(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning(
+                    "on_message_record_only callback failed", exc_info=True
+                )
+
     def _void_stored_reaction(self, target_id: str, caller_hash: str) -> None:
         """Void a reaction this reactor already stored on *target_id*.
 
@@ -1827,11 +1860,8 @@ class TauNode:
             else:
                 with self.mailbox.transaction():
                     self._record_received(record)
-            if not duplicate and publish_ok and self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            if not duplicate:
+                self._notify_message(record, publish_ok=publish_ok)
 
         return response_ok(
             echo=message["text"],
@@ -3766,11 +3796,8 @@ class TauNode:
                     self.mailbox.mark_seen(message["id"])
                     self._record_received(record)
                     recorded = True
-        if recorded and publish_ok and self.on_message is not None:
-            try:
-                self.on_message(record)
-            except Exception:  # pragma: no cover - user callback
-                log.warning("on_message callback failed", exc_info=True)
+        if recorded:
+            self._notify_message(record, publish_ok=publish_ok)
         return recorded
 
     # -- application layer -------------------------------------------------
