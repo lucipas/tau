@@ -35,6 +35,7 @@ import type {
   PeerInfoResult,
   PeersResponse,
   PingResult,
+  PinMessageResponse,
   ReactResponse,
   RenameResponse,
   RetryOutboxResponse,
@@ -46,6 +47,7 @@ import type {
   SocialInfo,
   TauGroup,
   TauMessage,
+  UnpinMessageResponse,
   UnreadCounts,
   UpdateSettingsResponse,
   VerifyPeerResponse,
@@ -136,6 +138,13 @@ export function useTau() {
   const [searchResults, setSearchResults] = useState<TauMessage[]>([]);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  // The pinned view, or null for the live traffic. Like search, it is a
+  // snapshot kept beside `messages`: pinning and unpinning keep updating
+  // `messages` underneath, and clearing the view returns to it.
+  const [pinnedMessages, setPinnedMessages] = useState<TauMessage[] | null>(
+    null,
+  );
+  const [pinnedError, setPinnedError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
@@ -198,6 +207,7 @@ export function useTau() {
 
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
+  const pinnedSeq = useRef(0);
 
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -309,6 +319,18 @@ export function useTau() {
       setMessages((previous) =>
         previous.map((entry) => (entry.id === message.id ? message : entry)),
       );
+      // A pin or unpin lands here too: keep an open pinned view in
+      // step, dropping an entry that lost its pin instead of leaving a
+      // stale bubble behind.
+      setPinnedMessages((previous) =>
+        previous === null
+          ? null
+          : message.pinned
+            ? previous.map((entry) =>
+                entry.id === message.id ? message : entry,
+              )
+            : previous.filter((entry) => entry.id !== message.id),
+      );
     };
 
     const onMessageDeleted = (event: Event) => {
@@ -318,6 +340,11 @@ export function useTau() {
       if (!payload || typeof payload.message_id !== "number") return;
       setMessages((previous) =>
         previous.filter((entry) => entry.id !== payload.message_id),
+      );
+      setPinnedMessages((previous) =>
+        previous === null
+          ? null
+          : previous.filter((entry) => entry.id !== payload.message_id),
       );
     };
 
@@ -633,6 +660,17 @@ export function useTau() {
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
     return result.deleted;
+  }, []);
+
+  const pinMessage = useCallback(async (id: number) => {
+    // The node records the pin and the bridge re-sends the message as
+    // `message_updated`, so the bubble updates through the SSE stream —
+    // no local state change here, like `reactToMessage`.
+    return apiPost<PinMessageResponse>("/api/messages/pin", { id });
+  }, []);
+
+  const unpinMessage = useCallback(async (id: number) => {
+    return apiPost<UnpinMessageResponse>("/api/messages/unpin", { id });
   }, []);
   const retryOutbox = useCallback(
     async (id?: string) => {
@@ -1333,6 +1371,22 @@ export function useTau() {
   // A search is a view switch, like the Tan search: setting the query
   // fetches the search endpoint instead of showing the live feed.
   // Clearing it returns to the live traffic the same way.
+  const clearSearch = useCallback(() => {
+    // Invalidate any in-flight search so its late response is discarded.
+    searchSeq.current += 1;
+    setSearchQuery(null);
+    setSearchResults([]);
+    setSearchError(null);
+  }, []);
+
+  const clearPinned = useCallback(() => {
+    // Invalidate any in-flight pinned fetch so its late response is
+    // discarded.
+    pinnedSeq.current += 1;
+    setPinnedMessages(null);
+    setPinnedError(null);
+  }, []);
+
   const runSearch = useCallback(async (trimmed: string) => {
     // Each request takes a sequence number; a response only applies if it
     // is still the latest request, so superseded or cleared searches
@@ -1357,6 +1411,9 @@ export function useTau() {
     async (query: string) => {
       const trimmed = query.trim();
       if (!trimmed) return;
+      // Opening a search leaves the pinned view: the two switches are
+      // exclusive, and a stale pinned list must not survive underneath.
+      clearPinned();
       if (trimmed === searchQueryRef.current) {
         // Resubmitting the current query: setting the same state would
         // bail out without reloading, so refresh directly — and keep
@@ -1372,16 +1429,30 @@ export function useTau() {
       setSearchQuery(trimmed);
       await runSearch(trimmed);
     },
-    [runSearch],
+    [runSearch, clearPinned],
   );
 
-  const clearSearch = useCallback(() => {
-    // Invalidate any in-flight search so its late response is discarded.
-    searchSeq.current += 1;
-    setSearchQuery(null);
-    setSearchResults([]);
-    setSearchError(null);
-  }, []);
+  // A pinned view is a view switch, like the Tan search: opening it
+  // fetches the pinned endpoint instead of showing the live feed, and
+  // clearing it returns to the live traffic. The two switches are
+  // exclusive — a search and the pinned view never show at once.
+  const showPinned = useCallback(async () => {
+    const seq = ++pinnedSeq.current;
+    try {
+      const result = await apiGet<MessagesResponse>("/api/messages?pinned=1");
+      if (seq !== pinnedSeq.current) return;
+      // The endpoint returns oldest first; the view shows newest first,
+      // like search results.
+      setPinnedMessages([...result.messages].reverse());
+      setPinnedError(null);
+      clearSearch();
+    } catch (caught) {
+      if (seq !== pinnedSeq.current) return;
+      setPinnedError(
+        caught instanceof Error ? caught.message : "pinned view failed",
+      );
+    }
+  }, [clearSearch]);
 
   return {
     node,
@@ -1393,6 +1464,12 @@ export function useTau() {
     searchError,
     search,
     clearSearch,
+    pinnedMessages,
+    pinnedError,
+    showPinned,
+    clearPinned,
+    pinMessage,
+    unpinMessage,
     unread,
     outbox,
     heldForOthers,

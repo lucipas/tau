@@ -915,3 +915,100 @@ describe("useTau sendGroup", () => {
     expect(result.current.messages).toEqual(legs);
   });
 });
+
+describe("useTau pinned view", () => {
+  it("fetches the pinned endpoint and shows the pins newest first", async () => {
+    const older = makeMessage({ id: 1, text: "first pin", pinned: true });
+    const newer = makeMessage({ id: 2, text: "second pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [older, newer], count: 2 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+
+    expect(mockedGet).toHaveBeenCalledWith("/api/messages?pinned=1");
+    expect(result.current.pinnedMessages).toEqual([newer, older]);
+    expect(result.current.pinnedError).toBeNull();
+  });
+
+  it("surfaces a pinned fetch failure", async () => {
+    mockedGet.mockRejectedValueOnce(new Error("bridge unreachable"));
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+
+    expect(result.current.pinnedError).toBe("bridge unreachable");
+    expect(result.current.pinnedMessages).toBeNull();
+  });
+
+  it("clearing the pinned view returns to the live feed", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+    expect(result.current.pinnedMessages).toEqual([pin]);
+
+    act(() => {
+      result.current.clearPinned();
+    });
+
+    expect(result.current.pinnedMessages).toBeNull();
+    expect(result.current.pinnedError).toBeNull();
+  });
+
+  it("pins and unpins through the new endpoints", async () => {
+    mockedPost.mockResolvedValue({
+      ok: true,
+      pinned: { id: 1, wire_id: "wire-1", already_pinned: false },
+    });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.pinMessage(1);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/pin", { id: 1 });
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      unpinned: { id: 1, wire_id: "wire-1", was_pinned: true },
+    });
+    await act(async () => {
+      await result.current.unpinMessage(1);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/unpin", {
+      id: 1,
+    });
+  });
+
+  it("drops an unpinned entry from an open pinned view", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+    expect(result.current.pinnedMessages).toEqual([pin]);
+
+    // The bridge re-sends the message as `message_updated` after an
+    // unpin; the pinned view must drop it, not leave a stale bubble.
+    act(() => {
+      FakeEventSource.instances[0].emit("message_updated", {
+        message: { ...pin, pinned: undefined },
+      });
+    });
+
+    expect(result.current.pinnedMessages).toEqual([]);
+  });
+});

@@ -421,3 +421,127 @@ describe("MessageFeed outbound status", () => {
     expect(screen.getByText("crew")).toBeTruthy();
   });
 });
+
+describe("MessageFeed pins", () => {
+  it("shows no pin button without an onPin handler", () => {
+    render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
+  it("pins an unpinned message", async () => {
+    const message = makeMessage();
+    const onPin = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Pin this message"));
+    await waitFor(() => expect(onPin).toHaveBeenCalledTimes(1));
+    expect(onPin).toHaveBeenCalledWith(message, true);
+  });
+
+  it("marks a pinned message and offers to unpin it", async () => {
+    const message = makeMessage({ pinned: true });
+    const onPin = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    expect(
+      screen.getByTitle("Pinned — kept easy to find, local only"),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Unpin this message"));
+    await waitFor(() => expect(onPin).toHaveBeenCalledTimes(1));
+    expect(onPin).toHaveBeenCalledWith(message, false);
+  });
+
+  it("hides the pin button while the message is still queued", () => {
+    // A queued message has no stored inbox copy yet, so there is
+    // nothing to pin; it can be pinned once delivered.
+    const message = makeMessage({ direction: "out", status: "queued" });
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={vi.fn(async () => {})}
+      />,
+    );
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
+  it("reports a failed pin inline and keeps the message", async () => {
+    const onPin = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Pin this message"));
+    expect(await screen.findByText("pin failed: boom")).toBeTruthy();
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Pin this message")).toBeTruthy();
+  });
+
+  it("shows the pinned view with a count and a way back", () => {
+    const onClearPinned = vi.fn();
+    render(
+      <MessageFeed
+        messages={[makeMessage({ pinned: true })]}
+        node={null}
+        live={true}
+        showingPinned={true}
+        onClearPinned={onClearPinned}
+      />,
+    );
+
+    expect(screen.getByText("1 pinned")).toBeTruthy();
+    fireEvent.click(screen.getByText("show all"));
+    expect(onClearPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the pinned view from the live traffic", () => {
+    const onShowPinned = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onShowPinned={onShowPinned}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("📌 pinned"));
+    expect(onShowPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an empty state when nothing is pinned", () => {
+    render(
+      <MessageFeed
+        messages={[]}
+        node={null}
+        live={true}
+        showingPinned={true}
+        onClearPinned={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("No pinned messages")).toBeTruthy();
+  });
+});

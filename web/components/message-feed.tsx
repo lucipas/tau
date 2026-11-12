@@ -25,12 +25,17 @@ export function MessageFeed({
   onReply,
   onDelete,
   onReact,
+  onPin,
   searching,
   searchQuery,
   searchError,
   onSearch,
   onClearSearch,
   quoteContext,
+  showingPinned,
+  pinnedError,
+  onShowPinned,
+  onClearPinned,
 }: {
   messages: TauMessage[];
   node: NodeInfo | null;
@@ -39,6 +44,8 @@ export function MessageFeed({
   onDelete?: (message: TauMessage) => Promise<void>;
   // `reaction` null retracts the caller's reaction to the message.
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
+  // `pinned` true pins the message, false unpins it.
+  onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
   searching?: boolean;
   searchQuery?: string | null;
   searchError?: string | null;
@@ -47,6 +54,10 @@ export function MessageFeed({
   // History used to resolve reply quotes; defaults to `messages`. Search
   // passes the live traffic here so originals outside the hits still resolve.
   quoteContext?: TauMessage[];
+  showingPinned?: boolean;
+  pinnedError?: string | null;
+  onShowPinned?: () => Promise<unknown> | unknown;
+  onClearPinned?: () => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -64,18 +75,19 @@ export function MessageFeed({
   }, [messages]);
 
   useEffect(() => {
-    // Search results are newest first: sticking to the bottom would land
-    // on the oldest match, so only the live feed auto-scrolls.
-    if (searching || !stickToBottom.current) return;
+    // Search results and the pinned view are newest first: sticking to
+    // the bottom would land on the oldest entry, so only the live feed
+    // auto-scrolls.
+    if (searching || showingPinned || !stickToBottom.current) return;
     endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
-  }, [messages.length, searching]);
+  }, [messages.length, searching, showingPinned]);
 
   useEffect(() => {
-    // Show newest-first search hits from the top, not wherever a scrolled
-    // live feed left the container.
-    if (!searching || !scrollRef.current) return;
+    // Show newest-first search hits and pins from the top, not wherever
+    // a scrolled live feed left the container.
+    if ((!searching && !showingPinned) || !scrollRef.current) return;
     scrollRef.current.scrollTop = 0;
-  }, [searching, messages]);
+  }, [searching, showingPinned, messages]);
 
   function onScroll() {
     const element = scrollRef.current;
@@ -99,14 +111,36 @@ export function MessageFeed({
     <section className="flex min-h-0 flex-1 flex-col rounded-2xl border border-line/80 bg-panel/40">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/60 px-4 py-3">
         <div className="flex items-center gap-3">
-          <SectionLabel>{searching ? "search results" : "traffic"}</SectionLabel>
+          <SectionLabel>
+            {showingPinned ? "pinned" : searching ? "search results" : "traffic"}
+          </SectionLabel>
           <span className="font-mono text-[10px] text-mist">
-            {searching
-              ? `${messages.length} match(es)`
-              : `${counts.inbound} in / ${counts.outbound} out`}
+            {showingPinned
+              ? `${messages.length} pinned`
+              : searching
+                ? `${messages.length} match(es)`
+                : `${counts.inbound} in / ${counts.outbound} out`}
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {showingPinned && onClearPinned ? (
+            <button
+              type="button"
+              onClick={onClearPinned}
+              className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
+            >
+              show all
+            </button>
+          ) : null}
+          {!showingPinned && !searching && onShowPinned ? (
+            <button
+              type="button"
+              onClick={() => void onShowPinned()}
+              className="rounded-lg border border-line/70 bg-void/50 px-2 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-100"
+            >
+              📌 pinned
+            </button>
+          ) : null}
           {searching && onClearSearch ? (
             <button
               type="button"
@@ -159,6 +193,12 @@ export function MessageFeed({
         </p>
       ) : null}
 
+      {pinnedError ? (
+        <p className="border-b border-line/60 px-4 py-2 font-mono text-[11px] text-rose-400">
+          {pinnedError}
+        </p>
+      ) : null}
+
       <div
         ref={scrollRef}
         onScroll={onScroll}
@@ -169,6 +209,8 @@ export function MessageFeed({
         {messages.length === 0 ? (
           searching ? (
             <SearchEmptyState query={searchQuery ?? ""} />
+          ) : showingPinned ? (
+            <PinnedEmptyState />
           ) : (
             <EmptyState node={node} />
           )
@@ -182,6 +224,7 @@ export function MessageFeed({
               onReply={onReply}
               onDelete={onDelete}
               onReact={onReact}
+              onPin={onPin}
             />
           ))
         )}
@@ -203,6 +246,24 @@ function SearchEmptyState({ query }: { query: string }) {
       <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
         Search covers the text of stored messages, sent and received. Try a
         different word, or clear the search to return to the live traffic.
+      </p>
+    </div>
+  );
+}
+
+function PinnedEmptyState() {
+  return (
+    <div className="flex h-full min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        📌
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No pinned messages
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Pin a message from the traffic view to keep it here. Pins are
+        local-only — the peer never sees them — and they show in{" "}
+        <code className="font-mono text-zinc-300">tau pinned</code> too.
       </p>
     </div>
   );
@@ -288,6 +349,7 @@ function MessageBubble({
   onReply,
   onDelete,
   onReact,
+  onPin,
 }: {
   message: TauMessage;
   messages: TauMessage[];
@@ -295,6 +357,7 @@ function MessageBubble({
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
+  onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
 }) {
   const outbound = message.direction === "out";
   const peerHash = message.peer ?? "";
@@ -325,9 +388,29 @@ function MessageBubble({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [reactError, setReactError] = useState<string | null>(null);
   const [reactPending, setReactPending] = useState(false);
+  const [pinPending, setPinPending] = useState(false);
+  const [pinError, setPinError] = useState<string | null>(null);
   // Synchronous guard so rapid clicks cannot start overlapping requests
   // before the pending state has re-rendered.
   const reactInFlight = useRef(false);
+  const pinInFlight = useRef(false);
+
+  async function handlePin() {
+    if (!onPin || pinInFlight.current) return;
+    pinInFlight.current = true;
+    setPinPending(true);
+    setPinError(null);
+    try {
+      // The bridge re-sends the message as `message_updated`, so the
+      // bubble (and the pinned view) update through the SSE stream.
+      await onPin(message, !message.pinned);
+    } catch (error) {
+      setPinError(error instanceof Error ? error.message : "pin failed");
+    } finally {
+      setPinPending(false);
+      pinInFlight.current = false;
+    }
+  }
   // The node's own destination hash is what the bridge records as the
   // reactor, so this is how the console knows which reaction is mine.
   const ownReaction =
@@ -396,6 +479,14 @@ function MessageBubble({
           <span className="font-mono text-[10px] text-mist/60">
             {formatTime(message.received_at)}
           </span>
+          {message.pinned ? (
+            <span
+              className="font-mono text-[10px] text-signal"
+              title="Pinned — kept easy to find, local only"
+            >
+              <span aria-hidden="true">📌</span> pinned
+            </span>
+          ) : null}
         </div>
 
         <div
@@ -547,6 +638,27 @@ function MessageBubble({
               ♡ react
             </button>
           ) : null}
+          {onPin && message.status !== "queued" ? (
+            <button
+              type="button"
+              title={
+                message.pinned ? "Unpin this message" : "Pin this message"
+              }
+              aria-label={
+                message.pinned ? "Unpin this message" : "Pin this message"
+              }
+              aria-pressed={message.pinned}
+              disabled={pinPending}
+              onClick={() => void handlePin()}
+              className={`rounded px-1 py-0.5 transition hover:bg-void/60 ${
+                message.pinned
+                  ? "text-signal hover:text-signal"
+                  : "text-mist hover:text-zinc-200"
+              }`}
+            >
+              {pinPending ? "pinning…" : message.pinned ? "📌 pinned" : "pin"}
+            </button>
+          ) : null}
         </div>
 
         {pickerOpen ? (
@@ -594,6 +706,14 @@ function MessageBubble({
             role="alert"
           >
             reaction failed: {reactError}
+          </p>
+        ) : null}
+        {pinError ? (
+          <p
+            className="px-1 pt-1 font-mono text-[10px] text-amber"
+            role="alert"
+          >
+            pin failed: {pinError}
           </p>
         ) : null}
       </div>

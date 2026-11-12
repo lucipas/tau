@@ -19,6 +19,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     GET  /api/messages     recent inbound/outbound messages
+                           (``?pinned=1`` lists pinned messages only,
+                           across the whole console log)
     GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -36,6 +38,10 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
+    POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
+                           inbox, so it shows in the console and in
+                           ``tau pinned`` (local only, never sent)
+    POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -2822,6 +2828,82 @@ class WebBridge:
             },
         }
 
+    def pin_message(self, target: int) -> Dict[str, Any]:
+        """Pin one stored DM from the console history, by console id.
+
+        The pin itself lives on the node inbox record (``Inbox.pin``),
+        so the CLI's ``tau pinned`` listing and this console agree:
+        pinning from either side shows up on the other, and the pin is
+        local only — the peer's copy is unaffected and nothing is sent.
+        Only messages with a stored inbox copy can be pinned: a queued
+        message has no wire id yet, so pinning it would record a pin
+        with nothing to attach to.  Other tabs learn through a
+        ``message_updated`` event carrying the annotated entry.
+
+        Returns the pinned console id, its wire id, and whether the pin
+        is new — pinning an already-pinned message is a no-op, not an
+        error, matching :meth:`Inbox.pin`.
+        """
+        return self._set_message_pinned(target, pinned=True)
+
+    def unpin_message(self, target: int) -> Dict[str, Any]:
+        """Remove the pin from one stored DM, by console id.
+
+        The mirror of :meth:`pin_message`: the inbox record loses its
+        pin flag and other tabs learn through a ``message_updated``
+        event.  Unpinning a message that was never pinned is a no-op,
+        not an error.
+        """
+        return self._set_message_pinned(target, pinned=False)
+
+    def _set_message_pinned(self, target: int, *, pinned: bool) -> Dict[str, Any]:
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("status") == "queued":
+                # A queued message has no stored inbox copy yet, so
+                # there is nothing to pin; pin it once it is delivered.
+                action = "pin" if pinned else "unpin"
+                raise ValueError(
+                    f"message {target!r} is still queued; {action} it once delivered"
+                )
+            wire_id = entry.get("wire_id")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError(
+                f"message {target!r} has no stored copy to pin"
+                if pinned
+                else f"message {target!r} has no stored copy to unpin"
+            )
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("this node has no inbox to pin in")
+        try:
+            _, changed = (
+                inbox.pin(wire_id) if pinned else inbox.unpin(wire_id)
+            )
+        except InboxError as exc:
+            raise ValueError(str(exc)) from exc
+        updated = self._with_inbox_pinned(
+            dict(entry), self._inbox_pinned_ids()
+        )
+        self.bus.publish({"type": "message_updated", "message": updated})
+        state = {"id": target, "wire_id": wire_id}
+        if pinned:
+            state["already_pinned"] = not changed
+        else:
+            state["was_pinned"] = changed
+        return {"ok": True, "pinned" if pinned else "unpinned": state}
+
     def _remove_history_entry(
         self, target: int, removed: Dict[str, Any], *, publish_unread: bool
     ) -> None:
@@ -3928,8 +4010,12 @@ class WebBridge:
                 )
             ]
         by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids()
         return [
-            self._with_inbox_reactions(dict(item), by_target) for item in items
+            self._with_inbox_pinned(
+                self._with_inbox_reactions(dict(item), by_target), pinned_ids
+            )
+            for item in items
         ]
 
     def received_file(
@@ -4106,6 +4192,45 @@ class WebBridge:
             else:
                 merged.pop(reactor, None)
         message["reactions"] = list(merged.values())
+        return message
+
+    def _inbox_pinned_ids(self) -> Set[str]:
+        """Wire ids of pinned inbox messages, reloaded once per read.
+
+        One reload serves the whole listing, like
+        :meth:`_inbox_reactions_by_target`: the inbox is the durable
+        authority for pins, so a pin made from another process (``tau
+        pin`` from the CLI) shows up on the next read.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return set()
+        try:
+            pinned = inbox.list_messages(
+                pinned_only=True, direction=None, limit=None
+            )
+        except Exception:  # pragma: no cover - defensive
+            return set()
+        return {
+            str(entry.get("id"))
+            for entry in pinned
+            if isinstance(entry.get("id"), str) and entry.get("id")
+        }
+
+    def _with_inbox_pinned(
+        self, message: Dict[str, Any], pinned_ids: Set[str]
+    ) -> Dict[str, Any]:
+        """Mark one history entry pinned when the inbox has it pinned.
+
+        Only pinned entries carry the flag — an absent ``pinned`` reads
+        as unpinned, the same way an absent ``reactions`` reads as no
+        reactions.  A live push to an already open console tab for a
+        CLI-made pin is still a follow-up: this reconciles reads, not
+        the SSE stream.
+        """
+        wire_id = message.get("wire_id")
+        if wire_id and wire_id in pinned_ids:
+            message["pinned"] = True
         return message
 
     def counts(self) -> Dict[str, int]:
@@ -4452,8 +4577,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
             if path == "/api/messages":
-                limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
-                self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                pinned_only = query.get("pinned") == ["1"]
+                # A pinned view spans the whole console log, not just
+                # the newest 200 the live feed shows: a pin from long
+                # ago is exactly the one worth finding.
+                limit = (
+                    -1
+                    if pinned_only
+                    else _int_param(query, "limit", default=200, minimum=1, maximum=500)
+                )
+                items = self.bridge.messages(limit)
+                if pinned_only:
+                    items = [item for item in items if item.get("pinned")]
+                self._send_json({"messages": items}, head_only)
                 return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
@@ -4817,6 +4953,12 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
+                return
+            if path == "/api/messages/pin":
+                self._handle_pin_message(body, head_only, pinned=True)
+                return
+            if path == "/api/messages/unpin":
+                self._handle_pin_message(body, head_only, pinned=False)
                 return
             if path == "/api/messages/read":
                 peer = body.get("peer")
@@ -5710,6 +5852,30 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             result = self.bridge.delete_message(target)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_pin_message(
+        self, body: Dict[str, Any], head_only: bool, *, pinned: bool
+    ) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = (
+                self.bridge.pin_message(target)
+                if pinned
+                else self.bridge.unpin_message(target)
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
