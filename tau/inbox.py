@@ -965,34 +965,140 @@ class Inbox:
         retargeted = 0
         with self._transaction():
             previous = list(self._reactions)
-            held = {
-                entry.get("id")
-                for entry in self._messages
-                if isinstance(entry.get("id"), str)
-            }
-            pending = [
-                entry
-                for entry in self._reactions
-                if entry.get("group") == group
-                and entry.get("target_author") == author
-                and isinstance(entry.get("target_sent_at"), (int, float))
-                and not isinstance(entry.get("target_sent_at"), bool)
-                and float(entry["target_sent_at"]) == wanted_at
-                and entry.get("target") not in held
-                and (allowed is None or entry.get("destination") in allowed)
-            ]
-            for entry in pending:
-                moved = dict(entry)
-                moved["target"] = message_id
-                self._reactions.remove(entry)
-                if merge_reaction(self._reactions, moved):
-                    retargeted += 1
+            retargeted = self._reconcile_group_reactions_locked(
+                group, author, wanted_at, message_id, allowed
+            )
             if retargeted:
-                self._reactions = self._reactions[-MAX_REACTIONS:]
                 if not self._save():
                     self._reactions = previous
                     raise OSError(f"could not persist inbox to {self.path}")
         return retargeted
+
+    def _reconcile_group_reactions_locked(
+        self,
+        group: str,
+        author: str,
+        wanted_at: float,
+        message_id: str,
+        allowed: Optional[Collection[str]],
+    ) -> int:
+        """Retarget stored group reactions onto a newly arrived copy.
+
+        Caller holds the inbox transaction (state already reloaded):
+        the reconcile mutates ``self._reactions`` in place and never
+        saves.  ``allowed`` is the pinned roster, or ``None`` for no
+        roster filter.  See :meth:`reconcile_group_reactions` for the
+        matching rules.
+        """
+        held = {
+            entry.get("id")
+            for entry in self._messages
+            if isinstance(entry.get("id"), str)
+        }
+        pending = [
+            entry
+            for entry in self._reactions
+            if entry.get("group") == group
+            and entry.get("target_author") == author
+            and isinstance(entry.get("target_sent_at"), (int, float))
+            and not isinstance(entry.get("target_sent_at"), bool)
+            and float(entry["target_sent_at"]) == wanted_at
+            and entry.get("target") not in held
+            and (allowed is None or entry.get("destination") in allowed)
+        ]
+        retargeted = 0
+        for entry in pending:
+            moved = dict(entry)
+            moved["target"] = message_id
+            self._reactions.remove(entry)
+            if merge_reaction(self._reactions, moved):
+                retargeted += 1
+        if retargeted:
+            self._reactions = self._reactions[-MAX_REACTIONS:]
+        return retargeted
+
+    def append_group_message(
+        self,
+        record: Dict[str, Any],
+        *,
+        group: str,
+        author: str,
+        sent_at: float,
+        members: Collection[str],
+    ) -> List[Dict[str, Any]]:
+        """Record one group message with its reaction authorization.
+
+        A group message's arrival has three inbox effects — retargeting
+        stored reactions onto it, voiding stored reactions from
+        non-members, and appending the message itself — and they must
+        land together: the purge used to run in one transaction and
+        the append in the next, so a non-member's reaction stored
+        between them never saw the target, skipped every roster
+        check, and became readable once the message appended.  Here
+        all three run under a single cross-process lock with a single
+        persist, so no reaction can slip between the purge and the
+        append, and no second ``Inbox._transaction`` is nested inside
+        the first.
+
+        A failed reconcile never breaks the arrival — it only strands
+        legitimate reactions, which stay invisible — so it is logged
+        and the purge and append still run.  A failed persist raises
+        :class:`OSError` and the in-memory state is restored, so the
+        caller can refuse the delivery and the sender can retry it.
+        Returns the tombstones written, one per voided reaction, so
+        the caller can fan them out to any reaction cache.
+        """
+        entry = _valid_record(record)
+        if entry is None:
+            raise ValueError("inbox record needs text")
+        try:
+            wanted_at: Optional[float] = float(sent_at)
+        except (TypeError, ValueError):
+            wanted_at = None
+        message_id = entry.get("id")
+        allowed = set(members)
+        voided: List[Dict[str, Any]] = []
+        with self._transaction():
+            previous_reactions = list(self._reactions)
+            previous_messages = list(self._messages)
+            try:
+                if (
+                    wanted_at is not None
+                    and math.isfinite(wanted_at)
+                    and isinstance(group, str)
+                    and group
+                    and isinstance(author, str)
+                    and author
+                    and isinstance(message_id, str)
+                    and message_id
+                ):
+                    try:
+                        self._reconcile_group_reactions_locked(
+                            group, author, wanted_at, message_id, allowed
+                        )
+                    except Exception:
+                        # A failed reconcile only strands legitimate
+                        # reactions (invisible); it never breaks the
+                        # arrival, and the purge below still runs.
+                        log.warning(
+                            "Could not reconcile group reactions",
+                            exc_info=True,
+                        )
+                voided = self._purge_non_member_reactions_locked(
+                    message_id if isinstance(message_id, str) else "",
+                    allowed,
+                    time.time(),
+                )
+                entry["seq"] = self._next_seq()
+                self._messages.append(entry)
+                self._messages = _retain(self._messages)
+                if not self._save():
+                    raise OSError(f"could not persist inbox to {self.path}")
+            except OSError:
+                self._reactions = previous_reactions
+                self._messages = previous_messages
+                raise
+        return voided
 
     def purge_non_member_reactions(
         self, message_id: str, *, members: Collection[str]
@@ -1022,26 +1128,44 @@ class Inbox:
         voided: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._reactions)
-            now = time.time()
-            for entry in list(self._reactions):
-                if (
-                    entry.get("target") == message_id
-                    and entry.get("reaction")
-                    and entry.get("destination") not in allowed
-                ):
-                    tombstone = dict(entry)
-                    tombstone["reaction"] = ""
-                    tombstone["sent_at"] = (
-                        max(float(entry.get("sent_at") or 0.0), now) + 1.0
-                    )
-                    tombstone["received_at"] = now
-                    if merge_reaction(self._reactions, tombstone):
-                        voided.append(tombstone)
+            voided = self._purge_non_member_reactions_locked(
+                message_id, allowed, time.time()
+            )
             if voided:
-                self._reactions = self._reactions[-MAX_REACTIONS:]
                 if not self._save():
                     self._reactions = previous
                     raise OSError(f"could not persist inbox to {self.path}")
+        return voided
+
+    def _purge_non_member_reactions_locked(
+        self,
+        message_id: str,
+        allowed: Collection[str],
+        now: float,
+    ) -> List[Dict[str, Any]]:
+        """Void stored reactions on one group message from non-members.
+
+        Caller holds the inbox transaction: the tombstones are merged
+        into ``self._reactions`` in place and never saved here.  See
+        :meth:`purge_non_member_reactions` for the tombstone rules.
+        """
+        voided: List[Dict[str, Any]] = []
+        for entry in list(self._reactions):
+            if (
+                entry.get("target") == message_id
+                and entry.get("reaction")
+                and entry.get("destination") not in allowed
+            ):
+                tombstone = dict(entry)
+                tombstone["reaction"] = ""
+                tombstone["sent_at"] = (
+                    max(float(entry.get("sent_at") or 0.0), now) + 1.0
+                )
+                tombstone["received_at"] = now
+                if merge_reaction(self._reactions, tombstone):
+                    voided.append(tombstone)
+        if voided:
+            self._reactions = self._reactions[-MAX_REACTIONS:]
         return voided
 
     def resolve(self, ref: str) -> Dict[str, Any]:

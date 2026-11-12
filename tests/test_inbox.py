@@ -1062,6 +1062,99 @@ def test_reconcile_group_reactions_keeps_newer_reaction_on_copy(tmp_path):
     ]
 
 
+def test_append_group_message_purges_and_appends_in_one_persist(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:1702): the purge used to run in one
+    # transaction and the append in the next, so a non-member's
+    # reaction stored between them skipped every roster check and
+    # became readable once the message appended.  The arrival is one
+    # locked step now: the stored reaction is voided and the message
+    # appended under a single persist.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            destination="ab" * 16,
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    saves = []
+    original_save = inbox._save
+
+    def _counting_save(*args, **kwargs):
+        saves.append(1)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(inbox, "_save", _counting_save)
+    voided = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert len(voided) == 1
+    assert voided[0]["destination"] == "ff" * 16
+    assert voided[0]["reaction"] == ""
+    assert len(saves) == 1
+    assert len(inbox.list_messages()) == 1
+    # The member's context reaction moved onto the copy; the
+    # non-member's is a tombstone and never displays.
+    shown = inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["destination"] == "ab" * 16
+
+
+def test_append_group_message_reconcile_failure_does_not_break_arrival(
+    tmp_path, monkeypatch
+):
+    # A failed reconcile only strands legitimate reactions: the purge
+    # and the append still run, so the arrival is not refused.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(inbox, "_reconcile_group_reactions_locked", _fail)
+    voided = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert len(voided) == 1
+    assert len(inbox.list_messages()) == 1
+    assert inbox.reactions_for("local-copy-1") == []
+
+
+def test_append_group_message_save_failure_restores_state(tmp_path, monkeypatch):
+    # A failed persist raises and leaves nothing behind: no message
+    # recorded, no reaction voided, so the sender can retry the
+    # delivery once the store is healthy.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(_reaction(target="local-copy-1", destination="ff" * 16))
+    monkeypatch.setattr(inbox, "_save", lambda *args, **kwargs: False)
+    with pytest.raises(OSError):
+        inbox.append_group_message(
+            _group_copy(),
+            group="cd" * 16,
+            author="aa" * 16,
+            sent_at=100.0,
+            members={"ab" * 16, "aa" * 16},
+        )
+    assert inbox.list_messages() == []
+    kept = inbox.reactions_for("local-copy-1")
+    assert len(kept) == 1
+    assert kept[0]["reaction"] == "👍"
+
+
 def test_resolve_ambiguous_prefix(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="abcdef01" + "0" * 24))

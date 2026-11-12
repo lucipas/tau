@@ -12,7 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.mailbox import open_message, seal_message
-from tau.node import NodeError, TauNode
+from tau.node import DeliveryDeferredError, NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
     ProtocolError,
@@ -747,7 +747,8 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
 
     # A second envelope, dropped by the owner (tau outbox drop-held) after
     # the sweep listed it, must not be surfaced. Simulate the drop by
-    # making drop_held report the envelope already gone.
+    # making is_held report the envelope already gone: the drop now
+    # happens after delivery, so the still-held check is the guard.
     blob2 = seal_message(
         sender,
         sender_name="alice",
@@ -762,7 +763,7 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
         message_id="self-2",
         expires_at=time.time() + 3600,
     )
-    monkeypatch.setattr(node.mailbox, "drop_held", lambda *a, **k: False)
+    monkeypatch.setattr(node.mailbox, "is_held", lambda *a, **k: False)
     assert node._process_local_held() == 0
     assert len(received) == 1
 
@@ -1788,7 +1789,9 @@ def test_group_message_refused_when_purge_fails(tmp_path, monkeypatch):
     # the message would leave the reaction readable through
     # reactions_for.  The arrival fails closed: the delivery is
     # refused and nothing is recorded or marked seen — the sender
-    # retries once the store is healthy.
+    # retries once the store is healthy.  The purge runs inside
+    # Inbox.append_group_message now, so the failure is injected at
+    # its locked helper.
     from tau.webapi import WebBridge
 
     node = make_node(tmp_path)
@@ -1821,7 +1824,9 @@ def test_group_message_refused_when_purge_fails(tmp_path, monkeypatch):
         def _fail(*args, **kwargs):
             raise OSError("disk full")
 
-        monkeypatch.setattr(node.inbox, "purge_non_member_reactions", _fail)
+        monkeypatch.setattr(
+            node.inbox, "_purge_non_member_reactions_locked", _fail
+        )
         delivered = call_handler(
             node._handle_group_message,
             encode_group_message(
@@ -1848,8 +1853,12 @@ def test_group_message_refused_when_purge_fails(tmp_path, monkeypatch):
 
 
 def test_relayed_message_refused_when_purge_fails(tmp_path, monkeypatch):
-    # The same fail-closed refusal on the relayed path: nothing is
-    # marked seen, so another holder's copy can deliver it later.
+    # The same fail-closed refusal on the relayed path, now as a
+    # distinct retryable outcome: _deliver_collected raises
+    # DeliveryDeferredError instead of returning False, so the
+    # callers keep the held copy and leave the envelope
+    # unacknowledged.  Nothing is recorded or marked seen, so a
+    # later sweep retries it.
     node = make_node(tmp_path)
     recipient = RNS.Identity()
     node.identity = recipient
@@ -1873,7 +1882,9 @@ def test_relayed_message_refused_when_purge_fails(tmp_path, monkeypatch):
     def _fail(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(node.inbox, "purge_non_member_reactions", _fail)
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
     blob = seal_message(
         author,
         sender_name="alice",
@@ -1889,7 +1900,8 @@ def test_relayed_message_refused_when_purge_fails(tmp_path, monkeypatch):
         },
     )
     message = open_message(recipient, blob)
-    assert node._deliver_collected(message) is False
+    with pytest.raises(DeliveryDeferredError):
+        node._deliver_collected(message)
     assert node.inbox.list_messages() == []
     assert not node.mailbox.is_seen("local-copy-1")
 
@@ -1960,8 +1972,10 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
 def test_relayed_reconcile_failure_does_not_skip_purge(tmp_path, monkeypatch):
     # CodeRabbit follow-up: on the relayed path the reconcile and the
     # purge shared one try block, so a reconcile failure skipped the
-    # purge and the message published with the reaction.  The purge
-    # runs independently now, and the live entry publishes clean.
+    # purge and the message published with the reaction.  The reconcile
+    # now runs inside Inbox.append_group_message and its failure is
+    # tolerated there, so the purge still runs and the live entry
+    # publishes clean.
     from tau.webapi import WebBridge
 
     node = make_node(tmp_path)
@@ -1998,7 +2012,9 @@ def test_relayed_reconcile_failure_does_not_skip_purge(tmp_path, monkeypatch):
         def _fail(*args, **kwargs):
             raise OSError("disk full")
 
-        monkeypatch.setattr(node.inbox, "reconcile_group_reactions", _fail)
+        monkeypatch.setattr(
+            node.inbox, "_reconcile_group_reactions_locked", _fail
+        )
         blob = seal_message(
             author,
             sender_name="alice",
@@ -2020,6 +2036,142 @@ def test_relayed_reconcile_failure_does_not_skip_purge(tmp_path, monkeypatch):
         assert published[0]["reactions"] == []
     finally:
         bridge.stop()
+
+
+def test_local_held_group_delivery_keeps_copy_when_purge_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:3372): the local-held sweep used to drop
+    # the copy before delivery, so a deferred delivery lost the only
+    # copy of a message nobody recorded.  The copy stays held until
+    # the delivery resolves, and a later sweep retries it.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    own = recipient_hash.hex()
+    sender = RNS.Identity()
+    author_hash = destination_hash(sender).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-group-1",
+        expires_at=time.time() + 3600,
+    )
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
+    assert node._process_local_held() == 0
+    assert received == []
+    assert not node.mailbox.is_seen("self-group-1")
+    held = node.mailbox.held_for(recipient_hash)
+    assert [envelope.id for envelope in held] == ["self-group-1"]
+    # Once the store is healthy, the next sweep delivers the kept copy.
+    monkeypatch.undo()
+    assert node._process_local_held() == 1
+    assert len(received) == 1
+    assert received[0]["text"] == "crew hello"
+    assert node.mailbox.held_for(recipient_hash) == []
+
+
+def test_collected_group_delivery_leaves_envelope_unacked_when_purge_fails(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit (node.py:3372): the fetch path used to ack an
+    # envelope before delivery, so a deferred delivery let the
+    # holder drop the only copy of a message nobody recorded.  The
+    # envelope is acked only once the delivery resolves; a deferred
+    # one stays unacknowledged and the next fetch retries it.
+    import base64
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    own = destination_hash(node.identity).hex()
+    node.destination = SimpleNamespace(
+        hexhash=own, hash=destination_hash(node.identity)
+    )
+    holder = RNS.Identity()
+    holder_hash = destination_hash(holder)
+    peer = Peer(
+        destination_hash=holder_hash,
+        name="holder",
+        public_key=holder.get_public_key(),
+        first_seen=1.0,
+        last_seen=1.0,
+        caps=("message", "ping", "peers", "mail", "read"),
+    )
+    node.registry._peers[holder_hash] = peer
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=node.identity.get_public_key(),
+        message_id="fetch-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node._request = lambda peer, path, payload, timeout, deadline=None: {
+        "ok": True,
+        "messages": [
+            {
+                "id": "fetch-group-1",
+                "blob": base64.b64encode(blob).decode("ascii"),
+                "expires_at": time.time() + 3600,
+            }
+        ],
+        "count": 1,
+    }
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        node.inbox, "_purge_non_member_reactions_locked", _fail
+    )
+    assert node._collect_mail(peer, timeout=5.0) == 0
+    assert received == []
+    assert node.mailbox.take_pending_acks(peer.hexhash) == []
+    # The envelope was never acked, so the next fetch serves it
+    # again; once the store is healthy it delivers and is acked.
+    monkeypatch.undo()
+    assert node._collect_mail(peer, timeout=5.0) == 1
+    assert len(received) == 1
+    assert received[0]["text"] == "crew hello"
+    assert node.mailbox.take_pending_acks(peer.hexhash) == ["fetch-group-1"]
 
 
 def test_reaction_denied_by_allow_list(tmp_path):

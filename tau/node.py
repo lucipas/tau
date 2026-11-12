@@ -222,6 +222,20 @@ class NotAMemberError(NodeError):
     """
 
 
+class DeliveryDeferredError(NodeError):
+    """A relayed delivery failed transiently and must be retried later.
+
+    Raised by :meth:`TauNode._deliver_collected` when the delivery
+    could not be recorded — for example the group-reaction
+    authorization cleanup could not persist — so the callers keep
+    the held copy instead of dropping or acknowledging it: a local
+    held envelope stays held, a fetched one stays unacknowledged,
+    and a later sweep retries it.  Distinct from a final refusal
+    (blocked, already seen, expired), which returns ``False`` and
+    lets the copy go.
+    """
+
+
 def check_tcp_listen_ports(config: TauConfig) -> None:
     """Fail fast when a configured TCP listen port cannot be bound.
 
@@ -1643,22 +1657,25 @@ class TauNode:
                 group["name"],
                 message["text"],
             )
-            # One delivery: mark seen and record under the mailbox
-            # transaction, so a live backup never restores a seen
-            # marker with no inbox entry (see _handle_message).
-            # The authorization cleanup runs BEFORE the record: a
-            # reaction can outrun the message it names — legs fan out
-            # one member at a time — and was stored under the
-            # reactor's foreign wire id with its signed group context
-            # retained.  Now that this copy is here, move those
-            # reactions onto it; only reactors on this group's roster
-            # move, so an outsider's reaction never surfaces.  And
-            # void any stored reaction on this id from a reactor the
-            # roster does not name (a no-context reaction stored
-            # before its target arrived, when no roster check could
-            # run).  If the purge fails, the delivery is refused and
-            # nothing is recorded or marked seen: the reaction would
-            # otherwise be readable through reactions_for, and the
+            # One delivery: the reaction authorization and the record
+            # land together, under the mailbox transaction.  A reaction
+            # can outrun the message it names — legs fan out one member
+            # at a time — and was stored under the reactor's foreign
+            # wire id with its signed group context retained.  Now that
+            # this copy is here, move those reactions onto it; only
+            # reactors on this group's roster move, so an outsider's
+            # reaction never surfaces.  And void any stored reaction
+            # on this id from a reactor the roster does not name (a
+            # no-context reaction stored before its target arrived,
+            # when no roster check could run).  The reconcile, the
+            # purge, and the append run in one inbox transaction with
+            # a single persist (see Inbox.append_group_message): a
+            # non-member's reaction stored between a separate purge
+            # and append used to skip every roster check and become
+            # readable once the message landed, and that window is
+            # gone.  If the combined step fails, the delivery is
+            # refused and nothing is recorded or marked seen — the
+            # record is written only after the step succeeds, so the
             # sender retries with the same id once the store is
             # healthy.  A failed reconcile is different — it only
             # leaves legitimate reactions stranded (invisible) — so
@@ -1671,25 +1688,18 @@ class TauNode:
             publish_ok = True
             if message_id:
                 try:
-                    self.inbox.reconcile_group_reactions(
-                        group["id"],
-                        caller_hash,
-                        message.get("sent_at"),
-                        message_id,
-                        members=set(group.get("members") or []),
-                    )
-                except Exception:  # pragma: no cover - storage failure
+                    with self.mailbox.transaction():
+                        voided = self.inbox.append_group_message(
+                            record,
+                            group=group["id"],
+                            author=caller_hash,
+                            sent_at=message.get("sent_at"),
+                            members=set(group.get("members") or []),
+                        )
+                        self.mailbox.mark_seen(message_id)
+                except OSError:
                     log.warning(
-                        "Could not reconcile group reactions", exc_info=True
-                    )
-                try:
-                    voided = self.inbox.purge_non_member_reactions(
-                        message_id,
-                        members=set(group.get("members") or []),
-                    )
-                except Exception:  # pragma: no cover - storage failure
-                    log.warning(
-                        "Could not purge non-member group reactions",
+                        "Could not authorize group reactions",
                         exc_info=True,
                     )
                     return response_error(
@@ -1699,10 +1709,9 @@ class TauNode:
                 for tombstone in voided:
                     if not self._publish_reaction(tombstone):
                         publish_ok = False
-            with self.mailbox.transaction():
-                if message_id:
-                    self.mailbox.mark_seen(message_id)
-                self._record_received(record)
+            else:
+                with self.mailbox.transaction():
+                    self._record_received(record)
             if publish_ok and self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -3193,28 +3202,45 @@ class TauNode:
             blob_text = item.get("blob")
             if not isinstance(message_id, str) or not isinstance(blob_text, str):
                 continue
-            # Whatever happens next, this envelope has been handed over;
-            # ack it so the holder can drop its copy.
-            new_acks.append(message_id)
             try:
                 blob = base64.b64decode(blob_text, validate=True)
                 kind, payload = open_sealed_envelope(self.identity, blob)
             except (ValueError, MailboxError) as exc:
                 log.warning("Dropping unreadable held mail %s: %s", message_id, exc)
+                # Unreadable is final: ack it so the holder drops
+                # the garbage instead of serving it forever.
+                new_acks.append(message_id)
                 continue
             if kind == "sealed_receipt":
                 # A receipt is not a message: record the reads and move
-                # on.  The envelope is already acked above, and a
+                # on.  The envelope is already acked below, and a
                 # receipt is never receipted itself.
                 self._record_receipt(
                     reader_hash=payload["from"],
                     message_ids=payload["ids"],
                     read_at=payload["read_at"],
                 )
+                new_acks.append(message_id)
                 continue
             message = payload
-            if self._deliver_collected(message):
+            try:
+                delivered = self._deliver_collected(message)
+            except DeliveryDeferredError as exc:
+                # The delivery could not be recorded (for example the
+                # group-reaction cleanup could not persist): do NOT
+                # ack the envelope, so the holder keeps its copy and
+                # a later fetch retries it.  Acking here would let
+                # the holder drop the only copy of a message this
+                # node never recorded.
+                log.warning(
+                    "Delivery of held mail %s deferred: %s", message_id, exc
+                )
+                continue
+            if delivered:
                 received += 1
+            # Delivered, blocked, already seen, or expired: the
+            # delivery resolved, so the holder can drop its copy.
+            new_acks.append(message_id)
         if new_acks:
             self.mailbox.add_pending_acks(peer.hexhash, new_acks)
         return received
@@ -3235,14 +3261,15 @@ class TauNode:
                 )
                 payload = None
                 kind = None
-            still_held = self.mailbox.drop_held(
-                envelope.id, to=self.destination.hash
-            )
-            if not still_held:
-                # Dropped by the owner (tau outbox drop-held) after this
-                # sweep listed it: do not surface a copy we no longer hold.
-                continue
             if kind == "sealed_receipt" and payload is not None:
+                still_held = self.mailbox.drop_held(
+                    envelope.id, to=self.destination.hash
+                )
+                if not still_held:
+                    # Dropped by the owner (tau outbox drop-held) after
+                    # this sweep listed it: do not record a receipt
+                    # for a copy we no longer hold.
+                    continue
                 self._record_receipt(
                     reader_hash=payload["from"],
                     message_ids=payload["ids"],
@@ -3250,9 +3277,34 @@ class TauNode:
                 )
                 continue
             if kind != "sealed_message" or payload is None:
+                # Unreadable: drop the garbage copy.
+                self.mailbox.drop_held(
+                    envelope.id, to=self.destination.hash
+                )
                 continue
-            if self._deliver_collected(payload):
+            # A sealed message is dropped only once its delivery has
+            # resolved (delivered, blocked, seen, or expired).  A
+            # delivery that fails transiently keeps the copy held
+            # for a later sweep: dropping it first would lose the
+            # only copy of a message this node never recorded.
+            if not self.mailbox.is_held(
+                envelope.id, to=self.destination.hash
+            ):
+                # Dropped by the owner (tau outbox drop-held) after this
+                # sweep listed it: do not surface a copy we no longer hold.
+                continue
+            try:
+                delivered = self._deliver_collected(payload)
+            except DeliveryDeferredError as exc:
+                log.warning(
+                    "Delivery of local held mail %s deferred: %s",
+                    envelope.id,
+                    exc,
+                )
+                continue
+            if delivered:
                 received += 1
+            self.mailbox.drop_held(envelope.id, to=self.destination.hash)
         return received
 
     def _deliver_collected(self, message: Dict[str, Any]) -> bool:
@@ -3334,51 +3386,60 @@ class TauNode:
         # with no inbox entry (see _handle_message).  Re-check inside
         # the transaction, as there: a duplicate that landed while
         # this one was in flight already marked the id seen.
-        # The authorization cleanup runs BEFORE the record, exactly
-        # as a direct group message does: if the purge fails, the
-        # delivery is refused and nothing is marked seen — another
-        # holder's copy can deliver it later, and the reaction can
-        # never become readable through reactions_for.  The reconcile
-        # and the purge are separate attempts, so a reconcile failure
-        # never skips the purge; a failed reconcile only leaves
+        # For a group message the authorization cleanup and the
+        # record land together in one inbox transaction (see
+        # Inbox.append_group_message), exactly as a direct group
+        # message does: a non-member's reaction stored between a
+        # separate purge and append used to skip every roster check
+        # and become readable once the message landed.  If that
+        # combined step fails, the delivery is deferred, not
+        # refused: DeliveryDeferredError propagates to the callers,
+        # which keep the held copy and leave the envelope
+        # unacknowledged, so a later sweep retries it.  A failed
+        # reconcile never breaks delivery — it only leaves
         # legitimate reactions stranded.  If a fan-out fails, the
         # message still records (the inbox is clean) but the live
         # event is withheld.
         publish_ok = True
+        recorded = False
         if pinned is not None:
             try:
-                self.inbox.reconcile_group_reactions(
-                    pinned["id"],
-                    message.get("from"),
-                    message.get("sent_at"),
-                    message["id"],
-                    members=set(pinned.get("members") or []),
-                )
-            except Exception:  # pragma: no cover - storage failure
+                with self.mailbox.transaction():
+                    if self.mailbox.is_seen(message["id"]):
+                        return False
+                    voided = self.inbox.append_group_message(
+                        record,
+                        group=pinned["id"],
+                        author=message.get("from"),
+                        sent_at=message.get("sent_at"),
+                        members=set(pinned.get("members") or []),
+                    )
+                    self.mailbox.mark_seen(message["id"])
+            except OSError as exc:
+                raise DeliveryDeferredError(
+                    "could not authorize group reactions for "
+                    f"{message['id']}"
+                ) from exc
+            except ValueError:
+                # The sealed payload carries no recordable text (the
+                # direct path normalizes this at parse time; a sealed
+                # envelope does not): nothing can be stored, so this
+                # is a final refusal and the copy can go.
                 log.warning(
-                    "Could not reconcile relayed group reactions",
-                    exc_info=True,
-                )
-            try:
-                voided = self.inbox.purge_non_member_reactions(
+                    "Dropping unrecordable relayed group message %s",
                     message["id"],
-                    members=set(pinned.get("members") or []),
-                )
-            except Exception:  # pragma: no cover - storage failure
-                log.warning(
-                    "Could not purge relayed non-member group reactions",
-                    exc_info=True,
                 )
                 return False
             for tombstone in voided:
                 if not self._publish_reaction(tombstone):
                     publish_ok = False
-        recorded = False
-        with self.mailbox.transaction():
-            if not self.mailbox.is_seen(message["id"]):
-                self.mailbox.mark_seen(message["id"])
-                self._record_received(record)
-                recorded = True
+            recorded = True
+        else:
+            with self.mailbox.transaction():
+                if not self.mailbox.is_seen(message["id"]):
+                    self.mailbox.mark_seen(message["id"])
+                    self._record_received(record)
+                    recorded = True
         if recorded and publish_ok and self.on_message is not None:
             try:
                 self.on_message(record)
