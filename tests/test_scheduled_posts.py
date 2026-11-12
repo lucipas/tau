@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -209,6 +210,56 @@ def test_publish_due_keeps_posts_with_unresolved_targets(tmp_path):
     assert len(load_scheduled_posts(path)) == 1
 
 
+def test_publish_pass_stops_between_posts_when_asked(tmp_path):
+    # A stop requested mid-pass ends it: the first post goes out, the
+    # second stays queued with its attempts untouched.
+    path = tmp_path / "scheduled-posts.json"
+    first = schedule_post(path, text="first", publish_at=1000.0, now=900.0)
+    second = schedule_post(path, text="second", publish_at=1000.0, now=900.0)
+    app = _FakeTanApp()
+    calls = {"n": 0}
+
+    def _stop_after_first():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    result = publish_due_scheduled_posts(
+        path, app, should_stop=_stop_after_first, now=2000.0
+    )
+    assert result == {"published": 1, "kept": 1}
+    assert [post["text"] for post in app.created] == ["first"]
+    remaining = load_scheduled_posts(path)
+    assert [post.id for post in remaining.posts] == [second.id]
+    assert remaining.posts[0].attempts == 0
+
+
+def test_publish_pass_stops_during_target_resolution(tmp_path):
+    # A stop requested while resolving a post's peers ends the pass
+    # before anything is created or published — and, crucially, does
+    # not burn an attempt on the entry, the way a failed publish would.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="now", publish_at=1000.0, to=["alice", "bob"], now=900.0)
+    app = _FakeTanApp()
+    resolved_names = []
+    stop = {"set": False}
+
+    def _resolve(name):
+        resolved_names.append(name)
+        if len(resolved_names) == 1:
+            stop["set"] = True
+        return SimpleNamespace(hexhash=f"{name}-hash")
+
+    result = publish_due_scheduled_posts(
+        path, app, resolve_peer=_resolve, should_stop=lambda: stop["set"], now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert resolved_names == ["alice"]
+    assert app.created == []
+    remaining = load_scheduled_posts(path)
+    assert len(remaining) == 1
+    assert remaining.posts[0].attempts == 0
+
+
 def test_publish_due_tolerates_corrupt_queue(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     path.write_text("{not json", encoding="utf-8")
@@ -299,7 +350,12 @@ def test_node_publish_hook_skips_without_tan_app(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     schedule_post(path, text="now", publish_at=1000.0, now=900.0)
     config = SimpleNamespace(scheduled_posts_path=path)
-    node = SimpleNamespace(app=None, config=config, resolve_peer=lambda t: None)
+    node = SimpleNamespace(
+        app=None,
+        config=config,
+        resolve_peer=lambda t: None,
+        _stop_event=threading.Event(),
+    )
     TauNode._publish_due_scheduled_posts(node)
     assert len(load_scheduled_posts(path)) == 1
 
@@ -313,10 +369,35 @@ def test_node_publish_hook_publishes_through_attached_app(tmp_path):
     schedule_post(path, text="now", publish_at=1000.0, now=900.0)
     config = SimpleNamespace(scheduled_posts_path=path)
     app = _FakeTanApp()
-    node = SimpleNamespace(app=app, config=config, resolve_peer=lambda t: None)
+    node = SimpleNamespace(
+        app=app,
+        config=config,
+        resolve_peer=lambda t: None,
+        _stop_event=threading.Event(),
+    )
     TauNode._publish_due_scheduled_posts(node)
     assert [post["text"] for post in app.created] == ["now"]
     assert len(load_scheduled_posts(path)) == 0
+
+
+def test_node_publish_hook_stops_pass_when_stopping(tmp_path):
+    # The hook wires the node's stop event into the pass, so a node
+    # shutting down does not wait out a publish pass in the mail loop.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="now", publish_at=1000.0, now=900.0)
+    config = SimpleNamespace(scheduled_posts_path=path)
+    app = _FakeTanApp()
+    stop_event = threading.Event()
+    stop_event.set()
+    node = SimpleNamespace(
+        app=app,
+        config=config,
+        resolve_peer=lambda t: None,
+        _stop_event=stop_event,
+    )
+    TauNode._publish_due_scheduled_posts(node)
+    assert app.created == []
+    assert len(load_scheduled_posts(path)) == 1
 
 
 def _run_cli(data_dir: Path, argv):

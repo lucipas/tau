@@ -405,12 +405,22 @@ def cancel_scheduled_post(
     return post
 
 
+class _StopRequested(Exception):
+    """Internal: the node is stopping, so a publish pass ends early.
+
+    Raised by the target-resolution step (and never by a publish
+    failure), so the pass returns its partial counts instead of
+    recording a failed attempt against the entry being worked on.
+    """
+
+
 def publish_due_scheduled_posts(
     path: Union[str, Path],
     app: Any,
     *,
     resolve_peer: Optional[Callable[[str], Any]] = None,
     now: Optional[float] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, int]:
     """Publish every due queued post through *app* (a ``TanApp``).
 
@@ -432,6 +442,13 @@ def publish_due_scheduled_posts(
     inspect or cancel.  A pass stops starting new entries once
     ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.
 
+    When ``should_stop`` is given (the node's stop event), a pass ends
+    early — between posts and between peer resolutions — so ``stop()``
+    never waits out a whole publish pass; the entry being worked on
+    stays queued with its attempts untouched.  The in-flight peer
+    resolution still runs to its own timeout, so a stop waits at most
+    one such wait, not a whole pass.
+
     Returns ``{"published": n, "kept": m}``.  A corrupt queue file logs a
     warning and publishes nothing, so one bad file cannot stall the mail
     loop that calls this.
@@ -450,68 +467,79 @@ def publish_due_scheduled_posts(
             if post.next_attempt_at <= at and post.attempts < MAX_PUBLISH_ATTEMPTS
         ]
         published = 0
-        for post in candidates:
-            if time.monotonic() > deadline:
-                break
-            failed_peers: Optional[Tuple[str, ...]] = None
-            try:
-                targets = _resolve_publish_targets(post, resolve_peer)
-                created = app.get_post(post.post_hash) if post.post_hash else None
-                if created is None:
-                    created = app.create_post(post.text, reply_to=post.reply_to)
-                    # Persist the signed post's identity before sending, so
-                    # a retry after a crash re-sends it rather than signing
-                    # a second copy.
-                    post = replace(post, post_hash=created["hash"])
+        try:
+            for post in candidates:
+                if should_stop is not None and should_stop():
+                    break
+                if time.monotonic() > deadline:
+                    break
+                failed_peers: Optional[Tuple[str, ...]] = None
+                try:
+                    targets = _resolve_publish_targets(post, resolve_peer, should_stop)
+                    created = app.get_post(post.post_hash) if post.post_hash else None
+                    if created is None:
+                        created = app.create_post(post.text, reply_to=post.reply_to)
+                        # Persist the signed post's identity before sending, so
+                        # a retry after a crash re-sends it rather than signing
+                        # a second copy.
+                        post = replace(post, post_hash=created["hash"])
+                        queue = queue.with_replaced(post)
+                        save_scheduled_posts(path, queue)
+                    result = app.publish(created, targets=targets, ttl=post.ttl)
+                    errors = list(result.get("errors") or []) if isinstance(result, dict) else []
+                    if errors:
+                        failed_peers = tuple(str(err.get("peer") or "") for err in errors)
+                        raise ScheduledPostsError(
+                            f"{len(errors)} peer(s) did not receive the post"
+                        )
+                except _StopRequested:
+                    # Not a publish failure: end the pass without burning
+                    # an attempt on the entry being worked on.
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a failed publish retries
+                    attempts = post.attempts + 1
+                    retry_in = min(
+                        PUBLISH_RETRY_BASE_SECONDS * 2 ** (attempts - 1),
+                        PUBLISH_RETRY_CAP_SECONDS,
+                    )
+                    pending = post.pending_peers
+                    if failed_peers is not None:
+                        # Retry only the peers that failed.  An unknown peer
+                        # hash cannot be re-targeted, so fall back to all targets.
+                        pending = failed_peers if all(p and p != "?" for p in failed_peers) else ()
+                    post = replace(
+                        post,
+                        attempts=attempts,
+                        next_attempt_at=at + retry_in,
+                        pending_peers=pending,
+                    )
                     queue = queue.with_replaced(post)
                     save_scheduled_posts(path, queue)
-                result = app.publish(created, targets=targets, ttl=post.ttl)
-                errors = list(result.get("errors") or []) if isinstance(result, dict) else []
-                if errors:
-                    failed_peers = tuple(str(err.get("peer") or "") for err in errors)
-                    raise ScheduledPostsError(
-                        f"{len(errors)} peer(s) did not receive the post"
-                    )
-            except Exception as exc:  # noqa: BLE001 - a failed publish retries
-                attempts = post.attempts + 1
-                retry_in = min(
-                    PUBLISH_RETRY_BASE_SECONDS * 2 ** (attempts - 1),
-                    PUBLISH_RETRY_CAP_SECONDS,
-                )
-                pending = post.pending_peers
-                if failed_peers is not None:
-                    # Retry only the peers that failed.  An unknown peer
-                    # hash cannot be re-targeted, so fall back to all targets.
-                    pending = failed_peers if all(p and p != "?" for p in failed_peers) else ()
-                post = replace(
-                    post,
-                    attempts=attempts,
-                    next_attempt_at=at + retry_in,
-                    pending_peers=pending,
-                )
-                queue = queue.with_replaced(post)
-                save_scheduled_posts(path, queue)
-                log.warning(
-                    "Scheduled post %s could not publish (%s); keeping it queued",
-                    post.id,
-                    exc,
-                )
-                if attempts >= MAX_PUBLISH_ATTEMPTS:
                     log.warning(
-                        "Scheduled post %s gave up after %d attempts; it stays "
-                        "queued until cancelled",
+                        "Scheduled post %s could not publish (%s); keeping it queued",
                         post.id,
-                        attempts,
+                        exc,
                     )
-                continue
-            queue = queue.with_removed(post.id)
-            save_scheduled_posts(path, queue)
-            published += 1
+                    if attempts >= MAX_PUBLISH_ATTEMPTS:
+                        log.warning(
+                            "Scheduled post %s gave up after %d attempts; it stays "
+                            "queued until cancelled",
+                            post.id,
+                            attempts,
+                        )
+                    continue
+                queue = queue.with_removed(post.id)
+                save_scheduled_posts(path, queue)
+                published += 1
+        except _StopRequested:
+            pass
     return {"published": published, "kept": len(candidates) - published}
 
 
 def _resolve_publish_targets(
-    post: ScheduledPost, resolve_peer: Optional[Callable[[str], Any]]
+    post: ScheduledPost,
+    resolve_peer: Optional[Callable[[str], Any]],
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Optional[List[Any]]:
     """Peers for one publish attempt: the still-owed ones, else ``to``."""
     names = post.pending_peers or post.to
@@ -519,4 +547,9 @@ def _resolve_publish_targets(
         return None
     if resolve_peer is None:
         raise ScheduledPostsError("scheduled post has targets but no peer resolver")
-    return [resolve_peer(name) for name in names]
+    resolved: List[Any] = []
+    for name in names:
+        if should_stop is not None and should_stop():
+            raise _StopRequested()
+        resolved.append(resolve_peer(name))
+    return resolved
