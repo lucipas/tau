@@ -35,9 +35,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     ProtocolError,
     clean_in_reply_to,
     excerpt_hash,
+    generate_message_id,
+    normalize_message,
     normalize_message_kind,
 )
 from .util import atomic_write_json, read_json
@@ -189,7 +192,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     if raw.get("pinned"):
         record["pinned"] = True
     kind = raw.get("kind")
-    if kind == "group":
+    if kind == NOTE_KIND:
+        # A note to self (``tau note``): local-only, written straight
+        # into the inbox, never received from a peer — the wire parser
+        # rejects it, so a stored ``note`` record is always our own.
+        record["kind"] = NOTE_KIND
+    elif kind == "group":
         group_id = raw.get("group")
         if not isinstance(group_id, str) or len(group_id) != 32:
             return None
@@ -706,6 +714,69 @@ class Inbox:
             self._save()
         return entry
 
+    def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
+        """Store a private note to self in the inbox and return it.
+
+        A note is an inbox record with kind ``note``, from this node to
+        itself: it shows in the received-message listing, is found by
+        search and the ``note`` kind filter, and is deleted, pruned,
+        exported and imported like any other stored message.  It never
+        touches the wire — no send, no queue, no announce.  The text
+        is validated like a message body (empty and over-long notes are
+        refused).  The note is read the moment it is written: the read
+        cursor for this node's own destination is advanced past it, so
+        it never counts as unread and never shows the unread marker.
+        The cursor is keyed by destination, and no peer message ever
+        carries our own hash, so the advance touches notes only.
+        """
+        cleaned = normalize_message(text)
+        now = time.time()
+        record = _valid_record(
+            {
+                "from": sender_name,
+                "destination": destination,
+                "text": cleaned,
+                "sent_at": now,
+                "received_at": now,
+                "id": generate_message_id(),
+                "direction": "in",
+                "kind": NOTE_KIND,
+            }
+        )
+        if record is None:
+            raise ValueError("inbox record needs text")
+        # Store and read in one transaction: a note is never persisted
+        # without its read cursor, and a failed write raises instead of
+        # reporting a saved note.
+        with self._transaction():
+            previous_messages = list(self._messages)
+            previous_cursors = dict(self._read_cursors)
+            record["seq"] = self._next_seq()
+            self._messages.append(record)
+            self._messages = _retain(self._messages)
+            self._advance_own_cursor(record)
+            try:
+                self._save(strict=True)
+            except OSError:
+                self._messages = previous_messages
+                self._read_cursors = previous_cursors
+                raise
+        return record
+
+    def _advance_own_cursor(self, entry: Dict[str, Any]) -> None:
+        """Move this node's read cursor up to a note (caller holds the lock).
+
+        The cursor is keyed by destination, and no peer message carries
+        our own hash, so this only ever marks notes read.
+        """
+        destination = entry.get("destination") or ""
+        current = self._read_cursors.get(destination)
+        if current is None or current["last_read_seq"] < entry["seq"]:
+            self._read_cursors[destination] = {
+                "last_read_seq": entry["seq"],
+                "last_read_id": entry.get("id"),
+            }
+
     def delete(self, ref: str) -> Dict[str, Any]:
         """Remove one stored message by full id or unique prefix.
 
@@ -961,6 +1032,8 @@ class Inbox:
                 and item.get("id")
                 and item.get("read_at") is not None
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
 
     def mark_receipt_sent(
@@ -1001,6 +1074,8 @@ class Inbox:
                 if isinstance(item.get("id"), str)
                 and item.get("id")
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]

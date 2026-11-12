@@ -48,6 +48,10 @@ MAX_MESSAGE_CHARS = 2000
 # message a receiver can filter on.  The wire field is optional so old
 # peers keep working: a payload without a kind is a chat message.
 DEFAULT_MESSAGE_KIND = "chat"
+# A private note to self (``tau note``): stored in the local inbox, never
+# sent, so it is a record kind like ``group``/``file`` rather than a wire
+# kind — see ``_RESERVED_MESSAGE_KINDS`` below.
+NOTE_KIND = "note"
 MAX_MESSAGE_KIND_LENGTH = 32
 # ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
 # would break the documented slug grammar for consumers that enforce it.
@@ -58,8 +62,12 @@ _MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 # and be silently lost — `_record_received` swallows the failure while
 # the sender already got success and the seen-id blocks a retry.  So
 # they are reserved here, at the one choke point every kind passes
-# through, and the wire parser rejects them the same way.
-_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
+# through, and the wire parser rejects them the same way.  ``note`` is
+# reserved the same way: a note is local-only by design (``tau note``
+# writes it straight into the inbox), so a peer must not be able to
+# send one — a note-kind payload on the wire is rejected, and
+# `tau send --kind note` is refused.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file", "note"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -158,9 +166,9 @@ def normalize_message_kind(kind: Any) -> str:
 
     A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
     at most 32 characters) so it is safe to print, compare and filter
-    on.  ``None`` — the local default — means plain chat.  ``group``
-    and ``file`` are reserved: they name inbox record types, and a
-    direct message carrying either could never be stored.
+    on.  ``None`` — the local default — means plain chat.  ``group``,
+    ``file`` and ``note`` are reserved: they name inbox record types,
+    and a direct message carrying any of them could never be stored.
     """
     if kind is None:
         return DEFAULT_MESSAGE_KIND
