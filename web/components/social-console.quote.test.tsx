@@ -30,6 +30,7 @@ describe("PostCard quote control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={onQuote}
         onDelete={() => {}}
@@ -47,6 +48,7 @@ describe("PostCard quote control", () => {
       <PostCard
         post={reply}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={() => {}}
@@ -76,6 +78,7 @@ describe("PostCard quote control", () => {
       <PostCard
         post={quote}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={() => {}}

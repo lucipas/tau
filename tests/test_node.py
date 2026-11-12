@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -9,7 +10,7 @@ import pytest
 
 from tau.config import TauConfig
 from tau.inbox import Inbox
-from tau.mailbox import Mailbox
+from tau.mailbox import Mailbox, MailboxError
 from tau.node import NodeError, NotAllowedError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import APP_NAME, ASPECT, parse_message
@@ -644,6 +645,221 @@ def test_send_message_distrusts_peer_queued_claim(tmp_path, monkeypatch):
     assert response["_rtt"] == 0.012
 
 
+def test_send_message_with_send_after_queues_without_delivery(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_message("alice", "later", send_after=send_after)
+
+    # No delivery attempt at all — the peer is reachable, but the
+    # message is scheduled, not sent.
+    assert calls == []
+    assert response["queued"] is True
+    assert response["send_after"] == send_after
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.send_after == send_after
+    assert entry.is_due() is False
+    # The sent message is still recorded in local history.
+    sent = node.inbox.list_messages(direction="out")
+    assert [message["id"] for message in sent] == [response["id"]]
+
+
+def test_send_message_rejects_nonfinite_send_after(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_message("alice", "hi", send_after=float("nan"))
+    with pytest.raises(NodeError):
+        node.send_message("alice", "hi", send_after="tomorrow")
+
+
+def test_send_message_scheduled_to_undiscovered_hash_keeps_schedule(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started: the fallback may queue
+    peer = make_peer("bob")
+    # The peer has never announced: resolution fails, so the send
+    # queues through the unresolved-peer fallback.
+    def _no_peer(*args, **kwargs):
+        raise NodeError("no announce")
+
+    monkeypatch.setattr(node, "resolve_peer", _no_peer)
+    send_after = time.time() + 3600.0
+    response = node.send_message(peer.hexhash, "later", send_after=send_after)
+
+    assert response["queued"] is True
+    assert response["send_after"] == send_after
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.send_after == send_after
+    assert entry.is_due() is False
+
+    # The peer announces afterwards: even a backoff-ignoring flush
+    # must not deliver the message before its scheduled time.
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="bob", now=100.0
+    )
+    delivered = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda p, e, timeout, **kwargs: (
+            delivered.append(e.id),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda p, e, timeout, **kwargs: False,
+    )
+    node._flush_peer(peer, 1.0, respect_backoff=False)
+    assert delivered == []
+    assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def test_send_message_rejects_scheduled_send_without_queue(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    # queue=False means "do not queue": a scheduled message is queued
+    # by definition, so the combination is refused before anything is
+    # recorded or enqueued.
+    with pytest.raises(NodeError, match="without queueing"):
+        node.send_message(
+            "alice", "later", queue=False, send_after=time.time() + 3600.0
+        )
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_send_message_scheduled_to_supplied_peer_registers_it(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    # The peer was never registered: resolve_peer returns a supplied
+    # Peer as-is, so without registration flush_outbox (which only
+    # visits registry peers) would never deliver the scheduled message.
+    assert node.registry.get(peer.destination_hash) is None
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_message(peer, "later", send_after=send_after)
+
+    assert calls == []
+    assert response["queued"] is True
+    assert node.registry.get(peer.destination_hash) is not None
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.send_after == send_after
+
+
+def test_send_message_failed_schedule_leaves_no_sent_record(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    # A schedule past the message's own expiry is rejected at enqueue.
+    send_after = time.time() + 3600.0
+    expires_at = time.time() + 60.0
+    with pytest.raises(MailboxError):
+        node.send_message(
+            "alice", "never", send_after=send_after, expires_at=expires_at
+        )
+    # Nothing was queued, and no sent record lingers behind.
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_flush_outbox_never_delivers_scheduled_entry_early(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for flush_outbox
+    alice = make_peer("alice")
+    bob = make_peer("bob")
+    node.registry.upsert(
+        alice.destination_hash, alice.public_key, name="alice", now=100.0
+    )
+    node.registry.upsert(
+        bob.destination_hash, bob.public_key, name="bob", now=100.0
+    )
+    now = time.time()
+    scheduled = node.mailbox.enqueue(
+        to=alice.destination_hash,
+        text="not yet",
+        message_id="aa" + "55" * 15,
+        send_after=now + 3600.0,
+    )
+    plain = node.mailbox.enqueue(
+        to=alice.destination_hash,
+        text="now",
+        message_id="aa" + "66" * 15,
+    )
+    # A scheduled message for bob: another peer's visit must not
+    # deposit a sealed copy of it early either.
+    for_other = node.mailbox.enqueue(
+        to=bob.destination_hash,
+        text="not yet either",
+        message_id="aa" + "77" * 15,
+        send_after=now + 3600.0,
+    )
+
+    delivered = []
+    deposited = []
+    monkeypatch.setattr(
+        node,
+        "_deliver_entry",
+        lambda peer, entry, timeout, **kwargs: (
+            delivered.append(entry.id),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        node,
+        "_deposit_entry",
+        lambda peer, entry, timeout, **kwargs: (
+            deposited.append(entry.id),
+            True,
+        )[1],
+    )
+    node._collect_mail = lambda p, timeout, **_kwargs: 0
+
+    # A backoff-ignoring round (fresh announce, `tau outbox retry`)
+    # still leaves scheduled entries queued.
+    node.flush_outbox(respect_backoff=False)
+    assert delivered == [plain.id]
+    assert for_other.id not in deposited
+    assert scheduled.id not in deposited
+    assert node.mailbox.get_outbox(scheduled.id) is not None
+    assert node.mailbox.get_outbox(for_other.id) is not None
+
+    # Once the scheduled time passes, the same round delivers it.
+    node.mailbox.get_outbox(scheduled.id).send_after = time.time() - 1.0
+    node.mailbox.save()
+    delivered.clear()
+    node.flush_outbox(respect_backoff=False)
+    assert scheduled.id in delivered
+
+
 def test_send_message_distrusts_peer_queued_claim_without_id(
     tmp_path, monkeypatch
 ):
@@ -726,6 +942,49 @@ def test_deliver_entry_carries_reply_reference(tmp_path, monkeypatch):
     sent = parse_message(calls[0][2])
     assert sent["in_reply_to"] == reply_to
     assert sent["text"] == "seconded"
+
+
+def test_deliver_collected_holds_mailbox_transaction(tmp_path):
+    # A collected (relayed) delivery marks the message seen and then
+    # records it.  Both steps run under the mailbox transaction, so a
+    # live backup holding the same transaction sees either both writes
+    # or neither — never a seen marker with no inbox entry.
+    node = make_node(tmp_path)
+    original_append = node.inbox.append
+    started = threading.Event()
+
+    def slow_append(record):
+        started.set()
+        time.sleep(0.3)
+        return original_append(record)
+
+    node.inbox.append = slow_append  # type: ignore[method-assign]
+    message = {
+        "id": "relayed-1",
+        "from": "ab" * 16,
+        "from_name": "alice",
+        "text": "hello via relay",
+        "sent_at": 1000.0,
+    }
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(node._deliver_collected(message)),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    # The delivery is inside the slowed record step: the mailbox
+    # transaction must still be held, so acquiring it times out.
+    with pytest.raises(TimeoutError):
+        with node.mailbox.transaction(timeout=0.1):
+            pass
+    worker.join(timeout=5)
+    assert result == [True]
+    # The transaction is free again once the delivery finishes.
+    with node.mailbox.transaction(timeout=1.0):
+        pass
+    stored = json.loads((tmp_path / "inbox.json").read_text(encoding="utf-8"))
+    assert any(entry["id"] == "relayed-1" for entry in stored["messages"])
 
 
 def test_send_message_records_sent_message_for_quote_lookup(
