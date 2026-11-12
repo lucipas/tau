@@ -1653,6 +1653,9 @@ class TauNode:
             # move, so an outsider's reaction never surfaces.  Never
             # breaks delivery: a failed reconcile leaves the
             # reactions stored (and invisible) exactly as before.
+            # The purge below is a separate attempt: a reconcile
+            # failure must not skip it.
+            purge_ok = True
             if message_id:
                 try:
                     self.inbox.reconcile_group_reactions(
@@ -1675,8 +1678,7 @@ class TauNode:
                 # fanned out to the console too: the bridge caches
                 # reactions separately and seeds appended messages
                 # from that cache, so a void that never reaches it
-                # would still display.  Same never-breaks guarantee
-                # as the reconcile above.
+                # would still display.
                 try:
                     voided = self.inbox.purge_non_member_reactions(
                         message_id,
@@ -1689,7 +1691,14 @@ class TauNode:
                         "Could not purge non-member group reactions",
                         exc_info=True,
                     )
-            if self.on_message is not None:
+                    purge_ok = False
+            # Fail closed on a purge failure: the voided reaction is
+            # still stored and still cached by the bridge, so
+            # publishing the live event would display it.  The
+            # message itself is already recorded durably — it stays
+            # visible in the inbox — only the live console event is
+            # withheld until the store is healthy again.
+            if purge_ok and self.on_message is not None:
                 try:
                     self.on_message(record)
                 except Exception:  # pragma: no cover - user callback
@@ -3326,14 +3335,19 @@ class TauNode:
                 self.mailbox.mark_seen(message["id"])
                 self._record_received(record)
                 recorded = True
+        # A relayed copy is an arrival too: reconcile stored
+        # reactions onto it and void non-members' reactions on it,
+        # exactly as a direct group message does.  The voids are
+        # fanned out to the console too, before on_message runs, so
+        # the bridge cache cannot seed them into the appended entry.
+        # The reconcile and the purge are separate attempts: a
+        # reconcile failure must not skip the purge.  A storage
+        # failure here never un-delivers the message — it is already
+        # recorded — but a failed purge withholds the live event:
+        # the reaction is still stored and still cached, so
+        # publishing it would display an unauthorized reaction.
+        purge_ok = True
         if recorded and pinned is not None:
-            # A relayed copy is an arrival too: reconcile stored
-            # reactions onto it and void non-members' reactions on
-            # it, exactly as a direct group message does.  The voids
-            # are fanned out to the console too, before on_message
-            # runs, so the bridge cache cannot seed them into the
-            # appended entry.  A storage failure here never
-            # un-delivers the message.
             try:
                 self.inbox.reconcile_group_reactions(
                     pinned["id"],
@@ -3342,6 +3356,12 @@ class TauNode:
                     message["id"],
                     members=set(pinned.get("members") or []),
                 )
+            except Exception:  # pragma: no cover - storage failure
+                log.warning(
+                    "Could not reconcile relayed group reactions",
+                    exc_info=True,
+                )
+            try:
                 voided = self.inbox.purge_non_member_reactions(
                     message["id"],
                     members=set(pinned.get("members") or []),
@@ -3350,10 +3370,11 @@ class TauNode:
                     self._publish_reaction(tombstone)
             except Exception:  # pragma: no cover - storage failure
                 log.warning(
-                    "Could not reconcile relayed group reactions",
+                    "Could not purge relayed non-member group reactions",
                     exc_info=True,
                 )
-        if recorded and self.on_message is not None:
+                purge_ok = False
+        if recorded and purge_ok and self.on_message is not None:
             try:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback

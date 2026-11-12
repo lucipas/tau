@@ -1782,6 +1782,130 @@ def test_group_reaction_purge_clears_console_cache_for_relayed_copy(tmp_path):
         bridge.stop()
 
 
+def test_group_message_not_published_when_purge_fails(tmp_path, monkeypatch):
+    # CodeRabbit follow-up (node.py:1664): if the purge fails, the
+    # voided reaction is still stored and still cached, so publishing
+    # the live event would display it.  The arrival fails closed:
+    # the message is recorded durably, but no live event is published.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id("ab" * 16, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+
+        def _fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(node.inbox, "purge_non_member_reactions", _fail)
+        delivered = call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "crew hello",
+                message_id="local-copy-1",
+                group_id=group,
+                group_name="crew",
+                creator="ab" * 16,
+                members=members,
+                sent_at=100.0,
+            ),
+            remote_identity=author,
+        )
+        assert delivered["ok"] is True
+        assert published == []
+        assert len(node.inbox.list_messages()) == 1
+        assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    finally:
+        bridge.stop()
+
+
+def test_relayed_reconcile_failure_does_not_skip_purge(tmp_path, monkeypatch):
+    # CodeRabbit follow-up: on the relayed path the reconcile and the
+    # purge shared one try block, so a reconcile failure skipped the
+    # purge and the message published with the reaction.  The purge
+    # runs independently now, and the live entry publishes clean.
+    from tau.webapi import WebBridge
+
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        published: list = []
+
+        def _capture(record):
+            message = bridge.record_inbound(record)
+            if message is not None:
+                published.append(message)
+
+        node.on_message = _capture
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+
+        def _fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(node.inbox, "reconcile_group_reactions", _fail)
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="local-copy-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        message = open_message(recipient, blob)
+        assert node._deliver_collected(message) is True
+        assert node.inbox.reactions_for("local-copy-1") == []
+        assert len(published) == 1
+        assert published[0]["reactions"] == []
+    finally:
+        bridge.stop()
+
+
 def test_reaction_denied_by_allow_list(tmp_path):
     from tau.allowlist import AllowList, save_allowlist
 
