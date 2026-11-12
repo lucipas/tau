@@ -35,8 +35,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     ProtocolError,
     clean_in_reply_to,
+    excerpt_hash,
+    generate_message_id,
+    normalize_message,
     normalize_message_kind,
 )
 from .util import atomic_write_json, read_json
@@ -131,6 +135,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if not math.isfinite(read_at):
             return None
+    edited_at = raw.get("edited_at")
+    if edited_at is not None:
+        try:
+            edited_at = float(edited_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
     expires_at = raw.get("expires_at")
     if expires_at is not None:
         try:
@@ -167,12 +179,35 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["receipt_sent_at"] = receipt_sent_at
     if read_at is not None:
         record["read_at"] = read_at
+    if edited_at is not None:
+        record["edited_at"] = edited_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    leg_ids = raw.get("leg_ids")
+    if isinstance(leg_ids, list):
+        # One record per group send keeps every leg id, so any leg can
+        # be quoted; the list is cleaned like an id, and a record with
+        # no usable leg id keeps none.
+        cleaned_legs = []
+        for leg in leg_ids:
+            if (
+                isinstance(leg, str)
+                and leg
+                and len(leg) <= 64
+                and leg not in cleaned_legs
+            ):
+                cleaned_legs.append(leg)
+        if cleaned_legs:
+            record["leg_ids"] = cleaned_legs
     if raw.get("pinned"):
         record["pinned"] = True
     kind = raw.get("kind")
-    if kind == "group":
+    if kind == NOTE_KIND:
+        # A note to self (``tau note``): local-only, written straight
+        # into the inbox, never received from a peer — the wire parser
+        # rejects it, so a stored ``note`` record is always our own.
+        record["kind"] = NOTE_KIND
+    elif kind == "group":
         group_id = raw.get("group")
         if not isinstance(group_id, str) or len(group_id) != 32:
             return None
@@ -512,8 +547,16 @@ class Inbox:
     peer registry and mailbox; a failed write only logs a warning.
     """
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else None
+        # A read-only inbox (dry runs) filters expired messages in memory
+        # but never persists the automatic expiry purge.
+        self._read_only = read_only
         self._lock = threading.RLock()
         self._txn_depth = 0
         self._messages: List[Dict[str, Any]] = []
@@ -571,7 +614,7 @@ class Inbox:
                         "last_read_id": entry.get("id"),
                     }
         self._read_cursors = cursors
-        if purged:
+        if purged and not self._read_only:
             # Disappearing messages whose deadline passed are gone for
             # good: persist the purge so a later load does not resurrect
             # them, and so `tau messages` never shows an expired entry.
@@ -681,6 +724,69 @@ class Inbox:
             self._save()
         return entry
 
+    def add_note(self, text: str, *, sender_name: str, destination: str) -> Dict[str, Any]:
+        """Store a private note to self in the inbox and return it.
+
+        A note is an inbox record with kind ``note``, from this node to
+        itself: it shows in the received-message listing, is found by
+        search and the ``note`` kind filter, and is deleted, pruned,
+        exported and imported like any other stored message.  It never
+        touches the wire — no send, no queue, no announce.  The text
+        is validated like a message body (empty and over-long notes are
+        refused).  The note is read the moment it is written: the read
+        cursor for this node's own destination is advanced past it, so
+        it never counts as unread and never shows the unread marker.
+        The cursor is keyed by destination, and no peer message ever
+        carries our own hash, so the advance touches notes only.
+        """
+        cleaned = normalize_message(text)
+        now = time.time()
+        record = _valid_record(
+            {
+                "from": sender_name,
+                "destination": destination,
+                "text": cleaned,
+                "sent_at": now,
+                "received_at": now,
+                "id": generate_message_id(),
+                "direction": "in",
+                "kind": NOTE_KIND,
+            }
+        )
+        if record is None:
+            raise ValueError("inbox record needs text")
+        # Store and read in one transaction: a note is never persisted
+        # without its read cursor, and a failed write raises instead of
+        # reporting a saved note.
+        with self._transaction():
+            previous_messages = list(self._messages)
+            previous_cursors = dict(self._read_cursors)
+            record["seq"] = self._next_seq()
+            self._messages.append(record)
+            self._messages = _retain(self._messages)
+            self._advance_own_cursor(record)
+            try:
+                self._save(strict=True)
+            except OSError:
+                self._messages = previous_messages
+                self._read_cursors = previous_cursors
+                raise
+        return record
+
+    def _advance_own_cursor(self, entry: Dict[str, Any]) -> None:
+        """Move this node's read cursor up to a note (caller holds the lock).
+
+        The cursor is keyed by destination, and no peer message carries
+        our own hash, so this only ever marks notes read.
+        """
+        destination = entry.get("destination") or ""
+        current = self._read_cursors.get(destination)
+        if current is None or current["last_read_seq"] < entry["seq"]:
+            self._read_cursors[destination] = {
+                "last_read_seq": entry["seq"],
+                "last_read_id": entry.get("id"),
+            }
+
     def delete(self, ref: str) -> Dict[str, Any]:
         """Remove one stored message by full id or unique prefix.
 
@@ -706,6 +812,85 @@ class Inbox:
                     f"could not persist inbox; message was not deleted: {exc}"
                 ) from exc
         return dict(removed)
+
+
+    def prune(
+        self,
+        older_than: float,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        dry_run: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Delete stored messages older than *older_than* seconds.
+
+        The cutoff is arrival time (``received_at``), the same clock
+        the retention cap and the expiry purge use, so a sent record
+        prunes on when this node stored it.  ``peer`` scopes the prune
+        to one sender destination hash and ``group`` to one group id;
+        both may be given, and both must match.  Reactions targeting a
+        pruned message go with it, so no orphaned reaction rows linger.
+        Read cursors are untouched: they are sequence numbers, so they
+        stay valid after older records are gone, and unread counts for
+        surviving messages are unchanged.  The outbox is never touched:
+        a queued message to an offline peer is not history.  Sent
+        history is a separate store: the mailbox keeps its own sent
+        log (what ``tau messages --sent`` shows), so pruning the inbox
+        does not erase sent text from there.  A dry run
+        reports the count without deleting or saving.
+
+        Returns ``{"pruned": n, "per_peer": {destination: n},
+        "dry_run": bool}``.
+        """
+        if not older_than > 0:
+            raise InboxError("prune cutoff must be positive")
+        cutoff = (now if now is not None else time.time()) - older_than
+        with self._transaction():
+            doomed = [
+                entry
+                for entry in self._messages
+                if float(entry.get("received_at") or 0.0) < cutoff
+                and (peer is None or (entry.get("destination") or "") == peer)
+                and (group is None or entry.get("group") == group)
+            ]
+            per_peer: Dict[str, int] = {}
+            for entry in doomed:
+                destination = entry.get("destination") or ""
+                per_peer[destination] = per_peer.get(destination, 0) + 1
+            if dry_run or not doomed:
+                return {
+                    "pruned": len(doomed),
+                    "per_peer": per_peer,
+                    "dry_run": dry_run,
+                }
+            pruned_ids = {
+                str(entry.get("id"))
+                for entry in doomed
+                if isinstance(entry.get("id"), str) and entry.get("id")
+            }
+            previous_messages = self._messages
+            previous_reactions = self._reactions
+            doomed_ids = {id(entry) for entry in doomed}
+            self._messages = [
+                entry for entry in self._messages if id(entry) not in doomed_ids
+            ]
+            self._reactions = [
+                reaction
+                for reaction in self._reactions
+                if reaction.get("target") not in pruned_ids
+            ]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous_messages
+                self._reactions = previous_reactions
+                raise InboxError(
+                    f"could not persist inbox; messages were not pruned: {exc}"
+                ) from exc
+            return {"pruned": len(doomed), "per_peer": per_peer, "dry_run": False}
+
 
     def pin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
         """Pin one stored message by full id or unique prefix.
@@ -799,6 +984,78 @@ class Inbox:
                 return dict(removed)
             return None
 
+
+    def apply_edit(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        edited_at: float,
+        direction: Optional[str] = None,
+        destination: Optional[str] = None,
+        newer_than_existing: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Replace one stored message's text, marking when it was edited.
+
+        Returns the updated record, or ``None`` when no stored message
+        has that id.  The id matches exactly — callers resolve a prefix
+        to the full id first.  File records carry no text, so an edit
+        naming one is refused with :class:`InboxError` instead of
+        silently rewriting a file entry.  The write runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this edit runs.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise InboxError("message id must not be empty")
+        if not isinstance(text, str) or not text:
+            raise InboxError("edited text must not be empty")
+        with self._transaction():
+            target = None
+            for entry in self._messages:
+                if entry.get("id") == message_id:
+                    target = entry
+                    break
+            if target is None:
+                return None
+            if target.get("kind") == "file":
+                raise InboxError("a file record has no text to edit")
+            if direction is not None or destination is not None:
+                # Re-check ownership inside the transaction: a snapshot
+                # taken by the caller can be stale under a racing edit.
+                if target.get("kind") == "group":
+                    return None
+                if direction is not None and target.get("direction") != direction:
+                    return None
+                if destination is not None and (
+                    target.get("destination") or ""
+                ) != destination:
+                    return None
+            if newer_than_existing:
+                # Never let an older edit overwrite a newer stored one.
+                stored_edited_at = target.get("edited_at")
+                if (
+                    isinstance(stored_edited_at, (int, float))
+                    and float(edited_at) <= float(stored_edited_at)
+                ):
+                    return None
+            previous_text = target.get("text")
+            previous_edited_at = target.get("edited_at")
+            target["text"] = text
+            target["edited_at"] = float(edited_at)
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                target["text"] = previous_text
+                if previous_edited_at is None:
+                    target.pop("edited_at", None)
+                else:
+                    target["edited_at"] = previous_edited_at
+                raise InboxError(
+                    f"could not persist inbox; message was not edited: {exc}"
+                ) from exc
+        return dict(target)
+
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
 
@@ -856,6 +1113,8 @@ class Inbox:
                 and item.get("id")
                 and item.get("read_at") is not None
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
 
     def mark_receipt_sent(
@@ -896,6 +1155,8 @@ class Inbox:
                 if isinstance(item.get("id"), str)
                 and item.get("id")
                 and item.get("receipt_sent_at") is None
+                # Notes are local-only: never owed a receipt.
+                and item.get("kind") != NOTE_KIND
             ]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1175,9 +1436,21 @@ class Inbox:
                     allowed,
                     time.time(),
                 )
-                entry["seq"] = self._next_seq()
-                self._messages.append(entry)
-                self._messages = _retain(self._messages)
+                if isinstance(message_id, str) and message_id and any(
+                    m.get("id") == message_id for m in self._messages
+                ):
+                    # A retry after a failed seen-marker write: the
+                    # copy is already here.  Skip the append so the
+                    # retry does not store a second copy — at the cap
+                    # that duplicate would evict unrelated history —
+                    # but still persist the reconcile/purge above and
+                    # return the tombstones, so the caller can finish
+                    # mark_seen and the delivery resolves.
+                    pass
+                else:
+                    entry["seq"] = self._next_seq()
+                    self._messages.append(entry)
+                    self._messages = _retain(self._messages)
                 if not self._save():
                     raise OSError(f"could not persist inbox to {self.path}")
             except OSError:
@@ -1271,6 +1544,14 @@ class Inbox:
             for entry in self._messages:
                 if entry.get("id") == value:
                     return dict(entry)
+            # A group send stores one leg id as the record id and the
+            # rest in leg_ids: a reaction naming any leg must resolve
+            # to the same record, exactly as find() already does.  An
+            # exact leg match beats a prefix match on a canonical id.
+            for entry in reversed(self._messages):
+                legs = entry.get("leg_ids")
+                if isinstance(legs, list) and value in legs:
+                    return dict(entry)
             matches = [
                 entry
                 for entry in self._messages
@@ -1289,7 +1570,7 @@ class Inbox:
         limit: Optional[int] = None,
         peer: Optional[str] = None,
         query: Optional[str] = None,
-        group: Optional[str] = None,
+        group: Optional[Union[str, List[str]]] = None,
         kind: Optional[str] = None,
         direction: Optional[str] = "in",
         pinned_only: bool = False,
@@ -1297,8 +1578,9 @@ class Inbox:
         """Received messages, newest first.
 
         ``peer`` filters to one sender destination hash; ``group``
-        filters to one group id; ``kind`` filters to one message kind;
-        ``query`` keeps only messages whose
+        filters to one group id, or to several (a group plus its rename
+        predecessors, so history spans renames); ``kind`` filters to
+        one message kind; ``query`` keeps only messages whose
         text contains it (case-insensitive substring); ``limit`` caps
         how many are returned (``None`` means all of them).  Sent
         messages are recorded here too — a reply quotes the sender's
@@ -1338,10 +1620,11 @@ class Inbox:
                 if needle in str(item.get("text") or "").casefold()
             ]
         if group is not None:
+            group_ids = {group} if isinstance(group, str) else set(group)
             entries = [
                 item
                 for item in entries
-                if item.get("kind") == "group" and item.get("group") == group
+                if item.get("kind") == "group" and item.get("group") in group_ids
             ]
         if kind is not None:
             entries = [item for item in entries if item.get("kind") == kind]
@@ -1367,9 +1650,17 @@ class Inbox:
         return annotated
 
     def _unread_counts_locked(self) -> Dict[str, Any]:
-        """Per-conversation unread counts from the in-memory state."""
+        """Per-conversation unread counts from the in-memory state.
+
+        Only received messages count: a reply this node sent is never
+        unread for its owner, so sent records past the cursor must not
+        inflate the counts (see :meth:`mark_unread`, which reports the
+        same received-only totals).
+        """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
+            if entry.get("direction") != "in":
+                continue
             if _is_unread(
                 entry, self._read_cursors.get(entry.get("destination") or "")
             ):
@@ -1437,12 +1728,79 @@ class Inbox:
             self._save()
             return self._unread_counts_locked()
 
-    def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def mark_unread(
+        self, peer: str, *, all: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Move a conversation's read cursor back so mail shows unread again.
+
+        ``tau messages`` marks what it shows as read, so a read DM the
+        owner has not answered yet disappears from the unread view.
+        This is the way back: by default the newest received message for
+        the peer becomes unread again; ``all=True`` clears the cursor so
+        the whole conversation shows unread.  Only the local display
+        state moves — a read receipt already sent for a message stays
+        sent, and a delayed ``mark_read`` still cannot move a cursor
+        backward on its own.  A peer with no stored messages is left
+        alone and the return is ``None``; otherwise the unread counts
+        after the mark.  Raises ``OSError`` when the moved cursor
+        cannot be persisted, leaving the in-memory cursor untouched.
+        """
+        with self._transaction():
+            # Only received messages count: a reply we sent must neither
+            # stand in for the unread reminder nor satisfy the presence check.
+            entries = [
+                entry
+                for entry in self._messages
+                if (entry.get("destination") or "") == peer
+                and entry.get("direction") == "in"
+            ]
+            if not entries:
+                return None
+            snapshot = dict(self._read_cursors)
+            if all:
+                self._read_cursors.pop(peer, None)
+            else:
+                newest = max(entries, key=lambda entry: entry["seq"])
+                cursor = self._read_cursors.get(peer)
+                # Already unread: the newest received message is past the cursor.
+                if not _is_unread(newest, cursor):
+                    earlier = [
+                        entry for entry in entries if entry["seq"] < newest["seq"]
+                    ]
+                    if not earlier:
+                        self._read_cursors.pop(peer, None)
+                    else:
+                        # The newest is read, so the cursor is at or past it;
+                        # stepping to the previous received message only moves backward.
+                        previous = max(earlier, key=lambda entry: entry["seq"])
+                        self._read_cursors[peer] = {
+                            "last_read_seq": previous["seq"],
+                            "last_read_id": previous.get("id"),
+                        }
+            if self._read_cursors != snapshot:
+                try:
+                    self._save(strict=True)
+                except OSError:
+                    self._read_cursors = snapshot
+                    raise
+            return self._unread_counts_locked()
+
+
+    def find(
+        self,
+        message_id: str,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Newest record with this wire id, optionally in one conversation.
 
         Quote resolution is scoped to the conversation: a reply
         reference only resolves against a message with the same peer,
-        so a reference to another peer's message never renders.
+        so a reference to another peer's message never renders.  For
+        a group message the conversation is the group instead: pass
+        ``group`` and the match is scoped to that group's messages,
+        from any member.
         """
         if not isinstance(message_id, str) or not message_id:
             return None
@@ -1450,19 +1808,24 @@ class Inbox:
             entries = list(self._messages)
         for item in reversed(entries):
             if item.get("id") != message_id:
-                continue
+                legs = item.get("leg_ids")
+                if not (isinstance(legs, list) and message_id in legs):
+                    continue
             if peer is not None and item.get("destination") != peer:
+                continue
+            if group is not None and item.get("group") != group:
                 continue
             return dict(item)
         return None
 
     def find_prefix(
-        self, prefix: str, *, peer: Optional[str] = None
+        self, prefix: str, *, peer: Optional[str] = None, group: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Records whose wire id starts with *prefix*, newest first.
 
         Used to resolve ``tau send --reply-to``: the prefix must match
-        exactly one message in the conversation.
+        exactly one message in the conversation.  ``group`` scopes the
+        match to one group's messages instead of one peer's.
         """
         if not isinstance(prefix, str) or not prefix:
             return []
@@ -1474,12 +1837,58 @@ class Inbox:
             message_id = item.get("id")
             if not isinstance(message_id, str):
                 continue
-            if not message_id.lower().startswith(value):
+            legs = item.get("leg_ids")
+            leg_match = isinstance(legs, list) and any(
+                isinstance(leg, str) and leg.lower().startswith(value)
+                for leg in legs
+            )
+            if not message_id.lower().startswith(value) and not leg_match:
                 continue
             if peer is not None and item.get("destination") != peer:
                 continue
+            if group is not None and item.get("group") != group:
+                continue
             matches.append(dict(item))
         return matches
+
+    def find_by_excerpt(
+        self, excerpt: str, *, group: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Newest record whose text hashes to *excerpt*, optionally in one group.
+
+        Group legs carry per-member ids, so the member who quoted a
+        message may name a leg id this node never held — but every
+        member holds the same text, so the excerpt hash (see
+        :func:`tau.protocol.excerpt_hash`) still identifies the quoted
+        message within the group.  Used to render a group quote whose
+        leg id is not in the local inbox.  When several messages in
+        the group share the text under different authors, the quote
+        cannot be attributed — ``None`` instead of naming the wrong
+        author.
+        """
+        if not isinstance(excerpt, str) or not excerpt:
+            return None
+        wanted = excerpt.strip().lower()
+        with self._lock:
+            entries = list(self._messages)
+        matches = []
+        for item in reversed(entries):
+            if group is not None and item.get("group") != group:
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            if excerpt_hash(text) == wanted:
+                matches.append(item)
+        if not matches:
+            return None
+        authors = {
+            (str(item.get("destination") or ""), item.get("direction"))
+            for item in matches
+        }
+        if len(authors) > 1:
+            return None
+        return dict(matches[0])
 
     def export_document(self, *, peer: Optional[str] = None) -> Dict[str, Any]:
         """Return a portable backup of the stored messages.

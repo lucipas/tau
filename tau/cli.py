@@ -45,6 +45,7 @@ from .bundle import (
     DEFAULT_MAX_BUNDLE_BYTES,
     apply_bundle,
     build_bundle,
+    inspect_bundle,
     parse_bundle,
     serialize_bundle,
 )
@@ -66,7 +67,15 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
-from .groups import GroupStore
+from .groups import GroupStore, pinned_rosters, visible_reactions
+from .ignored_groups import (
+    IgnoredGroups,
+    IgnoredGroupsError,
+    ignored_groups_lock,
+    load_ignored_group_ids,
+    load_ignored_groups,
+    save_ignored_groups,
+)
 from .inbox import Inbox, InboxError
 from .lxmf import lxmf_delivery_hash
 from .mailbox import Mailbox, MailboxError
@@ -82,6 +91,7 @@ from .peers import Peer, PeerError, PeerRegistry, safety_number
 from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
+    NOTE_KIND,
     MAX_MAIL_TTL,
     MAX_MESSAGE_CHARS,
     PROTOCOL_VERSION,
@@ -89,6 +99,7 @@ from .protocol import (
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
+    normalize_message,
     normalize_message_kind,
     sanitize_name,
     short_hash,
@@ -486,6 +497,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     send_file.set_defaults(func=cmd_send_file)
 
+    # A note is a message to self that never leaves the machine, so it
+    # gets its own subcommand instead of overloading `send --to <self>`
+    # (which would queue forever: the send path has no self case).
+    note = subparsers.add_parser(
+        "note",
+        parents=[common],
+        help="save a private note to self in the local inbox",
+    )
+    note.add_argument(
+        "message", nargs="?", help="note text (reads stdin when omitted)"
+    )
+    note.add_argument("--file", type=Path, help="read the note from a file")
+    note.set_defaults(func=cmd_note)
+
     react = subparsers.add_parser(
         "react",
         parents=[common],
@@ -578,6 +603,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     retract.set_defaults(func=cmd_retract)
+
+    edit = subparsers.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a message you sent",
+    )
+    edit.add_argument(
+        "target",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    edit.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    edit.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    edit.set_defaults(func=cmd_edit)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -1048,6 +1097,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print per-peer unread counts instead of listing messages",
     )
+    messages.add_argument(
+        "--ignored",
+        action="store_true",
+        help="only show messages from ignored groups",
+    )
     messages.set_defaults(func=cmd_messages)
 
     messages_sub = messages.add_subparsers(metavar="COMMAND")
@@ -1060,6 +1114,23 @@ def build_parser() -> argparse.ArgumentParser:
         "target", metavar="ID", help="message id or unique id prefix"
     )
     messages_delete.set_defaults(func=cmd_messages_delete)
+
+    messages_unread = messages_sub.add_parser(
+        "unread",
+        parents=[common],
+        help="mark a conversation unread again so it shows in the unread view",
+    )
+    messages_unread.add_argument(
+        "peer",
+        metavar="PEER",
+        help="peer name, destination hash or hash prefix",
+    )
+    messages_unread.add_argument(
+        "--all",
+        action="store_true",
+        help="mark the whole conversation unread instead of just the newest message",
+    )
+    messages_unread.set_defaults(func=cmd_messages_unread)
 
     messages_export = messages_sub.add_parser(
         "export",
@@ -1093,6 +1164,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_import.set_defaults(func=cmd_messages_import)
 
+    messages_prune = messages_sub.add_parser(
+        "prune",
+        parents=[common],
+        help="delete stored messages older than a cutoff",
+    )
+    messages_prune.add_argument(
+        "--older-than",
+        required=True,
+        metavar="DURATION",
+        help="delete messages older than this (e.g. 30s, 5m, 2h, 7d, 90d; at most 10y)",
+    )
+    messages_prune.add_argument(
+        "--peer",
+        # SUPPRESS, not None: the parent `messages` parser also defines
+        # --peer, and a subparser default of None would silently discard
+        # a scope flag given before `prune` (e.g. `messages --peer alice
+        # prune ...`). With SUPPRESS the parent value survives.
+        default=argparse.SUPPRESS,
+        metavar="NAME|HASH",
+        help="only prune messages exchanged with this peer (name, hash or hash prefix)",
+    )
+    messages_prune.add_argument(
+        "--group",
+        # Same as --peer above: preserve a --group given before `prune`.
+        default=argparse.SUPPRESS,
+        metavar="ID|NAME",
+        help="only prune messages from this group (id, id prefix or name)",
+    )
+    messages_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be pruned without deleting anything",
+    )
+    messages_prune.set_defaults(func=cmd_messages_prune)
+
     group = subparsers.add_parser(
         "group",
         parents=[common],
@@ -1106,7 +1212,9 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="create a group with a fixed member list",
     )
-    group_create.add_argument("name", help="group name")
+    group_create.add_argument(
+        "group_name", metavar="NAME", help="group name"
+    )
     group_create.add_argument(
         "--peer",
         required=True,
@@ -1140,6 +1248,60 @@ def build_parser() -> argparse.ArgumentParser:
         "group", metavar="GROUP", help="group id, id prefix or name"
     )
     group_delete.set_defaults(func=cmd_group_delete)
+
+    group_leave = group_sub.add_parser(
+        "leave",
+        parents=[common],
+        help="leave a group you joined (stops its messages for good)",
+    )
+    group_leave.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_leave.set_defaults(func=cmd_group_leave)
+
+    group_rejoin = group_sub.add_parser(
+        "rejoin",
+        parents=[common],
+        help="undo a leave so the next message pins the group again",
+    )
+    group_rejoin.add_argument(
+        "group", metavar="ID", help="full id of a group this node left"
+    )
+    group_rejoin.set_defaults(func=cmd_group_rejoin)
+
+    group_left = group_sub.add_parser(
+        "left",
+        parents=[common],
+        help="list groups this node has left",
+    )
+    group_left.set_defaults(func=cmd_group_left)
+
+    group_ignore = group_sub.add_parser(
+        "ignore",
+        parents=[common],
+        help="hide a group's messages from the default `tau messages` listing",
+    )
+    group_ignore.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_ignore.set_defaults(func=cmd_group_ignore)
+
+    group_unignore = group_sub.add_parser(
+        "unignore",
+        parents=[common],
+        help="show an ignored group's messages in `tau messages` again",
+    )
+    group_unignore.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_unignore.set_defaults(func=cmd_group_unignore)
+
+    group_ignored = group_sub.add_parser(
+        "ignored",
+        parents=[common],
+        help="list ignored groups",
+    )
+    group_ignored.set_defaults(func=cmd_group_ignored)
 
     group_add_member = group_sub.add_parser(
         "add-member",
@@ -1191,6 +1353,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_remove_member.set_defaults(func=cmd_group_remove_member)
 
+    group_topic = group_sub.add_parser(
+        "topic",
+        parents=[common],
+        help="set or show the topic of a group you created",
+    )
+    group_topic.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_topic.add_argument(
+        "text",
+        nargs="?",
+        help="topic text (omit to show the current topic)",
+    )
+    group_topic.add_argument(
+        "--file", type=Path, help="read the topic text from a file"
+    )
+    group_topic.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the topic instead of setting one",
+    )
+    group_topic.set_defaults(func=cmd_group_topic)
+    group_rename = group_sub.add_parser(
+        "rename",
+        parents=[common],
+        help="rename a group you created",
+    )
+    group_rename.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_rename.add_argument(
+        "new_name", metavar="NAME", help="the new group name"
+    )
+    group_rename.set_defaults(func=cmd_group_rename)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -1205,6 +1402,11 @@ def build_parser() -> argparse.ArgumentParser:
     group_send.add_argument("--file", type=Path, help="read the message from a file")
     group_send.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
     group_send.add_argument(
+        "--reply-to",
+        metavar="ID|PREFIX",
+        help="quote an earlier message in this group (message id or unique prefix)",
+    )
+    group_send.add_argument(
         "--discover-timeout",
         type=float,
         default=10.0,
@@ -1216,7 +1418,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of queueing the message when a member is offline",
     )
+    group_send.add_argument(
+        "--expire",
+        metavar="DURATION",
+        help="disappearing message: purge it from the receivers' inboxes "
+        "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
+    )
     group_send.set_defaults(func=cmd_group_send)
+
+    group_send_file = group_sub.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a file to every member of a group",
+    )
+    group_send_file.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    group_send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long each member's transfer may take (default 300)",
+    )
+    group_send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_send_file.set_defaults(func=cmd_group_send_file)
 
     tan = subparsers.add_parser(
         "tan",
@@ -1798,6 +2033,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bundle_import.set_defaults(func=cmd_bundle_import)
 
+    bundle_inspect = bundle_sub.add_parser(
+        "inspect",
+        parents=[common],
+        help="describe a bundle file without importing it",
+    )
+    bundle_inspect.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='bundle file to read ("-" reads stdin)',
+    )
+    bundle_inspect.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to read a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_inspect.set_defaults(func=cmd_bundle_inspect)
+
     return parser
 
 
@@ -1910,20 +2165,57 @@ def _next_try_at(entry: Any) -> Optional[float]:
 
 
 
-_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 7 * 86400,
+    "y": 365 * 86400,
+}
+
+# A prune cutoff may reach years back; the 30-day mail TTL cap only
+# applies to disappearing messages, never to pruning old history.
+_PRUNE_MAX_SECONDS = 10 * 365 * 24 * 60 * 60
 
 
-def _parse_duration(value: str, *, flag: str = "--expire") -> float:
-    """Parse a ``--expire``/``--delay`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _describe_duration(seconds: float) -> str:
+    """Shortest whole-unit rendering of a duration in seconds."""
+    for suffix, size in (
+        ("y", 365 * 86400),
+        ("w", 7 * 86400),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60),
+        ("s", 1),
+    ):
+        if seconds >= size and seconds % size == 0:
+            return f"{int(seconds // size)}{suffix}"
+    return f"{seconds:g}s"
+
+
+def _parse_duration(
+    value: str,
+    *,
+    max_seconds: float = MAX_MAIL_TTL,
+    label: str = "--expire",
+    flag: Optional[str] = None,
+) -> float:
+    """Parse a ``--expire``/``--delay``/``--older-than`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
-    longer than the mail TTL (a disappearing message cannot outlive
-    the store-and-forward envelope that might carry it).
+    longer than *max_seconds* (the mail TTL by default: a disappearing
+    message cannot outlive the store-and-forward envelope that might
+    carry it).
     """
+    if flag is not None:
+        # Main's `--delay` caller names the flag this way; the prune
+        # caller names it `label`.  Both mean the flag shown in errors.
+        label = flag
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError(f"{flag} needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{label} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -1932,13 +2224,15 @@ def _parse_duration(value: str, *, flag: str = "--expire") -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid {flag} duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {label} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError(f"{flag} duration must be positive")
-    if seconds > MAX_MAIL_TTL:
-        raise ValueError(f"{flag} duration must be at most 30d")
+        raise ValueError(f"{label} duration must be positive")
+    if seconds > max_seconds:
+        raise ValueError(
+            f"{label} duration must be at most {_describe_duration(max_seconds)}"
+        )
     return seconds
 
 def _print_peer_table(
@@ -3681,6 +3975,165 @@ def cmd_bundle_import(args: argparse.Namespace) -> int:
     return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
 
 
+def _bundle_inspect_names(
+    config: TauConfig, summary: Dict[str, Any]
+) -> Dict[str, str]:
+    """Best-effort display names for the hashes in an inspect summary.
+
+    Names are a convenience only — the registry is read, never
+    written, and a missing or unreadable registry leaves every hash
+    unnamed rather than failing the inspect.
+    """
+    try:
+        registry = PeerRegistry(config.peers_path)
+    except (OSError, ValueError):
+        return {}
+    hashes = set()
+    for value in (
+        [summary.get("exporter")]
+        + [entry.get("to") for entry in summary.get("mail", [])]
+        + [
+            entry.get("author")
+            for entry in summary.get("tan", [])
+            if entry.get("author")
+        ]
+    ):
+        # Only strings can be looked up; a malformed recipient (a
+        # list or object in a signed bundle) stays unnamed instead
+        # of crashing the lookup with an unhashable value.
+        if isinstance(value, str) and value:
+            hashes.add(value)
+    names: Dict[str, str] = {}
+    for hexhash in hashes:
+        try:
+            peer = registry.get(hexhash)
+        except (ValueError, TypeError):
+            continue
+        if peer is not None:
+            names[hexhash] = peer.display_name
+    return names
+
+
+def cmd_bundle_inspect(args: argparse.Namespace) -> int:
+    """Describe a bundle file without importing it.
+
+    Read-only by construction: no identity is loaded and no mailbox
+    or Tan store is opened, so this works on a data directory that
+    has never run ``tau init`` and leaves local state untouched.  The
+    container signature is verified by :func:`parse_bundle` before
+    anything is listed, so a tampered bundle is rejected whole.
+    """
+    max_bytes = int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES))
+    if max_bytes <= 0:
+        raise NodeError("max bundle size must be positive")
+    # Read at most one byte past the cap, so an oversized input is
+    # detected without being loaded whole.
+    if str(args.file) == "-":
+        raw = sys.stdin.buffer.read(max_bytes + 1)
+    else:
+        try:
+            with Path(args.file).expanduser().open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    if len(raw) > max_bytes:
+        raise NodeError(f"bundle is over the {max_bytes} byte cap")
+    document = parse_bundle(raw, max_bytes=max_bytes)
+    summary = inspect_bundle(document)
+    try:
+        names = _bundle_inspect_names(_make_config(args), summary)
+    except (OSError, ValueError):
+        names = {}
+    exporter = summary.get("exporter")
+    summary["exporter_name"] = (
+        names.get(exporter) if isinstance(exporter, str) else None
+    )
+    for entry in summary["mail"]:
+        recipient = entry.get("to")
+        entry["to_name"] = (
+            names.get(recipient) if isinstance(recipient, str) else None
+        )
+    for entry in summary["tan"]:
+        author = entry.get("author")
+        entry["author_name"] = (
+            names.get(author) if isinstance(author, str) else None
+        )
+    if _json_mode(args):
+        _emit(summary, True)
+        return _EXIT_OK
+
+    def _when(value: Any) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            try:
+                return datetime.fromtimestamp(float(value)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except (OverflowError, OSError, ValueError):
+                return "out of range"
+        return "unknown"
+
+    def _who(hexhash: Any, name: Optional[str]) -> str:
+        if name:
+            return name
+        if isinstance(hexhash, str) and hexhash:
+            return _safe_id_prefix(hexhash)
+        return "?"
+
+    print(f"Bundle {summary.get('format')} v{summary.get('version')} — signature valid")
+    print(f"  exporter: {_who(exporter, summary['exporter_name'])}")
+    print(f"  created: {_when(summary.get('created_at'))}")
+    print(f"Sealed mail ({summary['mail_count']}):")
+    if not summary["mail"]:
+        print("  (none)")
+    for entry in summary["mail"]:
+        if not entry["valid"]:
+            ref = _safe_id_prefix(str(entry.get("id") or "")) or "?"
+            print(
+                f"  {ref} -> "
+                f"{_who(entry.get('to'), entry.get('to_name'))} "
+                f"— invalid: {entry.get('error')}"
+            )
+            continue
+        print(
+            f"  {_safe_id_prefix(str(entry.get('id') or ''))} -> "
+            f"{_who(entry.get('to'), entry.get('to_name'))}, "
+            f"expires {_when(entry.get('expires_at'))}"
+        )
+    print(f"Tan posts ({summary['tan_count']}):")
+    if summary.get("tan_error"):
+        print(f"  Tan section unusable: {summary['tan_error']}")
+    if not summary["tan"]:
+        print("  (none)")
+    for entry in summary["tan"]:
+        digest = entry.get("hash")
+        label = _safe_id_prefix(str(digest)) if digest else "?"
+        if entry["verified"]:
+            print(
+                f"  {label} {entry.get('kind')} by "
+                f"{_who(entry.get('author'), entry.get('author_name'))} "
+                f"({_when(entry.get('created_at'))}) — signature valid"
+            )
+        else:
+            # Raw metadata survives verification failure, labelled
+            # unverified: the author/kind/time are claims from the
+            # entry itself, not authenticated facts.
+            author = _who(entry.get("author"), entry.get("author_name"))
+            if entry.get("author"):
+                author += " (unverified)"
+            detail = ""
+            if entry.get("kind") or entry.get("created_at") is not None:
+                detail = (
+                    f" {_safe_text(str(entry.get('kind') or '?'))}"
+                    f" ({_when(entry.get('created_at'))})"
+                )
+            print(
+                f"  {label} by {author}{detail}"
+                f" — signature invalid: "
+                f"{_safe_text(str(entry.get('error') or ''))}"
+            )
+    return _EXIT_OK
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "lxmf_propagation", False) and not getattr(
         args, "lxmf", False
@@ -3740,6 +4193,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
             console_message(record)
             bridge.record_inbound(record)
 
+        def on_message_record_only(record: Dict[str, Any]) -> None:
+            # The live event is withheld, so the terminal stays quiet
+            # too — but the console history is written, so the copy
+            # is not invisible there.
+            bridge.record_inbound(record, publish=False)
+
         def on_file(record: Dict[str, Any]) -> None:
             console_file(record)
             # The console lists messages, not files: record the arrival
@@ -3763,6 +4222,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         node.on_peer = on_peer
         node.on_message = on_message
+        node.on_message_record_only = on_message_record_only
         node.on_file = on_file
 
         def on_retract(record: Dict[str, Any]) -> None:
@@ -4780,18 +5240,39 @@ def _retract_local_message(
     )
 
 
-def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send or a retraction.
+def _edit_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    text: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Edit one DM on the running node, for the local send server."""
+    return node.send_edit(
+        target,
+        message_id,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
 
-    The socket carries both, distinguished by ``op``: ``"send"`` (the
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send, a retraction, or an edit.
+
+    The socket carries all three, distinguished by ``op``: ``"send"`` (the
     default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"`` runs the
-    retraction on the serving node, so ``tau retract`` works while
-    ``tau serve`` holds the data directory.
+    :func:`_send_local_message`, while ``"retract"`` and ``"edit"`` run the
+    retraction and the edit on the serving node, so ``tau retract`` and
+    ``tau edit`` work while ``tau serve`` holds the data directory.
     """
     op = request.pop("op", "send")
     if op == "retract":
         return _retract_local_message(node, **request)
+    if op == "edit":
+        return _edit_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -4942,6 +5423,35 @@ def _retract_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _edit_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    text: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Edit through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="edit",
+            target=recipient,
+            message_id=message_id,
+            text=text,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-edit; retry the edit"
         ) from exc
 
 
@@ -5528,6 +6038,10 @@ def _send_displayed_receipts(
         if isinstance(entry.get("id"), str)
         and entry.get("id")
         and entry.get("receipt_sent_at") is None
+        # Notes are local-only: no peer is owed a receipt for one, and
+        # receipting our own destination would make the node try to
+        # discover itself.
+        and entry.get("kind") != NOTE_KIND
     ]
     if not unreceipted:
         return {"sent": 0, "queued": 0}
@@ -5628,6 +6142,10 @@ def _resolve_reply_target(
         candidates.setdefault(str(item["id"]), item)
     value = ref.lower()
     for entry in mailbox.outbox_list(to=bytes.fromhex(peer_hash)):
+        # A queued group leg to this peer is not a DM: its id belongs
+        # to the group send, so it must not resolve as a direct reply.
+        if entry.group_id is not None:
+            continue
         if entry.id.lower().startswith(value):
             candidates.setdefault(
                 entry.id, {"id": entry.id, "text": entry.text}
@@ -5646,13 +6164,83 @@ def _resolve_reply_target(
     return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
 
 
+def _resolve_group_reply_target(
+    inbox: Inbox, mailbox: Mailbox, ref: str, group_id: str
+) -> Dict[str, Any]:
+    """Resolve ``tau group send --reply-to`` to an ``in_reply_to`` wire reference.
+
+    Same rules as :func:`_resolve_reply_target`, scoped to the group
+    instead of a peer: the quoted message must be in this group's
+    history — a received message, one of this node's own sent legs,
+    or a still-queued leg — and a prefix matching more than one is
+    refused.
+    """
+    ref = ref.strip()
+    if not ref:
+        raise NodeError("--reply-to must not be empty")
+    candidates: Dict[str, Dict[str, Any]] = {}
+    # A group send is one inbox record with every leg id, and a queued
+    # leg is also an outbox entry: the same leg seen in both stores is
+    # one candidate, not two — otherwise quoting a queued leg's id is
+    # always refused as ambiguous.  A candidate is keyed by the leg id
+    # that matched the prefix, so the reference names the leg quoted;
+    # two legs of one send matching the same prefix still resolve to
+    # that one send.
+    covered_ids: Set[str] = set()
+    value = ref.lower()
+    for item in inbox.find_prefix(ref, group=group_id):
+        matched: Optional[str] = None
+        if str(item["id"]).lower().startswith(value):
+            matched = str(item["id"])
+        else:
+            for leg in item.get("leg_ids") or []:
+                if isinstance(leg, str) and leg.lower().startswith(value):
+                    matched = leg
+                    break
+        if matched is None:
+            continue
+        candidates.setdefault(
+            matched, {"id": matched, "text": str(item["text"])}
+        )
+        covered_ids.add(str(item["id"]))
+        for leg in item.get("leg_ids") or []:
+            if isinstance(leg, str):
+                covered_ids.add(leg)
+    for entry in mailbox.outbox_list():
+        if entry.group_id != group_id:
+            continue
+        if entry.id in covered_ids:
+            continue
+        if entry.id.lower().startswith(value):
+            candidates.setdefault(
+                entry.id, {"id": entry.id, "text": entry.text}
+            )
+    if len(candidates) > 1:
+        raise NodeError(
+            f"{len(candidates)} messages in this group match {ref!r};"
+            " use a longer prefix"
+        )
+    if not candidates:
+        raise NodeError(
+            f"no message {ref!r} in this group to reply to;"
+            " replies quote a message from this group's history"
+        )
+    quoted = next(iter(candidates.values()))
+    return {"id": str(quoted["id"]), "excerpt": excerpt_hash(str(quoted["text"]))}
+
+
 def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> Optional[str]:
     """Render one message's quote, or ``None`` when it has none.
 
     The quoted text is pulled from the local inbox, in the same
     conversation only; when the original is not there — or its text
     no longer matches the excerpt hash the sender quoted — the line
-    says so instead of trusting anything on the wire.
+    says so instead of trusting anything on the wire.  A group quote
+    is scoped to the group, not the replier: the quoted message may
+    be from any member.  Group legs also carry per-member ids, so a
+    member may hold the quoted text under a different leg id — when
+    the id is not held, the excerpt hash matches the same text
+    within the group instead.
     """
     reply_to = entry.get("in_reply_to")
     if not isinstance(reply_to, dict):
@@ -5660,8 +6248,14 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
     ref_id = reply_to.get("id")
     if not isinstance(ref_id, str) or not ref_id:
         return None
-    quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
+    group_id = entry.get("group")
     excerpt = reply_to.get("excerpt")
+    if isinstance(group_id, str) and group_id:
+        quoted = inbox.find(ref_id, group=group_id)
+        if quoted is None and isinstance(excerpt, str) and excerpt:
+            quoted = inbox.find_by_excerpt(excerpt, group=group_id)
+    else:
+        quoted = inbox.find(ref_id, peer=str(entry.get("destination") or ""))
     if quoted is None or (
         isinstance(excerpt, str)
         and excerpt
@@ -5729,7 +6323,8 @@ def _print_message_entry(
         if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
         else ""
     )
-    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}")
+    edited_suffix = " (edited)" if entry.get("edited_at") else ""
+    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}{edited_suffix}")
     if entry.get("kind") == "file":
         print(
             f"  file: {entry.get('name')} "
@@ -5764,8 +6359,13 @@ def cmd_messages(args: argparse.Namespace) -> int:
     if getattr(args, "peer", None):
         peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
     group_id = None
+    group_ids = None
     if getattr(args, "group", None):
-        group_id = GroupStore(config.groups_path).find(args.group)["id"]
+        group = GroupStore(config.groups_path).find(args.group)
+        group_id = group["id"]
+        # History spans renames: messages stored under a predecessor
+        # id still belong to this group.
+        group_ids = [group["id"], *(group.get("renamed_from") or [])]
     if getattr(args, "count", False):
         # A count is for scripting: it never advances the read cursor.
         counts = inbox.unread_counts()
@@ -5794,10 +6394,16 @@ def cmd_messages(args: argparse.Namespace) -> int:
         raise NodeError("--limit must not be negative")
     kind = getattr(args, "kind", None)
     if kind is not None:
-        try:
-            kind = normalize_message_kind(kind)
-        except ProtocolError as exc:
-            raise NodeError(str(exc)) from exc
+        # ``note`` is a reserved record kind, not a wire kind, so the
+        # normalizer would refuse it — but it is exactly the filter a
+        # user needs to list their own notes.
+        if isinstance(kind, str) and kind.strip().lower() == NOTE_KIND:
+            kind = NOTE_KIND
+        else:
+            try:
+                kind = normalize_message_kind(kind)
+            except ProtocolError as exc:
+                raise NodeError(str(exc)) from exc
     query = getattr(args, "search", None)
     if query is not None and not query.strip():
         raise NodeError("--search must not be empty")
@@ -5842,8 +6448,24 @@ def cmd_messages(args: argparse.Namespace) -> int:
     # that cannot be read hides everything, matching the node, which
     # blocks all senders on the same condition.
     entries = inbox.list_messages(
-        limit=None, peer=peer_hash, group=group_id, query=query, kind=kind
+        limit=None, peer=peer_hash, group=group_ids, query=query, kind=kind
     )
+    # A stored reaction from a non-member must never be displayed on
+    # a group message, even when the authorization recheck or its
+    # cleanup failed and left it in the inbox: filter the listed
+    # reactions against each group's pinned roster before anything
+    # prints or is emitted as JSON.  With no pinned roster there is
+    # nothing to check against.
+    rosters = pinned_rosters(
+        GroupStore(config.groups_path),
+        {str(entry.get("group")) for entry in entries if entry.get("group")},
+    )
+    for entry in entries:
+        group = entry.get("group")
+        if group and entry.get("reactions"):
+            entry["reactions"] = visible_reactions(
+                entry["reactions"], rosters.get(str(group))
+            )
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
         entries = []
@@ -5851,34 +6473,66 @@ def cmd_messages(args: argparse.Namespace) -> int:
         entries = [
             entry for entry in entries if entry.get("destination") not in blocked
         ]
-    # Archive membership is a direct-message concern only: a group
-    # post from an archived sender is still that group's mail, and
-    # groups keep their current listing.  --archived is an explicit
-    # archived-only view, so it applies even to searches and group
-    # listings; the default hiding (and its unread count) stays
-    # limited to plain listings, where a search is an explicit
-    # lookup that still finds archived mail.
+    # Ignoring a group is a display preference only: its posts stay
+    # stored and keep arriving, and an explicit view (--group, --search,
+    # --ignored) still shows them.  Archive membership is likewise a
+    # direct-message concern only: a group post from an archived sender
+    # is still that group's mail, and groups keep their current listing.
+    # --archived is an explicit archived-only view, so it applies even
+    # to searches and group listings.  The default hiding (and its unread
+    # count) stays limited to plain listings, where a search is an
+    # explicit lookup that still finds ignored-group or archived mail.
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
+    show_ignored = getattr(args, "ignored", False)
+    ignored_unread = 0
     archived_unread = 0
-    if show_archived:
+    if show_ignored and show_archived:
         entries = [
             entry
             for entry in entries
-            if entry.get("kind") != "group"
-            and entry.get("destination") in archived
+            if (entry.get("kind") == "group"
+                and str(entry.get("group") or "") in ignored)
+            or (entry.get("kind") != "group"
+                and entry.get("destination") in archived)
         ]
-    elif query is None and group_id is None and archived:
-        hidden = [
-            entry
-            for entry in entries
-            if entry.get("kind") != "group"
-            and entry.get("destination") in archived
-        ]
-        archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+    elif show_ignored:
         entries = [
             entry
             for entry in entries
             if entry.get("kind") == "group"
-            or entry.get("destination") not in archived
+            and str(entry.get("group") or "") in ignored
+        ]
+    elif show_archived:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("kind") != "group"
+            and entry.get("destination") in archived
+        ]
+    elif query is None and group_id is None:
+        if ignored:
+            hidden = [
+                entry
+                for entry in entries
+                if entry.get("kind") == "group"
+                and str(entry.get("group") or "") in ignored
+            ]
+            ignored_unread = sum(1 for entry in hidden if entry.get("unread"))
+        if archived:
+            hidden = [
+                entry
+                for entry in entries
+                if entry.get("kind") != "group"
+                and entry.get("destination") in archived
+            ]
+            archived_unread = sum(1 for entry in hidden if entry.get("unread"))
+        entries = [
+            entry
+            for entry in entries
+            if (entry.get("kind") != "group"
+                or str(entry.get("group") or "") not in ignored)
+            and (entry.get("kind") == "group"
+                or entry.get("destination") not in archived)
         ]
     # Filter before limiting, so --unread finds older unread mail even
     # when newer messages from the same listing are already read.
@@ -5899,6 +6553,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 "messages": shown,
                 "count": len(shown),
                 "more_unread": more_unread,
+                "ignored_unread": ignored_unread,
                 "archived_unread": archived_unread,
             },
             True,
@@ -5912,6 +6567,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             print(
                 "No unread messages." if unread_only else "No messages received yet."
             )
+        if ignored_unread:
+            _print_ignored_unread(ignored_unread)
         if archived_unread:
             _print_archived_unread(archived_unread)
     else:
@@ -5919,6 +6576,8 @@ def cmd_messages(args: argparse.Namespace) -> int:
             _print_message_entry(inbox, registry, entry)
         if more_unread:
             _print_more_unread(registry, more_unread)
+        if ignored_unread:
+            _print_ignored_unread(ignored_unread)
         if archived_unread:
             _print_archived_unread(archived_unread)
     # Reading a conversation advances its cursor to the newest message
@@ -5944,11 +6603,14 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 newest_shown.get(destination, 0), int(entry["seq"])
             )
         # A read cursor is per-sender, shared by DMs and group posts,
-        # so showing a group post would otherwise mark an older hidden
-        # DM read without the owner ever seeing it.  Cap each
-        # destination's advance just before its oldest unread message
-        # that this listing did not show — archived mail, or mail a
-        # filtered view (group, --archived) left out.  The capped
+        # A read cursor is per-sender, shared by DMs and group posts,
+        # so showing a DM would otherwise mark an older hidden group
+        # post read, and showing a group post would otherwise mark an
+        # older hidden DM read, without the owner ever seeing it.  Cap
+        # each destination's advance just before its oldest unread
+        # message that this listing did not show — ignored-group mail,
+        # archived mail, or mail a filtered view (group, --ignored,
+        # --archived) left out.  The capped
         # message stays unread until the owner displays it; the next
         # listing that does advances past it.
         shown_seqs = {int(entry["seq"]) for entry in shown}
@@ -6005,6 +6667,25 @@ def cmd_messages_delete(args: argparse.Namespace) -> int:
             " theirs, and sealed copies already held by relays are"
             " unaffected."
         )
+    return _EXIT_OK
+
+
+def cmd_messages_unread(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+    counts = inbox.mark_unread(peer_hash, all=getattr(args, "all", False))
+    if counts is None:
+        raise NodeError(f"no stored messages from {args.peer!r}")
+    peer = registry.get(peer_hash)
+    name = peer.display_name if peer is not None else short_hash(peer_hash)
+    unread = counts["per_peer"].get(peer_hash, 0)
+    if _json_mode(args):
+        _emit({"peer": peer_hash, "unread": unread, "total": counts["total"]}, True)
+    else:
+        noun = "message" if unread == 1 else "messages"
+        print(f"marked {unread} {noun} from {name} unread")
     return _EXIT_OK
 
 
@@ -6149,6 +6830,58 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
 
 
+def cmd_messages_prune(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    # A dry run must not persist an expiry purge: open the inbox read-only.
+    inbox = Inbox(config.inbox_path, read_only=dry_run)
+    registry = PeerRegistry(config.peers_path)
+    older_than = _parse_duration(
+        args.older_than,
+        max_seconds=_PRUNE_MAX_SECONDS,
+        label="--older-than",
+    )
+    peer_hash = None
+    group_id = None
+    scope_parts = []
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(peer_hash)
+        scope_parts.append(
+            "with "
+            + (peer.display_name if peer is not None else short_hash(peer_hash))
+        )
+    if getattr(args, "group", None):
+        group = GroupStore(config.groups_path).find(args.group)
+        group_id = group["id"]
+        scope_parts.append(f"in group {group['name']}")
+    result = inbox.prune(
+        older_than,
+        peer=peer_hash,
+        group=group_id,
+        dry_run=dry_run,
+    )
+    scope = " ".join(scope_parts) if scope_parts else "from all senders"
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        verb = "Would prune" if result["dry_run"] else "Pruned"
+        print(
+            f"{verb} {result['pruned']} messages older than {args.older_than} ({scope})"
+        )
+        if result["dry_run"]:
+            print("dry run — nothing was deleted.")
+        else:
+            print(
+                "note: only this node's stored inbox copies were deleted"
+                " (received and sent); the other parties keep theirs, and"
+                " sealed copies already held by relays are unaffected."
+                " Sent history shown by `tau messages --sent` and messages"
+                " still queued in the outbox remain stored locally."
+            )
+    return _EXIT_OK
+
+
 def cmd_archive(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -6290,6 +7023,7 @@ def _describe_group(
         "members": members,
         "created_at": group["created_at"],
         "created_by": group["created_by"],
+        "topic": group.get("topic", ""),
     }
 
 
@@ -6312,7 +7046,7 @@ def cmd_group_create(args: argparse.Namespace) -> int:
         if len(members) < 2:
             raise NodeError("a group needs at least one other peer")
         group = node.groups.create(
-            getattr(args, "name"), members, created_by=own_hash
+            getattr(args, "group_name"), members, created_by=own_hash
         )
     finally:
         node.stop()
@@ -6332,7 +7066,10 @@ def cmd_group_list(args: argparse.Namespace) -> int:
     config = _make_config(args)
     store = GroupStore(config.groups_path)
     registry = PeerRegistry(config.peers_path)
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
     groups = [_describe_group(group, registry) for group in store.list_groups()]
+    for group in groups:
+        group["ignored"] = group["id"] in ignored
     if _json_mode(args):
         _emit({"groups": groups, "count": len(groups)}, True)
         return _EXIT_OK
@@ -6341,7 +7078,10 @@ def cmd_group_list(args: argparse.Namespace) -> int:
         return _EXIT_OK
     for group in groups:
         names = ", ".join(member["name"] for member in group["members"])
-        print(f"{group['name']} ({group['id'][:8]}) — {names}")
+        ignored_suffix = " [ignored]" if group["ignored"] else ""
+        print(f"{group['name']} ({group['id'][:8]}) — {names}{ignored_suffix}")
+        if group.get("topic"):
+            print(f"  topic: {group['topic']}")
     return _EXIT_OK
 
 
@@ -6355,6 +7095,279 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
         _emit({"deleted": group["id"], "name": group["name"]}, True)
         return _EXIT_OK
     print(f"deleted group {group['name']} ({group['id'][:8]})")
+    return _EXIT_OK
+
+
+def cmd_group_leave(args: argparse.Namespace) -> int:
+    """Leave a group this node joined: drop it and refuse to re-pin it.
+
+    The creator steps out with ``tau group delete`` instead — a group
+    this node created cannot be re-pinned by another member's message
+    the way a learned group can, so delete is durable for the creator.
+    Leaving is local only: the creator is not told and keeps the member
+    on the roster, so the messages keep coming and are rejected here.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError:
+        # Leaving twice is not an error: a full id already on the left
+        # list reports as already left instead of unknown.
+        query = args.group.strip().lower()
+        if len(query) == 32 and store.is_left(query):
+            if _json_mode(args):
+                _emit({"left": query, "already_left": True}, True)
+                return _EXIT_OK
+            print(f"already left group {query[:8]}")
+            return _EXIT_OK
+        raise
+    if group["local"]:
+        # The `local` flag is the durable marker of a group this node
+        # created — it survives even if the identity file is gone, and
+        # it cannot be forged by a member claiming this node as the
+        # creator of a learned group.
+        raise NodeError(
+            "only members can leave a group they did not create —"
+            " delete your own group with `tau group delete`"
+        )
+    left_ids = store.leave(group["id"])
+    if not left_ids:
+        raise NodeError(f"unknown group: {args.group!r}")
+    siblings = [gid for gid in left_ids if gid != group["id"]]
+    if _json_mode(args):
+        payload: Dict[str, Any] = {"left": group["id"], "name": group["name"]}
+        if siblings:
+            payload["also_left"] = siblings
+        _emit(payload, True)
+        return _EXIT_OK
+    print(f"left group {group['name']} ({group['id'][:8]})")
+    if siblings:
+        print(f"also left {len(siblings)} related roster(s) for the same group")
+    print("Future messages for it will be rejected; rejoin with `tau group rejoin <id>`.")
+    return _EXIT_OK
+
+
+def cmd_group_rejoin(args: argparse.Namespace) -> int:
+    """Undo a leave, so the next group message pins the group again."""
+    config = _make_config(args)
+    group_id = args.group.strip().lower()
+    valid = len(group_id) == 32
+    if valid:
+        try:
+            bytes.fromhex(group_id)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise NodeError(f"invalid group id: {args.group!r}")
+    store = GroupStore(config.groups_path)
+    if not store.rejoin(group_id):
+        raise NodeError(f"group {group_id} was never left")
+    if _json_mode(args):
+        _emit({"rejoined": group_id}, True)
+        return _EXIT_OK
+    print(f"rejoined group {group_id[:8]} — the next message will pin it again")
+    return _EXIT_OK
+
+
+def cmd_group_left(args: argparse.Namespace) -> int:
+    """List groups this node has left."""
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    entries = store.left_groups()
+    if _json_mode(args):
+        _emit({"left": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No left groups.")
+        return _EXIT_OK
+    for entry in entries:
+        left_at = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(entry["left_at"])
+        )
+        # The full id: `tau group rejoin` needs all 32 characters.
+        print(f"{entry['id']} — left {left_at}")
+    return _EXIT_OK
+
+
+def cmd_group_ignore(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    group = store.find(args.group)
+    group_id = group["id"]
+    # Reload inside the lock: two ignore commands racing must not
+    # discard each other's change to a different group.
+    with ignored_groups_lock(config.ignored_groups_path):
+        try:
+            ignored = load_ignored_groups(config.ignored_groups_path)
+        except IgnoredGroupsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        already = ignored.is_ignored(group_id)
+        if not already:
+            ignored = ignored.with_added(group_id)
+            save_ignored_groups(config.ignored_groups_path, ignored)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": group_id,
+                "name": group["name"],
+                "ignored": True,
+                "changed": not already,
+            },
+            True,
+        )
+        return _EXIT_OK
+    if already:
+        print(
+            f"Group {group['name']} ({group_id[:8]}) is already ignored."
+        )
+    else:
+        print(
+            f"Ignored group {group['name']} ({group_id[:8]}). "
+            "Its messages keep arriving; `tau group unignore` restores the view."
+        )
+    return _EXIT_OK
+
+
+def _stored_group_matches(store: GroupStore, query: str) -> bool:
+    """True when any stored group matches *query* by id, id prefix, or name.
+
+    Mirrors :meth:`tau.groups.GroupStore.find`: a full id matches by
+    lookup, a shorter query by exact (case-insensitive) name or by an
+    id prefix of at least four characters.  Used to tell an ambiguous
+    lookup apart from one that found nothing at all.
+    """
+    needle = query.strip()
+    if len(needle) == 32:
+        return store.get(needle) is not None
+    lowered = needle.lower()
+    for group in store.list_groups():
+        if group["name"].casefold() == needle.casefold():
+            return True
+        if len(needle) >= 4 and group["id"].startswith(lowered):
+            return True
+    return False
+
+
+def _ignored_id_for_query(ignored: IgnoredGroups, query: str) -> Optional[str]:
+    """The ignored id *query* names when no stored group record does.
+
+    Accepts a full 32-character id or a unique id prefix of at least
+    four characters, as ``GroupStore.find`` does.  Returns ``None``
+    when nothing matches; raises :class:`ValueError` when a prefix
+    matches several ignored ids.
+    """
+    needle = query.strip().lower()
+    if len(needle) == 32:
+        return needle if ignored.is_ignored(needle) else None
+    if len(needle) < 4:
+        return None
+    matches = sorted(group_id for group_id in ignored.ignored if group_id.startswith(needle))
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} ignored groups match the id prefix {query!r}")
+    return matches[0] if matches else None
+
+
+def cmd_group_unignore(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    # The group record can be gone (deleted, or a backup restored the
+    # ignore list without groups.json).  The id must still be removable,
+    # or its posts stay hidden with no way out.
+    find_error: Optional[ValueError] = None
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        group = None
+        find_error = exc
+    # Reload inside the lock: two ignore commands racing must not
+    # discard each other's change to a different group.
+    with ignored_groups_lock(config.ignored_groups_path):
+        try:
+            ignored = load_ignored_groups(config.ignored_groups_path)
+        except IgnoredGroupsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
+        if group is not None:
+            group_id = group["id"]
+            name = group["name"]
+        else:
+            # The orphan fallback is only for a lookup that found no
+            # stored group at all: an ambiguous name or id prefix must
+            # still be rejected, not silently resolved against an
+            # orphaned ignored id that happens to share the prefix.
+            if _stored_group_matches(store, args.group):
+                raise find_error
+            try:
+                resolved = _ignored_id_for_query(ignored, args.group)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return _EXIT_ERROR
+            if resolved is None:
+                raise find_error
+            group_id = resolved
+            name = ""
+        was_ignored = ignored.is_ignored(group_id)
+        if was_ignored:
+            ignored = ignored.with_removed(group_id)
+            save_ignored_groups(config.ignored_groups_path, ignored)
+    if _json_mode(args):
+        _emit(
+            {
+                "group": group_id,
+                "name": name,
+                "ignored": False,
+                "changed": was_ignored,
+            },
+            True,
+        )
+        return _EXIT_OK
+    label = name or "unknown"
+    if was_ignored:
+        print(
+            f"Restored group {label} ({group_id[:8]}) to `tau messages`."
+        )
+    else:
+        print(f"Group {label} ({group_id[:8]}) was not ignored.")
+    return _EXIT_OK
+
+
+def cmd_group_ignored(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    inbox = Inbox(config.inbox_path)
+    ignored = load_ignored_group_ids(config.ignored_groups_path)
+    counts: Dict[str, int] = {}
+    for entry in inbox.list_messages(limit=None):
+        # Only group posts belong to an ignored group; a DM id never
+        # collides with a group id, but the kind check keeps the count
+        # honest if a future kind reuses the field.
+        if entry.get("kind") == "group" and str(entry.get("group") or "") in ignored:
+            group_id = str(entry.get("group"))
+            counts[group_id] = counts.get(group_id, 0) + 1
+
+    def describe(group_id: str) -> Dict[str, Any]:
+        group = store.get(group_id)
+        return {
+            "id": group_id,
+            "name": group["name"] if group is not None else "",
+            "messages": counts.get(group_id, 0),
+        }
+
+    entries = [describe(group_id) for group_id in sorted(ignored)]
+    if _json_mode(args):
+        _emit({"ignored": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No ignored groups — hide one with `tau group ignore GROUP`.")
+        return _EXIT_OK
+    for entry in entries:
+        name = entry["name"] or "unknown"
+        print(
+            f"{name} ({entry['id'][:8]}): "
+            f"{entry['messages']} message(s)"
+        )
     return _EXIT_OK
 
 
@@ -6466,10 +7479,131 @@ def cmd_group_remove_member(args: argparse.Namespace) -> int:
     return _change_group_members(args, adding=False)
 
 
+def cmd_group_topic(args: argparse.Namespace) -> int:
+    """Set or show the topic of a group this node created.
+
+    With no text (and no ``--clear``) this only reads: the topic is
+    visible to any member, so showing it needs no creator check and no
+    identity.  Setting it does — only the creator can — and needs no
+    running node: the topic is local state until the next group message
+    carries it to the members.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if getattr(args, "clear", False) and getattr(args, "text", None) is not None:
+        raise NodeError("pass a topic or --clear, not both")
+    if getattr(args, "file", None) and getattr(args, "text", None) is not None:
+        raise NodeError("pass a topic text or --file, not both")
+    if getattr(args, "file", None) and getattr(args, "clear", False):
+        raise NodeError("pass --file or --clear, not both")
+    text = getattr(args, "text", None)
+    if getattr(args, "file", None):
+        try:
+            text = Path(args.file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+        if not text.strip():
+            raise NodeError(
+                f"{args.file} is blank; pass --clear to remove the topic"
+            )
+    registry = PeerRegistry(config.peers_path)
+    if text is None and not getattr(args, "clear", False):
+        described = _describe_group(group, registry)
+        if _json_mode(args):
+            _emit({"group": described}, True)
+            return _EXIT_OK
+        topic = group.get("topic", "")
+        if topic:
+            print(f"{group['name']} ({group['id'][:8]}): {topic}")
+        else:
+            print(f"{group['name']} ({group['id'][:8]}) has no topic set.")
+        return _EXIT_OK
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    own_hash = destination_hash(identity).hex()
+    try:
+        group = store.set_topic(
+            group["id"],
+            "" if getattr(args, "clear", False) else (text or ""),
+            created_by=own_hash,
+        )
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    described = _describe_group(group, registry)
+    if _json_mode(args):
+        _emit({"group": described}, True)
+        return _EXIT_OK
+    if group.get("topic"):
+        print(f"topic for {group['name']} ({group['id'][:8]}): {group['topic']}")
+    else:
+        print(f"cleared the topic for {group['name']} ({group['id'][:8]})")
+    print("Members learn the new topic from the next message sent to it.")
+    return _EXIT_OK
+
+
+def cmd_group_rename(args: argparse.Namespace) -> int:
+    """Rename a group this node created.
+
+    The id derives from the name, so the rename is a successor group
+    (same roster, new id); the store swaps the old record for the new
+    one in a single transaction.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can rename a group")
+        new_group = node.groups.rename(
+            group["id"], args.new_name, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described, "previous_id": group["id"]}, True)
+        return _EXIT_OK
+    if new_group["id"] == group["id"]:
+        print(
+            f"group {new_group['name']} ({new_group['id'][:8]})"
+            " already has that name"
+        )
+    else:
+        print(
+            f"renamed group {group['name']!r} to {new_group['name']!r}"
+            f" ({group['id'][:8]} -> {new_group['id'][:8]})"
+        )
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the new name from the next message sent to it.")
+    return _EXIT_OK
+
+
 def cmd_group_send(args: argparse.Namespace) -> int:
     text = _read_message(args)
     config = _make_config(args)
+    expires_at = None
+    expire_text = getattr(args, "expire", None)
+    if expire_text is not None:
+        expires_at = time.time() + _parse_duration(expire_text)
     delivered_ids: Set[str] = set()
+    in_reply_to = None
+    if getattr(args, "reply_to", None) is not None:
+        group_id = GroupStore(config.groups_path).find(args.group)["id"]
+        in_reply_to = _resolve_group_reply_target(
+            Inbox(config.inbox_path),
+            Mailbox(config.mailbox_path),
+            str(args.reply_to),
+            group_id,
+        )
     node = TauNode(config, name=config.name, on_delivered=delivered_ids.add)
     node.start()
     try:
@@ -6480,6 +7614,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             timeout=float(getattr(args, "timeout", 20.0)),
             discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
             queue=not getattr(args, "no_queue", False),
+            in_reply_to=in_reply_to,
+            expires_at=expires_at,
         )
         # One-shot send: give reachable members a brief chance to take
         # a queued leg before this process exits.
@@ -6505,6 +7641,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
     ]
     exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if expires_at is not None:
+        response["expires_at"] = expires_at
     if _json_mode(args):
         _emit(response, True)
         return exit_code
@@ -6523,6 +7661,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
             f"failed for {result.get('to_name') or result['to'][:8]}:"
             f" {result.get('error') or 'unknown error'}"
         )
+    if expires_at is not None:
+        print(f"disappears in {_ago(expires_at - time.time())}")
     return exit_code
 
 
@@ -6560,6 +7700,76 @@ def _report_group_reaction(
     return _EXIT_ERROR if failed_legs else _EXIT_OK
 
 
+def cmd_group_send_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        response = node.send_group_file(
+            group,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    if not response["results"]:
+        print(
+            f"group {response['name']} has no other members"
+            " — nothing to send to."
+        )
+        return _EXIT_OK
+    for result in response["results"]:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("delivered"):
+            print(
+                f"delivered {result['name']} ({result['size']} bytes) to {name}"
+            )
+        else:
+            print(
+                f"failed for {name}: {result.get('error') or 'unknown error'}"
+            )
+    return exit_code
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """Save a private note to self in the local inbox.
+
+    Local-only: no network, no announce, nothing queued.  The note is
+    an inbox record with kind ``note`` from this node to itself, so it
+    shows in `tau messages`, is found by `--search` and `--kind note`,
+    and is deleted and pruned like any other stored message.  It is
+    read the moment it is written, so it never counts as unread.
+    """
+    config = _make_config(args)
+    identity = load_identity(config.identity_path)
+    if identity is None:
+        raise NodeError(f"no identity at {config.identity_path}; run `tau init` first")
+    text = normalize_message(_read_message(args))
+    inbox = Inbox(config.inbox_path)
+    entry = inbox.add_note(
+        text,
+        sender_name=config.name,
+        destination=destination_hash(identity).hex(),
+    )
+    if _json_mode(args):
+        _emit({"note": entry}, True)
+    else:
+        print(f"note saved #{_safe_id_prefix(str(entry['id']))} [note]")
+        for line in str(entry.get("text", "")).splitlines() or [""]:
+            print(f"  {line}")
+    return _EXIT_OK
+
+
 def cmd_react(args: argparse.Namespace) -> int:
     if bool(getattr(args, "clear", False)) == bool(getattr(args, "reaction", None)):
         raise NodeError("give a reaction, or --clear to retract it (not both)")
@@ -6572,6 +7782,15 @@ def cmd_react(args: argparse.Namespace) -> int:
         raise NodeError(str(exc)) from exc
     if not target.get("id"):
         raise NodeError("that message has no id to react to")
+    if target.get("kind") == NOTE_KIND:
+        # A note is local-only: its destination is this node, not a
+        # remote author, so there is no peer to react to.
+        raise NodeError("notes are local-only and cannot be reacted to")
+    author = target.get("destination") or ""
+    if not author and not (
+        target.get("kind") == "group" and target.get("direction") == "out"
+    ):
+        raise NodeError("that message has no known sender to react to")
     if getattr(args, "clear", False):
         token = ""
     else:
@@ -6594,11 +7813,22 @@ def cmd_react(args: argparse.Namespace) -> int:
             group_id = target.get("group")
             if not isinstance(group_id, str) or not group_id:
                 raise NodeError("that group message has no group to react to")
+            # Resolve the stored id exactly, as the console does: a
+            # retired id that also matches a group name must not
+            # resolve to that other group and send the reaction to
+            # its members.
+            group = node.groups.get(group_id)
+            if group is None:
+                raise NodeError(f"unknown group: {group_id!r}")
             author = target.get("destination")
+            if not author and target.get("direction") == "out":
+                # An outbound group message names no single
+                # destination: its author is this node.
+                author = node.destination_hexhash
             sent_at = target.get("sent_at")
             try:
                 response = node.send_group_reaction(
-                    group_id,
+                    group,
                     str(target["id"]),
                     token,
                     timeout=float(getattr(args, "timeout", 20.0)),
@@ -6778,6 +8008,114 @@ def cmd_retract(args: argparse.Namespace) -> int:
         )
     return _EXIT_OK
 
+def cmd_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    try:
+        cleaned = normalize_message(text)
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.target)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to edit")
+    if target.get("kind") == "group":
+        raise NodeError(
+            "group messages cannot be edited; send a new message instead"
+        )
+    if target.get("kind") == "file":
+        raise NodeError("a file record has no text to edit")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be edited"
+        )
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known recipient to edit it for")
+    # A message still in the outbox has not reached its recipient yet; an
+    # edit answered "not found" would let the queued copy arrive later
+    # with the old text. Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it and send a new message instead"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: edit through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _edit_via_running_node(
+                config,
+                author,
+                str(target["id"]),
+                cleaned,
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Edits ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver edit: {exc} "
+                "(edits need the peer online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_edit(
+                    author,
+                    str(target["id"]),
+                    cleaned,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Edits ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver edit: {exc} "
+                    "(edits need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "text": cleaned,
+                "edited": bool(response.get("edited", True)),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("edited") is False:
+        print(
+            f"edit was not applied to {name}'s copy of "
+            f"{_safe_id_prefix(str(target['id']))} "
+            "(unknown message, or a newer edit already applied)"
+        )
+    else:
+        print(f"edited your message to {name} {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
 
 def _print_more_unread(
     registry: PeerRegistry, more_unread: Dict[str, int]
@@ -6790,6 +8128,14 @@ def _print_more_unread(
             f"{count} more unread from {name} ({short_hash(destination)})"
             " — raise --limit to see them."
         )
+
+
+def _print_ignored_unread(ignored_unread: int) -> None:
+    """Hint line for unread mail hidden in ignored groups."""
+    print(
+        f"{ignored_unread} unread in ignored groups"
+        " — see them with `tau messages --ignored`."
+    )
 
 
 def _print_archived_unread(archived_unread: int) -> None:

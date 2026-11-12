@@ -811,6 +811,92 @@ def test_status_reports_empty_node(tmp_path, capsys):
     assert not (data_dir / "tan.sqlite3").exists()
 
 
+def test_parser_group_topic_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "topic", "weekend", "planning the meetup"])
+    assert args.group_command == "topic"
+    assert args.group == "weekend"
+    assert args.text == "planning the meetup"
+    assert args.clear is False
+    assert args.file is None
+
+    shown = parser.parse_args(["group", "topic", "weekend"])
+    assert shown.text is None
+
+    cleared = parser.parse_args(["group", "topic", "weekend", "--clear"])
+    assert cleared.clear is True
+
+
+def test_group_topic_set_show_and_clear(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main(base) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    assert cli.main([*base, "planning the meetup"]) == 0
+    out = capsys.readouterr().out
+    assert "planning the meetup" in out
+    assert "next message" in out
+    # The CLI wrote through its own store instance: re-read from disk.
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"])["topic"]
+        == "planning the meetup"
+    )
+
+    assert cli.main([*base, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["group"]["topic"] == "planning the meetup"
+
+    assert cli.main(["group", "list", "--data-dir", str(data_dir)]) == 0
+    assert "topic: planning the meetup" in capsys.readouterr().out
+
+    assert cli.main([*base, "--clear"]) == 0
+    assert "cleared the topic" in capsys.readouterr().out
+    assert GroupStore(data_dir / "groups.json").get(group["id"])["topic"] == ""
+
+    # A group this node did not create refuses a topic change.
+    store.create("other", ["cd" * 16, "ef" * 16], created_by="cd" * 16)
+    assert (
+        cli.main(["group", "topic", "--data-dir", str(data_dir), "other", "forged"])
+        == 1
+    )
+    assert "only the creator" in capsys.readouterr().err
+
+
+def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    # --file together with a positional text is rejected, not silently won.
+    assert cli.main([*base, "some text", "--file", "whatever.txt"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # --file together with --clear is rejected, not silently dropped.
+    assert cli.main([*base, "--file", "whatever.txt", "--clear"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # A blank file is rejected instead of silently clearing the topic.
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n", encoding="utf-8")
+    assert cli.main([*base, "--file", str(blank)]) == 1
+    assert "blank" in capsys.readouterr().err
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"]).get("topic", "")
+        == ""
+    )
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])
@@ -1844,6 +1930,179 @@ def test_messages_lists_newest_first(tmp_path, capsys):
     assert "alice" in out
 
 
+def test_messages_hides_non_member_group_reaction(tmp_path, capsys):
+    """A stored reaction from a non-member never prints on a group
+    message, even when the authorization recheck or its cleanup failed
+    and left it in the inbox (CodeRabbit round-11 follow-up).
+
+    The copy is appended directly and the reaction stored directly —
+    the way a copy imported by another process lands, with no
+    arrival purge running in this process — so the listing's roster
+    filter is the only thing standing between the stored reaction
+    and the display.  A member's reaction on the same message still
+    prints.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    member = RNS.Identity()
+    member_hash = destination_hash(member)
+    outsider = RNS.Identity()
+    outsider_hash = destination_hash(outsider)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.upsert(member_hash, member.get_public_key(), name="carol", now=100.0)
+    registry.upsert(
+        outsider_hash, outsider.get_public_key(), name="mallory", now=100.0
+    )
+    registry.save()
+    groups = GroupStore(config.groups_path)
+    members = [sender_hash.hex(), member_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    assert groups.record(
+        group_id,
+        "crew",
+        members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+    )
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-g1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": outsider_hash.hex(),
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": member_hash.hex(),
+            "from": "carol",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-2",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "crew hello" in out
+    assert "👍 carol" in out
+    assert "👎" not in out
+    assert "mallory" not in out
+
+
+def test_messages_hides_all_reactions_when_no_roster_pinned(tmp_path, capsys):
+    """A group copy imported without its roster shows no reactions at
+    all — not even a member's — until the roster pins (CodeRabbit
+    Major, follow-up to the round-16 fail-closed rule).  With no
+    roster there is no membership to verify, so the listing hides
+    every stored reaction instead of trusting them; once the group
+    pins, the member's reaction prints and the outsider's stays
+    hidden.
+    """
+    from tau.groups import GroupStore, derive_group_id
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    member = RNS.Identity()
+    member_hash = destination_hash(member)
+    outsider = RNS.Identity()
+    outsider_hash = destination_hash(outsider)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.upsert(member_hash, member.get_public_key(), name="carol", now=100.0)
+    registry.upsert(
+        outsider_hash, outsider.get_public_key(), name="mallory", now=100.0
+    )
+    registry.save()
+    members = [sender_hash.hex(), member_hash.hex()]
+    group_id = derive_group_id(sender_hash.hex(), "crew", members)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-g1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": outsider_hash.hex(),
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-1",
+        }
+    )
+    inbox.record_reaction(
+        {
+            "target": "m-g1",
+            "destination": member_hash.hex(),
+            "from": "carol",
+            "reaction": "👍",
+            "sent_at": 21.0,
+            "received_at": 22.0,
+            "id": "r-2",
+        }
+    )
+    # No roster pinned: nothing prints, not even the member's.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "crew hello" in out
+    assert "👍" not in out
+    assert "👎" not in out
+    # Pin the roster: the member's reaction prints, the outsider's
+    # stays hidden.
+    groups = GroupStore(config.groups_path)
+    assert groups.record(
+        group_id,
+        "crew",
+        members,
+        creator=sender_hash.hex(),
+        sender=sender_hash.hex(),
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "👍 carol" in out
+    assert "👎" not in out
+    assert "mallory" not in out
+
+
 def test_messages_kind_filter_and_tag(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
@@ -1876,6 +2135,164 @@ def test_messages_kind_filter_and_tag(tmp_path, capsys):
     code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "has space"])
     assert code == 1
     assert "message kind" in capsys.readouterr().err
+
+
+def test_parser_note_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["note", "buy milk"])
+    assert args.command == "note"
+    assert args.message == "buy milk"
+    assert args.file is None
+
+    args = parser.parse_args(["note", "--file", "notes.txt"])
+    assert args.message is None
+    assert str(args.file) == "notes.txt"
+
+
+def test_note_saves_and_lists(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+
+    code = cli.main(["note", "--data-dir", str(data_dir), "buy milk on the way home"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "note saved #" in out
+    assert "[note]" in out
+    assert "buy milk on the way home" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "buy milk on the way home" in out
+    assert "[note]" in out
+    assert "alice" in out
+    # A note is read the moment it is written: no unread marker.
+    assert "●" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count"])
+    assert code == 0
+    assert "No unread messages." in capsys.readouterr().out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "note"])
+    assert code == 0
+    assert "buy milk on the way home" in capsys.readouterr().out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--kind", "chat"])
+    assert code == 0
+    assert "buy milk on the way home" not in capsys.readouterr().out
+
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--search", "MILK"]
+    )
+    assert code == 0
+    assert "buy milk on the way home" in capsys.readouterr().out
+
+
+def test_note_json_and_file(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    note_file = tmp_path / "note.txt"
+    note_file.write_text("call bob about the mesh node\n", encoding="utf-8")
+
+    code = cli.main(
+        ["note", "--data-dir", str(data_dir), "--file", str(note_file), "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["note"]["kind"] == "note"
+    assert payload["note"]["text"] == "call bob about the mesh node"
+    assert payload["note"]["from"] == "alice"
+    assert payload["note"]["direction"] == "in"
+
+
+def test_note_requires_identity(tmp_path, capsys):
+    data_dir = tmp_path / "node"
+    code = cli.main(["note", "--data-dir", str(data_dir), "hello"])
+    assert code == 1
+    assert "run `tau init` first" in capsys.readouterr().err
+
+
+def test_note_rejects_empty_text(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+
+    code = cli.main(["note", "--data-dir", str(data_dir), "   "])
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_react_to_note_is_refused(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    assert cli.main(["note", "--data-dir", str(data_dir), "a note", "--json"]) == 0
+    note_id = json.loads(capsys.readouterr().out)["note"]["id"]
+
+    # A note's destination is this node, not a remote author: there is
+    # no peer to react to, so refuse before starting a node.
+    code = cli.main(["react", "--data-dir", str(data_dir), note_id, "👍"])
+    assert code == 1
+    assert "cannot be reacted to" in capsys.readouterr().err
+
+
+def test_listing_notes_sends_no_receipt(tmp_path, capsys, monkeypatch):
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()
+    assert cli.main(["note", "--data-dir", str(data_dir), "just a note"]) == 0
+    capsys.readouterr()
+
+    started = []
+    receipted = []
+
+    class _RecordingNode:
+        def __init__(self, *args, **kwargs):
+            started.append(True)
+
+        def start(self, **kwargs):
+            pass
+
+        def stop(self):
+            pass
+
+        def send_read_receipts(self, peer_hash, ids):
+            receipted.append((peer_hash, list(ids)))
+            return {"ids": list(ids), "ok": True}
+
+    monkeypatch.setattr(cli, "TauNode", _RecordingNode)
+
+    # Listing a note-only inbox must not start a node at all: there is
+    # no peer to receipt, and receipting our own destination would make
+    # the node discover itself.
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "just a note" in capsys.readouterr().out
+    assert started == []
+    assert receipted == []
+
+    # Control: the same listing with a real peer message does reach
+    # for a node, so the skip above proves the filter, not a dead path.
+    data_dir2 = _init_node(tmp_path, "node2", "bob")
+    capsys.readouterr()
+    config2 = TauConfig.resolve(data_dir=data_dir2, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry2 = PeerRegistry(config2.peers_path)
+    registry2.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry2.save()
+    Inbox(config2.inbox_path).append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "hello bob",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+        }
+    )
+    code = cli.main(["messages", "--data-dir", str(data_dir2)])
+    assert code == 0
+    assert "hello bob" in capsys.readouterr().out
+    assert started == [True]
+    assert receipted == [(sender_hash.hex(), ["m-1"])]
 
 
 def test_messages_json_and_peer_filter(tmp_path, capsys):
@@ -2162,6 +2579,231 @@ def test_messages_delete_json_and_errors(tmp_path, capsys):
     assert payload["deleted"]["text"] == "first hello"
 
 
+def test_parser_messages_prune_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "prune", "--older-than", "90d"])
+    assert args.command == "messages"
+    assert args.older_than == "90d"
+    assert args.func is cli.cmd_messages_prune
+    assert args.dry_run is False
+
+    args = parser.parse_args(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "alice",
+            "--dry-run",
+        ]
+    )
+    assert args.peer == "alice"
+    assert args.dry_run is True
+
+    # Scope flags given before `prune` survive the subparser: the prune
+    # subparser uses SUPPRESS defaults, so a None default cannot
+    # silently discard the parent value and widen the prune.
+    args = parser.parse_args(
+        ["messages", "--peer", "alice", "prune", "--older-than", "90d"]
+    )
+    assert args.peer == "alice"
+    assert args.func is cli.cmd_messages_prune
+    args = parser.parse_args(
+        ["messages", "--group", "team", "prune", "--older-than", "90d"]
+    )
+    assert args.group == "team"
+    assert args.func is cli.cmd_messages_prune
+
+
+def test_messages_prune_dry_run_reports_without_deleting(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--dry-run",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Would prune 2 messages older than 90d" in out
+    assert "dry run" in out
+
+    # Nothing was deleted.
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+
+def test_messages_prune_deletes_and_persists(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        ["messages", "prune", "--older-than", "90d", "--data-dir", str(data_dir)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Pruned 2 messages older than 90d" in out
+    assert "only this node's stored inbox copies were deleted" in out
+    assert "Sent history shown by `tau messages --sent`" in out
+    assert "still queued in the outbox remain stored locally" in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"] == []
+
+
+def test_messages_prune_scopes_to_peer(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "alice",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 2 messages older than 90d (with alice)" in capsys.readouterr().out
+
+
+def test_messages_prune_keeps_scope_given_before_prune(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "carol old",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "m-3",
+        }
+    )
+    store = GroupStore(config.groups_path)
+    group = store.create(
+        "team", [sender_hash.hex(), "cd" * 16], created_by=sender_hash.hex()
+    )
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "cd" * 16,
+            "text": "group old",
+            "sent_at": 10.0,
+            "received_at": 10.0,
+            "id": "m-4",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "team",
+        }
+    )
+
+    # --peer before `prune` still scopes the prune to alice: carol's
+    # DM and group message survive.
+    code = cli.main(
+        [
+            "messages",
+            "--peer",
+            "alice",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 2 messages older than 90d (with alice)" in capsys.readouterr().out
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-4", "m-3"]
+
+    # --group before `prune` still scopes the prune to the group.
+    code = cli.main(
+        [
+            "messages",
+            "--group",
+            "team",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 0
+    assert "Pruned 1 messages older than 90d (in group team)" in capsys.readouterr().out
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-3"]
+
+
+def test_messages_prune_json_and_errors(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pruned"] == 2
+    assert payload["dry_run"] is False
+
+    # Unknown peer.
+    code = cli.main(
+        [
+            "messages",
+            "prune",
+            "--older-than",
+            "90d",
+            "--peer",
+            "nope",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+    # Bad duration, and a cutoff past the 10y cap.
+    code = cli.main(
+        ["messages", "prune", "--older-than", "bogus", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "invalid --older-than duration" in capsys.readouterr().err
+    code = cli.main(
+        ["messages", "prune", "--older-than", "20y", "--data-dir", str(data_dir)]
+    )
+    assert code == 1
+    assert "must be at most 10y" in capsys.readouterr().err
+
+
 def test_parser_pin_unpin_pinned_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["pin", "abcd1234"])
@@ -2435,6 +3077,66 @@ def test_messages_unread_filter_and_json_flags(tmp_path, capsys):
     assert [item["unread"] for item in payload["messages"]] == [True, False, False]
 
 
+def test_parser_messages_unread_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["messages", "unread", "alice"])
+    assert args.peer == "alice"
+    assert args.all is False
+
+    args = parser.parse_args(["messages", "unread", "alice", "--all"])
+    assert args.all is True
+
+
+def test_messages_unread_marks_newest_message_unread_again(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    # Listing marks both messages read.
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(["messages", "unread", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "marked 1 message from alice unread" in capsys.readouterr().out
+
+    # Only the newest message is unread again; the older one stays read.
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--unread", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["text"] == "second hello"
+
+
+def test_messages_unread_all_marks_whole_conversation_unread(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    assert cli.main(["messages", "--data-dir", str(data_dir)]) == 0
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "messages",
+            "unread",
+            "alice",
+            "--all",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"peer": sender_hash.hex(), "unread": 2, "total": 2}
+
+
+def test_messages_unread_unknown_peer(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["messages", "unread", "nobody", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown peer" in capsys.readouterr().err
+
+
 def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     data_dir, sender_hash = _seed_messages(tmp_path)
 
@@ -2464,6 +3166,31 @@ def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     )
     assert code == 1
     assert "unknown peer" in capsys.readouterr().err
+
+
+def test_messages_count_ignores_sent_records(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    # A reply sent after reading the conversation must not inflate
+    # the unread count: your own mail is never unread for you.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.mark_read()
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "my reply",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-sent",
+            "direction": "out",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {}, "total": 0}
 
 
 def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
@@ -3905,6 +4632,421 @@ def test_send_reply_to_unknown_reference_is_an_error(
     assert _FakeSendNode.instances[0].sent == []
 
 
+def _seed_group_reply_conversation(tmp_path):
+    """One received group message in \"weekend\", plus a same-prefix
+    message in a different group that must never resolve for it."""
+    from tau.groups import GroupStore
+    from tau.protocol import excerpt_hash
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    store = GroupStore(config.groups_path)
+    group = store.create("weekend", members, created_by="ab" * 16)
+    other_members = ["ab" * 16, "12" * 16, "34" * 16]
+    other = store.create("other", other_members, created_by="ab" * 16)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "seconded",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "b" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "not this group",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "a" * 31 + "f",
+            "kind": "group",
+            "group": other["id"],
+            "group_name": "other",
+            "direction": "in",
+        }
+    )
+    return data_dir, group, other
+
+
+def test_resolve_group_reply_target_scopes_to_the_group(tmp_path):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+
+    ref = cli._resolve_group_reply_target(inbox, mailbox, "aaaa", group["id"])
+    assert ref["id"] == "a" * 32
+    # The other group's message shares the "aaaa" prefix but must not
+    # leak into this group's resolution: its full id is unknown here.
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_reply_target(
+            inbox, mailbox, "a" * 31 + "f", group["id"]
+        )
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_reply_target(inbox, mailbox, "zzzz", group["id"])
+
+
+def test_resolve_group_reply_target_rejects_prefix_shared_across_stores(
+    tmp_path,
+):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    # A queued leg in the same group shares the "aaaa" prefix with the
+    # received one, so the reference is ambiguous and must be refused.
+    mailbox.enqueue(
+        to=bytes.fromhex("ef" * 16),
+        text="queued",
+        message_id="aaaa" + "c" * 28,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    with pytest.raises(cli.NodeError, match="2 messages"):
+        cli._resolve_group_reply_target(inbox, mailbox, "aaaa", group["id"])
+
+
+def test_group_messages_renders_quote_from_local_history(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "↩ alice: original thought" in out
+    assert "seconded" in out
+
+
+def test_group_messages_quote_falls_back_to_excerpt(tmp_path, capsys):
+    """Group legs carry per-member ids: the quoted leg id may never
+    have been held here, but the same text under another leg id still
+    renders the quote via the excerpt hash."""
+    from tau.protocol import excerpt_hash
+
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "ef" * 16,
+            "text": "agreed, different leg",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "c" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    # Two quote lines: `seconded` via its exact-id reference and
+    # `agreed, different leg` via the excerpt fallback.
+    assert out.count("↩ alice: original thought") == 2
+    assert "agreed, different leg" in out
+
+
+class _FakeGroupSendNode:
+    """Stub TauNode for `tau group send`: records the reply reference."""
+
+    instances: list = []
+
+    def __init__(self, config, **kwargs):
+        from tau.groups import GroupStore
+
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.sent: list = []
+        _FakeGroupSendNode.instances.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_group_message(self, group, text, **kwargs):
+        self.sent.append((group, text, kwargs.get("in_reply_to")))
+        return {
+            "ok": True,
+            "group": group["id"],
+            "name": group["name"],
+            "results": [
+                {
+                    "to": "cd" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "f" * 32,
+                }
+            ],
+        }
+
+    def flush_outbox(self, **kwargs):
+        pass
+
+
+def test_group_send_reply_to_resolves_prefix_and_sends_reference(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "aaaa",
+            "weekend",
+            "seconded, again",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.sent) == 1
+    sent_group, _, in_reply_to = node.sent[0]
+    assert sent_group["id"] == group["id"]
+    assert in_reply_to["id"] == "a" * 32
+    assert in_reply_to["excerpt"] == cli.excerpt_hash("original thought")
+    assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_group_send_reply_to_unknown_reference_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "zzzz",
+            "weekend",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_send_reply_to_empty_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "",
+            "weekend",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_direct_reply_target_still_quotes_received_group_message(tmp_path):
+    """Narrowing the DM/group boundary: a *received* group message
+    from a peer keeps quoting in a DM to that peer, exactly as before
+    this PR — only the new group-send records stay out of DMs."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    ref = cli._resolve_reply_target(inbox, mailbox, "a" * 32, "cd" * 16)
+    assert ref["id"] == "a" * 32
+
+
+def test_direct_reply_target_excludes_queued_group_leg(tmp_path):
+    """A queued group leg to the peer is not a DM reply target: its
+    id belongs to the group send."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="queued leg",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "dddd", "cd" * 16)
+
+
+def test_direct_quote_of_received_group_message_renders(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "quoting the group in a DM",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "e" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": cli.excerpt_hash("original thought"),
+            },
+        }
+    )
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--search",
+            "quoting the group",
+        ]
+    )
+    assert code == 0
+    assert "↩ alice: original thought" in capsys.readouterr().out
+
+
+def test_group_reply_target_dedupes_queued_leg_with_sent_record(tmp_path):
+    """A queued leg whose id is already covered by the group send's
+    inbox record (in leg_ids) is one candidate, not an ambiguity."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "hello group",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "c" * 31 + "1",
+            "leg_ids": ["c" * 31 + "1", "d" * 32],
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+        }
+    )
+    mailbox.enqueue(
+        to=bytes.fromhex("ef" * 16),
+        text="hello group",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    ref = cli._resolve_group_reply_target(inbox, mailbox, "d" * 32, group["id"])
+    assert ref["id"] == "d" * 32
+    assert ref["excerpt"] == cli.excerpt_hash("hello group")
+
+
+def test_group_quote_with_duplicate_text_is_unavailable(tmp_path, capsys):
+    """Two members posting identical text leaves the excerpt fallback
+    with no author to attribute the quote to."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    for sender, destination in (("alice", "cd" * 16), ("carol", "ef" * 16)):
+        inbox.append(
+            {
+                "from": sender,
+                "destination": destination,
+                "text": "same words",
+                "sent_at": 13.0,
+                "received_at": 23.0,
+                "id": "f" * 31 + ("1" if sender == "alice" else "2"),
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "weekend",
+                "direction": "in",
+            }
+        )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "which one?",
+            "sent_at": 14.0,
+            "received_at": 24.0,
+            "id": "c" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": cli.excerpt_hash("same words"),
+            },
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
 def _run_forward(tmp_path, monkeypatch, argv):
     monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
     _FakeSendNode.instances.clear()
@@ -4301,6 +5443,40 @@ def test_react_fans_out_to_group_members(tmp_path, capsys, monkeypatch):
     ]
 
 
+def test_react_to_own_group_message_uses_local_identity(tmp_path, capsys, monkeypatch):
+    # CodeRabbit Major: an outbound group message names no single
+    # destination, so cmd_react refused it ("no known sender") and
+    # the signed payload would have carried an empty target_author.
+    # The author of your own group message is this node.
+    data_dir, _ = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "crew hello",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "crew",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+            "leg_ids": ["g-1", "g-2"],
+            "direction": "out",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["react", "--data-dir", str(data_dir), "g-1", "👍"])
+    assert code == 0
+    node = _FakeReactNode.instances[0]
+    assert node.group_sent == [
+        ("ab" * 16, "g-1", "👍", _FakeReactNode.destination_hexhash, 12.0)
+    ]
+
+
 def test_react_group_reports_failed_leg(tmp_path, capsys, monkeypatch):
     data_dir, _ = _seed_group_message(tmp_path)
     monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
@@ -4411,6 +5587,173 @@ def _seed_sent_message(tmp_path):
     )
     return data_dir, recipient_hash
 
+
+def _seed_editable_message(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    return data_dir, recipient_hash
+
+
+def test_parser_edit_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["edit", "abcdef12", "fixed text"])
+    assert args.command == "edit"
+    assert args.target == "abcdef12"
+    assert args.text == "fixed text"
+
+    from_stdin = parser.parse_args(["edit", "abcdef12"])
+    assert from_stdin.text is None
+
+
+def test_edit_sends_to_the_message_recipient(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed here"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited your message to alice" in out
+    node = _FakeReactNode.instances[0]
+    assert node.started is False
+    assert node.edited == [(recipient_hash.hex(), "m-1", "fixed here")]
+
+
+def test_edit_json(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["edit", "--data-dir", str(data_dir), "m-1", "fixed here", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-1"
+    assert payload["to"] == recipient_hash.hex()
+    assert payload["to_name"] == "alice"
+    assert payload["text"] == "fixed here"
+    assert payload["edited"] is True
+    assert payload["id"] == "e-1"
+
+
+def test_edit_rejects_blank_and_oversized_text(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "must not be empty" in capsys.readouterr().err
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "x" * 2001])
+    assert code == cli._EXIT_ERROR
+    assert "longer than 2000" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "zzz", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_group_message(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "weekend",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "g-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "group messages cannot be edited" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_received_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "only your own sent messages can be edited" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
+    # An edit answered "not found" while the queued copy is still in
+    # the outbox would let that copy arrive later with the old text;
+    # refuse and point at outbox cancel instead.
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).enqueue(
+        to=recipient_hash, text="typo here", message_id="m-1"
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "still queued" in err
+    assert "outbox cancel" in err
+    assert _FakeReactNode.instances == []
+
+
+def test_messages_shows_edited_marker(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.apply_edit("m-1", "fixed here", edited_at=42.0)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "fixed here" in out
+    assert "(edited)" in out
 
 class _FakeRetractNode:
     instances = []
@@ -4579,16 +5922,34 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
 
 
+class _FakeGroupStore:
+    """Stand-in for GroupStore.get: the seeded group only."""
+
+    def get(self, group_id):
+        if group_id == "ab" * 16:
+            return {
+                "id": "ab" * 16,
+                "name": "crew",
+                "members": ["aa" * 16, "bb" * 16],
+                "creator": "aa" * 16,
+            }
+        return None
+
+
 class _FakeReactNode:
     instances = []
     # Tests may override the fan-out results (monkeypatch restores it).
     group_results = None
+    # The local node's identity hash, as TauNode.destination_hexhash.
+    destination_hexhash = "ef" * 16
 
     def __init__(self, config, name=None):
         self.config = config
         self.sent = []
         self.group_sent = []
+        self.edited = []
         self.started = False
+        self.groups = _FakeGroupStore()
         type(self).instances.append(self)
 
     def start(self):
@@ -4614,8 +5975,11 @@ class _FakeReactNode:
         target_author=None,
         target_sent_at=None,
     ):
+        # The real node takes a group record and returns its id; mirror
+        # that so the fan-out report reads the id, not the record.
+        group_id = group["id"] if isinstance(group, dict) else group
         self.group_sent.append(
-            (group, message_id, reaction, target_author, target_sent_at)
+            (group_id, message_id, reaction, target_author, target_sent_at)
         )
         results = type(self).group_results
         if results is None:
@@ -4636,7 +6000,7 @@ class _FakeReactNode:
         return {
             "ok": all(r.get("delivered") for r in results),
             "v": 1,
-            "group": group,
+            "group": group_id,
             "name": "crew",
             "target": message_id,
             "reaction": reaction,
@@ -4644,3 +6008,9 @@ class _FakeReactNode:
             "id": "r-group-1",
             "results": results,
         }
+
+    def send_edit(
+        self, target, message_id, text, *, timeout=20.0, discover_timeout=None
+    ):
+        self.edited.append((target, message_id, text))
+        return {"ok": True, "edited": True, "target": message_id, "id": "e-1"}

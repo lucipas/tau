@@ -303,6 +303,43 @@ def test_send_group_reaction_fans_out_one_signed_payload(tmp_path, monkeypatch):
     assert stored[0]["reaction"] == "👍"
 
 
+def test_send_group_reaction_records_signed_send_time(tmp_path, monkeypatch):
+    """The local reaction record carries the signed send time
+    (CodeRabbit round-13 review).
+
+    The payload is signed before the fan-out legs run; the local
+    record used to take time.time() after the legs finished, so a
+    reaction signed before a clear but recorded after it carried
+    the later time and replaced the clear locally, while receivers
+    — who order by the signed time — kept it.  Slowing each leg
+    separates the two moments: the stored record must still match
+    the signed payload exactly.
+    """
+    import time as _time
+
+    from tau.protocol import REQUEST_REACT, parse_reaction
+
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    calls = []
+
+    def slow_request(peer_arg, path, payload, timeout, deadline=None):
+        _time.sleep(0.05)
+        calls.append((peer_arg, path, payload))
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", slow_request)
+
+    response = node.send_group_reaction("crew", "m-1", "👍")
+
+    assert response["ok"] is True
+    assert len(calls) == 2
+    payload = parse_reaction(calls[0][2])
+    stored = node.inbox.reactions_for("m-1")
+    assert len(stored) == 1
+    assert stored[0]["id"] == response["id"]
+    assert stored[0]["sent_at"] == payload["sent_at"]
+
+
 def test_send_group_reaction_reports_failed_leg(tmp_path, monkeypatch):
     node, _, alice, bob = _group_reaction_node(tmp_path)
 
