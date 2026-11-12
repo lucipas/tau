@@ -58,6 +58,9 @@ export interface TauGroup {
   name: string;
   members: TauGroupMember[];
   created_at: number;
+  // Absent on snapshots from an older bridge; only groups this node
+  // created offer member changes in the console.
+  created_by_me?: boolean;
 }
 
 export interface GroupsResponse {
@@ -73,6 +76,12 @@ export interface CreateGroupResponse {
 export interface DeleteGroupResponse {
   ok: boolean;
   deleted: { id: string; name: string };
+}
+
+export interface ChangeGroupMembersResponse {
+  ok: boolean;
+  group: TauGroup;
+  previous_id: string;
 }
 
 export interface Peer {
@@ -204,6 +213,29 @@ export interface PingResult {
   peer: Peer;
   server?: string;
   rtt_ms: number | null;
+}
+
+export interface RenameResponse {
+  ok: boolean;
+  name: string;
+  previous_name: string;
+  changed: boolean;
+}
+
+export interface PeerInfo {
+  name?: string;
+  version?: string;
+  rns_version?: string;
+  protocol?: number;
+  uptime?: number;
+  peers?: number;
+  lxmf_enabled?: boolean;
+}
+
+export interface PeerInfoResult {
+  ok: boolean;
+  peer: Peer;
+  info: PeerInfo;
 }
 
 export interface SafetyNumberResult {
@@ -494,6 +526,21 @@ export interface TanSavedResponse {
 export interface TanFollowingResponse {
   following: TanFollow[];
   count: number;
+}
+
+export interface TanAuthor {
+  author: string;
+  name: string;
+  posts: number;
+  last_post: number;
+  followed: boolean;
+}
+
+export interface TanAuthorsResponse {
+  authors: TanAuthor[];
+  count: number;
+  // How many authors the directory holds behind the returned page.
+  total: number;
 }
 
 export interface TanSuggestion {

@@ -375,6 +375,41 @@ def test_reaction_signature_roundtrip():
     assert parsed["reaction"] == "👍"
 
 
+def test_retract_roundtrip():
+    from tau.protocol import encode_retract, parse_retract
+
+    data = encode_retract("msg-123", message_id="retract-1")
+    parsed = parse_retract(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["id"] == "retract-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_parse_retract_rejects_wrong_shape():
+    from tau.protocol import encode_retract, parse_retract
+
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "reaction", "target": "msg-1", "reaction": "👍"}))
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "retraction", "target": ""}))
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "retraction"}))
+    with pytest.raises(ProtocolError):
+        parse_retract(
+            encode({"type": "retraction", "target": "msg-1", "sig": "not base64!!"})
+        )
+
+
+def test_retract_signature_roundtrip():
+    from tau.protocol import encode_retract, parse_retract
+
+    parsed = parse_retract(
+        encode_retract("msg-123", message_id="retract-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["target"] == "msg-123"
+
+
 def test_reaction_without_signature_parses_with_none():
     from tau.protocol import encode_reaction, parse_reaction
 

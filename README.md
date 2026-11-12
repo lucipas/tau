@@ -115,7 +115,10 @@ tau serve --http          # console + JSON API on http://127.0.0.1:8787/
 ```
 
 Open <http://127.0.0.1:8787/>. The page streams inbound messages, peers and
-their latency in real time over server-sent events. Message history is kept
+their latency in real time over server-sent events. Each peer also has an
+info button that shows what the peer reports about itself — its tau version,
+protocol, uptime, and peer count — so you can see whether it understands
+newer entry kinds before sending it a reply or a quote. Message history is kept
 in `messages.json` in the data directory, so earlier conversations are still
 there after the node restarts.
 
@@ -155,11 +158,13 @@ The same bridge is the local integration point for scripts:
 | `/api/outbox/held` | GET | sealed mail held for other peers |
 | `/api/outbox/drop-held` | POST | drop `{"target": "<message id or prefix>"}` |
 | `/api/ping` | POST | measure a peer's round trip |
+| `/api/info` | POST | show a peer's reported info (`{"to": "alice"}`) — version, protocol, uptime, peer count, LXMF state |
 | `/api/allowlist` | GET | DM allow-list: whether enforced, and who is on it |
 | `/api/allowlist/add` | POST | allow DMs from `{"target": "alice"}` (name, hash or prefix) |
 | `/api/allowlist/remove` | POST | stop allowing DMs from `{"target": "alice"}` |
 | `/api/allowlist/set-enabled` | POST | turn enforcement `{"enabled": true}` on/off |
 | `/api/announce` | POST | announce this node immediately |
+| `/api/id/rename` | POST | rename this node `{"name": "..."}` (live name + re-announce) |
 | `/api/settings` | GET | node settings (`accept_files`, `send_read_receipts`) |
 | `/api/settings` | POST | change one setting `{"setting": "accept_files", "value": true}` |
 | `/api/backup` | GET | download a backup archive of the data directory |
@@ -170,12 +175,14 @@ The same bridge is the local integration point for scripts:
 | `/api/tan/mentions` | GET | replies to your own posts (`?limit=N`) |
 | `/api/tan/thread` | GET | thread rooted at a post (`?ref=<hash-or-prefix>`) |
 | `/api/tan/following` | GET | followed authors and their post counts |
+| `/api/tan/authors` | GET | every known author (`?sort=recent`, `posts`, or `name`; `?limit=N`, `?offset=N`; the response carries the directory `total`) |
 | `/api/tan/suggest` | GET | suggested authors to follow (`?limit=5`) |
 | `/api/tan/posts` | GET | recent Tan posts received by this node |
 | `/api/tan/posts` | POST | publish `{"text": "hello"}` |
 | `/api/tan/quote` | POST | quote `{"target": "<post hash>", "text": "…"}` |
 | `/api/tan/like` | POST | like `{"target": "<post hash>"}` |
 | `/api/tan/unlike` | POST | unlike `{"target": "<post hash>"}` |
+| `/api/tan/repost` | POST | repost `{"target": "<post hash>"}` |
 | `/api/tan/likes` | GET | who liked a post (`?target=<post hash>`) |
 | `/api/tan/delete` | POST | delete one of your own posts |
 | `/api/tan/follow` | POST | follow `{"target": "alice"}` |
@@ -346,6 +353,7 @@ Global options may appear before or after the command:
 | `tau peers alias PEER ALIAS` | Give a known peer a local alias (unique, never shared with other peers) |
 | `tau peers unalias PEER` | Remove a peer's local alias |
 | `tau messages` | List received direct messages kept in the node inbox |
+| `tau messages prune --older-than 90d` | Delete stored messages older than a cutoff (`--peer`, `--group`, `--dry-run`) |
 | `tau outbox` | List messages queued for offline peers |
 | `tau outbox retry [ID]` | Try delivering queued messages now, ignoring backoff (one message, or the whole queue) |
 | `tau outbox held` | List sealed messages held for other peers |
@@ -470,10 +478,8 @@ and decrypt its traffic, so keep it private.
 
 To back up identity, peer registry, queued outbox
 mail, the durable DM inbox, the Tan database and rules, the DM allowlist,
-and the Reticulum config, use `tau backup`:
-
-The backup does not include `groups.json`, `blocklist.json`, or received
-files in `files/`. Back up these paths separately if needed.
+groups, the block list, received files, and the Reticulum config, use
+`tau backup`:
 
 ```bash
 tau backup ~/tau-backup.tar.gz
@@ -690,6 +696,33 @@ envelope yet. Queueing reactions for offline peers is a follow-up. A
 reaction whose target this node has never seen is still stored (the target
 may arrive later over a relay), but it is only rendered under a message the
 inbox actually holds.
+
+### DM retracts
+
+`tau retract <message-id>` takes back a message you sent: it sends a
+signed retract (`/tau/dm/retract`) to the recipient, who deletes their
+stored copy, then deletes your own sent copy — so the message is gone
+on both sides. The payload is signed with the sender's Reticulum
+identity and verified by the receiver against the link identity, like a
+reaction, and the receiver only deletes a message the caller actually
+sent: a retract from anyone else fails with `not_sender`, and a retract
+for an id the receiver never held answers ok with nothing deleted, so
+retries are safe. A retract also leaves a marker keyed by (sender,
+message id) that lives for the message's delivery lifetime (7 days),
+unless the marker cap is reached first — at the cap the
+earliest-expiry markers are evicted, even unexpired ones — so a
+sealed relay copy that arrives after the retract — or after the
+id leaves the receiver's seen cache — is dropped instead of stored,
+and `tau messages import` skips the message instead of resurrecting
+it. Group messages cannot be retracted in v1 — a group
+message lives in every member's inbox, and deleting it from one member
+alone would silently half-retract it.
+
+Retracts are delivered live in v1, like reactions: the peer must be
+online. A message still queued in the outbox is cancelled with
+`tau outbox cancel` instead. A peer running a version that predates
+retracts rejects the unknown path, so a retract to an old peer fails
+instead of silently succeeding.
 
 ### Sneakernet bundles
 
