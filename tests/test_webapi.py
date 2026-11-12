@@ -5740,6 +5740,33 @@ def test_send_message_flip_reads_route_before_bridge_lock(bridge, node):
     assert seen == [False]
 
 
+def test_record_delivery_updates_route_to_lxmf_after_direct_delivery(
+    bridge, node
+):
+    # CodeRabbit Major: a message delivered directly and later
+    # re-delivered over LXMF must not keep the stale "direct"
+    # route — the recipient now holds an lxmf: copy, and a retract
+    # reading "direct" would miss it while reporting success.
+    _queue_send(node)
+    node.mailbox.record_sent(
+        "mail-1", to=bytes.fromhex(PEER_HASH), text="hi", sent_at=1000.0
+    )
+    node.mailbox.record_delivered("mail-1", now=1002.0, via="direct")
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["delivered_via"] == "direct"
+
+    node.mailbox.record_delivered("mail-1", now=1003.0, via="lxmf")
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["delivered_via"] == "lxmf"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["delivered_via"] == "lxmf"
+    assert feed["messages"][0]["status"] == "delivered"
+
+
 def test_record_delivery_ignores_unknown_id(bridge, node):
     _queue_send(node)
     _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})

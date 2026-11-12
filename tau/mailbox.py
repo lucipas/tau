@@ -1388,7 +1388,22 @@ class Mailbox:
         """
         with self._transaction(timeout=timeout):
             record = self._sent.get(message_id)
-            if record is None or record.get("delivered_at") is not None:
+            if record is None:
+                return
+            if record.get("delivered_at") is not None:
+                # A second confirmation still matters when it rode
+                # LXMF: the recipient now also holds an `lxmf:` copy,
+                # so the route must become "lxmf" or a later retract
+                # would read the stale "direct" route and miss that
+                # copy. "lxmf" is sticky — a direct confirmation
+                # never erases it — and the first delivery time
+                # stands.
+                if (
+                    via == "lxmf"
+                    and record.get("delivered_via") != "lxmf"
+                ):
+                    record["delivered_via"] = "lxmf"
+                    self.save()
                 return
             record["delivered_at"] = now if now is not None else time.time()
             if via is not None:

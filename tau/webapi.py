@@ -1087,6 +1087,27 @@ class WebBridge:
                         updated = dict(message)
                         break
                 if updated is None:
+                    # A second confirmation (LXMF after a direct
+                    # delivery) finds the entry already delivered:
+                    # keep the route honest — "lxmf" is sticky, or a
+                    # later retract would read the stale "direct"
+                    # route and miss the recipient's lxmf: copy.
+                    for message in self._messages:
+                        if (
+                            message.get("direction") == "out"
+                            and message.get("status")
+                            in ("delivered", "read")
+                            and message.get("mail_id") == mail_id
+                        ):
+                            if (
+                                route == "lxmf"
+                                and message.get("delivered_via")
+                                != "lxmf"
+                            ):
+                                message["delivered_via"] = "lxmf"
+                                updated = dict(message)
+                            break
+                if updated is None:
                     self._early_deliveries[mail_id] = None
                     while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
                         self._early_deliveries.popitem(last=False)
