@@ -123,6 +123,7 @@ from .tangents.tan import (
     save_post,
     search_posts,
     suggest_authors,
+    tags,
     thread,
     timeline,
     top_posts,
@@ -1270,6 +1271,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--author", metavar="NAME|HASH", help="show one author's posts"
     )
     tan_timeline.add_argument(
+        "--tag", metavar="TAG", help="show only posts carrying this tag"
+    )
+    tan_timeline.add_argument(
         "--limit", type=int, default=30, metavar="N", help="maximum posts"
     )
     tan_timeline.set_defaults(func=cmd_tan_timeline)
@@ -1308,6 +1312,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts (default 10)",
     )
     tan_top.set_defaults(func=cmd_tan_top)
+
+    tan_tags = tan_sub.add_parser(
+        "tags",
+        parents=[common],
+        help="list hashtags used in stored posts, most-used first",
+    )
+    tan_tags.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="maximum tags (default 30)",
+    )
+    tan_tags.set_defaults(func=cmd_tan_tags)
 
     tan_verify = tan_sub.add_parser(
         "verify",
@@ -2572,6 +2590,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         elif getattr(args, "all", False):
             posts = timeline(
@@ -2581,6 +2600,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         else:
             authors = [record["author"] for record in following(conn)]
@@ -2590,6 +2610,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 conn, authors, limit=args.limit, viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
     finally:
         conn.close()
@@ -2670,6 +2691,32 @@ def cmd_tan_top(args: argparse.Namespace) -> int:
         json_output=json_output,
         empty_message="No stored posts yet.",
     )
+    return _EXIT_OK
+
+
+def cmd_tan_tags(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
+    conn = init_db(config.social_db_path)
+    try:
+        entries = tags(
+            conn,
+            limit=args.limit,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"tags": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No hashtags in stored posts yet.")
+        return _EXIT_OK
+    width = max(len(str(entry["count"])) for entry in entries)
+    for entry in entries:
+        print(f"{entry['count']:>{width}}  #{entry['tag']}")
     return _EXIT_OK
 
 
