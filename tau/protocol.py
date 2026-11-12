@@ -367,6 +367,24 @@ def _clean_member_list(value: Any) -> List[str]:
     return members
 
 
+def _clean_renamed_from(value: Any) -> List[str]:
+    """Validate a rename lineage: predecessor group ids, newest first.
+
+    An absent lineage is ``[]``; a malformed one raises
+    :class:`ProtocolError`, like a malformed roster.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ProtocolError("renamed_from must be a list of group ids")
+    cleaned: List[str] = []
+    for entry in value:
+        cleaned.append(_clean_hexhash(entry, "renamed_from"))
+    if len(set(cleaned)) != len(cleaned):
+        raise ProtocolError("renamed_from must not repeat a group id")
+    return cleaned
+
+
 def encode_group_message(
     text: str,
     *,
@@ -376,6 +394,7 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    renamed_from: Optional[List[str]] = None,
     in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
 ) -> bytes:
@@ -386,7 +405,11 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
-    the id it claims.  ``in_reply_to`` optionally names the earlier
+    the id it claims.  ``renamed_from`` carries the group's rename
+    lineage (predecessor ids, newest first) when the group was renamed:
+    a member that still holds a predecessor learns from this message
+    that it was superseded, so it does not keep sending to an id the
+    creator retired.  ``in_reply_to`` optionally names the earlier
     message in the group this one quotes, exactly like a direct
     message (see :func:`clean_in_reply_to`).
 
@@ -407,6 +430,9 @@ def encode_group_message(
     }
     if message_id:
         payload["id"] = message_id
+    lineage = _clean_renamed_from(renamed_from)
+    if lineage:
+        payload["renamed_from"] = lineage
     reply_to = clean_in_reply_to(in_reply_to)
     if reply_to is not None:
         payload["in_reply_to"] = reply_to
@@ -444,6 +470,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
         "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
     }

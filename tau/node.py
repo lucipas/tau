@@ -1704,6 +1704,7 @@ class TauNode:
             creator=creator,
             sender=sender_hash or "",
             sent_at=sent_at,
+            renamed_from=group.get("renamed_from"),
         )
 
     def _handle_group_message(
@@ -1781,6 +1782,7 @@ class TauNode:
                 "name": message["group_name"],
                 "creator": message["creator"],
                 "members": message["members"],
+                "renamed_from": message.get("renamed_from") or [],
             },
             sent_at=message.get("sent_at"),
         )
@@ -3090,6 +3092,10 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                renamed_from=(
+                    (self.groups.get(entry.group_id) or {}).get("renamed_from")
+                    or None
+                ),
                 in_reply_to=entry.in_reply_to,
                 expires_at=entry.message_expires_at,
             )
@@ -3316,6 +3322,18 @@ class TauNode:
                         "name": entry.group_name,
                         "creator": entry.group_creator,
                         "members": entry.group_members,
+                        # The lineage rides in the sealed envelope, so
+                        # an offline member that receives this copy
+                        # through store-and-forward retires the
+                        # predecessor exactly as a direct recipient
+                        # would; the current record is read at deposit
+                        # time, like the direct re-send path.
+                        "renamed_from": (
+                            (self.groups.get(entry.group_id) or {}).get(
+                                "renamed_from"
+                            )
+                            or None
+                        ),
                     }
                     if entry.group_id is not None
                     else None
@@ -4486,6 +4504,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
             )
@@ -4504,6 +4523,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
             )

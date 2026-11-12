@@ -965,6 +965,12 @@ unlinked, and stall sync at the gap.
   group that includes you, gated by the DM allow-list like a direct message.
   Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
+  Manage groups with `tau group create NAME --peer ...`, `tau group list`,
+  `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
+  `tau group rename GROUP NEW-NAME` (creator only; a rename is a successor
+  group, so members learn the new name — and retire the old one — from the
+  next message sent to it, and `tau messages --group` history spans the
+  rename), and `tau group delete`.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts, edit their own posts, and delete their own posts. It is not a full ActivityPub-style
   federation protocol.
