@@ -703,7 +703,14 @@ class Inbox:
 
 
     def apply_edit(
-        self, message_id: str, text: str, *, edited_at: float
+        self,
+        message_id: str,
+        text: str,
+        *,
+        edited_at: float,
+        direction: Optional[str] = None,
+        destination: Optional[str] = None,
+        newer_than_existing: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Replace one stored message's text, marking when it was edited.
 
@@ -729,6 +736,25 @@ class Inbox:
                 return None
             if target.get("kind") == "file":
                 raise InboxError("a file record has no text to edit")
+            if direction is not None or destination is not None:
+                # Re-check ownership inside the transaction: a snapshot
+                # taken by the caller can be stale under a racing edit.
+                if target.get("kind") == "group":
+                    return None
+                if direction is not None and target.get("direction") != direction:
+                    return None
+                if destination is not None and (
+                    target.get("destination") or ""
+                ) != destination:
+                    return None
+            if newer_than_existing:
+                # Never let an older edit overwrite a newer stored one.
+                stored_edited_at = target.get("edited_at")
+                if (
+                    isinstance(stored_edited_at, (int, float))
+                    and float(edited_at) <= float(stored_edited_at)
+                ):
+                    return None
             previous_text = target.get("text")
             previous_edited_at = target.get("edited_at")
             target["text"] = text

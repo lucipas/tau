@@ -2112,11 +2112,14 @@ class TauNode:
                 "not_sender", "only the message's sender may edit it"
             )
         edit_sent_at = edit.get("sent_at")
-        effective_at = (
-            float(edit_sent_at)
-            if isinstance(edit_sent_at, (int, float))
-            else received_at
-        )
+        if edit_sent_at is None:
+            # The signed sent_at is the edit's ordering key.  Falling
+            # back to receipt time would let a replayed older edit look
+            # new and rewind a newer one.
+            return response_error(
+                "invalid_edit", "edit is missing its signed sent_at"
+            )
+        effective_at = float(edit_sent_at)
         previous_edited_at = record.get("edited_at")
         if (
             isinstance(previous_edited_at, (int, float))
@@ -2130,8 +2133,16 @@ class TauNode:
                 received_at=received_at,
             )
         try:
+            # The ownership and ordering checks above read a snapshot;
+            # the inbox repeats them atomically so racing edits cannot
+            # apply out of order.
             applied = self.inbox.apply_edit(
-                target_id, edit["text"], edited_at=effective_at
+                target_id,
+                edit["text"],
+                edited_at=effective_at,
+                direction="in",
+                destination=caller_hash,
+                newer_than_existing=True,
             )
         except InboxError as exc:
             # Do not acknowledge an edit that was not stored, so the
@@ -4713,6 +4724,11 @@ class TauNode:
                 raise PeerRefusedError(f"peer rejected the request: {message}")
             if error.get("code") == "not_a_member":
                 raise NotAMemberError(f"peer rejected the request: {message}")
+            raise NodeError(f"peer rejected the request: {message}")
+        if isinstance(state.get("rtt"), (int, float)):
+            decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
+        return decoded
+ge}")
             raise NodeError(f"peer rejected the request: {message}")
         if isinstance(state.get("rtt"), (int, float)):
             decoded.setdefault("_rtt", round(float(state["rtt"]), 6))
