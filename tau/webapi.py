@@ -1169,8 +1169,7 @@ class WebBridge:
         # Persist the flip like any other log change, so a restart does
         # not resurrect the message as queued.
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
-        return updated
+        return self._publish_message_updated(updated)
 
     def record_read(
         self,
@@ -1216,9 +1215,7 @@ class WebBridge:
         if not updated:
             return updated
         self._save_messages()
-        for message in updated:
-            self.bus.publish({"type": "message_updated", "message": message})
-        return updated
+        return [self._publish_message_updated(message) for message in updated]
 
     def mark_displayed_read(self) -> None:
         """Send read receipts for inbound messages shown in the thread view.
@@ -1309,6 +1306,29 @@ class WebBridge:
             target=_send, name="tau-read-receipts", daemon=True
         ).start()
 
+    def _publish_message_updated(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Annotate one history entry like :meth:`messages` does, then publish it.
+
+        The entry is copied, overlaid with the node inbox's reaction
+        state (which holds CLI-made reactions the bridge never heard
+        live), and group-filtered like the listing — so a live tab
+        never loses reactions when a ``message_updated`` event replaces
+        its bubble.  Returns the annotated copy.
+        """
+        annotated = dict(message)
+        groups = getattr(self.node, "groups", None)
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        group_id = message.get("group")
+        if groups is not None and isinstance(group_id, str) and group_id:
+            rosters = pinned_rosters(groups, [group_id])
+        annotated = self._with_inbox_reactions(
+            annotated, self._inbox_reactions_by_target(), rosters
+        )
+        self.bus.publish({"type": "message_updated", "message": annotated})
+        return annotated
+
     def record_reaction(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Attach a reaction to the console history entry it targets.
 
@@ -1376,8 +1396,7 @@ class WebBridge:
         if updated is None:
             return None
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
-        return updated
+        return self._publish_message_updated(updated)
 
     def record_edit(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Apply an edit to the console history entry it targets.
@@ -1402,7 +1421,12 @@ class WebBridge:
         console never shows — sent from the CLI, or predating wire ids
         — still drops: the node inbox keeps it, so ``tau messages``
         shows it.)  The updated entry is re-sent as ``message_updated``,
-        which the console already renders in place.
+        which the console already renders in place; the published copy
+        carries the inbox reaction overlay, like :meth:`messages` does,
+        so a CLI-made reaction is not lost when the bubble is replaced.
+        An inbound edit whose sender is blocked by the time it is
+        applied is stored — unblocking restores the updated history —
+        but its text is not fanned out live while the block stands.
         """
         target = record.get("target")
         text = record.get("text")
@@ -1459,8 +1483,14 @@ class WebBridge:
         if updated is None:
             return None
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
-        return updated
+        if direction == "in":
+            # The edit was accepted before the block landed; the stored
+            # copy keeps it, but the replacement text must not reach
+            # live subscribers while the sender is blocked.
+            blocklist = getattr(self.node, "blocklist", None)
+            if blocklist is not None and blocklist.is_blocked(peer):
+                return updated
+        return self._publish_message_updated(updated)
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Record a Tan post and fan it out to SSE subscribers."""
@@ -3238,12 +3268,17 @@ class WebBridge:
             except ValueError:
                 record = None
             # The inbox copy speaks for the edit only when it holds this
-            # edit or a newer one.  Otherwise the local inbox write did
+            # edit or a newer one — and only when it is this node's own
+            # sent copy to this peer.  Otherwise the local inbox write did
             # not land, and the text we were given is the accepted version.
+            # (An inbound record can reuse the wire id once the sent copy
+            # is pruned; its text must never replace our sent bubble.)
             raw_edited = record.get("edited_at") if record is not None else None
             if (
                 record is not None
                 and record.get("id") == wire_id
+                and record.get("direction") == "out"
+                and (record.get("destination") or "") == peer
                 and isinstance(record.get("text"), str)
                 and isinstance(raw_edited, (int, float))
                 and not isinstance(raw_edited, bool)

@@ -8062,6 +8062,90 @@ def test_record_edit_applies_an_inbound_edit(bridge):
     )
 
 
+def test_record_edit_keeps_cli_made_reactions(bridge, node):
+    # A reaction made from the CLI lives only in the shared inbox; the
+    # edit's message_updated event must carry it, or the open tab loses
+    # the reaction until reload.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    node.inbox.record_reaction(
+        {
+            "target": "wire-1",
+            "destination": BOB_HASH,
+            "reaction": "👍",
+            "from": "bob",
+            "sent_at": 150.0,
+            "received_at": 151.0,
+            "id": "react-1",
+        }
+    )
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["reactions"] == [
+        {"reactor": BOB_HASH, "name": "bob", "reaction": "👍"}
+    ]
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["reactions"] == updated["reactions"]
+
+
+def test_record_edit_does_not_publish_a_blocked_senders_edit(bridge, node):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    # The edit was accepted, then the sender was blocked before the
+    # bridge published it: the stored copy keeps the new text, but no
+    # live tab learns it while the block stands.
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    # Unblocking restores the updated history.
+    node.blocklist = BlockList()
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+
 def test_edit_survives_bridge_restart(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:
@@ -8111,6 +8195,45 @@ def test_edit_message_endpoint_adopts_a_newer_inbox_edit(bridge, node):
     assert payload["edited"] is True
     assert payload["message"]["text"] == "newer text"
     assert payload["message"]["edited_at"] == 250.0
+
+
+def test_edit_message_endpoint_ignores_an_inbound_record_with_the_same_wire_id(
+    bridge, node
+):
+    # The sent inbox copy was pruned, and a peer's inbound message
+    # reused the wire id and carries a newer edit.  The console must
+    # show this request's text, not the peer's: the inbox copy only
+    # speaks for the edit when it is our own sent copy to this peer.
+    message, _ = bridge.send_message("alice", "typo here")
+    node.inbox.append(
+        {
+            "id": message["wire_id"],
+            "destination": PEER_HASH,
+            "from": PEER_HASH,
+            "text": "peer text",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "direction": "in",
+        }
+    )
+    node.inbox.apply_edit(
+        message["wire_id"],
+        "peer edit",
+        edited_at=250.0,
+        newer_than_existing=True,
+    )
+    _stub_send_edit(node, edited_at=200.0)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is True
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
 
 
 def test_edit_message_endpoint_uses_the_signed_time_without_an_inbox_copy(
