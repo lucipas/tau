@@ -1409,6 +1409,46 @@ class TauNode:
             return False
         return True
 
+    def _void_stored_reaction(self, target_id: str, caller_hash: str) -> None:
+        """Void a reaction this reactor already stored on *target_id*.
+
+        Called when a reaction is refused for group membership: an
+        earlier attempt may have stored the reaction before the
+        message landed, and the post-store recheck may have failed to
+        void it — so the refusal also takes the orphan out.  Without
+        this, the retry the failed attempt prompts would be refused
+        up front and still leave the orphan displayed.  Best effort:
+        a failed void is logged and the refusal still stands.  A
+        no-op when nothing from this reactor is stored there.
+        """
+        try:
+            stored = [
+                item
+                for item in self.inbox.reactions_for(target_id)
+                if item.get("destination") == caller_hash and item.get("reaction")
+            ]
+        except Exception:  # pragma: no cover - defensive
+            return
+        if not stored:
+            return
+        latest = stored[-1]
+        tombstone = {
+            **latest,
+            "reaction": "",
+            "sent_at": max(float(latest["sent_at"]), time.time()) + 1.0,
+            "received_at": time.time(),
+        }
+        try:
+            self.inbox.record_reaction(tombstone)
+        except OSError:
+            log.warning(
+                "Could not void refused group reaction for %s",
+                target_id[:8],
+                exc_info=True,
+            )
+        else:
+            self._publish_reaction(tombstone)
+
     def _record_sent(self, record: Dict[str, Any]) -> None:
         """Persist an outgoing DM to the inbox; never break sending.
 
@@ -1978,6 +2018,7 @@ class TauNode:
                 if pinned is not None and caller_hash not in (
                     pinned.get("members") or []
                 ):
+                    self._void_stored_reaction(target_id, caller_hash)
                     return response_error(
                         "not_a_member",
                         "sender is not a group member",
@@ -2006,10 +2047,48 @@ class TauNode:
                 if pinned is not None and caller_hash not in (
                     pinned.get("members") or []
                 ):
+                    self._void_stored_reaction(target_id, caller_hash)
                     return response_error(
                         "not_a_member",
                         "sender is not a group member",
                     )
+            if resolved is None and reaction.get("group") is None:
+                # Final authorization look immediately before
+                # storing: the target may have landed after the
+                # lookup above (a cross-process import), and the
+                # store below would otherwise publish the reaction
+                # before the post-store recheck runs.  Reload and
+                # resolve once more against the current target; a
+                # group message the reactor is not a member of is
+                # refused here, before anything is stored or
+                # published.  A failed reload fails closed with
+                # storage_failed, so nothing is stored against a
+                # stale view.  The post-store recheck below stays
+                # as the backstop for the narrower window between
+                # this check and the persist.
+                try:
+                    self.inbox.reload()
+                except InboxError as exc:
+                    return response_error(
+                        "storage_failed", f"could not read inbox: {exc}"
+                    )
+                try:
+                    final = self.inbox.resolve(target_id)
+                except ValueError:
+                    final = None
+                if final is not None and final.get("kind") == "group":
+                    try:
+                        pinned = self.groups.find(final["group"])
+                    except ValueError:
+                        pinned = None
+                    if pinned is not None and caller_hash not in (
+                        pinned.get("members") or []
+                    ):
+                        self._void_stored_reaction(target_id, caller_hash)
+                        return response_error(
+                            "not_a_member",
+                            "sender is not a group member",
+                        )
             record = {
                 "target": target_id,
                 "reaction": reaction["reaction"],
@@ -2076,19 +2155,23 @@ class TauNode:
                             )
             if resolved is None:
                 # A second authorization look after storing: another
-                # process can import the target between resolve() and
-                # record_reaction(), and the storage transaction
-                # reloads the message but does not recheck the roster
-                # — so a reaction naming an imported copy with no
-                # group context would surface without any roster
-                # check ever running.  Reload and resolve the stored
-                # target again; if it is now a group message and the
-                # reactor is not on its roster, void the reaction
-                # just stored with a tombstone, so a replay cannot
-                # resurrect it.  A failed recheck never breaks the
-                # acknowledged delivery; the reaction stays stored
-                # (and, the copy being held now, visible) exactly as
-                # before.
+                # process can import the target between the final
+                # pre-store check and record_reaction(), and the
+                # storage transaction reloads the message but does
+                # not recheck the roster — so a reaction naming an
+                # imported copy with no group context would surface
+                # without any roster check ever running.  Reload and
+                # resolve the stored target again; if it is now a
+                # group message and the reactor is not on its roster,
+                # void the reaction just stored with a tombstone, so
+                # a replay cannot resurrect it.  A failed recheck
+                # fails closed with storage_failed instead of
+                # acknowledging a reaction that could not be
+                # verified: the sender retries, and the retry's
+                # refusal voids the orphan left behind (see
+                # _void_stored_reaction), so the reaction does not
+                # stay displayed.  The id is not marked seen, so
+                # the retry is processed, not deduped away.
                 try:
                     self.inbox.reload()
                 except InboxError as exc:
@@ -2096,6 +2179,10 @@ class TauNode:
                         "Could not reload inbox to recheck reaction for %s",
                         reaction["target"][:8],
                         exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed",
+                        f"could not recheck reaction: {exc}",
                     )
                 else:
                     try:
@@ -2124,12 +2211,17 @@ class TauNode:
                             }
                             try:
                                 self.inbox.record_reaction(tombstone)
-                            except OSError:
+                            except OSError as exc:
                                 log.warning(
                                     "Could not void unauthorized reaction "
                                     "for %s",
                                     reaction["target"][:8],
                                     exc_info=True,
+                                )
+                                return response_error(
+                                    "storage_failed",
+                                    "could not void unauthorized "
+                                    f"reaction: {exc}",
                                 )
                             else:
                                 # The void is fanned out too: the
