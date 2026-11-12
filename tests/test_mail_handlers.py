@@ -1353,6 +1353,63 @@ def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
     assert shown[0]["id"] == "react-1"
 
 
+def test_group_reaction_reconciles_when_relayed_copy_arrives_late(tmp_path):
+    # The same late arrival, but the copy comes through sealed relay
+    # mail: _deliver_collected must reconcile the stored reaction onto
+    # the local copy id too, not just the direct /tau/group path.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    assert node.inbox.reactions_for("local-copy-1") == []
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
 def test_group_reaction_not_reconciled_for_non_member(tmp_path):
     # The same late arrival, but the reactor is not on the roster the
     # message pins: the reaction stays stranded under the foreign id
