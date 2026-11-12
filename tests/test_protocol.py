@@ -12,11 +12,14 @@ from tau.protocol import (
     ProtocolError,
     build_announce,
     decode,
+    derive_group_id,
     encode,
+    encode_group_message,
     encode_message,
     excerpt_hash,
     normalize_message,
     parse_announce,
+    parse_group_message,
     parse_message,
     response_error,
     response_ok,
@@ -155,6 +158,65 @@ def test_message_rejects_malformed_reply():
                 {
                     "type": "message",
                     "text": "hi",
+                    "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
+def test_group_message_roundtrip_with_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    data = encode_group_message(
+        "seconded",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        in_reply_to=reply_to,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "seconded"
+    assert parsed["id"] == "b" * 32
+    assert parsed["in_reply_to"] == reply_to
+
+
+def test_group_message_without_reply_has_no_reference():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    data = encode_group_message(
+        "hello all",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+    )
+    assert parse_group_message(data)["in_reply_to"] is None
+
+
+def test_group_message_rejects_malformed_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    group_id = derive_group_id(members[0], "weekend", members)
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=group_id,
+            group_name="weekend",
+            creator=members[0],
+            members=members,
+            in_reply_to={"id": ""},
+        )
+    with pytest.raises(ProtocolError):
+        parse_group_message(
+            encode(
+                {
+                    "type": "group_message",
+                    "text": "hi",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "creator": members[0],
+                    "members": members,
                     "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
                 }
             )
@@ -313,6 +375,41 @@ def test_reaction_signature_roundtrip():
     )
     assert parsed["sig"] == "aGVsbG8="
     assert parsed["reaction"] == "👍"
+
+
+def test_retract_roundtrip():
+    from tau.protocol import encode_retract, parse_retract
+
+    data = encode_retract("msg-123", message_id="retract-1")
+    parsed = parse_retract(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["id"] == "retract-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_parse_retract_rejects_wrong_shape():
+    from tau.protocol import encode_retract, parse_retract
+
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "reaction", "target": "msg-1", "reaction": "👍"}))
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "retraction", "target": ""}))
+    with pytest.raises(ProtocolError):
+        parse_retract(encode({"type": "retraction"}))
+    with pytest.raises(ProtocolError):
+        parse_retract(
+            encode({"type": "retraction", "target": "msg-1", "sig": "not base64!!"})
+        )
+
+
+def test_retract_signature_roundtrip():
+    from tau.protocol import encode_retract, parse_retract
+
+    parsed = parse_retract(
+        encode_retract("msg-123", message_id="retract-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["target"] == "msg-123"
 
 
 def test_reaction_without_signature_parses_with_none():
