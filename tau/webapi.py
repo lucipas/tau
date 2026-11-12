@@ -36,6 +36,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
+    POST /api/messages/retract retract ``{"id": <console message id>}``: ask
+                           the peer to delete your sent DM, then drop the
+                           local copies too (``tau retract`` from the console)
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -2822,6 +2825,95 @@ class WebBridge:
             },
         }
 
+    def retract_message(self, target: int, *, timeout: float = 20.0) -> Dict[str, Any]:
+        """Retract one of this node's sent DMs, from the console.
+
+        Mirrors ``tau retract``: the peer is asked to delete the sent
+        message from their inbox, and the local copies go too (console
+        history entry, node inbox copy, sent record), so the message is
+        gone on both sides.  A peer who had no copy answers ``deleted``
+        False, which is not an error — the local copies still go.
+
+        Only your own sent DMs can be retracted: group messages are
+        not retractable in v1, a message still queued has not reached
+        its recipient yet (cancel it from the outbox instead), and
+        retracts ride the live link only, so an unreachable peer is a
+        failure, not a silent queue.
+
+        Ordering keeps every failure retryable from the console: the
+        retract goes first, so a failed retract never erases the local
+        copy; the inbox delete follows, so an inbox failure leaves the
+        bubble in place; the console entry is removed last, through the
+        same path as a delete, so other tabs learn through
+        ``message_deleted``.  A retry after either failure re-sends the
+        retract (idempotent — the peer answers ``deleted`` False) and
+        retries the local cleanup.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if removed is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if removed.get("direction") != "out":
+                raise ValueError(
+                    "only your own sent messages can be retracted"
+                )
+            if removed.get("group"):
+                raise ValueError("group messages cannot be retracted in v1")
+            if removed.get("status") == "queued":
+                # A retract answered "not found" would let the queued
+                # copy arrive later, so cancellation has to go through
+                # the outbox first.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = removed.get("wire_id")
+            peer = removed.get("peer")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("that message has no id to retract")
+        if not isinstance(peer, str) or not peer:
+            raise ValueError("that message has no known recipient to retract from")
+        with self.node.mailbox.transaction():
+            if self.node.mailbox.get_outbox(wire_id) is not None:
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+        response = self.node.send_retraction(peer, wire_id, timeout=timeout)
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                inbox.delete(wire_id)
+            except InboxError as exc:
+                # Already gone from the inbox (a stale wire id) is
+                # fine.  Any other inbox failure leaves the console
+                # entry in place, so the retract can be retried — the
+                # retract itself already succeeded.
+                if not str(exc).startswith("unknown message"):
+                    raise
+        # The sent record lives in mailbox.json, not the inbox: drop it
+        # too, or `tau messages --sent` keeps showing the retracted text.
+        # Only after the retract and the inbox delete succeeded, so a
+        # failed retract never erases the sent record.
+        self.node.mailbox.discard_sent(wire_id)
+        self._remove_history_entry(target, removed, publish_unread=inbox is not None)
+        return {
+            "ok": True,
+            "retracted": {
+                "id": target,
+                "wire_id": wire_id,
+            },
+            "deleted": bool(response.get("deleted")),
+            "id": response.get("id") if isinstance(response.get("id"), str) else None,
+        }
+
     def _remove_history_entry(
         self, target: int, removed: Dict[str, Any], *, publish_unread: bool
     ) -> None:
@@ -4819,6 +4911,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
                 return
+            if path == "/api/messages/retract":
+                self._handle_retract_message(body, head_only)
+                return
             if path == "/api/messages/read":
                 peer = body.get("peer")
                 if peer is not None and (
@@ -5713,6 +5808,34 @@ class _WebHandler(BaseHTTPRequestHandler):
             result = self.bridge.delete_message(target)
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_retract_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.retract_message(target, timeout=timeout)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json(result, head_only)
 

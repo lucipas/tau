@@ -6925,6 +6925,174 @@ def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     assert "field 'id'" in payload["error"]["message"]
 
 
+def _sent_console_entry(bridge, node, *, wire_id="wire-1", **overrides):
+    node.inbox.append(
+        {
+            "id": wire_id,
+            "destination": PEER_HASH,
+            "direction": "out",
+            "from": "tester",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    node.mailbox.record_sent(
+        wire_id, to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    entry = bridge._append_message(
+        **{
+            "direction": "out",
+            "peer": PEER_HASH,
+            "peer_name": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "status": "delivered",
+            "wire_id": wire_id,
+            **overrides,
+        }
+    )
+    assert entry is not None
+    return entry
+
+
+def test_retract_message_endpoint_retracts_and_removes_local_copies(
+    bridge, node
+):
+    _sent_console_entry(bridge, node)
+    sent = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        sent.append((peer, message_id, timeout))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "retracted": {"id": 1, "wire_id": "wire-1"},
+        "deleted": True,
+        "id": "retract-1",
+    }
+    assert sent == [(PEER_HASH, "wire-1", 20.0)]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+    assert node.mailbox.sent_record("wire-1") is None
+    retracted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(retracted_events) == 1
+    assert retracted_events[0]["message_id"] == 1
+
+
+def test_retract_message_endpoint_reports_peer_without_a_copy(bridge, node):
+    _sent_console_entry(bridge, node)
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "deleted": False, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["deleted"] is False
+    # The peer had no copy, but the local copies still go.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+
+
+def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node):
+    # A received message is not ours to retract.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "only your own sent" in payload["error"]["message"]
+
+    # Group messages cannot be retracted in v1.
+    _sent_console_entry(bridge, node, wire_id="wire-2", group="ab" * 16)
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 2}
+    )
+    assert status == 400
+    assert "group messages cannot be retracted" in payload["error"]["message"]
+
+    # Still queued: cancel it from the outbox instead.
+    _sent_console_entry(bridge, node, wire_id="wire-3", status="queued")
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 3}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+    # Delivered on the console but still queued in the mailbox: the
+    # outbox check, not just the bubble status, refuses the retract,
+    # or a "not found" answer would let the queued copy arrive later.
+    _sent_console_entry(bridge, node, wire_id="wire-4")
+    node.mailbox.enqueue(
+        to=bytes.fromhex(PEER_HASH), text="hello", message_id="wire-4"
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 4}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_keeps_bubble_when_peer_unreachable(
+    bridge, node
+):
+    _sent_console_entry(bridge, node)
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        raise NodeError("peer did not answer")
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 502
+    assert "peer did not answer" in payload["error"]["message"]
+    # A failed retract never erases the local copy: the bubble stays
+    # for a retry.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+    assert node.inbox.export_document()["messages"] != []
+
+
 def test_delete_by_wire_id_removes_the_console_copy(bridge):
     bridge.record_inbound(
         {

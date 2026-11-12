@@ -915,3 +915,45 @@ describe("useTau sendGroup", () => {
     expect(result.current.messages).toEqual(legs);
   });
 });
+
+describe("useTau retractMessage", () => {
+  it("posts the console id and drops the bubble at once", async () => {
+    const message = makeMessage({
+      id: 1,
+      direction: "out",
+      status: "delivered",
+      group: undefined,
+      wire_id: "a".repeat(32),
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 1, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [message]),
+      });
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+
+    let returned;
+    await act(async () => {
+      returned = await result.current.retractMessage(1);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/retract", {
+      id: 1,
+    });
+    expect(returned).toEqual({
+      ok: true,
+      retracted: { id: 1, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+    expect(result.current.messages).toEqual([]);
+  });
+});

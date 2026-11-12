@@ -353,6 +353,15 @@ export interface DeleteMessageResponse {
   ok: boolean;
   deleted: { id: number; wire_id?: string | null };
 }
+
+export interface RetractMessageResponse {
+  ok: boolean;
+  retracted: { id: number; wire_id?: string | null };
+  // Whether the peer had a copy to delete; false is not an error.
+  deleted: boolean;
+  // The retract's own wire id, when the peer answered one.
+  id?: string | null;
+}
 export interface RetryOutboxResponse {
   ok: boolean;
   delivered: number;

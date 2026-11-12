@@ -37,6 +37,7 @@ import type {
   PingResult,
   ReactResponse,
   RenameResponse,
+  RetractMessageResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
@@ -633,6 +634,19 @@ export function useTau() {
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
     return result.deleted;
+  }, []);
+
+  const retractMessage = useCallback(async (id: number) => {
+    const result = await apiPost<RetractMessageResponse>(
+      "/api/messages/retract",
+      { id },
+    );
+    // The retract already succeeded: drop the bubble locally at once,
+    // and let the message_deleted event reconcile other tabs.
+    setMessages((previous) =>
+      previous.filter((entry) => entry.id !== result.retracted.id),
+    );
+    return result;
   }, []);
   const retryOutbox = useCallback(
     async (id?: string) => {
@@ -1414,6 +1428,7 @@ export function useTau() {
     importing,
     send,
     deleteMessage,
+    retractMessage,
     sendGroup,
     sendFile,
     ping,
