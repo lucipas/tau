@@ -136,6 +136,17 @@ def build_bundle(
         if peer is None or not peer.public_key:
             skipped.append({"id": entry.id, "reason": "unknown recipient key"})
             continue
+        # Carry the queued leg's deadline and group context into the
+        # sealed envelope, so a bundled copy expires and is shown as a
+        # group message exactly as a direct delivery would be.
+        group: Optional[Dict[str, Any]] = None
+        if entry.group_id is not None:
+            group = {
+                "id": entry.group_id,
+                "name": entry.group_name,
+                "creator": entry.group_creator,
+                "members": list(entry.group_members),
+            }
         try:
             blob = seal_message(
                 identity,
@@ -144,6 +155,10 @@ def build_bundle(
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                group=group,
+                expires_at=entry.message_expires_at,
+                in_reply_to=entry.in_reply_to if group is None else None,
+                kind=getattr(entry, "kind", None) if group is None else None,
             )
         except MailboxError as exc:
             skipped.append({"id": entry.id, "reason": str(exc)})

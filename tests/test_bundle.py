@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 
@@ -18,6 +19,7 @@ from tau.config import TauConfig
 from tau.identity import destination_hash, load_identity
 from tau.mailbox import Mailbox, open_message, seal_message
 from tau.peers import PeerRegistry
+from tau.protocol import derive_group_id
 from tau.tangents.rules import Ruleset
 from tau.tangents.tan import create_post, export_entries, follow, get_post, init_db
 
@@ -360,6 +362,46 @@ def test_bundle_skips_unknown_recipient_and_expired(tmp_path):
         "unknown recipient key",
         "expired",
     }
+
+
+def test_bundle_export_keeps_group_expiry_and_context(tmp_path):
+    sender, recipient, third = _identities()
+    sender_hash = destination_hash(sender).hex()
+    recipient_hash = destination_hash(recipient).hex()
+    third_hash = destination_hash(third).hex()
+    members = [sender_hash, recipient_hash, third_hash]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="group hello",
+        to_name="bob",
+        message_id="group-1",
+        expires_at=2000.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": sender_hash,
+            "members": members,
+        },
+        now=1000.0,
+    )
+    registry = _registry_with(recipient)
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=registry,
+        now=1000.0,
+    )
+    assert summary["mail"] == 1
+    blob = base64.b64decode(document["mail"][0]["blob"], validate=True)
+    opened = open_message(recipient, blob)
+    # The bundled copy is a group message with the same deadline, so
+    # the recipient's relayed path stores it as one and purges it.
+    assert opened["group"]["id"] == group_id
+    assert opened["group"]["members"] == members
+    assert opened["expires_at"] == 2000.0
 
 
 def test_bundle_apply_skips_malformed_entries(tmp_path):

@@ -106,6 +106,55 @@ def test_group_message_roundtrip():
     assert parsed["creator"] == OWN_HASH
     assert parsed["members"] == members
     assert parsed["sent_at"] == 123.0
+    assert parsed["expires_at"] is None
+
+
+def test_group_message_roundtrip_with_expiry():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    payload = encode_group_message(
+        "vanish soon",
+        message_id="gm-exp",
+        group_id=group_id,
+        group_name="weekend",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+        expires_at=9999.0,
+    )
+    parsed = parse_group_message(payload)
+    assert parsed["text"] == "vanish soon"
+    assert parsed["expires_at"] == 9999.0
+
+
+def test_group_message_rejects_bad_expiry():
+    members = [OWN_HASH, OTHER_HASH]
+    group_id = derive_group_id(OWN_HASH, "g", members)
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "x",
+            group_id=group_id,
+            group_name="g",
+            creator=OWN_HASH,
+            members=members,
+            expires_at="soon",
+        )
+    raw = json.dumps(
+        {
+            "type": "group_message",
+            "v": 1,
+            "text": "bad expiry",
+            "group": group_id,
+            "group_name": "g",
+            "creator": OWN_HASH,
+            "members": members,
+            "sent_at": 1.0,
+            "id": "gm-bad-exp",
+            "expires_at": "soon",
+        }
+    ).encode("utf-8")
+    with pytest.raises(ProtocolError):
+        parse_group_message(raw)
 
 
 def test_group_id_derives_from_creator_name_and_roster():
@@ -1246,6 +1295,68 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned["creator"] == sender_hash
 
 
+def test_group_message_expired_is_dropped_unrecorded(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "too late",
+            message_id="gm-expired",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+            expires_at=time.time() - 60,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["expired"] is True
+    # Dropped like an expired direct message: never shown, never
+    # stored, and not marked seen, so a later live copy still lands.
+    assert received == []
+    assert node.inbox.list_messages() == []
+    assert node.mailbox.is_seen("gm-expired") is False
+    # And it must not pin the roster: an expired request has no
+    # business adding an unseen group.
+    assert node.groups.get(group_id) is None
+
+
+def test_group_message_stores_expiry(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    expires_at = time.time() + 300
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "vanish soon",
+            message_id="gm-live",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+            expires_at=expires_at,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["expired"] is False
+    assert len(received) == 1
+    assert received[0]["expires_at"] == expires_at
+    # The stored record carries the deadline, so the inbox purge
+    # removes it once the deadline passes.
+    entry = node.inbox.list_messages()[0]
+    assert entry["kind"] == "group"
+    assert entry["expires_at"] == expires_at
+
+
 def test_group_message_from_non_member_rejected(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -1793,6 +1904,140 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert third_records[0]["id"] == queued[0].id
 
 
+def test_send_group_message_carries_expiry_to_legs_and_queue(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    expires_at = time.time() + 300
+    result = node.send_group_message(group, "vanish soon", expires_at=expires_at)
+    assert result["ok"] is True
+    # The delivered leg's payload carries the same deadline.
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["text"] == "vanish soon"
+    assert parsed["expires_at"] == expires_at
+    # The queued leg keeps the message expiry, so the outbox (and any
+    # sealed relay copy) drops it at the deadline, not at the queue TTL.
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 1
+    assert queued[0].message_expires_at == expires_at
+    assert queued[0].expires_at == expires_at
+
+
+def test_send_group_message_expired_leg_is_not_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        if peer.hexhash == OTHER_HASH:
+            return {"ok": True, "expired": True}
+        raise AssertionError("only the reachable leg should be attempted")
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    result = node.send_group_message(
+        group, "vanish soon", expires_at=time.time() + 300
+    )
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    expired_leg = by_to[OTHER_HASH]
+    assert expired_leg.get("delivered") is not True
+    assert expired_leg["expired"] is True
+    assert "expired" in expired_leg["error"]
+    # The receiver never stored it, so no read receipt can ever
+    # verify: the send record is forgotten, like a refusal.
+    assert node.mailbox.sent_record(expired_leg["id"]) is None
+    assert by_to[THIRD_HASH]["queued"] is True
+
+
+def test_send_group_message_expired_duplicate_still_counts_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True, "duplicate": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = (  # type: ignore[method-assign]
+        lambda target, timeout=10.0: _stub_peer(OTHER_HASH, "bob")
+    )
+    result = node.send_group_message(
+        group, "vanish soon", expires_at=time.time() + 300
+    )
+    assert result["ok"] is True
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["delivered"] is True
+    # A duplicate the receiver already saw keeps its delivery
+    # confirmation: the message did reach the peer once.
+    assert (
+        node.mailbox.sent_record(by_to[OTHER_HASH]["id"]) is not None
+    )
+
+
+def test_send_group_message_expired_leg_is_not_queued(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    node.resolve_peer = (  # type: ignore[method-assign]
+        lambda target, timeout=10.0: (_ for _ in ()).throw(
+            NodeError("unreachable")
+        )
+    )
+    result = node.send_group_message(
+        group, "too late", expires_at=time.time() - 1
+    )
+    assert result["ok"] is False
+    # The deadline passed before any leg could be sent: queueing would
+    # store entries the next prune removes undelivered, so the legs
+    # report expired instead of queued.
+    assert all(entry["expired"] is True for entry in result["results"])
+    assert all(not entry.get("queued") for entry in result["results"])
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_message_expired_leg_past_deadline_is_not_queued(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    result = node.send_group_message(
+        group, "too late", timeout=0.0, expires_at=time.time() - 1
+    )
+    assert result["ok"] is False
+    assert all(entry["expired"] is True for entry in result["results"])
+    assert all(not entry.get("queued") for entry in result["results"])
+    assert node.mailbox.outbox_list() == []
+
+
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
@@ -2155,6 +2400,96 @@ def test_deliver_entry_re_encodes_group_payload(tmp_path):
     assert node.mailbox.get_outbox(entry.id) is None
 
 
+def test_deliver_entry_keeps_group_message_expiry(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    expires_at = time.time() + 300
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="retry me, then vanish",
+        expires_at=expires_at,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+    )
+    assert entry.message_expires_at == expires_at
+    seen = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        seen.append((path, parse_group_message(payload)))
+        return {"ok": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
+    assert len(seen) == 1
+    assert seen[0][1]["text"] == "retry me, then vanish"
+    # A retry must not silently extend the message: the re-encoded
+    # payload carries the original deadline.
+    assert seen[0][1]["expires_at"] == expires_at
+
+
+def test_deliver_entry_drops_expired_group_message(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="too late",
+        expires_at=time.time() + 300,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is False
+    # Terminal outcome: the entry leaves the outbox (a retry would be
+    # dropped the same way) and is never reported delivered.
+    assert node.mailbox.get_outbox(entry.id) is None
+    assert entry.id not in node._delivered_ids
+
+
+def test_deliver_entry_counts_expired_duplicate_group_message_delivered(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="already there",
+        expires_at=time.time() + 300,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+    )
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        return {"ok": True, "expired": True, "duplicate": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
+    assert node.mailbox.get_outbox(entry.id) is None
+    assert entry.id in node._delivered_ids
+
+
 # -- CLI ---------------------------------------------------------------------
 
 
@@ -2171,6 +2506,17 @@ def test_parser_group_arguments():
     assert send_args.group_command == "send"
     assert send_args.group == "weekend"
     assert send_args.message == "hello all"
+    assert send_args.expire is None
+
+    # An option between the two positionals is an argparse quirk of
+    # `group send` (pre-existing: `--timeout` does the same) — the
+    # message goes before the flag, like every other option here.
+    ephemeral = parser.parse_args(
+        ["group", "send", "weekend", "vanish soon", "--expire", "5m"]
+    )
+    assert ephemeral.group_command == "send"
+    assert ephemeral.expire == "5m"
+    assert ephemeral.message == "vanish soon"
 
     send_file_args = parser.parse_args(
         ["group", "send-file", "weekend", "photo.png"]
