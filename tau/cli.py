@@ -2815,6 +2815,7 @@ def cmd_tan_post(args: argparse.Namespace) -> int:
                 reply_to=reply_to,
                 to=getattr(args, "to", None),
                 ttl=int(getattr(args, "ttl", MAX_GOSSIP_TTL)),
+                name=config.name,
             )
         except ScheduledPostsError as exc:
             raise NodeError(str(exc)) from exc

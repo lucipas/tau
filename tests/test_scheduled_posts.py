@@ -131,6 +131,24 @@ def test_with_added_rejects_duplicate_and_removed_requires_present():
     assert len(queue.with_removed(post.id)) == 0
 
 
+def test_schedule_post_rejects_text_that_cannot_fit_a_tan_request(tmp_path):
+    # 2,000 four-byte characters pass the character limit but overflow
+    # the 8 KiB Tan request once encoded: refuse at schedule time,
+    # instead of failing every publish attempt forever.  Nothing is saved.
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(path, text="😀" * 2000, publish_at=1000.0, now=900.0)
+    assert load_scheduled_posts(path).posts == ()
+
+
+def test_schedule_post_accepts_long_text_that_fits(tmp_path):
+    # 1,500 four-byte characters (6,000 bytes) fit the request with
+    # room to spare.
+    path = tmp_path / "scheduled-posts.json"
+    post = schedule_post(path, text="😀" * 1500, publish_at=1000.0, now=900.0)
+    assert load_scheduled_posts(path).posts[0].id == post.id
+
+
 def test_cancel_scheduled_post_end_to_end(tmp_path):
     path = tmp_path / "scheduled-posts.json"
     post = schedule_post(path, text="later", publish_at=2000.0, now=1000.0)

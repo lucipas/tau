@@ -97,6 +97,7 @@ from ..protocol import (
     APP_NAME,
     ASPECT,
     MAX_MESSAGE_CHARS,
+    MAX_NAME_LENGTH,
     MAX_REQUEST_BYTES,
     ProtocolError,
     decode,
@@ -395,6 +396,42 @@ def _check_wire_size(post: Dict[str, Any]) -> None:
             f"entry exceeds the {MAX_REQUEST_BYTES} byte encoded limit "
             "for a Tan request; shorten the post"
         ) from exc
+
+
+def check_post_text_fits(
+    text: str, *, name: Optional[str] = None, reply_to: Optional[str] = None
+) -> None:
+    """Raise PostError if *text* cannot fit a Tan request once encoded.
+
+    The same check ``_check_wire_size`` runs before a post is stored —
+    here for a post that does not exist yet, so a caller scheduling one
+    can refuse it up front instead of failing every publish attempt
+    later.  Maximum-length placeholders stand in for the author, key,
+    chain head and (when *name* is unknown) display name the real post
+    will carry, so a text that passes here always fits; one that fails
+    is rejected before it is stored.
+    """
+    try:
+        clean_text = normalize_message(text)
+    except ProtocolError as exc:
+        raise PostError(str(exc)) from exc
+    _check_wire_size(
+        {
+            "v": TAN_VERSION,
+            "author": "0" * AUTHOR_HEX_LENGTH,
+            "key": "0" * 64,
+            "name": (
+                sanitize_name(name)
+                if name is not None
+                else "x" * MAX_NAME_LENGTH
+            ),
+            "text": clean_text,
+            "created_at": round(time.time(), 3),
+            "prev": "0" * HASH_HEX_LENGTH,
+            "kind": KIND_REPLY if reply_to is not None else KIND_POST,
+            "target": reply_to or "",
+        }
+    )
 
 
 def _identity_from_post(post: Dict[str, Any]) -> RNS.Identity:

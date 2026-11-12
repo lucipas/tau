@@ -355,6 +355,7 @@ def schedule_post(
     to: Optional[Sequence[str]] = None,
     ttl: int = 3,
     now: Optional[float] = None,
+    name: Optional[str] = None,
 ) -> ScheduledPost:
     """Queue a post for *publish_at*; returns the stored entry.
 
@@ -366,6 +367,18 @@ def schedule_post(
     try:
         clean_text = normalize_message(text)
     except ProtocolError as exc:
+        raise ScheduledPostsError(str(exc)) from exc
+    # The character limit alone is not enough: 2,000 four-byte
+    # characters pass it but overflow the 8 KiB Tan request once
+    # encoded, and such a post would fail every publish attempt
+    # forever.  Refuse it here, before the entry is saved.  (Lazy
+    # import: this module stays importable without Reticulum, which
+    # ``tau.backup`` relies on.)
+    from .tangents.tan import PostError, check_post_text_fits
+
+    try:
+        check_post_text_fits(clean_text, name=name, reply_to=reply_to)
+    except PostError as exc:
         raise ScheduledPostsError(str(exc)) from exc
     post = ScheduledPost(
         id=new_scheduled_post_id(),

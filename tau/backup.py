@@ -14,7 +14,14 @@ serving node itself (``live=True``) skips the lock, because the node's
 own writes are atomic and each file it reads is a consistent snapshot.
 The Tan database is captured with SQLite's
 backup API, so committed entries still sitting in a write-ahead log are
-included.  Restore treats the archive as untrusted input: the manifest
+included.  One pair is not atomic file-by-file, though: a scheduled
+post publishes by creating the signed post in the Tan database and
+then removing its queue entry, so a live backup that snapshots the
+database before reading the queue could hold neither.  The backup
+therefore holds the scheduled-posts lock from the member-list
+decision through both captures, and the publish pass holds that same
+lock across the create and the removal, so the pair is always one
+consistent state.  Restore treats the archive as untrusted input: the manifest
 must declare format 1, every member must be an allowlisted regular file
 with no ``..`` segments, the archive must contain an identity, and
 expanded sizes are bounded while streaming.
@@ -240,110 +247,122 @@ def create_backup(
     if not live:
         lock.acquire()
     try:
-        # Enumerated under the lock, so the member list cannot drift
-        # from the files actually archived below.
-        received = _received_files(config)
-        destinations.update(
-            {name: config.data_dir / name for name in received}
-        )
-        files = [name for name in BACKUP_FILES if destinations[name].is_file()]
-        files.extend(received)
-        # A symlinked state file would be archived as a symlink member,
-        # which restore rejects as not a regular file — so a backup of
-        # a node with linked state would succeed and then never
-        # restore.  Refuse loudly instead.  (The Tan database is the
-        # exception: it is snapshotted to a fresh regular file, so a
-        # link there is harmless.)
-        for name in files:
-            if name != SOCIAL_DB_NAME and destinations[name].is_symlink():
-                raise BackupError(
-                    f"cannot back up {destinations[name]}: it is a symlink"
-                )
-        manifest = _manifest(config.data_dir, files, config.name)
-        manifest_bytes = (
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        # Refuse before writing anything a restore could not read back.
-        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
-            raise BackupError(
-                "too many files to back up: the manifest would exceed "
-                f"{MAX_MANIFEST_BYTES} bytes, the restore limit"
-            )
+        # Hold the scheduled-posts lock from the member-list
+        # decision through the Tan database snapshot and the queue
+        # capture, so a post that publishes mid-backup cannot land
+        # in neither file: the publish pass holds this same lock
+        # across creating the signed post and removing the queue
+        # entry, so the pair the archive holds is always one
+        # consistent state — either the post is still queued, or
+        # it is in the database snapshot.  (Lazy import: this module
+        # stays importable without Reticulum.)
+        from .scheduled_posts import scheduled_posts_lock
 
-        parent = target.parent
-        # A missing parent is created private (0o700); an existing one is
-        # left untouched, matching `tau id export`.
-        ensure_dir(parent, restrict_existing=False)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                with tarfile.open(fileobj=handle, mode="w:gz") as archive:
-                    info = tarfile.TarInfo(MANIFEST_NAME)
-                    info.size = len(manifest_bytes)
-                    info.mtime = int(datetime.now(timezone.utc).timestamp())
-                    archive.addfile(info, io.BytesIO(manifest_bytes))
-                    with tempfile.TemporaryDirectory() as scratch:
-                        expanded = 0
-                        for name in files:
-                            source = destinations[name]
-                            if name == SOCIAL_DB_NAME:
-                                source = _snapshot_sqlite(
-                                    source, Path(scratch) / SOCIAL_DB_NAME
-                                )
-                            # Size and bytes come from one open descriptor:
-                            # a live node may atomically replace the file
-                            # between a pathname stat and the open.  The
-                            # size is read off that same descriptor, so the
-                            # restore bounds below are enforced on the bytes
-                            # actually archived, keeping a successful backup
-                            # restorable.
-                            try:
-                                handle_in = open(source, "rb")
-                            except FileNotFoundError as exc:
-                                raise BackupError(
-                                    f"{name} disappeared while the backup was "
-                                    "being written; try again"
-                                ) from exc
-                            with handle_in:
-                                info = archive.gettarinfo(
-                                    arcname=name, fileobj=handle_in
-                                )
-                                # A hard link to a file already in the
-                                # archive comes back as a link member,
-                                # which restore rejects — store the bytes
-                                # instead.  Only hard links are rewritten:
-                                # a symlink member is still archived as a
-                                # link and rejected on restore, as before.
-                                # gettarinfo reports size 0 for a link, so
-                                # the size comes from the open descriptor.
-                                if info.islnk():
-                                    info.type = tarfile.REGTYPE
-                                    info.linkname = ""
-                                    info.size = os.fstat(
-                                        handle_in.fileno()
-                                    ).st_size
-                                expanded += info.size
-                                if (
-                                    info.size > MAX_MEMBER_BYTES
-                                    or expanded > MAX_TOTAL_BYTES
-                                ):
-                                    raise BackupError(
-                                        f"cannot back up {name!r}: the data directory "
-                                        "exceeds the restore size limit"
-                                    )
-                                archive.addfile(info, handle_in)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, target)
-        except BaseException:
+        with scheduled_posts_lock(config.scheduled_posts_path):
+            # Enumerated under the lock, so the member list cannot drift
+            # from the files actually archived below.
+            received = _received_files(config)
+            destinations.update(
+                {name: config.data_dir / name for name in received}
+            )
+            files = [name for name in BACKUP_FILES if destinations[name].is_file()]
+            files.extend(received)
+            # A symlinked state file would be archived as a symlink member,
+            # which restore rejects as not a regular file — so a backup of
+            # a node with linked state would succeed and then never
+            # restore.  Refuse loudly instead.  (The Tan database is the
+            # exception: it is snapshotted to a fresh regular file, so a
+            # link there is harmless.)
+            for name in files:
+                if name != SOCIAL_DB_NAME and destinations[name].is_symlink():
+                    raise BackupError(
+                        f"cannot back up {destinations[name]}: it is a symlink"
+                    )
+            manifest = _manifest(config.data_dir, files, config.name)
+            manifest_bytes = (
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            # Refuse before writing anything a restore could not read back.
+            if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+                raise BackupError(
+                    "too many files to back up: the manifest would exceed "
+                    f"{MAX_MANIFEST_BYTES} bytes, the restore limit"
+                )
+
+            parent = target.parent
+            # A missing parent is created private (0o700); an existing one is
+            # left untouched, matching `tau id export`.
+            ensure_dir(parent, restrict_existing=False)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(parent), prefix=f".{target.name}.", suffix=".tmp"
+            )
             try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "wb") as handle:
+                    with tarfile.open(fileobj=handle, mode="w:gz") as archive:
+                        info = tarfile.TarInfo(MANIFEST_NAME)
+                        info.size = len(manifest_bytes)
+                        info.mtime = int(datetime.now(timezone.utc).timestamp())
+                        archive.addfile(info, io.BytesIO(manifest_bytes))
+                        with tempfile.TemporaryDirectory() as scratch:
+                            expanded = 0
+                            for name in files:
+                                source = destinations[name]
+                                if name == SOCIAL_DB_NAME:
+                                    source = _snapshot_sqlite(
+                                        source, Path(scratch) / SOCIAL_DB_NAME
+                                    )
+                                # Size and bytes come from one open descriptor:
+                                # a live node may atomically replace the file
+                                # between a pathname stat and the open.  The
+                                # size is read off that same descriptor, so the
+                                # restore bounds below are enforced on the bytes
+                                # actually archived, keeping a successful backup
+                                # restorable.
+                                try:
+                                    handle_in = open(source, "rb")
+                                except FileNotFoundError as exc:
+                                    raise BackupError(
+                                        f"{name} disappeared while the backup was "
+                                        "being written; try again"
+                                    ) from exc
+                                with handle_in:
+                                    info = archive.gettarinfo(
+                                        arcname=name, fileobj=handle_in
+                                    )
+                                    # A hard link to a file already in the
+                                    # archive comes back as a link member,
+                                    # which restore rejects — store the bytes
+                                    # instead.  Only hard links are rewritten:
+                                    # a symlink member is still archived as a
+                                    # link and rejected on restore, as before.
+                                    # gettarinfo reports size 0 for a link, so
+                                    # the size comes from the open descriptor.
+                                    if info.islnk():
+                                        info.type = tarfile.REGTYPE
+                                        info.linkname = ""
+                                        info.size = os.fstat(
+                                            handle_in.fileno()
+                                        ).st_size
+                                    expanded += info.size
+                                    if (
+                                        info.size > MAX_MEMBER_BYTES
+                                        or expanded > MAX_TOTAL_BYTES
+                                    ):
+                                        raise BackupError(
+                                            f"cannot back up {name!r}: the data directory "
+                                            "exceeds the restore size limit"
+                                        )
+                                    archive.addfile(info, handle_in)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_name, 0o600)
+                os.replace(tmp_name, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
     finally:
         if not live:
             lock.release()
