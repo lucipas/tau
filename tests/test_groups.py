@@ -7,9 +7,11 @@ store-and-forward outbox.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import RNS
@@ -1967,6 +1969,161 @@ def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     assert node.mailbox.outbox_list() == []
 
 
+# -- group file fan-out ------------------------------------------------------
+
+
+def _stub_group_send_file(node, *, fail_for=()):
+    """Replace ``_send_file_bytes`` with a recorder; *fail_for* members raise."""
+    calls = []
+
+    def fake_send_file_bytes(
+        target,
+        data,
+        name,
+        digest,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        deadline=None,
+    ):
+        calls.append((target, name, timeout, discover_timeout, data, deadline))
+        member = target if isinstance(target, str) else target.hexhash
+        if member in fail_for:
+            raise NodeError("unreachable")
+        return {
+            "ok": True,
+            "id": f"{member[:8]}-transfer",
+            "name": name,
+            "size": len(data),
+            "sha256": digest,
+            "to": member,
+        }
+
+    node._send_file_bytes = fake_send_file_bytes  # type: ignore[method-assign]
+    return calls
+
+
+def test_send_group_file_fans_out_to_every_member(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["group"] == group["id"]
+    assert result["name"] == "weekend"
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert set(by_to) == {OTHER_HASH, THIRD_HASH}
+    # The sender is skipped, and each leg is its own transfer.
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[OTHER_HASH]["id"] == f"{OTHER_HASH[:8]}-transfer"
+    assert by_to[OTHER_HASH]["name"] == "photo.png"
+    assert by_to[OTHER_HASH]["size"] == len(b"fake png bytes")
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["id"] != by_to[OTHER_HASH]["id"]
+    assert len(calls) == 2
+    assert {call[0] for call in calls} == {OTHER_HASH, THIRD_HASH}
+    # Every leg carries the same bytes, read once up front.
+    assert all(call[1] == "photo.png" for call in calls)
+    assert all(call[4] == b"fake png bytes" for call in calls)
+    # Each leg carries its own deadline, so one slow member cannot
+    # consume another member's window.
+    assert all(call[5] is not None for call in calls)
+    # Nothing is queued: files are direct links only in v1.
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_keeps_going_after_a_failed_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node, fail_for={OTHER_HASH})
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH].get("delivered") is None
+    assert by_to[OTHER_HASH]["error"] == "unreachable"
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert len(calls) == 2
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_rejects_a_bad_file_before_any_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    calls = _stub_group_send_file(node)
+    with pytest.raises(NodeError, match="outside the"):
+        node.send_group_file(group, big)
+    assert calls == []
+
+
+def test_send_group_file_accepts_a_group_id_string(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group["id"], shared)
+    assert result["ok"] is True
+    assert [entry["to"] for entry in result["results"]] == [OTHER_HASH]
+    assert len(calls) == 1
+
+
+def test_send_group_file_self_only_group_sends_nowhere(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    # A group needs at least two members to be created through the
+    # store, so a self-only group only reaches the fan-out as a bare
+    # record (a corrupt or hand-edited groups.json). The fan-out
+    # must still be a no-op, not an error — and must never send to
+    # this node itself.
+    group = {"id": "a" * 64, "name": "solo", "members": [OWN_HASH]}
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["results"] == []
+    assert calls == []
+
+
+def test_send_group_file_timeout_zero_attempts_no_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared, timeout=0.0)
+    assert result["ok"] is False
+    assert all(
+        entry["error"] == "not attempted: group send time limit reached"
+        for entry in result["results"]
+    )
+    assert calls == []
+
+
 def test_deliver_entry_re_encodes_group_payload(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
@@ -2015,6 +2172,15 @@ def test_parser_group_arguments():
     assert send_args.group == "weekend"
     assert send_args.message == "hello all"
 
+    send_file_args = parser.parse_args(
+        ["group", "send-file", "weekend", "photo.png"]
+    )
+    assert send_file_args.group_command == "send-file"
+    assert send_file_args.group == "weekend"
+    assert str(send_file_args.path) == "photo.png"
+    assert send_file_args.timeout == 300.0
+    assert send_file_args.discover_timeout == 10.0
+
     list_args = parser.parse_args(["group", "list"])
     assert list_args.group_command == "list"
 
@@ -2038,6 +2204,85 @@ def test_parser_group_arguments():
 
     messages_args = parser.parse_args(["messages", "--group", "weekend"])
     assert messages_args.group == "weekend"
+
+
+class _FakeGroupSendFileNode:
+    """Stub TauNode for `tau group send-file`: canned fan-out results."""
+
+    response: dict = {}
+
+    def __init__(self, config, **kwargs):
+        self.config = config
+        self.groups = SimpleNamespace(
+            find=lambda target: {"id": "a" * 64, "name": "weekend"}
+        )
+        self.calls: list = []
+
+    def start(self, **kwargs):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_group_file(self, group, path, **kwargs):
+        self.calls.append((group, str(path), kwargs))
+        return _FakeGroupSendFileNode.response
+
+
+def _run_group_send_file(tmp_path, monkeypatch, argv, response):
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendFileNode)
+    _FakeGroupSendFileNode.response = response
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    return cli.main(
+        ["group", "send-file", "--data-dir", str(tmp_path / "node"), "weekend", str(shared), *argv]
+    )
+
+
+def test_group_send_file_cli_reports_empty_group(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        [],
+        {"ok": True, "group": "a" * 64, "name": "weekend", "results": []},
+    )
+    assert code == 0
+    assert "has no other members" in capsys.readouterr().out
+
+
+def test_group_send_file_cli_json_reports_failed_leg(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--json"],
+        {
+            "ok": False,
+            "group": "a" * 64,
+            "name": "weekend",
+            "results": [
+                {
+                    "to": OTHER_HASH,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "x" * 32,
+                    "name": "photo.png",
+                    "size": 15,
+                    "sha256": "0" * 64,
+                },
+                {
+                    "to": THIRD_HASH,
+                    "to_name": "",
+                    "ok": False,
+                    "error": "unreachable",
+                },
+            ],
+        },
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["results"][0]["delivered"] is True
+    assert payload["results"][1]["error"] == "unreachable"
 
 
 def test_group_list_on_empty_store(tmp_path, capsys):

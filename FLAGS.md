@@ -42,6 +42,7 @@ Global options may appear before or after the command:
 | `tau group rejoin ID` | Undo a leave so the next message pins the group again (full group id) |
 | `tau group left` | List groups this node has left |
 | `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline) |
+| `tau group send-file GROUP FILE` | Send a file (at most 10 MiB) to every member of a group, one direct transfer per member (a member that cannot be reached or refuses is reported as failed, not queued) |
 | `tau group ignore GROUP` | Hide a group's messages from `tau messages` (history kept, mail keeps arriving; idempotent) |
 | `tau group unignore GROUP` | Show an ignored group's messages in `tau messages` again (idempotent) |
 | `tau group ignored` | List ignored groups (group name + id, message count) |
