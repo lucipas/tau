@@ -19,7 +19,9 @@ from tau.protocol import (
     build_mail_fetch,
     build_mail_store,
     decode,
+    derive_group_id,
     encode,
+    encode_group_message,
     encode_message,
     encode_reaction,
     encode_retract,
@@ -1117,6 +1119,184 @@ def test_group_reaction_unresolvable_context_stays_on_target(tmp_path):
         remote_identity=reactor,
     )
     assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+
+
+def _pinned_group(node, *, members, creator):
+    group = derive_group_id(creator, "crew", members)
+    assert (
+        node.groups.record(group, "crew", members, creator=creator, sender=creator)
+        is not None
+    )
+    return group
+
+
+def test_group_reaction_from_member_resolves_on_pinned_group(tmp_path):
+    # The pinned roster names the reactor, so the signed context
+    # still resolves the node's own copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_refused_for_non_member(tmp_path):
+    # A valid signature proves who chose the context, not that they
+    # belong to the group: an allow-listed outsider who learned the
+    # group id, author and send time must not get a reaction onto a
+    # message in a group they never joined.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
+    # The reaction outruns the message: stored under the reactor's
+    # foreign wire id, invisible.  When the copy lands, it moves onto
+    # the local id so it displays under the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = ["ab" * 16, author_hash, reactor_hash]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    assert node.inbox.reactions_for("local-copy-1") == []
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_group_reaction_not_reconciled_for_non_member(tmp_path):
+    # The same late arrival, but the reactor is not on the roster the
+    # message pins: the reaction stays stranded under the foreign id
+    # and never surfaces under the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
     assert node.inbox.reactions_for("local-copy-1") == []
     assert len(node.inbox.reactions_for("other-leg-1")) == 1
 

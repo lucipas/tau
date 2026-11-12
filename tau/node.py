@@ -1629,6 +1629,27 @@ class TauNode:
                 if message_id:
                     self.mailbox.mark_seen(message_id)
                 self._record_received(record)
+            # A reaction can outrun the message it names — legs fan
+            # out one member at a time — and was stored under the
+            # reactor's foreign wire id with its signed group context
+            # retained.  Now that this copy is here, move those
+            # reactions onto it; only reactors on this group's roster
+            # move, so an outsider's reaction never surfaces.  Never
+            # breaks delivery: a failed reconcile leaves the
+            # reactions stored (and invisible) exactly as before.
+            if message_id:
+                try:
+                    self.inbox.reconcile_group_reactions(
+                        group["id"],
+                        caller_hash,
+                        message.get("sent_at"),
+                        message_id,
+                        members=set(group.get("members") or []),
+                    )
+                except Exception:  # pragma: no cover - storage failure
+                    log.warning(
+                        "Could not reconcile group reactions", exc_info=True
+                    )
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1829,6 +1850,31 @@ class TauNode:
                 try:
                     self.inbox.resolve(target_id)
                 except ValueError:
+                    # The signed context names the logical message, but
+                    # a valid signature only proves who chose the
+                    # context, not that they belong to the group: an
+                    # allow-listed outsider who learned a group id,
+                    # author and send time could otherwise sign a
+                    # reaction onto a message in a group they never
+                    # joined.  The pinned roster is the trusted
+                    # membership list — a group message pins it on
+                    # arrival — so a reactor the roster does not name
+                    # is refused here.  No roster is pinned yet when
+                    # the reaction outruns the message; that reaction
+                    # is stored with its context and can only surface
+                    # through reconciliation when the message arrives,
+                    # which checks the roster then.
+                    try:
+                        pinned = self.groups.find(reaction["group"])
+                    except ValueError:
+                        pinned = None
+                    if pinned is not None and caller_hash not in (
+                        pinned.get("members") or []
+                    ):
+                        return response_error(
+                            "not_a_member",
+                            "sender is not a group member",
+                        )
                     local = self.inbox.find_group_message(
                         reaction["group"],
                         reaction["target_author"],
@@ -1845,6 +1891,15 @@ class TauNode:
                 "received_at": received_at,
                 "id": reaction_id,
             }
+            if reaction.get("group") is not None:
+                # Retain the signed context with the stored reaction:
+                # when the target copy has not arrived yet, the
+                # reaction is stored under the foreign wire id, and
+                # reconciliation needs the context to move it onto
+                # this node's copy when it lands.
+                record["group"] = reaction["group"]
+                record["target_author"] = reaction.get("target_author")
+                record["target_sent_at"] = reaction.get("target_sent_at")
             try:
                 self._record_reaction(record, strict=True)
             except OSError as exc:
@@ -3801,6 +3856,12 @@ class TauNode:
             "v": PROTOCOL_VERSION,
             "group": group["id"],
             "name": group["name"],
+            # The one send time every leg shares: the console stores
+            # it on each outbound history entry, so reacting to a leg
+            # from the console names the logical message (see
+            # WebBridge.react) instead of a post-delivery timestamp no
+            # member's copy carries.
+            "sent_at": sent_at,
             "results": results,
         }
 

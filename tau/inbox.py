@@ -26,7 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Collection, Dict, Iterator, List, Optional, Tuple, Union
 
 try:  # POSIX only; the cross-process lock is a no-op without it.
     import fcntl
@@ -291,7 +291,7 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         sent_at = 0.0
     if not math.isfinite(received_at):
         return None
-    return {
+    entry = {
         "target": target,
         "destination": destination,
         "from": str(raw.get("from") or "unknown"),
@@ -300,6 +300,28 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         "received_at": received_at,
         "id": raw.get("id"),
     }
+    # A group reaction carries the signed context that names the
+    # logical message — group, author, send time — so a reaction that
+    # arrives before its target copy can be reconciled onto the copy
+    # when it lands (see reconcile_group_reactions).  The context is
+    # advisory only: malformed values are dropped, never a reason to
+    # reject the reaction.
+    group = raw.get("group")
+    target_author = raw.get("target_author")
+    target_sent_at = raw.get("target_sent_at")
+    if (
+        isinstance(group, str)
+        and len(group) == 32
+        and isinstance(target_author, str)
+        and len(target_author) == 32
+        and isinstance(target_sent_at, (int, float))
+        and not isinstance(target_sent_at, bool)
+        and math.isfinite(target_sent_at)
+    ):
+        entry["group"] = group
+        entry["target_author"] = target_author
+        entry["target_sent_at"] = float(target_sent_at)
+    return entry
 
 
 def reaction_order(entry: Dict[str, Any]) -> Tuple[float, str]:
@@ -868,7 +890,12 @@ class Inbox:
             wanted_at = float(sent_at)
         except (TypeError, ValueError):
             return None
-        with self._lock:
+        # Read through the transaction path, like reactions(): a copy
+        # imported by another process (``tau import`` while ``tau
+        # serve`` runs) must be visible here, or a reaction naming
+        # that copy's wire id resolves against the stale cache and is
+        # stored under a foreign id instead.
+        with self._transaction():
             matches = [
                 entry
                 for entry in self._messages
@@ -883,6 +910,83 @@ class Inbox:
             return None
         matches.sort(key=lambda entry: entry.get("received_at") or 0)
         return dict(matches[-1])
+
+    def reconcile_group_reactions(
+        self,
+        group: str,
+        author: str,
+        sent_at: float,
+        message_id: str,
+        *,
+        members: Optional[Collection[str]] = None,
+    ) -> int:
+        """Retarget stored group reactions onto a newly arrived copy.
+
+        A reaction can arrive before the message it names — legs fan
+        out one member at a time, so an early reactor's reaction lands
+        while another member's copy is still in flight — and it is
+        stored under the reactor's foreign wire id with its signed
+        group context retained.  When this node's copy arrives, move
+        those reactions onto it so they display under the message
+        instead of staying invisible forever.
+
+        Only reactions whose stored context matches this copy exactly
+        (group, author, send time) and whose target no message in the
+        inbox holds are moved.  When *members* is given, only
+        reactions from a reactor on that roster move: an allow-listed
+        outsider's reaction is never associated with the message.
+        Retargeting runs through :func:`merge_reaction`, so a newer
+        reaction the same reactor already left on this copy wins and
+        the older retargeted one is dropped.  Returns how many
+        reactions were retargeted.  Raises :class:`OSError` when the
+        retargeted state cannot be persisted.
+        """
+        try:
+            wanted_at = float(sent_at)
+        except (TypeError, ValueError):
+            return 0
+        if (
+            not isinstance(group, str)
+            or not group
+            or not isinstance(author, str)
+            or not author
+            or not isinstance(message_id, str)
+            or not message_id
+            or not math.isfinite(wanted_at)
+        ):
+            return 0
+        allowed = None if members is None else set(members)
+        retargeted = 0
+        with self._transaction():
+            previous = list(self._reactions)
+            held = {
+                entry.get("id")
+                for entry in self._messages
+                if isinstance(entry.get("id"), str)
+            }
+            pending = [
+                entry
+                for entry in self._reactions
+                if entry.get("group") == group
+                and entry.get("target_author") == author
+                and isinstance(entry.get("target_sent_at"), (int, float))
+                and not isinstance(entry.get("target_sent_at"), bool)
+                and float(entry["target_sent_at"]) == wanted_at
+                and entry.get("target") not in held
+                and (allowed is None or entry.get("destination") in allowed)
+            ]
+            for entry in pending:
+                moved = dict(entry)
+                moved["target"] = message_id
+                self._reactions.remove(entry)
+                if merge_reaction(self._reactions, moved):
+                    retargeted += 1
+            if retargeted:
+                self._reactions = self._reactions[-MAX_REACTIONS:]
+                if not self._save():
+                    self._reactions = previous
+                    raise OSError(f"could not persist inbox to {self.path}")
+        return retargeted
 
     def resolve(self, ref: str) -> Dict[str, Any]:
         """Resolve a full message id or a unique prefix to its record.

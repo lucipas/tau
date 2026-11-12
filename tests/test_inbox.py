@@ -933,6 +933,135 @@ def test_reactions_persist_across_instances(tmp_path):
     assert reloaded.reactions_for("msg-1")[0]["reaction"] == "👍"
 
 
+def _group_copy(**overrides):
+    record = _record(
+        kind="group",
+        group="cd" * 16,
+        group_name="crew",
+        destination="aa" * 16,
+        sent_at=100.0,
+        received_at=101.0,
+        id="local-copy-1",
+    )
+    record.update(overrides)
+    return record
+
+
+def test_find_group_message_sees_copy_imported_by_another_process(tmp_path):
+    # A copy imported by a second process (``tau import`` while ``tau
+    # serve`` runs) must be visible to the lookup: the serving inbox's
+    # in-memory cache alone would miss it and strand the reaction
+    # under a foreign wire id.
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    assert inbox.find_group_message("cd" * 16, "aa" * 16, 100.0) is None
+    Inbox(path).append(_group_copy())
+    found = inbox.find_group_message("cd" * 16, "aa" * 16, 100.0)
+    assert found is not None
+    assert found["id"] == "local-copy-1"
+
+
+def test_group_reaction_context_survives_a_reload(tmp_path):
+    path = tmp_path / "inbox.json"
+    Inbox(path).record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    reloaded = Inbox(path)
+    stored = reloaded.all_reactions()
+    assert len(stored) == 1
+    assert stored[0]["group"] == "cd" * 16
+    assert stored[0]["target_author"] == "aa" * 16
+    assert stored[0]["target_sent_at"] == 100.0
+
+
+def test_reconcile_group_reactions_retargets_onto_arriving_copy(tmp_path):
+    # The reaction arrived before the message: stored under the
+    # reactor's foreign wire id, invisible.  When the copy lands, it
+    # moves onto the local id so it displays under the message.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    assert inbox.reactions_for("foreign-leg-1") != []
+    assert inbox.reactions_for("local-copy-1") == []
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1",
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert moved == 1
+    assert inbox.reactions_for("foreign-leg-1") == []
+    shown = inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+
+
+def test_reconcile_group_reactions_skips_non_members(tmp_path):
+    # An allow-listed outsider's reaction stays stranded: it was
+    # stored before the group was pinned, and the roster on arrival
+    # does not name the reactor, so it must never surface.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            destination="ff" * 16,
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1",
+        members={"ab" * 16, "aa" * 16},
+    )
+    assert moved == 0
+    assert inbox.reactions_for("local-copy-1") == []
+    assert len(inbox.reactions_for("foreign-leg-1")) == 1
+
+
+def test_reconcile_group_reactions_keeps_newer_reaction_on_copy(tmp_path):
+    # The reactor reacted again after the copy arrived, so the copy
+    # already carries their newer reaction: retargeting the older
+    # pre-arrival one must not override it.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.record_reaction(
+        _reaction(
+            target="local-copy-1",
+            sent_at=30.0,
+            received_at=31.0,
+            id="react-new",
+            reaction="❤️",
+        )
+    )
+    inbox.record_reaction(
+        _reaction(
+            target="foreign-leg-1",
+            sent_at=20.0,
+            received_at=21.0,
+            id="react-old",
+            group="cd" * 16,
+            target_author="aa" * 16,
+            target_sent_at=100.0,
+        )
+    )
+    moved = inbox.reconcile_group_reactions(
+        "cd" * 16, "aa" * 16, 100.0, "local-copy-1"
+    )
+    assert moved == 0
+    assert [item["reaction"] for item in inbox.reactions_for("local-copy-1")] == [
+        "❤️"
+    ]
+
+
 def test_resolve_ambiguous_prefix(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="abcdef01" + "0" * 24))

@@ -361,6 +361,8 @@ class FakeNode:
             "v": 1,
             "group": group["id"],
             "name": group["name"],
+            # One send time shared by every leg, like the real node.
+            "sent_at": 1000.0,
             "results": results,
         }
 
@@ -884,6 +886,9 @@ def test_send_group_message_records_one_entry_per_leg(bridge, node):
     assert messages[0]["rtt_ms"] == 9.0
     assert messages[0]["wire_id"] == f"wire-{PEER_HASH[:8]}"
     assert messages[1]["mail_id"] == "mail-bob-1"
+    # Both legs carry the one shared wire send time, not a
+    # post-delivery timestamp per leg.
+    assert [m["sent_at"] for m in messages] == [1000.0, 1000.0]
     # The queued leg is named by its outbox id, the same convention
     # as a queued peer DM: a receipt names the wire id, which for
     # queued mail is the outbox id.
@@ -6562,6 +6567,33 @@ def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
     assert status == 200
     assert payload["group"] == group_id
     assert node.group_reactions == [("crew", "wire-g", "🎉", PEER_HASH, 100.0)]
+
+
+def test_react_endpoint_uses_own_hash_for_outbound_group_leg(bridge, node):
+    # Reacting to a leg this node sent: the history entry's peer is
+    # the recipient, not the author — the author is this node — and
+    # the send time is the shared wire time, so every member can
+    # resolve its own copy.
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi all"},
+    )
+    assert status == 200
+    wire_id = payload["messages"][0]["wire_id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": wire_id, "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [
+        ("crew", wire_id, "👍", node.destination_hexhash, 1000.0)
+    ]
 
 
 def test_react_endpoint_group_gone_is_a_404(bridge, node):

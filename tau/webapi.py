@@ -2550,6 +2550,15 @@ class WebBridge:
         response = self.node.send_group_message(
             group_record, text, timeout=timeout
         )
+        # Every leg shares one wire send time (the node's send_group_
+        # message returns it): record that on each outbound entry, not
+        # a post-delivery timestamp, so reacting to a leg from the
+        # console names the logical message every member holds.
+        wire_sent_at = response.get("sent_at")
+        if not isinstance(wire_sent_at, (int, float)) or isinstance(
+            wire_sent_at, bool
+        ):
+            wire_sent_at = None
         messages: List[Dict[str, Any]] = []
         for result in response.get("results") or []:
             member = str(result.get("to") or "")
@@ -2577,7 +2586,9 @@ class WebBridge:
                     peer=member or None,
                     peer_name=peer_name,
                     text=text,
-                    sent_at=time.time(),
+                    sent_at=(
+                        wire_sent_at if wire_sent_at is not None else time.time()
+                    ),
                     received_at=time.time(),
                     status=status,
                     rtt=_as_float(result.get("rtt")),
@@ -2715,7 +2726,19 @@ class WebBridge:
                     group = message.get("group")
                     if isinstance(group, str):
                         group_id = group
-                        if isinstance(peer, str):
+                        if message.get("direction") == "out":
+                            # This entry is one leg of a send from this
+                            # node: the peer is the recipient, not the
+                            # author, and the send time is the shared
+                            # wire time (see send_group_message), not
+                            # a console-local timestamp.  An entry
+                            # recorded before that fix still carries a
+                            # post-delivery timestamp, which simply
+                            # fails to resolve on other members — the
+                            # pre-fix behaviour — instead of naming a
+                            # wrong author.
+                            target_author = self.node.destination_hexhash
+                        elif isinstance(peer, str):
                             target_author = peer
                         sent_at = message.get("sent_at")
                         if isinstance(sent_at, (int, float)) and not isinstance(

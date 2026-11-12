@@ -435,6 +435,33 @@ def test_send_group_reaction_signs_group_context(tmp_path, monkeypatch):
     assert payload["target"] == "other-leg-1"
 
 
+def test_send_group_message_returns_shared_sent_at(tmp_path, monkeypatch):
+    # Every leg of one send shares a send time, and the response
+    # reports it: the console stores it on each outbound entry so a
+    # reaction to a leg names the logical message every member holds.
+    from tau.protocol import parse_group_message
+
+    node, _, _, _ = _group_reaction_node(tmp_path)
+    payloads = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        payloads.append(payload)
+        return {"ok": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_message("crew", "hi all")
+
+    assert response["ok"] is True
+    sent_at = response["sent_at"]
+    assert isinstance(sent_at, float)
+    assert len(payloads) == 2
+    assert [parse_group_message(p)["sent_at"] for p in payloads] == [
+        sent_at,
+        sent_at,
+    ]
+
+
 def test_node_cannot_be_restarted_after_shutdown(tmp_path):
     node = make_node(tmp_path)
     node._shutdown = True
