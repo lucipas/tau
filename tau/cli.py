@@ -2828,9 +2828,12 @@ def cmd_tan_cancel_scheduled(args: argparse.Namespace) -> int:
         # (see publish_due_scheduled_posts): dropping only the queue
         # entry would leave it in the local timeline.  Remove it with
         # the same local-only delete `tau tan delete --no-publish`
-        # writes, so the cancelled post stops being served.  Peers
-        # that received a copy before the failure keep theirs — a
-        # local delete cannot retract what already went out.
+        # writes.  The post stays stored — Tan deletes are markers, so
+        # the chain stays verifiable and sync keeps carrying the post
+        # together with its delete entry, which is how a peer that
+        # syncs afterwards learns to hide it.  Peers that received a
+        # copy before the failure keep theirs — a local delete cannot
+        # retract what already went out.
         nonlocal deleted_local
         if post.post_hash is None:
             return

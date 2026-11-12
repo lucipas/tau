@@ -405,12 +405,11 @@ def cancel_scheduled_post(
     return post
 
 
-class _StopRequested(Exception):
-    """Internal: the node is stopping, so a publish pass ends early.
-
-    Raised by the target-resolution step (and never by a publish
-    failure), so the pass returns its partial counts instead of
-    recording a failed attempt against the entry being worked on.
+class _PassPaused(Exception):
+    """Internal: the publish pass ends early — node stopping, or the
+    pass budget elapsed.  Raised instead of recording a publish
+    failure, so the entry being worked on keeps its attempts and its
+    unsent peers stay queued for the next pass.
     """
 
 
@@ -443,11 +442,12 @@ def publish_due_scheduled_posts(
     ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.
 
     When ``should_stop`` is given (the node's stop event), a pass ends
-    early — between posts and between peer resolutions — so ``stop()``
-    never waits out a whole publish pass; the entry being worked on
-    stays queued with its attempts untouched.  The in-flight peer
-    resolution still runs to its own timeout, so a stop waits at most
-    one such wait, not a whole pass.
+    early — between posts, between peer resolutions, and between
+    sends — so ``stop()`` never waits out a whole publish pass; the
+    entry being worked on stays queued with its attempts untouched
+    and its unsent peers kept for the next pass.  The in-flight peer
+    resolution or send still runs to its own timeout, so a stop waits
+    at most one such wait, not a whole pass.
 
     Returns ``{"published": n, "kept": m}``.  A corrupt queue file logs a
     warning and publishes nothing, so one bad file cannot stall the mail
@@ -485,14 +485,37 @@ def publish_due_scheduled_posts(
                         post = replace(post, post_hash=created["hash"])
                         queue = queue.with_replaced(post)
                         save_scheduled_posts(path, queue)
-                    result = app.publish(created, targets=targets, ttl=post.ttl)
+                    result = app.publish(
+                        created,
+                        targets=targets,
+                        ttl=post.ttl,
+                        should_stop=should_stop,
+                        deadline=deadline,
+                    )
                     errors = list(result.get("errors") or []) if isinstance(result, dict) else []
+                    unsent = (
+                        tuple(str(h) for h in result.get("unsent") or [])
+                        if isinstance(result, dict)
+                        else ()
+                    )
+                    if unsent:
+                        # The send paused mid-post (stop or budget): the
+                        # peers never attempted stay queued for the next
+                        # pass; no attempt is burned.
+                        failed = tuple(str(err.get("peer") or "") for err in errors)
+                        pending = tuple(dict.fromkeys([*failed, *unsent]))
+                        if not all(p and p != "?" for p in pending):
+                            pending = ()
+                        post = replace(post, pending_peers=pending)
+                        queue = queue.with_replaced(post)
+                        save_scheduled_posts(path, queue)
+                        raise _PassPaused()
                     if errors:
                         failed_peers = tuple(str(err.get("peer") or "") for err in errors)
                         raise ScheduledPostsError(
                             f"{len(errors)} peer(s) did not receive the post"
                         )
-                except _StopRequested:
+                except _PassPaused:
                     # Not a publish failure: end the pass without burning
                     # an attempt on the entry being worked on.
                     raise
@@ -531,7 +554,7 @@ def publish_due_scheduled_posts(
                 queue = queue.with_removed(post.id)
                 save_scheduled_posts(path, queue)
                 published += 1
-        except _StopRequested:
+        except _PassPaused:
             pass
     return {"published": published, "kept": len(candidates) - published}
 
@@ -550,6 +573,6 @@ def _resolve_publish_targets(
     resolved: List[Any] = []
     for name in names:
         if should_stop is not None and should_stop():
-            raise _StopRequested()
+            raise _PassPaused()
         resolved.append(resolve_peer(name))
     return resolved

@@ -161,7 +161,7 @@ class _FakeTanApp:
                 return post
         return None
 
-    def publish(self, post, *, targets=None, ttl=3):
+    def publish(self, post, *, targets=None, ttl=3, should_stop=None, deadline=None):
         if self.fail_publish:
             raise RuntimeError("no route to peers")
         self.published.append((post, targets, ttl))
@@ -307,7 +307,7 @@ def test_partial_failure_retries_only_failed_peers(tmp_path):
     class _PartialApp(_FakeTanApp):
         fail_bob = True
 
-        def publish(self, post, *, targets=None, ttl=3):
+        def publish(self, post, *, targets=None, ttl=3, should_stop=None, deadline=None):
             self.published.append((post, targets, ttl))
             failed = (
                 [t for t in (targets or []) if t.hexhash == "b" * 64]
@@ -400,6 +400,98 @@ def test_node_publish_hook_stops_pass_when_stopping(tmp_path):
     assert len(load_scheduled_posts(path)) == 1
 
 
+def test_publish_pass_keeps_unsent_peers_when_stopping(tmp_path):
+    # A stop mid-send leaves the peers never attempted queued for the
+    # next pass — no attempt burned, and the retry sends only to them.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    queue_path = data_dir / "scheduled-posts.json"
+    schedule_post(
+        queue_path, text="good morning", publish_at=1000.0,
+        to=["alice", "bob"], now=900.0,
+    )
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    sent = []
+    stop = {"set": False}
+
+    class _RecordingNode:
+        def request(self, peer, path, payload, *, timeout=15.0):
+            sent.append(peer.hexhash)
+            if len(sent) == 1:
+                stop["set"] = True
+            return None
+
+    app.node = _RecordingNode()
+    by_name_or_hash = {
+        "alice": SimpleNamespace(hexhash="a" * 64),
+        "bob": SimpleNamespace(hexhash="b" * 64),
+        "a" * 64: SimpleNamespace(hexhash="a" * 64),
+        "b" * 64: SimpleNamespace(hexhash="b" * 64),
+    }
+    result = publish_due_scheduled_posts(
+        queue_path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        should_stop=lambda: stop["set"],
+        now=2000.0,
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert sent == ["a" * 64]
+    queued = load_scheduled_posts(queue_path).posts[0]
+    assert queued.pending_peers == ("b" * 64,)
+    assert queued.attempts == 0
+
+    # The next pass sends only to the peer that never got it.
+    stop["set"] = False
+    result = publish_due_scheduled_posts(
+        queue_path,
+        app,
+        resolve_peer=lambda name: by_name_or_hash[name],
+        should_stop=lambda: stop["set"],
+        now=2100.0,
+    )
+    assert result == {"published": 1, "kept": 0}
+    assert sent == ["a" * 64, "b" * 64]
+
+
+def test_tan_publish_reports_unsent_peers_past_deadline(tmp_path):
+    # TanApp.publish checks the deadline between sends: with a
+    # deadline already past, nothing is sent and every peer is unsent.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    config = TauConfig.resolve(data_dir=data_dir)
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+
+    sent = []
+
+    class _RecordingNode:
+        def request(self, peer, path, payload, *, timeout=15.0):
+            sent.append(peer.hexhash)
+            return None
+
+    app.node = _RecordingNode()
+    post = app.create_post("hello mesh")
+    peers = [SimpleNamespace(hexhash="a" * 64), SimpleNamespace(hexhash="b" * 64)]
+    result = app.publish(post, targets=peers, deadline=time.monotonic() - 1.0)
+    assert result["delivered"] == 0
+    assert result["unsent"] == ["a" * 64, "b" * 64]
+    assert sent == []
+    result = app.publish(post, targets=peers, deadline=time.monotonic() + 60.0)
+    assert result["delivered"] == 2
+    assert result["unsent"] == []
+    assert sent == ["a" * 64, "b" * 64]
+
+
 def _run_cli(data_dir: Path, argv):
     return cli.main(["--data-dir", str(data_dir), *argv])
 
@@ -490,6 +582,58 @@ def test_cancel_removes_stored_post_after_failed_publish(tmp_path, capsys):
     conn = init_db(config.social_db_path)
     try:
         assert stored_hash in deleted_targets(conn)
+    finally:
+        conn.close()
+
+
+def test_cancelled_post_syncs_only_as_deleted(tmp_path, capsys):
+    # Cancellation after a publish attempt writes a Tan delete, not a
+    # removal: the post stays stored so the chain stays verifiable,
+    # but the sync feed carries the delete entry with it, so a peer
+    # that syncs learns the deletion — and the display feed hides it.
+    from tau.config import TauConfig
+    from tau.identity import load_identity
+    from tau.tangents.tan import TanApp, deleted_targets, feed, init_db
+
+    data_dir = tmp_path / "node"
+    assert _run_cli(data_dir, ["init", "--json"]) == 0
+    assert _run_cli(data_dir, ["tan", "post", "--delay", "5m", "good morning"]) == 0
+    queue_path = data_dir / "scheduled-posts.json"
+    post = load_scheduled_posts(queue_path).posts[0]
+    config = TauConfig.resolve(data_dir=data_dir)
+
+    peer = SimpleNamespace(hexhash="d" * 64)
+
+    class _FailingNode:
+        registry = SimpleNamespace(all=lambda: [peer])
+
+        def request(self, *args, **kwargs):
+            raise RuntimeError("no route")
+
+    app = TanApp(config, load_identity(config.identity_path), name=config.name)
+    app.node = _FailingNode()
+    result = publish_due_scheduled_posts(
+        queue_path, app, now=post.publish_at + 1.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    stored_hash = load_scheduled_posts(queue_path).posts[0].post_hash
+    assert stored_hash is not None
+
+    assert _run_cli(data_dir, ["tan", "cancel-scheduled", post.id]) == 0
+    conn = init_db(config.social_db_path)
+    try:
+        assert stored_hash in deleted_targets(conn)
+        # What /tan/feed serves to a syncing peer: the post is still
+        # there (chain verifiable), but so is its delete entry.
+        synced = feed(conn)
+        assert any(p["hash"] == stored_hash for p in synced)
+        assert any(
+            p.get("kind") == "delete" and p.get("target") == stored_hash
+            for p in synced
+        )
+        # And the display feed — what any peer shows — hides it.
+        shown = feed(conn, posts_only=True)
+        assert all(p["hash"] != stored_hash for p in shown)
     finally:
         conn.close()
 

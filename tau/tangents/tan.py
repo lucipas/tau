@@ -4681,8 +4681,17 @@ class TanApp:
         ttl: int = MAX_GOSSIP_TTL,
         exclude: Optional[str] = None,
         fanout: Optional[int] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Push a post to peers; return delivery counts."""
+        """Push a post to peers; return delivery counts.
+
+        When ``should_stop`` or ``deadline`` (a ``time.monotonic``
+        value) is given, sending stops early — between peers — and
+        the peers never attempted come back in ``"unsent"`` so the
+        caller can keep them queued.  Callers that pass neither send
+        to every peer, as before.
+        """
         node = self.node
         if node is None:
             raise TanError("Tan is not attached to a running node")
@@ -4700,7 +4709,14 @@ class TanApp:
         )
         delivered = 0
         errors: List[Dict[str, str]] = []
-        for peer in peers:
+        unsent: List[str] = []
+        for index, peer in enumerate(peers):
+            if should_stop is not None and should_stop():
+                unsent = [getattr(p, "hexhash", "?") for p in peers[index:]]
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                unsent = [getattr(p, "hexhash", "?") for p in peers[index:]]
+                break
             try:
                 node.request(
                     peer, TAN_POST_PATH, payload, timeout=self.request_timeout
@@ -4710,7 +4726,12 @@ class TanApp:
                 errors.append(
                     {"peer": getattr(peer, "hexhash", "?"), "error": str(exc)}
                 )
-        return {"delivered": delivered, "peers": len(peers), "errors": errors}
+        return {
+            "delivered": delivered,
+            "peers": len(peers),
+            "errors": errors,
+            "unsent": unsent,
+        }
 
     # -- request handlers --------------------------------------------------
 
