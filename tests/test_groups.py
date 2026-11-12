@@ -7,8 +7,11 @@ store-and-forward outbox.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import RNS
@@ -16,14 +19,17 @@ import pytest
 
 from tau import cli
 from tau.config import TauConfig
-from tau.groups import GroupStore
+from tau.groups import MAX_RENAME_LINEAGE, GroupStore
 from tau.identity import destination_hash
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, open_message, seal_message
 from tau.node import NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
+    MAX_GROUP_TOPIC_LENGTH,
+    PROTOCOL_VERSION,
     ProtocolError,
+    clean_group_topic,
     decode,
     derive_group_id,
     encode_group_message,
@@ -154,7 +160,152 @@ def test_group_message_rejects_bad_expiry():
         parse_group_message(raw)
 
 
+def test_group_message_roundtrip_with_rename_lineage():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    old_id = derive_group_id(OWN_HASH, "weekend", members)
+    group_id = derive_group_id(OWN_HASH, "road trip", members)
+    payload = encode_group_message(
+        "hi all",
+        message_id="gm-1",
+        group_id=group_id,
+        group_name="road trip",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+        renamed_from=[old_id],
+    )
+    parsed = parse_group_message(payload)
+    assert parsed["renamed_from"] == [old_id]
+    # A message without lineage parses to an empty lineage.
+    plain = encode_group_message(
+        "hi",
+        group_id=group_id,
+        group_name="road trip",
+        creator=OWN_HASH,
+        members=members,
+    )
+    assert parse_group_message(plain)["renamed_from"] == []
+    # A malformed lineage is rejected, like a malformed roster.
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=group_id,
+            group_name="road trip",
+            creator=OWN_HASH,
+            members=members,
+            renamed_from=["not-a-hash"],
+        )
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=group_id,
+            group_name="road trip",
+            creator=OWN_HASH,
+            members=members,
+            renamed_from=[old_id, old_id],
+        )
+
+
 def test_group_id_derives_from_creator_name_and_roster():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    first = derive_group_id(OWN_HASH, "weekend", members)
+    # Order-independent and deterministic.
+    assert derive_group_id(OWN_HASH, "weekend", list(reversed(members))) == first
+    assert derive_group_id(OWN_HASH, "weekend", members) == first
+    # Any change to the roster, name or creator is a new group.
+    assert derive_group_id(OWN_HASH, "weekend", [OWN_HASH, OTHER_HASH]) != first
+    assert derive_group_id(OWN_HASH, "other", members) != first
+    assert derive_group_id(OTHER_HASH, "weekend", members) != first
+
+
+def test_group_message_roundtrip_with_topic():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    payload = encode_group_message(
+        "hi all",
+        message_id="gm-1",
+        group_id=group_id,
+        group_name="weekend",
+        creator=OWN_HASH,
+        members=members,
+        sent_at=123.0,
+        group_topic="planning the meetup",
+    )
+    parsed = parse_group_message(payload)
+    assert parsed["group_topic"] == "planning the meetup"
+    # Clearing is a present empty topic, not an absent one.
+    cleared = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            group_topic="",
+        )
+    )
+    assert cleared["group_topic"] == ""
+    # A sender that predates topics omits the field: the local topic
+    # must be left alone, so parse reports None.
+    legacy = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-3",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+        )
+    )
+    assert legacy["group_topic"] is None
+
+
+def test_group_message_roundtrip_with_topic_sent_at():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    # The topic carries its own set time, so a retried message whose
+    # send time predates a topic change is still judged by the topic.
+    parsed = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            sent_at=110.0,
+            group_topic="new plan",
+            group_topic_sent_at=130.0,
+        )
+    )
+    assert parsed["group_topic"] == "new plan"
+    assert parsed["group_topic_sent_at"] == 130.0
+    # Absent on the wire (a sender that predates topics, or one that
+    # never set a topic): the recipient falls back to the send time.
+    legacy = parse_group_message(
+        encode_group_message(
+            "hi all",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=OWN_HASH,
+            members=members,
+            group_topic="new plan",
+        )
+    )
+    assert legacy["group_topic"] == "new plan"
+    assert legacy["group_topic_sent_at"] is None
+
+
+def test_clean_group_topic_truncates_and_collapses():
+    assert clean_group_topic("  planning   the  meetup ") == "planning the meetup"
+    assert clean_group_topic("hello\n") == "hello"
+    assert clean_group_topic("") == ""
+    assert clean_group_topic(None) == ""
+    assert clean_group_topic(123) == ""
+    long_topic = "x" * (MAX_GROUP_TOPIC_LENGTH + 10)
+    assert clean_group_topic(long_topic) == "x" * MAX_GROUP_TOPIC_LENGTH
     members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
     first = derive_group_id(OWN_HASH, "weekend", members)
     # Order-independent and deterministic.
@@ -375,6 +526,465 @@ def test_group_store_update_members_adds_and_removes(tmp_path):
     assert len(store) == 1
 
 
+def test_group_store_set_topic(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert group["topic"] == ""
+    updated = store.set_topic(group["id"], "planning the meetup", created_by=OWN_HASH)
+    assert updated["topic"] == "planning the meetup"
+    assert updated["topic_sent_at"] is not None
+    # Setting the same topic again is a no-op returning the record.
+    assert store.set_topic(group["id"], "planning the meetup", created_by=OWN_HASH) == updated
+    # Clearing, and the change survives a reload.
+    cleared = store.set_topic(group["id"], "", created_by=OWN_HASH)
+    assert cleared["topic"] == ""
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group["id"])["topic"] == ""
+    # Only the creator can set it; a learned group is refused too.
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_topic(group["id"], "forged", created_by=OTHER_HASH)
+    learned = store.record(
+        derive_group_id(OTHER_HASH, "other", [OTHER_HASH, THIRD_HASH]),
+        "other",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+    )
+    assert learned is not None
+    with pytest.raises(ValueError, match="only the creator"):
+        store.set_topic(learned["id"], "forged", created_by=OTHER_HASH)
+    with pytest.raises(ValueError, match="unknown group"):
+        store.set_topic(generate_group_id(), "nope", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="longer than"):
+        store.set_topic(
+            group["id"], "x" * (MAX_GROUP_TOPIC_LENGTH + 1), created_by=OWN_HASH
+        )
+
+
+def test_group_store_topic_survives_roster_change(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    with_topic = store.set_topic(
+        group["id"], "planning the meetup", created_by=OWN_HASH
+    )
+    grown = store.update_members(
+        group["id"], [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    assert grown["topic"] == "planning the meetup"
+    assert grown["topic_sent_at"] == with_topic["topic_sent_at"]
+    assert store.get(grown["id"])["topic"] == "planning the meetup"
+
+
+def test_group_store_record_topic_pinning(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    # First sighting from the creator carries the topic.
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert pinned is not None and pinned["topic"] == "planning the meetup"
+    assert pinned["topic_sent_at"] == 100.0
+    # A member-carried message cannot set (or forge) the topic.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OTHER_HASH,
+            sent_at=150.0,
+            topic="forged",
+        )["topic"]
+        == "planning the meetup"
+    )
+    # A sender that predates topics leaves the topic alone.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=200.0,
+        )["topic"]
+        == "planning the meetup"
+    )
+    # A newer creator message replaces it; a stale queued copy does not.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=300.0,
+            topic="new plan",
+        )["topic"]
+        == "new plan"
+    )
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=250.0,
+            topic="planning the meetup",
+        )["topic"]
+        == "new plan"
+    )
+    # The creator clearing the topic sends "" with a newer sent_at.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=400.0,
+            topic="",
+        )["topic"]
+        == ""
+    )
+
+
+def test_group_store_record_topic_judged_by_its_own_timestamp(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="first plan",
+    )
+    assert pinned is not None and pinned["topic_sent_at"] == 100.0
+    # A retried copy sent at 110 carries a topic set at 130: the topic
+    # is newer than the pinned one even though the message is older.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=110.0,
+            topic="new plan",
+            topic_sent_at=130.0,
+        )["topic"]
+        == "new plan"
+    )
+    # The reverse: a message sent at 150 carrying a topic set at 100 is
+    # stale, even though the message itself is the newest seen.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=150.0,
+            topic="first plan",
+            topic_sent_at=100.0,
+        )["topic"]
+        == "new plan"
+    )
+
+
+def _topic_successor_setup(tmp_path):
+    """A store holding a predecessor group with a topic set at 200.
+
+    The successor shares the name but drops a member, so its id differs
+    and the creator's message supersedes the predecessor by name.
+    """
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    old_id = derive_group_id(OWN_HASH, "weekend", members)
+    pinned = store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="old plan",
+        topic_sent_at=200.0,
+    )
+    assert pinned is not None and pinned["topic"] == "old plan"
+    new_members = [OWN_HASH, OTHER_HASH]
+    new_id = derive_group_id(OWN_HASH, "weekend", new_members)
+    return store, members, new_members, old_id, new_id
+
+
+def test_group_store_record_successor_adopts_missing_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # The successor's message omits the topic: the predecessor's newer
+    # one survives the replacement.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_successor_keeps_newer_predecessor_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # The successor carries an older topic: the predecessor's newer one
+    # wins, even though the successor's roster is the live one.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="older plan",
+        topic_sent_at=100.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_successor_keeps_its_newer_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="new plan",
+        topic_sent_at=300.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "new plan"
+    assert successor["topic_sent_at"] == 300.0
+    assert store.get(old_id) is None
+    # And a clear with a newer stamp still clears it.
+    cleared = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=160.0,
+        topic="",
+        topic_sent_at=300.0,
+    )
+    assert cleared is not None and cleared["topic"] == ""
+
+
+def test_group_store_record_existing_successor_keeps_predecessor_topic(
+    tmp_path,
+):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    # A member message pins the successor first; members cannot set a
+    # topic, so it starts empty.
+    member_pinned = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OTHER_HASH,
+        sent_at=120.0,
+    )
+    assert member_pinned is not None and member_pinned["topic"] == ""
+    # The creator's message carries an older topic: the predecessor's
+    # newer one must win, and the predecessor is retired.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+        topic="older plan",
+        topic_sent_at=100.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_existing_successor_adopts_missing_topic(tmp_path):
+    store, members, new_members, old_id, new_id = _topic_successor_setup(
+        tmp_path
+    )
+    member_pinned = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OTHER_HASH,
+        sent_at=120.0,
+    )
+    assert member_pinned is not None and member_pinned["topic"] == ""
+    # The creator's message omits the topic entirely: the predecessor's
+    # newer one must still survive the replacement.
+    successor = store.record(
+        new_id,
+        "weekend",
+        new_members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=150.0,
+    )
+    assert successor is not None
+    assert successor["topic"] == "old plan"
+    assert successor["topic_sent_at"] == 200.0
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_same_topic_skips_write(tmp_path):
+    path = tmp_path / "groups.json"
+    store = GroupStore(path)
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert pinned is not None
+    # The identical creator message changes neither the text nor the
+    # stamp, so the groups file must not be rewritten at all.
+    calls = []
+    original_save = store._save
+
+    def counting_save():
+        calls.append(1)
+        return original_save()
+
+    store._save = counting_save
+    again = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=100.0,
+        topic="planning the meetup",
+    )
+    assert again is not None and again["topic"] == "planning the meetup"
+    assert calls == []
+
+
+def test_group_store_record_ignores_huge_timestamps(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group_id = derive_group_id(OWN_HASH, "weekend", members)
+    huge = 10**400
+    pinned = store.record(
+        group_id,
+        "weekend",
+        members,
+        creator=OWN_HASH,
+        sender=OWN_HASH,
+        sent_at=huge,
+        topic="planning the meetup",
+        topic_sent_at=huge,
+    )
+    assert pinned is not None
+    assert pinned["topic"] == "planning the meetup"
+    assert pinned["topic_sent_at"] is None
+    assert pinned.get("roster_sent_at") is None
+    # The store still works afterwards.
+    assert (
+        store.record(
+            group_id,
+            "weekend",
+            members,
+            creator=OWN_HASH,
+            sender=OWN_HASH,
+            sent_at=100.0,
+            topic="new plan",
+        )["topic"]
+        == "new plan"
+    )
+
+
+def test_group_message_huge_topic_timestamp_is_dropped():
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    raw = json.dumps(
+        {
+            "type": "group_message",
+            "v": PROTOCOL_VERSION,
+            "text": "hello",
+            "sent_at": 100.0,
+            "client": "tau/0",
+            "group": derive_group_id(OWN_HASH, "weekend", members),
+            "group_name": "weekend",
+            "creator": OWN_HASH,
+            "members": members,
+            "id": "huge-topic-1",
+            "group_topic": "planning the meetup",
+            "group_topic_sent_at": 10**400,
+        }
+    ).encode()
+    parsed = parse_group_message(raw)
+    assert parsed["group_topic"] == "planning the meetup"
+    assert parsed["group_topic_sent_at"] is None
+
+
+def test_validated_sealed_message_ignores_huge_timestamps():
+    from tau.mailbox import _validated_sealed_message
+
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    payload = {
+        "id": "sealed-huge-1",
+        "text": "hello",
+        "from": OWN_HASH,
+        "from_name": "alice",
+        "sent_at": 10**400,
+        "group": {
+            "id": derive_group_id(OWN_HASH, "weekend", members),
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": members,
+            "topic": "planning the meetup",
+            "topic_sent_at": 10**400,
+        },
+    }
+    result = _validated_sealed_message(payload)
+    assert result["sent_at"] is None
+    assert result["group"]["topic"] == "planning the meetup"
+    assert "topic_sent_at" not in result["group"]
+
+
 def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
     store = GroupStore(tmp_path / "groups.json")
     group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
@@ -397,6 +1007,315 @@ def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
         )
         is None
     )
+
+
+def test_group_store_leave_removes_and_refuses_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.get(group["id"]) is None
+    assert store.list_groups() == []
+    # A later message for the left group must not re-pin it — unlike
+    # delete, whose removal the next message undoes.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Survives a restart.
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.is_left(group["id"]) is True
+    assert (
+        reloaded.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    left = reloaded.left_groups()
+    assert [entry["id"] for entry in left] == [group["id"]]
+    assert isinstance(left[0]["left_at"], float)
+
+
+def test_group_store_transaction_uses_msvcrt_when_fcntl_missing(
+    tmp_path, monkeypatch
+):
+    """Without fcntl (Windows) the store still takes a cross-process lock.
+
+    Regression test for the CodeRabbit Major on PR #265: with only the
+    per-instance lock, a serving process's ``record()`` could save
+    after a concurrent CLI ``leave()`` and drop the left marker, so
+    the next message re-pinned the group.
+    """
+    import tau.groups as groups_mod
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            calls.append(mode)
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert calls == [FakeMsvcrt.LK_LOCK, FakeMsvcrt.LK_UNLCK]
+    assert (tmp_path / "groups.json.lock").exists()
+
+
+def test_group_store_leave_marker_survives_concurrent_record(
+    tmp_path, monkeypatch
+):
+    """A record() racing a leave() cannot drop the left marker.
+
+    Two stores on one path stand in for the serving process and the
+    CLI.  With fcntl missing, a fake msvcrt backed by a real lock
+    serialises the transactions; every interleaving must end with
+    the group left and unpinnable.
+    """
+    import tau.groups as groups_mod
+
+    gate = threading.Lock()
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == FakeMsvcrt.LK_LOCK:
+                gate.acquire()
+            else:
+                gate.release()
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    group_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    )
+    server = GroupStore(tmp_path / "groups.json")
+    cli_store = GroupStore(tmp_path / "groups.json")
+    assert (
+        server.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+
+    def hammer_record():
+        for _ in range(25):
+            server.record(
+                group_id,
+                "theirs",
+                [OWN_HASH, OTHER_HASH, THIRD_HASH],
+                creator=OTHER_HASH,
+            )
+
+    def hammer_leave():
+        for _ in range(25):
+            cli_store.leave(group_id)
+
+    first = threading.Thread(target=hammer_record)
+    second = threading.Thread(target=hammer_leave)
+    first.start()
+    second.start()
+    first.join(timeout=30)
+    second.join(timeout=30)
+    assert not first.is_alive() and not second.is_alive()
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group_id) is None
+    assert reloaded.is_left(group_id) is True
+    assert (
+        reloaded.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+
+
+def test_group_store_leave_unknown_and_rejoin_never_left(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    assert store.leave("00" * 16) == []
+    assert store.rejoin("00" * 16) is False
+    assert store.is_left("00" * 16) is False
+    assert store.left_groups() == []
+    # Leaving twice reports nothing left to do, but stays left.
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.leave(group["id"]) == []
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_rejoin_allows_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.rejoin(group["id"]) is True
+    assert store.is_left(group["id"]) is False
+    assert store.left_groups() == []
+    assert store.rejoin(group["id"]) is False
+    # The next message pins the group again.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.get(group["id"]) is not None
+    # A re-invite under a changed roster is a new id and pins without
+    # a rejoin, even while the old id stays left.
+    assert store.leave(group["id"]) == [group["id"]]
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    assert (
+        store.record(
+            grown_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_leave_also_leaves_pinned_successor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    first = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    # A successor roster carried by another member pins alongside the
+    # predecessor instead of replacing it.
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    second = store.record(
+        grown_id,
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    assert second is not None
+    assert len(store.list_groups()) == 2
+    # Leaving by name leaves both versions of the same group: the
+    # successor would otherwise keep receiving.
+    assert sorted(store.leave(first["id"])) == sorted([first["id"], grown_id])
+    assert store.list_groups() == []
+    assert store.is_left(first["id"]) is True
+    assert store.is_left(grown_id) is True
+    assert (
+        store.record(
+            first["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    assert (
+        store.record(
+            grown_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    # A genuinely new roster arriving after the leave is a new id and
+    # pins normally.
+    newer_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, "34" * 16]
+    )
+    assert (
+        store.record(
+            newer_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, "34" * 16],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+
+
+def test_group_store_find_resolves_32_char_name(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("n" * 32, [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    # A 32-character name resolves even though it is id-length.
+    assert store.find("n" * 32)["id"] == group["id"]
+    # An actual id still wins over a name that spells the same id.
+    other = store.create("other", [OWN_HASH, THIRD_HASH], created_by=OWN_HASH)
+    named = store.create(other["id"], [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert store.find(other["id"])["id"] == other["id"]
+    assert named["id"] != other["id"]
+
+
+def test_group_store_left_list_is_capped(tmp_path):
+    from tau.groups import MAX_LEFT_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    left_ids = []
+    for i in range(MAX_LEFT_GROUPS + 5):
+        group = store.record(
+            derive_group_id(
+                OTHER_HASH, f"g{i}", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+            ),
+            f"g{i}",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        assert store.leave(group["id"]) == [group["id"]]
+        left_ids.append(group["id"])
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert len(raw["left"]) == MAX_LEFT_GROUPS
+    assert left_ids[0] not in [entry["id"] for entry in raw["left"]]
+    assert left_ids[-1] in [entry["id"] for entry in raw["left"]]
 
 
 def test_group_store_update_members_refusals(tmp_path):
@@ -773,6 +1692,296 @@ def test_group_store_retirement_lifts_when_roster_returns(tmp_path):
     )
 
 
+def _learned_group_ids(tmp_path):
+    """A member-side store holding a group learned from its creator."""
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OTHER_HASH, OWN_HASH, THIRD_HASH]
+    old_id = derive_group_id(OTHER_HASH, "weekend", members)
+    old = store.record(
+        old_id, "weekend", members, creator=OTHER_HASH, sender=THIRD_HASH
+    )
+    assert old is not None
+    new_id = derive_group_id(OTHER_HASH, "road trip", members)
+    return store, members, old_id, new_id
+
+
+def test_group_store_record_retires_rename_predecessors(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # A creator-authorized message under the new name retires the old one.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert successor["renamed_from"] == [old_id]
+    assert store.get(old_id) is None
+    assert store.find("road trip") == successor
+    with pytest.raises(ValueError, match="unknown group"):
+        store.find("weekend")
+    # A queued copy of an old message cannot re-pin the retired id.
+    assert (
+        store.record(
+            old_id, "weekend", members, creator=OTHER_HASH, sender=OTHER_HASH
+        )
+        is None
+    )
+
+
+def test_group_store_record_keeps_predecessor_without_creator(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # A member-carried successor pins alongside: the lineage is only a
+    # claim until the creator themself sends under the new name.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert store.get(old_id) is not None
+    assert len(store) == 2
+    # The creator's own message then retires the predecessor, and the
+    # already-pinned successor adopts the lineage.
+    again = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert again is not None
+    assert again["renamed_from"] == [old_id]
+    assert store.get(old_id) is None
+
+
+def test_group_store_record_drops_member_carried_lineage(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # A member-carried successor pins alongside, but its lineage is
+    # only a claim: it must not be stored, or this node's later sends
+    # would retransmit it under the creator's identity and other
+    # members would retire the named group.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert successor["renamed_from"] == []
+    assert store.get(new_id)["renamed_from"] == []
+    assert store.get(old_id) is not None
+    # The creator's own message still adopts the authoritative lineage.
+    again = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert again is not None
+    assert again["renamed_from"] == [old_id]
+    assert store.get(old_id) is None
+
+
+def test_group_store_rename_caps_lineage(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    members = [OTHER_HASH, OWN_HASH, THIRD_HASH]
+    current = store.create("place-0", members, created_by=OTHER_HASH)
+    assert current["renamed_from"] == []
+    for i in range(1, 41):
+        current = store.rename(current["id"], f"place-{i}", created_by=OTHER_HASH)
+    assert len(current["renamed_from"]) == MAX_RENAME_LINEAGE
+    # Newest first: the most recent predecessor is place-39's id, and
+    # the oldest retained one is place-8's (40 renames, 32 kept).
+    assert current["renamed_from"][0] == derive_group_id(
+        OTHER_HASH, "place-39", members
+    )
+    assert current["renamed_from"][-1] == derive_group_id(
+        OTHER_HASH, "place-8", members
+    )
+    # A short message to the much-renamed group still fits the wire budget.
+    encode_group_message(
+        "hi",
+        group_id=current["id"],
+        group_name=current["name"],
+        creator=OTHER_HASH,
+        members=members,
+        renamed_from=current["renamed_from"],
+    )
+
+
+def test_group_store_record_caps_creator_lineage(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    lineage = [
+        derive_group_id(OTHER_HASH, f"old-{i}", members) for i in range(40)
+    ]
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=lineage,
+    )
+    assert successor is not None
+    assert successor["renamed_from"] == lineage[:MAX_RENAME_LINEAGE]
+    # A later creator message merges more lineage; the total stays capped.
+    extra = [
+        derive_group_id(OTHER_HASH, f"new-{i}", members) for i in range(5)
+    ]
+    again = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+        renamed_from=extra,
+    )
+    assert again is not None
+    assert len(again["renamed_from"]) == MAX_RENAME_LINEAGE
+    assert again["renamed_from"][:5] == extra
+
+
+def test_group_store_record_stale_predecessor_not_retired(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # The predecessor was pinned by a creator message sent after the
+    # successor message: the successor copy is stale and must not
+    # retire it.
+    store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+    )
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert store.get(old_id) is not None
+
+
+def test_group_store_record_creator_restore_of_retired_id(tmp_path):
+    store, members, old_id, new_id = _learned_group_ids(tmp_path)
+    # The creator renames: the member retires the predecessor.
+    successor = store.record(
+        new_id,
+        "road trip",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[old_id],
+    )
+    assert successor is not None
+    assert store.get(old_id) is None
+    # A queued copy of an old message (no lineage) cannot restore it.
+    assert (
+        store.record(
+            old_id,
+            "weekend",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=50.0,
+        )
+        is None
+    )
+    # The creator renames back: the restore message carries the lineage
+    # naming the successor, sent after the successor was pinned.
+    restored = store.record(
+        old_id,
+        "weekend",
+        members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=200.0,
+        renamed_from=[new_id],
+    )
+    assert restored is not None
+    assert restored["renamed_from"] == [new_id]
+    assert store.get(new_id) is None
+    assert store.find("weekend") == restored
+    # A stale copy of the successor message (sent before the restore)
+    # cannot flip it back.
+    assert (
+        store.record(
+            new_id,
+            "road trip",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+            sent_at=100.0,
+            renamed_from=[old_id],
+        )
+        is None
+    )
+    assert store.get(new_id) is None
+
+
+def test_group_store_record_dedupes_superseded_predecessor(tmp_path):
+    members = [OTHER_HASH, OWN_HASH, THIRD_HASH]
+    store = GroupStore(tmp_path / "groups.json")
+    mid_id = derive_group_id(OTHER_HASH, "road trip", members)
+    # The member learned the renamed group B ("road trip", roster R1).
+    mid = store.record(
+        mid_id, "road trip", members, creator=OTHER_HASH, sender=THIRD_HASH
+    )
+    assert mid is not None
+    # The creator then changed the roster: C ("road trip", R2) carries
+    # the lineage naming B, which also shares C's name — B is both a
+    # same-name supersede and a lineage predecessor, and must be
+    # replaced exactly once.
+    new_members = [OTHER_HASH, OWN_HASH, STRANGER_HASH]
+    new_id = derive_group_id(OTHER_HASH, "road trip", new_members)
+    successor = store.record(
+        new_id,
+        "road trip",
+        new_members,
+        creator=OTHER_HASH,
+        sender=OTHER_HASH,
+        sent_at=100.0,
+        renamed_from=[mid_id],
+    )
+    assert successor is not None
+    assert store.get(mid_id) is None
+    assert store.get(new_id) == successor
+    assert len(store) == 1
+    # B was retired as a predecessor, not just superseded: replay refused.
+    assert (
+        store.record(
+            mid_id,
+            "road trip",
+            members,
+            creator=OTHER_HASH,
+            sender=OTHER_HASH,
+        )
+        is None
+    )
+
+
 def test_group_store_retired_list_is_capped(tmp_path):
     from tau.groups import MAX_RETIRED_GROUPS
 
@@ -811,6 +2020,105 @@ def test_group_store_update_members_save_failure_rolls_back(
             [OWN_HASH, OTHER_HASH, THIRD_HASH],
             created_by=OWN_HASH,
         )
+    # Neither the old record lost nor the successor kept.
+    assert store.get(group["id"]) == group
+    assert len(store) == 1
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert [item["id"] for item in reloaded.list_groups()] == [group["id"]]
+
+
+def test_group_store_rename(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    created_at = group["created_at"]
+    renamed = store.rename(group["id"], "  road trip ", created_by=OWN_HASH)
+    assert renamed["id"] == derive_group_id(
+        OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH]
+    )
+    assert renamed["id"] != group["id"]
+    assert renamed["name"] == "road trip"
+    assert renamed["members"] == [OWN_HASH, OTHER_HASH]
+    assert renamed["created_at"] == created_at
+    assert renamed["local"] is True
+    # The successor remembers the predecessor, newest first.
+    assert renamed["renamed_from"] == [group["id"]]
+    assert store.get(group["id"]) is None
+    assert store.get(renamed["id"]) == renamed
+    assert len(store) == 1
+    with pytest.raises(ValueError, match="unknown group"):
+        store.find("weekend")
+    assert store.find("road trip") == renamed
+    # Renaming to the current name is a no-op: the same record comes back.
+    assert store.rename(renamed["id"], "road trip", created_by=OWN_HASH) == renamed
+    # A blank name sanitizes to "group", exactly as at creation, and
+    # the lineage grows: newest predecessor first.
+    blank = store.rename(renamed["id"], "   ", created_by=OWN_HASH)
+    assert blank["name"] == "group"
+    assert blank["id"] == derive_group_id(
+        OWN_HASH, "group", [OWN_HASH, OTHER_HASH]
+    )
+    assert blank["renamed_from"] == [renamed["id"], group["id"]]
+
+
+def test_group_store_rename_refusals(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    learned = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert learned is not None
+    with pytest.raises(ValueError, match="unknown group"):
+        store.rename("00" * 16, "new", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="only the creator"):
+        store.rename(learned["id"], "new", created_by=OWN_HASH)
+    with pytest.raises(ValueError, match="only the creator"):
+        store.rename(group["id"], "new", created_by=OTHER_HASH)
+    # Refusals leave the store untouched.
+    assert store.get(group["id"]) == group
+    assert len(store) == 2
+
+
+def test_group_store_rename_retires_old_name(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    renamed = store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    # The old id is retired: a replayed old message cannot restore it.
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Renaming back lifts the retirement.
+    restored = store.rename(renamed["id"], "weekend", created_by=OWN_HASH)
+    assert restored["id"] == group["id"]
+    # The lineage names only the successor, never the restored id itself.
+    assert restored["renamed_from"] == [renamed["id"]]
+    assert store.delete(restored["id"]) is True
+    assert (
+        store.record(
+            group["id"], "weekend", [OWN_HASH, OTHER_HASH], creator=OWN_HASH
+        )
+        is not None
+    )
+
+
+def test_group_store_rename_save_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.groups as groups_module
+
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(groups_module, "atomic_write_json", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        store.rename(group["id"], "road trip", created_by=OWN_HASH)
     # Neither the old record lost nor the successor kept.
     assert store.get(group["id"]) == group
     assert len(store) == 1
@@ -983,6 +2291,32 @@ def test_group_message_delivered_and_group_pinned(tmp_path):
     assert pinned["creator"] == sender_hash
 
 
+def test_group_message_with_reply_stores_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "seconded",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+            in_reply_to=reply_to,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert received[0]["in_reply_to"] == reply_to
+    entry = node.inbox.list_messages()[0]
+    assert entry["in_reply_to"] == reply_to
+
+
 def test_group_message_expired_is_dropped_unrecorded(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -1128,6 +2462,50 @@ def test_group_message_from_non_member_rejected(tmp_path):
     assert received == []
     assert len(node.inbox) == 0
     assert len(node.groups) == 0
+
+
+def test_group_message_after_leave_is_rejected(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    first = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "hi all",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert first["ok"] is True
+    assert len(received) == 1
+    assert node.groups.leave(group_id) == [group_id]
+    # A later message for the left group is rejected, never stored,
+    # and does not re-pin the group — unlike delete, whose removal the
+    # next message undoes.
+    second = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "are you still there?",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert second["ok"] is False
+    assert second["error"]["code"] == "not_a_member"
+    assert len(received) == 1
+    assert len(node.inbox) == 1
+    assert node.groups.get(group_id) is None
+    assert node.groups.is_left(group_id) is True
 
 
 def test_group_message_from_blocked_sender_dropped_silently(tmp_path):
@@ -1350,6 +2728,77 @@ def test_group_message_stale_creator_message_does_not_replace_successor(
     assert node.groups.find("weekend")["id"] == new_id
 
 
+def test_group_message_topic_pinned_from_creator_only(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    creator, creator_hash = make_sender()
+    member, member_hash = make_sender()
+    members = [OWN_HASH, creator_hash, member_hash]
+    group_id = derive_group_id(creator_hash, "weekend", members)
+
+    def send(sender, text, *, topic=None, sent_at, message_id):
+        kwargs = {}
+        if topic is not None:
+            kwargs["group_topic"] = topic
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                text,
+                message_id=message_id,
+                group_id=group_id,
+                group_name="weekend",
+                creator=creator_hash,
+                members=members,
+                sent_at=sent_at,
+                **kwargs,
+            ),
+            remote_identity=sender,
+        )
+
+    first = send(creator, "first", topic="planning the meetup", sent_at=100.0, message_id="gm-t1")
+    assert first["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "planning the meetup"
+    # A member's message carries whatever topic they know; it must not
+    # set (or forge) the group's topic.
+    forged = send(member, "forged", topic="forged topic", sent_at=150.0, message_id="gm-t2")
+    assert forged["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "planning the meetup"
+    # A newer creator message replaces the topic...
+    second = send(creator, "second", topic="new plan", sent_at=200.0, message_id="gm-t3")
+    assert second["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # ...but a queued creator copy sent before it does not.
+    stale = send(creator, "stale", topic="planning the meetup", sent_at=150.0, message_id="gm-t4")
+    assert stale["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # A creator message from a client that predates topics leaves it.
+    legacy = send(creator, "legacy", sent_at=250.0, message_id="gm-t5")
+    assert legacy["ok"] is True
+    assert node.groups.get(group_id)["topic"] == "new plan"
+    # Clearing sends an empty topic with a newer sent_at.
+    cleared = send(creator, "cleared", topic="", sent_at=300.0, message_id="gm-t6")
+    assert cleared["ok"] is True
+    assert node.groups.get(group_id)["topic"] == ""
+    assert len(received) == 6
+
+
+def test_current_group_topic_returns_none_for_gone_group(tmp_path):
+    node = make_node(tmp_path)
+    # A group that was never known (deleted, or roster-changed into a
+    # successor) carries no topic at all: the retry omits the field and
+    # the recipient keeps its own, rather than being cleared.
+    assert node._current_group_topic(generate_group_id()) is None
+    assert node._current_group_topic(None) is None
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    assert node._current_group_topic(group["id"]) == ("", None)
+    node.groups.set_topic(group["id"], "planning the meetup", created_by=OWN_HASH)
+    topic, topic_at = node._current_group_topic(group["id"])
+    assert topic == "planning the meetup"
+    assert topic_at is not None
+
+
 def test_group_message_dedupes_by_id(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -1411,6 +2860,80 @@ def test_relayed_group_message_delivered_as_group(tmp_path):
     assert record["group"] == group_id
     assert record["relayed"] is True
     assert node.groups.get(group_id) is not None
+
+
+def test_relayed_group_message_carries_topic(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    members = [own, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    blob = seal_message(
+        sender,
+        sender_name="bob",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="gm-relay-topic-1",
+        text="via a holder",
+        sent_at=99.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": sender_hash,
+            "members": members,
+            "topic": "planning the meetup",
+            "topic_sent_at": 90.0,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert message["group"]["topic"] == "planning the meetup"
+    assert node._deliver_collected(message) is True
+    assert len(received) == 1
+    pinned = node.groups.get(group_id)
+    assert pinned is not None and pinned["topic"] == "planning the meetup"
+    assert pinned["topic_sent_at"] == 90.0
+
+
+def test_relayed_group_message_with_reply_keeps_reference(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    members = [own, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    blob = seal_message(
+        sender,
+        sender_name="bob",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="gm-relay-2",
+        text="seconded, via a holder",
+        sent_at=99.0,
+        group={
+            "id": group_id,
+            "name": "weekend",
+            "creator": sender_hash,
+            "members": members,
+        },
+        in_reply_to=reply_to,
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert len(received) == 1
+    assert received[0]["in_reply_to"] == reply_to
+    assert received[0]["kind"] == "group"
 
 
 def test_relayed_group_message_with_forked_roster_rejected(tmp_path):
@@ -1614,6 +3137,108 @@ def test_send_group_message_fans_out_and_queues_offline(tmp_path):
     assert third_records[0]["id"] == queued[0].id
 
 
+def test_send_group_message_does_not_retransmit_member_carried_lineage(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    members = [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    group = node.groups.create(
+        "weekend", members, created_by=OWN_HASH
+    )
+    # A member sends the creator a message for a successor group that
+    # names the weekend group in its lineage — a claim, not the
+    # creator's rename.  The lineage must not be stored, or the
+    # creator's next send would retransmit it under the creator's
+    # identity and other members would retire the weekend group.
+    successor_id = derive_group_id(OWN_HASH, "road trip", members)
+    pinned = node._accept_group_message(
+        THIRD_HASH,
+        {
+            "id": successor_id,
+            "name": "road trip",
+            "creator": OWN_HASH,
+            "members": members,
+            "renamed_from": [group["id"]],
+        },
+        sent_at=100.0,
+    )
+    assert pinned is not None
+    assert pinned["renamed_from"] == []
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    result = node.send_group_message(node.groups.get(successor_id), "hello all")
+    assert result["ok"] is True
+    assert len(calls) == 1
+    parsed = parse_group_message(calls[0][2])
+    assert parsed["renamed_from"] == []
+
+
+def test_send_group_message_with_reply_carries_reference_on_every_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()  # started enough for queueing
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    calls = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        calls.append((peer.hexhash, path, payload, deadline))
+        return {"ok": True}
+
+    def fake_resolve(target, timeout=10.0):
+        if target == OTHER_HASH:
+            return _stub_peer(OTHER_HASH, "bob")
+        raise NodeError("unreachable")
+
+    node._request = fake_request  # type: ignore[method-assign]
+    node.resolve_peer = fake_resolve  # type: ignore[method-assign]
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    result = node.send_group_message(group, "seconded", in_reply_to=reply_to)
+    assert result["ok"] is True
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["queued"] is True
+    # The delivered leg carries the reference on the wire.
+    assert len(calls) == 1
+    assert parse_group_message(calls[0][2])["in_reply_to"] == reply_to
+    # The queued leg keeps the reference in the outbox, so a retry
+    # re-sends the quote.
+    queued = node.mailbox.outbox_list()
+    assert len(queued) == 1
+    assert queued[0].in_reply_to == reply_to
+    # One inbox record per send — not one per leg — so a wide fan-out
+    # cannot evict sent DMs from the shared sent cap; the record
+    # carries every leg id, so any leg can still be quoted.
+    out_records = [
+        entry
+        for entry in node.inbox.export_document()["messages"]
+        if entry.get("direction") == "out"
+    ]
+    assert len(out_records) == 1
+    sent = out_records[0]
+    assert sent["kind"] == "group"
+    assert sent["group"] == group["id"]
+    assert sent["in_reply_to"] == reply_to
+    leg_ids = {leg["id"] for leg in result["results"]}
+    assert set(sent["leg_ids"]) == leg_ids
+    for leg_id in leg_ids:
+        found = node.inbox.find(leg_id, group=group["id"])
+        assert found is not None
+        assert found["leg_ids"] == sent["leg_ids"]
+    # Sent legs stay out of the received listing.
+    assert node.inbox.list_messages() == []
+
+
 def test_send_group_message_carries_expiry_to_legs_and_queue(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough for queueing
@@ -1753,6 +3378,8 @@ def test_send_group_message_expired_leg_past_deadline_is_not_queued(tmp_path):
     assert all(entry["expired"] is True for entry in result["results"])
     assert all(not entry.get("queued") for entry in result["results"])
     assert node.mailbox.outbox_list() == []
+
+
 
 
 def test_send_group_message_skips_self_and_records_refusal(tmp_path):
@@ -1931,6 +3558,161 @@ def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     assert node.mailbox.outbox_list() == []
 
 
+# -- group file fan-out ------------------------------------------------------
+
+
+def _stub_group_send_file(node, *, fail_for=()):
+    """Replace ``_send_file_bytes`` with a recorder; *fail_for* members raise."""
+    calls = []
+
+    def fake_send_file_bytes(
+        target,
+        data,
+        name,
+        digest,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        deadline=None,
+    ):
+        calls.append((target, name, timeout, discover_timeout, data, deadline))
+        member = target if isinstance(target, str) else target.hexhash
+        if member in fail_for:
+            raise NodeError("unreachable")
+        return {
+            "ok": True,
+            "id": f"{member[:8]}-transfer",
+            "name": name,
+            "size": len(data),
+            "sha256": digest,
+            "to": member,
+        }
+
+    node._send_file_bytes = fake_send_file_bytes  # type: ignore[method-assign]
+    return calls
+
+
+def test_send_group_file_fans_out_to_every_member(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["group"] == group["id"]
+    assert result["name"] == "weekend"
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert set(by_to) == {OTHER_HASH, THIRD_HASH}
+    # The sender is skipped, and each leg is its own transfer.
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[OTHER_HASH]["id"] == f"{OTHER_HASH[:8]}-transfer"
+    assert by_to[OTHER_HASH]["name"] == "photo.png"
+    assert by_to[OTHER_HASH]["size"] == len(b"fake png bytes")
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["id"] != by_to[OTHER_HASH]["id"]
+    assert len(calls) == 2
+    assert {call[0] for call in calls} == {OTHER_HASH, THIRD_HASH}
+    # Every leg carries the same bytes, read once up front.
+    assert all(call[1] == "photo.png" for call in calls)
+    assert all(call[4] == b"fake png bytes" for call in calls)
+    # Each leg carries its own deadline, so one slow member cannot
+    # consume another member's window.
+    assert all(call[5] is not None for call in calls)
+    # Nothing is queued: files are direct links only in v1.
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_keeps_going_after_a_failed_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node, fail_for={OTHER_HASH})
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH].get("delivered") is None
+    assert by_to[OTHER_HASH]["error"] == "unreachable"
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert len(calls) == 2
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_rejects_a_bad_file_before_any_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    calls = _stub_group_send_file(node)
+    with pytest.raises(NodeError, match="outside the"):
+        node.send_group_file(group, big)
+    assert calls == []
+
+
+def test_send_group_file_accepts_a_group_id_string(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group["id"], shared)
+    assert result["ok"] is True
+    assert [entry["to"] for entry in result["results"]] == [OTHER_HASH]
+    assert len(calls) == 1
+
+
+def test_send_group_file_self_only_group_sends_nowhere(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    # A group needs at least two members to be created through the
+    # store, so a self-only group only reaches the fan-out as a bare
+    # record (a corrupt or hand-edited groups.json). The fan-out
+    # must still be a no-op, not an error — and must never send to
+    # this node itself.
+    group = {"id": "a" * 64, "name": "solo", "members": [OWN_HASH]}
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["results"] == []
+    assert calls == []
+
+
+def test_send_group_file_timeout_zero_attempts_no_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared, timeout=0.0)
+    assert result["ok"] is False
+    assert all(
+        entry["error"] == "not attempted: group send time limit reached"
+        for entry in result["results"]
+    )
+    assert calls == []
+
+
 def test_deliver_entry_re_encodes_group_payload(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
@@ -1960,6 +3742,36 @@ def test_deliver_entry_re_encodes_group_payload(tmp_path):
     assert seen[0][1]["text"] == "retry me"
     assert seen[0][1]["group"] == group["id"]
     assert node.mailbox.get_outbox(entry.id) is None
+
+
+def test_deliver_entry_re_encodes_group_reply_reference(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    reply_to = {"id": "a" * 32, "excerpt": "0123456789abcdef"}
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex(OTHER_HASH),
+        text="seconded",
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": OWN_HASH,
+            "members": [OWN_HASH, OTHER_HASH],
+        },
+        in_reply_to=reply_to,
+    )
+    seen = []
+
+    def fake_request(peer, path, payload, timeout, *, deadline=None):
+        seen.append((path, parse_group_message(payload)))
+        return {"ok": True}
+
+    node._request = fake_request  # type: ignore[method-assign]
+    assert node._deliver_entry(_stub_peer(OTHER_HASH), entry, 5.0) is True
+    assert len(seen) == 1
+    assert seen[0][1]["in_reply_to"] == reply_to
 
 
 def test_deliver_entry_keeps_group_message_expiry(tmp_path):
@@ -2068,7 +3880,7 @@ def test_parser_group_arguments():
         ["group", "create", "weekend", "--peer", "bob", "--peer", "carol"]
     )
     assert args.group_command == "create"
-    assert args.name == "weekend"
+    assert args.group_name == "weekend"
     assert args.peer == ["bob", "carol"]
 
     send_args = parser.parse_args(["group", "send", "weekend", "hello all"])
@@ -2086,6 +3898,15 @@ def test_parser_group_arguments():
     assert ephemeral.group_command == "send"
     assert ephemeral.expire == "5m"
     assert ephemeral.message == "vanish soon"
+
+    send_file_args = parser.parse_args(
+        ["group", "send-file", "weekend", "photo.png"]
+    )
+    assert send_file_args.group_command == "send-file"
+    assert send_file_args.group == "weekend"
+    assert str(send_file_args.path) == "photo.png"
+    assert send_file_args.timeout == 300.0
+    assert send_file_args.discover_timeout == 10.0
 
     list_args = parser.parse_args(["group", "list"])
     assert list_args.group_command == "list"
@@ -2110,6 +3931,85 @@ def test_parser_group_arguments():
 
     messages_args = parser.parse_args(["messages", "--group", "weekend"])
     assert messages_args.group == "weekend"
+
+
+class _FakeGroupSendFileNode:
+    """Stub TauNode for `tau group send-file`: canned fan-out results."""
+
+    response: dict = {}
+
+    def __init__(self, config, **kwargs):
+        self.config = config
+        self.groups = SimpleNamespace(
+            find=lambda target: {"id": "a" * 64, "name": "weekend"}
+        )
+        self.calls: list = []
+
+    def start(self, **kwargs):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_group_file(self, group, path, **kwargs):
+        self.calls.append((group, str(path), kwargs))
+        return _FakeGroupSendFileNode.response
+
+
+def _run_group_send_file(tmp_path, monkeypatch, argv, response):
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendFileNode)
+    _FakeGroupSendFileNode.response = response
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    return cli.main(
+        ["group", "send-file", "--data-dir", str(tmp_path / "node"), "weekend", str(shared), *argv]
+    )
+
+
+def test_group_send_file_cli_reports_empty_group(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        [],
+        {"ok": True, "group": "a" * 64, "name": "weekend", "results": []},
+    )
+    assert code == 0
+    assert "has no other members" in capsys.readouterr().out
+
+
+def test_group_send_file_cli_json_reports_failed_leg(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--json"],
+        {
+            "ok": False,
+            "group": "a" * 64,
+            "name": "weekend",
+            "results": [
+                {
+                    "to": OTHER_HASH,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "x" * 32,
+                    "name": "photo.png",
+                    "size": 15,
+                    "sha256": "0" * 64,
+                },
+                {
+                    "to": THIRD_HASH,
+                    "to_name": "",
+                    "ok": False,
+                    "error": "unreachable",
+                },
+            ],
+        },
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["results"][0]["delivered"] is True
+    assert payload["results"][1]["error"] == "unreachable"
 
 
 def test_group_list_on_empty_store(tmp_path, capsys):
@@ -2147,6 +4047,153 @@ def test_group_delete_via_cli(tmp_path, capsys):
         cli.main(["group", "delete", "weekend", "--data-dir", str(tmp_path / "node")])
         != 0
     )
+
+
+def _seed_learned_group(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    return config, store, group
+
+
+def test_group_leave_via_cli(tmp_path, capsys):
+    _, store, group = _seed_learned_group(tmp_path)
+    code = cli.main(
+        ["group", "leave", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "left group theirs" in capsys.readouterr().out
+    assert store.list_groups() == []
+    # list_groups/left_groups reload from disk, so they see the CLI's
+    # leave; is_left alone reads the in-memory list.
+    assert [entry["id"] for entry in store.left_groups()] == [group["id"]]
+    # Leaving twice is not an error.
+    code = cli.main(
+        ["group", "leave", group["id"], "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "already left" in capsys.readouterr().out
+    # `group left` lists it, in text and JSON — the text listing prints
+    # the full id, so it round-trips straight into `group rejoin`.
+    code = cli.main(["group", "left", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert group["id"] in out
+    printed_id = out.strip().splitlines()[0].split(" ")[0]
+    assert printed_id == group["id"]
+    code = cli.main(
+        ["group", "left", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["left"][0]["id"] == group["id"]
+    # `group rejoin` restores it, and the next message pins it again.
+    code = cli.main(
+        ["group", "rejoin", printed_id, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "rejoined" in capsys.readouterr().out
+    assert store.left_groups() == []
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    # --json leave round-trips.
+    code = cli.main(
+        ["group", "leave", "--json", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"left": group["id"], "name": "theirs"}
+    # Unknown groups and never-left ids still error.
+    assert (
+        cli.main(["group", "leave", "nope", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert (
+        cli.main(
+            ["group", "rejoin", "00" * 16, "--data-dir", str(tmp_path / "node")]
+        )
+        != 0
+    )
+    assert (
+        cli.main(["group", "rejoin", "xyz", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert "invalid group id" in capsys.readouterr().err
+
+
+def test_group_leave_via_cli_leaves_pinned_successor_too(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    first = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    store.record(
+        grown_id,
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    code = cli.main(
+        ["group", "leave", "--json", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["left"] == first["id"]
+    assert payload["also_left"] == [grown_id]
+    assert store.list_groups() == []
+    code = cli.main(
+        ["group", "left", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert json.loads(capsys.readouterr().out)["count"] == 2
+
+
+def test_group_leave_via_cli_resolves_32_char_name(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.record(
+        derive_group_id(OTHER_HASH, "n" * 32, [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "n" * 32,
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    code = cli.main(
+        ["group", "leave", "n" * 32, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert store.list_groups() == []
+    assert [entry["id"] for entry in store.left_groups()] == [group["id"]]
+
+
+def test_group_leave_refuses_group_this_node_created(tmp_path, capsys):
+    # No identity file in this data dir: the refusal must come from
+    # the group's `local` flag alone, not from loading the identity.
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    store.create("mine", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    code = cli.main(["group", "leave", "mine", "--data-dir", str(tmp_path / "node")])
+    assert code == 1
+    assert "delete your own group" in capsys.readouterr().err
+    assert len(store.list_groups()) == 1
 
 
 class _FakeGroupNode:
@@ -2317,6 +4364,106 @@ def test_group_change_members_refusals(tmp_path, capsys, monkeypatch):
     assert store.get(group["id"]) == group
 
 
+def test_group_rename_via_cli(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "weekend",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "renamed group 'weekend' to 'road trip'" in out
+    assert group["id"][:8] in out
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+    renamed = store.list_groups()[0]
+    assert renamed["name"] == "road trip"
+    assert renamed["id"] == derive_group_id(
+        OWN_HASH, "road trip", [OWN_HASH, OTHER_HASH]
+    )
+    assert store.get(group["id"]) is None
+
+
+def test_group_rename_json_and_same_name(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "weekend",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["previous_id"] == group["id"]
+    assert payload["group"]["name"] == "road trip"
+    # Renaming to the current name is a no-op.
+    code = cli.main(
+        [
+            "group",
+            "rename",
+            "road trip",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+        ]
+    )
+    assert code == 0
+    assert "already has that name" in capsys.readouterr().out
+    store = GroupStore(config.groups_path)
+    assert len(store) == 1
+
+
+def test_group_rename_refusals(tmp_path, capsys, monkeypatch):
+    config, group = _seed_group_cli(tmp_path, monkeypatch)
+    data_dir = str(tmp_path / "node")
+    store = GroupStore(config.groups_path)
+    learned_id = derive_group_id(OTHER_HASH, "theirs", [OTHER_HASH, THIRD_HASH])
+    store.record(
+        learned_id, "theirs", [OTHER_HASH, THIRD_HASH], creator=OTHER_HASH
+    )
+
+    def _run(argv):
+        code = cli.main([*argv, "--data-dir", data_dir])
+        assert code != 0
+        return capsys.readouterr().err
+
+    assert "only the creator" in _run(["group", "rename", "theirs", "new"])
+    assert "unknown group" in _run(["group", "rename", "nope", "new"])
+    # Refusals leave the store untouched.
+    assert store.get(group["id"]) == group
+    assert len(store) == 2
+
+
+def test_group_name_arguments_do_not_clobber_node_name():
+    # The group name positional and the shared --name node option must
+    # not share a destination: a rename (or create) that announced the
+    # group name as the node name would misidentify the node to peers.
+    parser = cli.build_parser()
+    rename = parser.parse_args(["group", "rename", "weekend", "road trip"])
+    assert rename.new_name == "road trip"
+    assert getattr(rename, "name", None) is None
+    create = parser.parse_args(["group", "create", "weekend", "--peer", "bob"])
+    assert create.group_name == "weekend"
+    assert getattr(create, "name", None) is None
+    # --name still reaches the node name slot when it is given.
+    named = parser.parse_args(
+        ["--name", "alice", "group", "rename", "weekend", "road trip"]
+    )
+    assert named.name == "alice"
+    assert named.new_name == "road trip"
+
+
 def test_messages_group_filter(tmp_path, capsys):
     config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
     inbox = Inbox(config.inbox_path)
@@ -2372,3 +4519,54 @@ def test_messages_group_filter(tmp_path, capsys):
         ]
     )
     assert code != 0
+
+
+def test_messages_group_filter_spans_rename(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.create("weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "before the rename",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+        }
+    )
+    store.rename(group["id"], "road trip", created_by=OWN_HASH)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "after the rename",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "g-2",
+            "kind": "group",
+            "group": store.find("road trip")["id"],
+            "group_name": "road trip",
+        }
+    )
+    code = cli.main(
+        [
+            "messages",
+            "--group",
+            "road trip",
+            "--data-dir",
+            str(tmp_path / "node"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert [item["text"] for item in payload["messages"]] == [
+        "after the rename",
+        "before the rename",
+    ]
