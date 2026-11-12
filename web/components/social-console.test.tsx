@@ -1000,6 +1000,106 @@ describe("SocialConsole mentions view", () => {
   });
 });
 
+describe("SocialConsole pinned view", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      save: vi.fn(),
+      unsave: vi.fn(),
+      pinned: [],
+      pinnedLoading: false,
+      pinnedHasMore: false,
+      loadPinned: vi.fn(async () => {}),
+      loadMorePinned: vi.fn(),
+      pin: vi.fn(),
+      unpin: vi.fn(),
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      repost: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("switches the feed to pinned posts and loads them on demand", async () => {
+    const timelinePost = makePost({ text: "timeline post" });
+    const pinnedPost = makePost({
+      hash: "e".repeat(64),
+      text: "keep me on top",
+      pinned: true,
+      pinned_at: 2000,
+    });
+    const state = hookState({ posts: [timelinePost], pinned: [pinnedPost] });
+    mockedUseTan.mockReturnValue(state);
+
+    const { rerender } = render(<SocialConsole />);
+    expect(screen.getByText("timeline post")).toBeTruthy();
+    expect(screen.queryByText("keep me on top")).toBeNull();
+
+    fireEvent.click(screen.getByText("pinned"));
+    await waitFor(() => expect(state.loadPinned).toHaveBeenCalledTimes(1));
+
+    rerender(<SocialConsole />);
+    expect(screen.queryByText("timeline post")).toBeNull();
+    expect(screen.getByText("keep me on top")).toBeTruthy();
+    expect(screen.getByText("📌 pinned")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "following" }));
+    expect(state.setView).toHaveBeenCalledWith("timeline");
+    expect(state.setAll).toHaveBeenCalledWith(false);
+  });
+
+  it("says there are no pinned posts yet when the pinned list is empty", () => {
+    mockedUseTan.mockReturnValue(hookState({}));
+
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByText("pinned"));
+    expect(screen.getByText("No pinned posts yet")).toBeTruthy();
+  });
+});
+
 describe("SocialConsole authors directory", () => {
   function hookState(overrides: Record<string, unknown> = {}) {
     return {
@@ -1200,5 +1300,68 @@ describe("PostCard save control", () => {
     expect(screen.queryByTitle("Delete this post")).toBeNull();
     // The save toggle stays so the post can still be removed from the list.
     expect(screen.getByTitle("Remove from saved posts")).toBeTruthy();
+  });
+});
+
+describe("PostCard pin control", () => {
+  function renderCard(
+    post: TanPost,
+    onTogglePin = vi.fn(),
+    onToggleSave = vi.fn(),
+  ) {
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onToggleSave={onToggleSave}
+        onTogglePin={onTogglePin}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+    return onTogglePin;
+  }
+
+  it("offers to pin an unpinned own post and calls back with the post", () => {
+    const post = makePost({ own: true, pinned: false });
+    const onTogglePin = renderCard(post);
+
+    fireEvent.click(screen.getByTitle("Pin this post to the top of your pinned list"));
+    expect(onTogglePin).toHaveBeenCalledTimes(1);
+    expect(onTogglePin).toHaveBeenCalledWith(post);
+  });
+
+  it("shows a pinned post as pinned, with when it was pinned", () => {
+    renderCard(makePost({ own: true, pinned: true, pinned_at: 2000 }));
+
+    expect(screen.getByTitle("Remove from pinned posts")).toBeTruthy();
+    expect(screen.getByText("📌 pinned")).toBeTruthy();
+    expect(screen.getByText(/pinned /)).toBeTruthy();
+  });
+
+  it("hides the pin control on other authors' posts", () => {
+    renderCard(makePost({ own: false, pinned: false }));
+
+    expect(screen.queryByTitle("Pin this post to the top of your pinned list")).toBeNull();
+    expect(screen.queryByTitle("Remove from pinned posts")).toBeNull();
+  });
+
+  it("hides the pin control when no handler is given", () => {
+    render(
+      <PostCard
+        post={makePost({ own: true })}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onToggleSave={vi.fn()}
+        onReply={() => {}}
+        onDelete={vi.fn()}
+        deleting={false}
+      />,
+    );
+
+    expect(screen.queryByTitle("Pin this post to the top of your pinned list")).toBeNull();
+    expect(screen.queryByTitle("Remove from pinned posts")).toBeNull();
   });
 });

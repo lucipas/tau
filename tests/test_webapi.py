@@ -3714,6 +3714,166 @@ def test_tan_saved_via_api(tmp_path):
         bridge.stop()
 
 
+def test_tan_pinned_via_api(tmp_path):
+    import RNS
+
+    from tau.config import TauConfig
+    from tau.tangents.tan import TanApp, create_post, init_db
+
+    node = FakeNode()
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    identity = RNS.Identity()
+    other = RNS.Identity()
+    conn = init_db(node.config.social_db_path)
+    try:
+        mine = create_post(conn, identity, "pin me", name="tester", now=1000)
+        theirs = create_post(conn, other, "not mine", name="other", now=1001)
+        extra = [
+            create_post(
+                conn, identity, f"pin me {index}", name="tester", now=1010 + index
+            )
+            for index in range(10)
+        ]
+    finally:
+        conn.close()
+    # The pin owner is the node's own author hash, so the Tan app must
+    # be attached before pinning — the same identity authored "mine".
+    node.app = TanApp(node.config, identity, name="tester", gossip=False)
+
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        # The timeline flags pinned posts so the console can show pin
+        # state on each card.
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        assert status == 200
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["pin me"]["pinned"] is False
+
+        # Pinning requires a target, and an unknown hash cannot be pinned.
+        status, _, payload = _json(
+            bridge, "/api/tan/pin", method="POST", body={}
+        )
+        assert status == 400
+        status, _, payload = _json(
+            bridge, "/api/tan/pin", method="POST", body={"target": "ff" * 32}
+        )
+        assert status == 400
+
+        # Only your own posts can be pinned.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": theirs["hash"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["pin"]["hash"] == mine["hash"]
+        assert payload["pin"]["already_pinned"] is False
+
+        # Pinning again is a no-op that reports the original pin.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": mine["hash"]},
+        )
+        assert status == 200
+        assert payload["pin"]["already_pinned"] is True
+
+        # The shelf holds ten posts: the nine extra pins fill it, and
+        # an eleventh own post is refused.
+        for post in extra[:9]:
+            status, _, payload = _json(
+                bridge,
+                "/api/tan/pin",
+                method="POST",
+                body={"target": post["hash"]},
+            )
+            assert status == 200
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/pin",
+            method="POST",
+            body={"target": extra[9]["hash"]},
+        )
+        assert status == 400
+
+        status, _, payload = _json(bridge, "/api/tan/timeline?all=1")
+        by_text = {item["text"]: item for item in payload["posts"]}
+        assert by_text["pin me"]["pinned"] is True
+        assert by_text["not mine"]["pinned"] is False
+
+        # Pinned posts come back newest pin first, flagged as pinned.
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert status == 200
+        assert [item["text"] for item in payload["posts"]] == [
+            f"pin me {index}" for index in range(8, -1, -1)
+        ] + ["pin me"]
+        assert all(item["pinned"] is True for item in payload["posts"])
+        assert all("pinned_at" in item for item in payload["posts"])
+
+        # The list pages through older pins instead of stopping at the
+        # first page. The resume offset comes from the response: it
+        # counts raw rows, so filtering never shifts it.
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1")
+        assert [item["text"] for item in payload["posts"]] == ["pin me 8"]
+        assert payload["next_offset"] == 1
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1&offset=1")
+        assert [item["text"] for item in payload["posts"]] == ["pin me 7"]
+        assert payload["next_offset"] == 2
+        status, _, payload = _json(bridge, "/api/tan/pinned?limit=1&offset=10")
+        assert payload["posts"] == []
+        assert payload["next_offset"] is None
+
+        # Unpinning removes it from the list; unpinning again is a no-op.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unpin",
+            method="POST",
+            body={"target": extra[0]["hash"][:16]},
+        )
+        assert status == 200
+        assert payload["pin"]["unpinned"] is True
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/unpin",
+            method="POST",
+            body={"target": extra[0]["hash"]},
+        )
+        assert status == 200
+        assert payload["pin"]["unpinned"] is False
+
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert [item["text"] for item in payload["posts"]].count("pin me 0") == 0
+
+        # A post deleted after being pinned stays in the list with its
+        # text blanked, so the pin is not silently lost.
+        status, _, payload = _json(
+            bridge,
+            "/api/tan/delete",
+            method="POST",
+            body={"target": mine["hash"][:16]},
+        )
+        assert status == 200
+        status, _, payload = _json(bridge, "/api/tan/pinned")
+        assert status == 200
+        pinned = {item["hash"]: item for item in payload["posts"]}
+        assert pinned[mine["hash"]]["text"] == ""
+        assert pinned[mine["hash"]]["deleted"] is True
+        assert pinned[mine["hash"]]["pinned"] is True
+    finally:
+        bridge.stop()
+
+
 def test_tan_saved_annotations_and_muting(tmp_path):
     import RNS
 

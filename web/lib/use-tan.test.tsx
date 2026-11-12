@@ -285,6 +285,89 @@ describe("useTan saved posts", () => {
   });
 });
 
+describe("useTan pinned posts", () => {
+  it("loads pinned posts on demand and posts pin/unpin to the API", async () => {
+    const mine = makePost();
+    const pinned = makePost({ hash: "e".repeat(64), text: "keep me on top" });
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/pinned")) {
+        return Promise.resolve({ posts: [pinned], count: 1, next_offset: null });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // Pinned posts are not part of the feed's poll: nothing loaded yet.
+    expect(result.current.pinned).toEqual([]);
+    expect(
+      mockedGet.mock.calls.some((call) =>
+        String(call[0]).startsWith("/api/tan/pinned"),
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      await result.current.loadPinned();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/pinned?limit=100&offset=0",
+    );
+    expect(result.current.pinned).toEqual([pinned]);
+
+    await act(async () => {
+      await result.current.pin(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/pin", {
+      target: mine.hash,
+    });
+
+    await act(async () => {
+      await result.current.unpin(mine.hash);
+    });
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/unpin", {
+      target: mine.hash,
+    });
+  });
+
+  it("refreshes the pinned list after liking from the pinned view", async () => {
+    const mine = makePost();
+    const pinned = makePost({ hash: "e".repeat(64), text: "keep me on top" });
+    let pinnedCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/pinned")) {
+        pinnedCalls += 1;
+        return Promise.resolve({ posts: [pinned], count: 1, next_offset: null });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+
+    // Liking before the pinned list was ever opened does not fetch it.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(pinnedCalls).toBe(0);
+
+    await act(async () => {
+      await result.current.loadPinned();
+    });
+    expect(pinnedCalls).toBe(1);
+
+    // Once opened, a like refreshes the pinned cards too.
+    await act(async () => {
+      await result.current.like(mine.hash);
+    });
+    expect(pinnedCalls).toBe(2);
+  });
+});
 
 describe("useTan repost", () => {
   it("posts the hash to /api/tan/repost and reloads the feed", async () => {
