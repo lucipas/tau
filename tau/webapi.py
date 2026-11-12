@@ -1030,16 +1030,15 @@ class WebBridge:
         # from it.  Overlay the inbox's reactions for this wire id as
         # well — the inbox is the durable authority, as in the snapshot
         # read — so the live event carries them.  The roster filter
-        # below still runs over the merged set.
+        # below still runs over the merged set.  Read through the same
+        # helper the snapshot read uses, so a reaction another process
+        # wrote to inbox.json is visible here too.
         group_id = message.get("group")
+        reactions_before = list(message.get("reactions") or [])
         if isinstance(group_id, str) and group_id:
             wire_id = message.get("wire_id")
-            inbox = getattr(self.node, "inbox", None)
-            if isinstance(wire_id, str) and wire_id and inbox is not None:
-                try:
-                    stored = inbox.reactions_for(wire_id)
-                except Exception:  # pragma: no cover - defensive
-                    stored = []
+            if isinstance(wire_id, str) and wire_id:
+                stored = self._inbox_reactions_by_target().get(wire_id) or []
                 if stored:
                     message = self._with_inbox_reactions(
                         message, {wire_id: stored}
@@ -1056,6 +1055,12 @@ class WebBridge:
                 message["reactions"] = visible_reactions(
                     message["reactions"], rosters.get(group_id)
                 )
+        if message.get("reactions") != reactions_before:
+            # The overlay and filter above ran after _append_message
+            # saved, so persist the entry as published; otherwise a
+            # restart reloads it without the reactions until a later
+            # save.
+            self._save_messages()
         if not publish:
             return message
         # The node appends to its inbox before this callback runs, so

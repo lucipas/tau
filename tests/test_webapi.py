@@ -7240,6 +7240,141 @@ def test_live_group_message_shows_inbox_only_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_live_group_message_shows_reaction_written_by_another_process(
+    node, tmp_path
+):
+    """A live group copy shows a reaction another process wrote (#304).
+
+    The reaction is recorded straight to inbox.json by a second Inbox
+    (the way ``tau react`` from the CLI lands) after the copy is in
+    this node's inbox, so the node's in-memory reaction list is stale.
+    The live overlay reads through the transaction path, like the
+    snapshot read, so the live event still carries it.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        node.inbox.append_group_message(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-local",
+            },
+            group=group["id"],
+            author=PEER_HASH,
+            sent_at=100.0,
+            members=set(group.get("members") or []),
+        )
+        # Another process writes the reaction after this node's last
+        # inbox reload.
+        other = Inbox(inbox_path)
+        other.record_reaction(
+            {
+                "target": "wire-local",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-local",
+                }
+            )
+            is not None
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-local"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_overlaid_group_reactions_persist_to_history(node, tmp_path):
+    """Reactions overlaid onto a live entry are saved, not just held
+    in memory (#304).
+
+    The overlay runs after _append_message saved, so without a second
+    save the on-disk history would reload the entry without them.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            )
+            is not None
+        )
+        stored = json.loads((tmp_path / "messages.json").read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in stored["messages"]
+            if item.get("wire_id") == "wire-g1"
+        )
+        assert entry["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {
