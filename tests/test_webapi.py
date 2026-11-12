@@ -7724,6 +7724,369 @@ def test_delete_message_rejects_queued_entry(bridge, node):
     assert len(feed["messages"]) == 1
 
 
+def _send_for_edit(bridge, node, *, text="typo here"):
+    """A delivered outbound console entry, with its inbox record, ready to edit."""
+    message, _ = bridge.send_message("alice", text)
+    node.inbox.append(
+        {
+            "id": message["wire_id"],
+            "destination": PEER_HASH,
+            "from": "tester",
+            "text": text,
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "direction": "out",
+        }
+    )
+    return message
+
+
+def _stub_send_edit(node, *, edited=True, edited_at=200.0):
+    """Stand in for the node's live-link edit, mirroring its local recording."""
+    calls = []
+
+    def send_edit(peer, message_id, text, *, timeout=20.0, discover_timeout=None):
+        calls.append((peer, message_id, text, timeout))
+        if edited:
+            node.inbox.apply_edit(
+                message_id, text, edited_at=edited_at, newer_than_existing=True
+            )
+        return {
+            "ok": True,
+            "target": message_id,
+            "edited": edited,
+            "received_at": 201.0,
+            "id": "edit-1",
+        }
+
+    node.send_edit = send_edit
+    return calls
+
+
+def test_edit_message_endpoint_updates_the_bubble(bridge, node):
+    from tau.protocol import excerpt_hash
+
+    message = _send_for_edit(bridge, node)
+    calls = _stub_send_edit(node)
+    wire_id = message["wire_id"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["edited"] is True
+    assert payload["id"] == "edit-1"
+    assert payload["message"]["id"] == message["id"]
+    assert payload["message"]["text"] == "fixed here"
+    assert payload["message"]["edited_at"] == 200.0
+    assert payload["message"]["excerpt_hash"] == excerpt_hash("fixed here")
+    assert calls == [(PEER_HASH, wire_id, "fixed here", 20.0)]
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+    assert feed["messages"][0]["edited_at"] == 200.0
+    # The node inbox copy carries the edit too (the stub mirrors
+    # send_edit), so `tau messages` agrees with the console.
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "fixed here"
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["text"] == "fixed here"
+
+
+def test_edit_message_endpoint_leaves_the_bubble_when_the_peer_has_no_copy(
+    bridge, node
+):
+    message = _send_for_edit(bridge, node)
+    _stub_send_edit(node, edited=False)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 200
+    assert payload["edited"] is False
+    assert payload["message"] is None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+    assert "edited_at" not in feed["messages"][0]
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
+    assert not [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+
+
+def test_edit_message_endpoint_rejects_guards(bridge, node):
+    message = _send_for_edit(bridge, node)
+    _stub_send_edit(node)
+
+    # Unknown console id.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 99, "text": "fixed"},
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    # A received message is not the node's to edit.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-in",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 2, "text": "fixed"},
+    )
+    assert status == 400
+    assert "only your own sent" in payload["error"]["message"]
+
+    # Non-string and empty replacement text.
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": 42},
+    )
+    assert status == 400
+    assert "must be a string" in payload["error"]["message"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "   "},
+    )
+    assert status == 400
+    assert "must not be empty" in payload["error"]["message"]
+
+    # A group message cannot be edited in v1.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="group typo",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-group",
+        group="crew",
+        group_name="crew",
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 3, "text": "fixed"},
+    )
+    assert status == 400
+    assert "group messages cannot be edited" in payload["error"]["message"]
+
+    # A file record has no text to edit.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-file",
+        file={
+            "name": "notes.txt",
+            "size": 4,
+            "sha256": "ab" * 32,
+            "kind": "file",
+        },
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 4, "text": "fixed"},
+    )
+    assert status == 400
+    assert "file transfers cannot be edited" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_rejects_a_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+    _stub_send_edit(node)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": 1, "text": "fixed"},
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_rejects_a_message_still_in_the_outbox(
+    bridge, node
+):
+    # The bubble says delivered, but the mailbox still holds the send:
+    # an edit answered "not found" would let the queued copy arrive
+    # later with the old text.
+    message = _send_for_edit(bridge, node)
+    node.mailbox.enqueue(
+        to=bytes.fromhex(PEER_HASH),
+        text="typo here",
+        message_id=message["wire_id"],
+    )
+    _stub_send_edit(node)
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed"},
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_edit_message_endpoint_keeps_the_bubble_when_the_peer_is_unreachable(
+    bridge, node
+):
+    message = _send_for_edit(bridge, node)
+
+    def send_edit(peer, message_id, text, **kwargs):
+        raise NodeError("peer is unreachable")
+
+    node.send_edit = send_edit
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": message["id"], "text": "fixed here"},
+    )
+    assert status == 502
+    assert "unreachable" in payload["error"]["message"]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "typo here"
+
+
+def test_record_edit_applies_an_inbound_edit(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "typo here",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    updated = bridge.record_edit(
+        {
+            "target": "wire-1",
+            "text": "fixed here",
+            "edited_at": 200.0,
+            "from": "alice",
+            "destination": PEER_HASH,
+        }
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert updated["edited_at"] == 200.0
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+    assert feed["messages"][0]["edited_at"] == 200.0
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+
+    # A replayed older edit must not rewind the newer one.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-1",
+                "text": "older text",
+                "edited_at": 150.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["text"] == "fixed here"
+
+    # An edit for a message outside this console's history, and a
+    # malformed record, are dropped quietly.
+    assert (
+        bridge.record_edit(
+            {
+                "target": "wire-missing",
+                "text": "fixed",
+                "edited_at": 300.0,
+                "from": "alice",
+                "destination": PEER_HASH,
+            }
+        )
+        is None
+    )
+    assert (
+        bridge.record_edit({"target": "wire-1", "edited_at": 300.0}) is None
+    )
+
+
+def test_edit_survives_bridge_restart(node, tmp_path):
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        message = _send_for_edit(bridge, node)
+        _stub_send_edit(node)
+        status, _, payload = _json(
+            bridge,
+            "/api/messages/edit",
+            method="POST",
+            body={"id": message["id"], "text": "fixed here"},
+        )
+        assert status == 200
+        assert payload["edited"] is True
+    finally:
+        bridge.stop()
+
+    bridge2 = _bridge_with_data_dir(FakeNode(), tmp_path)
+    try:
+        messages = bridge2.messages()
+        assert len(messages) == 1
+        assert messages[0]["text"] == "fixed here"
+        assert messages[0]["edited_at"] == 200.0
+    finally:
+        bridge2.stop()
+
+
 def test_delete_message_fails_when_history_cannot_persist(node, tmp_path):
     bridge = _bridge_with_data_dir(node, tmp_path)
     try:

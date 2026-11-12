@@ -250,6 +250,10 @@ export function Console() {
               onDelete={async (message) => {
                 await tau.deleteMessage(message.id);
               }}
+              onEdit={async (message, text) => {
+                const result = await tau.editMessage(message.id, text);
+                return result.edited;
+              }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;
                 if (reaction === null) {

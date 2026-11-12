@@ -16,6 +16,7 @@ import type {
   DeleteMessageResponse,
   DoctorResponse,
   DropHeldResponse,
+  EditMessageResponse,
   ForgetPeerResponse,
   GroupsResponse,
   HeldMailEntry,
@@ -633,6 +634,26 @@ export function useTau() {
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
     return result.deleted;
+  }, []);
+
+  const editMessage = useCallback(async (id: number, text: string) => {
+    const result = await apiPost<EditMessageResponse>("/api/messages/edit", {
+      id,
+      text,
+    });
+    // The edit already succeeded: swap the new text in at once, and
+    // let the message_updated event reconcile other tabs. When the
+    // peer had no copy the server reports edited false and leaves the
+    // bubble alone — the caller says so instead of showing new text
+    // one-sidedly.
+    if (result.edited && result.message) {
+      setMessages((previous) =>
+        previous.map((entry) =>
+          entry.id === result.message?.id ? result.message : entry,
+        ),
+      );
+    }
+    return result;
   }, []);
   const retryOutbox = useCallback(
     async (id?: string) => {
@@ -1414,6 +1435,7 @@ export function useTau() {
     importing,
     send,
     deleteMessage,
+    editMessage,
     sendGroup,
     sendFile,
     ping,

@@ -21,6 +21,8 @@ export interface TauMessage {
   rtt_ms?: number;
   // Unix time the recipient read this outbound message, when known.
   read_at?: number;
+  // Unix time the message text was last edited, when it has been.
+  edited_at?: number;
   // Outbox entry id, present while the message is queued for delivery.
   mail_id?: string;
   // Group DM context, present on group messages (inbound, and
@@ -352,6 +354,18 @@ export interface DoctorResponse {
 export interface DeleteMessageResponse {
   ok: boolean;
   deleted: { id: number; wire_id?: string | null };
+}
+
+export interface EditMessageResponse {
+  ok: boolean;
+  // Whether the peer applied the edit; false (peer had no copy, or a
+  // newer edit already landed) is not an error, and the local copy is
+  // left alone in that case.
+  edited: boolean;
+  // The updated console entry, when it is in this console's history.
+  message?: TauMessage | null;
+  // The edit's own wire id, when the peer answered one.
+  id?: string | null;
 }
 export interface RetryOutboxResponse {
   ok: boolean;

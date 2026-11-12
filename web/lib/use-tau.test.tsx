@@ -4,6 +4,7 @@ import type { Mock } from "vitest";
 
 import type {
   BlockPeerResponse,
+  EditMessageResponse,
   NodeInfo,
   Peer,
   Snapshot,
@@ -727,6 +728,70 @@ describe("useTau search", () => {
 
     expect(mockedGet).not.toHaveBeenCalled();
     expect(result.current.searchQuery).toBeNull();
+  });
+});
+
+describe("useTau editMessage", () => {
+  it("swaps the edited text in place", async () => {
+    const original = makeMessage({
+      id: 1,
+      direction: "out",
+      text: "typo here",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+    });
+    const edited = { ...original, text: "fixed here", edited_at: 2000 };
+    const { result } = await renderWithPeer(makePeer(), [original]);
+    await waitFor(() => expect(result.current.messages).toEqual([original]));
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      edited: true,
+      message: edited,
+      id: "edit-1",
+    });
+    let response: EditMessageResponse | undefined;
+    await act(async () => {
+      response = await result.current.editMessage(1, "fixed here");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/edit", {
+      id: 1,
+      text: "fixed here",
+    });
+    expect(response).toEqual({
+      ok: true,
+      edited: true,
+      message: edited,
+      id: "edit-1",
+    });
+    expect(result.current.messages).toEqual([edited]);
+  });
+
+  it("leaves the bubble alone when the peer had no copy", async () => {
+    const original = makeMessage({
+      id: 1,
+      direction: "out",
+      text: "typo here",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+    });
+    const { result } = await renderWithPeer(makePeer(), [original]);
+    await waitFor(() => expect(result.current.messages).toEqual([original]));
+
+    mockedPost.mockResolvedValue({
+      ok: true,
+      edited: false,
+      message: null,
+      id: "edit-1",
+    });
+    let response: EditMessageResponse | undefined;
+    await act(async () => {
+      response = await result.current.editMessage(1, "fixed here");
+    });
+
+    expect(response?.edited).toBe(false);
+    expect(result.current.messages).toEqual([original]);
   });
 });
 

@@ -527,6 +527,17 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(read_at, (int, float)) or isinstance(read_at, bool):
             return None
         message["read_at"] = float(read_at)
+    edited_at = entry.get("edited_at")
+    if edited_at is not None:
+        if not isinstance(edited_at, (int, float)) or isinstance(edited_at, bool):
+            return None
+        try:
+            edited_at = float(edited_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
+        message["edited_at"] = edited_at
     mail_id = entry.get("mail_id")
     if isinstance(mail_id, str):
         # Kept so a message still queued across a restart can be matched
@@ -675,6 +686,20 @@ class WebBridge:
                 self.record_reaction(record)
 
         node.on_reaction = _on_reaction
+
+        # Edits arrive on the same node callback pattern: chain any edit
+        # callback the node already has, then update the console history
+        # entry the edit targets.
+        previous_on_edit = getattr(node, "on_edit", None)
+
+        def _on_edit(record: Dict[str, Any]) -> None:
+            try:
+                if callable(previous_on_edit):
+                    previous_on_edit(record)
+            finally:
+                self.record_edit(record)
+
+        node.on_edit = _on_edit
 
         self.bus = EventBus()
         self._lock = threading.Lock()
@@ -1288,6 +1313,62 @@ class WebBridge:
                         message["reactions"] = visible_reactions(
                             message["reactions"], rosters.get(group_id)
                         )
+                updated = dict(message)
+                break
+        if updated is None:
+            return None
+        self._save_messages()
+        self.bus.publish({"type": "message_updated", "message": updated})
+        return updated
+
+    def record_edit(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply an edit to the console history entry it targets.
+
+        Edits name their target by wire id, like reactions.  The entry's
+        text is replaced and ``edited_at`` stamped, so the console shows
+        the new text with an edited marker; the excerpt hash is
+        recomputed from the new text so replies quoting it still verify.
+        A stale edit — one whose ``edited_at`` does not beat the entry's
+        — is dropped, so a replayed older edit cannot rewind a newer
+        one.  An edit whose target is not in this console's history
+        (sent from the CLI, or predating wire ids) is dropped: the node
+        inbox still keeps it, so ``tau messages`` shows it.  The updated
+        entry is re-sent as ``message_updated``, which the console
+        already renders in place.
+        """
+        target = record.get("target")
+        text = record.get("text")
+        raw_edited_at = record.get("edited_at")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(text, str)
+            or not text
+            or not isinstance(raw_edited_at, (int, float))
+            or isinstance(raw_edited_at, bool)
+        ):
+            return None
+        try:
+            edited_at = float(raw_edited_at)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
+        updated: Optional[Dict[str, Any]] = None
+        with self._lock:
+            for message in self._messages:
+                if message.get("wire_id") != target:
+                    continue
+                previous = message.get("edited_at")
+                if (
+                    isinstance(previous, (int, float))
+                    and not isinstance(previous, bool)
+                    and edited_at <= float(previous)
+                ):
+                    return None
+                message["text"] = text
+                message["edited_at"] = edited_at
+                message["excerpt_hash"] = excerpt_hash(text)
                 updated = dict(message)
                 break
         if updated is None:
@@ -2974,6 +3055,116 @@ class WebBridge:
                 "id": target,
                 "wire_id": wire_id if isinstance(wire_id, str) else None,
             },
+        }
+
+    def edit_message(
+        self, target: int, text: str, *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Edit one of this node's sent DMs, from the console.
+
+        Mirrors ``tau edit``: the peer is asked to replace the sent
+        message's text, and the local copies update too (console history
+        entry, through :meth:`record_edit`; the node inbox copy and sent
+        record are updated by :meth:`TauNode.send_edit` itself), so the
+        bubble shows the new text with an edited marker.  A peer who had
+        no copy answers ``edited`` False, which is not an error — but
+        unlike a retract, the local copy is left alone: applying the new
+        text locally while the peer keeps the old one would split the
+        two histories.
+
+        Only your own sent DMs can be edited: group messages are not
+        editable in v1, a file transfer has no text to edit, and a
+        message still queued has not reached its recipient yet (cancel
+        it from the outbox instead).  Edits ride the live link only, so
+        an unreachable peer is a failure, not a silent queue.
+
+        Ordering keeps every failure retryable from the console: the
+        edit goes first, so a failed edit never rewrites the local
+        copy; the console entry is updated last, through the same
+        ``message_updated`` event an inbound edit uses, so other tabs
+        learn.  A retry after a failure re-sends the edit (idempotent —
+        the peer answers ``edited`` False for a stale one) and retries
+        the local update.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        if not isinstance(text, str):
+            raise ValueError("field 'text' must be a string")
+        cleaned = normalize_message(text)
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("direction") != "out":
+                raise ValueError("only your own sent messages can be edited")
+            if entry.get("group"):
+                raise ValueError("group messages cannot be edited in v1")
+            if entry.get("file"):
+                raise ValueError("file transfers cannot be edited")
+            if entry.get("status") == "queued":
+                # An edit answered "not found" would let the queued
+                # copy arrive later with the old text, so cancellation
+                # has to go through the outbox first.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = entry.get("wire_id")
+            peer = entry.get("peer")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("that message has no id to edit")
+        if not isinstance(peer, str) or not peer:
+            raise ValueError("that message has no known recipient to edit from")
+        with self.node.mailbox.transaction():
+            if self.node.mailbox.get_outbox(wire_id) is not None:
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+        response = self.node.send_edit(peer, wire_id, cleaned, timeout=timeout)
+        if response.get("edited") is False:
+            # The peer had no copy (or a newer edit already landed):
+            # leave the local copy alone and report it, so the console
+            # can say so instead of showing the new text one-sidedly.
+            return {
+                "ok": True,
+                "edited": False,
+                "message": None,
+                "id": response.get("id")
+                if isinstance(response.get("id"), str)
+                else None,
+            }
+        edited_at = time.time()
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                record = inbox.resolve(wire_id)
+            except ValueError:
+                record = None
+            if record is not None and record.get("id") == wire_id:
+                if isinstance(record.get("text"), str):
+                    cleaned = record["text"]
+                raw_edited = record.get("edited_at")
+                if (
+                    isinstance(raw_edited, (int, float))
+                    and not isinstance(raw_edited, bool)
+                ):
+                    edited_at = float(raw_edited)
+        updated = self.record_edit(
+            {"target": wire_id, "text": cleaned, "edited_at": edited_at}
+        )
+        return {
+            "ok": True,
+            "edited": True,
+            "message": updated,
+            "id": response.get("id")
+            if isinstance(response.get("id"), str)
+            else None,
         }
 
     def _remove_history_entry(
@@ -5003,6 +5194,9 @@ class _WebHandler(BaseHTTPRequestHandler):
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
                 return
+            if path == "/api/messages/edit":
+                self._handle_edit_message(body, head_only)
+                return
             if path == "/api/messages/read":
                 peer = body.get("peer")
                 if peer is not None and (
@@ -5904,6 +6098,42 @@ class _WebHandler(BaseHTTPRequestHandler):
             result = self.bridge.delete_message(target)
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_edit_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        text = body.get("text")
+        if not isinstance(text, str):
+            self._send_json(
+                {"error": {"message": "field 'text' must be a string"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.edit_message(target, text, timeout=timeout)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
             return
         self._send_json(result, head_only)
 

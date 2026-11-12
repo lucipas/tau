@@ -493,6 +493,7 @@ class TauNode:
         on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_edit: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -515,6 +516,7 @@ class TauNode:
         self.on_read = on_read
         self.on_reaction = on_reaction
         self.on_retract = on_retract
+        self.on_edit = on_edit
         # Ids whose delivery this node confirmed by a successful send,
         # newest last, capped so a long-lived node does not grow the
         # record without bound.  An outbox entry that disappears without
@@ -2836,6 +2838,24 @@ class TauNode:
                 edited=False,
                 received_at=received_at,
             )
+        # The inbox record is updated; a serving console keeps its own
+        # copy of the message, so tell it to show the new text too —
+        # otherwise /api/messages keeps showing the original, including
+        # after a restart.  A failing console callback must not fail
+        # the edit itself: the inbox edit already landed.
+        if self.on_edit is not None:
+            try:
+                self.on_edit(
+                    {
+                        "target": target_id,
+                        "text": edit["text"],
+                        "edited_at": effective_at,
+                        "from": caller_name,
+                        "destination": caller_hash,
+                    }
+                )
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_edit callback failed", exc_info=True)
         log.info(
             "Edit from %s (%s) on %s",
             caller_name,
