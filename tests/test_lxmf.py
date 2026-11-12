@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from tau.config import TauConfig
 from tau.identity import destination_hash
 from tau.node import NodeError, NotAllowedError, PeerRefusedError, TauNode
 from tau.peers import Peer, PeerRegistry
+from tau.protocol import decode, encode, retract_dict
 
 
 def test_delivery_hash_matches_rns_destination_hash() -> None:
@@ -513,6 +515,40 @@ def test_build_lxmf_message_rejects_bad_key(fake_lxmf):
         lxmf.build_lxmf_message(RNS.Identity(), bytes(32), "hi")
 
 
+def test_build_lxmf_message_carries_tau_message_id(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    message = lxmf.build_lxmf_message(
+        own, peer.get_public_key(), "hello", tau_message_id="tau-id-1"
+    )
+    assert message.content == "hello"
+    assert message.fields == {"tau_message_id": "tau-id-1"}
+
+
+def test_build_lxmf_message_without_tau_id_sets_no_fields(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    message = lxmf.build_lxmf_message(own, peer.get_public_key(), "hello")
+    assert message.fields is None
+
+
+def test_build_lxmf_message_rejects_bad_tau_message_id(fake_lxmf):
+    own = RNS.Identity()
+    peer = RNS.Identity()
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_message(
+            own, peer.get_public_key(), "hi", tau_message_id=""
+        )
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_message(
+            own, peer.get_public_key(), "hi", tau_message_id="x" * 65
+        )
+    with pytest.raises(ValueError):
+        lxmf.build_lxmf_message(
+            own, peer.get_public_key(), "hi", tau_message_id=123  # type: ignore[arg-type]
+        )
+
+
 def test_send_lxmf_message_returns_true_on_delivery(fake_lxmf, tmp_path):
     router = _FakeLXMRouter(identity=RNS.Identity(), storagepath=str(tmp_path))
     router.outcome = "deliver"
@@ -726,7 +762,7 @@ def _lxmf_peer(node, name="alice"):
     return peer, sender
 
 
-def _lxmf_message(sender, *, text="hello via lxmf", verified=True):
+def _lxmf_message(sender, *, text="hello via lxmf", verified=True, fields=None):
     """A delivered LXMessage stand-in for *sender*."""
     return types.SimpleNamespace(
         source_hash=lxmf.lxmf_delivery_hash(sender),
@@ -734,6 +770,27 @@ def _lxmf_message(sender, *, text="hello via lxmf", verified=True):
         content_as_string=lambda: text,
         hash=b"\x11" * 16,
         timestamp=1_700_000_000.0,
+        fields=fields,
+    )
+
+
+def _signed_retract(sender, target, message_id):
+    """A retract payload signed by *sender*, as send_retraction builds it."""
+    payload = retract_dict(target, message_id=message_id)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _call_retract(node, sender, target, message_id):
+    return decode(
+        node._handle_retract(
+            "/tau/test",
+            _signed_retract(sender, target, message_id),
+            b"request-id",
+            sender,
+            time.time(),
+        )
     )
 
 
@@ -857,6 +914,98 @@ def test_node_lxmf_delivery_dedupes_redelivery(fake_lxmf, tmp_path):
         node.lxmf_router.delivery_callback(message)
         node.lxmf_router.delivery_callback(message)
         assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_stores_tau_id_when_carried(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(
+                sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-id-1"}
+            )
+        )
+        stored = node.inbox.list_messages()
+        assert len(stored) == 1
+        # The displayed text is unchanged; the copy is the same message
+        # as the direct-path copy, keyed by its tau id.
+        assert stored[0]["text"] == "hello via lxmf"
+        assert stored[0]["id"] == "tau-id-1"
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_dedupes_by_carried_tau_id(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        first = _lxmf_message(
+            sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-id-1"}
+        )
+        second = _lxmf_message(
+            sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-id-1"}
+        )
+        second.hash = b"\x22" * 16  # a different LXMF transport copy
+        node.lxmf_router.delivery_callback(first)
+        node.lxmf_router.delivery_callback(second)
+        assert len(node.inbox.list_messages()) == 1
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_drops_retracted_tau_id(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    peer, sender = _lxmf_peer(node)
+    try:
+        # The retract arrived before the LXMF copy: the marker must
+        # cover the carried tau id.
+        node.mailbox.record_retraction(peer.hexhash, "tau-id-1")
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(
+                sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-id-1"}
+            )
+        )
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_retract_deletes_stored_copy(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        node.lxmf_router.delivery_callback(
+            _lxmf_message(
+                sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: "tau-id-1"}
+            )
+        )
+        assert len(node.inbox.list_messages()) == 1
+        # The LXMF copy was stored under the tau id, so the retract
+        # finds and deletes it like a direct-path copy.
+        response = _call_retract(node, sender, "tau-id-1", "retract-1")
+        assert response["ok"] is True
+        assert response["deleted"] is True
+        assert node.inbox.list_messages() == []
+    finally:
+        node.stop()
+
+
+def test_node_lxmf_delivery_ignores_malformed_tau_id_field(fake_lxmf, tmp_path):
+    node = _lxmf_node(tmp_path)
+    _peer, sender = _lxmf_peer(node)
+    try:
+        for bad in ("", "x" * 65, 123, None):
+            message = _lxmf_message(
+                sender, fields={lxmf.LXMF_FIELD_TAU_MESSAGE_ID: bad}
+            )
+            message.hash = bytes([len(node.inbox.list_messages()) + 1]) * 16
+            node.lxmf_router.delivery_callback(message)
+        stored = node.inbox.list_messages()
+        assert len(stored) == 4
+        # Every copy fell back to its LXMF hash id.
+        assert all(record["id"].startswith("lxmf:") for record in stored)
     finally:
         node.stop()
 

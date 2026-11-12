@@ -725,6 +725,24 @@ online. A message still queued in the outbox is cancelled with
 retracts rejects the unknown path, so a retract to an old peer fails
 instead of silently succeeding.
 
+### DM edits
+
+`tau edit <message-id> <text>` fixes a message you already sent, in place:
+it sends a signed `/tau/dm/edit` request carrying the target message id
+and the replacement text — the same signed-envelope pattern as a reaction,
+verified by the receiver against the link identity. The receiver applies
+it only when the editor is the message's original sender, and only when
+the edit is newer than the last one applied, so a replayed older edit
+cannot rewind a newer one and a retried edit is safe. The stored text is
+replaced and the message is marked edited (`edited_at`); `tau messages`
+shows an `(edited)` marker, and only the latest text is kept — there is
+no edit history. A group message is refused: group messages have a
+different id on every member's copy, so one edit cannot name them all.
+
+Edits are delivered live in v1, like reactions: the peer must be online.
+A peer running a version that predates edits rejects the unknown path,
+so an edit to an old peer fails instead of silently succeeding.
+
 ### Sneakernet bundles
 
 When two nodes share no network at all, mail can still travel on a
@@ -965,6 +983,12 @@ unlinked, and stall sync at the gap.
   group that includes you, gated by the DM allow-list like a direct message.
   Members learn a group from the first message sent to it, and the console
   is read-only for groups — composing from the console comes later.
+  Manage groups with `tau group create NAME --peer ...`, `tau group list`,
+  `tau group send GROUP TEXT`, `tau group add-member` / `remove-member`,
+  `tau group rename GROUP NEW-NAME` (creator only; a rename is a successor
+  group, so members learn the new name — and retire the old one — from the
+  next message sent to it, and `tau messages --group` history spans the
+  rename), and `tau group delete`.
 - Tan is a public timeline: no private posts or media yet.
   Authors can reply to posts, edit their own posts, and delete their own posts. It is not a full ActivityPub-style
   federation protocol.

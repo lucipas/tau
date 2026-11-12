@@ -11,6 +11,7 @@ from tau.bundle import (
     BundleError,
     apply_bundle,
     build_bundle,
+    inspect_bundle,
     parse_bundle,
     serialize_bundle,
 )
@@ -120,6 +121,52 @@ def test_bundle_roundtrip_held_and_outbox(tmp_path):
     assert again["imported"] == 0
     assert again["present"] == 2
     assert again["skipped"] == 0
+
+
+def test_bundle_export_queued_group_leg_keeps_shared_send_time(tmp_path):
+    # A queued group leg exported to a bundle must seal with the
+    # fan-out's shared send time and its group context, like a relay
+    # deposit — otherwise the copy arrives as a plain DM stamped with
+    # the enqueue time and a reaction on the live copy cannot resolve.
+    sender, recipient, _ = _identities()
+    members = [
+        destination_hash(sender).hex(),
+        destination_hash(recipient).hex(),
+    ]
+    group = derive_group_id(destination_hash(sender).hex(), "crew", members)
+    mailbox = Mailbox(tmp_path / "mailbox.json")
+    mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": destination_hash(sender).hex(),
+            "members": members,
+        },
+        sent_at=100.0,
+        now=2000.0,
+    )
+    document, summary = build_bundle(
+        identity=sender,
+        sender_name="alice",
+        mailbox=mailbox,
+        registry=_registry_with(recipient),
+        now=2000.0,
+    )
+    assert summary["mail"] == 1
+    parsed = parse_bundle(serialize_bundle(document))
+    receiver_box = Mailbox(tmp_path / "receiver.json")
+    result = apply_bundle(
+        mailbox=receiver_box, tan_conn=None, document=parsed, now=2000.0
+    )
+    assert result["imported"] == 1
+    held = receiver_box.held_list()
+    assert len(held) == 1
+    message = open_message(recipient, held[0].blob)
+    assert message["sent_at"] == 100.0
+    assert message["group"]["id"] == group
 
 
 def test_bundle_tan_roundtrip(tmp_path):
@@ -609,3 +656,332 @@ def test_cli_export_preserves_target_directory_permissions(tmp_path):
     )
     assert bundle_file.exists()
     assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
+
+
+# -- inspect ---------------------------------------------------------------
+
+
+def _build_with_tan(tmp_path, sender, recipient):
+    """A bundle with one held + one queued message and one Tan post."""
+    sender_conn = init_db(tmp_path / "sender.sqlite3")
+    try:
+        post = create_post(
+            sender_conn, sender, "hello from the bundle", name="alice", now=1000
+        )
+        mailbox = _seed_sender(tmp_path, sender, recipient)
+        document, _ = build_bundle(
+            identity=sender,
+            sender_name="alice",
+            mailbox=mailbox,
+            registry=_registry_with(recipient),
+            tan_conn=sender_conn,
+            include_tan=True,
+            now=1000.0,
+        )
+    finally:
+        sender_conn.close()
+    return document, post
+
+
+def test_inspect_bundle_summary(tmp_path):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    summary = inspect_bundle(parse_bundle(serialize_bundle(document)))
+
+    assert summary["format"] == "tau-bundle"
+    assert summary["version"] == 1
+    assert summary["exporter"] == destination_hash(sender).hex()
+    assert summary["created_at"] == 1000.0
+    assert summary["mail_count"] == 2
+    assert {entry["id"] for entry in summary["mail"]} == {
+        "held-1",
+        "queued-1",
+    }
+    assert {
+        entry["to"] for entry in summary["mail"]
+    } == {destination_hash(recipient).hex()}
+    assert all(
+        entry["expires_at"] == 1000.0 + 7 * 24 * 3600
+        for entry in summary["mail"]
+    )
+    assert summary["tan_count"] == 1
+    tan_entry = summary["tan"][0]
+    assert tan_entry["hash"] == post["hash"]
+    assert tan_entry["author"] == destination_hash(sender).hex()
+    assert tan_entry["kind"] == "post"
+    assert tan_entry["created_at"] == 1000
+    assert tan_entry["verified"] is True
+    assert tan_entry["error"] is None
+
+
+def test_inspect_bundle_reports_unverifiable_tan_entry(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    # Tamper with a Tan post after signing: the container is no
+    # longer parseable, but inspect of the parsed document still
+    # reports the entry as unverified instead of hiding the rest.
+    document["tan"]["entries"][0]["text"] = "tampered"
+    summary = inspect_bundle(document)
+    assert summary["tan_count"] == 1
+    assert summary["tan"][0]["verified"] is False
+    assert "hash does not match" in summary["tan"][0]["error"]
+    assert summary["mail_count"] == 2
+
+
+def test_cli_bundle_inspect(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    empty_dir = tmp_path / "empty"
+    mailbox_before = Mailbox(tmp_path / "mailbox.json")
+    assert (
+        main(
+            ["bundle", "inspect", str(bundle_file), "--data-dir", str(empty_dir)]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "signature valid" in out
+    assert "Sealed mail (2):" in out
+    assert "held-1" in out and "queued-1" in out
+    assert "Tan posts (1):" in out
+    assert post["hash"][:8] in out
+    # Inspect is read-only: nothing is created in the data dir and
+    # the mailbox it was built from is untouched.
+    assert not empty_dir.exists() or list(empty_dir.iterdir()) == []
+    assert {item.id for item in mailbox_before.held_list()} == {"held-1"}
+
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "bundle",
+                "inspect",
+                str(bundle_file),
+                "--data-dir",
+                str(empty_dir),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["exporter"] == destination_hash(sender).hex()
+    assert payload["mail_count"] == 2
+    assert payload["tan"][0]["verified"] is True
+    assert payload["tan"][0]["hash"] == post["hash"]
+    assert not empty_dir.exists() or list(empty_dir.iterdir()) == []
+
+
+def test_cli_bundle_inspect_reads_stdin(tmp_path, monkeypatch):
+    import io
+    import sys
+
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    raw = serialize_bundle(document)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw)))
+    assert (
+        main(["bundle", "inspect", "-", "--data-dir", str(tmp_path / "empty")])
+        == 0
+    )
+
+
+def test_cli_bundle_inspect_rejects_tampered_bundle(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    tampered = json.loads(serialize_bundle(document))
+    tampered["manifest"]["mail"] += 1  # payload no longer matches the signature
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_text(json.dumps(tampered), encoding="utf-8")
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "signature does not verify" in err
+
+
+def test_cli_bundle_inspect_rejects_non_bundle(tmp_path, capsys):
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_text("not a bundle", encoding="utf-8")
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 1
+    )
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def _resign(sender, document):
+    """Re-sign a mutated bundle document with the exporter's key.
+
+    Lets a test build a bundle that is still container-valid while
+    its contents are malformed — the shape a hostile or buggy
+    exporter could actually produce.
+    """
+    import base64
+
+    from tau.bundle import _canonical_bytes, _payload
+
+    signature = sender.sign(_canonical_bytes(_payload(document)))
+    document["sig"] = base64.b64encode(signature).decode("ascii")
+    return document
+
+
+def test_inspect_bundle_reports_malformed_mail_entries(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["mail"] = [
+        42,
+        {"id": "bad-to", "to": ["not", "a", "hash"], "expires_at": 1000.0},
+        {
+            "id": "bad-expiry",
+            "to": destination_hash(recipient).hex(),
+            "expires_at": float("inf"),
+        },
+    ]
+    summary = inspect_bundle(document)
+    assert summary["mail_count"] == 3
+    assert summary["mail"][0]["valid"] is False
+    assert summary["mail"][0]["error"] == "mail entry is not an object"
+    assert summary["mail"][1]["valid"] is False
+    assert summary["mail"][1]["error"] == "mail entry has no destination"
+    assert summary["mail"][2]["valid"] is False
+    assert summary["mail"][2]["expires_at"] is None
+    assert "expiry" in summary["mail"][2]["error"]
+
+
+def test_inspect_bundle_reports_malformed_tan_section(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"] = {"entries": 1}
+    summary = inspect_bundle(document)
+    assert summary["tan"] == []
+    assert summary["tan_error"] == "Tan section has no entries list"
+    document["tan"] = "junk"
+    summary = inspect_bundle(document)
+    assert summary["tan"] == []
+    assert summary["tan_error"] == "Tan section has no entries list"
+
+
+def test_inspect_bundle_normalizes_nonfinite_timestamps(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["manifest"]["created_at"] = float("nan")
+    summary = inspect_bundle(document)
+    assert summary["created_at"] is None
+    # The summary must stay real JSON: no NaN token leaks out.
+    assert "NaN" not in json.dumps(summary)
+
+
+def test_inspect_bundle_keeps_unverified_tan_metadata(tmp_path):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["text"] = "tampered"
+    summary = inspect_bundle(document)
+    entry = summary["tan"][0]
+    assert entry["verified"] is False
+    assert entry["author"] == destination_hash(sender).hex()
+    assert entry["kind"] == "post"
+    assert entry["created_at"] == 1000
+    assert "hash does not match" in entry["error"]
+
+
+def test_cli_bundle_inspect_malformed_signed_bundle(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["mail"].append(42)
+    document["mail"][0]["expires_at"] = 1e308
+    document["tan"] = {"entries": 1}
+    document["manifest"]["created_at"] = float("nan")
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "invalid: mail entry is not an object" in out
+    assert "Tan section unusable: Tan section has no entries list" in out
+    assert "out of range" in out
+
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "bundle",
+                "inspect",
+                str(bundle_file),
+                "--data-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    raw = capsys.readouterr().out
+    assert "NaN" not in raw
+    payload = json.loads(raw)
+    assert payload["mail_count"] == 3
+    assert payload["created_at"] is None
+    assert payload["tan_error"] == "Tan section has no entries list"
+
+
+def test_cli_bundle_inspect_unverified_tan_metadata(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["text"] = "tampered"
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "(unverified)" in out
+    assert "post" in out
+    assert "signature invalid" in out
+
+
+def test_cli_bundle_inspect_escapes_unverified_kind(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["kind"] = "\x1b[2J\x1b[Hevil"
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    # No raw escape byte may reach the terminal; the printable
+    # remainder still shows so the entry is identifiable.
+    assert "\x1b" not in out
+    assert "evil" in out
+    assert "(unverified)" in out
+
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "bundle",
+                "inspect",
+                str(bundle_file),
+                "--data-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tan"][0]["verified"] is False
+    assert payload["tan"][0]["kind"] == "\x1b[2J\x1b[Hevil"

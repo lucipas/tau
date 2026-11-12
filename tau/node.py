@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
 
 import RNS
 
@@ -35,7 +35,7 @@ from .config import (
     tcp_listen_endpoints,
     write_rns_config,
 )
-from .groups import GroupStore
+from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -49,6 +49,8 @@ from .instance_lock import (
     instance_lock_holder,
 )
 from .lxmf import (
+    LXMF_FIELD_TAU_MESSAGE_ID,
+    MAX_TAU_MESSAGE_ID_LENGTH,
     LXMFError,
     build_lxmf_message,
     lxmf_router_delivery_hash,
@@ -91,6 +93,7 @@ from .protocol import (
     REQUEST_READ,
     REQUEST_REACT,
     REQUEST_RETRACT,
+    REQUEST_DM_EDIT,
     ProtocolError,
     build_announce,
     build_file_offer,
@@ -101,6 +104,8 @@ from .protocol import (
     clean_reaction,
     decode,
     derive_group_id,
+    edit_dict,
+    edit_unsigned_bytes,
     encode_group_message,
     encode,
     encode_message,
@@ -108,6 +113,7 @@ from .protocol import (
     normalize_message,
     normalize_message_kind,
     parse_announce,
+    parse_edit,
     parse_group_message,
     parse_file_offer,
     parse_mail_fetch,
@@ -245,6 +251,20 @@ class NotAMemberError(NodeError):
 
     A changed roster or a non-member sender is a permanent refusal, so
     the group leg is not queued for retry.
+    """
+
+
+class DeliveryDeferredError(NodeError):
+    """A relayed delivery failed transiently and must be retried later.
+
+    Raised by :meth:`TauNode._deliver_collected` when the delivery
+    could not be recorded — for example the group-reaction
+    authorization cleanup could not persist — so the callers keep
+    the held copy instead of dropping or acknowledging it: a local
+    held envelope stays held, a fetched one stays unacknowledged,
+    and a later sweep retries it.  Distinct from a final refusal
+    (blocked, already seen, expired), which returns ``False`` and
+    lets the copy go.
     """
 
 
@@ -466,6 +486,7 @@ class TauNode:
         name: Optional[str] = None,
         registry: Optional[PeerRegistry] = None,
         on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_message_record_only: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_peer: Optional[Callable[[Peer], None]] = None,
         on_delivered: Optional[Callable[[str], None]] = None,
         on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -482,6 +503,12 @@ class TauNode:
         self.inbox = Inbox(config.inbox_path)
         self.groups = GroupStore(getattr(config, "groups_path", None))
         self.on_message = on_message
+        # Record-only twin of on_message: the console history write
+        # without the live event.  A delivery whose live publication
+        # is withheld (a voided-reaction fan-out failed) still calls
+        # this one, so the copy is not invisible in the console even
+        # though it is in the inbox and marked seen.
+        self.on_message_record_only = on_message_record_only
         self.on_peer = on_peer
         self.on_delivered = on_delivered
         self.on_file = on_file
@@ -755,6 +782,7 @@ class TauNode:
             REQUEST_READ: self._handle_read,
             REQUEST_REACT: self._handle_reaction,
             REQUEST_RETRACT: self._handle_retract,
+            REQUEST_DM_EDIT: self._handle_dm_edit,
             REQUEST_PEERS: self._handle_peers,
             REQUEST_MAIL_STORE: self._handle_mail_store,
             REQUEST_MAIL_FETCH: self._handle_mail_fetch,
@@ -922,13 +950,37 @@ class TauNode:
                 caller_hash,
             )
             return
+        # A tau DM sent over LXMF carries its tau message id in the
+        # message fields (see build_lxmf_message).  When present and
+        # well-formed, the copy is stored under that id, so it is the
+        # same message as the direct-path copy: a retraction marker
+        # keyed by the tau id covers it, a later retract finds and
+        # deletes it, and a direct copy dedupes against it.  A
+        # malformed field is ignored — a forged or truncated id must
+        # never displace the hash id — and a message without one (a
+        # non-tau LXMF client, or an older tau sender) keeps the
+        # hash id as before.
+        tau_message_id = None
+        fields = getattr(message, "fields", None)
+        if isinstance(fields, dict):
+            carried = fields.get(LXMF_FIELD_TAU_MESSAGE_ID)
+            if (
+                isinstance(carried, str)
+                and carried
+                and len(carried) <= MAX_TAU_MESSAGE_ID_LENGTH
+            ):
+                tau_message_id = carried
         # A propagation copy can redeliver the same message after a
         # router restart, so dedupe on the LXMF hash exactly like the
         # DM path dedupes relayed copies on the tau message id.
         # Tau message ids are capped at 64 characters on the wire, so the
         # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
         # still collision-free in practice).
-        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
+        message_id = (
+            tau_message_id
+            if tau_message_id is not None
+            else f"lxmf:{bytes(message_hash).hex()[:59]}"
+        )
         # The router can invoke this callback concurrently for two
         # copies of one message (direct + propagation), and each copy
         # passes the router's own duplicate check first — so the
@@ -936,7 +988,12 @@ class TauNode:
         # below run under one lock.  Without it both copies could
         # pass the checks before either stored anything and the
         # message would land in the inbox twice.
-        with self._lxmf_delivery_lock:
+        # The mailbox transaction is held across the retraction check and
+        # the append, so a retract that records its marker concurrently
+        # either lands first (and the check sees it) or waits until this
+        # copy is stored (and then deletes it).  Lock order is delivery
+        # lock, then mailbox, then inbox — the same as the retract path.
+        with self._lxmf_delivery_lock, self.mailbox.transaction():
             if self.mailbox.is_seen(message_id):
                 log.info("Ignoring duplicate LXMF message %s", message_id)
                 return
@@ -947,6 +1004,20 @@ class TauNode:
                 # Stored earlier but interrupted before it was marked seen.
                 self.mailbox.mark_seen(message_id)
                 log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            if tau_message_id is not None and self.mailbox.is_retracted(
+                caller_hash, tau_message_id
+            ):
+                # The sender retracted this DM before the LXMF copy
+                # arrived: drop it the way the direct path drops a
+                # retracted message, and leave it unseen so a
+                # redelivery re-checks the marker instead of being
+                # mistaken for a new message.
+                log.info(
+                    "Dropping retracted LXMF message %s from %s",
+                    tau_message_id,
+                    caller_hash,
+                )
                 return
             try:
                 sent_at = float(getattr(message, "timestamp", None) or 0.0)
@@ -1371,7 +1442,13 @@ class TauNode:
         """
         self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
 
-    def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
+    def _record_reaction(
+        self,
+        record: Dict[str, Any],
+        *,
+        strict: bool = False,
+        publish: bool = True,
+    ) -> None:
         """Persist a reaction and fan it out.
 
         A reaction whose target this node has never seen is still
@@ -1386,6 +1463,11 @@ class TauNode:
         local record is logged and delivery still succeeds — the
         sender's own copy is best-effort; the peer already accepted
         the reaction.
+
+        With ``publish=False`` (the receive handler) the reaction is
+        persisted but not fanned out yet: the handler publishes it
+        only once authorization has completed, so a reaction the
+        recheck refuses or cannot verify is never published live.
         """
         try:
             self.inbox.record_reaction(record)
@@ -1393,11 +1475,98 @@ class TauNode:
             log.warning("Could not record reaction", exc_info=True)
             if strict:
                 raise
-        if self.on_reaction is not None:
+        if publish and self.on_reaction is not None:
             try:
                 self.on_reaction(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_reaction callback failed", exc_info=True)
+
+    def _publish_reaction(self, record: Dict[str, Any]) -> bool:
+        """Fan one reaction record out to the console, best effort.
+
+        The record is already persisted — this is only the callback
+        half of :meth:`_record_reaction`, for tombstones the purge
+        wrote itself.  The console bridge keeps its own reaction
+        cache, seeded into messages appended afterwards, so a void
+        that never reaches it would still display.  Returns ``True``
+        when the callback ran (or there is no console to tell), and
+        ``False`` when it raised, so the caller can withhold the
+        live event instead of publishing with a stale cache.
+        """
+        if self.on_reaction is None:
+            return True
+        try:
+            self.on_reaction(record)
+        except Exception:  # pragma: no cover - user callback
+            log.warning("on_reaction callback failed", exc_info=True)
+            return False
+        return True
+
+    def _notify_message(self, record: Dict[str, Any], *, publish_ok: bool) -> None:
+        """Deliver a recorded message to the console callbacks.
+
+        When ``publish_ok`` is False the live event is withheld (a
+        voided-reaction fan-out failed), but the console history is
+        still written via ``on_message_record_only`` when one is
+        wired: ``messages()`` reads only that history, so skipping
+        the callback would leave the copy invisible in the console
+        even though it is in the inbox and marked seen.  Without a
+        record-only callback there is nothing to write to, and the
+        live event stays withheld.
+        """
+        if publish_ok:
+            if self.on_message is not None:
+                try:
+                    self.on_message(record)
+                except Exception:  # pragma: no cover - user callback
+                    log.warning("on_message callback failed", exc_info=True)
+        elif self.on_message_record_only is not None:
+            try:
+                self.on_message_record_only(record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning(
+                    "on_message_record_only callback failed", exc_info=True
+                )
+
+    def _void_stored_reaction(self, target_id: str, caller_hash: str) -> None:
+        """Void a reaction this reactor already stored on *target_id*.
+
+        Called when a reaction is refused for group membership: an
+        earlier attempt may have stored the reaction before the
+        message landed, and the post-store recheck may have failed to
+        void it — so the refusal also takes the orphan out.  Without
+        this, the retry the failed attempt prompts would be refused
+        up front and still leave the orphan displayed.  Best effort:
+        a failed void is logged and the refusal still stands.  A
+        no-op when nothing from this reactor is stored there.
+        """
+        try:
+            stored = [
+                item
+                for item in self.inbox.reactions_for(target_id)
+                if item.get("destination") == caller_hash and item.get("reaction")
+            ]
+        except Exception:  # pragma: no cover - defensive
+            return
+        if not stored:
+            return
+        latest = stored[-1]
+        tombstone = {
+            **latest,
+            "reaction": "",
+            "sent_at": max(float(latest["sent_at"]), time.time()) + 1.0,
+            "received_at": time.time(),
+        }
+        try:
+            self.inbox.record_reaction(tombstone)
+        except OSError:
+            log.warning(
+                "Could not void refused group reaction for %s",
+                target_id[:8],
+                exc_info=True,
+            )
+        else:
+            self._publish_reaction(tombstone)
 
     def _record_sent(self, record: Dict[str, Any]) -> None:
         """Persist an outgoing DM to the inbox; never break sending.
@@ -1546,6 +1715,7 @@ class TauNode:
         group: Dict[str, Any],
         *,
         sent_at: Optional[float] = None,
+        topic_sent_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Validate a group message's roster; pin the group on first sight.
 
@@ -1585,6 +1755,9 @@ class TauNode:
             creator=creator,
             sender=sender_hash or "",
             sent_at=sent_at,
+            topic=group.get("topic"),
+            topic_sent_at=topic_sent_at,
+            renamed_from=group.get("renamed_from"),
         )
 
     def _handle_group_message(
@@ -1634,9 +1807,15 @@ class TauNode:
         # A delayed group request past the sender's deadline is dropped
         # before the roster is pinned: an expired request must not add an
         # unseen group or replace a saved roster, and it is never shown.
-        # The duplicate flag is still reported: a retry of a message
-        # already seen counts as delivered on the sender's side, even
-        # though the deadline has since passed.
+        # The duplicate flag is NOT reported here: consulting the seen
+        # store before membership is established would let any
+        # allow-listed caller probe whether this node has seen an
+        # arbitrary id — including ids from groups they do not belong
+        # to, or direct messages — by sending a well-formed expired
+        # payload carrying it.  An expired retry of a message the
+        # receiver already saw therefore reports as undelivered on the
+        # sender's side; the deadline has passed, so no retry can
+        # succeed and the sender drops the leg (see _deliver_entry).
         message_id = message.get("id")
         expires_at = message.get("expires_at")
         if expires_at is not None and expires_at <= received_at:
@@ -1651,7 +1830,7 @@ class TauNode:
                 server=self.name,
                 node=self.destination_hexhash,
                 group=message["group"],
-                duplicate=bool(message_id and self.mailbox.is_seen(message_id)),
+                duplicate=False,
                 expired=True,
             )
 
@@ -1662,8 +1841,11 @@ class TauNode:
                 "name": message["group_name"],
                 "creator": message["creator"],
                 "members": message["members"],
+                "topic": message.get("group_topic"),
+                "renamed_from": message.get("renamed_from") or [],
             },
             sent_at=message.get("sent_at"),
+            topic_sent_at=message.get("group_topic_sent_at"),
         )
         if group is None:
             log.info(
@@ -1678,6 +1860,11 @@ class TauNode:
 
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
+        # Known gap: this live path still consults the node-wide seen
+        # store, so a pinned-group member can learn whether an arbitrary
+        # id was seen (including ids from other groups or DMs), and the
+        # probe marks unseen ids as seen. Only the expired path above is
+        # closed; scoping seen entries per group/sender is still open.
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         if not duplicate:
             record = {
@@ -1701,18 +1888,74 @@ class TauNode:
                 group["name"],
                 message["text"],
             )
-            # One delivery: mark seen and record under the mailbox
-            # transaction, so a live backup never restores a seen
-            # marker with no inbox entry (see _handle_message).
-            with self.mailbox.transaction():
-                if message_id:
-                    self.mailbox.mark_seen(message_id)
-                self._record_received(record)
-            if self.on_message is not None:
+            # One delivery: the reaction authorization and the record
+            # land together, under the mailbox transaction.  A reaction
+            # can outrun the message it names — legs fan out one member
+            # at a time — and was stored under the reactor's foreign
+            # wire id with its signed group context retained.  Now that
+            # this copy is here, move those reactions onto it; only
+            # reactors on this group's roster move, so an outsider's
+            # reaction never surfaces.  And void any stored reaction
+            # on this id from a reactor the roster does not name (a
+            # no-context reaction stored before its target arrived,
+            # when no roster check could run).  The reconcile, the
+            # purge, and the append run in one inbox transaction with
+            # a single persist (see Inbox.append_group_message): a
+            # non-member's reaction stored between a separate purge
+            # and append used to skip every roster check and become
+            # readable once the message landed, and that window is
+            # gone.  If the combined step fails, the delivery is
+            # refused and nothing is recorded or marked seen — the
+            # record is written only after the step succeeds, so the
+            # sender retries with the same id once the store is
+            # healthy.  A failed reconcile is different — it only
+            # leaves legitimate reactions stranded (invisible) — so
+            # it never breaks delivery.  The voids are fanned out to
+            # the console before the record too: the bridge caches
+            # reactions separately and seeds appended messages from
+            # that cache, so a void that never reaches it would still
+            # display.  If a fan-out fails, the message still records
+            # (the inbox is clean) but the live event is withheld.
+            publish_ok = True
+            voided: List[Dict[str, Any]] = []
+            if message_id:
                 try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+                    with self.mailbox.transaction():
+                        if self.mailbox.is_seen(message_id):
+                            # A competing delivery marked this id seen
+                            # after the pre-check: the transaction
+                            # reloaded the mailbox, so this reads the
+                            # current on-disk state — skip the append
+                            # and the notification, exactly as the
+                            # relayed path does (see _deliver_collected).
+                            duplicate = True
+                        else:
+                            voided = self.inbox.append_group_message(
+                                record,
+                                group=group["id"],
+                                author=caller_hash,
+                                sent_at=message.get("sent_at"),
+                                members=set(group.get("members") or []),
+                            )
+                            self.mailbox.mark_seen(message_id)
+                except OSError:
+                    log.warning(
+                        "Could not authorize group reactions",
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed",
+                        "could not authorize group reactions",
+                    )
+                if not duplicate:
+                    for tombstone in voided:
+                        if not self._publish_reaction(tombstone):
+                            publish_ok = False
+            else:
+                with self.mailbox.transaction():
+                    self._record_received(record)
+            if not duplicate:
+                self._notify_message(record, publish_ok=publish_ok)
 
         return response_ok(
             echo=message["text"],
@@ -1889,8 +2132,112 @@ class TauNode:
         seen_key = f"reaction:{caller_hash}:{reaction_id}" if reaction_id else None
         duplicate = bool(seen_key and self.mailbox.is_seen(seen_key))
         if not duplicate:
+            target_id = reaction["target"]
+            # Reload first: another process (a one-shot CLI import)
+            # may have persisted the target after this node's
+            # in-memory copy was read.  Without it, resolve() can
+            # miss a just-imported group-message copy, and a
+            # reaction naming it would skip both roster checks
+            # below — the same reason _handle_retract reloads
+            # before resolving.  A failed reload fails closed: the
+            # sender can retry, instead of the reaction being
+            # stored against a stale view of the inbox.
+            try:
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            try:
+                resolved = self.inbox.resolve(target_id)
+            except ValueError:
+                resolved = None
+            if resolved is not None:
+                # A reaction may name a group leg id rather than the
+                # stored record's canonical id (or a prefix of it):
+                # resolve matched the record, so store the reaction
+                # under the canonical id — otherwise it never
+                # displays under the message listing.
+                target_id = str(resolved["id"])
+            if (
+                resolved is None
+                and reaction.get("group") is not None
+                and reaction.get("target_author") is not None
+                and reaction.get("target_sent_at") is not None
+            ):
+                # Group sends carry a different wire id per leg, so
+                # this target names the reactor's copy, not this
+                # node's.  When this node does not hold the target,
+                # resolve its own copy from the signed group context
+                # instead — the context is covered by the signature
+                # verified above, so a relay cannot retarget the
+                # reaction onto a different message.  A copy that
+                # arrived through an outbox retry carries the shared
+                # send time and resolves the same way; only a copy
+                # queued before the shared time was recorded falls
+                # back to its enqueue time, and then the reaction is
+                # still stored under the wire target, and shows for
+                # the author, exactly as before.
+                # The signed context names the logical message, but
+                # a valid signature only proves who chose the
+                # context, not that they belong to the group: an
+                # allow-listed outsider who learned a group id,
+                # author and send time could otherwise sign a
+                # reaction onto a message in a group they never
+                # joined.  The pinned roster is the trusted
+                # membership list — a group message pins it on
+                # arrival — so a reactor the roster does not name
+                # is refused here.  No roster is pinned yet when
+                # the reaction outruns the message; that reaction
+                # is stored with its context and can only surface
+                # through reconciliation when the message arrives,
+                # which checks the roster then.  The lookup is by
+                # which checks the roster then.  The lookup is by
+                # exact id: a retired id that is also another group's
+                # name must not resolve to that group.
+                pinned = pinned_group(self.groups, reaction["group"])
+                if pinned is not None and caller_hash not in (
+                    pinned.get("members") or []
+                ):
+                    self._void_stored_reaction(target_id, caller_hash)
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
+                local = self.inbox.find_group_message(
+                    reaction["group"],
+                    reaction["target_author"],
+                    reaction["target_sent_at"],
+                )
+                if local is not None:
+                    target_id = str(local["id"])
+                    resolved = local
+            if resolved is not None and resolved.get("kind") == "group":
+                # A resolved target bypasses the context check above,
+                # so check the roster here too: an allow-listed
+                # non-member naming a known local group-message id
+                # must not get their reaction stored or displayed —
+                # including reactions that carry no group context.
+                # A missing roster fails closed: the group was deleted
+                # A missing roster fails closed: the group was deleted
+                # (or the message was imported without one), so there
+                # is no membership to verify — and a deleted group has
+                # no members left to authorize.  Treating the missing
+                # roster as permission let an outsider who learned a
+                # message id react to a retained copy.  The lookup is
+                # by exact id: a retired id that is also another
+                # group's name must not resolve to that group.
+                pinned = pinned_group(self.groups, resolved["group"])
+                if pinned is None or caller_hash not in (
+                    pinned.get("members") or []
+                ):
+                    self._void_stored_reaction(target_id, caller_hash)
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
             record = {
-                "target": reaction["target"],
+                "target": target_id,
                 "reaction": reaction["reaction"],
                 "from": caller_name,
                 "destination": caller_hash,
@@ -1898,15 +2245,226 @@ class TauNode:
                 "received_at": received_at,
                 "id": reaction_id,
             }
-            try:
-                self._record_reaction(record, strict=True)
-            except OSError as exc:
-                # Do not acknowledge a reaction that was not stored, and
-                # do not mark its id seen — the sender can retry with the
-                # same id and it will be recorded then.
-                return response_error(
-                    "storage_failed", f"could not store reaction: {exc}"
+            if reaction.get("group") is not None:
+                # Retain the signed context with the stored reaction:
+                # when the target copy has not arrived yet, the
+                # reaction is stored under the foreign wire id, and
+                # reconciliation needs the context to move it onto
+                # this node's copy when it lands.
+                record["group"] = reaction["group"]
+                record["target_author"] = reaction.get("target_author")
+                record["target_sent_at"] = reaction.get("target_sent_at")
+            if resolved is None and reaction.get("group") is None:
+                # Final authorization AND storage under ONE inbox
+                # transaction: the lookup, the roster check and the
+                # persist hold the cross-process flock, so no other
+                # process can import the target between the check
+                # and the store.  Previously the check ran, the
+                # transaction was released, and a copy imported in
+                # between was stored before the post-store recheck
+                # could void it — and a failed recheck left the
+                # non-member's reaction stored and visible, cleaned
+                # up only if the sender happened to retry.  The
+                # transaction reloads at entry, so the resolve reads
+                # the current on-disk state; a failed entry reload
+                # fails closed with storage_failed and nothing is
+                # stored.  The post-store recheck below stays as the
+                # backstop for a copy that lands after the store.
+                # The reaction is persisted here but NOT published:
+                # it is fanned out only after the recheck passes
+                # (see below), so an unauthorized reaction never
+                # reaches the live console.
+                authorized = True
+                try:
+                    with self.inbox.transaction():
+                        try:
+                            final = self.inbox.resolve(target_id)
+                        except ValueError:
+                            final = None
+                        if final is not None and final.get("kind") == "group":
+                            # A missing roster fails closed, as above:
+                            # A missing roster fails closed, as above:
+                            # the group was deleted, so no membership
+                            # can be verified.  The lookup is by exact
+                            # id, so a retired id that is also another
+                            # group's name does not resolve to it.
+                            pinned = pinned_group(self.groups, final["group"])
+                            if pinned is None or caller_hash not in (
+                                pinned.get("members") or []
+                            ):
+                                authorized = False
+                        if authorized:
+                            try:
+                                self.inbox.record_reaction(record)
+                            except OSError as exc:
+                                return response_error(
+                                    "storage_failed",
+                                    f"could not store reaction: {exc}",
+                                )
+                except InboxError as exc:
+                    return response_error(
+                        "storage_failed", f"could not read inbox: {exc}"
+                    )
+                if not authorized:
+                    # Refused before anything was stored; void any
+                    # orphan an earlier attempt left behind (its
+                    # recheck failed), after the transaction so the
+                    # fan-out does not run under the flock.
+                    self._void_stored_reaction(target_id, caller_hash)
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
+            else:
+                try:
+                    self._record_reaction(record, strict=True, publish=False)
+                except OSError as exc:
+                    # Do not acknowledge a reaction that was not stored, and
+                    # do not mark its id seen — the sender can retry with the
+                    # same id and it will be recorded then.
+                    return response_error(
+                        "storage_failed", f"could not store reaction: {exc}"
+                    )
+            recheck_voided = False
+            if resolved is None and reaction.get("group") is not None:
+                # The lookup above can race the message's arrival:
+                # the copy may have landed after find_group_message
+                # missed it but before this reaction was stored, and
+                # the message handler's reconcile already ran — so
+                # neither handler would move it again.  Recheck once:
+                # if the copy is here now, move the reaction onto it
+                # here.  Either order is now covered — a store before
+                # the message handler's reconcile is caught there, a
+                # store after it is caught here.  A failed recheck
+                # never breaks the acknowledged delivery; the reaction
+                # stays stored under the foreign id, as before.
+                local = self.inbox.find_group_message(
+                    reaction["group"],
+                    reaction["target_author"],
+                    reaction["target_sent_at"],
                 )
+                if local is not None:
+                    # Exact-id lookup: a retired id that is also
+                    # Exact-id lookup: a retired id that is also
+                    # another group's name must not supply the
+                    # roster the reconciliation filters against.
+                    pinned = pinned_group(self.groups, reaction["group"])
+                    if pinned is not None:
+                        try:
+                            self.inbox.reconcile_group_reactions(
+                                reaction["group"],
+                                reaction["target_author"],
+                                reaction["target_sent_at"],
+                                str(local["id"]),
+                                members=set(pinned.get("members") or []),
+                            )
+                        except Exception:  # pragma: no cover - storage failure
+                            log.warning(
+                                "Could not reconcile group reaction for %s",
+                                reaction["target"][:8],
+                                exc_info=True,
+                            )
+            if resolved is None:
+                # A second authorization look after storing: the
+                # target can still land after the atomic final
+                # check and persist above (the store is atomic with
+                # the check, not with a later arrival), so a
+                # reaction naming an imported copy with no group
+                # context would surface without any roster check
+                # ever running.  Reload and resolve the stored
+                # target again; if it is now a group message and
+                # the reactor is not on its roster, void the
+                # reaction just stored with a tombstone, so a
+                # replay cannot resurrect it.  A failed recheck
+                # fails closed with storage_failed instead of
+                # acknowledging a reaction that could not be
+                # verified: the sender retries, and the retry's
+                # refusal voids the orphan left behind (see
+                # _void_stored_reaction), so the reaction does not
+                # stay displayed.  The id is not marked seen, so
+                # the retry is processed, not deduped away.  The
+                # reaction was not published live yet (see below),
+                # so a failed recheck also never publishes it.
+                try:
+                    self.inbox.reload()
+                except InboxError as exc:
+                    log.warning(
+                        "Could not reload inbox to recheck reaction for %s",
+                        reaction["target"][:8],
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed",
+                        f"could not recheck reaction: {exc}",
+                    )
+                else:
+                    try:
+                        now_resolved = self.inbox.resolve(target_id)
+                    except ValueError:
+                        now_resolved = None
+                    if (
+                        now_resolved is not None
+                        and now_resolved.get("kind") == "group"
+                    ):
+                        # Exact-id lookup: a retired id that is also
+                        # Exact-id lookup: a retired id that is also
+                        # another group's name must not supply the
+                        # roster this void check runs against.  A
+                        # missing roster fails closed here too: the
+                        # target resolved at check time, so the only
+                        # way no roster is pinned now is that the
+                        # group was deleted between the check and the
+                        # store — and a deleted group has no members
+                        # left to authorize.
+                        pinned = pinned_group(
+                            self.groups, now_resolved["group"]
+                        )
+                        if pinned is None or caller_hash not in (
+                            pinned.get("members") or []
+                        ):
+                            tombstone = {
+                                **record,
+                                "reaction": "",
+                                "sent_at": max(
+                                    float(record["sent_at"]), time.time()
+                                )
+                                + 1.0,
+                                "received_at": time.time(),
+                            }
+                            try:
+                                self.inbox.record_reaction(tombstone)
+                            except OSError as exc:
+                                log.warning(
+                                    "Could not void unauthorized reaction "
+                                    "for %s",
+                                    reaction["target"][:8],
+                                    exc_info=True,
+                                )
+                                return response_error(
+                                    "storage_failed",
+                                    "could not void unauthorized "
+                                    f"reaction: {exc}",
+                                )
+                            else:
+                                # The void is fanned out too: the
+                                # bridge cached the reaction when it
+                                # was stored, and a void that never
+                                # reaches it would still display.
+                                # (With the deferred publish below,
+                                # the reaction itself was never
+                                # fanned out, so this only clears
+                                # state the bridge may have seeded
+                                # from the inbox.)
+                                self._publish_reaction(tombstone)
+                                recheck_voided = True
+            # Publish only once authorization has completed: the
+            # reaction was persisted above but not fanned out, so a
+            # reaction the recheck refused or could not verify never
+            # reaches the live console.  A reaction the recheck
+            # voided is not published here — only its tombstone
+            # was fanned out, above.
+            if not recheck_voided:
+                self._publish_reaction(record)
             if seen_key:
                 self.mailbox.mark_seen(seen_key)
             log.info(
@@ -2115,6 +2673,181 @@ class TauNode:
                 received_at=received_at,
                 deleted=True,
             )
+
+
+    def _handle_dm_edit(
+        self,
+        path: str,
+        data: Any,
+        request_id: bytes,
+        remote_identity: Optional[RNS.Identity],
+        requested_at: float,
+    ) -> bytes:
+        """Apply a signed edit for a DM this node received."""
+        try:
+            edit = parse_edit(data)
+        except ProtocolError as exc:
+            return response_error("invalid_edit", str(exc))
+
+        received_at = time.time()
+        if remote_identity is None:
+            # An edit is state keyed by its editor: without an
+            # authenticated link identity there is no editor to key on,
+            # and an anonymous edit could rewrite anyone's message.
+            return response_error(
+                "unidentified", "identify on the link to edit"
+            )
+        caller_hash = tau_destination_hash(remote_identity).hex()
+        # Edits are signed entries, like reactions: the signature covers
+        # the whole payload and is verified against the link identity, so
+        # attribution does not depend on trusting the transport — a
+        # relayed or replayed edit still has to prove its editor.
+        # (parse_edit already checked the base64.)
+        signature_text = edit.get("sig")
+        if not signature_text:
+            return response_error("invalid_edit", "edit is missing its signature")
+        try:
+            signature = base64.b64decode(signature_text, validate=True)
+            unsigned = edit_unsigned_bytes(data)
+        except (ValueError, ProtocolError) as exc:
+            return response_error("invalid_edit", str(exc))
+        try:
+            verified = remote_identity.validate(signature, unsigned)
+        except Exception as exc:
+            return response_error(
+                "invalid_edit", f"could not verify edit: {exc}"
+            )
+        if not verified:
+            return response_error(
+                "invalid_edit", "edit signature does not verify"
+            )
+        if self.blocklist.is_blocked(caller_hash):
+            # The block check runs before the allow-list: blocking an
+            # allow-listed peer wins, so a blocked sender cannot rewrite
+            # a message already sitting in the inbox either.
+            log.info(
+                "Edit from %s denied by the block-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "unavailable", "message could not be delivered"
+            )
+        if not self.allowlist.is_allowed(caller_hash):
+            log.info(
+                "Edit from %s denied by the DM allow-list",
+                caller_hash or "anonymous",
+            )
+            return response_error(
+                "not_allowed", "sender is not on this node's allow-list"
+            )
+        caller_name = "unknown"
+        if caller_hash:
+            peer = self.registry.get(caller_hash)
+            caller_name = peer.display_name if peer is not None else caller_hash[:8]
+
+        target_id = edit["target"]
+        try:
+            record = self.inbox.resolve(target_id)
+        except ValueError:
+            # An unknown id answers ok with edited: false, so a retried
+            # edit is safe (idempotent) — the sender can retry with the
+            # same id and it will apply when the message arrives.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        if record.get("id") != target_id:
+            # resolve() also matches unique prefixes; an edit must name
+            # the full id, so a prefix match is not an edit target.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        if record.get("kind") == "group":
+            # A group message has a different id on every member's
+            # copy, so one edit cannot name them all; refuse instead of
+            # rewriting a single member's copy.
+            return response_error(
+                "group_message",
+                "group messages cannot be edited; send a new message instead",
+            )
+        if record.get("kind") == "file":
+            return response_error(
+                "file_message", "a file record has no text to edit"
+            )
+        if record.get("direction") != "in":
+            # Only an inbound record names its sender in
+            # ``destination``: an outbound record is this node's own
+            # sent message, and no remote peer may rewrite it.
+            return response_error(
+                "not_sender", "only the message's sender may edit it"
+            )
+        if (record.get("destination") or "") != caller_hash:
+            return response_error(
+                "not_sender", "only the message's sender may edit it"
+            )
+        edit_sent_at = edit.get("sent_at")
+        if edit_sent_at is None:
+            # The signed sent_at is the edit's ordering key.  Falling
+            # back to receipt time would let a replayed older edit look
+            # new and rewind a newer one.
+            return response_error(
+                "invalid_edit", "edit is missing its signed sent_at"
+            )
+        effective_at = float(edit_sent_at)
+        previous_edited_at = record.get("edited_at")
+        if (
+            isinstance(previous_edited_at, (int, float))
+            and effective_at <= float(previous_edited_at)
+        ):
+            # A replayed or retried older edit must not rewind a newer
+            # one; the sender's retry with the same id is harmless.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        try:
+            # The ownership and ordering checks above read a snapshot;
+            # the inbox repeats them atomically so racing edits cannot
+            # apply out of order.
+            applied = self.inbox.apply_edit(
+                target_id,
+                edit["text"],
+                edited_at=effective_at,
+                direction="in",
+                destination=caller_hash,
+                newer_than_existing=True,
+            )
+        except InboxError as exc:
+            # Do not acknowledge an edit that was not stored, so the
+            # sender can retry with the same id and it will apply then.
+            return response_error(
+                "storage_failed", f"could not store edit: {exc}"
+            )
+        if applied is None:
+            # The record went away between the lookup and the edit (a
+            # concurrent delete or retract): report it as not applied
+            # rather than acknowledging an edit that landed nowhere.
+            return response_ok(
+                target=target_id,
+                edited=False,
+                received_at=received_at,
+            )
+        log.info(
+            "Edit from %s (%s) on %s",
+            caller_name,
+            caller_hash or "anonymous",
+            target_id[:8],
+        )
+        return response_ok(
+            target=target_id,
+            edited=True,
+            received_at=received_at,
+        )
+
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -2565,6 +3298,34 @@ class TauNode:
         except TimeoutError:
             return True
 
+    def _current_group_topic(
+        self, group_id: Optional[str]
+    ) -> Optional[Tuple[str, Optional[float]]]:
+        """The topic a queued group message should carry on retry, with
+        the time it was set (``None`` when unknown).
+
+        Read from the store at delivery time, so a topic set or cleared
+        after queueing travels with the retry.  Returns ``None`` when the
+        group is gone (deleted, or roster-changed into a successor) or the
+        store cannot be read: the retry then omits the topic, and the
+        recipient keeps its own, rather than treating it as a clear.
+        """
+        if not group_id:
+            return None
+        try:
+            # find() reloads from disk, so a topic set by another
+            # process (``tau group topic`` while serving) is seen.
+            group = self.groups.find(group_id)
+        except (ValueError, OSError):  # unknown group, or unreadable store
+            return None
+        if group is None:
+            return None
+        topic_at = group.get("topic_sent_at")
+        return (
+            str(group.get("topic", "") or ""),
+            float(topic_at) if isinstance(topic_at, (int, float)) else None,
+        )
+
     def _deliver_entry(
         self,
         peer: Peer,
@@ -2598,28 +3359,60 @@ class TauNode:
                     return False
         except TimeoutError:
             return False
-        payload = (
-            encode_group_message(
-                entry.text,
+        if entry.group_id is not None:
+            group_kwargs: Dict[str, Any] = dict(
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                renamed_from=(
+                    (self.groups.get(entry.group_id) or {}).get("renamed_from")
+                    or None
+                ),
                 in_reply_to=entry.in_reply_to,
                 expires_at=entry.message_expires_at,
             )
-            if entry.group_id is not None
-            else encode_message(
+            # Re-read the topic at retry time, not queue time: a topic
+            # set or cleared after queueing travels with the retry, and
+            # a stale queued copy cannot resurrect one.  Its own set
+            # time rides along, since it can postdate the queued message.
+            # A group that is gone carries no topic at all (None), so
+            # the recipient keeps its own rather than being cleared.
+            current = self._current_group_topic(entry.group_id)
+            topic, topic_at = current if current is not None else (None, None)
+            try:
+                payload = encode_group_message(
+                    entry.text,
+                    group_topic=topic,
+                    group_topic_sent_at=topic_at,
+                    **group_kwargs,
+                )
+            except ProtocolError:
+                # A topic set after queueing can push the payload past
+                # the size limit.  Send without it rather than abort the
+                # whole flush round; the recipient keeps its topic.
+                try:
+                    payload = encode_group_message(
+                        entry.text, group_topic=None, **group_kwargs
+                    )
+                except ProtocolError:
+                    log.error(
+                        "Queued group message %s to %s cannot be encoded",
+                        entry.id,
+                        peer.hexhash,
+                    )
+                    return False
+        else:
+            payload = encode_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
             )
-        )
         if not self._still_queued(entry.id, timeout=_remaining(deadline)):
             return False
         via_lxmf = False
@@ -2771,7 +3564,10 @@ class TauNode:
             return False
         try:
             message = build_lxmf_message(
-                self.identity, recipient.public_key, entry.text
+                self.identity,
+                recipient.public_key,
+                entry.text,
+                tau_message_id=entry.id,
             )
             return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
         except (LXMFError, ValueError) as exc:
@@ -2819,6 +3615,32 @@ class TauNode:
             # Without the recipient's public key the message cannot be
             # sealed for anyone else to hold; direct delivery only.
             return False
+        sealed_group = None
+        if entry.group_id is not None:
+            sealed_group = {
+                "id": entry.group_id,
+                "name": entry.group_name,
+                "creator": entry.group_creator,
+                "members": entry.group_members,
+                # The lineage rides in the sealed envelope, so an
+                # offline member that receives this copy through
+                # store-and-forward retires the predecessor exactly
+                # as a direct recipient would; the current record is
+                # read at deposit time, like the direct re-send path.
+                "renamed_from": (
+                    (self.groups.get(entry.group_id) or {}).get(
+                        "renamed_from"
+                    )
+                    or None
+                ),
+            }
+            # A relayed copy carries the topic like a direct one, with
+            # its own set time, so the recipient judges it the same way.
+            # A group that is gone carries none: the recipient keeps
+            # its own rather than being cleared.
+            current = self._current_group_topic(entry.group_id)
+            if current is not None:
+                sealed_group["topic"], sealed_group["topic_sent_at"] = current
         try:
             blob = seal_message(
                 self.identity,
@@ -2826,17 +3648,8 @@ class TauNode:
                 recipient_public_key=recipient.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
-                group=(
-                    {
-                        "id": entry.group_id,
-                        "name": entry.group_name,
-                        "creator": entry.group_creator,
-                        "members": entry.group_members,
-                    }
-                    if entry.group_id is not None
-                    else None
-                ),
+                sent_at=entry.wire_sent_at,
+                group=sealed_group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3088,28 +3901,45 @@ class TauNode:
             blob_text = item.get("blob")
             if not isinstance(message_id, str) or not isinstance(blob_text, str):
                 continue
-            # Whatever happens next, this envelope has been handed over;
-            # ack it so the holder can drop its copy.
-            new_acks.append(message_id)
             try:
                 blob = base64.b64decode(blob_text, validate=True)
                 kind, payload = open_sealed_envelope(self.identity, blob)
             except (ValueError, MailboxError) as exc:
                 log.warning("Dropping unreadable held mail %s: %s", message_id, exc)
+                # Unreadable is final: ack it so the holder drops
+                # the garbage instead of serving it forever.
+                new_acks.append(message_id)
                 continue
             if kind == "sealed_receipt":
                 # A receipt is not a message: record the reads and move
-                # on.  The envelope is already acked above, and a
+                # on.  The envelope is already acked below, and a
                 # receipt is never receipted itself.
                 self._record_receipt(
                     reader_hash=payload["from"],
                     message_ids=payload["ids"],
                     read_at=payload["read_at"],
                 )
+                new_acks.append(message_id)
                 continue
             message = payload
-            if self._deliver_collected(message):
+            try:
+                delivered = self._deliver_collected(message)
+            except DeliveryDeferredError as exc:
+                # The delivery could not be recorded (for example the
+                # group-reaction cleanup could not persist): do NOT
+                # ack the envelope, so the holder keeps its copy and
+                # a later fetch retries it.  Acking here would let
+                # the holder drop the only copy of a message this
+                # node never recorded.
+                log.warning(
+                    "Delivery of held mail %s deferred: %s", message_id, exc
+                )
+                continue
+            if delivered:
                 received += 1
+            # Delivered, blocked, already seen, or expired: the
+            # delivery resolved, so the holder can drop its copy.
+            new_acks.append(message_id)
         if new_acks:
             self.mailbox.add_pending_acks(peer.hexhash, new_acks)
         return received
@@ -3130,14 +3960,15 @@ class TauNode:
                 )
                 payload = None
                 kind = None
-            still_held = self.mailbox.drop_held(
-                envelope.id, to=self.destination.hash
-            )
-            if not still_held:
-                # Dropped by the owner (tau outbox drop-held) after this
-                # sweep listed it: do not surface a copy we no longer hold.
-                continue
             if kind == "sealed_receipt" and payload is not None:
+                still_held = self.mailbox.drop_held(
+                    envelope.id, to=self.destination.hash
+                )
+                if not still_held:
+                    # Dropped by the owner (tau outbox drop-held) after
+                    # this sweep listed it: do not record a receipt
+                    # for a copy we no longer hold.
+                    continue
                 self._record_receipt(
                     reader_hash=payload["from"],
                     message_ids=payload["ids"],
@@ -3145,13 +3976,66 @@ class TauNode:
                 )
                 continue
             if kind != "sealed_message" or payload is None:
+                # Unreadable: drop the garbage copy.
+                self.mailbox.drop_held(
+                    envelope.id, to=self.destination.hash
+                )
                 continue
-            if self._deliver_collected(payload):
+            # A sealed message is dropped only once its delivery has
+            # resolved (delivered, blocked, seen, or expired).  A
+            # delivery that fails transiently keeps the copy held
+            # for a later sweep: dropping it first would lose the
+            # only copy of a message this node never recorded.
+            # This check is a fast path only: it reads the serving
+            # process's cached held pool, so a drop by another
+            # process after the sweep listed the envelope still
+            # passes it — the delivery rechecks ownership inside
+            # its mailbox transaction (see _deliver_collected)
+            # before anything is stored or published.
+            if not self.mailbox.is_held(
+                envelope.id, to=self.destination.hash
+            ):
+                # Dropped by the owner (tau outbox drop-held) after this
+                # sweep listed it: do not surface a copy we no longer hold.
+                continue
+            try:
+                delivered = self._deliver_collected(
+                    payload,
+                    held_id=envelope.id,
+                    held_to=self.destination.hash,
+                )
+            except DeliveryDeferredError as exc:
+                log.warning(
+                    "Delivery of local held mail %s deferred: %s",
+                    envelope.id,
+                    exc,
+                )
+                continue
+            if delivered:
                 received += 1
+            self.mailbox.drop_held(envelope.id, to=self.destination.hash)
         return received
 
-    def _deliver_collected(self, message: Dict[str, Any]) -> bool:
-        """Hand a decrypted relayed message to the user, at most once."""
+    def _deliver_collected(
+        self,
+        message: Dict[str, Any],
+        *,
+        held_id: Optional[str] = None,
+        held_to: Optional[bytes] = None,
+    ) -> bool:
+        """Hand a decrypted relayed message to the user, at most once.
+
+        ``held_id`` names the local held envelope this copy came
+        from (the local-held sweep passes it; the fetch path does
+        not).  When given, ownership is rechecked inside the mailbox
+        transaction that guards the store: the sweep's pre-delivery
+        ``is_held`` reads the serving process's cached held pool, so
+        a drop by another process (``tau outbox drop-held``) after
+        the sweep listed the envelope is invisible to it — but the
+        transaction reloads the mailbox from disk, so the recheck
+        sees the drop and the delivery is deferred before anything
+        is stored or published.
+        """
         sender = message.get("from")
         if self.blocklist.is_blocked(
             sender if isinstance(sender, str) else None
@@ -3192,6 +4076,7 @@ class TauNode:
                 sender if isinstance(sender, str) else "",
                 group,
                 sent_at=message.get("sent_at"),
+                topic_sent_at=group.get("topic_sent_at"),
             )
             if pinned is None:
                 log.info(
@@ -3228,34 +4113,101 @@ class TauNode:
         # transaction, so a live backup never restores a seen marker
         # with no inbox entry (see _handle_message).  Re-check inside
         # the transaction, as there: a duplicate that landed while
-        # this one was in flight already marked the id seen.  The
-        # retraction check runs inside the same transaction, so a
-        # concurrent retract cannot land between the marker check and
-        # the append — the marker outlives the seen cache, so a relayed
-        # copy arriving after the id was evicted still loses to it.
-        # Group messages are not retractable in v1, so they never
-        # match a marker.
+        # this one was in flight already marked the id seen.
+        # For a group message the authorization cleanup and the
+        # record land together in one inbox transaction (see
+        # Inbox.append_group_message), exactly as a direct group
+        # message does: a non-member's reaction stored between a
+        # separate purge and append used to skip every roster check
+        # and become readable once the message landed.  If that
+        # combined step fails, the delivery is deferred, not
+        # refused: DeliveryDeferredError propagates to the callers,
+        # which keep the held copy and leave the envelope
+        # unacknowledged, so a later sweep retries it.  A failed
+        # reconcile never breaks delivery — it only leaves
+        # legitimate reactions stranded.  If a fan-out fails, the
+        # message still records (the inbox is clean) but the live
+        # event is withheld.  The retraction check runs inside the
+        # same transaction, so a concurrent retract cannot land
+        # between the marker check and the append — the marker
+        # outlives the seen cache, so a relayed copy arriving after
+        # the id was evicted still loses to it.  Group messages are
+        # not retractable in v1, so they never match a marker.
+        publish_ok = True
         recorded = False
-        with self.mailbox.transaction():
-            if self.mailbox.is_seen(message["id"]):
-                pass
-            elif message.get("group") is None and self.mailbox.is_retracted(
-                sender if isinstance(sender, str) else "", message["id"]
-            ):
-                # A retract the sender issued after this copy was sealed
-                # still wins: the marker outlives the seen cache, so a
-                # relayed copy is dropped, never stored.  Group messages
-                # are not retractable in v1, so they never match a marker.
-                log.info("Dropping retracted relayed message %s", message["id"])
-            else:
-                self.mailbox.mark_seen(message["id"])
-                self._record_received(record)
-                recorded = True
-        if recorded and self.on_message is not None:
+        if pinned is not None:
             try:
-                self.on_message(record)
-            except Exception:  # pragma: no cover - user callback
-                log.warning("on_message callback failed", exc_info=True)
+                with self.mailbox.transaction():
+                    if held_id is not None and not self.mailbox.is_held(
+                        held_id, to=held_to
+                    ):
+                        # Dropped by the owner (tau outbox drop-held)
+                        # after this sweep listed it.  The transaction
+                        # reloaded the mailbox, so this reads the
+                        # current on-disk state, not the serving
+                        # process's cache — defer before anything is
+                        # stored or published.
+                        raise DeliveryDeferredError(
+                            f"held envelope {held_id} no longer held"
+                        )
+                    if self.mailbox.is_seen(message["id"]):
+                        return False
+                    voided = self.inbox.append_group_message(
+                        record,
+                        group=pinned["id"],
+                        author=message.get("from"),
+                        sent_at=message.get("sent_at"),
+                        members=set(pinned.get("members") or []),
+                    )
+                    self.mailbox.mark_seen(message["id"])
+            except OSError as exc:
+                raise DeliveryDeferredError(
+                    "could not authorize group reactions for "
+                    f"{message['id']}"
+                ) from exc
+            except ValueError:
+                # The sealed payload carries no recordable text (the
+                # direct path normalizes this at parse time; a sealed
+                # envelope does not): nothing can be stored, so this
+                # is a final refusal and the copy can go.
+                log.warning(
+                    "Dropping unrecordable relayed group message %s",
+                    message["id"],
+                )
+                return False
+            for tombstone in voided:
+                if not self._publish_reaction(tombstone):
+                    publish_ok = False
+            recorded = True
+        else:
+            with self.mailbox.transaction():
+                if held_id is not None and not self.mailbox.is_held(
+                    held_id, to=held_to
+                ):
+                    # Dropped by the owner (tau outbox drop-held)
+                    # after this sweep listed it.  The transaction
+                    # reloaded the mailbox, so this reads the current
+                    # on-disk state, not the serving process's cache
+                    # — defer before anything is stored or published.
+                    raise DeliveryDeferredError(
+                        f"held envelope {held_id} no longer held"
+                    )
+                if self.mailbox.is_seen(message["id"]):
+                    pass
+                elif message.get("group") is None and self.mailbox.is_retracted(
+                    sender if isinstance(sender, str) else "", message["id"]
+                ):
+                    # A retract the sender issued after this copy was sealed
+                    # still wins: the marker outlives the seen cache, so a
+                    # relayed copy is dropped, never stored.  Group messages
+                    # are not retractable in v1, so they never match a marker.
+                    log.info("Dropping retracted relayed message %s", message["id"])
+                else:
+                    self.mailbox.mark_seen(message["id"])
+                    self._record_received(record)
+                    recorded = True
+        if recorded:
+            self._notify_message(record, publish_ok=publish_ok)
         return recorded
 
     # -- application layer -------------------------------------------------
@@ -3848,6 +4800,11 @@ class TauNode:
         sent_leg_ids: List[str] = []
         results: List[Dict[str, Any]] = []
         any_queued = False
+        # One send time for every leg: the wire id still differs per
+        # leg, but the legs share the send time, so a reaction can name
+        # the logical message by (group, author, sent_at) and every
+        # member can resolve its own copy (see _handle_reaction).
+        sent_at = time.time()
         # Check the full group request size once, before any leg is sent
         # or queued, so an oversized message fails cleanly up front rather
         # than aborting the fan-out partway through.
@@ -3855,10 +4812,14 @@ class TauNode:
             encode_group_message(
                 normalized,
                 message_id=generate_message_id(),
+                sent_at=sent_at,
                 group_id=group["id"],
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                group_topic=group.get("topic", ""),
+                group_topic_sent_at=group.get("topic_sent_at"),
+                renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
             )
@@ -3872,10 +4833,14 @@ class TauNode:
             payload = encode_group_message(
                 normalized,
                 message_id=message_id,
+                sent_at=sent_at,
                 group_id=group["id"],
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                group_topic=group.get("topic", ""),
+                group_topic_sent_at=group.get("topic_sent_at"),
+                renamed_from=group.get("renamed_from") or None,
                 in_reply_to=reply_to,
                 expires_at=expires_at,
             )
@@ -3936,6 +4901,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -3953,7 +4919,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -4079,6 +5045,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -4107,7 +5074,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -4164,6 +5131,12 @@ class TauNode:
             "v": PROTOCOL_VERSION,
             "group": group["id"],
             "name": group["name"],
+            # The one send time every leg shares: the console stores
+            # it on each outbound history entry, so reacting to a leg
+            # from the console names the logical message (see
+            # WebBridge.react) instead of a post-delivery timestamp no
+            # member's copy carries.
+            "sent_at": sent_at,
             "results": results,
         }
 
@@ -4442,16 +5415,9 @@ class TauNode:
         target_id = message_id.strip() if isinstance(message_id, str) else ""
         if not target_id or len(target_id) > 64:
             raise NodeError("reaction target must be a message id of 1-64 characters")
-        if self.identity is None:
-            raise NodeError("node has not been started")
-        reaction_id = generate_message_id()
-        payload = reaction_dict(target_id, token, message_id=reaction_id)
-        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        signature = self.identity.sign(canonical)
-        if signature is None:  # pragma: no cover - identity without private keys
-            raise NodeError("could not sign reaction")
-        payload["sig"] = base64.b64encode(signature).decode("ascii")
-        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        payload_bytes, reaction_id, sent_at = self._signed_reaction_payload(
+            target_id, token
+        )
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
@@ -4461,19 +5427,234 @@ class TauNode:
         response = self._request(peer, REQUEST_REACT, payload_bytes, timeout)
         # Record the outgoing reaction locally, so the reactor sees it
         # under the message in their own inbox and console.
-        record = {
+        self._record_reaction(
+            self._outgoing_reaction_record(
+                target_id, token, reaction_id, sent_at
+            )
+        )
+        return dict(response, id=reaction_id)
+
+    def _signed_reaction_payload(
+        self,
+        target_id: str,
+        token: str,
+        *,
+        group: Optional[str] = None,
+        target_author: Optional[str] = None,
+        target_sent_at: Optional[float] = None,
+    ) -> Tuple[bytes, str, float]:
+        """Build and sign one reaction payload.
+
+        Returns ``(payload_bytes, reaction_id, sent_at)``.  The
+        reaction id is part of the signed payload, so a fan-out that
+        reuses these bytes sends every member the same reaction — one
+        id, one signature — instead of a fresh reaction per leg.  The
+        signed ``sent_at`` is returned too, so the local record uses
+        the time the payload was signed, not the moment the legs
+        finished: a reaction signed before a clear but recorded after
+        it would otherwise carry the later time and its local copy
+        would replace the clear, while receivers — who order by the
+        signed time — keep it.
+
+        ``group`` / ``target_author`` / ``target_sent_at`` name the
+        group message being reacted to, when the target is one: group
+        sends carry a different wire id per leg, so the target id
+        alone only matches the reactor's copy and the author's sent
+        record, and a receiver needs the context to find its own copy.
+        """
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        reaction_id = generate_message_id()
+        sent_at = time.time()
+        payload = reaction_dict(
+            target_id,
+            token,
+            message_id=reaction_id,
+            sent_at=sent_at,
+            group=group,
+            target_author=target_author,
+            target_sent_at=target_sent_at,
+        )
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign reaction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        return encode(payload, max_bytes=MAX_REQUEST_BYTES), reaction_id, sent_at
+
+    def _outgoing_reaction_record(
+        self, target_id: str, token: str, reaction_id: str, sent_at: float
+    ) -> Dict[str, Any]:
+        """The local inbox record for a reaction this node sent.
+
+        ``sent_at`` is the signed send time from the payload builder,
+        so the local copy orders the same way receivers order it (see
+        :meth:`_signed_reaction_payload`); ``received_at`` is when the
+        legs finished.
+        """
+        return {
             "target": target_id,
             "reaction": token,
             "from": self.name,
             "destination": self.destination_hexhash
             if self.destination is not None
             else "",
-            "sent_at": time.time(),
+            "sent_at": sent_at,
             "received_at": time.time(),
             "id": reaction_id,
         }
-        self._record_reaction(record)
-        return dict(response, id=reaction_id)
+
+    def send_group_reaction(
+        self,
+        group: Union[str, Dict[str, Any]],
+        message_id: str,
+        reaction: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        target_author: Optional[str] = None,
+        target_sent_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a reaction to a group message out to every member.
+
+        *group* is a group id, id prefix, name, or group record.
+        The reaction is built and signed once — one reaction id —
+        and the same bytes go to every member except this node, one
+        leg per member with the same per-leg timeout a group send
+        uses, so one slow member cannot starve the rest.  The local
+        copy is recorded once, when at least one leg delivered.
+
+        Group sends carry a different wire id per leg, so the target
+        id alone would only match the reactor's copy and the author's
+        sent record.  The signed payload therefore also carries the
+        message's group, author and send time (``target_author`` /
+        ``target_sent_at``: the author and ``sent_at`` of the copy
+        being reacted to), and a receiver that does not hold the
+        target id resolves its own copy from that context instead —
+        see :meth:`_handle_reaction`.  Copies that arrived through an
+        outbox retry carry the shared send time and resolve the same
+        way; only a copy queued before the shared time was recorded
+        falls back to its enqueue time, and then its reaction is
+        still stored, and shows for the author, exactly as a DM
+        reaction to an unknown target would.
+
+        A failed leg reports an ``error`` instead of queueing: like
+        DM reactions, group reactions are live-only in v1.  Returns
+        a per-member result list; ``ok`` is true only when every
+        member received the reaction.
+        """
+        token = clean_reaction(reaction)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("reaction target must be a message id of 1-64 characters")
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if not members:
+            # A usage error, not a delivery failure: the console maps
+            # it to a 400 and the CLI prints it plain, instead of a
+            # 502 / a misleading "peer offline" suffix.
+            raise ValueError("group has no other members to react to")
+        payload_bytes, reaction_id, sent_at = self._signed_reaction_payload(
+            target_id,
+            token,
+            group=group["id"],
+            target_author=target_author,
+            target_sent_at=target_sent_at,
+        )
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            # One deadline bounds each leg, exactly as in
+            # send_group_message: the stages of a single delivery
+            # share the leg's budget, but one member's leg must not
+            # consume another's.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group reaction time limit reached",
+                        "id": reaction_id,
+                    }
+                )
+                continue
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                response = self._request(
+                    peer,
+                    REQUEST_REACT,
+                    payload_bytes,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "id": reaction_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; a
+                # reaction has no outbox to queue into, so the leg
+                # is simply reported as failed.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "id": reaction_id,
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "id": reaction_id,
+                    }
+                )
+        if any(result.get("delivered") for result in results):
+            # Record the outgoing reaction once, so the reactor sees
+            # it under the message in their own inbox and console —
+            # the same id every member recorded.
+            self._record_reaction(
+                self._outgoing_reaction_record(
+                    target_id, token, reaction_id, sent_at
+                )
+            )
+        all_ok = all(result.get("delivered") for result in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "target": target_id,
+            "reaction": token,
+            "cleared": not token,
+            "id": reaction_id,
+            "results": results,
+        }
 
     def send_retraction(
         self,
@@ -4520,6 +5701,82 @@ class TauNode:
         )
         response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
         return dict(response, id=retract_id)
+
+
+    def send_edit(
+        self,
+        target: Union[str, bytes, Peer],
+        message_id: str,
+        text: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Send an edit for a DM this node sent and return the decoded response.
+
+        ``message_id`` names the edited message, ``text`` is the
+        replacement body.  Edits are their own signed message kind:
+        the payload is signed with this node's Reticulum identity and
+        verified by the receiver against the link identity, exactly like
+        a reaction — and the receiver applies it only when the editor is
+        the message's original sender.
+
+        Edits are delivered live in v1: unlike ``send_message`` there is
+        no outbox queue, because the sealed-mail path is text-shaped
+        throughout.  An unreachable peer raises :class:`NodeError`;
+        queueing edits for offline peers is a follow-up once the
+        mailbox can carry non-text kinds.
+        """
+        cleaned = normalize_message(text)
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("edit target must be a message id of 1-64 characters")
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        edit_id = generate_message_id()
+        payload = edit_dict(target_id, cleaned, message_id=edit_id)
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign edit")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        peer = self.resolve_peer(
+            target,
+            timeout=discover_timeout
+            if discover_timeout is not None
+            else min(timeout, 10.0),
+        )
+        response = self._request(peer, REQUEST_DM_EDIT, payload_bytes, timeout)
+        if response.get("edited") is False:
+            # The receiver answered ok without applying the edit — an
+            # unknown id, or a stale edit that lost to a newer one — so
+            # the local copy must not change either.
+            return dict(response, id=edit_id)
+        # Update the local sent copy, so the editor sees the new text
+        # under the message in their own inbox and console.  A missing
+        # local copy (pruned since the send) is not a delivery failure.
+        # The guard keeps an overlapping older edit from rewinding a
+        # newer one that already landed locally.
+        try:
+            self.inbox.apply_edit(
+                target_id,
+                cleaned,
+                edited_at=float(payload["sent_at"]),
+                newer_than_existing=True,
+            )
+        except InboxError as exc:
+            log.warning("Could not record sent edit: %s", exc)
+        # ``tau messages --sent`` reads the mailbox, not the inbox: the
+        # sent record needs the new text too, or the editor's own history
+        # keeps showing the original.
+        try:
+            self.mailbox.update_sent_text(
+                target_id, cleaned, edited_at=float(payload["sent_at"])
+            )
+        except MailboxError as exc:
+            log.warning("Could not update sent edit: %s", exc)
+        return dict(response, id=edit_id)
 
     def _target_hash(self, target: Union[str, bytes, Peer]) -> Optional[bytes]:
         """Best-effort destination hash for a target that failed to resolve."""

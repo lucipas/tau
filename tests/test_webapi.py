@@ -178,6 +178,7 @@ class FakeNode:
         )
         self.sent = []
         self.group_sent = []
+        self.group_reactions = []
         self.group_refusals = set()
         self.groups = GroupStore(groups_path)
         self.groups.create(
@@ -362,9 +363,72 @@ class FakeNode:
             "v": 1,
             "group": group["id"],
             "name": group["name"],
+            # One send time shared by every leg, like the real node.
+            "sent_at": 1000.0,
             "results": results,
         }
 
+    def send_group_reaction(
+        self,
+        group,
+        message_id,
+        reaction,
+        *,
+        timeout=20.0,
+        discover_timeout=None,
+        target_author=None,
+        target_sent_at=None,
+    ):
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        self.group_reactions.append(
+            (group["name"], message_id, reaction, target_author, target_sent_at)
+        )
+        names = {PEER_HASH: "alice", BOB_HASH: "bob"}
+        results = []
+        for member in group["members"]:
+            if member in self.group_refusals:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "ok": False,
+                        "error": "not_allowed",
+                        "id": "react-1",
+                    }
+                )
+            elif member == BOB_HASH:
+                # Offline member: reactions have no outbox in v1.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "bob",
+                        "ok": False,
+                        "error": "no route to peer",
+                        "id": "react-1",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": names.get(member, ""),
+                        "delivered": True,
+                        "id": "react-1",
+                        "rtt": 0.009,
+                    }
+                )
+        return {
+            "ok": all(result.get("delivered") for result in results),
+            "v": 1,
+            "group": group["id"],
+            "name": group["name"],
+            "target": message_id,
+            "reaction": reaction,
+            "cleared": not reaction,
+            "id": "react-1",
+            "results": results,
+        }
 
     def send_file(
         self,
@@ -824,6 +888,9 @@ def test_send_group_message_records_one_entry_per_leg(bridge, node):
     assert messages[0]["rtt_ms"] == 9.0
     assert messages[0]["wire_id"] == f"wire-{PEER_HASH[:8]}"
     assert messages[1]["mail_id"] == "mail-bob-1"
+    # Both legs carry the one shared wire send time, not a
+    # post-delivery timestamp per leg.
+    assert [m["sent_at"] for m in messages] == [1000.0, 1000.0]
     # The queued leg is named by its outbox id, the same convention
     # as a queued peer DM: a receipt names the wire id, which for
     # queued mail is the outbox id.
@@ -1250,6 +1317,7 @@ def test_api_groups_lists_known_groups(bridge, node, tmp_path):
     assert payload["count"] == 1
     group = payload["groups"][0]
     assert group["name"] == "weekend"
+    assert group["topic"] == ""
     assert [member["hash"] for member in group["members"]] == [
         PEER_HASH,
         OTHER_HASH,
@@ -6683,6 +6751,333 @@ def test_messages_reconciles_cli_made_reactions(node, tmp_path):
         bridge.stop()
 
 
+def test_group_message_hides_non_member_reaction(node, tmp_path):
+    """A stored reaction from a non-member never displays on a group
+    message, even when the authorization recheck or its cleanup failed
+    and left it in the inbox (CodeRabbit round-11 follow-up).
+
+    The copy is appended directly and the reaction stored directly —
+    the way a copy imported by another process lands, with no
+    arrival purge running in this process — so the console read is
+    the only thing standing between the stored reaction and the
+    display.  A member's reaction on the same message still shows.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        node.inbox.append(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-g1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": OTHER_HASH,
+                "from": "mallory",
+                "reaction": "👎",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-g1",
+            }
+        )
+        messages = bridge.messages()
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_imported_group_message_event_hides_non_member_reaction(node, tmp_path):
+    """A live import event never carries a non-member's reaction
+    (CodeRabbit round-12 follow-up).
+
+    Ordering: a no-context reaction arrives before its target, so
+    both lookups miss and the console caches it; the group message
+    is then imported, which seeds the entry from that cache and
+    publishes it live.  The roster is pinned throughout, so the
+    import event must drop the non-member reaction while keeping a
+    member's.  The snapshot read hides it too.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        # The reaction arrives before its target: no history entry
+        # matches, so nothing is published, but the console caches it.
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": OTHER_HASH,
+                    "from": "mallory",
+                    "reaction": "👎",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-1",
+                }
+            )
+            is None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-2",
+                }
+            )
+            is None
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": OTHER_HASH,
+                "from": "mallory",
+                "reaction": "👎",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        bridge._mirror_imported_messages(
+            [
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            ]
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-g1"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
+
+def test_imported_group_message_hides_all_reactions_without_pinned_roster(
+    node, tmp_path
+):
+    """A copy imported without a pinned roster shows no reactions at
+    all — not even a member's — until a roster pins (CodeRabbit
+    round-13 follow-up).
+
+    The group id was never created, so pinned_rosters returns None
+    for it; visible_reactions(None) is fail-closed, so the live import
+    event and the snapshot read both hide every stored reaction.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        unpinned = "ff" * 16
+        # A member's reaction arrives before its target and is cached.
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g2",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-3",
+                }
+            )
+            is None
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g2",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-3",
+            }
+        )
+        bridge._mirror_imported_messages(
+            [
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "orphan crew hello",
+                    "kind": "group",
+                    "group": unpinned,
+                    "group_name": "orphan",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g2",
+                }
+            ]
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-g2"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == []
+        assert bridge.messages()[0]["reactions"] == []
+    finally:
+        bridge.stop()
+
+def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
+    """A delayed live reaction never reaches the console unfiltered
+    (CodeRabbit round-13 follow-up on the import-event fix).
+
+    Ordering: the group message is already in the console history
+    when a non-member's no-context reaction reaches the callback —
+    it passed the handler's final lookup before the copy arrived,
+    so the callback is the first roster check it meets.  The
+    message_updated event must drop the non-member reaction while
+    keeping a member's, and the stored entry must not keep it either.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        group = node.groups.find("crew")
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            )
+            is not None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": OTHER_HASH,
+                    "from": "mallory",
+                    "reaction": "👎",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-1",
+                }
+            )
+            is not None
+        )
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g1",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-2",
+                }
+            )
+            is not None
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_updated"
+            and event.get("message", {}).get("wire_id") == "wire-g1"
+        ]
+        assert len(events) == 2
+        assert events[0]["message"]["reactions"] == []
+        assert events[1]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {
@@ -6737,6 +7132,199 @@ def test_react_endpoint_rejects_unknown_target_and_bad_token(bridge):
     )
     assert status == 400
     assert "unknown message" in payload["error"]["message"]
+
+
+def test_react_endpoint_fans_out_to_group_members(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["target"] == "wire-g"
+    assert payload["group"] == group_id
+    assert payload["cleared"] is False
+    # The author and send time of the reacted-to copy travel with the
+    # fan-out, so each member can resolve its own copy.
+    assert node.group_reactions == [
+        ("crew", "wire-g", "👍", PEER_HASH, 100.0)
+    ]
+    # The offline member's leg fails instead of queueing: reactions
+    # are live-only in v1, and the member results come back.
+    assert payload["ok"] is False
+    assert [bool(r.get("delivered")) for r in payload["results"]] == [True, False]
+    assert payload["results"][1]["error"] == "no route to peer"
+
+
+def test_react_endpoint_refuses_retired_group_id_matching_a_name(bridge, node):
+    # CodeRabbit Major (webapi.py:2885, CWE-706): GroupStore.find
+    # falls back to a name match when the id lookup misses, so a
+    # retired group id that is also some other group's name resolved
+    # to that group and the reaction fanned out to its members.  The
+    # stored id is resolved exactly now — a retired id fails instead
+    # of falling back to the name.
+    retired = node.groups.create(
+        "crew", [OTHER_HASH, BOB_HASH], created_by=OTHER_HASH
+    )
+    # A second group whose NAME is the retired id: find() would
+    # resolve the retired id to this group through the name fallback.
+    namesake = node.groups.create(
+        retired["id"], [PEER_HASH, BOB_HASH], created_by=PEER_HASH
+    )
+    bridge.record_inbound(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "old crew hi",
+            "kind": "group",
+            "group": retired["id"],
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-old",
+        }
+    )
+    assert node.groups.delete(retired["id"]) is True
+    # The name fallback still resolves the retired id to the namesake.
+    assert node.groups.find(retired["id"])["id"] == namesake["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-old", "reaction": "👍"},
+    )
+    assert status == 404
+    assert "unknown group" in payload["error"]["message"]
+    assert node.group_reactions == []
+
+
+def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
+    # The message is past the console's window, so the bridge resolves
+    # it from the node inbox instead of its history.
+    group_id = node.groups.list_groups()[0]["id"]
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "🎉"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [("crew", "wire-g", "🎉", PEER_HASH, 100.0)]
+
+
+
+def test_react_endpoint_uses_own_hash_for_outbound_group_record_in_inbox(bridge, node):
+    # The message is past the console's window, so the bridge resolves
+    # it from the node inbox.  An outbound record's destination is
+    # empty — the author is this node, not "" — so the fan-out names
+    # this node's hash (CodeRabbit round-13 follow-up).
+    group_id = node.groups.list_groups()[0]["id"]
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": "",
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "direction": "out",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "🎉"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [
+        ("crew", "wire-g", "🎉", node.destination_hexhash, 100.0)
+    ]
+
+def test_react_endpoint_uses_own_hash_for_outbound_group_leg(bridge, node):
+    # Reacting to a leg this node sent: the history entry's peer is
+    # the recipient, not the author — the author is this node — and
+    # the send time is the shared wire time, so every member can
+    # resolve its own copy.
+    group_id = node.groups.list_groups()[0]["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi all"},
+    )
+    assert status == 200
+    wire_id = payload["messages"][0]["wire_id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": wire_id, "reaction": "👍"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [
+        ("crew", wire_id, "👍", node.destination_hexhash, 1000.0)
+    ]
+
+
+def test_react_endpoint_group_gone_is_a_404(bridge, node):
+    group_id = node.groups.list_groups()[0]["id"]
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    assert node.groups.delete(group_id) is True
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "👍"},
+    )
+    assert status == 404
+    assert "unknown group" in payload["error"]["message"]
 
 
 def test_react_accepts_oversized_timeout(bridge, node):

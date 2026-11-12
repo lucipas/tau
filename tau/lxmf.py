@@ -273,10 +273,21 @@ def _lxmf_destination(identity: RNS.Identity) -> Any:
     )
 
 
+#: LXMF message field carrying the tau message id of a DM sent over
+#: LXMF, so the receiver can match it against retraction markers and
+#: the direct-path copy (see :func:`build_lxmf_message`).
+LXMF_FIELD_TAU_MESSAGE_ID = "tau_message_id"
+
+#: Tau message ids are capped at 64 characters on the wire.
+MAX_TAU_MESSAGE_ID_LENGTH = 64
+
+
 def build_lxmf_message(
     source_identity: RNS.Identity,
     destination_public_key: bytes,
     text: str,
+    *,
+    tau_message_id: Optional[str] = None,
 ) -> Any:
     """Build an ``LXMessage`` carrying *text* to a peer's LXMF address.
 
@@ -286,11 +297,32 @@ def build_lxmf_message(
     peer exactly like an incoming delivery.  Raises
     :class:`LXMFError` when the ``lxmf`` package is not installed
     and :class:`ValueError` for a key that cannot be loaded.
+
+    With *tau_message_id* given, the id travels in the message's
+    fields (LXMF's metadata channel, not the text, so the displayed
+    message is unchanged) and the receiver stores the copy under
+    that id.  That makes an LXMF-delivered DM the same message as
+    its direct-path copy: a retraction marker keyed by the tau id
+    covers it, and a later direct copy dedupes against it.  Without
+    it — an LXMF message from a non-tau client, or an older tau
+    sender — the receiver falls back to the LXMF hash id.  The id
+    must be a non-empty string within the 64-character wire cap.
     """
+    if tau_message_id is not None and (
+        not isinstance(tau_message_id, str)
+        or not tau_message_id
+        or len(tau_message_id) > MAX_TAU_MESSAGE_ID_LENGTH
+    ):
+        raise ValueError("tau_message_id must be a non-empty string of at most 64 characters")
     lxmf_module = _import_lxmf()
     destination = _lxmf_destination(_identity_for_key(destination_public_key))
     source = _lxmf_destination(source_identity)
-    return lxmf_module.LXMessage(destination, source, content=text)
+    fields = (
+        {LXMF_FIELD_TAU_MESSAGE_ID: tau_message_id}
+        if tau_message_id is not None
+        else None
+    )
+    return lxmf_module.LXMessage(destination, source, content=text, fields=fields)
 
 
 def send_lxmf_message(router: Any, message: Any, *, timeout: float) -> bool:

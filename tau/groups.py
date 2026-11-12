@@ -35,6 +35,12 @@ The superseded predecessor is only deleted, not retired, because the
 old roster may still be live elsewhere and its messages should be able
 to pin it again.
 
+The creator can also set a short topic (:meth:`GroupStore.set_topic`,
+``tau group topic``): it is metadata, not part of the group id, so it
+survives a roster change into the successor, and it travels in group
+messages — a recipient pins it only from the creator, with the same
+``sent_at`` staleness rule as the roster, so a queued copy cannot
+overwrite a newer topic.
 A member can leave a group they did not create with
 :meth:`GroupStore.leave` (``tau group leave``): the record is deleted
 and the id is remembered as left, so a later group message for it
@@ -59,7 +65,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Union
 
 try:  # POSIX only; Windows locks through msvcrt instead (see below).
     import fcntl
@@ -73,8 +79,10 @@ except ImportError:  # pragma: no cover - POSIX
 
 from .protocol import (
     MAX_GROUP_MEMBERS,
+    MAX_GROUP_TOPIC_LENGTH,
     MIN_GROUP_MEMBERS,
     ProtocolError,
+    clean_group_topic,
     derive_group_id,
     sanitize_group_name,
 )
@@ -90,6 +98,14 @@ GROUPS_FILE_NAME = "groups.json"
 # when a cap is reached.
 MAX_GROUPS = 100
 MAX_LEARNED_GROUPS = 50
+# A rename lineage is capped, newest first: each predecessor id is 32
+# hex chars (~35 bytes on the wire), so an unbounded chain would
+# eventually push even a short group message past the 8 KiB request
+# budget and make the group unsendable.  32 ids (~1.1 KiB) leaves room
+# for a full 32-member roster and a 2000-character message; a member
+# that missed more renames than that still retires same-name
+# predecessors through the supersede path.
+MAX_RENAME_LINEAGE = 32
 # Retired group ids (rosters replaced by their creator) are kept so a
 # removed peer cannot restore one by replaying an old group message.
 # The list is capped like the groups themselves; the oldest retirement
@@ -174,10 +190,41 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
     if roster_sent_at is not None:
         try:
             roster_sent_at = float(roster_sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if not math.isfinite(roster_sent_at):
             return None
+    # The creator-set topic, and the sent_at of the creator message that
+    # last pinned it (None when never set or set locally before any
+    # message carried it).  Same staleness rule as the roster: only a
+    # creator message stamps it, so a queued copy sent before a newer
+    # topic cannot overwrite the newer one.
+    topic_sent_at = raw.get("topic_sent_at")
+    if topic_sent_at is not None:
+        try:
+            topic_sent_at = float(topic_sent_at)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(topic_sent_at):
+            return None
+    # Rename lineage: predecessor ids, newest first.  The lineage is
+    # not part of the id derivation, so a stored record with a malformed
+    # entry keeps only the usable ids instead of dropping the group.
+    renamed_from: List[str] = []
+    lineage = raw.get("renamed_from")
+    if isinstance(lineage, list):
+        seen_ids = set()
+        for entry in lineage:
+            if not isinstance(entry, str) or len(entry) != 32:
+                continue
+            try:
+                bytes.fromhex(entry)
+            except ValueError:
+                continue
+            entry = entry.lower()
+            if entry not in seen_ids:
+                seen_ids.add(entry)
+                renamed_from.append(entry)
     return {
         "id": group_id.lower(),
         "name": name,
@@ -187,6 +234,9 @@ def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
         "created_by": creator,
         "local": bool(raw.get("local", False)),
         "roster_sent_at": roster_sent_at,
+        "topic": clean_group_topic(raw.get("topic")),
+        "topic_sent_at": topic_sent_at,
+        "renamed_from": renamed_from,
     }
 
 
@@ -445,6 +495,11 @@ class GroupStore:
                     "creator": existing["creator"],
                     "created_by": existing["creator"],
                     "local": True,
+                    # A roster change is the same group continuing: the
+                    # topic carries into the successor.
+                    "topic": existing.get("topic", ""),
+                    "topic_sent_at": existing.get("topic_sent_at"),
+                    "renamed_from": existing.get("renamed_from") or [],
                 }
             )
             if candidate is None:
@@ -467,6 +522,136 @@ class GroupStore:
                 raise
         return dict(candidate)
 
+    def set_topic(
+        self, group_id: str, topic: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Set the topic of a group this node created (``""`` clears it).
+
+        Only the creator can set it, mirroring roster changes: a
+        member, or the creator of a learned group, is refused.  An
+        over-long topic is refused rather than silently truncated.
+        The local clock stamps the change, so the next message the
+        creator sends carries a newer ``sent_at`` and recipients accept
+        it over any older topic they hold.
+
+        Raises :class:`ValueError` when the group is unknown, was not
+        created by this node, or the topic is too long, and
+        :class:`OSError` when the write fails (the store is left as it
+        was on disk).
+        """
+        if not isinstance(topic, str):
+            raise ValueError("topic must be text")
+        if len(" ".join(topic.split())) > MAX_GROUP_TOPIC_LENGTH:
+            raise ValueError(
+                f"topic is longer than {MAX_GROUP_TOPIC_LENGTH} characters"
+            )
+        cleaned = clean_group_topic(topic)
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can change a group's topic")
+            if existing.get("topic", "") == cleaned:
+                return dict(existing)
+            snapshot = self._snapshot()
+            self._groups[existing["id"]] = {
+                **existing,
+                "topic": cleaned,
+                "topic_sent_at": time.time(),
+            }
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(self._groups[group_id.lower()])
+
+    def rename(
+        self, group_id: str, new_name: str, *, created_by: str
+    ) -> Dict[str, Any]:
+        """Rename a group this node created.
+
+        The group id derives from the name, so a renamed group is a new
+        group: the successor (same roster, new name, new id, same
+        ``created_at``) is created and the old record deleted inside
+        one transaction, so the local cap cannot block a net-zero
+        change and a failure cannot leave both groups or neither.  The
+        old id is retired (persisted): a replayed old message cannot
+        restore the pre-rename name, and the retirement is lifted if
+        the name is ever changed back to it.  The new name is
+        sanitized exactly as :func:`tau.protocol.sanitize_group_name`
+        sanitizes it at creation, so a blank name becomes ``"group"``.
+
+        Raises :class:`ValueError` when the group is unknown or was
+        not created by this node, and :class:`OSError` when the write
+        fails (the store is left as it was on disk).
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                raise ValueError(f"unknown group: {group_id!r}")
+            if not existing["local"] or existing["creator"] != created_by.lower():
+                raise ValueError("only the creator can rename a group")
+            name = sanitize_group_name(new_name)
+            try:
+                new_id = derive_group_id(
+                    existing["creator"], name, existing["members"]
+                )
+            except ProtocolError as exc:
+                raise ValueError(f"invalid group: {exc}") from exc
+            if new_id == existing["id"]:
+                return dict(existing)
+            if new_id in self._groups:  # pragma: no cover - hash collision
+                raise ValueError("group id already exists with another roster")
+            candidate = _valid_group(
+                {
+                    "id": new_id,
+                    "name": name,
+                    "members": existing["members"],
+                    "created_at": existing["created_at"],
+                    "creator": existing["creator"],
+                    "created_by": existing["creator"],
+                    "local": True,
+                    "roster_sent_at": existing.get("roster_sent_at"),
+                    # The successor remembers the newest predecessors,
+                    # newest first, so a member that missed an
+                    # intermediate rename still retires them, and group
+                    # history can span the renames.  The lineage never
+                    # names the successor itself: renaming back to an
+                    # earlier name drops that name from the chain.  It
+                    # is capped so repeated renames can never make the
+                    # group unsendable (see MAX_RENAME_LINEAGE).
+                    "renamed_from": (
+                        [existing["id"]]
+                        + [
+                            pred
+                            for pred in (existing.get("renamed_from") or [])
+                            if pred != new_id
+                        ]
+                    )[:MAX_RENAME_LINEAGE],
+                }
+            )
+            if candidate is None:
+                raise ValueError("invalid group: the creator must be a member")
+            snapshot = self._snapshot()
+            del self._groups[existing["id"]]
+            self._groups[new_id] = candidate
+            if existing["id"] not in self._retired:
+                self._retired.append(existing["id"])
+                if len(self._retired) > MAX_RETIRED_GROUPS:
+                    del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
+            if new_id in self._retired:
+                # The name is live again (renamed back to it), so the
+                # old id must not stay retired.
+                self._retired.remove(new_id)
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return dict(candidate)
+
     def record(
         self,
         group_id: str,
@@ -476,6 +661,9 @@ class GroupStore:
         creator: str,
         sender: str = "",
         sent_at: Optional[float] = None,
+        topic: Optional[str] = None,
+        topic_sent_at: Optional[float] = None,
+        renamed_from: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Pin a roster learned from an incoming group message.
 
@@ -505,6 +693,20 @@ class GroupStore:
         longest (a locally created group first), so sends by name keep
         working until the creator sends the successor themself.
 
+        ``renamed_from`` is the successor's rename lineage (predecessor
+        ids, newest first).  A creator-authorized message carrying it
+        retires those predecessors the same way: a learned predecessor
+        from the same creator is deleted and its id retired, so a
+        member that still holds the old name stops sending to an id
+        the creator retired, and a queued copy of an old message
+        cannot re-pin it.  A member-carried message never retires
+        anything — and its lineage is not stored at all: the lineage
+        is only a claim until the creator themself sends under the new
+        name, and storing it would let this node's later sends
+        retransmit it under the creator's authenticated identity
+        (``send_group_message`` and the sealed re-send both read the
+        stored lineage), retiring a group the creator never retired.
+
         ``sent_at`` is the message's send time on the creator's clock.
         A creator message sent before the successor was learned is
         stale — a queued copy that predates the roster change — and
@@ -514,14 +716,42 @@ class GroupStore:
         none, cannot prove staleness and is superseded as before, so
         an intentional creator restore (sent after the change, with a
         newer ``sent_at``) still replaces the successor.
+
+        ``topic`` is the topic the message carried, or ``None`` when
+        the sender predates topics.  It is pinned only from the
+        creator: a member's message carries whatever topic that member
+        knows, which must not let a member set the group's topic.  The
+        same staleness rule applies — a queued creator copy sent before
+        a newer topic was set must not overwrite it — with the stamp
+        left alone when the message carries no ``sent_at``.
+        ``topic_sent_at`` is the time the carried topic was set on the
+        sender's clock (``None`` falls back to ``sent_at``): a retried
+        message re-reads the current topic, whose set time can postdate
+        the queued message's send time, so the topic is judged by its
+        own timestamp, not the message's.
         """
         if sent_at is not None:
             try:
                 sent_at = float(sent_at)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 sent_at = None
             if sent_at is not None and not math.isfinite(sent_at):
                 sent_at = None
+        # Normalize the carried topic the same way the wire does: a
+        # non-text value is not a topic at all, and a present string
+        # (including "") is authoritative.
+        topic = clean_group_topic(topic) if isinstance(topic, str) else None
+        # A retried topic carries the time it was set, which can be later
+        # than the queued message's send time; the topic is judged by that.
+        if topic_sent_at is not None:
+            try:
+                topic_sent_at = float(topic_sent_at)
+            except (TypeError, ValueError, OverflowError):
+                topic_sent_at = None
+            if topic_sent_at is not None and not math.isfinite(topic_sent_at):
+                topic_sent_at = None
+        if topic_sent_at is None:
+            topic_sent_at = sent_at
         candidate = _valid_group(
             {
                 "id": group_id,
@@ -531,26 +761,70 @@ class GroupStore:
                 "creator": creator,
                 "created_by": creator,
                 "local": False,
+                "renamed_from": list(renamed_from or [])[:MAX_RENAME_LINEAGE],
             }
         )
         if candidate is None:
             return None
         creator_authorized = bool(sender) and sender.lower() == candidate["creator"]
+        if not creator_authorized:
+            # A member-carried lineage is only a claim: never store it.
+            # Otherwise a later send to this group would retransmit it
+            # under the creator's authenticated identity (the send and
+            # sealed re-send paths read the stored lineage), and other
+            # members would retire a group the creator never retired.
+            # The creator's own message adopts the authoritative
+            # lineage on the existing record below.
+            candidate["renamed_from"] = []
         if creator_authorized:
             # Only a creator message stamps the roster: the staleness
             # comparison is only meaningful between two timestamps from
             # the creator's own clock.
             candidate["roster_sent_at"] = sent_at
+            if topic is not None:
+                # A first sighting from the creator carries the topic;
+                # one from a member keeps "" — members cannot set it.
+                candidate["topic"] = topic
+                candidate["topic_sent_at"] = topic_sent_at
         with self._transaction():
             existing = self._groups.get(candidate["id"])
+            restored = False
             if existing is not None:
                 if existing["members"] != candidate["members"]:
                     return None
             elif candidate["id"] in self._retired or self.is_left(
                 candidate["id"]
             ):
-                return None
+                # A retired id stays refused — except a creator restore:
+                # the creator renamed back to this name, so their
+                # message carries the lineage naming the successor this
+                # node currently holds, sent after that successor was
+                # pinned.  A queued copy of an old message carries no
+                # lineage, and a stale successor copy predates the
+                # successor's pin, so neither can pass this gate.
+                # A group this node left stays refused: no restore path.
+                restored = (
+                    candidate["id"] in self._retired
+                    and not self.is_left(candidate["id"])
+                    and creator_authorized
+                    and sent_at is not None
+                    and any(
+                        (other := self._groups.get(pred_id)) is not None
+                        and not other["local"]
+                        and other["creator"] == candidate["creator"]
+                        and (
+                            other.get("roster_sent_at") is None
+                            or sent_at >= other["roster_sent_at"]
+                        )
+                        for pred_id in dict.fromkeys(
+                            candidate.get("renamed_from") or []
+                        )
+                    )
+                )
+                if not restored:
+                    return None
             superseded = []
+            predecessors = []
             if creator_authorized:
                 superseded = [
                     other
@@ -562,6 +836,23 @@ class GroupStore:
                         and other["id"] != candidate["id"]
                     )
                 ]
+                # A rename successor names its predecessors: learned
+                # predecessors from the same creator are retired, so
+                # the member stops sending to an id the creator no
+                # longer accepts.  A predecessor this node created
+                # itself is never touched — only the creator retires
+                # their own groups, and a local copy means this node
+                # is the creator.
+                for pred_id in dict.fromkeys(renamed_from or []):
+                    other = self._groups.get(pred_id)
+                    if (
+                        other is None
+                        or other["local"]
+                        or other["creator"] != candidate["creator"]
+                        or other["id"] == candidate["id"]
+                    ):
+                        continue
+                    predecessors.append(other)
                 if sent_at is not None:
                     # A queued creator message sent before the successor
                     # was learned must not replace it.  Supersede only
@@ -573,7 +864,7 @@ class GroupStore:
                     # known longest — the successor.
                     stale_for = [
                         other
-                        for other in superseded
+                        for other in superseded + predecessors
                         if other.get("roster_sent_at") is not None
                         and sent_at < other["roster_sent_at"]
                     ]
@@ -589,19 +880,86 @@ class GroupStore:
                             for other in superseded
                             if other not in stale_for
                         ]
+                        predecessors = [
+                            other
+                            for other in predecessors
+                            if other not in stale_for
+                        ]
+                if superseded:
+                    # The topic is judged independently of the roster:
+                    # a successor whose message omits the topic, or
+                    # carries an older one, must not wipe a newer topic
+                    # a predecessor already holds.  Take the newest
+                    # topic among the predecessors being replaced and
+                    # adopt it when the incoming one is older or absent
+                    # (an unstamped incoming topic cannot prove itself
+                    # newer; a tie keeps the incoming message, like the
+                    # same-id rule below).  The candidate is only stored
+                    # when it is a new id; when it re-pins an existing
+                    # one the branch below decides instead.
+                    best_topic = None
+                    best_at = float("-inf")
+                    for other in superseded:
+                        if other.get("topic") is None:
+                            continue
+                        other_at = other.get("topic_sent_at")
+                        other_key = (
+                            other_at
+                            if isinstance(other_at, (int, float))
+                            else float("-inf")
+                        )
+                        if best_topic is None or other_key > best_at:
+                            best_topic = other["topic"]
+                            best_at = other_key
+                    cand_at = (
+                        topic_sent_at
+                        if isinstance(topic_sent_at, (int, float))
+                        else float("-inf")
+                    )
+                    if best_topic is not None and (
+                        topic is None or cand_at < best_at
+                    ):
+                        candidate["topic"] = best_topic
+                        candidate["topic_sent_at"] = (
+                            None if best_at == float("-inf") else best_at
+                        )
+                        # The same reconciled topic governs the
+                        # existing branch below: a successor pinned
+                        # earlier by a member message carries no topic
+                        # of its own, so without this the branch would
+                        # keep the incoming older (or empty) topic
+                        # while the predecessor holding the newer one
+                        # is deleted.
+                        topic = best_topic
+                        topic_sent_at = (
+                            None if best_at == float("-inf") else best_at
+                        )
+            # A group named in both lists is replaced once: a
+            # predecessor that also shares the successor's name
+            # (a rename back) must not be deleted twice or counted
+            # twice against the learned cap.
+            replaced = {other["id"]: other for other in superseded}
+            for other in predecessors:
+                replaced.setdefault(other["id"], other)
             if existing is None:
                 learned = sum(1 for g in self._groups.values() if not g["local"])
-                if learned - len(superseded) >= MAX_LEARNED_GROUPS:
+                if learned - len(replaced) >= MAX_LEARNED_GROUPS:
                     log.info(
                         "Refusing to pin group %s: learned-group limit reached",
                         group_id,
                     )
                     return None
             snapshot = self._snapshot()
-            for other in superseded:
+            for other in replaced.values():
                 del self._groups[other["id"]]
+            for other in predecessors:
+                if other["id"] not in self._retired:
+                    self._retired.append(other["id"])
+                    if len(self._retired) > MAX_RETIRED_GROUPS:
+                        del self._retired[: len(self._retired) - MAX_RETIRED_GROUPS]
             if existing is not None:
                 refreshed = False
+                updates: Dict[str, Any] = {}
                 if (
                     creator_authorized
                     and sent_at is not None
@@ -615,12 +973,56 @@ class GroupStore:
                     # older roster cannot replace it — including one the
                     # node first learned from a member-carried message,
                     # which carries no creator timestamp of its own.
-                    self._groups[existing["id"]] = {
-                        **existing,
-                        "roster_sent_at": sent_at,
-                    }
+                    updates["roster_sent_at"] = sent_at
+                if creator_authorized and topic is not None:
+                    # Only the creator sets the topic, and a queued copy
+                    # sent before the topic now held must not overwrite
+                    # it.  A message with no sent_at cannot prove
+                    # staleness, so it pins the text but leaves the
+                    # stamp alone — clearing it would let an older
+                    # queued copy win afterwards.  An update that
+                    # changes neither the text nor the stamp writes
+                    # nothing, so an ordinary creator message does not
+                    # rewrite the groups file.
+                    existing_topic_at = existing.get("topic_sent_at")
+                    stale = (
+                        existing_topic_at is not None
+                        and topic_sent_at is not None
+                        and topic_sent_at < existing_topic_at
+                    )
+                    if not stale and (
+                        existing.get("topic", "") != topic
+                        or (
+                            topic_sent_at is not None
+                            and topic_sent_at != existing_topic_at
+                        )
+                    ):
+                        updates["topic"] = topic
+                        if topic_sent_at is not None:
+                            updates["topic_sent_at"] = topic_sent_at
+                if updates:
+                    self._groups[existing["id"]] = {**existing, **updates}
                     refreshed = True
-                if superseded or refreshed:
+                if creator_authorized and renamed_from:
+                    # A creator message carries the authoritative
+                    # lineage: a successor first pinned from a
+                    # member-carried message has none, so adopt it
+                    # here (a message without lineage never wipes
+                    # one already known).
+                    current = self._groups[existing["id"]]
+                    merged = list(
+                        dict.fromkeys(
+                            list(renamed_from)
+                            + list(current.get("renamed_from") or [])
+                        )
+                    )[:MAX_RENAME_LINEAGE]
+                    if merged != list(current.get("renamed_from") or []):
+                        self._groups[existing["id"]] = {
+                            **current,
+                            "renamed_from": merged,
+                        }
+                        refreshed = True
+                if replaced or refreshed:
                     try:
                         self._save()
                     except OSError as exc:
@@ -632,6 +1034,9 @@ class GroupStore:
                         return None
                 return dict(self._groups[existing["id"]])
             self._groups[candidate["id"]] = candidate
+            if restored and candidate["id"] in self._retired:
+                # A creator restore brings the id back to life.
+                self._retired.remove(candidate["id"])
             try:
                 self._save()
             except OSError as exc:
@@ -817,3 +1222,75 @@ class GroupStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._groups)
+
+
+def pinned_group(
+    groups: "GroupStore", group_id: str
+) -> Optional[Dict[str, Any]]:
+    """The pinned record for *group_id*, by exact id only.
+
+    ``GroupStore.find`` falls back to a name match when the id lookup
+    misses, so a retired id that is also another group's name would
+    resolve to that group.  Authorization and roster filtering must
+    never use the wrong group's roster, so a record whose id does not
+    match the requested id is treated as no roster at all.  Returns
+    ``None`` when nothing is pinned for that exact id.
+    """
+    try:
+        group = groups.find(group_id)
+    except ValueError:
+        return None
+    if not isinstance(group, dict):
+        return None
+    if str(group.get("id") or "").lower() != str(group_id).lower():
+        return None
+    return group
+
+
+def pinned_rosters(
+    groups: "GroupStore", group_ids: Iterable[str]
+) -> Dict[str, Optional[Set[str]]]:
+    """Pinned rosters for *group_ids*, resolved once each.
+
+    Each value is the group's pinned member set, or ``None`` when
+    nothing is pinned for that id — there is no roster to check
+    against, so readers pass reactions through unchanged.  ``find``
+    reloads from disk, so a group pinned by another process is
+    seen.  Resolving once per listing keeps a large history from
+    re-reading the store once per entry.
+    """
+    rosters: Dict[str, Optional[Set[str]]] = {}
+    for group_id in group_ids:
+        group = pinned_group(groups, group_id)
+        rosters[group_id] = (
+            set(group.get("members") or []) if group is not None else None
+        )
+    return rosters
+
+
+def visible_reactions(
+    reactions: List[Dict[str, Any]], members: Optional[Set[str]]
+) -> List[Dict[str, Any]]:
+    """The reactions on a group message that a reader may display.
+
+    A reaction stored before its target's copy arrived — or left
+    behind when an authorization recheck or its cleanup failed —
+    can sit in the inbox from a reactor who is not on the group's
+    pinned roster.  It must never be displayed on that message, so
+    readers filter stored reactions here instead of trusting them.
+    *members* is ``None`` when no roster is pinned: there is no
+    membership to verify, so nothing is displayed — a reaction on
+    a message whose group was deleted, or whose copy was imported
+    without its roster, stays hidden until a roster pins.  This is
+    the same fail-closed rule the handler applies on receipt.  A
+    reaction record carries its reactor under ``reactor`` (console
+    overlay) or ``destination`` (inbox).
+    """
+    if members is None:
+        return []
+    return [
+        reaction
+        for reaction in reactions
+        if str(reaction.get("reactor") or reaction.get("destination") or "")
+        in members
+    ]
