@@ -1454,6 +1454,208 @@ def test_group_reaction_rechecks_after_storing_unresolved(tmp_path, monkeypatch)
     assert stored[0]["reaction"] == "👍"
 
 
+def test_group_reaction_voided_when_message_imported_mid_handler(
+    tmp_path, monkeypatch
+):
+    # CodeRabbit follow-up (node.py:1850): the reload fixes the
+    # stale-cache case, but a copy can still be imported after
+    # resolve() misses it and before record_reaction() stores the
+    # reaction — the storage transaction reloads the message but
+    # does not recheck the roster.  The handler rechecks after
+    # storing and voids a non-member's reaction on the imported
+    # copy.  The import is forced inside record_reaction to make
+    # the race deterministic.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    real_record = node.inbox.record_reaction
+
+    def _import_then_record(record):
+        other = Inbox(node.inbox.path)
+        other.append(copy)
+        return real_record(record)
+
+    monkeypatch.setattr(node.inbox, "record_reaction", _import_then_record)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1", sent_at=200.0),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+    # A replay of the voided reaction cannot resurrect it: the
+    # tombstone is strictly newer than the original, so merging the
+    # original back is a no-op.  (Replaying through the handler
+    # would dedupe on the reaction id instead, so replay at the
+    # inbox level, with the monkeypatch removed.)
+    monkeypatch.undo()
+    node.inbox.record_reaction(
+        {
+            "target": "local-copy-1",
+            "reaction": "👍",
+            "from": "unknown",
+            "destination": destination_hash(reactor).hex(),
+            "sent_at": 200.0,
+            "received_at": 201.0,
+            "id": "react-1",
+        }
+    )
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_purged_when_message_arrives_after_it(tmp_path):
+    # CodeRabbit follow-up (node.py:1850): a reaction stored before
+    # its target arrives — no context, so no roster check could run
+    # — would surface under the exact id when the copy lands.  The
+    # message handler voids non-members' reactions on arrival.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("local-copy-1")) == 1
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_kept_when_member_reacts_before_arrival(tmp_path):
+    # The same early reaction, from a reactor the roster names, is
+    # kept when the message arrives.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = ["ab" * 16, author_hash, reactor_hash]
+    group = derive_group_id("ab" * 16, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="local-copy-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert delivered["ok"] is True
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+
+
+def test_group_reaction_reconciles_when_relayed_copy_arrives(tmp_path):
+    # Issue #293: a group message arriving via sealed relay mail
+    # reconciles stored context reactions onto the relayed copy,
+    # exactly as a direct group message does.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
 def test_reaction_denied_by_allow_list(tmp_path):
     from tau.allowlist import AllowList, save_allowlist
 

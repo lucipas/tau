@@ -988,6 +988,54 @@ class Inbox:
                     raise OSError(f"could not persist inbox to {self.path}")
         return retargeted
 
+    def purge_non_member_reactions(
+        self, message_id: str, *, members: Collection[str]
+    ) -> int:
+        """Void stored reactions on one group message from non-members.
+
+        A reaction can be stored before its target arrives — the target
+        was unknown then, so no roster check could run — and then
+        surface under the exact message id when the copy lands, without
+        any authorization ever running.  When a group message arrives,
+        void every stored reaction on it whose reactor is not on the
+        pinned roster, so only members' reactions display.
+
+        Voiding is a tombstone, not a deletion: its ``(sent_at, id)``
+        is strictly newer than the reaction it voids, so a replayed
+        copy of the voided reaction cannot resurrect it, while a later
+        reaction from the same reactor — for example after joining the
+        group — replaces the tombstone.  Returns how many reactions
+        were voided.  Raises :class:`OSError` when the voided state
+        cannot be persisted.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            return 0
+        allowed = set(members)
+        voided = 0
+        with self._transaction():
+            previous = list(self._reactions)
+            now = time.time()
+            for entry in list(self._reactions):
+                if (
+                    entry.get("target") == message_id
+                    and entry.get("reaction")
+                    and entry.get("destination") not in allowed
+                ):
+                    tombstone = dict(entry)
+                    tombstone["reaction"] = ""
+                    tombstone["sent_at"] = (
+                        max(float(entry.get("sent_at") or 0.0), now) + 1.0
+                    )
+                    tombstone["received_at"] = now
+                    if merge_reaction(self._reactions, tombstone):
+                        voided += 1
+            if voided:
+                self._reactions = self._reactions[-MAX_REACTIONS:]
+                if not self._save():
+                    self._reactions = previous
+                    raise OSError(f"could not persist inbox to {self.path}")
+        return voided
+
     def resolve(self, ref: str) -> Dict[str, Any]:
         """Resolve a full message id or a unique prefix to its record.
 

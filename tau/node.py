@@ -1650,6 +1650,23 @@ class TauNode:
                     log.warning(
                         "Could not reconcile group reactions", exc_info=True
                     )
+                # A reaction can also be stored before its target
+                # arrives with no group context at all — the target
+                # was unknown, so no roster check could run — and
+                # then surface under this exact id now that the copy
+                # is here.  Void any stored reaction on it from a
+                # reactor the roster does not name.  Same never-breaks
+                # guarantee as the reconcile above.
+                try:
+                    self.inbox.purge_non_member_reactions(
+                        message_id,
+                        members=set(group.get("members") or []),
+                    )
+                except Exception:  # pragma: no cover - storage failure
+                    log.warning(
+                        "Could not purge non-member group reactions",
+                        exc_info=True,
+                    )
             if self.on_message is not None:
                 try:
                     self.on_message(record)
@@ -1984,6 +2001,63 @@ class TauNode:
                                 reaction["target"][:8],
                                 exc_info=True,
                             )
+            if resolved is None:
+                # A second authorization look after storing: another
+                # process can import the target between resolve() and
+                # record_reaction(), and the storage transaction
+                # reloads the message but does not recheck the roster
+                # — so a reaction naming an imported copy with no
+                # group context would surface without any roster
+                # check ever running.  Reload and resolve the stored
+                # target again; if it is now a group message and the
+                # reactor is not on its roster, void the reaction
+                # just stored with a tombstone, so a replay cannot
+                # resurrect it.  A failed recheck never breaks the
+                # acknowledged delivery; the reaction stays stored
+                # (and, the copy being held now, visible) exactly as
+                # before.
+                try:
+                    self.inbox.reload()
+                except InboxError as exc:
+                    log.warning(
+                        "Could not reload inbox to recheck reaction for %s",
+                        reaction["target"][:8],
+                        exc_info=True,
+                    )
+                else:
+                    try:
+                        now_resolved = self.inbox.resolve(target_id)
+                    except ValueError:
+                        now_resolved = None
+                    if (
+                        now_resolved is not None
+                        and now_resolved.get("kind") == "group"
+                    ):
+                        try:
+                            pinned = self.groups.find(now_resolved["group"])
+                        except ValueError:
+                            pinned = None
+                        if pinned is not None and caller_hash not in (
+                            pinned.get("members") or []
+                        ):
+                            tombstone = {
+                                **record,
+                                "reaction": "",
+                                "sent_at": max(
+                                    float(record["sent_at"]), time.time()
+                                )
+                                + 1.0,
+                                "received_at": time.time(),
+                            }
+                            try:
+                                self.inbox.record_reaction(tombstone)
+                            except OSError:
+                                log.warning(
+                                    "Could not void unauthorized reaction "
+                                    "for %s",
+                                    reaction["target"][:8],
+                                    exc_info=True,
+                                )
             if seen_key:
                 self.mailbox.mark_seen(seen_key)
             log.info(
@@ -3224,6 +3298,28 @@ class TauNode:
                 self.mailbox.mark_seen(message["id"])
                 self._record_received(record)
                 recorded = True
+        if recorded and pinned is not None:
+            # A relayed copy is an arrival too: reconcile stored
+            # reactions onto it and void non-members' reactions on
+            # it, exactly as a direct group message does.  A storage
+            # failure here never un-delivers the message.
+            try:
+                self.inbox.reconcile_group_reactions(
+                    pinned["id"],
+                    message.get("from"),
+                    message.get("sent_at"),
+                    message["id"],
+                    members=set(pinned.get("members") or []),
+                )
+                self.inbox.purge_non_member_reactions(
+                    message["id"],
+                    members=set(pinned.get("members") or []),
+                )
+            except Exception:  # pragma: no cover - storage failure
+                log.warning(
+                    "Could not reconcile relayed group reactions",
+                    exc_info=True,
+                )
         if recorded and self.on_message is not None:
             try:
                 self.on_message(record)
