@@ -647,6 +647,49 @@ class Inbox:
                 ) from exc
         return dict(removed)
 
+    def delete_authorized(
+        self, message_id: str, *, direction: str, destination: str
+    ) -> Optional[Dict[str, Any]]:
+        """Delete the record with exactly this id, when it matches.
+
+        The exact-id match and the direction/destination checks run
+        inside the same cross-process transaction as the delete, so a
+        retraction authorized against one record can never delete a
+        different record: a concurrent retract of the same id either
+        wins this record first (then this call finds nothing) or loses
+        it, and no prefix fallback ever re-selects another entry —
+        unlike :meth:`delete`, which re-matches by prefix inside its
+        own transaction.  Returns the deleted record, or ``None`` when
+        no record has exactly this id.  Raises :class:`InboxError`
+        when the record exists but fails a supplied check, or when the
+        delete cannot be persisted.
+        """
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise InboxError("message reference must not be empty")
+        value = message_id.strip()
+        with self._transaction():
+            for entry in self._messages:
+                if str(entry.get("id") or "") != value:
+                    continue
+                if entry.get("direction") != direction:
+                    raise InboxError("message was not received from this sender")
+                if entry.get("destination") != destination:
+                    raise InboxError("message was not sent by this sender")
+                removed = entry
+                previous = self._messages
+                self._messages = [
+                    other for other in self._messages if other is not removed
+                ]
+                try:
+                    self._save(strict=True)
+                except OSError as exc:
+                    # Roll back so this instance matches what is still on disk.
+                    self._messages = previous
+                    raise InboxError(
+                        f"could not persist inbox; message was not deleted: {exc}"
+                    ) from exc
+                return dict(removed)
+            return None
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.

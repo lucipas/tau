@@ -3727,6 +3727,10 @@ def test_retract_sends_to_the_recipient_and_deletes_the_local_copy(
     tmp_path, capsys, monkeypatch
 ):
     data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
     monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
     _FakeRetractNode.instances.clear()
 
@@ -3741,6 +3745,9 @@ def test_retract_sends_to_the_recipient_and_deletes_the_local_copy(
     # The local sent copy is gone too.
     inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
     assert inbox.list_messages(direction="out") == []
+    # So is the sent record: `tau messages --sent` must not keep
+    # showing the retracted text.
+    assert Mailbox(config.mailbox_path).sent_list() == []
 
 
 def test_retract_reports_when_the_peer_had_no_copy(
@@ -3835,7 +3842,11 @@ def test_retract_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
 
 
 def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
-    data_dir, _ = _seed_sent_message(tmp_path)
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
 
     class _OfflineNode(_FakeRetractNode):
         def send_retraction(
@@ -3854,6 +3865,7 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     # The failed retract leaves the local sent copy in place.
     inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
     assert len(inbox.list_messages(direction="out")) == 1
+    assert len(Mailbox(config.mailbox_path).sent_list()) == 1
 
 
 class _FakeReactNode:

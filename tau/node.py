@@ -1938,11 +1938,28 @@ class TauNode:
                 "not_supported",
                 "group messages cannot be retracted in v1",
             )
+        # Authorize and delete as one exact-ID operation: the checks
+        # above pick the error code, but the delete itself re-verifies
+        # the exact id, direction, and sender inside the same inbox
+        # transaction, so two concurrent retracts of one short id can
+        # never reselect a different record by prefix.  Kind is
+        # immutable after append, so the kind checks above cannot go
+        # stale between here and the delete.
         try:
-            self.inbox.delete(str(stored["id"]))
+            removed = self.inbox.delete_authorized(
+                retract["target"], direction="in", destination=caller_hash
+            )
         except InboxError as exc:
             return response_error(
                 "storage_failed", f"could not retract message: {exc}"
+            )
+        if removed is None:
+            # A concurrent retract deleted it first: the message is
+            # already gone, so answer the same as "not found".
+            return response_ok(
+                target=retract["target"],
+                received_at=received_at,
+                deleted=False,
             )
         log.info(
             "Retraction from %s deleted %s",

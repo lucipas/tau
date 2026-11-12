@@ -1364,6 +1364,59 @@ def test_retract_rejects_an_outgoing_record(tmp_path):
     assert len(node.inbox.list_messages(direction="out")) == 1
 
 
+def test_concurrent_retracts_cannot_delete_a_different_record(tmp_path):
+    # Regression test for the CodeRabbit Major TOCTOU: two concurrent
+    # retracts of one short id must not let the loser reselect another
+    # record by prefix — the node's own outgoing copy shares the id
+    # prefix and must survive.
+    import threading
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "abc")
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "cd" * 16,
+            "text": "my sent copy",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "abcdef" + "1" * 26,
+            "direction": "out",
+        }
+    )
+
+    barrier = threading.Barrier(2)
+    responses = []
+
+    def _retract(suffix):
+        barrier.wait(timeout=10)
+        responses.append(
+            call_handler(
+                node._handle_retract,
+                signed_retract(sender, "abc", f"retract-{suffix}"),
+                remote_identity=sender,
+            )
+        )
+
+    threads = [
+        threading.Thread(target=_retract, args=(1,)),
+        threading.Thread(target=_retract, args=(2,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert [response["ok"] for response in responses] == [True, True]
+    assert sorted(response["deleted"] for response in responses) == [False, True]
+    # The short id is gone; the longer outgoing record sharing its
+    # prefix is untouched.
+    assert [entry["id"] for entry in node.inbox.list_messages(direction=None)] == [
+        "abcdef" + "1" * 26
+    ]
+
+
 def test_retract_refuses_file_records(tmp_path):
     # A received file lives on disk; deleting only the inbox record
     # would orphan it, so file records are not retractable.

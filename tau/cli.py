@@ -3699,7 +3699,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             send_server = SendServer(
                 config.data_dir,
-                lambda **request: _send_local_message(node, **request),
+                lambda **request: _dispatch_local_send(node, **request),
             )
         except Exception:
             # The send socket is best-effort: a data directory too long
@@ -4568,6 +4568,40 @@ def _send_local_message(
     return result
 
 
+def _retract_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Retract one DM on the running node, for the local send server."""
+    return node.send_retraction(
+        target,
+        message_id,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
+
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send or a retraction.
+
+    The socket carries both, distinguished by ``op``: ``"send"`` (the
+    default, so older one-shot clients keep working) runs
+    :func:`_send_local_message`, while ``"retract"`` runs the
+    retraction on the serving node, so ``tau retract`` works while
+    ``tau serve`` holds the data directory.
+    """
+    op = request.pop("op", "send")
+    if op == "retract":
+        return _retract_local_message(node, **request)
+    if op == "send":
+        return _send_local_message(node, **request)
+    raise NodeError(f"unknown local send operation: {op!r}")
+
+
 def _send_via_local_node(
     args: argparse.Namespace,
     config: TauConfig,
@@ -4683,6 +4717,33 @@ def _send_via_running_node(
             reply_ids[target] = reply_id
         results.append(result)
     return results
+
+
+def _retract_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Retract through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="retract",
+            target=recipient,
+            message_id=message_id,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
 
 
 #: How long a one-shot send waits for a serving node's socket to appear
@@ -5908,15 +5969,20 @@ def cmd_retract(args: argparse.Namespace) -> int:
             "that message is still queued for delivery;"
             " use `tau outbox cancel` to stop it instead"
         )
-    node = TauNode(config, name=config.name)
-    node.start()
-    try:
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: retract through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
         try:
-            response = node.send_retraction(
+            response = _retract_via_running_node(
+                config,
                 recipient,
                 str(target["id"]),
-                timeout=float(getattr(args, "timeout", 20.0)),
-                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
             )
         except NodeError as exc:
             # Retracts ride the live link only in v1 — there is no
@@ -5926,8 +5992,27 @@ def cmd_retract(args: argparse.Namespace) -> int:
                 f"could not deliver retract: {exc} "
                 "(retracts need the peer online in v1)"
             ) from exc
-    finally:
-        node.stop()
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_retraction(
+                    recipient,
+                    str(target["id"]),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Retracts ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver retract: {exc} "
+                    "(retracts need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
 
     # The peer confirmed (or already had it gone): drop this node's own
     # sent copy too, so the message is gone on both sides.  A local
@@ -5940,6 +6025,11 @@ def cmd_retract(args: argparse.Namespace) -> int:
             "retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
+    # The sent record lives in mailbox.json, not the inbox: drop it
+    # too, or `tau messages --sent` keeps showing the retracted text.
+    # Only after the retract and the inbox delete succeeded, so a
+    # failed retract never erases the sent record.
+    Mailbox(config.mailbox_path).discard_sent(str(target["id"]))
 
     peer = registry.get(recipient)
     name = peer.display_name if peer is not None else short_hash(recipient)
