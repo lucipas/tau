@@ -1417,6 +1417,76 @@ def test_concurrent_retracts_cannot_delete_a_different_record(tmp_path):
     ]
 
 
+def test_retract_notifies_the_console_callback(tmp_path):
+    # A serving console keeps its own copy of the message; the node
+    # tells it the wire id so it can drop that copy too.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+    notified = []
+    node.on_retract = notified.append
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert [record["id"] for record in notified] == ["msg-1"]
+
+
+def test_retract_callback_failure_does_not_fail_the_retract(tmp_path):
+    # The inbox delete already landed; a failing console callback
+    # must not turn the retraction into an error.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    def _boom(record):
+        raise RuntimeError("console is down")
+
+    node.on_retract = _boom
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_concurrent_deliveries_store_only_one_copy(tmp_path):
+    # Regression test for the CodeRabbit Minor: two deliveries of the
+    # same id that both pass the pre-check must still store once —
+    # the in-transaction re-check sees the first delivery's mark.
+    import threading
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender = RNS.Identity()
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    payload = encode_message("take this back", message_id="dup-1")
+
+    barrier = threading.Barrier(2)
+
+    def _deliver():
+        barrier.wait(timeout=10)
+        call_handler(node._handle_message, payload, remote_identity=sender)
+
+    threads = [threading.Thread(target=_deliver) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(node.inbox.list_messages()) == 1
+    assert len(received) == 1
+
+
 def test_retract_refuses_file_records(tmp_path):
     # A received file lives on disk; deleting only the inbox record
     # would orphan it, so file records are not retractable.

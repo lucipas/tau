@@ -3579,6 +3579,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
         node.on_peer = on_peer
         node.on_message = on_message
         node.on_file = on_file
+
+        def on_retract(record: Dict[str, Any]) -> None:
+            # The node already deleted the inbox record; drop the
+            # console's own copy so a retracted DM leaves the feed
+            # and never comes back after a restart.
+            bridge.delete_by_wire_id(str(record.get("id") or ""))
+
+        node.on_retract = on_retract
     # The data-directory lock is the more specific guard, so probe it
     # before the port check: a second serve on the same directory
     # reports the instance error even though it would also trip the

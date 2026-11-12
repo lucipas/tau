@@ -2811,6 +2811,37 @@ class WebBridge:
             },
         }
 
+    def delete_by_wire_id(self, wire_id: str) -> Optional[Dict[str, Any]]:
+        """Delete the console history entry for one retracted DM, by wire id.
+
+        Called when the node accepts a retraction for a message this
+        console already shows: the entry leaves the persisted history
+        and connected tabs learn through the same ``message_deleted``
+        event as a console delete, so a retracted message never
+        survives in the console past a restart.  Only an inbound entry
+        can match — a retract deletes a received record, never a sent
+        one.  Returns the delete result, or ``None`` when no inbound
+        entry carries that wire id (the console window may not cover
+        it).  The inbox record is already gone — the node's retract
+        handler deleted it first — so the inbox step inside
+        :meth:`delete_message` is a tolerated no-op.
+        """
+        if not isinstance(wire_id, str) or not wire_id:
+            return None
+        with self._lock:
+            target = next(
+                (
+                    message.get("id")
+                    for message in self._messages
+                    if message.get("direction") == "in"
+                    and message.get("wire_id") == wire_id
+                ),
+                None,
+            )
+        if target is None:
+            return None
+        return self.delete_message(target)
+
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
 

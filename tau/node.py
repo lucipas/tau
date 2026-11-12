@@ -445,6 +445,7 @@ class TauNode:
         on_file: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_read: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_reaction: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_retract: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.config = config
         self.name = name or config.name
@@ -460,6 +461,7 @@ class TauNode:
         self.on_file = on_file
         self.on_read = on_read
         self.on_reaction = on_reaction
+        self.on_retract = on_retract
         # Ids whose delivery this node confirmed by a successful send,
         # newest last, capped so a long-lived node does not grow the
         # record without bound.  An outbox entry that disappears without
@@ -1457,11 +1459,19 @@ class TauNode:
             # (the message would then be rejected as already seen and
             # lost).  The record step takes the inbox transaction
             # inside this one; the order is mailbox first everywhere.
+            # Re-check inside the transaction: a duplicate delivery
+            # that landed while this one was in flight already marked
+            # the id seen, and the transaction reloaded that mark —
+            # without the re-check both copies would be stored, and a
+            # later retract would leave one behind.
+            recorded = False
             with self.mailbox.transaction():
-                if message_id:
-                    self.mailbox.mark_seen(message_id)
-                self._record_received(record)
-            if self.on_message is not None:
+                if not message_id or not self.mailbox.is_seen(message_id):
+                    if message_id:
+                        self.mailbox.mark_seen(message_id)
+                    self._record_received(record)
+                    recorded = True
+            if recorded and self.on_message is not None:
                 try:
                     self.on_message(record)
                 except Exception:  # pragma: no cover - user callback
@@ -1961,6 +1971,16 @@ class TauNode:
                 received_at=received_at,
                 deleted=False,
             )
+        # The inbox record is gone; a serving console keeps its own
+        # copy of the message, so tell it to drop that too — otherwise
+        # /api/messages keeps showing the retracted text, including
+        # after a restart.  A failing console callback must not fail
+        # the retraction itself: the inbox delete already landed.
+        if self.on_retract is not None:
+            try:
+                self.on_retract(removed)
+            except Exception:  # pragma: no cover - console callback
+                log.warning("on_retract callback failed", exc_info=True)
         log.info(
             "Retraction from %s deleted %s",
             caller_hash[:8],
@@ -3038,16 +3058,21 @@ class TauNode:
         )
         # One delivery: mark seen and record under the mailbox
         # transaction, so a live backup never restores a seen marker
-        # with no inbox entry (see _handle_message).
+        # with no inbox entry (see _handle_message).  Re-check inside
+        # the transaction, as there: a duplicate that landed while
+        # this one was in flight already marked the id seen.
+        recorded = False
         with self.mailbox.transaction():
-            self.mailbox.mark_seen(message["id"])
-            self._record_received(record)
-        if self.on_message is not None:
+            if not self.mailbox.is_seen(message["id"]):
+                self.mailbox.mark_seen(message["id"])
+                self._record_received(record)
+                recorded = True
+        if recorded and self.on_message is not None:
             try:
                 self.on_message(record)
             except Exception:  # pragma: no cover - user callback
                 log.warning("on_message callback failed", exc_info=True)
-        return True
+        return recorded
 
     # -- application layer -------------------------------------------------
 
