@@ -82,6 +82,9 @@ Global options may appear before or after the command:
 | `tau tan save POST` | Save a post to read later (local only, never published) |
 | `tau tan unsave POST` | Remove a post from your saved list |
 | `tau tan saved` | List your saved posts, newest first |
+| `tau tan pin POST` | Pin one of your own posts (local only, never published) |
+| `tau tan unpin POST` | Remove a post from your pinned list |
+| `tau tan pinned` | List your pinned posts, newest pin first |
 | `tau tan sync` | Pull missing posts from known peers |
 | `tau tan export` | Back up stored Tan posts as a JSON export |
 | `tau tan import FILE` | Restore Tan posts from a JSON export |
