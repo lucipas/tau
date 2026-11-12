@@ -3485,6 +3485,14 @@ class TauNode:
                 raise NodeError(
                     "send_after must be a finite number of epoch seconds"
                 )
+        if send_after is not None and not queue:
+            # A scheduled message is queued by definition: with queueing
+            # refused there is nowhere for it to wait until its time, so
+            # refuse the combination before anything is recorded.
+            raise NodeError(
+                "cannot schedule a message without queueing: "
+                "send_after requires queue=True"
+            )
         message_id = generate_message_id()
         payload = encode_message(
             normalized,
@@ -3531,6 +3539,15 @@ class TauNode:
                     # sent history as a message that never went anywhere.
                     self.mailbox.discard_sent(message_id)
                     raise
+                if self.registry.get(peer.destination_hash) is None:
+                    # A caller can hand send_message a Peer that never
+                    # entered the registry (resolve_peer returns Peer
+                    # objects as-is); flush_outbox only visits registry
+                    # peers, so register it now or the scheduled message
+                    # would wait until another path registers the peer.
+                    self.registry.upsert(
+                        peer.destination_hash, peer.public_key, name=peer.name
+                    )
                 self._record_sent(
                     {
                         "from": self.name,

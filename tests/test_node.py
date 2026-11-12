@@ -728,6 +728,48 @@ def test_send_message_scheduled_to_undiscovered_hash_keeps_schedule(
     assert node.mailbox.get_outbox(entry.id) is not None
 
 
+def test_send_message_rejects_scheduled_send_without_queue(tmp_path):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    node.registry.upsert(
+        peer.destination_hash, peer.public_key, name="alice", now=1.0
+    )
+    # queue=False means "do not queue": a scheduled message is queued
+    # by definition, so the combination is refused before anything is
+    # recorded or enqueued.
+    with pytest.raises(NodeError, match="without queueing"):
+        node.send_message(
+            "alice", "later", queue=False, send_after=time.time() + 3600.0
+        )
+    assert node.mailbox.outbox_list() == []
+    assert node.mailbox.sent_list() == []
+    assert node.inbox.list_messages(direction="out") == []
+
+
+def test_send_message_scheduled_to_supplied_peer_registers_it(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    peer = make_peer("alice")
+    # The peer was never registered: resolve_peer returns a supplied
+    # Peer as-is, so without registration flush_outbox (which only
+    # visits registry peers) would never deliver the scheduled message.
+    assert node.registry.get(peer.destination_hash) is None
+    calls = []
+    monkeypatch.setattr(
+        node, "_request", lambda *args, **kwargs: calls.append(args)
+    )
+    send_after = time.time() + 3600.0
+    response = node.send_message(peer, "later", send_after=send_after)
+
+    assert calls == []
+    assert response["queued"] is True
+    assert node.registry.get(peer.destination_hash) is not None
+    entry = node.mailbox.get_outbox(response["id"])
+    assert entry is not None
+    assert entry.send_after == send_after
+
+
 def test_send_message_failed_schedule_leaves_no_sent_record(tmp_path):
     node = make_node(tmp_path)
     peer = make_peer("alice")
