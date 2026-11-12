@@ -12,6 +12,8 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
+    RETRACTED_CLOCK_SKEW_TOLERANCE,
+    RETRACTED_RETENTION,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -48,6 +50,7 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
         "seen": 0,
         "sent": 0,
         "receipts": 0,
+        "retracted": 0,
     }
 
     reloaded = Mailbox(path)
@@ -103,6 +106,32 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     assert box.counts()["outbox"] == 1
 
 
+def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
+    """`delivered_at` must survive a reload: the queued-to-delivered flip
+    and the sent-messages display both read it after one."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0)
+
+    reloaded = Mailbox(path)
+    delivered = reloaded.sent_record("m1")
+    assert delivered is not None
+    assert delivered["delivered_at"] == 1002.0
+    pending = reloaded.sent_record("m2")
+    assert pending is not None
+    assert pending["delivered_at"] is None
+
+    # A record written before delivery tracking has no such key and
+    # keeps counting as delivered in the sent-messages display.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_at"]
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_at" not in reloaded.sent_record("m2")
+
+
 def test_load_dedupes_duplicate_message_ids(tmp_path):
     """A mailbox.json with duplicate ids keeps the newest copy of each
     and is rewritten on load, so the duplicates do not survive a
@@ -156,7 +185,7 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0}
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
     kept = box.get_outbox("dup-id")
     assert kept is not None
     assert kept.text == "newer copy"
@@ -215,7 +244,7 @@ def test_load_skips_nonfinite_timestamps(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0}
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
     assert box.get_outbox("nan-created") is None
     assert box.get_outbox("good-id") is not None
 
@@ -669,6 +698,7 @@ def test_prune_expires_everything(tmp_path):
         "sent": 0,
         "receipts": 0,
         "dropped_held": 1,
+        "retracted": 0,
     }
     assert box.counts() == {
         "outbox": 0,
@@ -676,6 +706,7 @@ def test_prune_expires_everything(tmp_path):
         "seen": 0,
         "sent": 0,
         "receipts": 0,
+        "retracted": 0,
     }
 
 
@@ -689,6 +720,125 @@ def test_seen_and_pending_acks(tmp_path):
     box.add_pending_acks("holder1", ["b", "c"])
     assert box.take_pending_acks("holder1") == ["a", "b", "c"]
     assert box.take_pending_acks("holder1") == []
+
+
+def test_retraction_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    assert box.is_retracted(sender, "msg-1") is False
+
+    recorded_at = time.time()
+    box.record_retraction(sender, "msg-1", now=recorded_at)
+    assert box.is_retracted(sender, "msg-1") is True
+    # A marker is keyed by (sender, id): another sender's message with
+    # the same id, or another id from the same sender, is unaffected.
+    assert box.is_retracted("bb" * 32, "msg-1") is False
+    assert box.is_retracted(sender, "msg-2") is False
+    assert box.counts()["retracted"] == 1
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_retracted(sender, "msg-1") is True
+    assert (
+        reloaded.is_retracted(
+            sender, "msg-1", now=recorded_at + RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_retracted(sender, "msg-1", now=recorded_at + RETRACTED_RETENTION)
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + RETRACTED_RETENTION)
+    assert removed["retracted"] == 1
+    assert reloaded.counts()["retracted"] == 0
+    assert reloaded.is_retracted(sender, "msg-1") is False
+
+
+def test_retraction_markers_are_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_retraction(sender, "m-1", now=1000.0)
+    box.record_retraction(sender, "m-2", now=1001.0)
+    box.record_retraction(sender, "m-3", now=1002.0)
+    assert box.counts()["retracted"] == 3
+    # The fourth marker evicts the one expiring soonest (m-1).
+    box.record_retraction(sender, "m-4", now=1003.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_retracted(sender, "m-1", now=1003.0) is False
+    assert box.is_retracted(sender, "m-4", now=1003.0) is True
+    # Re-recording a marker refreshes it instead of growing the set.
+    box.record_retraction(sender, "m-2", now=2000.0)
+    assert box.counts()["retracted"] == 3
+
+
+def test_confirmed_markers_survive_unknown_flood(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    other = "bb" * 32
+    box.record_retraction(sender, "real", confirmed=True, now=1000.0)
+    box.record_retraction(other, "junk-1", now=1001.0)
+    box.record_retraction(other, "junk-2", now=1002.0)
+    assert box.counts()["retracted"] == 3
+    # A flood of unknown-ID markers evicts unknown markers, never the
+    # confirmed one — capacity pressure must not invalidate a
+    # retraction the sender saw succeed.
+    box.record_retraction(other, "junk-3", now=1003.0)
+    box.record_retraction(other, "junk-4", now=1004.0)
+    assert box.counts()["retracted"] == 3
+    assert box.is_retracted(sender, "real", now=1004.0) is True
+    # A retried retract refreshes a confirmed marker, never downgrades
+    # it: it still survives the next flood.
+    box.record_retraction(sender, "real", now=2000.0)
+    box.record_retraction(other, "junk-5", now=2001.0)
+    box.record_retraction(other, "junk-6", now=2002.0)
+    box.record_retraction(other, "junk-7", now=2003.0)
+    assert box.is_retracted(sender, "real", now=2003.0) is True
+
+
+def test_retraction_markers_survive_a_backward_clock_correction(tmp_path):
+    # Regression test for the CodeRabbit Major: a marker is written as
+    # now + RETRACTED_RETENTION, so if the wall clock moves backward
+    # after the write, a reload must not drop the still-live marker —
+    # only markers past the bounded skew tolerance are malformed.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    now = time.time()
+    # The clock stood an hour ahead when the first marker was recorded,
+    # then moved back: its expiry sits past now + RETRACTED_RETENTION.
+    box.record_retraction(sender, "kept", now=now + 3600.0)
+    # Two days ahead is past the tolerance: malformed, not a correction.
+    box.record_retraction(sender, "dropped", now=now + 2 * 24 * 60 * 60)
+    assert box.is_retracted(sender, "kept", now=now) is True
+    assert RETRACTED_CLOCK_SKEW_TOLERANCE == 24 * 60 * 60
+
+    reloaded = Mailbox(path)
+    assert reloaded.is_retracted(sender, "kept", now=now) is True
+    assert reloaded.is_retracted(sender, "dropped", now=now) is False
+    assert reloaded.counts()["retracted"] == 1
+
+
+def test_confirmed_markers_evict_oldest_when_all_confirmed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_retraction(sender, "m-1", confirmed=True, now=1000.0)
+    box.record_retraction(sender, "m-2", confirmed=True, now=1001.0)
+    assert box.counts()["retracted"] == 2
+    # With no unknown marker left to spend, the cap still holds: the
+    # earliest-expiry confirmed marker gives way.
+    box.record_retraction(sender, "m-3", confirmed=True, now=1002.0)
+    assert box.counts()["retracted"] == 2
+    assert box.is_retracted(sender, "m-1", now=1002.0) is False
+    assert box.is_retracted(sender, "m-2", now=1002.0) is True
+    assert box.is_retracted(sender, "m-3", now=1002.0) is True
 
 
 # -- sealed envelopes -------------------------------------------------------------
