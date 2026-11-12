@@ -2706,6 +2706,7 @@ class WebBridge:
         target = target.strip()
         peer: Optional[str] = None
         group_id: Optional[str] = None
+        group_target = target
         with self._lock:
             for message in self._messages:
                 if message.get("wire_id") == target:
@@ -2726,6 +2727,10 @@ class WebBridge:
                 record.get("group"), str
             ):
                 group_id = record["group"]
+                # The caller may have sent a unique prefix; recipients
+                # key the reaction by the full id, so sign that.
+                if isinstance(record.get("id"), str) and record["id"]:
+                    group_target = record["id"]
             else:
                 peer = record.get("destination")
         if group_id is not None:
