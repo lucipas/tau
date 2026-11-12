@@ -8,7 +8,7 @@ about every 45 seconds.
 
 The queue lives in the data directory (``scheduled-posts.json``) so
 scheduled posts survive restarts.  A publish that fails keeps the
-entry queued and retries on the next pass instead of dropping the
+entry queued and retries with exponential backoff (up to a limit) instead of dropping the
 post — the same failure direction as the outbox: never lose a queued
 post silently.  Cancelling removes the entry before it goes out.
 
@@ -26,10 +26,11 @@ import os
 import secrets
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from .protocol import ProtocolError, normalize_message
 from .util import atomic_write_json, ensure_dir
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,15 @@ SCHEDULED_POSTS_FILE_MODE = 0o600
 SCHEDULED_POST_ID_BYTES = 8
 MAX_SCHEDULED_POST_DELAY = 7 * 24 * 60 * 60
 MAX_SCHEDULED_POST_TTL = 255
+# Retry policy for a failed publish: exponential backoff from the base,
+# capped, and a hard attempt limit after which the entry stays queued
+# (never dropped silently) but is no longer retried automatically.
+MAX_PUBLISH_ATTEMPTS = 12
+PUBLISH_RETRY_BASE_SECONDS = 60.0
+PUBLISH_RETRY_CAP_SECONDS = 60.0 * 60.0
+# Wall-clock bound on one publish pass.  The pass runs on the mail-loop
+# thread, so entries not started within the budget wait for a later pass.
+PUBLISH_PASS_BUDGET_SECONDS = 20.0
 
 
 class ScheduledPostsError(ValueError):
@@ -123,6 +133,22 @@ def _clean_timestamp(value: Any, label: str) -> float:
     return stamp
 
 
+def _clean_attempts(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ScheduledPostsError(f"not an attempt count: {value!r}")
+    return value
+
+
+def _clean_retry_at(value: Any) -> float:
+    # 0.0 means "eligible now"; unlike publish_at it is not a real time.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledPostsError(f"not a retry time: {value!r}")
+    stamp = float(value)
+    if stamp < 0 or stamp != stamp or stamp == float("inf"):
+        raise ScheduledPostsError(f"not a retry time: {value!r}")
+    return stamp
+
+
 @dataclass(frozen=True)
 class ScheduledPost:
     """One queued Tan post, waiting for its publish time."""
@@ -134,6 +160,14 @@ class ScheduledPost:
     reply_to: Optional[str] = None
     to: Tuple[str, ...] = ()
     ttl: int = 3
+    # Once a publish has created the signed post, its hash is kept so
+    # retries re-send that same post instead of signing a new copy.
+    post_hash: Optional[str] = None
+    attempts: int = 0
+    next_attempt_at: float = 0.0
+    # Destination hashes that still owe delivery after a partial
+    # failure; empty means "all of ``to`` (or every peer)".
+    pending_peers: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A frozen dataclass still builds through __init__: validate
@@ -146,6 +180,10 @@ class ScheduledPost:
         object.__setattr__(self, "ttl", _clean_ttl(self.ttl))
         object.__setattr__(self, "publish_at", _clean_timestamp(self.publish_at, "publish_at"))
         object.__setattr__(self, "created_at", _clean_timestamp(self.created_at, "created_at"))
+        object.__setattr__(self, "post_hash", _clean_reply_to(self.post_hash))
+        object.__setattr__(self, "attempts", _clean_attempts(self.attempts))
+        object.__setattr__(self, "next_attempt_at", _clean_retry_at(self.next_attempt_at))
+        object.__setattr__(self, "pending_peers", _clean_targets(list(self.pending_peers)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -170,6 +208,10 @@ class ScheduledPost:
             ttl=_clean_ttl(data.get("ttl", 3)),
             publish_at=_clean_timestamp(data.get("publish_at"), "publish_at"),
             created_at=_clean_timestamp(data.get("created_at"), "created_at"),
+            post_hash=_clean_reply_to(data.get("post_hash")),
+            attempts=_clean_attempts(data.get("attempts", 0)),
+            next_attempt_at=_clean_retry_at(data.get("next_attempt_at", 0.0)),
+            pending_peers=_clean_targets(data.get("pending_peers")),
         )
 
 
@@ -206,6 +248,12 @@ class ScheduledPosts:
             raise ScheduledPostsError(f"scheduled post {post.id} is already queued")
         ordered = tuple(sorted((*self.posts, post), key=lambda p: p.publish_at))
         return ScheduledPosts(posts=ordered)
+
+    def with_replaced(self, post: ScheduledPost) -> "ScheduledPosts":
+        if not any(existing.id == post.id for existing in self.posts):
+            raise ScheduledPostsError(f"no scheduled post {post.id!r}")
+        swapped = tuple(post if existing.id == post.id else existing for existing in self.posts)
+        return ScheduledPosts(posts=swapped)
 
     def with_removed(self, post_id: str) -> "ScheduledPosts":
         kept = tuple(post for post in self.posts if post.id != post_id)
@@ -304,10 +352,20 @@ def schedule_post(
     ttl: int = 3,
     now: Optional[float] = None,
 ) -> ScheduledPost:
-    """Queue a post for *publish_at*; returns the stored entry."""
+    """Queue a post for *publish_at*; returns the stored entry.
+
+    The text gets the same validation as an immediate ``tau tan post``
+    (``normalize_message``: non-empty, at most ``MAX_MESSAGE_CHARS``), so
+    a post that could never be created is refused here, not on every
+    publish pass.
+    """
+    try:
+        clean_text = normalize_message(text)
+    except ProtocolError as exc:
+        raise ScheduledPostsError(str(exc)) from exc
     post = ScheduledPost(
         id=new_scheduled_post_id(),
-        text=_clean_text(text),
+        text=clean_text,
         reply_to=_clean_reply_to(reply_to),
         to=_clean_targets(list(to) if to is not None else None),
         ttl=_clean_ttl(ttl),
@@ -338,70 +396,109 @@ def publish_due_scheduled_posts(
 ) -> Dict[str, int]:
     """Publish every due queued post through *app* (a ``TanApp``).
 
-    A post is published when ``app.create_post`` + ``app.publish``
-    return without raising — the same bar as an immediate ``tau tan
-    post``, where zero known peers still counts as published.  A post
-    whose publish fails stays queued and retries on the next pass;
-    a target that cannot be resolved yet (a peer that has not
-    announced) likewise waits.  Returns ``{"published": n,
-    "kept": m}``.  A corrupt queue file logs a warning and publishes
-    nothing, so one bad file cannot stall the mail loop that calls
-    this.
+    The whole pass runs under the queue lock, so a cancel either lands
+    before the entry is considered (and it is never sent) or waits until
+    the entry has been sent and removed (and then reports it gone).  The
+    lock is held across the network sends, which is the price of that
+    guarantee.
+
+    A post is published when ``app.publish`` returns with no per-peer
+    errors — the same bar as an immediate ``tau tan post``, where zero
+    known peers still counts as published.  The signed post is created
+    once and its hash saved before sending, so retries re-send the same
+    post.  Peers that already accepted it are not sent it again.
+
+    A failed attempt (exception or per-peer errors) keeps the entry
+    queued with exponential backoff.  After ``MAX_PUBLISH_ATTEMPTS`` it
+    is no longer retried automatically but stays queued for the user to
+    inspect or cancel.  A pass stops starting new entries once
+    ``PUBLISH_PASS_BUDGET_SECONDS`` have elapsed.
+
+    Returns ``{"published": n, "kept": m}``.  A corrupt queue file logs a
+    warning and publishes nothing, so one bad file cannot stall the mail
+    loop that calls this.
     """
-    try:
-        queue = load_scheduled_posts(path)
-    except ScheduledPostsError as exc:
-        log.warning("Scheduled-posts at %s is unusable (%s); skipping", path, exc)
-        return {"published": 0, "kept": 0}
-    due = queue.due(now)
-    if not due:
-        return {"published": 0, "kept": 0}
-    published: List[str] = []
-    kept = 0
-    for post in due:
+    at = now if now is not None else time.time()
+    deadline = time.monotonic() + PUBLISH_PASS_BUDGET_SECONDS
+    with scheduled_posts_lock(path):
         try:
-            targets = None
-            if post.to:
-                if resolve_peer is None:
-                    raise ScheduledPostsError(
-                        "scheduled post has targets but no peer resolver"
-                    )
-                targets = [resolve_peer(target) for target in post.to]
-            created = app.create_post(post.text, reply_to=post.reply_to)
-            # create_post stores the post locally before publish: if
-            # publish raises, the stored copy stays and the retry
-            # creates a second one.  The retry still goes out (the
-            # queued text is what matters), and the extra local copy
-            # is the same shape as a --no-publish draft.
-            app.publish(created, targets=targets, ttl=post.ttl)
-        except Exception as exc:  # noqa: BLE001 - a failed publish retries
-            log.warning(
-                "Scheduled post %s could not publish (%s); keeping it queued",
-                post.id,
-                exc,
-            )
-            kept += 1
-            continue
-        published.append(post.id)
-    if published:
-        # Reload under the lock: a cancel that landed while a publish
-        # was in flight already removed its entry, and must not be
-        # resurrected by saving the stale snapshot.
-        with scheduled_posts_lock(path):
+            queue = load_scheduled_posts(path)
+        except ScheduledPostsError as exc:
+            log.warning("Scheduled-posts at %s is unusable (%s); skipping", path, exc)
+            return {"published": 0, "kept": 0}
+        candidates = [
+            post
+            for post in queue.due(at)
+            if post.next_attempt_at <= at and post.attempts < MAX_PUBLISH_ATTEMPTS
+        ]
+        published = 0
+        for post in candidates:
+            if time.monotonic() > deadline:
+                break
+            failed_peers: Optional[Tuple[str, ...]] = None
             try:
-                queue = load_scheduled_posts(path)
-            except ScheduledPostsError as exc:
+                targets = _resolve_publish_targets(post, resolve_peer)
+                created = app.get_post(post.post_hash) if post.post_hash else None
+                if created is None:
+                    created = app.create_post(post.text, reply_to=post.reply_to)
+                    # Persist the signed post's identity before sending, so
+                    # a retry after a crash re-sends it rather than signing
+                    # a second copy.
+                    post = replace(post, post_hash=created["hash"])
+                    queue = queue.with_replaced(post)
+                    save_scheduled_posts(path, queue)
+                result = app.publish(created, targets=targets, ttl=post.ttl)
+                errors = list(result.get("errors") or []) if isinstance(result, dict) else []
+                if errors:
+                    failed_peers = tuple(str(err.get("peer") or "") for err in errors)
+                    raise ScheduledPostsError(
+                        f"{len(errors)} peer(s) did not receive the post"
+                    )
+            except Exception as exc:  # noqa: BLE001 - a failed publish retries
+                attempts = post.attempts + 1
+                retry_in = min(
+                    PUBLISH_RETRY_BASE_SECONDS * 2 ** (attempts - 1),
+                    PUBLISH_RETRY_CAP_SECONDS,
+                )
+                pending = post.pending_peers
+                if failed_peers is not None:
+                    # Retry only the peers that failed.  An unknown peer
+                    # hash cannot be re-targeted, so fall back to all targets.
+                    pending = failed_peers if all(p and p != "?" for p in failed_peers) else ()
+                post = replace(
+                    post,
+                    attempts=attempts,
+                    next_attempt_at=at + retry_in,
+                    pending_peers=pending,
+                )
+                queue = queue.with_replaced(post)
+                save_scheduled_posts(path, queue)
                 log.warning(
-                    "Scheduled-posts at %s became unusable (%s); published "
-                    "posts stay queued and will retry",
-                    path,
+                    "Scheduled post %s could not publish (%s); keeping it queued",
+                    post.id,
                     exc,
                 )
-                return {"published": 0, "kept": len(due)}
-            for post_id in published:
-                try:
-                    queue = queue.with_removed(post_id)
-                except ScheduledPostsError:
-                    pass
+                if attempts >= MAX_PUBLISH_ATTEMPTS:
+                    log.warning(
+                        "Scheduled post %s gave up after %d attempts; it stays "
+                        "queued until cancelled",
+                        post.id,
+                        attempts,
+                    )
+                continue
+            queue = queue.with_removed(post.id)
             save_scheduled_posts(path, queue)
-    return {"published": len(published), "kept": kept}
+            published += 1
+    return {"published": published, "kept": len(candidates) - published}
+
+
+def _resolve_publish_targets(
+    post: ScheduledPost, resolve_peer: Optional[Callable[[str], Any]]
+) -> Optional[List[Any]]:
+    """Peers for one publish attempt: the still-owed ones, else ``to``."""
+    names = post.pending_peers or post.to
+    if not names:
+        return None
+    if resolve_peer is None:
+        raise ScheduledPostsError("scheduled post has targets but no peer resolver")
+    return [resolve_peer(name) for name in names]

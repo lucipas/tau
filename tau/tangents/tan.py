@@ -4359,6 +4359,14 @@ class TanApp:
             self.publish(post, targets=targets, ttl=ttl)
         return post
 
+    def get_post(self, digest: str) -> Optional[Dict[str, Any]]:
+        """Return a stored post by hash, or ``None``."""
+        conn = self.connect()
+        try:
+            return get_post(conn, digest)
+        finally:
+            conn.close()
+
     def quote(
         self,
         target: str,
