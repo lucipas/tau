@@ -194,6 +194,10 @@ class ScheduledPost:
             "ttl": self.ttl,
             "publish_at": self.publish_at,
             "created_at": self.created_at,
+            "post_hash": self.post_hash,
+            "attempts": self.attempts,
+            "next_attempt_at": self.next_attempt_at,
+            "pending_peers": list(self.pending_peers),
         }
 
     @classmethod

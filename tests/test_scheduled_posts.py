@@ -60,6 +60,21 @@ def test_schedule_and_load_round_trip(tmp_path):
     assert post.created_at == 1000.0
 
 
+def test_retry_state_survives_a_save_round_trip(tmp_path):
+    # The retry fields are load-bearing: a save that drops them would
+    # reset every failed post to zero attempts and re-sign a new post
+    # on the next pass.
+    path = tmp_path / "scheduled-posts.json"
+    post = _post(
+        post_hash="c" * 64,
+        attempts=2,
+        next_attempt_at=5000.0,
+        pending_peers=("d" * 64,),
+    )
+    save_scheduled_posts(path, ScheduledPosts(posts=(post,)))
+    assert load_scheduled_posts(path).posts[0] == post
+
+
 def test_load_missing_file_is_empty(tmp_path):
     assert len(load_scheduled_posts(tmp_path / "missing.json")) == 0
 
@@ -139,6 +154,12 @@ class _FakeTanApp:
         self.created.append(post)
         return post
 
+    def get_post(self, digest):
+        for post in self.created:
+            if post["hash"] == digest:
+                return post
+        return None
+
     def publish(self, post, *, targets=None, ttl=3):
         if self.fail_publish:
             raise RuntimeError("no route to peers")
@@ -195,6 +216,81 @@ def test_publish_due_tolerates_corrupt_queue(tmp_path):
     result = publish_due_scheduled_posts(path, app, now=2000.0)
     assert result == {"published": 0, "kept": 0}
     assert app.created == []
+
+
+def test_failed_publish_backs_off_before_retrying(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="now", publish_at=1000.0, now=900.0)
+    app = _FakeTanApp(fail_publish=True)
+
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    queued = load_scheduled_posts(path).posts[0]
+    assert queued.attempts == 1
+    assert queued.next_attempt_at == 2000.0 + 60.0
+    assert queued.post_hash == "c" * 64
+
+    # Inside the backoff window the pass does not retry.
+    result = publish_due_scheduled_posts(path, app, now=2030.0)
+    assert result == {"published": 0, "kept": 0}
+    assert len(app.created) == 1
+
+    # Past the backoff it retries the SAME signed post, not a new one.
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(path, app, now=2100.0)
+    assert result == {"published": 1, "kept": 0}
+    assert len(app.created) == 1
+    assert len(load_scheduled_posts(path)) == 0
+
+
+def test_partial_failure_retries_only_failed_peers(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="now", publish_at=1000.0, to=["alice", "bob"], now=900.0)
+    peers = {
+        "alice": SimpleNamespace(hexhash="a" * 64),
+        "bob": SimpleNamespace(hexhash="b" * 64),
+    }
+    by_name_or_hash = {**peers}
+    by_name_or_hash.update({p.hexhash: p for p in peers.values()})
+
+    class _PartialApp(_FakeTanApp):
+        fail_bob = True
+
+        def publish(self, post, *, targets=None, ttl=3):
+            self.published.append((post, targets, ttl))
+            failed = (
+                [t for t in (targets or []) if t.hexhash == "b" * 64]
+                if self.fail_bob
+                else []
+            )
+            return {
+                "delivered": len(targets or []) - len(failed),
+                "peers": len(targets or []),
+                "errors": [
+                    {"peer": t.hexhash, "error": "no route"} for t in failed
+                ],
+            }
+
+    app = _PartialApp()
+    resolve = lambda name: by_name_or_hash[name]
+    result = publish_due_scheduled_posts(path, app, resolve_peer=resolve, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+    queued = load_scheduled_posts(path).posts[0]
+    assert queued.pending_peers == ("b" * 64,)
+    assert queued.attempts == 1
+
+    # The retry goes to the failed peer only.
+    app.fail_bob = False
+    result = publish_due_scheduled_posts(path, app, resolve_peer=resolve, now=2100.0)
+    assert result == {"published": 1, "kept": 0}
+    assert [t.hexhash for t in app.published[-1][1]] == ["b" * 64]
+
+
+def test_schedule_rejects_oversized_text(tmp_path):
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError):
+        schedule_post(path, text="x" * 2001, publish_at=2000.0, now=1000.0)
+    assert len(load_scheduled_posts(path)) == 0
 
 
 def test_node_publish_hook_skips_without_tan_app(tmp_path):
