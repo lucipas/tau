@@ -2028,6 +2028,44 @@ def test_send_edit_leaves_the_sent_record_when_the_receiver_did_not_apply(
     assert "edited_at" not in sent
 
 
+def test_send_edit_keeps_a_newer_local_edit(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    # The local copy already holds a newer edit than the one this send
+    # is delivering: its write must not rewind it, even though the
+    # receiver applied this (older) edit.
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "newest text",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+            "edited_at": 9999999999.0,
+        }
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": True, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "older edit")
+
+    assert response["edited"] is True
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "newest text"
+    assert entry["edited_at"] == 9999999999.0
+
+
 def test_collected_message_drops_expired_arrival(tmp_path):
     import time as _time
 

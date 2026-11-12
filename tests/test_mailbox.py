@@ -129,6 +129,42 @@ def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
     assert "delivered_at" not in reloaded.sent_record("m2")
 
 
+def test_update_sent_text_ignores_a_stale_edit(tmp_path):
+    """Two overlapping edit sends can finish out of order: the older
+    one's local write must not rewind the newer one's text."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="original", sent_at=1000.0)
+
+    box.update_sent_text("m1", "newer text", edited_at=200.0)
+    assert box.sent_record("m1")["text"] == "newer text"
+
+    box.update_sent_text("m1", "older text", edited_at=100.0)
+    assert box.sent_record("m1")["text"] == "newer text"
+    assert box.sent_record("m1")["edited_at"] == 200.0
+
+    box.update_sent_text("m1", "newest text", edited_at=300.0)
+    assert box.sent_record("m1")["text"] == "newest text"
+    assert box.sent_record("m1")["edited_at"] == 300.0
+
+
+def test_sent_record_keeps_edited_at_through_reload(tmp_path):
+    """`edited_at` must survive a reload: the staleness check in
+    update_sent_text compares against it after the transaction
+    reloads the document."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="original", sent_at=1000.0)
+    box.update_sent_text("m1", "newer text", edited_at=200.0)
+
+    reloaded = Mailbox(path)
+    assert reloaded.sent_record("m1")["edited_at"] == 200.0
+
+    # A stale edit arriving after the reload is still rejected.
+    reloaded.update_sent_text("m1", "older text", edited_at=100.0)
+    assert reloaded.sent_record("m1")["text"] == "newer text"
+
+
 def test_load_dedupes_duplicate_message_ids(tmp_path):
     """A mailbox.json with duplicate ids keeps the newest copy of each
     and is rewritten on load, so the duplicates do not survive a

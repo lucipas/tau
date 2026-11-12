@@ -860,6 +860,10 @@ class Mailbox:
                         delivered_at is not None
                         and not isinstance(delivered_at, (int, float))
                     )
+                    or (
+                        record.get("edited_at") is not None
+                        and not isinstance(record.get("edited_at"), (int, float))
+                    )
                     or not isinstance(text, str)
                 ):
                     continue
@@ -883,6 +887,14 @@ class Mailbox:
                         float(delivered_at)
                         if delivered_at is not None
                         else None
+                    )
+                if "edited_at" in record:
+                    # An edit's timestamp must survive a reload: the
+                    # staleness check in update_sent_text compares
+                    # against it after the transaction reloads.
+                    edited_at = record.get("edited_at")
+                    parsed["edited_at"] = (
+                        float(edited_at) if edited_at is not None else None
                     )
                 sent[message_id] = parsed
 
@@ -1244,12 +1256,22 @@ class Mailbox:
         ``tau messages --sent`` reads its text from the sent record, not
         the inbox, so an edit that only rewrote the inbox copy would
         leave the sender's own history showing the original text.  A
-        missing record (pruned since the send) is not an error.
+        missing record (pruned since the send) is not an error.  When
+        ``edited_at`` is given, an older edit never overwrites a newer
+        stored one: two overlapping sends can finish their local writes
+        out of order, and the receiver keeps the newer edit.
         """
         with self._transaction():
             record = self._sent.get(message_id)
             if record is None:
                 return
+            if edited_at is not None:
+                stored = record.get("edited_at")
+                if (
+                    isinstance(stored, (int, float))
+                    and float(edited_at) <= float(stored)
+                ):
+                    return
             record["text"] = normalize_message(text)
             if edited_at is not None:
                 record["edited_at"] = float(edited_at)

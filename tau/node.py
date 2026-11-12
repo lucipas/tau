@@ -4230,9 +4230,14 @@ class TauNode:
         # Update the local sent copy, so the editor sees the new text
         # under the message in their own inbox and console.  A missing
         # local copy (pruned since the send) is not a delivery failure.
+        # The guard keeps an overlapping older edit from rewinding a
+        # newer one that already landed locally.
         try:
             self.inbox.apply_edit(
-                target_id, cleaned, edited_at=float(payload["sent_at"])
+                target_id,
+                cleaned,
+                edited_at=float(payload["sent_at"]),
+                newer_than_existing=True,
             )
         except InboxError as exc:
             log.warning("Could not record sent edit: %s", exc)
