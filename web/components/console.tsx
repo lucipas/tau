@@ -260,6 +260,9 @@ export function Console() {
                 const result = await tau.editMessage(message.id, text);
                 return result.edited;
               }}
+              onRetract={async (message) => {
+                await tau.retractMessage(message.id);
+              }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;
                 if (reaction === null) {

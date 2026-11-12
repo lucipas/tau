@@ -729,6 +729,35 @@ describe("useTau search", () => {
     expect(mockedGet).not.toHaveBeenCalled();
     expect(result.current.searchQuery).toBeNull();
   });
+
+  it("drops a retracted message from later searches", async () => {
+    const hit = makeMessage({ id: 2, text: "mesh hit" });
+    mockedGet.mockResolvedValue({ messages: [hit], count: 1 });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 2, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([hit]);
+
+    await act(async () => {
+      await result.current.retractMessage(2);
+    });
+
+    // The search ran before the retract, so its stale hit is still
+    // in state; a re-run must not bring the retracted message back.
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([]);
+  });
 });
 
 describe("useTau editMessage", () => {
@@ -1035,6 +1064,48 @@ describe("useTau sendGroup", () => {
     });
 
     expect(result.current.messages).toEqual(legs);
+  });
+});
+
+describe("useTau retractMessage", () => {
+  it("posts the console id and drops the bubble at once", async () => {
+    const message = makeMessage({
+      id: 1,
+      direction: "out",
+      status: "delivered",
+      group: undefined,
+      wire_id: "a".repeat(32),
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 1, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [message]),
+      });
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+
+    let returned;
+    await act(async () => {
+      returned = await result.current.retractMessage(1);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/messages/retract", {
+      id: 1,
+    });
+    expect(returned).toEqual({
+      ok: true,
+      retracted: { id: 1, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+    expect(result.current.messages).toEqual([]);
   });
 });
 

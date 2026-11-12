@@ -26,6 +26,7 @@ export function MessageFeed({
   onReply,
   onDelete,
   onEdit,
+  onRetract,
   onReact,
   onPin,
   searching,
@@ -47,6 +48,7 @@ export function MessageFeed({
   // Resolves true when the edit landed on both sides; false keeps the
   // editor open (the peer had no copy, or a newer edit landed).
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
+  onRetract?: (message: TauMessage) => Promise<void>;
   // `reaction` null retracts the caller's reaction to the message.
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   // `pinned` true pins the message, false unpins it.
@@ -229,6 +231,7 @@ export function MessageFeed({
               onReply={onReply}
               onDelete={onDelete}
               onEdit={onEdit}
+              onRetract={onRetract}
               onReact={onReact}
               onPin={onPin}
             />
@@ -358,6 +361,7 @@ function MessageBubble({
   onReply,
   onDelete,
   onEdit,
+  onRetract,
   onReact,
   onPin,
 }: {
@@ -367,6 +371,7 @@ function MessageBubble({
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
+  onRetract?: (message: TauMessage) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
 }) {
@@ -420,6 +425,28 @@ function MessageBubble({
       setEditError(error instanceof Error ? error.message : "edit failed");
     } finally {
       setSavingEdit(false);
+    }
+  }
+
+  const [confirmingRetract, setConfirmingRetract] = useState(false);
+  const [retracting, setRetracting] = useState(false);
+  const [retractError, setRetractError] = useState<string | null>(null);
+
+  async function handleConfirmRetract() {
+    if (!onRetract || retracting) return;
+    setRetracting(true);
+    setRetractError(null);
+    try {
+      await onRetract(message);
+    } catch (error) {
+      // A failed retract keeps the bubble, with the reason inline and
+      // the plain retract button back so the user can retry.
+      setRetractError(
+        error instanceof Error ? error.message : "retract failed",
+      );
+      setConfirmingRetract(false);
+    } finally {
+      setRetracting(false);
     }
   }
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -732,6 +759,47 @@ function MessageBubble({
             >
               edit
             </button>
+          ) : null}
+          {onRetract &&
+          outbound &&
+          !message.group &&
+          !message.file &&
+          message.wire_id &&
+          message.status !== "queued" ? (
+            retracting ? (
+              <span className="px-1 py-0.5 text-mist/60">retracting…</span>
+            ) : confirmingRetract ? (
+              <>
+                <button
+                  type="button"
+                  title="Retract this message"
+                  onClick={() => void handleConfirmRetract()}
+                  className="rounded px-1 py-0.5 text-rose-300 transition hover:bg-rose-400/10"
+                >
+                  confirm retract
+                </button>
+                <button
+                  type="button"
+                  title="Keep this message"
+                  onClick={() => setConfirmingRetract(false)}
+                  className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+                >
+                  keep
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                title="Retract this message"
+                onClick={() => setConfirmingRetract(true)}
+                className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-rose-300"
+              >
+                retract
+              </button>
+            )
+          ) : null}
+          {retractError ? (
+            <span className="text-rose-300">{retractError}</span>
           ) : null}
           {onReact && message.wire_id ? (
             <button

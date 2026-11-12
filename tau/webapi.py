@@ -39,6 +39,9 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
+    POST /api/messages/retract retract ``{"id": <console message id>}``: ask
+                           the peer to delete your sent DM, then drop the
+                           local copies too (``tau retract`` from the console)
     POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
                            inbox, so it shows in the console and in
                            ``tau pinned`` (local only, never sent)
@@ -564,6 +567,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # how reactions (which name their target by wire id) attach to
         # the right history entry.
         message["wire_id"] = wire_id
+    delivered_via = entry.get("delivered_via")
+    if delivered_via in ("direct", "lxmf"):
+        # Which transport confirmed the delivery: kept so a retract
+        # can still tell an LXMF-delivered copy from a direct one
+        # after the mailbox sent record is evicted. Entries written
+        # before the route was tracked carry no such key.
+        message["delivered_via"] = delivered_via
     reactions = entry.get("reactions")
     if isinstance(reactions, list):
         cleaned = [_clean_stored_reaction(item) for item in reactions]
@@ -1139,6 +1149,23 @@ class WebBridge:
             self.mark_displayed_read()
         return message
 
+    def _delivery_route(self, message_id: str) -> Optional[str]:
+        """Which transport confirmed a delivery, if it is known.
+
+        Read from the mailbox sent record: ``"direct"`` or ``"lxmf"``.
+        ``None`` when the record is gone (evicted) or was written
+        before the route was tracked — the caller keeps the previous
+        behavior in that case.
+        """
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            return None
+        record = mailbox.sent_record(message_id)
+        if record is None:
+            return None
+        via = record.get("delivered_via")
+        return via if via in ("direct", "lxmf") else None
+
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
         """Mark a queued outbound message delivered.
 
@@ -1153,6 +1180,12 @@ class WebBridge:
         before this was tracked — simply age out of that buffer.
         """
         updated: Optional[Dict[str, Any]] = None
+        # The route read takes the mailbox lock, so fetch it before
+        # any bridge lock: an inbound retraction takes the locks in
+        # the opposite order (mailbox transaction, then the bridge
+        # lock through on_retract), and the two paths would deadlock
+        # if they overlapped.
+        route = self._delivery_route(mail_id)
         with self._send_lock:
             with self._lock:
                 for message in self._messages:
@@ -1162,8 +1195,35 @@ class WebBridge:
                         and message.get("mail_id") == mail_id
                     ):
                         message["status"] = "delivered"
+                        # Stamp the route on the entry itself: the
+                        # mailbox sent record can be evicted while
+                        # this entry remains retractable, and only the
+                        # entry outlives that eviction.
+                        if route is not None:
+                            message["delivered_via"] = route
                         updated = dict(message)
                         break
+                if updated is None:
+                    # A second confirmation (LXMF after a direct
+                    # delivery) finds the entry already delivered:
+                    # keep the route honest — "lxmf" is sticky, or a
+                    # later retract would read the stale "direct"
+                    # route and miss the recipient's lxmf: copy.
+                    for message in self._messages:
+                        if (
+                            message.get("direction") == "out"
+                            and message.get("status")
+                            in ("delivered", "read")
+                            and message.get("mail_id") == mail_id
+                        ):
+                            if (
+                                route == "lxmf"
+                                and message.get("delivered_via")
+                                != "lxmf"
+                            ):
+                                message["delivered_via"] = "lxmf"
+                                updated = dict(message)
+                            break
                 if updated is None:
                     self._early_deliveries[mail_id] = None
                     while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
@@ -2774,12 +2834,24 @@ class WebBridge:
                 mail_id=mail_id,
                 expires_at=expires_at,
                 wire_id=wire_id,
+                # A live send went out over the direct link by
+                # construction: a failed direct send queues instead.
+                delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
+            )
+            # The route read takes the mailbox lock, so fetch it
+            # before the bridge lock (same deadlock as record_delivery).
+            route = (
+                self._delivery_route(mail_id)
+                if mail_id is not None
+                else None
             )
             with self._lock:
                 if mail_id is not None and mail_id in self._early_deliveries:
                     del self._early_deliveries[mail_id]
                     message["status"] = "delivered"
+                    if route is not None:
+                        message["delivered_via"] = route
                     flipped = True
                 read_key = wire_id or mail_id
                 if read_key is not None:
@@ -3299,6 +3371,132 @@ class WebBridge:
             else None,
         }
 
+
+    def retract_message(self, target: int, *, timeout: float = 20.0) -> Dict[str, Any]:
+        """Retract one of this node's sent DMs, from the console.
+
+        Mirrors ``tau retract``: the peer is asked to delete the sent
+        message from their inbox, and the local copies go too (console
+        history entry, node inbox copy, sent record), so the message is
+        gone on both sides.  A peer who had no copy answers ``deleted``
+        False, which is not an error — the local copies still go.
+
+        Only your own sent DMs can be retracted: group messages are
+        not retractable in v1, a file transfer's saved copy lives on
+        the recipient's disk (the peer refuses those retracts), a
+        message still queued has not reached its recipient yet
+        (cancel it from the outbox instead), and a message delivered
+        over LXMF is stored by the recipient under an LXMF id the
+        retract cannot name — that copy stays until LXMF carries the
+        tau id (see #248).  The route is stamped on the console entry
+        when delivery is confirmed (and falls back to the mailbox
+        sent record for older entries), so it survives the sent
+        record being evicted.  Retracts ride the live link only, so
+        an unreachable peer is a failure, not a silent queue.
+
+        Ordering keeps every failure retryable from the console: the
+        retract goes first, so a failed retract never erases the local
+        copy; the inbox delete follows, so an inbox failure leaves the
+        bubble in place; the console entry is removed last, through the
+        same path as a delete, so other tabs learn through
+        ``message_deleted``.  A retry after either failure re-sends the
+        retract (idempotent — the peer answers ``deleted`` False) and
+        retries the local cleanup.  The local inbox delete is exact:
+        ``delete_authorized`` checks the id, direction and recipient
+        in one transaction, so a stale wire id can never delete a
+        different record sharing its prefix.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if removed is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if removed.get("direction") != "out":
+                raise ValueError(
+                    "only your own sent messages can be retracted"
+                )
+            if removed.get("group"):
+                raise ValueError("group messages cannot be retracted in v1")
+            if removed.get("file"):
+                raise ValueError("file transfers cannot be retracted")
+            if removed.get("status") == "queued":
+                # A retract answered "not found" would let the queued
+                # copy arrive later, so cancellation has to go through
+                # the outbox first.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = removed.get("wire_id")
+            peer = removed.get("peer")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("that message has no id to retract")
+        if not isinstance(peer, str) or not peer:
+            raise ValueError("that message has no known recipient to retract from")
+        with self.node.mailbox.transaction():
+            if self.node.mailbox.get_outbox(wire_id) is not None:
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            # The route lives on the console entry itself, so it
+            # survives the mailbox sent record being evicted; the
+            # sent record is the fallback for entries written before
+            # the route was stamped. A missing route keeps the prior
+            # behavior — it is not, by itself, a reason to refuse.
+            delivered_via = removed.get("delivered_via")
+            if delivered_via is None:
+                sent_record = self.node.mailbox.sent_record(wire_id)
+                if sent_record is not None:
+                    delivered_via = sent_record.get("delivered_via")
+            if delivered_via == "lxmf":
+                # The recipient stores an LXMF-delivered copy under an
+                # `lxmf:` id, not this wire id: the retract would
+                # answer `deleted` False while the copy stays. Refuse
+                # instead of removing the sender's copies around a
+                # copy the retract cannot reach.
+                raise ValueError(
+                    "that message was delivered over LXMF; the recipient "
+                    "stores it under an LXMF id, so a retract cannot "
+                    "reach that copy yet"
+                )
+        response = self.node.send_retraction(peer, wire_id, timeout=timeout)
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                inbox.delete_authorized(
+                    wire_id, direction="out", destination=peer
+                )
+            except InboxError as exc:
+                # A record that exists but is not this node's sent
+                # copy, or a delete that could not be persisted,
+                # leaves the console entry in place, so the retract
+                # can be retried — the retract itself already
+                # succeeded. A missing record (None) is fine.
+                if str(exc).startswith("could not persist"):
+                    raise OSError(str(exc)) from exc
+                raise ValueError(str(exc)) from exc
+        # The sent record lives in mailbox.json, not the inbox: drop it
+        # too, or `tau messages --sent` keeps showing the retracted text.
+        # Only after the retract and the inbox delete succeeded, so a
+        # failed retract never erases the sent record.
+        self.node.mailbox.discard_sent(wire_id)
+        self._remove_history_entry(target, removed, publish_unread=inbox is not None)
+        return {
+            "ok": True,
+            "retracted": {
+                "id": target,
+                "wire_id": wire_id,
+            },
+            "deleted": bool(response.get("deleted")),
+            "id": response.get("id") if isinstance(response.get("id"), str) else None,
+        }
 
     def pin_message(self, target: int) -> Dict[str, Any]:
         """Pin one stored DM from the console history, by console id.
@@ -4860,6 +5058,7 @@ class WebBridge:
         group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
+        delivered_via: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
         save: bool = True,
@@ -4907,6 +5106,8 @@ class WebBridge:
                         message["reactions"] = _with_reaction(
                             message["reactions"], entry["destination"], entry
                         )
+            if delivered_via in ("direct", "lxmf"):
+                message["delivered_via"] = delivered_via
             message["excerpt_hash"] = excerpt_hash(text)
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
@@ -5505,6 +5706,9 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/edit":
                 self._handle_edit_message(body, head_only)
+                return
+            if path == "/api/messages/retract":
+                self._handle_retract_message(body, head_only)
                 return
             if path == "/api/messages/pin":
                 self._handle_pin_message(body, head_only, pinned=True)
@@ -6438,6 +6642,35 @@ class _WebHandler(BaseHTTPRequestHandler):
         timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
         try:
             result = self.bridge.edit_message(target, text, timeout=timeout)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+
+
+    def _handle_retract_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.retract_message(target, timeout=timeout)
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
