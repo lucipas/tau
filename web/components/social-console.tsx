@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { formatDateTime, shortHash } from "@/lib/format";
 import type {
+  TanAuthor,
   TanExportDocument,
   TanImportError,
   TanImportResult,
@@ -48,6 +49,8 @@ export function SocialConsole() {
   const [deleting, setDeleting] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Hashes with a repost request in flight; see submitRepost.
+  const repostingRef = useRef<Set<string>>(new Set());
   // Hash of the post whose liker list is open, if any, and the likers for
   // it (null while the list is loading). Only one list is open at a time,
   // and it is always fetched fresh on open so a like toggle cannot leave
@@ -106,6 +109,28 @@ export function SocialConsole() {
     }
   }
 
+  // Follow or unfollow an author from the directory. The hook reloads
+  // the feed after either, so the directory and the following list
+  // update together.
+  async function submitToggleFollowAuthor(author: TanAuthor) {
+    setError(null);
+    try {
+      if (author.followed) {
+        await tan.unfollow(author.author);
+      } else {
+        await tan.follow(author.author);
+      }
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : author.followed
+            ? "could not unfollow"
+            : "could not follow",
+      );
+    }
+  }
+
   async function submitFollowSuggestion(author: string) {
     setError(null);
     try {
@@ -151,6 +176,21 @@ export function SocialConsole() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not react");
+    }
+  }
+
+  async function submitRepost(post: TanPost) {
+    // A ref, not state: two clicks before React re-renders must not both
+    // send a repost, or the second one reports the store's duplicate error.
+    if (repostingRef.current.has(post.hash)) return;
+    repostingRef.current.add(post.hash);
+    setError(null);
+    try {
+      await tan.repost(post.hash);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not repost");
+    } finally {
+      repostingRef.current.delete(post.hash);
     }
   }
 
@@ -418,6 +458,66 @@ export function SocialConsole() {
                   </li>
                 ))}
               </ul>
+            </section>
+
+            <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
+              <div className="flex items-center justify-between">
+                <SectionLabel>authors</SectionLabel>
+                <span className="font-mono text-[10px] text-mist">
+                  {tan.authorsTotal}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-mist">
+                Everyone with a post in the local store. Follow an author
+                to see their posts in your timeline.
+              </p>
+              <ul className="mt-3 space-y-1.5">
+                {tan.authors.length === 0 ? (
+                  <li className="rounded-lg border border-dashed border-line/70 px-3 py-2 text-[11px] leading-relaxed text-mist">
+                    No authors yet. Sync to pull posts from your peers.
+                  </li>
+                ) : null}
+                {tan.authors.map((record) => (
+                  <li
+                    key={record.author}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-line/60 bg-void/40 px-2.5 py-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-zinc-200">
+                        {record.name || "unknown"}
+                      </p>
+                      <p className="font-mono text-[10px] text-mist/80">
+                        {shortHash(record.author, 10)} · {record.posts}{" "}
+                        post{record.posts === 1 ? "" : "s"} ·{" "}
+                        {record.last_post
+                          ? formatDateTime(record.last_post)
+                          : "never"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void submitToggleFollowAuthor(record)}
+                      className="shrink-0 font-mono text-[10px] text-mist/70 transition hover:text-signal"
+                      title={
+                        record.followed
+                          ? "unfollow this author"
+                          : "follow this author"
+                      }
+                    >
+                      {record.followed ? "remove" : "follow"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {tan.authors.length < tan.authorsTotal ? (
+                <button
+                  type="button"
+                  onClick={() => void tan.loadMoreAuthors()}
+                  className="mt-3 inline-flex w-full items-center justify-center rounded-lg border border-line bg-void/70 px-3 py-2 font-mono text-[11px] text-mist transition hover:border-signal/50 hover:text-signal"
+                >
+                  show more ({tan.authors.length} of {tan.authorsTotal})
+                </button>
+              ) : null}
             </section>
 
             <section className="rounded-2xl border border-line/80 bg-panel/40 p-4">
@@ -765,6 +865,7 @@ export function SocialConsole() {
                     loading={tan.threadLoading}
                     error={tan.threadError ?? tan.error}
                     onToggleLike={toggleLike}
+                    onRepost={submitRepost}
                     onReply={(target) => setReplyTarget(target)}
                     onDelete={submitDelete}
                     onOpenThread={(target) => void tan.openThread(target.hash)}
@@ -786,6 +887,7 @@ export function SocialConsole() {
                           key={post.hash}
                           post={post}
                           onToggleLike={toggleLike}
+                          onRepost={submitRepost}
                           onToggleSave={toggleSave}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
@@ -819,6 +921,7 @@ export function SocialConsole() {
                         key={post.hash}
                         post={post}
                         onToggleLike={toggleLike}
+                        onRepost={submitRepost}
                         onToggleSave={toggleSave}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
@@ -839,6 +942,7 @@ export function SocialConsole() {
                       key={post.hash}
                       post={post}
                       onToggleLike={toggleLike}
+                      onRepost={submitRepost}
                       onToggleLikers={toggleLikers}
                       likersOpen={likersOpen === post.hash}
                       likers={likersOpen === post.hash ? likers : null}
@@ -1156,6 +1260,7 @@ function ThreadView({
   loading,
   error,
   onToggleLike,
+  onRepost,
   onReply,
   onDelete,
   onOpenThread,
@@ -1165,6 +1270,7 @@ function ThreadView({
   loading: boolean;
   error: string | null;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   onOpenThread: (post: TanPost) => void;
@@ -1187,6 +1293,7 @@ function ThreadView({
             key={post.hash}
             post={post}
             onToggleLike={onToggleLike}
+            onRepost={onRepost}
             onReply={onReply}
             onDelete={onDelete}
             deleting={deleting.has(post.hash)}
@@ -1267,6 +1374,18 @@ function SavedEmptyState() {
   );
 }
 
+// Whether the console offers a Repost button for this card. The store
+// only accepts posts and replies as repost targets (a missing kind reads
+// as a plain post, the same default the store uses), and refuses your own
+// posts, posts you already reposted, and deleted posts — so the button
+// stays hidden there and the count chip remains a plain display.
+function canRepost(post: TanPost): boolean {
+  if (post.deleted || post.own || post.reposted) return false;
+  return (
+    post.kind === undefined || post.kind === "post" || post.kind === "reply"
+  );
+}
+
 export function VerifyResult({ report }: { report: TanVerifyReport }) {
   if (report.ok) {
     return (
@@ -1309,11 +1428,13 @@ export function VerifyResult({ report }: { report: TanVerifyReport }) {
 export function PostCard({
   post,
   onToggleLike,
+  onRepost,
   onToggleLikers,
   likersOpen,
   likers,
   likersTotal,
-  onToggleSave,  onReply,
+  onToggleSave,
+  onReply,
   onQuote,
   onDelete,
   onEdit,
@@ -1324,6 +1445,7 @@ export function PostCard({
 }: {
   post: TanPost;
   onToggleLike: (post: TanPost) => void;
+  onRepost: (post: TanPost) => void;
   // Optional so existing callers (and tests) that only exercise the
   // like toggle keep working; when absent the count button is inert.
   onToggleLikers?: (post: TanPost) => void;
@@ -1332,7 +1454,8 @@ export function PostCard({
   likers?: TanLiker[] | null;
   // Full liker count before the server's cap; 0 when unknown.
   likersTotal?: number;
-  onToggleSave?: (post: TanPost) => void;  onReply: (post: TanPost) => void;
+  onToggleSave?: (post: TanPost) => void;
+  onReply: (post: TanPost) => void;
   onQuote?: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
   // Optional like onQuote/onMute: views that do not wire editing (thread,
@@ -1530,16 +1653,27 @@ export function PostCard({
                 ♥ {post.likes ?? 0}
               </button>
             )}
-            <span
-              title={post.reposted ? "You reposted this" : "Reposts"}
-              className={`rounded border px-1.5 py-0.5 ${
-                post.reposted
-                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
-                  : "border-line/70 bg-panel/60"
-              }`}
-            >
-              ↻ {post.reposts ?? 0}
-            </span>
+            {canRepost(post) ? (
+              <button
+                type="button"
+                onClick={() => onRepost(post)}
+                title="Repost this post"
+                className="rounded border border-line/70 bg-panel/60 px-1.5 py-0.5 transition-colors hover:text-emerald-300"
+              >
+                ↻ {post.reposts ?? 0}
+              </button>
+            ) : (
+              <span
+                title={post.reposted ? "You reposted this" : "Reposts"}
+                className={`rounded border px-1.5 py-0.5 ${
+                  post.reposted
+                    ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                    : "border-line/70 bg-panel/60"
+                }`}
+              >
+                ↻ {post.reposts ?? 0}
+              </span>
+            )}
             {(post.likes ?? 0) > 0 ? (
               <button
                 type="button"

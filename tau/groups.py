@@ -34,22 +34,42 @@ by name keep working until the creator themself sends the successor.
 The superseded predecessor is only deleted, not retired, because the
 old roster may still be live elsewhere and its messages should be able
 to pin it again.
+
+A member can leave a group they did not create with
+:meth:`GroupStore.leave` (``tau group leave``): the record is deleted
+and the id is remembered as left, so a later group message for it
+cannot re-pin the group — unlike :meth:`GroupStore.delete`, whose
+removal the next message undoes.  A successor roster for the same
+creator and name that was already pinned alongside leaves with it: it
+is the same group under a new roster, and leaving one version while
+the other keeps receiving would not be leaving the group.  Leaving is
+local only: the creator is not told and keeps the member on the
+roster, so the messages keep coming and are rejected on arrival.
+:meth:`GroupStore.rejoin` (``tau group rejoin``) clears a left id, so
+the next message pins the group again; a re-invite under a changed
+roster is a new id and pins without a rejoin.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
-try:  # POSIX only; the cross-process lock is a no-op without it.
+try:  # POSIX only; Windows locks through msvcrt instead (see below).
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the lock uses msvcrt there, as identity.py does.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 from .protocol import (
     MAX_GROUP_MEMBERS,
@@ -83,6 +103,10 @@ MAX_RENAME_LINEAGE = 32
 # The list is capped like the groups themselves; the oldest retirement
 # is forgotten first, so a very old roster can be pinned again.
 MAX_RETIRED_GROUPS = MAX_GROUPS + MAX_LEARNED_GROUPS
+# Groups this node has left are remembered the same way, so a later
+# message cannot re-pin one: the oldest departure is forgotten first,
+# so a very old group can be pinned again.
+MAX_LEFT_GROUPS = MAX_RETIRED_GROUPS
 
 
 def _valid_group(raw: Any) -> Optional[Dict[str, Any]]:
@@ -206,6 +230,7 @@ class GroupStore:
         self._lock = threading.Lock()
         self._groups: Dict[str, Dict[str, Any]] = {}
         self._retired: List[str] = []
+        self._left: List[Dict[str, Any]] = []
         self._load()
 
     def _load(self) -> None:
@@ -238,6 +263,29 @@ class GroupStore:
                 if entry not in seen:
                     seen.add(entry)
                     self._retired.append(entry)
+        left = raw.get("left")
+        self._left = []
+        if isinstance(left, list):
+            seen = set()
+            for entry in left:
+                if not isinstance(entry, dict):
+                    continue
+                entry_id = entry.get("id")
+                left_at = entry.get("left_at")
+                if not isinstance(entry_id, str) or len(entry_id) != 32:
+                    continue
+                try:
+                    bytes.fromhex(entry_id)
+                except ValueError:
+                    continue
+                if not isinstance(left_at, (int, float)) or not math.isfinite(
+                    left_at
+                ):
+                    continue
+                entry_id = entry_id.lower()
+                if entry_id not in seen:
+                    seen.add(entry_id)
+                    self._left.append({"id": entry_id, "left_at": float(left_at)})
 
     def _save(self) -> None:
         """Persist the store; raises :class:`OSError` when the write fails."""
@@ -245,20 +293,27 @@ class GroupStore:
             return
         atomic_write_json(
             self.path,
-            {"groups": list(self._groups.values()), "retired": self._retired},
+            {
+                "groups": list(self._groups.values()),
+                "retired": self._retired,
+                "left": self._left,
+            },
             mode=0o600,
         )
 
-    def _snapshot(self) -> "tuple[Dict[str, Dict[str, Any]], List[str]]":
+    def _snapshot(
+        self,
+    ) -> "tuple[Dict[str, Dict[str, Any]], List[str], List[Dict[str, Any]]]":
         """In-memory state before a mutation, for rollback on a failed save.
 
         A shallow copy is enough: mutations replace whole records, they
         never edit a stored group dict in place.
         """
-        return (dict(self._groups), list(self._retired))
+        return (dict(self._groups), list(self._retired), list(self._left))
 
     def _restore(
-        self, snapshot: "tuple[Dict[str, Dict[str, Any]], List[str]]"
+        self,
+        snapshot: "tuple[Dict[str, Dict[str, Any]], List[str], List[Dict[str, Any]]]",
     ) -> None:
         """Restore the state captured by :meth:`_snapshot`.
 
@@ -267,33 +322,56 @@ class GroupStore:
         state in place, so a group whose first write failed would stay
         visible until restart.
         """
-        groups, retired = snapshot
+        groups, retired, left = snapshot
         self._groups = dict(groups)
         self._retired = list(retired)
+        self._left = list(left)
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         """Serialise a read-modify-write of the store across processes.
 
         Mirrors :meth:`Inbox._transaction`: each mutation takes an
-        exclusive ``flock`` on a sidecar lock file and reloads the
-        latest on-disk state first.
+        exclusive lock on a sidecar lock file and reloads the latest
+        on-disk state first, so a serving process and a CLI command
+        cannot interleave a load and a save.  The lock is ``flock``
+        on POSIX and ``msvcrt.locking`` on the first byte on Windows,
+        as :mod:`tau.ignored_groups` does — without it, a ``record()``
+        that loaded before a concurrent ``leave()`` could save after
+        it and silently drop the left marker, letting the next
+        message re-pin the group.
         """
         with self._lock:
-            if self.path is None or fcntl is None:
-                if self.path is not None:
-                    self._load()
+            if self.path is None:
+                yield
+                return
+            if fcntl is None and msvcrt is None:
+                # pragma: no cover - neither platform offers a
+                # cross-process lock; best effort only.
+                self._load()
                 yield
                 return
             lock_path = self.path.with_name(self.path.name + ".lock")
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            with open(lock_path, "a+") as handle:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:  # pragma: no cover - exercised on Windows
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(" ")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 try:
                     self._load()
                     yield
                 finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    else:  # pragma: no cover - exercised on Windows
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
     def create(
         self, name: str, members: List[str], *, created_by: str = ""
@@ -523,7 +601,9 @@ class GroupStore:
         (delete a group to make room); locally created groups are never
         evicted to make room for one.  A roster the creator retired
         with a membership change is refused as well, so a removed peer
-        cannot restore it by replaying an old group message.
+        cannot restore it by replaying an old group message — and so is
+        a group this node left, so leaving cannot be undone by the next
+        message for it.
 
         ``sender`` is the authenticated sender of the message.  A new
         roster supersedes a learned group from the same creator under
@@ -605,7 +685,9 @@ class GroupStore:
             if existing is not None:
                 if existing["members"] != candidate["members"]:
                     return None
-            elif candidate["id"] in self._retired:
+            elif candidate["id"] in self._retired or self.is_left(
+                candidate["id"]
+            ):
                 # A retired id stays refused — except a creator restore:
                 # the creator renamed back to this name, so their
                 # message carries the lineage naming the successor this
@@ -613,8 +695,11 @@ class GroupStore:
                 # pinned.  A queued copy of an old message carries no
                 # lineage, and a stale successor copy predates the
                 # successor's pin, so neither can pass this gate.
+                # A group this node left stays refused: no restore path.
                 restored = (
-                    creator_authorized
+                    candidate["id"] in self._retired
+                    and not self.is_left(candidate["id"])
+                    and creator_authorized
                     and sent_at is not None
                     and any(
                         (other := self._groups.get(pred_id)) is not None
@@ -799,6 +884,94 @@ class GroupStore:
                 raise
         return True
 
+    def is_left(self, group_id: str) -> bool:
+        """Whether *group_id* was left and must not be re-pinned.
+
+        Reads the in-memory list; callers that need a fresh read go
+        through :meth:`find` or :meth:`list_groups` first, which reload
+        from disk.  Must not take the lock: it is called from
+        :meth:`record`, which already holds it.
+        """
+        group_id = group_id.lower()
+        return any(entry["id"] == group_id for entry in self._left)
+
+    def leave(self, group_id: str) -> List[str]:
+        """Leave a known group; ``[]`` when it was not stored.
+
+        Returns the ids left: the resolved group plus any successor
+        roster for the same creator and name already pinned alongside
+        it — the same group under a new roster, which would keep
+        receiving if it stayed.  Each id is remembered as left, so a
+        later group message for it cannot re-pin the group (see
+        :meth:`record`) — unlike :meth:`delete`, whose removal the next
+        message undoes.  A genuinely new roster arriving after the
+        leave is a new id and pins normally.  Raises :class:`OSError`
+        when the write fails, leaving the in-memory store as it was on
+        disk.
+        """
+        with self._transaction():
+            existing = self._groups.get(group_id.lower())
+            if existing is None:
+                return []
+            snapshot = self._snapshot()
+            family = [existing] + [
+                other
+                for other in self._groups.values()
+                if other["id"] != existing["id"]
+                and not other["local"]
+                and other["creator"] == existing["creator"]
+                and other["name"] == existing["name"]
+            ]
+            left_ids = []
+            for group in family:
+                del self._groups[group["id"]]
+                left_ids.append(group["id"])
+                if not self.is_left(group["id"]):
+                    self._left.append(
+                        {"id": group["id"], "left_at": time.time()}
+                    )
+                    if len(self._left) > MAX_LEFT_GROUPS:
+                        del self._left[: len(self._left) - MAX_LEFT_GROUPS]
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return left_ids
+
+    def rejoin(self, group_id: str) -> bool:
+        """Clear a left group id, so the next message can pin it again.
+
+        ``False`` when the id was never left.  Raises :class:`OSError`
+        when the write fails, leaving the in-memory store as it was on
+        disk.
+        """
+        with self._transaction():
+            group_id = group_id.lower()
+            remaining = [
+                entry for entry in self._left if entry["id"] != group_id
+            ]
+            if len(remaining) == len(self._left):
+                return False
+            snapshot = self._snapshot()
+            self._left = remaining
+            try:
+                self._save()
+            except OSError:
+                self._restore(snapshot)
+                raise
+        return True
+
+    def left_groups(self) -> List[Dict[str, Any]]:
+        """Groups this node has left, oldest first.
+
+        Reloads from disk first, so a leave in another process is seen.
+        Each entry carries the group ``id`` and the ``left_at`` time it
+        was left.
+        """
+        with self._transaction():
+            return [dict(entry) for entry in self._left]
+
     def get(self, group_id: str) -> Optional[Dict[str, Any]]:
         """One group by id, or ``None``."""
         with self._lock:
@@ -822,9 +995,11 @@ class GroupStore:
             groups = [dict(group) for group in self._groups.values()]
         if len(query) == 32:
             group = self.get(query)
-            if group is None:
-                raise ValueError(f"unknown group: {query!r}")
-            return group
+            if group is not None:
+                return group
+            # A 32-character name is also possible: fall through to the
+            # name match below instead of erroring here.  An actual id
+            # still wins — get() above already checked it.
         by_name = [
             group for group in groups if group["name"].casefold() == query.casefold()
         ]

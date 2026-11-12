@@ -48,6 +48,10 @@ MAX_MESSAGE_CHARS = 2000
 # message a receiver can filter on.  The wire field is optional so old
 # peers keep working: a payload without a kind is a chat message.
 DEFAULT_MESSAGE_KIND = "chat"
+# A private note to self (``tau note``): stored in the local inbox, never
+# sent, so it is a record kind like ``group``/``file`` rather than a wire
+# kind — see ``_RESERVED_MESSAGE_KINDS`` below.
+NOTE_KIND = "note"
 MAX_MESSAGE_KIND_LENGTH = 32
 # ASCII only: str.isalnum() accepts non-ASCII letters (e.g. "é"), which
 # would break the documented slug grammar for consumers that enforce it.
@@ -58,8 +62,12 @@ _MESSAGE_KIND_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 # and be silently lost — `_record_received` swallows the failure while
 # the sender already got success and the seen-id blocks a retry.  So
 # they are reserved here, at the one choke point every kind passes
-# through, and the wire parser rejects them the same way.
-_RESERVED_MESSAGE_KINDS = frozenset({"group", "file"})
+# through, and the wire parser rejects them the same way.  ``note`` is
+# reserved the same way: a note is local-only by design (``tau note``
+# writes it straight into the inbox), so a peer must not be able to
+# send one — a note-kind payload on the wire is rejected, and
+# `tau send --kind note` is refused.
+_RESERVED_MESSAGE_KINDS = frozenset({"group", "file", "note"})
 # A reaction is one unicode emoji or a short text token (``+1``, ``lol``) —
 # never an image or a URL.  32 characters leaves room for a multi-codepoint
 # emoji sequence while keeping the reaction far inside the request budget.
@@ -90,6 +98,7 @@ REQUEST_MESSAGE = "/tau/message"
 REQUEST_FILE = "/tau/file"
 REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
+REQUEST_RETRACT = "/tau/dm/retract"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
@@ -101,6 +110,7 @@ REQUEST_PATHS = (
     REQUEST_FILE,
     REQUEST_READ,
     REQUEST_REACT,
+    REQUEST_RETRACT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
@@ -156,9 +166,9 @@ def normalize_message_kind(kind: Any) -> str:
 
     A kind is a short ASCII lowercase slug (``[a-z0-9][a-z0-9_-]*``,
     at most 32 characters) so it is safe to print, compare and filter
-    on.  ``None`` — the local default — means plain chat.  ``group``
-    and ``file`` are reserved: they name inbox record types, and a
-    direct message carrying either could never be stored.
+    on.  ``None`` — the local default — means plain chat.  ``group``,
+    ``file`` and ``note`` are reserved: they name inbox record types,
+    and a direct message carrying any of them could never be stored.
     """
     if kind is None:
         return DEFAULT_MESSAGE_KIND
@@ -385,6 +395,8 @@ def encode_group_message(
     members: List[str],
     sent_at: Optional[float] = None,
     renamed_from: Optional[List[str]] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
+    expires_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
 
@@ -397,7 +409,13 @@ def encode_group_message(
     lineage (predecessor ids, newest first) when the group was renamed:
     a member that still holds a predecessor learns from this message
     that it was superseded, so it does not keep sending to an id the
-    creator retired.
+    creator retired.  ``in_reply_to`` optionally names the earlier
+    message in the group this one quotes, exactly like a direct
+    message (see :func:`clean_in_reply_to`).
+
+    ``expires_at`` is an optional sender-set expiry (epoch seconds),
+    exactly like a direct message: the receiver shows the deadline and
+    purges the message once it passes.
     """
     payload = {
         "type": "group_message",
@@ -415,6 +433,12 @@ def encode_group_message(
     lineage = _clean_renamed_from(renamed_from)
     if lineage:
         payload["renamed_from"] = lineage
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
+    cleaned_expires_at = _clean_expires_at(expires_at)
+    if cleaned_expires_at is not None:
+        payload["expires_at"] = cleaned_expires_at
     return encode(payload, max_bytes=MAX_REQUEST_BYTES)
 
 
@@ -447,6 +471,8 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "creator": creator,
         "members": members,
         "renamed_from": _clean_renamed_from(payload.get("renamed_from")),
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
+        "expires_at": _clean_expires_at(payload.get("expires_at")),
     }
 
 
@@ -566,6 +592,104 @@ def parse_reaction(raw: Any) -> Dict[str, Any]:
 
 def reaction_unsigned_bytes(raw: Any) -> bytes:
     """Canonical bytes of a reaction payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+def retract_dict(
+    target: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/dm/retract`` payload as a dict, unsigned unless signed.
+
+    The signature — when present — covers every other field, exactly
+    like a reaction: the sender signs the canonical encoding of the
+    payload without ``"sig"`` and attaches the base64 signature, so the
+    receiver can verify attribution against the link identity
+    independently of the transport.  A retract names only the target
+    message id; the receiver checks that the caller is that message's
+    original sender before deleting anything.
+    """
+    target = _clean_message_id(target)
+    payload: Dict[str, Any] = {
+        "type": "retraction",
+        "v": PROTOCOL_VERSION,
+        "target": target,
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if message_id:
+        payload["id"] = message_id
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_retract(
+    target: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM retract for the ``/tau/dm/retract`` request.
+
+    ``target`` names the retracted message id.  ``signature`` is the
+    base64 signature over the canonical unsigned payload; see
+    :func:`retract_dict`.
+    """
+    return encode(
+        retract_dict(
+            target,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_retract(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/dm/retract`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "retraction":
+        raise ProtocolError("expected a retraction payload")
+    target = _clean_message_id(payload.get("target"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("retraction signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "retraction signature is not valid base64"
+            ) from exc
+    return {
+        "target": target,
+        "sent_at": sent_at,
+        "id": message_id,
+        "sig": signature,
+    }
+
+
+def retract_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of a retract payload without its signature.
 
     Used to verify the signature: the signer signs exactly these bytes,
     and the deterministic encoder reproduces them from the received
