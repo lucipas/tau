@@ -638,7 +638,7 @@ function MessageBubble({
               ♡ react
             </button>
           ) : null}
-          {onPin && message.status !== "queued" ? (
+          {onPin && message.status !== "queued" && message.wire_id ? (
             <button
               type="button"
               title={
