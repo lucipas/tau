@@ -4,9 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
 import { shortHash } from "@/lib/format";
-import type { TanExportDocument, TanPost } from "@/lib/types";
+import type { TanExportDocument, TanPost, TanVerifyReport } from "@/lib/types";
 
-import { PostCard, SocialConsole, TanBackupSection } from "./social-console";
+import {
+  PostCard,
+  SocialConsole,
+  TanBackupSection,
+  VerifyResult,
+} from "./social-console";
 
 const mockTan = vi.hoisted(() => ({
   current: {} as Record<string, unknown>,
@@ -66,6 +71,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -88,6 +94,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -107,6 +114,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost({ own: false })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -123,6 +131,7 @@ describe("PostCard delete control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={onDelete}
@@ -138,12 +147,94 @@ describe("PostCard delete control", () => {
   });
 });
 
+describe("VerifyResult", () => {
+  function makeReport(overrides: Partial<TanVerifyReport> = {}): TanVerifyReport {
+    return {
+      entries: 12,
+      authors: 3,
+      unlinked: 0,
+      problems: [],
+      ok: true,
+      ...overrides,
+    };
+  }
+
+  it("reports a healthy store with its counts", () => {
+    render(<VerifyResult report={makeReport()} />);
+    expect(
+      screen.getByText("store OK — 12 entries from 3 authors"),
+    ).toBeTruthy();
+  });
+
+  it("notes unlinked entries as partial sync, not damage", () => {
+    render(<VerifyResult report={makeReport({ unlinked: 2 })} />);
+    expect(screen.getByText(/2 unlinked \(partial sync\)/)).toBeTruthy();
+  });
+
+  it("lists each problem with its post hash and message", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 1 problem in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+  });
+
+  it("renders two faults on one post as separate rows", () => {
+    render(
+      <VerifyResult
+        report={makeReport({
+          entries: 2,
+          authors: 1,
+          ok: false,
+          problems: [
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "post hash does not match its contents",
+            },
+            {
+              hash: "c".repeat(64),
+              author: "a".repeat(64),
+              problem: "sequence jumps from 1 to 3",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(
+      screen.getByText("store NOT OK — 2 problems in 2 entries"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("post hash does not match its contents"),
+    ).toBeTruthy();
+    expect(screen.getByText("sequence jumps from 1 to 3")).toBeTruthy();
+  });
+});
+
 describe("PostCard edit control", () => {
   function renderCard(post: TanPost, onEdit = vi.fn().mockResolvedValue(true)) {
     render(
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         onEdit={onEdit}
@@ -238,6 +329,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -353,6 +445,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 2 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -365,6 +458,7 @@ describe("PostCard quote rendering", () => {
       <PostCard
         post={makePost({ quotes: 0 })}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onQuote={() => {}}
         onDelete={vi.fn()}
@@ -515,6 +609,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -546,6 +641,7 @@ describe("PostCard mute control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}
@@ -571,6 +667,10 @@ describe("SocialConsole muted sidebar", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       saved: [],
@@ -582,6 +682,8 @@ describe("SocialConsole muted sidebar", () => {
       unsave: vi.fn(),
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -693,10 +795,16 @@ describe("SocialConsole search", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -715,6 +823,7 @@ describe("SocialConsole search", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -792,10 +901,16 @@ describe("SocialConsole mentions view", () => {
       searchQuery: null,
       mentions: [],
       following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
       mutedAuthors: [],
       mutedKeywords: [],
       all: false,
       setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
       showMentions: false,
       setShowMentions: vi.fn(),
       loading: false,
@@ -814,6 +929,7 @@ describe("SocialConsole mentions view", () => {
       unmuteKeyword: vi.fn(),
       like: vi.fn(),
       unlike: vi.fn(),
+      repost: vi.fn(),
       deletePost: vi.fn(),
       sync: vi.fn(),
       threadRef: null,
@@ -859,6 +975,7 @@ describe("SocialConsole mentions view", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "following" }));
     expect(state.setShowMentions).toHaveBeenCalledWith(false);
+    expect(state.setView).toHaveBeenCalledWith("timeline");
     expect(state.setAll).toHaveBeenCalledWith(false);
   });
 
@@ -883,6 +1000,147 @@ describe("SocialConsole mentions view", () => {
   });
 });
 
+describe("SocialConsole authors directory", () => {
+  function hookState(overrides: Record<string, unknown> = {}) {
+    return {
+      posts: [],
+      searchResults: [],
+      searchQuery: null,
+      mentions: [],
+      following: [],
+      authors: [],
+      authorsTotal: 0,
+      loadMoreAuthors: vi.fn(),
+      suggestions: [],
+      mutedAuthors: [],
+      mutedKeywords: [],
+      all: false,
+      setAll: vi.fn(),
+      view: "timeline",
+      setView: vi.fn(),
+      showMentions: false,
+      setShowMentions: vi.fn(),
+      loading: false,
+      posting: false,
+      syncing: false,
+      error: null,
+      refresh: vi.fn(),
+      search: vi.fn(),
+      clearSearch: vi.fn(),
+      publish: vi.fn(),
+      follow: vi.fn(),
+      unfollow: vi.fn(),
+      muteAuthor: vi.fn(),
+      unmuteAuthor: vi.fn(),
+      muteKeyword: vi.fn(),
+      unmuteKeyword: vi.fn(),
+      like: vi.fn(),
+      unlike: vi.fn(),
+      deletePost: vi.fn(),
+      sync: vi.fn(),
+      threadRef: null,
+      threadPosts: null,
+      threadLoading: false,
+      threadError: null,
+      openThread: vi.fn(),
+      closeThread: vi.fn(),
+      saved: [],
+      savedLoading: false,
+      savedHasMore: false,
+      loadSaved: vi.fn(),
+      loadMoreSaved: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  function makeAuthor(overrides: Record<string, unknown> = {}) {
+    return {
+      author: "a".repeat(64),
+      name: "alice",
+      posts: 3,
+      last_post: 1000,
+      followed: false,
+      ...overrides,
+    };
+  }
+
+  it("lists known authors with a follow button for the unfollowed", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor(),
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    expect(screen.getByText("alice")).toBeTruthy();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText(/3 posts/)).toBeTruthy();
+
+    fireEvent.click(screen.getByTitle("follow this author"));
+    expect(state.follow).toHaveBeenCalledTimes(1);
+    expect(state.follow).toHaveBeenCalledWith("a".repeat(64));
+  });
+
+  it("offers to remove a followed author from the directory", () => {
+    const state = hookState({
+      authors: [
+        makeAuthor({
+          author: "b".repeat(64),
+          name: "bob",
+          posts: 1,
+          followed: true,
+        }),
+      ],
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    fireEvent.click(screen.getByTitle("unfollow this author"));
+    expect(state.unfollow).toHaveBeenCalledTimes(1);
+    expect(state.unfollow).toHaveBeenCalledWith("b".repeat(64));
+  });
+
+  it("says there are no authors yet when the store is empty", () => {
+    mockedUseTan.mockReturnValue(hookState());
+
+    render(<SocialConsole />);
+    expect(
+      screen.getByText("No authors yet. Sync to pull posts from your peers."),
+    ).toBeTruthy();
+  });
+
+  it("offers the next page while authors are still hidden", () => {
+    const state = hookState({
+      authors: [makeAuthor()],
+      authorsTotal: 120,
+    });
+    mockedUseTan.mockReturnValue(state);
+
+    render(<SocialConsole />);
+    const button = screen.getByText("show more (1 of 120)");
+    expect(button).toBeTruthy();
+
+    fireEvent.click(button);
+    expect(state.loadMoreAuthors).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the show-more button once every author is shown", () => {
+    mockedUseTan.mockReturnValue(
+      hookState({ authors: [makeAuthor()], authorsTotal: 1 }),
+    );
+
+    render(<SocialConsole />);
+    expect(screen.queryByText(/show more/)).toBeNull();
+  });
+});
+
 
 describe("PostCard save control", () => {
   function renderCard(post: TanPost, onToggleSave = vi.fn()) {
@@ -890,6 +1148,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={post}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onToggleSave={onToggleSave}
         onReply={() => {}}
         onDelete={vi.fn()}
@@ -921,6 +1180,7 @@ describe("PostCard save control", () => {
       <PostCard
         post={makePost()}
         onToggleLike={() => {}}
+        onRepost={() => {}}
         onReply={() => {}}
         onDelete={vi.fn()}
         deleting={false}

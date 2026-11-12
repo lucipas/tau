@@ -27,6 +27,7 @@ function renderCard(post: TanPost, onOpenThread?: (post: TanPost) => void) {
     <PostCard
       post={post}
       onToggleLike={() => {}}
+      onRepost={() => {}}
       onReply={() => {}}
       onDelete={() => {}}
       deleting={false}

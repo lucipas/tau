@@ -1,7 +1,15 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { NodeInfo, Peer, SocialInfo, TauGroup } from "@/lib/types";
+import { ApiError } from "@/lib/api";
+import type {
+  ChangeGroupMembersResponse,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+} from "@/lib/types";
+import type { PeerInfoState } from "@/lib/use-tau";
 
 import { PeerSidebar } from "./peer-sidebar";
 
@@ -46,21 +54,62 @@ function makeGroup(overrides: Partial<TauGroup> = {}): TauGroup {
   };
 }
 
+
+type SidebarOptions = {
+  peers?: Peer[];
+  onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  groups?: TauGroup[];
+  onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
+  onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
+  onAddGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
+  onRemoveGroupMembers?: (
+    group: string,
+    members: string[],
+  ) => Promise<ChangeGroupMembersResponse>;
+  node?: NodeInfo | null;
+  social?: SocialInfo | null;
+  blocks?: Record<string, { pending?: boolean; error?: string }>;
+  onBlock?: (destination: string) => void;
+  onUnblock?: (destination: string) => void;
+  onForgetPeer?: (destination: string, force: boolean) => Promise<void>;
+  infos?: Record<string, PeerInfoState>;
+  onInfo?: (destination: string) => void;
+};
+
 function renderSidebar(
   unread: Record<string, number>,
   onSelectPeer = vi.fn(),
-  options: {
-    groups?: TauGroup[];
-    onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
-    onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
-    node?: NodeInfo | null;
-    social?: SocialInfo | null;
-    peers?: Peer[];
-    blocks?: Record<string, { pending?: boolean; error?: string }>;
-    onBlock?: (destination: string) => void;
-    onUnblock?: (destination: string) => void;
-  } = {},
+  third:
+    | Record<string, PeerInfoState>
+    | ((destination: string, force: boolean) => Promise<void>)
+    | SidebarOptions = {},
+  onInfo = vi.fn(),
 ) {
+  // The branch's peer-info tests pass the infos record positionally as the
+  // third argument; the options object carries the same record as `infos`.
+  const infosRecord =
+    typeof third !== "function" &&
+    Object.values(third).some(
+      (value) =>
+        value !== null &&
+        typeof value === "object" &&
+        ("info" in value || "pending" in value || "error" in value),
+    );
+  const options: SidebarOptions =
+    typeof third === "function" || infosRecord
+      ? {}
+      : (third as unknown as SidebarOptions);
+  const infos = infosRecord
+    ? (third as Record<string, PeerInfoState>)
+    : (options.infos ?? {});
+  const onForgetPeer =
+    typeof third === "function" ? third : (options.onForgetPeer ?? vi.fn());
+  const onSetAlias =
+    options.onSetAlias ??
+    (async (destination: string) => makePeer({ destination }));
   return render(
     <PeerSidebar
       node={options.node ?? null}
@@ -74,19 +123,25 @@ function renderSidebar(
       bridge={null}
       social={options.social ?? null}
       pings={{}}
+      infos={infos}
       blocks={options.blocks ?? {}}
       verifications={{}}
       unread={unread}
       selected=""
       onPing={() => {}}
+      onInfo={options.onInfo ?? onInfo}
+      onForgetPeer={onForgetPeer}
       onBlock={options.onBlock ?? (() => {})}
       onUnblock={options.onUnblock ?? (() => {})}
       onVerify={() => {}}
       onShowSafetyNumber={() => {}}
       onDismissVerification={() => {}}
       onSelectPeer={onSelectPeer}
+      onSetAlias={onSetAlias}
       onCreateGroup={options.onCreateGroup}
       onDeleteGroup={options.onDeleteGroup}
+      onAddGroupMembers={options.onAddGroupMembers}
+      onRemoveGroupMembers={options.onRemoveGroupMembers}
     />,
   );
 }
@@ -119,6 +174,193 @@ describe("PeerSidebar unread badges", () => {
     renderSidebar({ ["ab".repeat(16)]: 150 });
 
     expect(screen.getByTitle("150 unread messages").textContent).toBe("99+");
+  });
+});
+
+describe("PeerSidebar peer info", () => {
+  const aliceHash = "ab".repeat(16);
+
+  it("asks for info when the info button is clicked", () => {
+    const onInfo = vi.fn();
+    renderSidebar({}, vi.fn(), {}, onInfo);
+
+    fireEvent.click(screen.getByLabelText("Show info for alice"));
+    expect(onInfo).toHaveBeenCalledWith(aliceHash);
+  });
+
+  it("shows the reported version, protocol, uptime, peers and LXMF state", () => {
+    renderSidebar(
+      {},
+      vi.fn(),
+      {
+        [aliceHash]: {
+          info: {
+            version: "0.2.0",
+            rns_version: "0.9.3",
+            protocol: 1,
+            uptime: 3661,
+            peers: 3,
+            lxmf_enabled: true,
+          },
+        },
+      },
+    );
+
+    expect(
+      screen.getByText(
+        "tau 0.2.0 · RNS 0.9.3 · protocol 1 · up 1h 01m · 3 peers · lxmf on",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("shows a pending line while asking the peer", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { pending: true } });
+
+    expect(screen.getByText("asking peer…")).toBeTruthy();
+  });
+
+  it("shows the error when the peer does not answer", () => {
+    renderSidebar({}, vi.fn(), {
+      [aliceHash]: { error: "peer did not answer" },
+    });
+
+    expect(screen.getByText("peer did not answer")).toBeTruthy();
+  });
+
+  it("says so when the peer answers with no usable info", () => {
+    renderSidebar({}, vi.fn(), { [aliceHash]: { info: {} } });
+
+    expect(screen.getByText("answered with no usable info")).toBeTruthy();
+  });
+});
+
+describe("PeerSidebar forget", () => {
+  it("asks for confirmation before forgetting a peer", async () => {
+    const onForgetPeer = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    const forget = screen.getByRole("button", { name: "Forget alice" });
+    fireEvent.click(forget);
+    expect(onForgetPeer).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Forget alice" }).textContent,
+    ).toBe("confirm forget");
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    expect(onForgetPeer).toHaveBeenCalledWith("ab".repeat(16), false);
+  });
+
+  it("offers to forget anyway when mail is still queued", async () => {
+    const onForgetPeer = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError("alice still has 2 queued message(s)", 400, "queued_mail", 2),
+      )
+      .mockResolvedValue(undefined);
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+
+    expect(
+      await screen.findByText(/still has 2 queued message/),
+    ).toBeTruthy();
+    const anyway = screen.getByRole("button", {
+      name: /forget anyway — strand 2 queued messages/,
+    });
+    fireEvent.click(anyway);
+    expect(onForgetPeer).toHaveBeenCalledTimes(2);
+    expect(onForgetPeer).toHaveBeenLastCalledWith("ab".repeat(16), true);
+  });
+
+  it("shows a plain error with no force option for other refusals", async () => {
+    const onForgetPeer = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError("alice still has mail acknowledgements owed", 400),
+      );
+    renderSidebar({}, vi.fn(), onForgetPeer);
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Forget alice" }));
+
+    expect(
+      await screen.findByText(/acknowledgements owed/),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /forget anyway/ }),
+    ).toBeNull();
+  });
+});
+describe("PeerSidebar aliases", () => {
+  it("shows the alias as the label and keeps the announced name visible", () => {
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ alias: "laptop" })],
+    });
+
+    expect(screen.getByText("laptop")).toBeTruthy();
+    expect(screen.getByText("announced as alice")).toBeTruthy();
+    expect(screen.getByTitle("Announced as alice")).toBeTruthy();
+  });
+
+  it("shows no alias badge for a peer without one", () => {
+    renderSidebar({});
+
+    expect(screen.queryByTitle(/Announced as/)).toBeNull();
+  });
+
+  it("saves a new alias through onSetAlias", async () => {
+    const onSetAlias = vi.fn(async (destination: string) =>
+      makePeer({ destination, alias: "laptop" }),
+    );
+    renderSidebar({}, vi.fn(), { onSetAlias });
+
+    fireEvent.click(screen.getByLabelText("Set alias for alice"));
+    fireEvent.change(screen.getByLabelText("Local alias for alice"), {
+      target: { value: "laptop" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    await waitFor(() =>
+      expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), "laptop"),
+    );
+  });
+
+  it("clears an alias through onSetAlias", async () => {
+    const onSetAlias = vi.fn(async (destination: string) =>
+      makePeer({ destination, alias: null }),
+    );
+    renderSidebar({}, vi.fn(), {
+      peers: [makePeer({ alias: "laptop" })],
+      onSetAlias,
+    });
+
+    fireEvent.click(screen.getByLabelText("Set alias for laptop"));
+    fireEvent.click(screen.getByText("clear alias"));
+
+    await waitFor(() =>
+      expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), null),
+    );
+  });
+
+  it("shows the server's message when saving fails", async () => {
+    const onSetAlias = vi.fn(async () => {
+      throw new Error("alias 'laptop' is already used by another peer");
+    });
+    renderSidebar({}, vi.fn(), { onSetAlias });
+
+    fireEvent.click(screen.getByLabelText("Set alias for alice"));
+    fireEvent.change(screen.getByLabelText("Local alias for alice"), {
+      target: { value: "laptop" },
+    });
+    fireEvent.click(screen.getByText("save"));
+
+    expect(
+      await screen.findByText(
+        "alias 'laptop' is already used by another peer",
+      ),
+    ).toBeTruthy();
+    expect(onSetAlias).toHaveBeenCalledWith("ab".repeat(16), "laptop");
   });
 });
 
@@ -201,6 +443,206 @@ describe("PeerSidebar group management", () => {
 
     expect(screen.queryByRole("button", { name: "+ new group" })).toBeNull();
     expect(screen.queryByRole("button", { name: "delete" })).toBeNull();
+  });
+
+  it("offers member changes only on groups this node created", () => {
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({ created_by_me: true }),
+        makeGroup({ id: "22".repeat(16), name: "theirs" }),
+      ],
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    expect(
+      screen.getAllByRole("button", { name: "members" }),
+    ).toHaveLength(1);
+  });
+
+  it("adds a picked peer to a group and closes the panel", async () => {
+    const successor = makeGroup({
+      id: "22".repeat(16),
+      members: [
+        { hash: "ab".repeat(16), name: "alice" },
+        { hash: "cd".repeat(16), name: "bob" },
+      ],
+    });
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+
+    expect(onAddGroupMembers).toHaveBeenCalledWith("11".repeat(16), [
+      "cd".repeat(16),
+    ]);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "add selected" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("removes a picked member from a group", async () => {
+    const successor = makeGroup({
+      id: "22".repeat(16),
+      members: [{ hash: "ab".repeat(16), name: "alice" }],
+    });
+    const onAddGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: successor,
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [makeGroup({ created_by_me: true })],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "remove selected" }));
+
+    expect(onRemoveGroupMembers).toHaveBeenCalledWith("11".repeat(16), [
+      "cd".repeat(16),
+    ]);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "remove selected" }),
+      ).toBeNull(),
+    );
+  });
+
+  it("shows a member-change error instead of closing the panel", async () => {
+    const onAddGroupMembers = vi.fn(async () => {
+      throw new Error("only the creator can change a group's members");
+    });
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+
+    await screen.findByText("only the creator can change a group's members");
+    expect(
+      screen.getByRole("button", { name: "add selected" }),
+    ).toBeTruthy();
+  });
+
+  it("does not let a finished change discard another group's editor", async () => {
+    let resolveAdd: (value: ChangeGroupMembersResponse) => void = () => {};
+    const pending = new Promise<ChangeGroupMembersResponse>((resolve) => {
+      resolveAdd = resolve;
+    });
+    const onAddGroupMembers = vi.fn(() => pending);
+    const onRemoveGroupMembers = vi.fn(async () => ({
+      ok: true,
+      group: makeGroup(),
+      previous_id: "11".repeat(16),
+    }));
+    renderSidebar({}, vi.fn(), {
+      groups: [
+        makeGroup({
+          created_by_me: true,
+          members: [{ hash: "ab".repeat(16), name: "alice" }],
+        }),
+        makeGroup({
+          id: "22".repeat(16),
+          name: "other",
+          created_by_me: true,
+          members: [
+            { hash: "ab".repeat(16), name: "alice" },
+            { hash: "cd".repeat(16), name: "bob" },
+          ],
+        }),
+      ],
+      node: makeNode(),
+      onAddGroupMembers,
+      onRemoveGroupMembers,
+    });
+
+    // Open the first group's editor and start adding bob.
+    fireEvent.click(screen.getAllByRole("button", { name: "members" })[0]);
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+    fireEvent.click(screen.getByRole("button", { name: "add selected" }));
+    expect(onAddGroupMembers).toHaveBeenCalledTimes(1);
+
+    // Switch to the other group's editor while the change is pending
+    // and pick bob for removal there.
+    fireEvent.click(screen.getByRole("button", { name: "members" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /bob/ }));
+
+    // The first change lands: the new editor keeps its selection and
+    // stays open.
+    await act(async () => {
+      resolveAdd({
+        ok: true,
+        group: makeGroup({ id: "33".repeat(16) }),
+        previous_id: "11".repeat(16),
+      });
+    });
+    expect(
+      screen.getByRole("button", { name: "remove selected" }),
+    ).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("checkbox", {
+          name: /bob/,
+        }) as HTMLInputElement
+      ).checked,
+    ).toBe(true);
   });
 });
 
