@@ -2004,10 +2004,12 @@ class TauNode:
                 # instead — the context is covered by the signature
                 # verified above, so a relay cannot retarget the
                 # reaction onto a different message.  A copy that
-                # arrived through an outbox retry carries a re-stamped
-                # send time and cannot resolve; the reaction is still
-                # stored under the wire target, and shows for the
-                # author, exactly as before.
+                # arrived through an outbox retry carries the shared
+                # send time and resolves the same way; only a copy
+                # queued before the shared time was recorded falls
+                # back to its enqueue time, and then the reaction is
+                # still stored under the wire target, and shows for
+                # the author, exactly as before.
                 # The signed context names the logical message, but
                 # a valid signature only proves who chose the
                 # context, not that they belong to the group: an
@@ -4799,9 +4801,11 @@ class TauNode:
         being reacted to), and a receiver that does not hold the
         target id resolves its own copy from that context instead —
         see :meth:`_handle_reaction`.  Copies that arrived through an
-        outbox retry carry a re-stamped send time and cannot resolve
-        this way; their reaction is still stored, and shows for the
-        author, exactly as a DM reaction to an unknown target would.
+        outbox retry carry the shared send time and resolve the same
+        way; only a copy queued before the shared time was recorded
+        falls back to its enqueue time, and then its reaction is
+        still stored, and shows for the author, exactly as a DM
+        reaction to an unknown target would.
 
         A failed leg reports an ``error`` instead of queueing: like
         DM reactions, group reactions are live-only in v1.  Returns

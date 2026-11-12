@@ -143,7 +143,17 @@ def build_bundle(
                 recipient_public_key=peer.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
+                group=(
+                    {
+                        "id": entry.group_id,
+                        "name": entry.group_name,
+                        "creator": entry.group_creator,
+                        "members": entry.group_members,
+                    }
+                    if entry.group_id is not None
+                    else None
+                ),
             )
         except MailboxError as exc:
             skipped.append({"id": entry.id, "reason": str(exc)})

@@ -975,8 +975,8 @@ class Inbox:
         ``sent_at`` is a float timestamp, so two distinct sends never
         share one; when several records match (a copy stored twice),
         the most recently received wins.  Returns ``None`` when no copy
-        matches (for example a copy that arrived through an outbox
-        retry, which re-stamps the send time).
+        matches — for example a copy queued before the shared send
+        time was recorded, which still carries its enqueue time.
         """
         try:
             wanted_at = float(sent_at)
