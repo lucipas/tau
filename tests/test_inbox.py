@@ -896,6 +896,125 @@ def test_mark_read_advances_only_to_up_to(tmp_path):
     assert [entry["unread"] for entry in listed] == [True, False, False]
 
 
+def test_mark_unread_marks_newest_message_unread_again(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_all_marks_whole_conversation_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert all(entry["unread"] for entry in inbox.list_messages())
+
+
+def test_mark_unread_is_noop_when_nothing_was_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    assert inbox.mark_unread(peer="bb" * 16) is None
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_leaves_other_peers_alone(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    inbox.mark_unread(peer="aa" * 16)
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_ignores_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=3.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_does_not_mark_unread_messages_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="a3", received_at=3.0))
+    inbox.mark_read(up_to_seq=1)
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    listed = inbox.list_messages()
+    assert [entry["unread"] for entry in listed] == [True, True, False]
+
+
+def test_sent_records_do_not_inflate_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.mark_read()
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+
+    # A reply this node sent is never unread for its owner.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == counts
+
+
+def test_mark_unread_raises_when_the_cursor_cannot_persist(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Inbox, "_save", _fail)
+    with pytest.raises(OSError):
+        inbox.mark_unread(peer="ab" * 16)
+
+    # The in-memory cursor is restored, and the on-disk state is untouched.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert Inbox(tmp_path / "inbox.json").unread_counts() == {
+        "per_peer": {},
+        "total": 0,
+    }
+
+
 def test_mark_read_never_moves_a_cursor_backward(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))

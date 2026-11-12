@@ -1026,9 +1026,17 @@ class Inbox:
         return annotated
 
     def _unread_counts_locked(self) -> Dict[str, Any]:
-        """Per-conversation unread counts from the in-memory state."""
+        """Per-conversation unread counts from the in-memory state.
+
+        Only received messages count: a reply this node sent is never
+        unread for its owner, so sent records past the cursor must not
+        inflate the counts (see :meth:`mark_unread`, which reports the
+        same received-only totals).
+        """
         per_peer: Dict[str, int] = {}
         for entry in self._messages:
+            if entry.get("direction") != "in":
+                continue
             if _is_unread(
                 entry, self._read_cursors.get(entry.get("destination") or "")
             ):
@@ -1094,6 +1102,63 @@ class Inbox:
                     "last_read_id": newest.get("id"),
                 }
             self._save()
+            return self._unread_counts_locked()
+
+    def mark_unread(
+        self, peer: str, *, all: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Move a conversation's read cursor back so mail shows unread again.
+
+        ``tau messages`` marks what it shows as read, so a read DM the
+        owner has not answered yet disappears from the unread view.
+        This is the way back: by default the newest received message for
+        the peer becomes unread again; ``all=True`` clears the cursor so
+        the whole conversation shows unread.  Only the local display
+        state moves — a read receipt already sent for a message stays
+        sent, and a delayed ``mark_read`` still cannot move a cursor
+        backward on its own.  A peer with no stored messages is left
+        alone and the return is ``None``; otherwise the unread counts
+        after the mark.  Raises ``OSError`` when the moved cursor
+        cannot be persisted, leaving the in-memory cursor untouched.
+        """
+        with self._transaction():
+            # Only received messages count: a reply we sent must neither
+            # stand in for the unread reminder nor satisfy the presence check.
+            entries = [
+                entry
+                for entry in self._messages
+                if (entry.get("destination") or "") == peer
+                and entry.get("direction") == "in"
+            ]
+            if not entries:
+                return None
+            snapshot = dict(self._read_cursors)
+            if all:
+                self._read_cursors.pop(peer, None)
+            else:
+                newest = max(entries, key=lambda entry: entry["seq"])
+                cursor = self._read_cursors.get(peer)
+                # Already unread: the newest received message is past the cursor.
+                if not _is_unread(newest, cursor):
+                    earlier = [
+                        entry for entry in entries if entry["seq"] < newest["seq"]
+                    ]
+                    if not earlier:
+                        self._read_cursors.pop(peer, None)
+                    else:
+                        # The newest is read, so the cursor is at or past it;
+                        # stepping to the previous received message only moves backward.
+                        previous = max(earlier, key=lambda entry: entry["seq"])
+                        self._read_cursors[peer] = {
+                            "last_read_seq": previous["seq"],
+                            "last_read_id": previous.get("id"),
+                        }
+            if self._read_cursors != snapshot:
+                try:
+                    self._save(strict=True)
+                except OSError:
+                    self._read_cursors = snapshot
+                    raise
             return self._unread_counts_locked()
 
     def find(self, message_id: str, *, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
