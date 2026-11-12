@@ -37,6 +37,7 @@ from .bundle import (
     DEFAULT_MAX_BUNDLE_BYTES,
     apply_bundle,
     build_bundle,
+    inspect_bundle,
     parse_bundle,
     serialize_bundle,
 )
@@ -1631,6 +1632,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse to read a bundle larger than N bytes (default: %(default)s)",
     )
     bundle_import.set_defaults(func=cmd_bundle_import)
+
+    bundle_inspect = bundle_sub.add_parser(
+        "inspect",
+        parents=[common],
+        help="describe a bundle file without importing it",
+    )
+    bundle_inspect.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='bundle file to read ("-" reads stdin)',
+    )
+    bundle_inspect.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to read a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_inspect.set_defaults(func=cmd_bundle_inspect)
 
     return parser
 
@@ -3474,6 +3495,132 @@ def cmd_bundle_import(args: argparse.Namespace) -> int:
             print(f"  skipped {ref}: {error['error']}")
     tan_clean = result["tan"] is None or result["tan"]["skipped"] == 0
     return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
+
+
+def _bundle_inspect_names(
+    config: TauConfig, summary: Dict[str, Any]
+) -> Dict[str, str]:
+    """Best-effort display names for the hashes in an inspect summary.
+
+    Names are a convenience only — the registry is read, never
+    written, and a missing or unreadable registry leaves every hash
+    unnamed rather than failing the inspect.
+    """
+    try:
+        registry = PeerRegistry(config.peers_path)
+    except (OSError, ValueError):
+        return {}
+    hashes = {summary.get("exporter")}
+    hashes.update(entry.get("to") for entry in summary.get("mail", []))
+    hashes.update(
+        entry.get("author")
+        for entry in summary.get("tan", [])
+        if entry.get("author")
+    )
+    names: Dict[str, str] = {}
+    for hexhash in hashes:
+        if not isinstance(hexhash, str):
+            continue
+        try:
+            peer = registry.get(hexhash)
+        except (ValueError, TypeError):
+            continue
+        if peer is not None:
+            names[hexhash] = peer.display_name
+    return names
+
+
+def cmd_bundle_inspect(args: argparse.Namespace) -> int:
+    """Describe a bundle file without importing it.
+
+    Read-only by construction: no identity is loaded and no mailbox
+    or Tan store is opened, so this works on a data directory that
+    has never run ``tau init`` and leaves local state untouched.  The
+    container signature is verified by :func:`parse_bundle` before
+    anything is listed, so a tampered bundle is rejected whole.
+    """
+    max_bytes = int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES))
+    if max_bytes <= 0:
+        raise NodeError("max bundle size must be positive")
+    # Read at most one byte past the cap, so an oversized input is
+    # detected without being loaded whole.
+    if str(args.file) == "-":
+        raw = sys.stdin.buffer.read(max_bytes + 1)
+    else:
+        try:
+            with Path(args.file).expanduser().open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    if len(raw) > max_bytes:
+        raise NodeError(f"bundle is over the {max_bytes} byte cap")
+    document = parse_bundle(raw, max_bytes=max_bytes)
+    summary = inspect_bundle(document)
+    try:
+        names = _bundle_inspect_names(_make_config(args), summary)
+    except (OSError, ValueError):
+        names = {}
+    exporter = summary.get("exporter")
+    summary["exporter_name"] = (
+        names.get(exporter) if isinstance(exporter, str) else None
+    )
+    for entry in summary["mail"]:
+        recipient = entry.get("to")
+        entry["to_name"] = (
+            names.get(recipient) if isinstance(recipient, str) else None
+        )
+    for entry in summary["tan"]:
+        author = entry.get("author")
+        entry["author_name"] = (
+            names.get(author) if isinstance(author, str) else None
+        )
+    if _json_mode(args):
+        _emit(summary, True)
+        return _EXIT_OK
+
+    def _when(value: Any) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        return "unknown"
+
+    def _who(hexhash: Any, name: Optional[str]) -> str:
+        if name:
+            return name
+        if isinstance(hexhash, str) and hexhash:
+            return _safe_id_prefix(hexhash)
+        return "?"
+
+    print(f"Bundle {summary.get('format')} v{summary.get('version')} — signature valid")
+    print(f"  exporter: {_who(exporter, summary['exporter_name'])}")
+    print(f"  created: {_when(summary.get('created_at'))}")
+    print(f"Sealed mail ({summary['mail_count']}):")
+    if not summary["mail"]:
+        print("  (none)")
+    for entry in summary["mail"]:
+        print(
+            f"  {_safe_id_prefix(str(entry.get('id') or ''))} -> "
+            f"{_who(entry.get('to'), entry.get('to_name'))}, "
+            f"expires {_when(entry.get('expires_at'))}"
+        )
+    print(f"Tan posts ({summary['tan_count']}):")
+    if not summary["tan"]:
+        print("  (none)")
+    for entry in summary["tan"]:
+        digest = entry.get("hash")
+        label = _safe_id_prefix(str(digest)) if digest else "?"
+        if entry["verified"]:
+            print(
+                f"  {label} {entry.get('kind')} by "
+                f"{_who(entry.get('author'), entry.get('author_name'))} "
+                f"({_when(entry.get('created_at'))}) — signature valid"
+            )
+        else:
+            print(
+                f"  {label} by "
+                f"{_who(entry.get('author'), entry.get('author_name'))} "
+                f"— signature invalid: {entry.get('error')}"
+            )
+    return _EXIT_OK
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

@@ -264,6 +264,81 @@ def parse_bundle(raw: bytes, *, max_bytes: int = DEFAULT_MAX_BUNDLE_BYTES) -> Di
     return document
 
 
+def inspect_bundle(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe a parsed bundle without importing it.
+
+    A read-only summary of what a bundle carries: the manifest
+    (exporter, creation time, counts) plus one record per sealed-mail
+    entry and per Tan post.  The container signature is already
+    verified by :func:`parse_bundle`; each Tan post gets its own
+    signature check here, reported per entry — a post that fails it
+    is listed as unverified with its error, never fatal to the rest
+    of the listing.  Sealed mail is described, never decrypted, and
+    nothing is written to the mailbox or the Tan store.
+    """
+    manifest = document.get("manifest")
+    if not isinstance(manifest, dict):
+        manifest = {}
+    mail: List[Dict[str, Any]] = []
+    for entry in document.get("mail") or []:
+        if not isinstance(entry, dict):
+            continue
+        mail.append(
+            {
+                "id": entry.get("id"),
+                "to": entry.get("to"),
+                "expires_at": entry.get("expires_at"),
+            }
+        )
+    tan: List[Dict[str, Any]] = []
+    tan_document = document.get("tan")
+    entries = (
+        tan_document.get("entries")
+        if isinstance(tan_document, dict)
+        else None
+    )
+    for entry in entries or []:
+        record: Dict[str, Any] = {
+            "hash": entry.get("hash") if isinstance(entry, dict) else None,
+            "author": None,
+            "kind": None,
+            "created_at": None,
+            "verified": False,
+            "error": None,
+        }
+        try:
+            post = verify_post(entry)
+        except (
+            TanError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            OverflowError,
+        ) as exc:
+            record["error"] = str(exc)
+        else:
+            record.update(
+                {
+                    "author": post["author"],
+                    "kind": post["kind"],
+                    "created_at": post["created_at"],
+                    "verified": True,
+                }
+            )
+        tan.append(record)
+    return {
+        "format": document.get("format"),
+        "version": document.get("version"),
+        "exporter": manifest.get("exporter"),
+        "created_at": manifest.get("created_at"),
+        "mail": mail,
+        "mail_count": len(mail),
+        "tan": tan,
+        "tan_count": len(tan),
+    }
+
+
 def _admit_tan_entries(
     tan_document: Any, admit: Callable[[str], bool]
 ) -> Tuple[Any, List[Dict[str, str]]]:
