@@ -4215,6 +4215,421 @@ def test_send_reply_to_unknown_reference_is_an_error(
     assert _FakeSendNode.instances[0].sent == []
 
 
+def _seed_group_reply_conversation(tmp_path):
+    """One received group message in \"weekend\", plus a same-prefix
+    message in a different group that must never resolve for it."""
+    from tau.groups import GroupStore
+    from tau.protocol import excerpt_hash
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    store = GroupStore(config.groups_path)
+    group = store.create("weekend", members, created_by="ab" * 16)
+    other_members = ["ab" * 16, "12" * 16, "34" * 16]
+    other = store.create("other", other_members, created_by="ab" * 16)
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "original thought",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "a" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "seconded",
+            "sent_at": 11.0,
+            "received_at": 21.0,
+            "id": "b" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "not this group",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "a" * 31 + "f",
+            "kind": "group",
+            "group": other["id"],
+            "group_name": "other",
+            "direction": "in",
+        }
+    )
+    return data_dir, group, other
+
+
+def test_resolve_group_reply_target_scopes_to_the_group(tmp_path):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+
+    ref = cli._resolve_group_reply_target(inbox, mailbox, "aaaa", group["id"])
+    assert ref["id"] == "a" * 32
+    # The other group's message shares the "aaaa" prefix but must not
+    # leak into this group's resolution: its full id is unknown here.
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_reply_target(
+            inbox, mailbox, "a" * 31 + "f", group["id"]
+        )
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_group_reply_target(inbox, mailbox, "zzzz", group["id"])
+
+
+def test_resolve_group_reply_target_rejects_prefix_shared_across_stores(
+    tmp_path,
+):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    # A queued leg in the same group shares the "aaaa" prefix with the
+    # received one, so the reference is ambiguous and must be refused.
+    mailbox.enqueue(
+        to=bytes.fromhex("ef" * 16),
+        text="queued",
+        message_id="aaaa" + "c" * 28,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    with pytest.raises(cli.NodeError, match="2 messages"):
+        cli._resolve_group_reply_target(inbox, mailbox, "aaaa", group["id"])
+
+
+def test_group_messages_renders_quote_from_local_history(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "↩ alice: original thought" in out
+    assert "seconded" in out
+
+
+def test_group_messages_quote_falls_back_to_excerpt(tmp_path, capsys):
+    """Group legs carry per-member ids: the quoted leg id may never
+    have been held here, but the same text under another leg id still
+    renders the quote via the excerpt hash."""
+    from tau.protocol import excerpt_hash
+
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "carol",
+            "destination": "ef" * 16,
+            "text": "agreed, different leg",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "c" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": excerpt_hash("original thought"),
+            },
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    # Two quote lines: `seconded` via its exact-id reference and
+    # `agreed, different leg` via the excerpt fallback.
+    assert out.count("↩ alice: original thought") == 2
+    assert "agreed, different leg" in out
+
+
+class _FakeGroupSendNode:
+    """Stub TauNode for `tau group send`: records the reply reference."""
+
+    instances: list = []
+
+    def __init__(self, config, **kwargs):
+        from tau.groups import GroupStore
+
+        self.config = config
+        self.groups = GroupStore(config.groups_path)
+        self.sent: list = []
+        _FakeGroupSendNode.instances.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_group_message(self, group, text, **kwargs):
+        self.sent.append((group, text, kwargs.get("in_reply_to")))
+        return {
+            "ok": True,
+            "group": group["id"],
+            "name": group["name"],
+            "results": [
+                {
+                    "to": "cd" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "id": "f" * 32,
+                }
+            ],
+        }
+
+    def flush_outbox(self, **kwargs):
+        pass
+
+
+def test_group_send_reply_to_resolves_prefix_and_sends_reference(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "aaaa",
+            "weekend",
+            "seconded, again",
+        ]
+    )
+    assert code == 0
+    node = _FakeGroupSendNode.instances[0]
+    assert len(node.sent) == 1
+    sent_group, _, in_reply_to = node.sent[0]
+    assert sent_group["id"] == group["id"]
+    assert in_reply_to["id"] == "a" * 32
+    assert in_reply_to["excerpt"] == cli.excerpt_hash("original thought")
+    assert "delivered to alice" in capsys.readouterr().out
+
+
+def test_group_send_reply_to_unknown_reference_is_an_error(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "zzzz",
+            "weekend",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "no message" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_group_send_reply_to_empty_is_an_error(tmp_path, capsys, monkeypatch):
+    data_dir, _, _ = _seed_group_reply_conversation(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendNode)
+    _FakeGroupSendNode.instances.clear()
+    code = cli.main(
+        [
+            "group",
+            "send",
+            "--data-dir",
+            str(data_dir),
+            "--reply-to",
+            "",
+            "weekend",
+            "dangling",
+        ]
+    )
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+    assert _FakeGroupSendNode.instances == []
+
+
+def test_direct_reply_target_still_quotes_received_group_message(tmp_path):
+    """Narrowing the DM/group boundary: a *received* group message
+    from a peer keeps quoting in a DM to that peer, exactly as before
+    this PR — only the new group-send records stay out of DMs."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    ref = cli._resolve_reply_target(inbox, mailbox, "a" * 32, "cd" * 16)
+    assert ref["id"] == "a" * 32
+
+
+def test_direct_reply_target_excludes_queued_group_leg(tmp_path):
+    """A queued group leg to the peer is not a DM reply target: its
+    id belongs to the group send."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.enqueue(
+        to=bytes.fromhex("cd" * 16),
+        text="queued leg",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    with pytest.raises(cli.NodeError, match="no message"):
+        cli._resolve_reply_target(inbox, mailbox, "dddd", "cd" * 16)
+
+
+def test_direct_quote_of_received_group_message_renders(tmp_path, capsys):
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": "cd" * 16,
+            "text": "quoting the group in a DM",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "e" * 32,
+            "direction": "in",
+            "in_reply_to": {
+                "id": "a" * 32,
+                "excerpt": cli.excerpt_hash("original thought"),
+            },
+        }
+    )
+    code = cli.main(
+        [
+            "messages",
+            "--data-dir",
+            str(data_dir),
+            "--search",
+            "quoting the group",
+        ]
+    )
+    assert code == 0
+    assert "↩ alice: original thought" in capsys.readouterr().out
+
+
+def test_group_reply_target_dedupes_queued_leg_with_sent_record(tmp_path):
+    """A queued leg whose id is already covered by the group send's
+    inbox record (in leg_ids) is one candidate, not an ambiguity."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    mailbox = Mailbox(config.mailbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "hello group",
+            "sent_at": 13.0,
+            "received_at": 23.0,
+            "id": "c" * 31 + "1",
+            "leg_ids": ["c" * 31 + "1", "d" * 32],
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "out",
+        }
+    )
+    mailbox.enqueue(
+        to=bytes.fromhex("ef" * 16),
+        text="hello group",
+        message_id="d" * 32,
+        group={
+            "id": group["id"],
+            "name": "weekend",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16, "ef" * 16],
+        },
+    )
+    ref = cli._resolve_group_reply_target(inbox, mailbox, "d" * 32, group["id"])
+    assert ref["id"] == "d" * 32
+    assert ref["excerpt"] == cli.excerpt_hash("hello group")
+
+
+def test_group_quote_with_duplicate_text_is_unavailable(tmp_path, capsys):
+    """Two members posting identical text leaves the excerpt fallback
+    with no author to attribute the quote to."""
+    data_dir, group, _ = _seed_group_reply_conversation(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    for sender, destination in (("alice", "cd" * 16), ("carol", "ef" * 16)):
+        inbox.append(
+            {
+                "from": sender,
+                "destination": destination,
+                "text": "same words",
+                "sent_at": 13.0,
+                "received_at": 23.0,
+                "id": "f" * 31 + ("1" if sender == "alice" else "2"),
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "weekend",
+                "direction": "in",
+            }
+        )
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "ab" * 16,
+            "text": "which one?",
+            "sent_at": 14.0,
+            "received_at": 24.0,
+            "id": "c" * 32,
+            "kind": "group",
+            "group": group["id"],
+            "group_name": "weekend",
+            "direction": "in",
+            "in_reply_to": {
+                "id": "d" * 32,
+                "excerpt": cli.excerpt_hash("same words"),
+            },
+        }
+    )
+    code = cli.main(
+        ["messages", "--data-dir", str(data_dir), "--group", group["id"]]
+    )
+    assert code == 0
+    assert "↩ original not available" in capsys.readouterr().out
+
+
 def _run_forward(tmp_path, monkeypatch, argv):
     monkeypatch.setattr(cli, "TauNode", _FakeSendNode)
     _FakeSendNode.instances.clear()

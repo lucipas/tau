@@ -368,6 +368,7 @@ def encode_group_message(
     creator: str,
     members: List[str],
     sent_at: Optional[float] = None,
+    in_reply_to: Optional[Dict[str, Any]] = None,
     expires_at: Optional[float] = None,
 ) -> bytes:
     """Encode a group chat message for the ``/tau/group`` request.
@@ -377,7 +378,9 @@ def encode_group_message(
     recipient that has never seen the group can learn and pin it.  The
     group id is derived from the creator, name and roster (see
     :func:`derive_group_id`), so the roster a message carries must match
-    the id it claims.
+    the id it claims.  ``in_reply_to`` optionally names the earlier
+    message in the group this one quotes, exactly like a direct
+    message (see :func:`clean_in_reply_to`).
 
     ``expires_at`` is an optional sender-set expiry (epoch seconds),
     exactly like a direct message: the receiver shows the deadline and
@@ -396,6 +399,9 @@ def encode_group_message(
     }
     if message_id:
         payload["id"] = message_id
+    reply_to = clean_in_reply_to(in_reply_to)
+    if reply_to is not None:
+        payload["in_reply_to"] = reply_to
     cleaned_expires_at = _clean_expires_at(expires_at)
     if cleaned_expires_at is not None:
         payload["expires_at"] = cleaned_expires_at
@@ -430,6 +436,7 @@ def parse_group_message(raw: Any) -> Dict[str, Any]:
         "group_name": group_name,
         "creator": creator,
         "members": members,
+        "in_reply_to": clean_in_reply_to(payload.get("in_reply_to")),
         "expires_at": _clean_expires_at(payload.get("expires_at")),
     }
 

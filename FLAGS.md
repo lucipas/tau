@@ -41,7 +41,7 @@ Global options may appear before or after the command:
 | `tau group leave GROUP` | Leave a group you joined: drop it and remember the id, so the next message for it is rejected instead of re-pinning the group (refuses groups this node created — delete those instead) |
 | `tau group rejoin ID` | Undo a leave so the next message pins the group again (full group id) |
 | `tau group left` | List groups this node has left |
-| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration) |
+| `tau group send GROUP TEXT` | Send a message to every member of a group (queued per member when offline; `--expire 30s` makes it a disappearing message, purged from receivers' inboxes after the duration; `--reply-to ID` replies to an earlier message in the group, quoting it — options come before the group name, as with `--timeout`) |
 | `tau group send-file GROUP FILE` | Send a file (at most 10 MiB) to every member of a group, one direct transfer per member (a member that cannot be reached or refuses is reported as failed, not queued) |
 | `tau group ignore GROUP` | Hide a group's messages from `tau messages` (history kept, mail keeps arriving; idempotent) |
 | `tau group unignore GROUP` | Show an ignored group's messages in `tau messages` again (idempotent) |

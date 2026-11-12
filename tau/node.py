@@ -1692,6 +1692,8 @@ class TauNode:
                 "group_name": group["name"],
                 "expires_at": message.get("expires_at"),
             }
+            if message.get("in_reply_to") is not None:
+                record["in_reply_to"] = message["in_reply_to"]
             log.info(
                 "Group message from %s (%s) in %s: %s",
                 caller_name,
@@ -2605,6 +2607,7 @@ class TauNode:
                 group_name=entry.group_name,
                 creator=entry.group_creator,
                 members=entry.group_members,
+                in_reply_to=entry.in_reply_to,
                 expires_at=entry.message_expires_at,
             )
             if entry.group_id is not None
@@ -3792,6 +3795,7 @@ class TauNode:
         timeout: float = 20.0,
         discover_timeout: Optional[float] = None,
         queue: bool = True,
+        in_reply_to: Optional[Dict[str, Any]] = None,
         expires_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Fan *text* out to every member of a group except this node.
@@ -3807,6 +3811,16 @@ class TauNode:
         per-member result list: ``delivered``, ``queued``, or an
         ``error`` for that leg.
 
+        ``in_reply_to`` quotes an earlier message in the group:
+        ``{\"id\": <wire id>, \"excerpt\": <short hash>}``.  The
+        reference travels on every leg, through queued legs and
+        sealed relay copies, exactly like a direct-message reply.
+        Each send is recorded once in the local inbox (direction out,
+        like a sent DM), with every leg id in ``leg_ids`` — so the
+        sender's own group message can itself be quoted and a peer's
+        reply to it renders — without one record per leg evicting
+        sent DMs from the shared sent cap.
+
         ``expires_at`` is an optional sender-set expiry (epoch seconds),
         exactly like a direct message: it travels in every leg's
         payload, a queued leg expires at the same deadline, and the
@@ -3820,6 +3834,7 @@ class TauNode:
                 "group record has no creator; delete it and re-create it"
             )
         normalized = normalize_message(text)
+        reply_to = clean_in_reply_to(in_reply_to)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]
         context = {
@@ -3828,6 +3843,9 @@ class TauNode:
             "creator": creator,
             "members": list(group["members"]),
         }
+        # Leg ids that were delivered or queued (never a refused leg:
+        # its id reached nobody, so nobody can quote it).
+        sent_leg_ids: List[str] = []
         results: List[Dict[str, Any]] = []
         any_queued = False
         # Check the full group request size once, before any leg is sent
@@ -3841,6 +3859,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                in_reply_to=reply_to,
                 expires_at=expires_at,
             )
         except ProtocolError as exc:
@@ -3857,6 +3876,7 @@ class TauNode:
                 group_name=group["name"],
                 creator=creator,
                 members=list(group["members"]),
+                in_reply_to=reply_to,
                 expires_at=expires_at,
             )
             peer: Optional[Peer] = None
@@ -3916,6 +3936,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
                     results.append(
@@ -3934,6 +3955,7 @@ class TauNode:
                     text=normalized,
                     sent_at=entry.created_at,
                 )
+                sent_leg_ids.append(entry.id)
                 any_queued = True
                 results.append(
                     {
@@ -3994,6 +4016,7 @@ class TauNode:
                     )
                     continue
                 self.mailbox.record_delivered(message_id)
+                sent_leg_ids.append(message_id)
                 results.append(
                     {
                         "to": member,
@@ -4056,6 +4079,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
                     # The outbox is full (or the write failed): record the
@@ -4085,6 +4109,7 @@ class TauNode:
                     text=normalized,
                     sent_at=entry.created_at,
                 )
+                sent_leg_ids.append(entry.id)
                 any_queued = True
                 log.info(
                     "Member %s is unreachable; queued group message %s "
@@ -4101,6 +4126,29 @@ class TauNode:
                         "expires_at": entry.expires_at,
                     }
                 )
+        # One inbox record per send, not one per leg: a 31-member group
+        # would otherwise write 31 records (and 31 inbox.json saves)
+        # and evict sent DMs from the shared sent cap.  The record
+        # carries every delivered-or-queued leg id so any leg can be
+        # quoted; it has no single member destination, so a direct
+        # reply can never resolve against it.
+        if sent_leg_ids:
+            self._record_sent(
+                {
+                    "from": self.name,
+                    "destination": "",
+                    "text": normalized,
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": group["name"],
+                    "sent_at": time.time(),
+                    "received_at": time.time(),
+                    "id": sent_leg_ids[0],
+                    "leg_ids": list(sent_leg_ids),
+                    "direction": "out",
+                    **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                }
+            )
         if any_queued:
             threading.Thread(
                 target=self.flush_outbox,
