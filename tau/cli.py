@@ -3510,17 +3510,23 @@ def _bundle_inspect_names(
         registry = PeerRegistry(config.peers_path)
     except (OSError, ValueError):
         return {}
-    hashes = {summary.get("exporter")}
-    hashes.update(entry.get("to") for entry in summary.get("mail", []))
-    hashes.update(
-        entry.get("author")
-        for entry in summary.get("tan", [])
-        if entry.get("author")
-    )
+    hashes = set()
+    for value in (
+        [summary.get("exporter")]
+        + [entry.get("to") for entry in summary.get("mail", [])]
+        + [
+            entry.get("author")
+            for entry in summary.get("tan", [])
+            if entry.get("author")
+        ]
+    ):
+        # Only strings can be looked up; a malformed recipient (a
+        # list or object in a signed bundle) stays unnamed instead
+        # of crashing the lookup with an unhashable value.
+        if isinstance(value, str) and value:
+            hashes.add(value)
     names: Dict[str, str] = {}
     for hexhash in hashes:
-        if not isinstance(hexhash, str):
-            continue
         try:
             peer = registry.get(hexhash)
         except (ValueError, TypeError):
@@ -3580,7 +3586,12 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
 
     def _when(value: Any) -> str:
         if isinstance(value, (int, float)) and math.isfinite(value):
-            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+            try:
+                return datetime.fromtimestamp(float(value)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except (OverflowError, OSError, ValueError):
+                return "out of range"
         return "unknown"
 
     def _who(hexhash: Any, name: Optional[str]) -> str:
@@ -3597,12 +3608,22 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
     if not summary["mail"]:
         print("  (none)")
     for entry in summary["mail"]:
+        if not entry["valid"]:
+            ref = _safe_id_prefix(str(entry.get("id") or "")) or "?"
+            print(
+                f"  {ref} -> "
+                f"{_who(entry.get('to'), entry.get('to_name'))} "
+                f"— invalid: {entry.get('error')}"
+            )
+            continue
         print(
             f"  {_safe_id_prefix(str(entry.get('id') or ''))} -> "
             f"{_who(entry.get('to'), entry.get('to_name'))}, "
             f"expires {_when(entry.get('expires_at'))}"
         )
     print(f"Tan posts ({summary['tan_count']}):")
+    if summary.get("tan_error"):
+        print(f"  Tan section unusable: {summary['tan_error']}")
     if not summary["tan"]:
         print("  (none)")
     for entry in summary["tan"]:
@@ -3615,10 +3636,21 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
                 f"({_when(entry.get('created_at'))}) — signature valid"
             )
         else:
+            # Raw metadata survives verification failure, labelled
+            # unverified: the author/kind/time are claims from the
+            # entry itself, not authenticated facts.
+            author = _who(entry.get("author"), entry.get("author_name"))
+            if entry.get("author"):
+                author += " (unverified)"
+            detail = ""
+            if entry.get("kind") or entry.get("created_at") is not None:
+                detail = (
+                    f" {entry.get('kind') or '?'}"
+                    f" ({_when(entry.get('created_at'))})"
+                )
             print(
-                f"  {label} by "
-                f"{_who(entry.get('author'), entry.get('author_name'))} "
-                f"— signature invalid: {entry.get('error')}"
+                f"  {label} by {author}{detail}"
+                f" — signature invalid: {entry.get('error')}"
             )
     return _EXIT_OK
 

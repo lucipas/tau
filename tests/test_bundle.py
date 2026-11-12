@@ -724,3 +724,138 @@ def test_cli_bundle_inspect_rejects_non_bundle(tmp_path, capsys):
         == 1
     )
     assert "not valid JSON" in capsys.readouterr().err
+
+
+def _resign(sender, document):
+    """Re-sign a mutated bundle document with the exporter's key.
+
+    Lets a test build a bundle that is still container-valid while
+    its contents are malformed — the shape a hostile or buggy
+    exporter could actually produce.
+    """
+    import base64
+
+    from tau.bundle import _canonical_bytes, _payload
+
+    signature = sender.sign(_canonical_bytes(_payload(document)))
+    document["sig"] = base64.b64encode(signature).decode("ascii")
+    return document
+
+
+def test_inspect_bundle_reports_malformed_mail_entries(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["mail"] = [
+        42,
+        {"id": "bad-to", "to": ["not", "a", "hash"], "expires_at": 1000.0},
+        {
+            "id": "bad-expiry",
+            "to": destination_hash(recipient).hex(),
+            "expires_at": float("inf"),
+        },
+    ]
+    summary = inspect_bundle(document)
+    assert summary["mail_count"] == 3
+    assert summary["mail"][0]["valid"] is False
+    assert summary["mail"][0]["error"] == "mail entry is not an object"
+    assert summary["mail"][1]["valid"] is False
+    assert summary["mail"][1]["error"] == "mail entry has no destination"
+    assert summary["mail"][2]["valid"] is False
+    assert summary["mail"][2]["expires_at"] is None
+    assert "expiry" in summary["mail"][2]["error"]
+
+
+def test_inspect_bundle_reports_malformed_tan_section(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"] = {"entries": 1}
+    summary = inspect_bundle(document)
+    assert summary["tan"] == []
+    assert summary["tan_error"] == "Tan section has no entries list"
+    document["tan"] = "junk"
+    summary = inspect_bundle(document)
+    assert summary["tan"] == []
+    assert summary["tan_error"] == "Tan section has no entries list"
+
+
+def test_inspect_bundle_normalizes_nonfinite_timestamps(tmp_path):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["manifest"]["created_at"] = float("nan")
+    summary = inspect_bundle(document)
+    assert summary["created_at"] is None
+    # The summary must stay real JSON: no NaN token leaks out.
+    assert "NaN" not in json.dumps(summary)
+
+
+def test_inspect_bundle_keeps_unverified_tan_metadata(tmp_path):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["text"] = "tampered"
+    summary = inspect_bundle(document)
+    entry = summary["tan"][0]
+    assert entry["verified"] is False
+    assert entry["author"] == destination_hash(sender).hex()
+    assert entry["kind"] == "post"
+    assert entry["created_at"] == 1000
+    assert "hash does not match" in entry["error"]
+
+
+def test_cli_bundle_inspect_malformed_signed_bundle(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, _ = _build_with_tan(tmp_path, sender, recipient)
+    document["mail"].append(42)
+    document["mail"][0]["expires_at"] = 1e308
+    document["tan"] = {"entries": 1}
+    document["manifest"]["created_at"] = float("nan")
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "invalid: mail entry is not an object" in out
+    assert "Tan section unusable: Tan section has no entries list" in out
+    assert "out of range" in out
+
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "bundle",
+                "inspect",
+                str(bundle_file),
+                "--data-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    raw = capsys.readouterr().out
+    assert "NaN" not in raw
+    payload = json.loads(raw)
+    assert payload["mail_count"] == 3
+    assert payload["created_at"] is None
+    assert payload["tan_error"] == "Tan section has no entries list"
+
+
+def test_cli_bundle_inspect_unverified_tan_metadata(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["text"] = "tampered"
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "(unverified)" in out
+    assert "post" in out
+    assert "signature invalid" in out
