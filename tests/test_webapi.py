@@ -33,6 +33,7 @@ from tau.webapi import (
     WebBridge,
     WebBridgeError,
     _backup_name,
+    _clean_stored_message,
     check_web_console_bind,
 )
 
@@ -5755,6 +5756,84 @@ def test_record_delivery_flips_queued_message_and_publishes(bridge, node):
     assert updates[0]["message"]["status"] == "delivered"
 
 
+def test_record_delivery_reads_route_before_bridge_lock(bridge, node):
+    # CodeRabbit Major: _delivery_route takes the mailbox lock, so
+    # it must not run while the bridge lock is held — an inbound
+    # retraction takes the locks in the opposite order (mailbox
+    # transaction, then the bridge lock through on_retract), and the
+    # two paths would deadlock if they overlapped.
+    _queue_send(node)
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+    seen = []
+    real_sent_record = node.mailbox.sent_record
+
+    def spy(message_id):
+        seen.append(bridge._lock.locked())
+        return real_sent_record(message_id)
+
+    node.mailbox.sent_record = spy
+    try:
+        updated = bridge.record_delivery("mail-1")
+    finally:
+        node.mailbox.sent_record = real_sent_record
+    assert updated is not None
+    assert updated["status"] == "delivered"
+    assert seen == [False]
+
+
+def test_send_message_flip_reads_route_before_bridge_lock(bridge, node):
+    # Same lock-order finding, second path: a delivery report that
+    # arrived before the send is reconciled in send_message's
+    # early-delivery flip, which also read the route under the
+    # bridge lock.
+    _queue_send(node)
+    bridge._early_deliveries["mail-1"] = None
+    seen = []
+    real_sent_record = node.mailbox.sent_record
+
+    def spy(message_id):
+        seen.append(bridge._lock.locked())
+        return real_sent_record(message_id)
+
+    node.mailbox.sent_record = spy
+    try:
+        _, _, sent = _json(
+            bridge, "/api/messages", method="POST",
+            body={"to": "alice", "text": "hi"},
+        )
+    finally:
+        node.mailbox.sent_record = real_sent_record
+    assert sent["message"]["status"] == "delivered"
+    assert seen == [False]
+
+
+def test_record_delivery_updates_route_to_lxmf_after_direct_delivery(
+    bridge, node
+):
+    # CodeRabbit Major: a message delivered directly and later
+    # re-delivered over LXMF must not keep the stale "direct"
+    # route — the recipient now holds an lxmf: copy, and a retract
+    # reading "direct" would miss it while reporting success.
+    _queue_send(node)
+    node.mailbox.record_sent(
+        "mail-1", to=bytes.fromhex(PEER_HASH), text="hi", sent_at=1000.0
+    )
+    node.mailbox.record_delivered("mail-1", now=1002.0, via="direct")
+    _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["delivered_via"] == "direct"
+
+    node.mailbox.record_delivered("mail-1", now=1003.0, via="lxmf")
+    updated = bridge.record_delivery("mail-1")
+    assert updated is not None
+    assert updated["delivered_via"] == "lxmf"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["delivered_via"] == "lxmf"
+    assert feed["messages"][0]["status"] == "delivered"
+
+
 def test_record_delivery_ignores_unknown_id(bridge, node):
     _queue_send(node)
     _json(bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"})
@@ -7375,6 +7454,82 @@ def test_overlaid_group_reactions_persist_to_history(node, tmp_path):
         bridge.stop()
 
 
+def test_pin_event_hides_non_member_group_reaction(bridge, node, tmp_path):
+    """Pinning a group message must not leak a non-member reaction
+    (CodeRabbit Major on PR #303).
+
+    The pin endpoint publishes a ``message_updated`` carrying the
+    inbox's overlays; it overlaid reactions without the group-roster
+    filter that :meth:`messages` applies, so an open tab learned of
+    a CLI-made reaction a fresh read hides.  The event must agree
+    with the listing.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+    node.inbox = Inbox(inbox_path)
+    cli_inbox = Inbox(inbox_path)
+    group = node.groups.find("crew")
+    message = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group["id"],
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-g1",
+    }
+    node.inbox.append(dict(message))
+    assert bridge.record_inbound(dict(message)) is not None
+    # CLI-made reactions, written by a second process: one from a
+    # non-member, one from a member.
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": OTHER_HASH,
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-1",
+        }
+    )
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "reaction": "👍",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-2",
+        }
+    )
+    status, _, _ = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    updates = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+        and event.get("message", {}).get("wire_id") == "wire-g1"
+    ]
+    assert len(updates) == 1
+    assert updates[0]["message"]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+    assert updates[0]["message"]["pinned"] is True
+    assert bridge.messages()[0]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+
+
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {
@@ -7807,6 +7962,555 @@ def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     )
     assert status == 400
     assert "field 'id'" in payload["error"]["message"]
+
+
+def _sent_console_entry(bridge, node, *, wire_id="wire-1", **overrides):
+    node.inbox.append(
+        {
+            "id": wire_id,
+            "destination": PEER_HASH,
+            "direction": "out",
+            "from": "tester",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    node.mailbox.record_sent(
+        wire_id, to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    entry = bridge._append_message(
+        **{
+            "direction": "out",
+            "peer": PEER_HASH,
+            "peer_name": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "status": "delivered",
+            "wire_id": wire_id,
+            **overrides,
+        }
+    )
+    assert entry is not None
+    return entry
+
+
+def test_retract_message_endpoint_retracts_and_removes_local_copies(
+    bridge, node
+):
+    _sent_console_entry(bridge, node)
+    sent = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        sent.append((peer, message_id, timeout))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "retracted": {"id": 1, "wire_id": "wire-1"},
+        "deleted": True,
+        "id": "retract-1",
+    }
+    assert sent == [(PEER_HASH, "wire-1", 20.0)]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+    assert node.mailbox.sent_record("wire-1") is None
+    retracted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(retracted_events) == 1
+    assert retracted_events[0]["message_id"] == 1
+
+
+def test_retract_message_endpoint_reports_peer_without_a_copy(bridge, node):
+    _sent_console_entry(bridge, node)
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "deleted": False, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["deleted"] is False
+    # The peer had no copy, but the local copies still go.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+    assert node.inbox.export_document()["messages"] == []
+
+
+def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node):
+    # A received message is not ours to retract.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "only your own sent" in payload["error"]["message"]
+
+    # Group messages cannot be retracted in v1.
+    _sent_console_entry(bridge, node, wire_id="wire-2", group="ab" * 16)
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 2}
+    )
+    assert status == 400
+    assert "group messages cannot be retracted" in payload["error"]["message"]
+
+    # Still queued: cancel it from the outbox instead.
+    _sent_console_entry(bridge, node, wire_id="wire-3", status="queued")
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 3}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+    # Delivered on the console but still queued in the mailbox: the
+    # outbox check, not just the bubble status, refuses the retract,
+    # or a "not found" answer would let the queued copy arrive later.
+    _sent_console_entry(bridge, node, wire_id="wire-4")
+    node.mailbox.enqueue(
+        to=bytes.fromhex(PEER_HASH), text="hello", message_id="wire-4"
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 4}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_keeps_bubble_when_peer_unreachable(
+    bridge, node
+):
+    _sent_console_entry(bridge, node)
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        raise NodeError("peer did not answer")
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 502
+    assert "peer did not answer" in payload["error"]["message"]
+    # A failed retract never erases the local copy: the bubble stays
+    # for a retry.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+    assert node.inbox.export_document()["messages"] != []
+
+
+def test_retract_still_refuses_lxmf_copy_after_sent_record_evicted(
+    bridge, node
+):
+    # A queued entry, delivered over LXMF: the delivery flip stamps
+    # the route on the console entry itself.
+    entry = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="queued",
+        wire_id="wire-1",
+        mail_id="wire-1",
+    )
+    assert entry is not None
+    node.mailbox.record_sent(
+        "wire-1", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    node.mailbox.record_delivered("wire-1", via="lxmf")
+    updated = bridge.record_delivery("wire-1")
+    assert updated is not None
+    assert updated["status"] == "delivered"
+    assert updated["delivered_via"] == "lxmf"
+
+    # The sent record is evicted (256-send cap / 30-day sweep) while
+    # the console entry remains retractable: the entry's own stamp
+    # still refuses the retract, and nothing goes out.
+    node.mailbox.discard_sent("wire-1")
+    called = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        called.append((peer, message_id))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": entry["id"]}
+    )
+    assert status == 400
+    assert "delivered over LXMF" in payload["error"]["message"]
+    assert called == []
+
+
+def test_stored_message_keeps_delivery_route(bridge):
+    entry = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+        delivered_via="direct",
+    )
+    assert entry is not None
+    assert entry["delivered_via"] == "direct"
+
+    # The loader keeps a known route across a restart, and drops an
+    # unknown one instead of trusting it.
+    stored = {
+        "id": 1,
+        "direction": "out",
+        "peer": PEER_HASH,
+        "peer_name": "alice",
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "status": "delivered",
+        "wire_id": "wire-1",
+        "delivered_via": "lxmf",
+    }
+    cleaned = _clean_stored_message(stored)
+    assert cleaned is not None
+    assert cleaned["delivered_via"] == "lxmf"
+    assert "delivered_via" not in _clean_stored_message(
+        {**stored, "delivered_via": "carrier-pigeon"}
+    )
+
+
+def test_retract_message_endpoint_rejects_file_entries(bridge, node):
+    # The peer refuses retracts of saved files (the bytes live on
+    # disk), so offering retract on a sent file would always fail.
+    _sent_console_entry(
+        bridge,
+        node,
+        file={"name": "notes.txt", "size": 10, "sha256": "ab" * 32},
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "file transfers cannot be retracted" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_lxmf_delivered_copy(bridge, node):
+    _sent_console_entry(bridge, node)
+    node.mailbox.record_delivered("wire-1", via="lxmf")
+    called = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        called.append((peer, message_id))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "delivered over LXMF" in payload["error"]["message"]
+    # The retract never went out: the recipient stores that copy
+    # under an `lxmf:` id, so naming the tau wire id could not
+    # delete it — and the sender's copies stay in place.
+    assert called == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+
+
+def test_retract_message_endpoint_never_deletes_a_prefix_sharing_record(
+    bridge, node
+):
+    # The sender's inbox copy is already gone, and another sender's
+    # record shares the wire id's prefix: the local delete must not
+    # fall through to that record.
+    node.inbox.append(
+        {
+            "id": "wire-1-other",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "another sender's message",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "wire-1", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+    )
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["deleted"] is True
+    assert [
+        entry["id"] for entry in node.inbox.list_messages()
+    ] == ["wire-1-other"]
+
+
+def _seed_pinnable_message(bridge, node, wire_id="wire-1"):
+    node.inbox.append(
+        {
+            "id": wire_id,
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": wire_id,
+        }
+    )
+
+
+def test_pin_message_endpoint_pins_inbox_and_annotates_feed(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "pinned": {"id": 1, "wire_id": "wire-1", "already_pinned": False},
+    }
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+    assert [entry["id"] for entry in node.inbox.list_messages(pinned_only=True)] == [
+        "wire-1"
+    ]
+    # Other tabs learn through a message_updated event carrying the
+    # annotated entry, like a reaction does.
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["id"] == 1
+    assert updated_events[0]["message"]["pinned"] is True
+
+
+def test_pin_message_endpoint_is_a_noop_when_already_pinned(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["already_pinned"] is True
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+
+
+def test_unpin_message_endpoint_clears_pin(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    _json(bridge, "/api/messages/pin", method="POST", body={"id": 1})
+    status, _, payload = _json(
+        bridge, "/api/messages/unpin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "unpinned": {"id": 1, "wire_id": "wire-1", "was_pinned": True},
+    }
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "pinned" not in feed["messages"][0]
+    assert node.inbox.list_messages(pinned_only=True) == []
+    # Unpinning again is a no-op, not an error.
+    status, _, payload = _json(
+        bridge, "/api/messages/unpin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["unpinned"]["was_pinned"] is False
+
+
+def test_console_feed_shows_cli_pin(bridge, node):
+    # A pin made from another process (``tau pin``) lands in the shared
+    # inbox.json only; the listing must still show it on the next read.
+    _seed_pinnable_message(bridge, node)
+    node.inbox.pin("wire-1")
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+
+
+def test_messages_pinned_filter_lists_only_pinned(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "not pinned",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "wire-2",
+        }
+    )
+    node.inbox.append(
+        {
+            "id": "wire-2",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "not pinned",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    _json(bridge, "/api/messages/pin", method="POST", body={"id": 1})
+    _, _, feed = _json(bridge, "/api/messages?pinned=1")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+    assert feed["messages"][0]["pinned"] is True
+    _, _, feed = _json(bridge, "/api/messages")
+    assert len(feed["messages"]) == 2
+
+
+def test_pin_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": "1"}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_pin_message_endpoint_rejects_message_without_stored_copy(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            # No wire id: an entry from before ids existed, or one the
+            # node inbox never stored. There is no inbox record to pin.
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "no stored copy" in payload["error"]["message"]
+
+
+def test_pin_message_endpoint_rejects_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_pin_message_does_not_publish_blocked_message(bridge, node):
+    # A message received before its sender was blocked is retained but
+    # hidden from the listing; pinning it must not publish its text to
+    # /api/events, where a remote client could read it back by id.
+    _seed_pinnable_message(bridge, node)
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["already_pinned"] is False
+    # The pin itself landed — only the event is suppressed.
+    assert [
+        entry["id"] for entry in node.inbox.list_messages(pinned_only=True)
+    ] == ["wire-1"]
+    assert [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ] == []
+
+
+def test_messages_pinned_reports_inbox_read_failure(bridge, node, monkeypatch):
+    _seed_pinnable_message(bridge, node)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("inbox unreadable")
+
+    monkeypatch.setattr(node.inbox, "list_messages", _boom)
+    # The pinned view reports the failure instead of an empty pin list.
+    with pytest.raises(RuntimeError, match="inbox unreadable"):
+        bridge.messages(limit=-1, strict_pins=True)
+    # The live feed stays up: a failed pin overlay degrades to no pins.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "pinned" not in feed["messages"][0]
 
 
 def test_delete_by_wire_id_removes_the_console_copy(bridge):

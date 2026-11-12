@@ -113,10 +113,12 @@ from .tangents.tan import (
     TanApp,
     TanError,
     _author_from_identity,
+    annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
     annotate_reactions,
     annotate_replies,
+    annotated_pinned_posts,
     annotated_saved_posts,
     apply_display_rules,
     author_stats,
@@ -135,6 +137,7 @@ from .tangents.tan import (
     muted_keywords,
     open_db_readonly,
     open_readonly_db,
+    pin_post,
     resolve_author,
     resolve_cached_author,
     resolve_delete_target,
@@ -150,6 +153,7 @@ from .tangents.tan import (
     unfollow,
     unmute,
     unmute_keyword,
+    unpin_post,
     unsave_post,
     verify_store,
 )
@@ -1847,6 +1851,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tan_saved.set_defaults(func=cmd_tan_saved)
 
+    tan_pin = tan_sub.add_parser(
+        "pin", parents=[common], help="pin one of your own posts to the top"
+    )
+    tan_pin.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_pin.set_defaults(func=cmd_tan_pin)
+
+    tan_unpin = tan_sub.add_parser(
+        "unpin", parents=[common], help="remove a post from your pinned list"
+    )
+    tan_unpin.add_argument(
+        "ref", metavar="HASH|PREFIX", help="post hash (full hash or unique prefix)"
+    )
+    tan_unpin.set_defaults(func=cmd_tan_unpin)
+
+    tan_pinned = tan_sub.add_parser(
+        "pinned", parents=[common], help="list your pinned posts"
+    )
+    tan_pinned.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_FEED_LIMIT,
+        metavar="N",
+        help="maximum posts",
+    )
+    tan_pinned.set_defaults(func=cmd_tan_pinned)
+
     tan_sync = tan_sub.add_parser(
         "sync",
         parents=[common],
@@ -2435,7 +2467,7 @@ def _print_tan_posts(
         when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
             "%Y-%m-%d %H:%M"
         )
-        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}")
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}{' 📌' if post.get('pinned') else ''}")
         if post.get("kind") == "reply":
             parent = post.get("reply_to")
             if isinstance(parent, dict):
@@ -2577,13 +2609,78 @@ def _print_saved_posts(
         saved = datetime.fromtimestamp(float(post.get("saved_at", 0))).strftime(
             "%Y-%m-%d %H:%M"
         )
-        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}")
         print(f"  saved {saved}")
         if post.get("deleted"):
             print("  (deleted post)")
             continue
         for line in str(post.get("text", "")).splitlines() or [""]:
             print(f"  {line}")
+        likes = int(post.get("likes") or 0)
+        if likes or post.get("liked"):
+            suffix = " (you liked this)" if post.get("liked") else ""
+            print(f"  ♥ {likes}{suffix}")
+
+
+def _print_pinned_posts(
+    posts: Sequence[Dict[str, Any]],
+    *,
+    json_output: bool,
+) -> None:
+    """Print pinned posts, newest pin first."""
+    if json_output:
+        _emit({"pinned": list(posts), "count": len(posts)}, True)
+        return
+    if not posts:
+        print("No pinned posts yet. Try `tau tan pin <hash>` on one of your posts.")
+        return
+    for post in posts:
+        name = post.get("name") or "anonymous"
+        author = short_hash(str(post.get("author", "")))
+        when = datetime.fromtimestamp(float(post.get("created_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        pinned = datetime.fromtimestamp(float(post.get("pinned_at", 0))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))} 📌")
+        print(f"  pinned {pinned}")
+        if post.get("deleted"):
+            print("  (deleted post)")
+            continue
+        if post.get("kind") == "repost":
+            original = post.get("repost_of")
+            if isinstance(original, dict):
+                if original.get("deleted"):
+                    print("  reposted a deleted post")
+                else:
+                    print(
+                        f"  reposted {original.get('name') or 'anonymous'} "
+                        f"({short_hash(str(original.get('author', '')))}):"
+                    )
+                    for line in str(original.get("text") or "").splitlines() or [""]:
+                        print(f"  {line}")
+            else:
+                print(
+                    f"  reposted {short_hash(str(post.get('target', '')))}"
+                    " (original not cached yet)"
+                )
+        else:
+            for line in str(post.get("text", "")).splitlines() or [""]:
+                print(f"  {line}")
+        if post.get("kind") == "quote":
+            quoted = post.get("quoted")
+            if isinstance(quoted, dict):
+                if quoted.get("blocked"):
+                    print("  quoting a blocked author's post")
+                elif quoted.get("deleted"):
+                    print("  quoting a deleted post")
+                else:
+                    print(f"  quoting {quoted.get('name') or 'anonymous'}:")
+                    for line in str(quoted.get("text") or "").splitlines() or [""]:
+                        print(f"    {line}")
+            else:
+                print(f"  quoting {short_hash(str(post.get('target', '')))}")
         likes = int(post.get("likes") or 0)
         if likes or post.get("liked"):
             suffix = " (you liked this)" if post.get("liked") else ""
@@ -3044,6 +3141,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 exclude_all=blocked is None,
                 tag=getattr(args, "tag", None),
             )
+        annotate_pinned(conn, posts)
     finally:
         conn.close()
     try:
@@ -3609,6 +3707,71 @@ def cmd_tan_saved(args: argparse.Namespace) -> int:
         conn.close()
     _print_saved_posts(posts, json_output=json_output)
     return _EXIT_OK
+    return _EXIT_OK
+
+
+def cmd_tan_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        identity = _tan_identity(config)
+        owner = destination_hash(identity).hex()
+        record = pin_post(conn, args.ref, owner=owner)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record.get("already_pinned"):
+            when = datetime.fromtimestamp(float(record["pinned_at"])).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(f"already pinned {short_hash(str(record['hash']))} at {when}")
+        else:
+            print(f"pinned {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    conn = init_db(config.social_db_path)
+    try:
+        record = unpin_post(conn, args.ref)
+    finally:
+        conn.close()
+    if _json_mode(args):
+        _emit(record, True)
+    else:
+        if record["unpinned"]:
+            print(f"unpinned {short_hash(str(record['hash']))}")
+        else:
+            print(f"was not pinned: {short_hash(str(record['hash']))}")
+    return _EXIT_OK
+
+
+def cmd_tan_pinned(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
+    conn = init_db(config.social_db_path)
+    try:
+        display_ruleset = load_ruleset(config.tan_rules_path)
+    except RulesError:
+        display_ruleset = Ruleset()
+    try:
+        identity = load_identity(config.identity_path)
+        viewer = destination_hash(identity).hex() if identity is not None else None
+        posts, _ = annotated_pinned_posts(
+            conn,
+            limit=args.limit,
+            viewer=viewer,
+            ruleset=display_ruleset,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    _print_pinned_posts(posts, json_output=json_output)
     return _EXIT_OK
 
 

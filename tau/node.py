@@ -49,6 +49,8 @@ from .instance_lock import (
     instance_lock_holder,
 )
 from .lxmf import (
+    LXMF_FIELD_TAU_MESSAGE_ID,
+    MAX_TAU_MESSAGE_ID_LENGTH,
     LXMFError,
     build_lxmf_message,
     lxmf_router_delivery_hash,
@@ -948,13 +950,37 @@ class TauNode:
                 caller_hash,
             )
             return
+        # A tau DM sent over LXMF carries its tau message id in the
+        # message fields (see build_lxmf_message).  When present and
+        # well-formed, the copy is stored under that id, so it is the
+        # same message as the direct-path copy: a retraction marker
+        # keyed by the tau id covers it, a later retract finds and
+        # deletes it, and a direct copy dedupes against it.  A
+        # malformed field is ignored — a forged or truncated id must
+        # never displace the hash id — and a message without one (a
+        # non-tau LXMF client, or an older tau sender) keeps the
+        # hash id as before.
+        tau_message_id = None
+        fields = getattr(message, "fields", None)
+        if isinstance(fields, dict):
+            carried = fields.get(LXMF_FIELD_TAU_MESSAGE_ID)
+            if (
+                isinstance(carried, str)
+                and carried
+                and len(carried) <= MAX_TAU_MESSAGE_ID_LENGTH
+            ):
+                tau_message_id = carried
         # A propagation copy can redeliver the same message after a
         # router restart, so dedupe on the LXMF hash exactly like the
         # DM path dedupes relayed copies on the tau message id.
         # Tau message ids are capped at 64 characters on the wire, so the
         # 5-char "lxmf:" prefix leaves 59 hex digits of the hash (236 bits,
         # still collision-free in practice).
-        message_id = f"lxmf:{bytes(message_hash).hex()[:59]}"
+        message_id = (
+            tau_message_id
+            if tau_message_id is not None
+            else f"lxmf:{bytes(message_hash).hex()[:59]}"
+        )
         # The router can invoke this callback concurrently for two
         # copies of one message (direct + propagation), and each copy
         # passes the router's own duplicate check first — so the
@@ -962,7 +988,12 @@ class TauNode:
         # below run under one lock.  Without it both copies could
         # pass the checks before either stored anything and the
         # message would land in the inbox twice.
-        with self._lxmf_delivery_lock:
+        # The mailbox transaction is held across the retraction check and
+        # the append, so a retract that records its marker concurrently
+        # either lands first (and the check sees it) or waits until this
+        # copy is stored (and then deletes it).  Lock order is delivery
+        # lock, then mailbox, then inbox — the same as the retract path.
+        with self._lxmf_delivery_lock, self.mailbox.transaction():
             if self.mailbox.is_seen(message_id):
                 log.info("Ignoring duplicate LXMF message %s", message_id)
                 return
@@ -973,6 +1004,20 @@ class TauNode:
                 # Stored earlier but interrupted before it was marked seen.
                 self.mailbox.mark_seen(message_id)
                 log.info("Ignoring duplicate LXMF message %s", message_id)
+                return
+            if tau_message_id is not None and self.mailbox.is_retracted(
+                caller_hash, tau_message_id
+            ):
+                # The sender retracted this DM before the LXMF copy
+                # arrived: drop it the way the direct path drops a
+                # retracted message, and leave it unseen so a
+                # redelivery re-checks the marker instead of being
+                # mistaken for a new message.
+                log.info(
+                    "Dropping retracted LXMF message %s from %s",
+                    tau_message_id,
+                    caller_hash,
+                )
                 return
             try:
                 sent_at = float(getattr(message, "timestamp", None) or 0.0)
@@ -2127,10 +2172,12 @@ class TauNode:
                 # instead — the context is covered by the signature
                 # verified above, so a relay cannot retarget the
                 # reaction onto a different message.  A copy that
-                # arrived through an outbox retry carries a re-stamped
-                # send time and cannot resolve; the reaction is still
-                # stored under the wire target, and shows for the
-                # author, exactly as before.
+                # arrived through an outbox retry carries the shared
+                # send time and resolves the same way; only a copy
+                # queued before the shared time was recorded falls
+                # back to its enqueue time, and then the reaction is
+                # still stored under the wire target, and shows for
+                # the author, exactly as before.
                 # The signed context names the logical message, but
                 # a valid signature only proves who chose the
                 # context, not that they belong to the group: an
@@ -2144,6 +2191,7 @@ class TauNode:
                 # the reaction outruns the message; that reaction
                 # is stored with its context and can only surface
                 # through reconciliation when the message arrives,
+                # which checks the roster then.  The lookup is by
                 # which checks the roster then.  The lookup is by
                 # exact id: a retired id that is also another group's
                 # name must not resolve to that group.
@@ -2170,6 +2218,7 @@ class TauNode:
                 # non-member naming a known local group-message id
                 # must not get their reaction stored or displayed —
                 # including reactions that carry no group context.
+                # A missing roster fails closed: the group was deleted
                 # A missing roster fails closed: the group was deleted
                 # (or the message was imported without one), so there
                 # is no membership to verify — and a deleted group has
@@ -2234,6 +2283,7 @@ class TauNode:
                             final = None
                         if final is not None and final.get("kind") == "group":
                             # A missing roster fails closed, as above:
+                            # A missing roster fails closed, as above:
                             # the group was deleted, so no membership
                             # can be verified.  The lookup is by exact
                             # id, so a retired id that is also another
@@ -2295,6 +2345,7 @@ class TauNode:
                 )
                 if local is not None:
                     # Exact-id lookup: a retired id that is also
+                    # Exact-id lookup: a retired id that is also
                     # another group's name must not supply the
                     # roster the reconciliation filters against.
                     pinned = pinned_group(self.groups, reaction["group"])
@@ -2355,6 +2406,7 @@ class TauNode:
                         now_resolved is not None
                         and now_resolved.get("kind") == "group"
                     ):
+                        # Exact-id lookup: a retired id that is also
                         # Exact-id lookup: a retired id that is also
                         # another group's name must not supply the
                         # roster this void check runs against.  A
@@ -3310,7 +3362,7 @@ class TauNode:
         if entry.group_id is not None:
             group_kwargs: Dict[str, Any] = dict(
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
@@ -3356,7 +3408,7 @@ class TauNode:
             payload = encode_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3450,7 +3502,11 @@ class TauNode:
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)
         try:
-            self.mailbox.record_delivered(entry.id, timeout=_remaining(deadline))
+            self.mailbox.record_delivered(
+                entry.id,
+                timeout=_remaining(deadline),
+                via="lxmf" if via_lxmf else "direct",
+            )
             self.mailbox.remove_outbox(entry.id, timeout=_remaining(deadline))
         except TimeoutError:
             # The delivery is confirmed, so report success; the entry
@@ -3512,7 +3568,10 @@ class TauNode:
             return False
         try:
             message = build_lxmf_message(
-                self.identity, recipient.public_key, entry.text
+                self.identity,
+                recipient.public_key,
+                entry.text,
+                tau_message_id=entry.id,
             )
             return send_lxmf_message(self.lxmf_router, message, timeout=timeout)
         except (LXMFError, ValueError) as exc:
@@ -3593,7 +3652,7 @@ class TauNode:
                 recipient_public_key=recipient.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group=sealed_group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
@@ -4566,7 +4625,7 @@ class TauNode:
                     "send_after": entry.send_after,
                 }
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
-            self.mailbox.record_delivered(message_id)
+            self.mailbox.record_delivered(message_id, via="direct")
             if isinstance(response, dict):
                 # Only this node's own outbox may report a message as
                 # queued, with a real local entry id. A peer that claims
@@ -4846,6 +4905,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -4863,7 +4923,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -4925,7 +4985,7 @@ class TauNode:
                         }
                     )
                     continue
-                self.mailbox.record_delivered(message_id)
+                self.mailbox.record_delivered(message_id, via="direct")
                 sent_leg_ids.append(message_id)
                 results.append(
                     {
@@ -4989,6 +5049,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -5017,7 +5078,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -5475,9 +5536,11 @@ class TauNode:
         being reacted to), and a receiver that does not hold the
         target id resolves its own copy from that context instead —
         see :meth:`_handle_reaction`.  Copies that arrived through an
-        outbox retry carry a re-stamped send time and cannot resolve
-        this way; their reaction is still stored, and shows for the
-        author, exactly as a DM reaction to an unknown target would.
+        outbox retry carry the shared send time and resolve the same
+        way; only a copy queued before the shared time was recorded
+        falls back to its enqueue time, and then its reaction is
+        still stored, and shows for the author, exactly as a DM
+        reaction to an unknown target would.
 
         A failed leg reports an ``error`` instead of queueing: like
         DM reactions, group reactions are live-only in v1.  Returns

@@ -133,6 +133,152 @@ describe("MessageFeed delete", () => {
   });
 });
 
+describe("MessageFeed retract", () => {
+  const sent = (overrides: Partial<TauMessage> = {}) =>
+    makeMessage({
+      direction: "out",
+      status: "delivered",
+      wire_id: "a".repeat(32),
+      ...overrides,
+    });
+
+  it("shows no retract button without an onRetract handler", () => {
+    render(<MessageFeed messages={[sent()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("asks for confirmation before retracting", async () => {
+    const message = sent();
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    expect(onRetract).not.toHaveBeenCalled();
+    expect(screen.getByText("confirm retract")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("confirm retract"));
+    expect(onRetract).toHaveBeenCalledTimes(1);
+    expect(onRetract).toHaveBeenCalledWith(message);
+  });
+
+  it("keeps the message when the confirmation is cancelled", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    fireEvent.click(screen.getByText("keep"));
+    expect(onRetract).not.toHaveBeenCalled();
+    expect(screen.queryByText("confirm retract")).toBeNull();
+    expect(screen.getByTitle("Retract this message")).toBeTruthy();
+  });
+
+  it("reports a failed retract inline and keeps the message", async () => {
+    const onRetract = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[sent()]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    fireEvent.click(screen.getByText("confirm retract"));
+    expect(await screen.findByText("boom")).toBeTruthy();
+    // The bubble stays, with the plain retract button back for a retry.
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Retract this message")).toBeTruthy();
+  });
+
+  it("shows no retract button on received messages", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button on group messages", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ group: "ab".repeat(16), group_name: "crew" })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button on file entries", () => {
+    // The peer refuses retracts of saved files, so offering retract
+    // on a sent file would always fail.
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[
+          sent({
+            file: { name: "notes.txt", size: 10, sha256: "ab".repeat(32) },
+          }),
+        ]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("shows no retract button without a wire id", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ wire_id: undefined })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
+  it("hides the retract button while the message is still queued", () => {
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[sent({ status: "queued" })]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+});
+
 describe("MessageFeed react picker", () => {
   const NODE: NodeInfo = {
     name: "me",
@@ -419,5 +565,144 @@ describe("MessageFeed outbound status", () => {
 
     expect(screen.getByText("failed")).toBeTruthy();
     expect(screen.getByText("crew")).toBeTruthy();
+  });
+});
+
+describe("MessageFeed pins", () => {
+  it("shows no pin button without an onPin handler", () => {
+    render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
+  it("pins an unpinned message", async () => {
+    const message = makeMessage({ wire_id: "a".repeat(32) });
+    const onPin = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Pin this message"));
+    await waitFor(() => expect(onPin).toHaveBeenCalledTimes(1));
+    expect(onPin).toHaveBeenCalledWith(message, true);
+  });
+
+  it("marks a pinned message and offers to unpin it", async () => {
+    const message = makeMessage({ pinned: true, wire_id: "a".repeat(32) });
+    const onPin = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    expect(
+      screen.getByTitle("Pinned — kept easy to find, local only"),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Unpin this message"));
+    await waitFor(() => expect(onPin).toHaveBeenCalledTimes(1));
+    expect(onPin).toHaveBeenCalledWith(message, false);
+  });
+
+  it("hides the pin button while the message is still queued", () => {
+    // A queued message has no stored inbox copy yet, so there is
+    // nothing to pin; it can be pinned once delivered.
+    const message = makeMessage({ direction: "out", status: "queued" });
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onPin={vi.fn(async () => {})}
+      />,
+    );
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
+  it("hides the pin button when the message has no stored copy", () => {
+    // A console entry from before wire ids existed has no inbox record
+    // to pin; the button stays hidden instead of offering a pin the
+    // bridge would refuse.
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onPin={vi.fn(async () => {})}
+      />,
+    );
+    expect(screen.queryByTitle("Pin this message")).toBeNull();
+  });
+
+  it("reports a failed pin inline and keeps the message", async () => {
+    const onPin = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
+        node={null}
+        live={true}
+        onPin={onPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Pin this message"));
+    expect(await screen.findByText("pin failed: boom")).toBeTruthy();
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Pin this message")).toBeTruthy();
+  });
+
+  it("shows the pinned view with a count and a way back", () => {
+    const onClearPinned = vi.fn();
+    render(
+      <MessageFeed
+        messages={[makeMessage({ pinned: true })]}
+        node={null}
+        live={true}
+        showingPinned={true}
+        onClearPinned={onClearPinned}
+      />,
+    );
+
+    expect(screen.getByText("1 pinned")).toBeTruthy();
+    fireEvent.click(screen.getByText("show all"));
+    expect(onClearPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the pinned view from the live traffic", () => {
+    const onShowPinned = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onShowPinned={onShowPinned}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("📌 pinned"));
+    expect(onShowPinned).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an empty state when nothing is pinned", () => {
+    render(
+      <MessageFeed
+        messages={[]}
+        node={null}
+        live={true}
+        showingPinned={true}
+        onClearPinned={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("No pinned messages")).toBeTruthy();
   });
 });

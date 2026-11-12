@@ -19,6 +19,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/groups/add-member add ``{"group": "...", "members": ["<hash>", ...]}``
     POST /api/groups/remove-member remove ``{"group": "...", "members": ["<hash>", ...]}``
     GET  /api/messages     recent inbound/outbound messages
+                           (``?pinned=1`` lists pinned messages only,
+                           across the whole console log)
     GET  /api/messages/search search stored messages by keyword
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
@@ -37,6 +39,13 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages/delete delete ``{"id": <console message id>}`` from
                            the console history (and the node inbox, when the
                            message carries a wire id)
+    POST /api/messages/retract retract ``{"id": <console message id>}``: ask
+                           the peer to delete your sent DM, then drop the
+                           local copies too (``tau retract`` from the console)
+    POST /api/messages/pin pin ``{"id": <console message id>}`` in the node
+                           inbox, so it shows in the console and in
+                           ``tau pinned`` (local only, never sent)
+    POST /api/messages/unpin unpin ``{"id": <console message id>}``
     GET  /api/outbox       queued mail waiting on offline peers
     POST /api/outbox/cancel cancel ``{"target": "<message id or prefix>"}``
     GET  /api/backup       download a backup archive of the data directory
@@ -544,6 +553,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # how reactions (which name their target by wire id) attach to
         # the right history entry.
         message["wire_id"] = wire_id
+    delivered_via = entry.get("delivered_via")
+    if delivered_via in ("direct", "lxmf"):
+        # Which transport confirmed the delivery: kept so a retract
+        # can still tell an LXMF-delivered copy from a direct one
+        # after the mailbox sent record is evicted. Entries written
+        # before the route was tracked carry no such key.
+        message["delivered_via"] = delivered_via
     reactions = entry.get("reactions")
     if isinstance(reactions, list):
         cleaned = [_clean_stored_reaction(item) for item in reactions]
@@ -1075,6 +1091,23 @@ class WebBridge:
             self.mark_displayed_read()
         return message
 
+    def _delivery_route(self, message_id: str) -> Optional[str]:
+        """Which transport confirmed a delivery, if it is known.
+
+        Read from the mailbox sent record: ``"direct"`` or ``"lxmf"``.
+        ``None`` when the record is gone (evicted) or was written
+        before the route was tracked — the caller keeps the previous
+        behavior in that case.
+        """
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            return None
+        record = mailbox.sent_record(message_id)
+        if record is None:
+            return None
+        via = record.get("delivered_via")
+        return via if via in ("direct", "lxmf") else None
+
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
         """Mark a queued outbound message delivered.
 
@@ -1089,6 +1122,12 @@ class WebBridge:
         before this was tracked — simply age out of that buffer.
         """
         updated: Optional[Dict[str, Any]] = None
+        # The route read takes the mailbox lock, so fetch it before
+        # any bridge lock: an inbound retraction takes the locks in
+        # the opposite order (mailbox transaction, then the bridge
+        # lock through on_retract), and the two paths would deadlock
+        # if they overlapped.
+        route = self._delivery_route(mail_id)
         with self._send_lock:
             with self._lock:
                 for message in self._messages:
@@ -1098,8 +1137,35 @@ class WebBridge:
                         and message.get("mail_id") == mail_id
                     ):
                         message["status"] = "delivered"
+                        # Stamp the route on the entry itself: the
+                        # mailbox sent record can be evicted while
+                        # this entry remains retractable, and only the
+                        # entry outlives that eviction.
+                        if route is not None:
+                            message["delivered_via"] = route
                         updated = dict(message)
                         break
+                if updated is None:
+                    # A second confirmation (LXMF after a direct
+                    # delivery) finds the entry already delivered:
+                    # keep the route honest — "lxmf" is sticky, or a
+                    # later retract would read the stale "direct"
+                    # route and miss the recipient's lxmf: copy.
+                    for message in self._messages:
+                        if (
+                            message.get("direction") == "out"
+                            and message.get("status")
+                            in ("delivered", "read")
+                            and message.get("mail_id") == mail_id
+                        ):
+                            if (
+                                route == "lxmf"
+                                and message.get("delivered_via")
+                                != "lxmf"
+                            ):
+                                message["delivered_via"] = "lxmf"
+                                updated = dict(message)
+                            break
                 if updated is None:
                     self._early_deliveries[mail_id] = None
                     while len(self._early_deliveries) > MAX_EARLY_DELIVERIES:
@@ -1111,7 +1177,7 @@ class WebBridge:
         # Persist the flip like any other log change, so a restart does
         # not resurrect the message as queued.
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_read(
@@ -1159,7 +1225,7 @@ class WebBridge:
             return updated
         self._save_messages()
         for message in updated:
-            self.bus.publish({"type": "message_updated", "message": message})
+            self._publish_message_updated(message)
         return updated
 
     def mark_displayed_read(self) -> None:
@@ -1318,7 +1384,7 @@ class WebBridge:
         if updated is None:
             return None
         self._save_messages()
-        self.bus.publish({"type": "message_updated", "message": updated})
+        self._publish_message_updated(updated)
         return updated
 
     def record_tan_post(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -2604,12 +2670,24 @@ class WebBridge:
                 mail_id=mail_id,
                 expires_at=expires_at,
                 wire_id=wire_id,
+                # A live send went out over the direct link by
+                # construction: a failed direct send queues instead.
+                delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
+            )
+            # The route read takes the mailbox lock, so fetch it
+            # before the bridge lock (same deadlock as record_delivery).
+            route = (
+                self._delivery_route(mail_id)
+                if mail_id is not None
+                else None
             )
             with self._lock:
                 if mail_id is not None and mail_id in self._early_deliveries:
                     del self._early_deliveries[mail_id]
                     message["status"] = "delivered"
+                    if route is not None:
+                        message["delivered_via"] = route
                     flipped = True
                 read_key = wire_id or mail_id
                 if read_key is not None:
@@ -2625,9 +2703,7 @@ class WebBridge:
                 self._save_messages()
         self.bus.publish({"type": "message", "message": message})
         if flipped:
-            self.bus.publish(
-                {"type": "message_updated", "message": dict(message)}
-            )
+            self._publish_message_updated(message)
         return message, response
 
     def send_group_message(
@@ -2749,9 +2825,7 @@ class WebBridge:
                     self._save_messages()
             self.bus.publish({"type": "message", "message": message})
             if flipped:
-                self.bus.publish(
-                    {"type": "message_updated", "message": dict(message)}
-                )
+                self._publish_message_updated(message)
             messages.append(message)
         return messages, response
 
@@ -3000,6 +3074,223 @@ class WebBridge:
                 "wire_id": wire_id if isinstance(wire_id, str) else None,
             },
         }
+
+    def retract_message(self, target: int, *, timeout: float = 20.0) -> Dict[str, Any]:
+        """Retract one of this node's sent DMs, from the console.
+
+        Mirrors ``tau retract``: the peer is asked to delete the sent
+        message from their inbox, and the local copies go too (console
+        history entry, node inbox copy, sent record), so the message is
+        gone on both sides.  A peer who had no copy answers ``deleted``
+        False, which is not an error — the local copies still go.
+
+        Only your own sent DMs can be retracted: group messages are
+        not retractable in v1, a file transfer's saved copy lives on
+        the recipient's disk (the peer refuses those retracts), a
+        message still queued has not reached its recipient yet
+        (cancel it from the outbox instead), and a message delivered
+        over LXMF is stored by the recipient under an LXMF id the
+        retract cannot name — that copy stays until LXMF carries the
+        tau id (see #248).  The route is stamped on the console entry
+        when delivery is confirmed (and falls back to the mailbox
+        sent record for older entries), so it survives the sent
+        record being evicted.  Retracts ride the live link only, so
+        an unreachable peer is a failure, not a silent queue.
+
+        Ordering keeps every failure retryable from the console: the
+        retract goes first, so a failed retract never erases the local
+        copy; the inbox delete follows, so an inbox failure leaves the
+        bubble in place; the console entry is removed last, through the
+        same path as a delete, so other tabs learn through
+        ``message_deleted``.  A retry after either failure re-sends the
+        retract (idempotent — the peer answers ``deleted`` False) and
+        retries the local cleanup.  The local inbox delete is exact:
+        ``delete_authorized`` checks the id, direction and recipient
+        in one transaction, so a stale wire id can never delete a
+        different record sharing its prefix.
+        """
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if removed is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if removed.get("direction") != "out":
+                raise ValueError(
+                    "only your own sent messages can be retracted"
+                )
+            if removed.get("group"):
+                raise ValueError("group messages cannot be retracted in v1")
+            if removed.get("file"):
+                raise ValueError("file transfers cannot be retracted")
+            if removed.get("status") == "queued":
+                # A retract answered "not found" would let the queued
+                # copy arrive later, so cancellation has to go through
+                # the outbox first.
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            wire_id = removed.get("wire_id")
+            peer = removed.get("peer")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError("that message has no id to retract")
+        if not isinstance(peer, str) or not peer:
+            raise ValueError("that message has no known recipient to retract from")
+        with self.node.mailbox.transaction():
+            if self.node.mailbox.get_outbox(wire_id) is not None:
+                raise ValueError(
+                    f"message {target!r} is still queued; cancel it from the outbox first"
+                )
+            # The route lives on the console entry itself, so it
+            # survives the mailbox sent record being evicted; the
+            # sent record is the fallback for entries written before
+            # the route was stamped. A missing route keeps the prior
+            # behavior — it is not, by itself, a reason to refuse.
+            delivered_via = removed.get("delivered_via")
+            if delivered_via is None:
+                sent_record = self.node.mailbox.sent_record(wire_id)
+                if sent_record is not None:
+                    delivered_via = sent_record.get("delivered_via")
+            if delivered_via == "lxmf":
+                # The recipient stores an LXMF-delivered copy under an
+                # `lxmf:` id, not this wire id: the retract would
+                # answer `deleted` False while the copy stays. Refuse
+                # instead of removing the sender's copies around a
+                # copy the retract cannot reach.
+                raise ValueError(
+                    "that message was delivered over LXMF; the recipient "
+                    "stores it under an LXMF id, so a retract cannot "
+                    "reach that copy yet"
+                )
+        response = self.node.send_retraction(peer, wire_id, timeout=timeout)
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                inbox.delete_authorized(
+                    wire_id, direction="out", destination=peer
+                )
+            except InboxError as exc:
+                # A record that exists but is not this node's sent
+                # copy, or a delete that could not be persisted,
+                # leaves the console entry in place, so the retract
+                # can be retried — the retract itself already
+                # succeeded. A missing record (None) is fine.
+                if str(exc).startswith("could not persist"):
+                    raise OSError(str(exc)) from exc
+                raise ValueError(str(exc)) from exc
+        # The sent record lives in mailbox.json, not the inbox: drop it
+        # too, or `tau messages --sent` keeps showing the retracted text.
+        # Only after the retract and the inbox delete succeeded, so a
+        # failed retract never erases the sent record.
+        self.node.mailbox.discard_sent(wire_id)
+        self._remove_history_entry(target, removed, publish_unread=inbox is not None)
+        return {
+            "ok": True,
+            "retracted": {
+                "id": target,
+                "wire_id": wire_id,
+            },
+            "deleted": bool(response.get("deleted")),
+            "id": response.get("id") if isinstance(response.get("id"), str) else None,
+        }
+    def pin_message(self, target: int) -> Dict[str, Any]:
+        """Pin one stored DM from the console history, by console id.
+
+        The pin itself lives on the node inbox record (``Inbox.pin``),
+        so the CLI's ``tau pinned`` listing and this console agree:
+        pinning from either side shows up on the other, and the pin is
+        local only — the peer's copy is unaffected and nothing is sent.
+        Only messages with a stored inbox copy can be pinned: a queued
+        message has no wire id yet, so pinning it would record a pin
+        with nothing to attach to.  Other tabs learn through a
+        ``message_updated`` event carrying the annotated entry — unless
+        the message is from a blocked sender, whose text the listing
+        hides: then no event is published and tabs reconcile on their
+        next poll.
+
+        Returns the pinned console id, its wire id, and whether the pin
+        is new — pinning an already-pinned message is a no-op, not an
+        error, matching :meth:`Inbox.pin`.
+        """
+        return self._set_message_pinned(target, pinned=True)
+
+    def unpin_message(self, target: int) -> Dict[str, Any]:
+        """Remove the pin from one stored DM, by console id.
+
+        The mirror of :meth:`pin_message`: the inbox record loses its
+        pin flag and other tabs learn through a ``message_updated``
+        event.  Unpinning a message that was never pinned is a no-op,
+        not an error.
+        """
+        return self._set_message_pinned(target, pinned=False)
+
+    def _set_message_pinned(self, target: int, *, pinned: bool) -> Dict[str, Any]:
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            raise ValueError("message id is required")
+        with self._lock:
+            entry = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("id") == target
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(f"unknown message: {target!r}")
+            if entry.get("status") == "queued":
+                # A queued message has no stored inbox copy yet, so
+                # there is nothing to pin; pin it once it is delivered.
+                action = "pin" if pinned else "unpin"
+                raise ValueError(
+                    f"message {target!r} is still queued; {action} it once delivered"
+                )
+            wire_id = entry.get("wire_id")
+        if not isinstance(wire_id, str) or not wire_id:
+            raise ValueError(
+                f"message {target!r} has no stored copy to pin"
+                if pinned
+                else f"message {target!r} has no stored copy to unpin"
+            )
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            raise ValueError("this node has no inbox to pin in")
+        try:
+            _, changed = (
+                inbox.pin(wire_id) if pinned else inbox.unpin(wire_id)
+            )
+        except InboxError as exc:
+            raise ValueError(str(exc)) from exc
+        updated = self._inbox_annotated(entry)
+        # Set the flag explicitly both ways: clients keep the previous pin
+        # state when an update omits it, so an unpin must send false.
+        updated["pinned"] = pinned
+        # A retained message from a blocked sender stays hidden from the
+        # listing (see messages()); publishing its full text here would
+        # let a remote client read it back from /api/events by pinning
+        # its console id. The pin itself still succeeds — the response
+        # carries no text — and other tabs reconcile on their next poll.
+        blocklist = getattr(self.node, "blocklist", None)
+        hidden = (
+            blocklist is not None
+            and entry.get("direction") == "in"
+            and blocklist.is_blocked(entry.get("destination") or entry.get("peer"))
+        )
+        if not hidden:
+            self._publish_message_updated(updated)
+        state = {"id": target, "wire_id": wire_id}
+        if pinned:
+            state["already_pinned"] = not changed
+        else:
+            state["was_pinned"] = changed
+        return {"ok": True, "pinned" if pinned else "unpinned": state}
 
     def _remove_history_entry(
         self, target: int, removed: Dict[str, Any], *, publish_unread: bool
@@ -4069,7 +4360,9 @@ class WebBridge:
             "previous_id": group["id"],
         }
 
-    def messages(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def messages(
+        self, limit: int = 200, *, strict_pins: bool = False
+    ) -> List[Dict[str, Any]]:
         # Drop disappearing messages whose deadline has passed while the
         # Drop disappearing messages whose deadline has passed while the
         # bridge is running, not only at startup, so snapshots and the
@@ -4108,6 +4401,7 @@ class WebBridge:
                 )
             ]
         by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids(strict=strict_pins)
         groups = getattr(self.node, "groups", None)
         rosters: Dict[str, Optional[Set[str]]] = {}
         if groups is not None:
@@ -4120,7 +4414,10 @@ class WebBridge:
                 },
             )
         return [
-            self._with_inbox_reactions(dict(item), by_target, rosters)
+            self._with_inbox_pinned(
+                self._with_inbox_reactions(dict(item), by_target, rosters),
+                pinned_ids,
+            )
             for item in items
         ]
 
@@ -4318,6 +4615,84 @@ class WebBridge:
             )
         return message
 
+    def _inbox_pinned_ids(self, *, strict: bool = False) -> Set[str]:
+        """Wire ids of pinned inbox messages, reloaded once per read.
+
+        One reload serves the whole listing, like
+        :meth:`_inbox_reactions_by_target`: the inbox is the durable
+        authority for pins, so a pin made from another process (``tau
+        pin`` from the CLI) shows up on the next read.
+
+        A read failure is logged and treated as no pin overlay for the
+        live stream; with ``strict`` it propagates, so the pinned view
+        reports the error instead of an empty pin list.
+        """
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is None:
+            return set()
+        try:
+            pinned = inbox.list_messages(
+                pinned_only=True, direction=None, limit=None
+            )
+        except Exception:
+            if strict:
+                raise
+            log.warning("Could not read inbox pins", exc_info=True)
+            return set()
+        return {
+            str(entry.get("id"))
+            for entry in pinned
+            if isinstance(entry.get("id"), str) and entry.get("id")
+        }
+
+    def _with_inbox_pinned(
+        self, message: Dict[str, Any], pinned_ids: Set[str]
+    ) -> Dict[str, Any]:
+        """Mark one history entry pinned when the inbox has it pinned.
+
+        Only pinned entries carry the flag — an absent ``pinned`` reads
+        as unpinned, the same way an absent ``reactions`` reads as no
+        reactions.  A live push to an already open console tab for a
+        CLI-made pin is still a follow-up: this reconciles reads, not
+        the SSE stream.
+        """
+        wire_id = message.get("wire_id")
+        if wire_id and wire_id in pinned_ids:
+            message["pinned"] = True
+        return message
+
+    def _inbox_annotated(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy *message* with the inbox's reaction and pin overlays.
+
+        The inbox is the durable authority for both, so a copy annotated
+        here agrees with what :meth:`messages` serves — a pin made from
+        the CLI, or a reaction recorded by the node, rides on the event
+        too instead of being silently dropped from the payload.
+        """
+        by_target = self._inbox_reactions_by_target()
+        pinned_ids = self._inbox_pinned_ids()
+        groups = getattr(self.node, "groups", None)
+        group_id = message.get("group")
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None and isinstance(group_id, str) and group_id:
+            rosters = pinned_rosters(groups, [group_id])
+        return self._with_inbox_pinned(
+            self._with_inbox_reactions(dict(message), by_target, rosters),
+            pinned_ids,
+        )
+
+    def _publish_message_updated(self, message: Dict[str, Any]) -> None:
+        """Publish a ``message_updated`` carrying the inbox's overlays.
+
+        Every update goes through here so the reaction and pin state the
+        inbox holds rides on the event too.  Otherwise a receipt or a
+        reaction would replace a pinned bubble with a payload that reads
+        as unpinned in every open tab.
+        """
+        self.bus.publish(
+            {"type": "message_updated", "message": self._inbox_annotated(message)}
+        )
+
     def counts(self) -> Dict[str, int]:
         with self._lock:
             message_count = len(self._messages)
@@ -4396,6 +4771,7 @@ class WebBridge:
         group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
+        delivered_via: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
         save: bool = True,
@@ -4443,6 +4819,8 @@ class WebBridge:
                         message["reactions"] = _with_reaction(
                             message["reactions"], entry["destination"], entry
                         )
+            if delivered_via in ("direct", "lxmf"):
+                message["delivered_via"] = delivered_via
             message["excerpt_hash"] = excerpt_hash(text)
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
@@ -4662,8 +5040,19 @@ class _WebHandler(BaseHTTPRequestHandler):
                 self._send_json({"groups": groups, "count": len(groups)}, head_only)
                 return
             if path == "/api/messages":
-                limit = _int_param(query, "limit", default=200, minimum=1, maximum=500)
-                self._send_json({"messages": self.bridge.messages(limit)}, head_only)
+                pinned_only = query.get("pinned") == ["1"]
+                # A pinned view spans the whole console log, not just
+                # the newest 200 the live feed shows: a pin from long
+                # ago is exactly the one worth finding.
+                limit = (
+                    -1
+                    if pinned_only
+                    else _int_param(query, "limit", default=200, minimum=1, maximum=500)
+                )
+                items = self.bridge.messages(limit, strict_pins=pinned_only)
+                if pinned_only:
+                    items = [item for item in items if item.get("pinned")]
+                self._send_json({"messages": items}, head_only)
                 return
             if path == "/api/messages/export":
                 # The full inbox backup goes only to the local machine,
@@ -5027,6 +5416,15 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/messages/delete":
                 self._handle_delete_message(body, head_only)
+                return
+            if path == "/api/messages/retract":
+                self._handle_retract_message(body, head_only)
+                return
+            if path == "/api/messages/pin":
+                self._handle_pin_message(body, head_only, pinned=True)
+                return
+            if path == "/api/messages/unpin":
+                self._handle_pin_message(body, head_only, pinned=False)
                 return
             if path == "/api/messages/read":
                 peer = body.get("peer")
@@ -5927,6 +6325,57 @@ class _WebHandler(BaseHTTPRequestHandler):
             return
         try:
             result = self.bridge.delete_message(target)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        self._send_json(result, head_only)
+
+    def _handle_retract_message(self, body: Dict[str, Any], head_only: bool) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        timeout = _clamped_timeout(body.get("timeout", 20.0), 20.0)
+        try:
+            result = self.bridge.retract_message(target, timeout=timeout)
+        except (ValueError, ProtocolError) as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 400)
+            return
+        except PeerError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 404)
+            return
+        except NodeError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 502)
+            return
+        except OSError as exc:
+            self._send_json({"error": {"message": str(exc)}}, head_only, 503)
+            return
+        self._send_json(result, head_only)
+    def _handle_pin_message(
+        self, body: Dict[str, Any], head_only: bool, *, pinned: bool
+    ) -> None:
+        target = body.get("id")
+        if target is None:
+            target = body.get("target")
+        if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+            self._send_json(
+                {"error": {"message": "field 'id' must be a message id"}},
+                head_only,
+                400,
+            )
+            return
+        try:
+            result = (
+                self.bridge.pin_message(target)
+                if pinned
+                else self.bridge.unpin_message(target)
+            )
         except (ValueError, ProtocolError) as exc:
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return

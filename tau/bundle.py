@@ -154,7 +154,7 @@ def build_bundle(
                 recipient_public_key=peer.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group=group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to if group is None else None,

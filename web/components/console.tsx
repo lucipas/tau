@@ -230,7 +230,9 @@ export function Console() {
           <div className="flex min-w-0 flex-col">
             <MessageFeed
               messages={
-                tau.searchQuery !== null ? tau.searchResults : tau.messages
+                tau.searchQuery !== null
+                  ? tau.searchResults
+                  : tau.pinnedMessages ?? tau.messages
               }
               node={tau.node}
               live={tau.connection === "live"}
@@ -240,6 +242,10 @@ export function Console() {
               quoteContext={tau.messages}
               onSearch={tau.search}
               onClearSearch={tau.clearSearch}
+              showingPinned={tau.pinnedMessages !== null}
+              pinnedError={tau.pinnedError}
+              onShowPinned={tau.showPinned}
+              onClearPinned={tau.clearPinned}
               onReply={(message) => {
                 setReplyTo(message);
                 if (message.peer) {
@@ -250,12 +256,22 @@ export function Console() {
               onDelete={async (message) => {
                 await tau.deleteMessage(message.id);
               }}
+              onRetract={async (message) => {
+                await tau.retractMessage(message.id);
+              }}
               onReact={async (message, reaction) => {
                 if (!message.wire_id) return;
                 if (reaction === null) {
                   await tau.clearReaction(message.wire_id);
                 } else {
                   await tau.reactToMessage(message.wire_id, reaction);
+                }
+              }}
+              onPin={async (message, pinned) => {
+                if (pinned) {
+                  await tau.pinMessage(message.id);
+                } else {
+                  await tau.unpinMessage(message.id);
                 }
               }}
             />
