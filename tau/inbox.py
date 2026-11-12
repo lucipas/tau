@@ -20,7 +20,6 @@ stored message marked read, so an upgrade does not surface a wall of
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import threading
@@ -283,12 +282,12 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
     received_at = raw.get("received_at")
     try:
         received_at = float(received_at) if received_at is not None else time.time()
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
     if not math.isfinite(sent_at):
         sent_at = 0.0
@@ -319,17 +318,11 @@ def _valid_reaction(raw: Any) -> Optional[Dict[str, Any]]:
         and len(target_author) == 32
         and isinstance(target_sent_at, (int, float))
         and not isinstance(target_sent_at, bool)
+        and math.isfinite(target_sent_at)
     ):
-        # An unbounded integer cannot become a float: treat it as
-        # unusable context rather than an error.
-        try:
-            sent_context = float(target_sent_at)
-        except OverflowError:
-            sent_context = math.nan
-        if math.isfinite(sent_context):
-            entry["group"] = group
-            entry["target_author"] = target_author
-            entry["target_sent_at"] = sent_context
+        entry["group"] = group
+        entry["target_author"] = target_author
+        entry["target_sent_at"] = float(target_sent_at)
     return entry
 
 
@@ -531,23 +524,10 @@ class Inbox:
         with self._transaction():
             pass
 
-    def _load(self, *, strict: bool = False) -> None:
+    def _load(self) -> None:
         if self.path is None:
             return
-        if strict:
-            # read_json() turns an unreadable or corrupt file into None,
-            # which would silently keep the stale in-memory state.  A
-            # strict load raises so a caller that must not act on stale
-            # data (reaction storage) can fail closed.
-            try:
-                with self.path.open("r", encoding="utf-8") as handle:
-                    raw = json.load(handle)
-            except FileNotFoundError:
-                return
-            except (OSError, ValueError) as exc:
-                raise InboxError(f"could not read {self.path}: {exc}") from exc
-        else:
-            raw = read_json(self.path, default=None)
+        raw = read_json(self.path, default=None)
         if not isinstance(raw, dict):
             return
         entries = raw.get("messages")
@@ -637,12 +617,12 @@ class Inbox:
             return False
         return True
 
-    def transaction(self, *, strict: bool = False) -> Iterator[None]:
+    def transaction(self) -> Iterator[None]:
         """Public handle on the cross-process inbox lock (see ``_transaction``)."""
-        return self._transaction(strict=strict)
+        return self._transaction()
 
     @contextmanager
-    def _transaction(self, *, strict: bool = False) -> Iterator[None]:
+    def _transaction(self) -> Iterator[None]:
         """Serialise a read-modify-write of the inbox across processes.
 
         ``tau serve`` and one-shot commands such as ``tau send`` share
@@ -672,7 +652,7 @@ class Inbox:
             try:
                 if self.path is None or fcntl is None:
                     if self.path is not None:
-                        self._load(strict=strict)
+                        self._load()
                     yield
                     return
                 lock_path = self.path.with_name(self.path.name + ".lock")
@@ -680,7 +660,7 @@ class Inbox:
                 with open(lock_path, "a") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
-                        self._load(strict=strict)
+                        self._load()
                         yield
                     finally:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -819,11 +799,8 @@ class Inbox:
                 return dict(removed)
             return None
 
-    def reload(self, *, strict: bool = False) -> None:
+    def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
-
-        ``strict=True`` raises :class:`InboxError` when the file exists
-        but cannot be read; the default keeps the cached state.
 
         One-shot commands (``tau messages``) stamp read/receipt state
         on disk while a serving node holds its own copy in memory; the
@@ -837,7 +814,7 @@ class Inbox:
         write would have its entries overwritten.  Under the flock the
         purge write is serialised with every other commit.
         """
-        with self._transaction(strict=strict):
+        with self._transaction():
             pass
 
     def _stamp_read_ids(
@@ -1003,7 +980,7 @@ class Inbox:
         """
         try:
             wanted_at = float(sent_at)
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError):
             return None
         # Read through the transaction path, like reactions(): a copy
         # imported by another process (``tau import`` while ``tau
@@ -1090,7 +1067,6 @@ class Inbox:
         wanted_at: float,
         message_id: str,
         allowed: Optional[Collection[str]],
-        applied: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """Retarget stored group reactions onto a newly arrived copy.
 
@@ -1123,8 +1099,6 @@ class Inbox:
             self._reactions.remove(entry)
             if merge_reaction(self._reactions, moved):
                 retargeted += 1
-                if applied is not None:
-                    applied.append(dict(moved))
         if retargeted:
             self._reactions = self._reactions[-MAX_REACTIONS:]
         return retargeted
@@ -1157,10 +1131,8 @@ class Inbox:
         and the purge and append still run.  A failed persist raises
         :class:`OSError` and the in-memory state is restored, so the
         caller can refuse the delivery and the sender can retry it.
-        Returns the reaction records written, so the caller can fan them
-        out to any reaction cache before publishing the message: each
-        reaction retargeted onto this copy (its updated record), then a
-        tombstone per voided reaction.
+        Returns the tombstones written, one per voided reaction, so
+        the caller can fan them out to any reaction cache.
         """
         entry = _valid_record(record)
         if entry is None:
@@ -1172,7 +1144,6 @@ class Inbox:
         message_id = entry.get("id")
         allowed = set(members)
         voided: List[Dict[str, Any]] = []
-        retargeted: List[Dict[str, Any]] = []
         with self._transaction():
             previous_reactions = list(self._reactions)
             previous_messages = list(self._messages)
@@ -1189,12 +1160,7 @@ class Inbox:
                 ):
                     try:
                         self._reconcile_group_reactions_locked(
-                            group,
-                            author,
-                            wanted_at,
-                            message_id,
-                            allowed,
-                            retargeted,
+                            group, author, wanted_at, message_id, allowed
                         )
                     except Exception:
                         # A failed reconcile only strands legitimate
@@ -1218,9 +1184,7 @@ class Inbox:
                 self._reactions = previous_reactions
                 self._messages = previous_messages
                 raise
-        # Retargeted reactions come first so the console's reaction cache
-        # holds them before the new message is published under them.
-        return retargeted + voided
+        return voided
 
     def purge_non_member_reactions(
         self, message_id: str, *, members: Collection[str]
@@ -1644,22 +1608,6 @@ class Inbox:
             if inserted is not None:
                 # Only records that survived the retention cap were
                 # stored. Collect them while the transaction still holds
-                # the lock: a concurrent reload replaces the record
-                # objects in self._messages, so an identity check after
-                # the transaction would find none of them and the caller
-                # would mirror nothing.
-                kept = {id(item) for item in self._messages}
-                inserted.extend(item for item in added if id(item) in kept)
-        return {
-            "imported": imported,
-            "present": present,
-            "skipped": skipped,
-            "errors": errors,
-        }
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._messages)
                 # the lock: a concurrent reload replaces the record
                 # objects in self._messages, so an identity check after
                 # the transaction would find none of them and the caller

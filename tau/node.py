@@ -1982,8 +1982,8 @@ class TauNode:
             # sender can retry, instead of the reaction being
             # stored against a stale view of the inbox.
             try:
-                self.inbox.reload(strict=True)
-            except (InboxError, OSError) as exc:
+                self.inbox.reload()
+            except InboxError as exc:
                 return response_error(
                     "storage_failed", f"could not read inbox: {exc}"
                 )
@@ -2081,7 +2081,7 @@ class TauNode:
                 record["group"] = reaction["group"]
                 record["target_author"] = reaction.get("target_author")
                 record["target_sent_at"] = reaction.get("target_sent_at")
-            if resolved is None:
+            if resolved is None and reaction.get("group") is None:
                 # Final authorization AND storage under ONE inbox
                 # transaction: the lookup, the roster check and the
                 # persist hold the cross-process flock, so no other
@@ -2103,7 +2103,7 @@ class TauNode:
                 # reaches the live console.
                 authorized = True
                 try:
-                    with self.inbox.transaction(strict=True):
+                    with self.inbox.transaction():
                         try:
                             final = self.inbox.resolve(target_id)
                         except ValueError:
@@ -2125,7 +2125,7 @@ class TauNode:
                                     "storage_failed",
                                     f"could not store reaction: {exc}",
                                 )
-                except (InboxError, OSError) as exc:
+                except InboxError as exc:
                     return response_error(
                         "storage_failed", f"could not read inbox: {exc}"
                     )
@@ -2209,8 +2209,8 @@ class TauNode:
                 # reaction was not published live yet (see below),
                 # so a failed recheck also never publishes it.
                 try:
-                    self.inbox.reload(strict=True)
-                except (InboxError, OSError) as exc:
+                    self.inbox.reload()
+                except InboxError as exc:
                     log.warning(
                         "Could not reload inbox to recheck reaction for %s",
                         reaction["target"][:8],
