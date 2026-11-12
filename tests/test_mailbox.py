@@ -105,6 +105,32 @@ def test_enqueue_dedupes_by_message_id(tmp_path):
     assert box.counts()["outbox"] == 1
 
 
+def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
+    """`delivered_at` must survive a reload: the queued-to-delivered flip
+    and the sent-messages display both read it after one."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0)
+
+    reloaded = Mailbox(path)
+    delivered = reloaded.sent_record("m1")
+    assert delivered is not None
+    assert delivered["delivered_at"] == 1002.0
+    pending = reloaded.sent_record("m2")
+    assert pending is not None
+    assert pending["delivered_at"] is None
+
+    # A record written before delivery tracking has no such key and
+    # keeps counting as delivered in the sent-messages display.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_at"]
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_at" not in reloaded.sent_record("m2")
+
+
 def test_load_dedupes_duplicate_message_ids(tmp_path):
     """A mailbox.json with duplicate ids keeps the newest copy of each
     and is rewritten on load, so the duplicates do not survive a

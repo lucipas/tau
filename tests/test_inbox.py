@@ -303,6 +303,52 @@ def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
     assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
 
 
+def test_delete_authorized_deletes_only_the_exact_match(tmp_path):
+    # The retract race: a short id must never delete a longer id that
+    # merely shares its prefix, and a second retract of the same id
+    # finds nothing instead of reselecting.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abc", text="short", direction="in", destination="ab" * 16)
+    )
+    inbox.append(
+        _record(id="abcdef" + "1" * 26, text="long", direction="out")
+    )
+
+    removed = inbox.delete_authorized("abc", direction="in", destination="ab" * 16)
+    assert removed is not None
+    assert removed["text"] == "short"
+    assert inbox.delete_authorized("abc", direction="in", destination="ab" * 16) is None
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "abcdef" + "1" * 26
+    ]
+
+
+def test_delete_authorized_never_matches_a_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abcd" + "1" * 28, text="one", direction="in", destination="ab" * 16)
+    )
+
+    assert inbox.delete_authorized("abcd", direction="in", destination="ab" * 16) is None
+    assert len(inbox) == 1
+
+
+def test_delete_authorized_refuses_a_mismatched_record(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="mine", direction="out", destination="ab" * 16)
+    )
+
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="in", destination="ab" * 16)
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="out", destination="cd" * 16)
+    assert len(inbox) == 1
+
+
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))
@@ -365,6 +411,61 @@ def test_export_document_filters_by_peer(tmp_path):
 
     document = inbox.export_document(peer="aa" * 16)
     assert [entry["id"] for entry in document["messages"]] == ["a1"]
+
+
+def test_export_document_sees_messages_committed_by_another_process(tmp_path):
+    # A serving node's in-memory inbox goes stale when another process
+    # (e.g. `tau messages import`) commits to the same file: the export
+    # must read through the cross-process transaction, not the stale copy.
+    path = tmp_path / "inbox.json"
+    serving = Inbox(path)
+    serving.append(_record(id="one", text="first"))
+
+    cli = Inbox(path)
+    cli.append(_record(id="two", text="second"))
+
+    document = serving.export_document()
+    assert [entry["id"] for entry in document["messages"]] == ["one", "two"]
+
+
+def test_import_reports_inserted_records_under_concurrent_appends(tmp_path):
+    # The records an import stored are collected while its transaction
+    # still holds the lock: a concurrent append reloads the inbox and
+    # replaces the record objects, so collecting them afterwards would
+    # report a successful restore that mirrors nothing.
+    import threading
+
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    other = Inbox(path)
+    stop = threading.Event()
+
+    def append_forever():
+        index = 0
+        while not stop.is_set():
+            other.append(_record(id=f"race-{index}", text="noise"))
+            index += 1
+
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id=f"imp-{index}", text=f"imported {index}")
+            for index in range(100)
+        ],
+    }
+    worker = threading.Thread(target=append_forever)
+    worker.start()
+    try:
+        inserted: list = []
+        result = inbox.import_messages(document, inserted=inserted)
+    finally:
+        stop.set()
+        worker.join()
+    assert result["imported"] == 100
+    assert [entry["id"] for entry in inserted] == [
+        f"imp-{index}" for index in range(100)
+    ]
 
 
 def test_import_dedupes_records_without_ids_by_content(tmp_path):
