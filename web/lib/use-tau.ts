@@ -317,7 +317,11 @@ export function useTau() {
       // console id arrives under `message_id` instead.
       const payload = readEventData<{ message_id: number }>(event);
       if (!payload || typeof payload.message_id !== "number") return;
+      removedMessageIds.current.add(payload.message_id);
       setMessages((previous) =>
+        previous.filter((entry) => entry.id !== payload.message_id),
+      );
+      setSearchResults((previous) =>
         previous.filter((entry) => entry.id !== payload.message_id),
       );
     };
@@ -633,6 +637,10 @@ export function useTau() {
     setMessages((previous) =>
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
+    removedMessageIds.current.add(result.deleted.id);
+    setSearchResults((previous) =>
+      previous.filter((entry) => entry.id !== result.deleted.id),
+    );
     return result.deleted;
   }, []);
 
@@ -643,7 +651,11 @@ export function useTau() {
     );
     // The retract already succeeded: drop the bubble locally at once,
     // and let the message_deleted event reconcile other tabs.
+    removedMessageIds.current.add(result.retracted.id);
     setMessages((previous) =>
+      previous.filter((entry) => entry.id !== result.retracted.id),
+    );
+    setSearchResults((previous) =>
       previous.filter((entry) => entry.id !== result.retracted.id),
     );
     return result;
@@ -1357,7 +1369,11 @@ export function useTau() {
         `/api/messages/search?q=${encodeURIComponent(trimmed)}&limit=100`,
       );
       if (seq !== searchSeq.current) return;
-      setSearchResults(result.messages);
+      setSearchResults(
+        result.messages.filter(
+          (entry) => !removedMessageIds.current.has(entry.id),
+        ),
+      );
       setSearchError(null);
     } catch (caught) {
       if (seq !== searchSeq.current) return;
@@ -1467,6 +1483,12 @@ export function useTau() {
     refreshHeldMail,
     dropHeldMail,
     refreshAllowlist,
+    addAllowlistPeer,
+    removeAllowlistPeer,
+    setAllowlistEnabled,
+  };
+}
+freshAllowlist,
     addAllowlistPeer,
     removeAllowlistPeer,
     setAllowlistEnabled,
