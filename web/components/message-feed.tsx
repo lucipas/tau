@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { API_BASE } from "@/lib/api";
 import { MAX_MESSAGE_CHARS } from "@/lib/constants";
-import type { NodeInfo, TauMessage } from "@/lib/types";
+import type { NodeInfo, Peer, TauMessage } from "@/lib/types";
 import {
   formatExpiresIn,
   formatFileSize,
@@ -23,11 +23,13 @@ export const REACT_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 export function MessageFeed({
   messages,
   node,
+  peers,
   live,
   onReply,
   onDelete,
   onEdit,
   onRetract,
+  onForward,
   onReact,
   onPin,
   searching,
@@ -43,6 +45,9 @@ export function MessageFeed({
 }: {
   messages: TauMessage[];
   node: NodeInfo | null;
+  // Known peers to offer as forward targets; the picker reports none
+  // when the list is empty.
+  peers?: Peer[];
   live: boolean;
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
@@ -50,6 +55,7 @@ export function MessageFeed({
   // editor open (the peer had no copy, or a newer edit landed).
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
+  onForward?: (message: TauMessage, to: string) => Promise<void>;
   // `reaction` null retracts the caller's reaction to the message.
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   // `pinned` true pins the message, false unpins it.
@@ -229,10 +235,12 @@ export function MessageFeed({
               message={message}
               messages={quoteContext ?? messages}
               node={node}
+              peers={peers}
               onReply={onReply}
               onDelete={onDelete}
               onEdit={onEdit}
               onRetract={onRetract}
+              onForward={onForward}
               onReact={onReact}
               onPin={onPin}
             />
@@ -359,20 +367,24 @@ function MessageBubble({
   message,
   messages,
   node,
+  peers,
   onReply,
   onDelete,
   onEdit,
   onRetract,
+  onForward,
   onReact,
   onPin,
 }: {
   message: TauMessage;
   messages: TauMessage[];
   node: NodeInfo | null;
+  peers?: Peer[];
   onReply?: (message: TauMessage) => void;
   onDelete?: (message: TauMessage) => Promise<void>;
   onEdit?: (message: TauMessage, text: string) => Promise<boolean>;
   onRetract?: (message: TauMessage) => Promise<void>;
+  onForward?: (message: TauMessage, to: string) => Promise<void>;
   onReact?: (message: TauMessage, reaction: string | null) => Promise<void>;
   onPin?: (message: TauMessage, pinned: boolean) => Promise<void>;
 }) {
@@ -485,6 +497,32 @@ function MessageBubble({
       pinInFlight.current = false;
     }
   }
+
+  const [forwardOpen, setForwardOpen] = useState(false);
+  const [forwardPending, setForwardPending] = useState(false);
+  const [forwardError, setForwardError] = useState<string | null>(null);
+  const forwardInFlight = useRef(false);
+
+  async function handleForward(to: string) {
+    if (!onForward || forwardInFlight.current) return;
+    forwardInFlight.current = true;
+    setForwardPending(true);
+    setForwardError(null);
+    try {
+      // The bridge records the forwarded copy as a new outbound entry,
+      // so it appears in the feed through the SSE stream.
+      await onForward(message, to);
+      setForwardOpen(false);
+    } catch (error) {
+      setForwardError(
+        error instanceof Error ? error.message : "forward failed",
+      );
+    } finally {
+      setForwardPending(false);
+      forwardInFlight.current = false;
+    }
+  }
+
   // The node's own destination hash is what the bridge records as the
   // reactor, so this is how the console knows which reaction is mine.
   const ownReaction =
@@ -847,6 +885,22 @@ function MessageBubble({
               {pinPending ? "pinning…" : message.pinned ? "📌 pinned" : "pin"}
             </button>
           ) : null}
+          {onForward && !message.group && !message.file ? (
+            <button
+              type="button"
+              title="Forward this message"
+              aria-label="Forward this message"
+              aria-expanded={forwardOpen}
+              disabled={forwardPending}
+              onClick={() => {
+                setForwardError(null);
+                setForwardOpen((open) => !open);
+              }}
+              className="rounded px-1 py-0.5 text-mist transition hover:bg-void/60 hover:text-zinc-200"
+            >
+              {forwardPending ? "forwarding…" : "↗ forward"}
+            </button>
+          ) : null}
         </div>
 
         {pickerOpen ? (
@@ -887,6 +941,42 @@ function MessageBubble({
               );
             })}
           </div>
+        ) : null}
+        {forwardOpen ? (
+          <div
+            className={`flex flex-wrap gap-1 px-1 pt-1 ${
+              outbound ? "justify-end" : ""
+            }`}
+            role="group"
+            aria-label="Forward to a peer"
+          >
+            {(peers ?? []).length === 0 ? (
+              <span className="font-mono text-[10px] text-mist/60">
+                no known peers yet
+              </span>
+            ) : (
+              (peers ?? []).map((peer) => (
+                <button
+                  key={peer.destination}
+                  type="button"
+                  title={`Forward to ${peer.alias ?? peer.name}`}
+                  disabled={forwardPending}
+                  onClick={() => void handleForward(peer.destination)}
+                  className="rounded-lg border border-line/80 bg-void/60 px-2 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/35 hover:bg-void"
+                >
+                  {peer.alias ?? peer.name}
+                </button>
+              ))
+            )}
+          </div>
+        ) : null}
+        {forwardError ? (
+          <p
+            className="px-1 pt-1 font-mono text-[10px] text-amber"
+            role="alert"
+          >
+            forward failed: {forwardError}
+          </p>
         ) : null}
         {reactError ? (
           <p
