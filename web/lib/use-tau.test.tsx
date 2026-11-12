@@ -4,6 +4,7 @@ import type { Mock } from "vitest";
 
 import type {
   BlockPeerResponse,
+  NodeInfo,
   Peer,
   Snapshot,
   TauGroup,
@@ -21,6 +22,20 @@ import { apiGet, apiPost } from "./api";
 
 const mockedGet = apiGet as Mock;
 const mockedPost = apiPost as Mock;
+
+function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
+  return {
+    name: "tester",
+    destination: "cd".repeat(16),
+    protocol: 1,
+    version: "0.1.0",
+    rns_version: "test",
+    uptime: 12.5,
+    peers: 1,
+    interfaces: [{ name: "TCP", online: true }],
+    ...overrides,
+  };
+}
 
 // useTau opens an EventSource on mount; capture it so tests can push
 // snapshot events into the hook.
@@ -350,6 +365,115 @@ describe("useTau group management", () => {
     });
     expect(result.current.groups).toEqual([]);
   });
+
+  it("swaps in the successor group when members are added", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [
+        { hash: PEER_HASH, name: "alice" },
+        { hash: BOB_HASH, name: "bob" },
+        { hash: "cd".repeat(16), name: "carol" },
+      ],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+    expect(result.current.groups).toEqual([created]);
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
+    let returned:
+      | { ok: boolean; group: TauGroup; previous_id: string }
+      | undefined;
+    await act(async () => {
+      returned = await result.current.addGroupMembers(created.id, [
+        "cd".repeat(16),
+      ]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/add-member", {
+      group: created.id,
+      members: ["cd".repeat(16)],
+    });
+    expect(returned).toEqual({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
+    expect(result.current.groups).toEqual([successor]);
+  });
+
+  it("swaps in the successor group when members are removed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    mockedPost.mockResolvedValueOnce({ ok: true, group: created });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+
+    const { result } = renderHook(() => useTau());
+    await act(async () => {
+      await result.current.createGroup("crew", [PEER_HASH]);
+    });
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockResolvedValueOnce({ ok: true, groups: [successor] });
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/groups/remove-member", {
+      group: created.id,
+      members: [BOB_HASH],
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/groups");
+    expect(result.current.groups).toEqual([successor]);
+  });
+
+  it("does not duplicate a group when the successor is already listed", async () => {
+    const created = makeGroup();
+    const successor = makeGroup({
+      id: "bb".repeat(16),
+      members: [{ hash: PEER_HASH, name: "alice" }],
+    });
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+    expect(source).toBeTruthy();
+    // A poll landed with the successor before the POST came back.
+    act(() => {
+      source.emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [], [created, successor]),
+      });
+    });
+    await waitFor(() => expect(result.current.groups).toHaveLength(2));
+
+    mockedPost.mockResolvedValueOnce({
+      ok: true,
+      group: successor,
+      previous_id: created.id,
+    });
+    mockedGet.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => {
+      await result.current.removeGroupMembers(created.id, [BOB_HASH]);
+    });
+
+    expect(result.current.groups).toEqual([successor]);
+  });
 });
 
 async function renderWithPeer(peer: Peer, messages: TauMessage[] = []) {
@@ -603,6 +727,60 @@ describe("useTau search", () => {
 
     expect(mockedGet).not.toHaveBeenCalled();
     expect(result.current.searchQuery).toBeNull();
+  });
+});
+
+describe("useTau rename", () => {
+  it("renames the node and refreshes its record", async () => {
+    mockedPost.mockResolvedValue({
+      ok: true,
+      name: "renamed",
+      previous_name: "tester",
+      changed: true,
+    });
+    mockedGet.mockResolvedValue({ node: makeNode({ name: "renamed" }) });
+
+    const { result } = renderHook(() => useTau());
+
+    let response;
+    await act(async () => {
+      response = await result.current.renameNode("renamed");
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/id/rename", {
+      name: "renamed",
+    });
+    expect(response).toEqual({
+      ok: true,
+      name: "renamed",
+      previous_name: "tester",
+      changed: true,
+    });
+    expect(mockedGet).toHaveBeenCalledWith("/api/status");
+    expect(result.current.node?.name).toBe("renamed");
+  });
+
+  it("a status event re-reads the node record", async () => {
+    let source: FakeEventSource | undefined;
+    class CapturingSource extends FakeEventSource {
+      constructor(url: string) {
+        super(url);
+        source = this;
+      }
+    }
+    vi.stubGlobal("EventSource", CapturingSource);
+    mockedGet.mockResolvedValue({ node: makeNode({ name: "renamed" }) });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      source?.listeners["status"]?.forEach((listener) =>
+        listener(new Event("status")),
+      );
+    });
+
+    expect(mockedGet).toHaveBeenCalledWith("/api/status");
+    expect(result.current.node?.name).toBe("renamed");
   });
 });
 

@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import type { TanPost } from "@/lib/types";
 
@@ -25,7 +25,7 @@ function makePost(overrides: Partial<TanPost> = {}): TanPost {
 }
 
 const card = (post: TanPost) => (
-  <PostCard post={post} onToggleLike={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />
+  <PostCard post={post} onToggleLike={() => {}} onRepost={() => {}} onReply={() => {}} onDelete={() => {}} deleting={false} />
 );
 
 describe("PostCard repost display", () => {
@@ -108,5 +108,67 @@ describe("PostCard repost display", () => {
     // Replying targets a post or reply; a repost has no text of its
     // own, so the button is hidden rather than offered and failing.
     expect(screen.queryByTitle("Reply to this post")).toBeNull();
+  });
+});
+
+describe("PostCard repost button", () => {
+  it("offers a repost button on someone else's post and calls onRepost", () => {
+    const post = makePost({ kind: "post", reposts: 2 });
+    const onRepost = vi.fn();
+    render(
+      <PostCard
+        post={post}
+        onToggleLike={() => {}}
+        onRepost={onRepost}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Repost this post"));
+    expect(onRepost).toHaveBeenCalledTimes(1);
+    expect(onRepost).toHaveBeenCalledWith(post);
+  });
+
+  it("offers the button on a reply too", () => {
+    const reply = makePost({ kind: "reply", text: "agreed" });
+    render(
+      <PostCard
+        post={reply}
+        onToggleLike={() => {}}
+        onRepost={() => {}}
+        onReply={() => {}}
+        onDelete={() => {}}
+        deleting={false}
+      />,
+    );
+
+    expect(screen.getByTitle("Repost this post")).toBeTruthy();
+  });
+
+  it("hides the button on your own post, an already-reposted post, and a repost entry", () => {
+    for (const overrides of [
+      { own: true },
+      { reposted: true },
+      { kind: "repost" },
+      { kind: "quote" },
+      { deleted: true },
+    ]) {
+      const { unmount } = render(
+        <PostCard
+          post={makePost(overrides)}
+          onToggleLike={() => {}}
+          onRepost={() => {}}
+          onReply={() => {}}
+          onDelete={() => {}}
+          deleting={false}
+        />,
+      );
+      expect(screen.queryByTitle("Repost this post")).toBeNull();
+      // The count chip stays visible as a plain display.
+      expect(screen.getByTitle(/Reposts|You reposted this/)).toBeTruthy();
+      unmount();
+    }
   });
 });

@@ -44,10 +44,22 @@ function makePost(overrides: Partial<TanPost> = {}): TanPost {
 }
 
 const emptyFollowing = { following: [], count: 0 };
+const emptyAuthors = { authors: [], count: 0, total: 0 };
+
+// The feed load fetches the timeline, the following list and the
+// authors directory in parallel; the non-timeline responses come back
+// in their own shapes.
+function otherResponses(path: string) {
+  return path.startsWith("/api/tan/authors")
+    ? Promise.resolve(emptyAuthors)
+    : Promise.resolve(emptyFollowing);
+}
+
 const emptySuggestions = { suggestions: [], count: 0 };
 
 function routeLoad(path: string, timeline: unknown) {
   if (path.startsWith("/api/tan/timeline")) return Promise.resolve(timeline);
+  if (path.startsWith("/api/tan/authors")) return Promise.resolve(emptyAuthors);
   if (path.startsWith("/api/tan/suggest")) return Promise.resolve(emptySuggestions);
   return Promise.resolve(emptyFollowing);
 }
@@ -111,12 +123,15 @@ describe("useTan mentions view", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
     const { result } = renderHook(() => useTan());
     await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // The authors directory loads with the feed, like following.
+    expect(result.current.authors).toEqual([]);
+    expect(result.current.authorsTotal).toBe(0);
     // Mentions are not part of the timeline's load: nothing loaded yet.
     expect(result.current.mentions).toEqual([]);
     expect(
@@ -150,7 +165,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -209,7 +224,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [], count: 0 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -244,7 +259,7 @@ describe("useTan saved posts", () => {
       }
       return path.startsWith("/api/tan/timeline")
         ? Promise.resolve({ posts: [mine], count: 1 })
-        : Promise.resolve(emptyFollowing);
+        : otherResponses(path);
     });
     mockedPost.mockResolvedValue({ ok: true });
 
@@ -271,6 +286,32 @@ describe("useTan saved posts", () => {
 });
 
 
+describe("useTan repost", () => {
+  it("posts the hash to /api/tan/repost and reloads the feed", async () => {
+    const post = makePost();
+    mockedGet.mockImplementation((path: string) =>
+      path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [post], count: 1 })
+        : Promise.resolve(emptyFollowing),
+    );
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([post]));
+    const loadsBefore = mockedGet.mock.calls.length;
+
+    await act(async () => {
+      await result.current.repost(post.hash);
+    });
+
+    expect(mockedPost).toHaveBeenCalledWith("/api/tan/repost", {
+      target: post.hash,
+    });
+    // The feed is reloaded after the repost, so the card shows the
+    // reposted state and the repost itself appears in the timeline.
+    expect(mockedGet.mock.calls.length).toBeGreaterThan(loadsBefore);
+  });
+});
 
 describe("useTan deletePost", () => {
   it("posts the hash to /api/tan/delete and reloads the feed", async () => {
@@ -301,14 +342,19 @@ describe("useTan deletePost", () => {
       const mine = makePost();
       const first = deferred();
       const firstFollowing = deferred();
+      const firstAuthors = deferred();
       const firstMuted = deferred();
       const firstMutedKeywords = deferred();
       const firstSuggestions = deferred();
+      // A feed load fires the timeline, following, muted and muted-
+      // keyword requests, and the authors directory and suggestions
+      // load beside it.
       const queue = [
         first,
         firstFollowing,
         firstMuted,
         firstMutedKeywords,
+        firstAuthors,
         firstSuggestions,
       ];
       let next = 0;
@@ -320,18 +366,19 @@ describe("useTan deletePost", () => {
 
       const { result } = renderHook(() => useTan());
       // The initial load is in flight; a poll tick must not invalidate it.
-      // Five feed calls plus the one rules load.
-      expect(mockedGet.mock.calls.length).toBe(6);
+      // Six feed calls plus the one rules load.
+      expect(mockedGet.mock.calls.length).toBe(7);
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBe(6);
+      expect(mockedGet.mock.calls.length).toBe(7);
 
       await act(async () => {
         first.resolve({ posts: [mine], count: 1 });
         firstFollowing.resolve(emptyFollowing);
         firstMuted.resolve({ muted: [], count: 0 });
         firstMutedKeywords.resolve({ muted_keywords: [], count: 0 });
+        firstAuthors.resolve(emptyAuthors);
         firstSuggestions.resolve(emptySuggestions);
       });
       expect(result.current.posts).toEqual([mine]);
@@ -343,7 +390,7 @@ describe("useTan deletePost", () => {
       await act(async () => {
         vi.advanceTimersByTime(5000);
       });
-      expect(mockedGet.mock.calls.length).toBeGreaterThan(6);
+      expect(mockedGet.mock.calls.length).toBeGreaterThan(7);
     } finally {
       vi.useRealTimers();
     }
@@ -352,7 +399,11 @@ describe("useTan deletePost", () => {
   it("drops a stale feed response that resolves after a newer load", async () => {
     const first = makePost({ hash: "a".repeat(64), text: "first" });
     const second = makePost({ hash: "b".repeat(64), text: "second" });
+    // Two feed loads in flight: the initial load takes the first
+    // six deferreds (timeline, following, muted, muted keywords,
+    // authors, suggestions), the refresh the next four.
     const queue = [
+      deferred(),
       deferred(),
       deferred(),
       deferred(),
@@ -378,16 +429,18 @@ describe("useTan deletePost", () => {
     });
     // Resolve the newer load first, then the older one.
     await act(async () => {
-      queue[5].resolve({ posts: [second], count: 1 });
-      queue[6].resolve(emptyFollowing);
-      queue[7].resolve({ muted: [], count: 0 });
-      queue[8].resolve({ muted_keywords: [], count: 0 });
+      queue[6].resolve({ posts: [second], count: 1 });
+      queue[7].resolve(emptyFollowing);
+      queue[8].resolve({ muted: [], count: 0 });
+      queue[9].resolve({ muted_keywords: [], count: 0 });
     });
     await act(async () => {
       queue[0].resolve({ posts: [first], count: 1 });
       queue[1].resolve(emptyFollowing);
       queue[2].resolve({ muted: [], count: 0 });
       queue[3].resolve({ muted_keywords: [], count: 0 });
+      queue[4].resolve(emptyAuthors);
+      queue[5].resolve(emptySuggestions);
     });
     await act(async () => {
       await refreshPromise;
@@ -395,6 +448,88 @@ describe("useTan deletePost", () => {
 
     // The deleted post's refresh wins; the stale poll response is dropped.
     expect(result.current.posts).toEqual([second]);
+  });
+
+  it("keeps the feed when the authors directory fails to load", async () => {
+    const mine = makePost();
+    // The directory loads on its own generation, not the feed's, so a
+    // failed authors request must not fail the feed or clear the
+    // directory.
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/authors")) {
+        return Promise.reject(new Error("authors unavailable"));
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    expect(result.current.authors).toEqual([]);
+    expect(result.current.authorsTotal).toBe(0);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("pages the authors directory with show more", async () => {
+    const mine = makePost();
+    function makeAuthorRecord(index: number) {
+      return {
+        author: `${index}`.padStart(64, "0"),
+        name: `author ${index}`,
+        posts: 1,
+        last_post: 1000 + index,
+        followed: false,
+      };
+    }
+    mockedGet.mockImplementation((path: string) => {
+      if (path.startsWith("/api/tan/authors")) {
+        // The directory holds 120 authors; each page returns the
+        // requested offset slice, like the real API.
+        const params = new URL(path, "http://localhost").searchParams;
+        const offset = Number(params.get("offset") ?? 0);
+        const limit = Number(params.get("limit") ?? 50);
+        const page = Array.from(
+          { length: Math.max(0, Math.min(limit, 120 - offset)) },
+          (_, index) => makeAuthorRecord(offset + index),
+        );
+        return Promise.resolve({ authors: page, count: page.length, total: 120 });
+      }
+      return path.startsWith("/api/tan/timeline")
+        ? Promise.resolve({ posts: [mine], count: 1 })
+        : otherResponses(path);
+    });
+    mockedPost.mockResolvedValue({ ok: true });
+
+    const { result } = renderHook(() => useTan());
+    await waitFor(() => expect(result.current.posts).toEqual([mine]));
+    // The first page loads with the feed: 50 of 120 authors.
+    await waitFor(() => expect(result.current.authors).toHaveLength(50));
+    expect(result.current.authorsTotal).toBe(120);
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=0",
+    );
+
+    // Show more appends the next offset page instead of re-fetching
+    // the first rows with a larger limit.
+    await act(async () => {
+      await result.current.loadMoreAuthors();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=50",
+    );
+    expect(result.current.authors).toHaveLength(100);
+    expect(result.current.authors[50].name).toBe("author 50");
+
+    // A third page reaches the total; the last page is short.
+    await act(async () => {
+      await result.current.loadMoreAuthors();
+    });
+    expect(mockedGet).toHaveBeenCalledWith(
+      "/api/tan/authors?limit=50&offset=100",
+    );
+    expect(result.current.authors).toHaveLength(120);
   });
 
   it("loads suggested authors alongside the feed and refreshes them after a follow", async () => {
@@ -1011,10 +1146,13 @@ describe("useTan top view", () => {
     vi.useFakeTimers();
     try {
       const top = makePost({ text: "most liked", likes: 5 });
-      // Five queued calls for the initial load (feed, following, muted,
-      // muted keywords, suggestions) plus the rules load, then four
-      // more for the top load (feed, following, muted, muted keywords).
+      // Six queued calls for the initial load (feed, following, muted,
+      // muted keywords, authors, suggestions) plus the rules load, then
+      // five more for the top load (feed, following, muted, muted
+      // keywords, authors).
       const queue = [
+        deferred(),
+        deferred(),
         deferred(),
         deferred(),
         deferred(),
@@ -1035,24 +1173,25 @@ describe("useTan top view", () => {
       const { result } = renderHook(() => useTan());
       // The initial timeline load is in flight; switch to top, which
       // supersedes it with a top load.
-      expect(mockedGet.mock.calls.length).toBe(6);
+      expect(mockedGet.mock.calls.length).toBe(7);
       act(() => {
         result.current.setView("top");
       });
-      expect(mockedGet.mock.calls.length).toBe(10);
+      expect(mockedGet.mock.calls.length).toBe(12);
 
       await act(async () => {
-        queue[5].resolve({ posts: [top], count: 1 });
-        queue[6].resolve(emptyFollowing);
-        queue[7].resolve({ muted: [], count: 0 });
-        queue[8].resolve({ muted_keywords: [], count: 0 });
+        queue[6].resolve({ posts: [top], count: 1 });
+        queue[7].resolve(emptyFollowing);
+        queue[8].resolve({ muted: [], count: 0 });
+        queue[9].resolve({ muted_keywords: [], count: 0 });
+        queue[10].resolve(emptyAuthors);
       });
       expect(result.current.posts).toEqual([top]);
 
       await act(async () => {
         vi.advanceTimersByTime(15000);
       });
-      expect(mockedGet.mock.calls.length).toBe(10);
+      expect(mockedGet.mock.calls.length).toBe(12);
     } finally {
       vi.useRealTimers();
     }

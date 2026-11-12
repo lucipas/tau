@@ -36,9 +36,11 @@ from tau.tangents.tan import (
     create_reaction,
     create_reply,
     create_repost,
+    clean_tag,
     deleted_targets,
     edit_states,
     export_entries,
+    extract_tags,
     feed,
     follow,
     following,
@@ -72,6 +74,7 @@ from tau.tangents.tan import (
     store_post,
     SUGGEST_FOLLOWED_WEIGHT,
     suggest_authors,
+    tags,
     thread,
     timeline,
     top_posts,
@@ -5255,3 +5258,291 @@ def test_exclude_all_hides_everything(identities, tmp_path):
     assert search_posts(conn, "from", exclude_all=True) == []
     with pytest.raises(TanError, match="block-list is unusable"):
         thread(conn, post["hash"], exclude_all=True)
+
+
+def test_extract_tags():
+    assert extract_tags("hello #meshnet world") == ["meshnet"]
+    assert extract_tags("#MeshNet and #meshnet again") == ["meshnet"]
+    assert extract_tags("#ato-2026 #café #tag_1") == ["ato-2026", "café", "tag_1"]
+    assert extract_tags("trailing #tag- punctuation #hi! and (#yo)") == [
+        "tag",
+        "hi",
+        "yo",
+    ]
+    # A '#' mid-word is not a tag: C# the language, or foo#bar.
+    assert extract_tags("C# is not a tag, nor is foo#bar") == []
+    # A tag must start with a letter.
+    assert extract_tags("#123 #_x #") == []
+    assert extract_tags("") == []
+    assert extract_tags(None) == []
+    assert extract_tags("#a #a-b #a") == ["a", "a-b"]
+
+
+def test_clean_tag():
+    assert clean_tag("#MeshNet") == "meshnet"
+    assert clean_tag("  meshnet  ") == "meshnet"
+    assert clean_tag("#ato-2026") == "ato-2026"
+    for bad in ("", "   ", "#", "123", "two words", "#a-", "a#b", None, 42):
+        with pytest.raises(TanError, match="not a tag|tag must be text"):
+            clean_tag(bad)
+
+
+def test_tags_lists_counts_most_used_first(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "#meshnet hello", name="alice", now=1000)
+    create_post(conn, alice, "#meshnet again #meshnet", name="alice", now=1001)
+    create_post(conn, bob, "#ato time", name="bob", now=1002)
+    create_post(conn, alice, "#ato #meshnet both", name="alice", now=1003)
+    create_post(conn, bob, "no tags here", name="bob", now=1004)
+
+    assert tags(conn) == [
+        {"tag": "meshnet", "count": 3},
+        {"tag": "ato", "count": 2},
+    ]
+    assert tags(conn, limit=1) == [{"tag": "meshnet", "count": 3}]
+    # A post counts once per tag no matter how often it repeats it.
+    assert tags(conn, limit=2)[0]["count"] == 3
+
+
+def test_tags_uses_edited_text_and_excludes_deleted_and_muted(
+    identities, tmp_path
+):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    edited = create_post(conn, alice, "#oldtag hello", name="alice", now=1000)
+    create_edit(conn, alice, edited["hash"], "#newtag hello", name="alice", now=1001)
+    deleted = create_post(conn, alice, "#gone hello", name="alice", now=1002)
+    create_delete(conn, alice, deleted["hash"], name="alice", now=1003)
+    create_post(conn, bob, "#muted hello", name="bob", now=1004)
+
+    assert tags(conn) == [
+        {"tag": "muted", "count": 1},
+        {"tag": "newtag", "count": 1},
+    ]
+    mute(conn, author_of(bob), name="bob")
+    assert tags(conn) == [{"tag": "newtag", "count": 1}]
+    unmute(conn, author_of(bob))
+    assert tags(conn) == [
+        {"tag": "muted", "count": 1},
+        {"tag": "newtag", "count": 1},
+    ]
+
+
+def test_timeline_tag_filters_posts_replies_and_reposts(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, alice, "tagged #meshnet", name="alice", now=1000)
+    plain = create_post(conn, bob, "plain post", name="bob", now=1001)
+    reply = create_reply(
+        conn, alice, plain["hash"], "reply #meshnet", name="alice", now=1002
+    )
+    repost_tagged = create_repost(conn, bob, tagged["hash"], name="bob", now=1003)
+    create_repost(conn, alice, plain["hash"], name="alice", now=1004)
+    authors = [tagged["author"], plain["author"]]
+
+    found = timeline(conn, authors, tag="meshnet")
+    assert [post["hash"] for post in found] == [
+        repost_tagged["hash"],
+        reply["hash"],
+        tagged["hash"],
+    ]
+    # A leading '#' and upper case are accepted: the tag is cleaned.
+    assert [post["hash"] for post in timeline(conn, authors, tag="#MESHNET")] == [
+        repost_tagged["hash"],
+        reply["hash"],
+        tagged["hash"],
+    ]
+    # The author view filters the same way.
+    assert [post["hash"] for post in author_timeline(conn, tagged["author"], tag="meshnet")] == [
+        reply["hash"],
+        tagged["hash"],
+    ]
+    # So does the --all view.
+    assert [post["hash"] for post in timeline(conn, include_all=True, tag="meshnet")] == [
+        repost_tagged["hash"],
+        reply["hash"],
+        tagged["hash"],
+    ]
+    assert timeline(conn, authors, tag="nothing") == []
+    with pytest.raises(TanError, match="not a tag"):
+        timeline(conn, authors, tag="two words")
+
+
+def test_timeline_tag_uses_edited_text(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    added = create_post(conn, alice, "hello", name="alice", now=1000)
+    create_edit(conn, alice, added["hash"], "hello #meshnet", name="alice", now=1001)
+    removed = create_post(conn, bob, "#meshnet hello", name="bob", now=1002)
+    create_edit(conn, bob, removed["hash"], "hello", name="bob", now=1003)
+    authors = [added["author"], removed["author"]]
+
+    assert [post["hash"] for post in timeline(conn, authors, tag="meshnet")] == [
+        added["hash"]
+    ]
+    assert [post["hash"] for post in timeline(conn, include_all=True, tag="meshnet")] == [
+        added["hash"]
+    ]
+
+
+def test_timeline_tag_hides_muted_authors(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    create_post(conn, alice, "#meshnet from alice", name="alice", now=1000)
+    create_post(conn, bob, "#meshnet from bob", name="bob", now=1001)
+    authors = [author_of(alice), author_of(bob)]
+
+    mute(conn, author_of(bob), name="bob")
+    assert [post["text"] for post in timeline(conn, authors, tag="meshnet")] == [
+        "#meshnet from alice"
+    ]
+    assert tags(conn) == [{"tag": "meshnet", "count": 1}]
+
+
+def test_cli_tan_tags(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert main(["tan", "tags", "--data-dir", str(data_dir)]) == 0
+    assert "No hashtags in stored posts yet." in capsys.readouterr().out
+    for text in ("#meshnet hello", "#meshnet again", "#ato time"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+    assert main(["tan", "tags", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "tags": [
+            {"tag": "meshnet", "count": 2},
+            {"tag": "ato", "count": 1},
+        ],
+        "count": 2,
+    }
+    assert main(["tan", "tags", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "2  #meshnet" in out
+    assert "1  #ato" in out
+
+
+def test_cli_timeline_tag(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    for text in ("#meshnet hello", "plain post"):
+        assert (
+            main(
+                [
+                    "tan",
+                    "post",
+                    "--data-dir",
+                    str(data_dir),
+                    "--no-publish",
+                    "--json",
+                    text,
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+    assert (
+        main(
+            [
+                "tan",
+                "timeline",
+                "--data-dir",
+                str(data_dir),
+                "--all",
+                "--tag",
+                "meshnet",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["posts"][0]["text"] == "#meshnet hello"
+    assert (
+        main(
+            [
+                "tan",
+                "timeline",
+                "--data-dir",
+                str(data_dir),
+                "--all",
+                "--tag",
+                "two words",
+                "--json",
+            ]
+        )
+        == 1
+    )
+    assert "not a tag" in capsys.readouterr().err
+
+
+def test_extract_tags_skips_tags_that_do_not_survive_casefolding():
+    # "İ" casefolds to "i" plus a combining mark, which a tag cannot
+    # carry — so it is no tag at all, rather than a mangled one.
+    assert extract_tags("about #İ") == []
+    # Every tag extraction returns passes clean_tag: the two agree.
+    for text in (
+        "#MeshNet #ato-2026",
+        "#café #tag_1 (see #yo!)",
+        "plain text, no tags",
+    ):
+        for tag in extract_tags(text):
+            assert clean_tag(tag) == tag
+            assert clean_tag("#" + tag) == tag
+
+
+def test_timeline_tag_excludes_repost_of_deleted_post(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    tagged = create_post(conn, alice, "tagged #meshnet", name="alice", now=1000)
+    create_repost(conn, bob, tagged["hash"], name="bob", now=1001)
+    create_delete(conn, alice, tagged["hash"], name="alice", now=1002)
+    authors = [tagged["author"], author_of(bob)]
+
+    # The repost must not match on the deleted original's text: the
+    # tag view stays empty instead of showing a blank repost that
+    # leaks that the deleted post carried the tag.
+    assert timeline(conn, authors, tag="meshnet") == []
+    assert timeline(conn, include_all=True, tag="meshnet") == []
+    assert tags(conn) == []
+
+
+def test_timeline_tag_hidden_repost_does_not_consume_limit(identities, tmp_path):
+    alice, bob = identities
+    carol = RNS.Identity()
+    conn = init_db(tmp_path / "tan.sqlite3")
+    visible = create_post(conn, alice, "#meshnet visible", name="alice", now=1000)
+    hidden = create_post(conn, bob, "#meshnet hidden", name="bob", now=1001)
+    repost = create_repost(conn, carol, hidden["hash"], name="carol", now=1002)
+    authors = [visible["author"], hidden["author"], author_of(carol)]
+
+    mute(conn, author_of(bob), name="bob")
+    # The repost of bob's post is hidden by the timeline's repost
+    # rules, so with limit 1 the tag view must page past it to the
+    # visible post instead of coming back empty.
+    assert [post["hash"] for post in timeline(conn, authors, tag="meshnet", limit=1)] == [
+        visible["hash"]
+    ]
+    assert [post["hash"] for post in timeline(conn, include_all=True, tag="meshnet", limit=1)] == [
+        visible["hash"]
+    ]
+    # The author view keeps reposts of muted authors, the way its
+    # untagged view does — the filter mirrors the call site.
+    assert [post["hash"] for post in author_timeline(conn, author_of(carol), tag="meshnet")] == [
+        repost["hash"]
+    ]
