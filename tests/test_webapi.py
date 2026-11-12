@@ -8305,6 +8305,238 @@ def test_retract_message_endpoint_rejects_inbound_group_and_queued(bridge, node)
     assert "still queued" in payload["error"]["message"]
 
 
+def _received_console_entry(bridge, *, text="hello there"):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": text,
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+
+
+def test_forward_message_endpoint_forwards_received_message(bridge, node):
+    from tau.blocklist import BlockList
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["message"]["text"] == "Forwarded from alice:\nhello there"
+    assert payload["message"]["direction"] == "out"
+    assert node.sent == [("alice", "Forwarded from alice:\nhello there", None)]
+    # The original stays in the feed: forwarding sends a copy.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1, 2]
+
+
+def test_forward_message_endpoint_attributes_own_message_as_you(bridge, node):
+    _sent_console_entry(bridge, node)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["message"]["text"] == "Forwarded from you:\nhello"
+
+
+def test_forward_message_endpoint_prefers_registry_name(bridge, node):
+    from tau.blocklist import BlockList
+
+    # The entry was recorded under a stale name; the registry's current
+    # display name wins, like `tau forward`.
+    bridge.record_inbound(
+        {
+            "from": "stale-name",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-1",
+        }
+    )
+    node.set_blocklist(BlockList())
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 200
+    assert payload["message"]["text"] == "Forwarded from alice:\nhello"
+
+
+def test_forward_message_endpoint_rejects_group_file_and_blocked(bridge, node):
+    from tau.blocklist import BlockList
+
+    # Group messages would leak the group's text to a nonmember.
+    _sent_console_entry(bridge, node, wire_id="wire-1", group="ab" * 16)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "group messages cannot be forwarded" in payload["error"]["message"]
+
+    # File transfers have no text to forward.
+    _sent_console_entry(
+        bridge,
+        node,
+        wire_id="wire-2",
+        file={"name": "photo.jpg", "size": 12, "sha256": "ab" * 32},
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 2, "to": "alice"},
+    )
+    assert status == 400
+    assert "file transfers cannot be forwarded" in payload["error"]["message"]
+
+    # A received message from a blocked peer stays unforwardable.
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList(blocked=frozenset({PEER_HASH})))
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 3, "to": "alice"},
+    )
+    assert status == 400
+    assert "blocked peer" in payload["error"]["message"]
+
+    # An unreadable block-list fails closed for received messages,
+    # matching `tau forward`.
+    node.set_blocklist(None)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 3, "to": "alice"},
+    )
+    assert status == 400
+    assert "could not be read" in payload["error"]["message"]
+
+
+def test_forward_message_endpoint_rejects_unknown_and_bad_input(bridge, node):
+    _received_console_entry(bridge)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 99, "to": "alice"},
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": "1", "to": "alice"},
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/forward", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "field 'to'" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_forward_message_endpoint_rejects_restored_file_entry(bridge, node):
+    # Regression test for the Qodo review finding: a file restored
+    # from a backup used to arrive in the feed without its file
+    # metadata, so the forward guard passed it and the peer got a
+    # fake "Received file: ..." line as a DM.
+    bridge._mirror_imported_messages(
+        [
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "kind": "file",
+                "name": "photo.jpg",
+                "size": 12,
+                "sha256": "ab" * 32,
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-file-1",
+            }
+        ]
+    )
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["file"] == {
+        "name": "photo.jpg",
+        "size": 12,
+        "sha256": "ab" * 32,
+    }
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "file transfers cannot be forwarded" in payload["error"]["message"]
+    assert node.sent == []
+
+
+def test_forward_message_endpoint_reports_full_outbox(bridge, node):
+    from tau.mailbox import MailboxFull
+
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+
+    def send_message(peer, text, **kwargs):
+        raise MailboxFull("outbox is full (100 messages)")
+
+    node.send_message = send_message
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 503
+    assert "outbox is full" in payload["error"]["message"]
+
+
+def test_forward_message_endpoint_refuses_expired_disappearing_message(
+    bridge, node
+):
+    # The Qodo autofix refuses forwarding past the expiry: the text
+    # was meant to vanish, so forwarding it would resurrect it.
+    _received_console_entry(bridge)
+    node.set_blocklist(BlockList())
+    entry = bridge._messages[0]
+    entry["expires_at"] = time.time() - 1.0
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/forward",
+        method="POST",
+        body={"id": 1, "to": "alice"},
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+    assert node.sent == []
+
+
 def test_retract_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     status, _, payload = _json(
         bridge, "/api/messages/retract", method="POST", body={"id": 7}

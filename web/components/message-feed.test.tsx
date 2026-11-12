@@ -475,6 +475,103 @@ describe("MessageFeed retract", () => {
   });
 });
 
+describe("MessageFeed forward", () => {
+  const peers = [
+    {
+      destination: "cd".repeat(16),
+      name: "bob",
+      last_seen: 1000,
+      age: 10,
+      hops: 1,
+      protocol: 1,
+    },
+  ];
+
+  it("shows no forward button without an onForward handler", () => {
+    render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);
+    expect(screen.queryByLabelText("Forward this message")).toBeNull();
+  });
+
+  it("opens a peer picker and forwards to the picked peer", async () => {
+    const message = makeMessage();
+    const onForward = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        peers={peers}
+        live={true}
+        onForward={onForward}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Forward this message"));
+    expect(screen.getByLabelText("Forward to a peer")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Forward to bob"));
+    expect(onForward).toHaveBeenCalledTimes(1);
+    expect(onForward).toHaveBeenCalledWith(message, "cd".repeat(16));
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Forward to a peer")).toBeNull(),
+    );
+  });
+
+  it("shows no forward button on group or file messages", () => {
+    const onForward = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[
+          makeMessage({ id: 1, group: "ab".repeat(16), group_name: "crew" }),
+          makeMessage({
+            id: 2,
+            file: { name: "photo.jpg", size: 12, sha256: "ab".repeat(32) },
+          }),
+        ]}
+        node={null}
+        live={true}
+        onForward={onForward}
+      />,
+    );
+    expect(screen.queryByLabelText("Forward this message")).toBeNull();
+  });
+
+  it("reports a failed forward inline and keeps the picker open", async () => {
+    const onForward = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        peers={peers}
+        live={true}
+        onForward={onForward}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("Forward this message"));
+    fireEvent.click(screen.getByTitle("Forward to bob"));
+    await waitFor(() =>
+      expect(screen.getByText("forward failed: boom")).toBeTruthy(),
+    );
+    expect(screen.getByLabelText("Forward to a peer")).toBeTruthy();
+  });
+
+  it("says so when there are no known peers", () => {
+    const onForward = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        peers={[]}
+        live={true}
+        onForward={onForward}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Forward this message"));
+    expect(screen.getByText("no known peers yet")).toBeTruthy();
+    expect(onForward).not.toHaveBeenCalled();
+  });
+});
 
 describe("MessageFeed react picker", () => {
   const NODE: NodeInfo = {
