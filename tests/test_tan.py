@@ -23,10 +23,12 @@ from tau.tangents.tan import (
     TanApp,
     TanError,
     annotate_edits,
+    annotate_pinned,
     annotate_quote_counts,
     annotate_quotes,
     annotate_reactions,
     annotate_replies,
+    annotated_pinned_posts,
     author_stats,
     author_timeline,
     create_delete,
@@ -67,6 +69,8 @@ from tau.tangents.tan import (
     muted,
     muted_author_set,
     open_readonly_db,
+    pin_post,
+    pinned_posts,
     save_post,
     saved_posts,
     search_posts,
@@ -81,6 +85,7 @@ from tau.tangents.tan import (
     unfollow,
     unmute,
     unmute_keyword,
+    unpin_post,
     unsave_post,
     verify_post,
     verify_store,
@@ -4763,6 +4768,210 @@ def test_save_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
     assert saved[0]["hash"] == keep["hash"]
     assert saved[0]["deleted"] is True
     assert saved[0]["text"] == ""
+
+
+def test_pin_post_round_trip(identities, tmp_path):
+    alice, bob = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    mine = create_post(conn, alice, "pin this", name="alice", now=1000)
+    theirs = create_post(conn, bob, "not mine", name="bob", now=1001)
+    owner = author_of(alice)
+
+    # Only your own posts can be pinned.
+    with pytest.raises(TanError, match="only your own posts"):
+        pin_post(conn, theirs["hash"], owner=owner)
+
+    record = pin_post(conn, mine["hash"][:16], owner=owner, now=2000)
+    assert record["hash"] == mine["hash"]
+    assert record["already_pinned"] is False
+    assert record["pinned_at"] == 2000
+
+    # Pinning again is a no-op that reports the original pin time.
+    again = pin_post(conn, mine["hash"], owner=owner, now=3000)
+    assert again["already_pinned"] is True
+    assert again["pinned_at"] == 2000
+
+    pinned = pinned_posts(conn)
+    assert [post["hash"] for post in pinned] == [mine["hash"]]
+    assert pinned[0]["pinned_at"] == 2000
+
+    # The annotation flags the pinned post and leaves others clear.
+    flagged = annotate_pinned(conn, [dict(mine), dict(theirs)])
+    assert flagged[0]["pinned"] is True
+    assert flagged[1]["pinned"] is False
+
+    removed = unpin_post(conn, mine["hash"][:16])
+    assert removed == {"hash": mine["hash"], "unpinned": True}
+    assert unpin_post(conn, mine["hash"]) == {"hash": mine["hash"], "unpinned": False}
+    assert pinned_posts(conn) == []
+
+
+def test_pin_post_rejects_unknown_unlinked_and_deleted(identities, tmp_path):
+    alice, bob = identities
+    source = init_db(tmp_path / "source.sqlite3")
+    first = create_post(source, alice, "first", name="alice", now=1000)
+    second = create_post(source, alice, "second", name="alice", now=1001)
+    owner = author_of(alice)
+
+    with pytest.raises(TanError, match="unknown post"):
+        pin_post(source, "ab" * 32, owner=owner)
+
+    # Only the second post arrives: it is cached but unlinked, so
+    # pinning it would file a post with no verified chain behind it.
+    destination = init_db(tmp_path / "destination.sqlite3")
+    store_post(destination, second)
+    with pytest.raises(TanError, match="has not linked yet"):
+        pin_post(destination, second["hash"], owner=owner)
+
+    # A post its author deleted cannot be pinned.
+    create_delete(source, alice, first["hash"], name="alice", now=1002)
+    with pytest.raises(TanError, match="has been deleted"):
+        pin_post(source, first["hash"], owner=owner)
+
+    # ... but a post deleted after being pinned stays listed, blanked,
+    # and can still be unpinned.
+    keep = create_post(source, bob, "keep me", name="bob", now=1003)
+    pin_post(source, keep["hash"], owner=author_of(bob), now=2000)
+    create_delete(source, bob, keep["hash"], name="bob", now=1004)
+    pinned = pinned_posts(source)
+    assert len(pinned) == 1
+    assert pinned[0]["hash"] == keep["hash"]
+    assert pinned[0]["deleted"] is True
+    assert pinned[0]["text"] == ""
+    assert unpin_post(source, keep["hash"]) == {
+        "hash": keep["hash"],
+        "unpinned": True,
+    }
+
+
+def test_pin_post_cap(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    posts = [
+        create_post(conn, alice, f"post {n}", name="alice", now=1000 + n)
+        for n in range(11)
+    ]
+    for post in posts[:10]:
+        pin_post(conn, post["hash"], owner=owner)
+    with pytest.raises(TanError, match="limited to 10"):
+        pin_post(conn, posts[10]["hash"], owner=owner)
+    # Re-pinning a post already on the shelf still succeeds at the cap.
+    assert pin_post(conn, posts[0]["hash"], owner=owner)["already_pinned"] is True
+
+
+def test_annotated_pinned_posts_newest_first(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    older = create_post(conn, alice, "older pin", name="alice", now=1000)
+    newer = create_post(conn, alice, "newer pin", name="alice", now=1001)
+    pin_post(conn, older["hash"], owner=owner, now=2000)
+    pin_post(conn, newer["hash"], owner=owner, now=2001)
+
+    posts, next_offset = annotated_pinned_posts(conn, viewer=owner)
+    assert [post["hash"] for post in posts] == [newer["hash"], older["hash"]]
+    assert all(post["pinned"] for post in posts)
+    assert next_offset is None
+
+
+def test_annotated_pinned_posts_applies_edits(identities, tmp_path):
+    alice, _ = identities
+    conn = init_db(tmp_path / "tan.sqlite3")
+    owner = author_of(alice)
+    post = create_post(conn, alice, "original", name="alice", now=1000)
+    pin_post(conn, post["hash"], owner=owner, now=2000)
+
+    # The pinned list shows the current edit, not the original text.
+    create_edit(conn, alice, post["hash"], "fixed", name="alice", now=1001)
+    posts, _ = annotated_pinned_posts(conn, viewer=owner)
+    assert len(posts) == 1
+    assert posts[0]["text"] == "fixed"
+    assert posts[0]["edited"] is True
+
+    # ... and an edit that landed before a delete stays blanked.
+    create_delete(conn, alice, post["hash"], name="alice", now=1002)
+    posts, _ = annotated_pinned_posts(conn, viewer=owner)
+    assert len(posts) == 1
+    assert posts[0]["text"] == ""
+    assert posts[0]["deleted"] is True
+    assert posts[0]["edited"] is False
+
+
+def test_cli_tan_pin(tmp_path, capsys):
+    data_dir = tmp_path / "alice"
+    assert main(["init", "--data-dir", str(data_dir), "--name", "alice"]) == 0
+    assert (
+        main(
+            [
+                "tan",
+                "post",
+                "--data-dir",
+                str(data_dir),
+                "--no-publish",
+                "--json",
+                "pin me",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = init_db(data_dir / "tan.sqlite3")
+    try:
+        post = feed(conn, all_authors=True)[0]
+    finally:
+        conn.close()
+
+    assert main(["tan", "pin", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert f"pinned {post['hash'][:8]}" in capsys.readouterr().out
+
+    # Pinning again reports the original pin time.
+    assert main(["tan", "pin", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "already pinned" in capsys.readouterr().out
+
+    # JSON output lists the pinned post with its pin time.
+    assert main(["tan", "pinned", "--data-dir", str(data_dir), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["pinned"][0]["text"] == "pin me"
+    assert payload["pinned"][0]["pinned_at"] > 0
+
+    # Text output shows the post and when it was pinned, and the
+    # timeline marks the pinned post.
+    assert main(["tan", "pinned", "--data-dir", str(data_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "pin me" in out
+    assert "📌" in out
+    assert main(["tan", "timeline", "--data-dir", str(data_dir)]) == 0
+    assert "📌" in capsys.readouterr().out
+
+    # Unpinning by prefix reports the full hash in JSON output, so
+    # machine-readable callers can identify the affected post.
+    assert (
+        main(
+            [
+                "tan",
+                "unpin",
+                "--data-dir",
+                str(data_dir),
+                "--json",
+                post["hash"][:16],
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"hash": post["hash"], "unpinned": True}
+
+    # Unpinning twice: the second time reports it was not pinned.
+    assert main(["tan", "unpin", "--data-dir", str(data_dir), post["hash"][:16]]) == 0
+    assert "was not pinned" in capsys.readouterr().out
+    assert main(["tan", "pinned", "--data-dir", str(data_dir), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    # An unknown reference is a clean CLI error, not a traceback.
+    assert main(["tan", "pin", "--data-dir", str(data_dir), "cd" * 32]) != 0
+    assert "tau: error: unknown post" in capsys.readouterr().err
 
 
 def test_cli_tan_save(tmp_path, capsys):
