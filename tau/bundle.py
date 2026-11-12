@@ -136,6 +136,17 @@ def build_bundle(
         if peer is None or not peer.public_key:
             skipped.append({"id": entry.id, "reason": "unknown recipient key"})
             continue
+        # Carry the queued leg's deadline and group context into the
+        # sealed envelope, so a bundled copy expires and is shown as a
+        # group message exactly as a direct delivery would be.
+        group: Optional[Dict[str, Any]] = None
+        if entry.group_id is not None:
+            group = {
+                "id": entry.group_id,
+                "name": entry.group_name,
+                "creator": entry.group_creator,
+                "members": list(entry.group_members),
+            }
         try:
             blob = seal_message(
                 identity,
@@ -144,6 +155,10 @@ def build_bundle(
                 message_id=entry.id,
                 text=entry.text,
                 sent_at=entry.created_at,
+                group=group,
+                expires_at=entry.message_expires_at,
+                in_reply_to=entry.in_reply_to if group is None else None,
+                kind=getattr(entry, "kind", None) if group is None else None,
             )
         except MailboxError as exc:
             skipped.append({"id": entry.id, "reason": str(exc)})
@@ -262,6 +277,162 @@ def parse_bundle(raw: bytes, *, max_bytes: int = DEFAULT_MAX_BUNDLE_BYTES) -> Di
     if not verified:
         raise BundleError("bundle signature does not verify")
     return document
+
+
+def _finite_timestamp(value: Any) -> Optional[float]:
+    """A JSON-safe timestamp, or ``None`` for anything unusable.
+
+    Bundle contents are signed but not trusted to be well-formed:
+    a manifest or mail entry can carry ``NaN``, an infinity, or a
+    string where a time belongs.  Non-finite floats would also leak
+    a ``NaN`` token into ``--json`` output, which is not JSON.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _describe_mail_entry(entry: Any) -> Dict[str, Any]:
+    """One report record per mail-list item, valid or not.
+
+    Every item in the signed list gets a record, so the count stays
+    aligned with the file instead of silently dropping malformed
+    entries.  The checks mirror what :func:`apply_bundle` enforces
+    on import (id shape, recipient shape, finite expiry); a record
+    that fails one is kept with ``valid`` false and the reason in
+    ``error``.
+    """
+    record: Dict[str, Any] = {
+        "id": None,
+        "to": None,
+        "expires_at": None,
+        "valid": False,
+        "error": None,
+    }
+    if not isinstance(entry, dict):
+        record["error"] = "mail entry is not an object"
+        return record
+    message_id = entry.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        record["error"] = "mail entry has no id"
+        return record
+    if len(message_id) > MAX_MAIL_ID_CHARS:
+        record["error"] = (
+            f"mail entry id is over {MAX_MAIL_ID_CHARS} characters"
+        )
+        return record
+    record["id"] = message_id
+    recipient = entry.get("to")
+    if not isinstance(recipient, str):
+        record["error"] = "mail entry has no destination"
+        return record
+    try:
+        to_bytes = bytes.fromhex(recipient)
+    except ValueError:
+        record["error"] = "mail entry destination is not hex"
+        return record
+    if len(to_bytes) != 16:
+        record["error"] = "mail entry destination has the wrong length"
+        return record
+    record["to"] = recipient
+    expires_at = _finite_timestamp(entry.get("expires_at"))
+    if expires_at is None:
+        record["error"] = "mail entry has no usable expiry"
+        return record
+    record["expires_at"] = expires_at
+    record["valid"] = True
+    return record
+
+
+def inspect_bundle(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe a parsed bundle without importing it.
+
+    A read-only summary of what a bundle carries: the manifest
+    (exporter, creation time, counts) plus one record per sealed-mail
+    entry and per Tan post.  The container signature is already
+    verified by :func:`parse_bundle`; each Tan post gets its own
+    signature check here, reported per entry — a post that fails it
+    keeps whatever author, kind and creation time the raw entry
+    carries, labelled unverified by ``verified`` false, and the
+    failure in ``error``.  A malformed Tan section is reported in
+    ``tan_error`` instead of crashing the listing.  Sealed mail is
+    described, never decrypted, and nothing is written to the mailbox
+    or the Tan store.
+    """
+    manifest = document.get("manifest")
+    if not isinstance(manifest, dict):
+        manifest = {}
+    mail = [_describe_mail_entry(entry) for entry in document.get("mail") or []]
+    tan: List[Dict[str, Any]] = []
+    tan_error: Optional[str] = None
+    tan_document = document.get("tan")
+    if tan_document is not None:
+        entries = (
+            tan_document.get("entries")
+            if isinstance(tan_document, dict)
+            else None
+        )
+        if not isinstance(entries, list):
+            tan_error = "Tan section has no entries list"
+        else:
+            for entry in entries:
+                record: Dict[str, Any] = {
+                    "hash": entry.get("hash")
+                    if isinstance(entry, dict)
+                    else None,
+                    "author": None,
+                    "kind": None,
+                    "created_at": None,
+                    "verified": False,
+                    "error": None,
+                }
+                try:
+                    post = verify_post(entry)
+                except (
+                    TanError,
+                    ValueError,
+                    TypeError,
+                    AttributeError,
+                    KeyError,
+                    OverflowError,
+                ) as exc:
+                    record["error"] = str(exc)
+                    # Keep whatever metadata the raw entry carries,
+                    # clearly unverified: a container-signed entry
+                    # with a bad post hash still names its author.
+                    if isinstance(entry, dict):
+                        author = entry.get("author")
+                        if isinstance(author, str) and author:
+                            record["author"] = author
+                        kind = entry.get("kind")
+                        if isinstance(kind, str) and kind:
+                            record["kind"] = kind
+                        record["created_at"] = _finite_timestamp(
+                            entry.get("created_at")
+                        )
+                else:
+                    record.update(
+                        {
+                            "author": post["author"],
+                            "kind": post["kind"],
+                            "created_at": post["created_at"],
+                            "verified": True,
+                        }
+                    )
+                tan.append(record)
+    return {
+        "format": document.get("format"),
+        "version": document.get("version"),
+        "exporter": manifest.get("exporter"),
+        "created_at": _finite_timestamp(manifest.get("created_at")),
+        "mail": mail,
+        "mail_count": len(mail),
+        "tan": tan,
+        "tan_count": len(tan),
+        "tan_error": tan_error,
+    }
 
 
 def _admit_tan_entries(
