@@ -236,6 +236,12 @@ class OutboxEntry:
     # stays in the recipient's inbox even though its queue entry still
     # has a TTL.
     message_expires_at: Optional[float] = None
+    # Earliest delivery time for a scheduled message (``tau send
+    # --delay``), epoch seconds.  ``None`` means send as soon as the
+    # peer is reachable; a future value holds the entry back from
+    # every delivery path, including backoff-ignoring flushes — the
+    # not-before time is the sender's instruction, not retry pacing.
+    send_after: Optional[float] = None
     in_reply_to: Optional[Dict[str, Any]] = None
 
     @property
@@ -266,10 +272,18 @@ class OutboxEntry:
 
     def is_due(self, now: Optional[float] = None) -> bool:
         """True when the entry may be attempted at *now* (default: now)."""
+        if self.is_scheduled(now):
+            return False
         target = self.next_attempt_at
         if target is None:
             return True
         return (now if now is not None else time.time()) >= target
+
+    def is_scheduled(self, now: Optional[float] = None) -> bool:
+        """True when a scheduled send time is still in the future."""
+        if self.send_after is None:
+            return False
+        return (now if now is not None else time.time()) < self.send_after
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -286,6 +300,7 @@ class OutboxEntry:
             "next_attempt_at": self.next_attempt_at,
             "held_by": dict(self.held_by),
             "message_expires_at": self.message_expires_at,
+            "send_after": self.send_after,
         }
         if self.group_id is not None:
             payload["group"] = {
@@ -379,6 +394,18 @@ class OutboxEntry:
             # make the outbox unreadable; the message still delivers,
             # just without its quote.
             in_reply_to = None
+        send_after = raw.get("send_after")
+        if isinstance(send_after, bool) or not isinstance(
+            send_after, (int, float)
+        ):
+            send_after = None
+        else:
+            try:
+                send_after = float(send_after)
+            except (OverflowError, ValueError):
+                send_after = None
+            if send_after is not None and not math.isfinite(send_after):
+                send_after = None
         return cls(
             id=message_id,
             to=destination,
@@ -406,6 +433,7 @@ class OutboxEntry:
             group_creator=group_creator,
             group_members=group_members,
             message_expires_at=message_expires_at,
+            send_after=send_after,
             in_reply_to=in_reply_to,
         )
 
@@ -1032,6 +1060,7 @@ class Mailbox:
         now: Optional[float] = None,
         group: Optional[Dict[str, Any]] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
+        send_after: Optional[float] = None,
     ) -> OutboxEntry:
         """Queue *text* for delivery to destination *to*.
 
@@ -1095,6 +1124,27 @@ class Mailbox:
             if not math.isfinite(expires_at):
                 raise MailboxError("expires_at must be a finite number")
         reply_to = clean_in_reply_to(in_reply_to)
+        send_after_value: Optional[float] = None
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise MailboxError("send_after must be a finite number")
+            try:
+                send_after_value = float(send_after)
+            except (OverflowError, ValueError) as exc:
+                raise MailboxError("send_after must be a finite number") from exc
+            if not math.isfinite(send_after_value):
+                raise MailboxError("send_after must be a finite number")
+            if expires_at is not None and send_after_value >= expires_at:
+                raise MailboxError(
+                    "send_after must be before the message expiry — "
+                    "the message would expire before it is sent"
+                )
+            if send_after_value > timestamp + MAX_MAIL_TTL - 3600.0:
+                raise MailboxError(
+                    "send_after leaves no delivery window before the mail TTL"
+                )
         with self._transaction():
             existing = self._outbox.get(entry_id)
             if existing is not None:
@@ -1104,7 +1154,18 @@ class Mailbox:
             entry_expires_at = timestamp + max(
                 60.0, min(float(ttl), MAX_MAIL_TTL)
             )
+            if send_after_value is not None:
+                # A scheduled message must still be in the outbox when
+                # its time comes: stretch the entry TTL past the
+                # scheduled time, with an hour of slack for the sweep.
+                entry_expires_at = max(
+                    entry_expires_at,
+                    min(send_after_value + 3600.0, timestamp + MAX_MAIL_TTL),
+                )
             if expires_at is not None:
+                # The message's own expiry still wins: the stretch
+                # above must never keep a dead message in the outbox
+                # past the deadline the sender set for it.
                 entry_expires_at = min(entry_expires_at, expires_at)
             entry = OutboxEntry(
                 id=entry_id,
@@ -1121,6 +1182,7 @@ class Mailbox:
                 group_creator=group_creator,
                 group_members=group_members,
                 message_expires_at=expires_at,
+                send_after=send_after_value,
                 in_reply_to=reply_to,
             )
             self._outbox[entry.id] = entry

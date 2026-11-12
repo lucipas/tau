@@ -399,6 +399,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing message: purge it from the receiver's inbox "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
+    send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     send.set_defaults(func=cmd_send)
 
     # `tau forward` shares `tau send`'s delivery flags: a forward is a
@@ -1813,12 +1820,22 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
+def _next_try_at(entry: Any) -> Optional[float]:
+    """When an outbox entry may next be attempted: the later of its
+    delivery backoff and its scheduled send time, if either is set."""
+    next_try = entry.next_attempt_at
+    send_after = getattr(entry, "send_after", None)
+    if send_after is not None and (next_try is None or send_after > next_try):
+        return send_after
+    return next_try
+
+
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
 
-def _parse_duration(value: str) -> float:
-    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _parse_duration(value: str, *, flag: str = "--expire") -> float:
+    """Parse a ``--expire``/``--delay`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
@@ -1827,7 +1844,7 @@ def _parse_duration(value: str) -> float:
     """
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{flag} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -1836,13 +1853,13 @@ def _parse_duration(value: str) -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {flag} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError("--expire duration must be positive")
+        raise ValueError(f"{flag} duration must be positive")
     if seconds > MAX_MAIL_TTL:
-        raise ValueError("--expire duration must be at most 30d")
+        raise ValueError(f"{flag} duration must be at most 30d")
     return seconds
 
 def _print_peer_table(
@@ -4626,6 +4643,7 @@ def _send_local_message(
     reply_to: Optional[str] = None,
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -4652,6 +4670,7 @@ def _send_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         kind=kind,
+        send_after=send_after,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -4708,6 +4727,7 @@ def _send_via_local_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     node = TauNode(config, name=config.name)
@@ -4741,6 +4761,7 @@ def _send_via_local_node(
                     in_reply_to=reply_to,
                     expires_at=expires_at,
                     kind=kind,
+                    send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -4780,6 +4801,7 @@ def _send_via_running_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -4799,6 +4821,7 @@ def _send_via_running_node(
                 reply_to=getattr(args, "reply_to", None),
                 kind=kind,
                 wait=wait,
+                send_after=send_after,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -5023,18 +5046,44 @@ def cmd_send(args: argparse.Namespace) -> int:
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
-
+    send_after = None
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_queue", False):
+            print(
+                "error: --delay cannot be combined with --no-queue",
+                file=sys.stderr,
+            )
+            return 2
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+        if expires_at is not None and send_after >= expires_at:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "message would expire before it is sent",
+                file=sys.stderr,
+            )
+            return 2
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
     # A serving node owns the data directory: send through it instead of
     # starting a second Reticulum instance on the same identity.
     if _send_routes_via_running_node(config):
         results = _send_via_running_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
     else:
         results = _send_via_local_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -5086,6 +5135,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                 waited = result.get("waited")
                 if waited is not None:
                     print(f"still queued for {target} after {waited:.1f}s")
+                elif result.get("send_after"):
+                    print(
+                        f"scheduled for {target} — sends in "
+                        f"{_ago(result['send_after'] - time.time())}"
+                    )
                 else:
                     print(f"queued for {target} — they are unreachable right now")
                 print(f"  id:      {result['id']}")
@@ -5121,8 +5175,14 @@ def cmd_send(args: argparse.Namespace) -> int:
                     print("  the receiver dropped it — past its expiry")
                 if expires_at is not None:
                     print(f"  disappears in {_ago(expires_at - time.time())}")
-        if any(result.get("queued") for result in results):
-            print("  it will be delivered automatically when they are heard from;")
+        queued = [result for result in results if result.get("queued")]
+        if queued:
+            if all(result.get("send_after") for result in queued):
+                print("  it will be delivered at its scheduled time;")
+            else:
+                print(
+                    "  it will be delivered automatically when they are heard from;"
+                )
             print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
 
@@ -5277,7 +5337,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             for entry in entries:
                 peer = registry.get(entry.to)
                 name = peer.display_name if peer is not None else entry.to_name
-                next_try = entry.next_attempt_at
+                next_try = _next_try_at(entry)
                 if next_try is None or next_try <= now:
                     next_try_text = "now"
                 else:
@@ -6552,7 +6612,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         payload["target_delivered"] = target_entry.id in delivered_ids
         if fresh is not None:
             payload["target_attempts"] = fresh.attempts
-            payload["target_next_attempt_at"] = fresh.next_attempt_at
+            payload["target_next_attempt_at"] = _next_try_at(fresh)
 
     if _json_mode(args):
         _emit(payload, True)
@@ -6567,7 +6627,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 " delivered by another process)"
             )
         else:
-            next_try = fresh.next_attempt_at
+            next_try = _next_try_at(fresh)
             if next_try is None or next_try <= time.time():
                 next_text = "now"
             else:

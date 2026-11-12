@@ -22,6 +22,7 @@ from tau.mailbox import (
 )
 from tau.protocol import (
     MAX_MAIL_BLOB_BYTES,
+    MAX_MAIL_TTL,
     ProtocolError,
     build_mail_fetch,
     build_mail_store,
@@ -1269,6 +1270,112 @@ def test_enqueue_without_message_expiry_keeps_ttl(tmp_path):
 
     reloaded = Mailbox(tmp_path / "mailbox.json")
     assert reloaded.outbox_list()[0].message_expires_at is None
+
+
+def test_scheduled_entry_not_due_before_send_after(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        now=1000.0,
+        send_after=2000.0,
+        message_id="sched-1",
+    )
+    assert entry.send_after == 2000.0
+    assert entry.is_scheduled(now=1500.0) is True
+    assert entry.is_due(now=1500.0) is False
+    assert entry.is_due(now=1999.0) is False
+    assert entry.is_scheduled(now=2000.0) is False
+    assert entry.is_due(now=2000.0) is True
+    assert [e.id for e in box.due_outbox(now=1500.0)] == []
+    assert [e.id for e in box.due_outbox(now=2000.0)] == [entry.id]
+
+
+def test_scheduled_entry_survives_reload(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        now=1000.0,
+        send_after=5000.0,
+        message_id="sched-2",
+    )
+    reloaded = Mailbox(tmp_path / "mailbox.json")
+    stored = reloaded.get_outbox(entry.id)
+    assert stored.send_after == 5000.0
+    assert stored.to_dict()["send_after"] == 5000.0
+    assert stored.is_due(now=4999.0) is False
+
+
+def test_enqueue_stretches_entry_ttl_past_send_after(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    # Ten days out is past the 7-day queue TTL: the entry must still
+    # be in the outbox when its time comes.
+    entry = box.enqueue(
+        to=BOB,
+        text="far",
+        now=1000.0,
+        send_after=1000.0 + 10 * 86400,
+        message_id="sched-3",
+    )
+    assert entry.expires_at == 1000.0 + 10 * 86400 + 3600.0
+
+
+def test_enqueue_scheduled_ttl_stretch_never_passes_message_expiry(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    # The message expires 20 minutes after its scheduled time: the
+    # entry must die with the message, not live on for the hour of
+    # TTL slack the stretch would otherwise add.
+    entry = box.enqueue(
+        to=BOB,
+        text="short-lived",
+        now=1000.0,
+        send_after=2000.0,
+        expires_at=3200.0,
+        message_id="sched-5",
+    )
+    assert entry.expires_at == 3200.0
+
+
+def test_enqueue_rejects_bad_send_after(tmp_path):
+    box = Mailbox(tmp_path / "mailbox.json")
+    with pytest.raises(MailboxError, match="before the message expiry"):
+        box.enqueue(
+            to=BOB,
+            text="bad",
+            now=1000.0,
+            expires_at=1060.0,
+            send_after=2000.0,
+        )
+    with pytest.raises(MailboxError, match="no delivery window"):
+        box.enqueue(
+            to=BOB, text="bad", now=1000.0, send_after=1000.0 + MAX_MAIL_TTL
+        )
+    with pytest.raises(MailboxError, match="finite number"):
+        box.enqueue(to=BOB, text="bad", now=1000.0, send_after="tomorrow")
+    with pytest.raises(MailboxError, match="finite number"):
+        box.enqueue(to=BOB, text="bad", now=1000.0, send_after=float("inf"))
+
+
+def test_reload_ignores_corrupt_send_after(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    entry = box.enqueue(
+        to=BOB,
+        text="later",
+        now=1000.0,
+        send_after=5000.0,
+        message_id="sched-4",
+    )
+    raw = json.loads(path.read_text())
+    for item in raw["outbox"]:
+        item["send_after"] = "tomorrow"
+    path.write_text(json.dumps(raw))
+
+    reloaded = Mailbox(path)
+    stored = reloaded.get_outbox(entry.id)
+    assert stored.send_after is None
+    assert stored.is_due(now=1000.0) is True
 
 
 def test_seal_and_open_roundtrip_with_expiry():

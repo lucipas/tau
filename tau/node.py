@@ -6,6 +6,7 @@ import base64
 import errno
 import hashlib
 import logging
+import math
 import os
 import random
 import socket
@@ -2439,6 +2440,12 @@ class TauNode:
             )
         if message_id is not None:
             due = [entry for entry in due if entry.id == message_id]
+        # A scheduled message never goes early: the not-before time is
+        # the sender's instruction, not retry pacing, so even a
+        # backoff-ignoring round (a fresh announce, `tau outbox retry`,
+        # a delivery wait) leaves it queued until its time comes.
+        now = time.time()
+        due = [entry for entry in due if not entry.is_scheduled(now)]
         if peer.caps and "mail" not in peer.caps:
             # A pre-mail peer can still receive direct messages, just not
             # hold or hand over sealed envelopes.
@@ -2457,13 +2464,17 @@ class TauNode:
             if self._deliver_entry(peer, entry, timeout, deadline=deadline):
                 moved["delivered"] += 1
 
-        now = time.time()
         for entry in self.mailbox.outbox_list(timeout=_remaining(deadline)):
             if _past(deadline):
                 return moved
             if entry.to == peer.destination_hash:
                 continue
             if message_id is not None and entry.id != message_id:
+                continue
+            if entry.is_scheduled(now):
+                # A sealed copy deposited early could reach the
+                # recipient before the scheduled time, so scheduled
+                # entries are never deposited ahead of schedule either.
                 continue
             holders = {
                 holder: deposited_at
@@ -3423,6 +3434,7 @@ class TauNode:
         expires_at: Optional[float] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
+        send_after: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a text message to a peer and return the decoded response.
 
@@ -3446,10 +3458,41 @@ class TauNode:
         The reference travels the direct and the store-and-forward
         paths alike, and the sent message is recorded in the inbox so
         the peer's reply to it can be rendered from local history.
+
+        ``send_after`` schedules the message (epoch seconds): instead
+        of attempting delivery now, the message is queued with a
+        not-before time and the outbox delivers it once that time
+        arrives — even when the peer is reachable.  The scheduled
+        time is local only; the recipient sees a normal message.
         """
         normalized = normalize_message(text)
         reply_to = clean_in_reply_to(in_reply_to)
         clean_kind = normalize_message_kind(kind)
+        if send_after is not None:
+            if isinstance(send_after, bool) or not isinstance(
+                send_after, (int, float)
+            ):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+            try:
+                send_after = float(send_after)
+            except (OverflowError, ValueError) as exc:
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                ) from exc
+            if not math.isfinite(send_after):
+                raise NodeError(
+                    "send_after must be a finite number of epoch seconds"
+                )
+        if send_after is not None and not queue:
+            # A scheduled message is queued by definition: with queueing
+            # refused there is nowhere for it to wait until its time, so
+            # refuse the combination before anything is recorded.
+            raise NodeError(
+                "cannot schedule a message without queueing: "
+                "send_after requires queue=True"
+            )
         message_id = generate_message_id()
         payload = encode_message(
             normalized,
@@ -3475,6 +3518,70 @@ class TauNode:
                 to=peer.destination_hash,
                 text=normalized,
             )
+            if send_after is not None:
+                # Scheduled: no delivery attempt now, even when the peer
+                # is reachable — the entry leaves the outbox only once
+                # its time arrives (every flush path honours it).
+                try:
+                    entry = self.mailbox.enqueue(
+                        to=peer.destination_hash,
+                        text=normalized,
+                        to_name=peer.display_name,
+                        message_id=message_id,
+                        expires_at=expires_at,
+                        in_reply_to=reply_to,
+                        kind=clean_kind,
+                        send_after=send_after,
+                    )
+                except MailboxError:
+                    # Nothing was queued: forget the sent record made
+                    # above, so a rejected schedule does not linger in
+                    # sent history as a message that never went anywhere.
+                    self.mailbox.discard_sent(message_id)
+                    raise
+                if self.registry.get(peer.destination_hash) is None:
+                    # A caller can hand send_message a Peer that never
+                    # entered the registry (resolve_peer returns Peer
+                    # objects as-is); flush_outbox only visits registry
+                    # peers, so register it now or the scheduled message
+                    # would wait until another path registers the peer.
+                    self.registry.upsert(
+                        peer.destination_hash, peer.public_key, name=peer.name
+                    )
+                self._record_sent(
+                    {
+                        "from": self.name,
+                        "destination": peer.hexhash,
+                        "text": normalized,
+                        "kind": clean_kind,
+                        "sent_at": time.time(),
+                        "received_at": time.time(),
+                        "id": message_id,
+                        "direction": "out",
+                        **({"in_reply_to": reply_to} if reply_to is not None else {}),
+                    }
+                )
+                self.mailbox.record_sent(
+                    entry.id,
+                    to=peer.destination_hash,
+                    text=normalized,
+                    sent_at=entry.created_at,
+                )
+                log.info(
+                    "Scheduled message %s for %s at %s",
+                    entry.id,
+                    peer.destination_hash.hex(),
+                    entry.send_after,
+                )
+                return {
+                    "ok": True,
+                    "v": PROTOCOL_VERSION,
+                    "queued": True,
+                    "id": entry.id,
+                    "to": entry.to_hex,
+                    "expires_at": entry.expires_at,
+                    "send_after": entry.send_after,
+                }
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
             self.mailbox.record_delivered(message_id)
             if isinstance(response, dict):
@@ -3545,6 +3652,10 @@ class TauNode:
                 expires_at=expires_at,
                 in_reply_to=reply_to,
                 kind=clean_kind,
+                # A scheduled send to an undiscovered peer queues here:
+                # the not-before time must survive the fallback, or the
+                # message would go out as soon as the peer is heard from.
+                send_after=send_after,
             )
             self._record_sent(
                 {
@@ -3583,6 +3694,11 @@ class TauNode:
                 "id": entry.id,
                 "to": entry.to_hex,
                 "expires_at": entry.expires_at,
+                **(
+                    {"send_after": entry.send_after}
+                    if entry.send_after is not None
+                    else {}
+                ),
             }
 
     def send_group_message(

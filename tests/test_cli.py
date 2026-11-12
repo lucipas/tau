@@ -77,6 +77,102 @@ def test_parser_send_to_is_repeatable():
     assert args.to == ["alice", "bob"]
 
 
+def test_parser_send_delay():
+    parser = cli.build_parser()
+    args = parser.parse_args(["send", "--to", "alice", "--delay", "5m", "hello"])
+    assert args.delay == "5m"
+
+
+def test_send_delay_schedules_without_delivery(tmp_path, capsys, monkeypatch):
+    before = time.time()
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", "later"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+    node = _FakeSendNode.instances[-1]
+    assert len(node.send_kwargs) == 1
+    send_after = node.send_kwargs[0]["send_after"]
+    assert before + 7200 <= send_after <= time.time() + 7200
+    out = capsys.readouterr().out
+    assert "scheduled for alice" in out
+    assert "sends in 1h" in out
+    assert "it will be delivered at its scheduled time" in out
+
+
+def test_send_delay_json_reports_send_after(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--json", "--to", "alice", "--delay", "5m", "later"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["queued"] is True
+    assert payload["send_after"] is not None
+    assert payload["send_after"] > time.time()
+
+
+def test_send_delay_rejects_bad_combinations(tmp_path, capsys, monkeypatch):
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "5m", "--no-queue", "hi"],
+    )
+    assert code == 2
+    assert "--delay cannot be combined with --no-queue" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "2h", "--expire", "1h", "hi"],
+    )
+    assert code == 2
+    assert "--delay must be shorter than --expire" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "soon", "hi"]
+    )
+    assert code == 1
+    assert "invalid --delay duration" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "31d", "hi"]
+    )
+    assert code == 1
+    assert "--delay duration must be at most 30d" in capsys.readouterr().err
+    # 30d is past the effective maximum: the mail TTL less an hour
+    # of delivery slack. 29d fits and queues.
+    code = _run_send(
+        tmp_path, monkeypatch, ["--to", "alice", "--delay", "30d", "hi"]
+    )
+    assert code == 2
+    assert "--delay must be at most 29d23h" in capsys.readouterr().err
+    code = _run_send(
+        tmp_path,
+        monkeypatch,
+        ["--to", "alice", "--delay", "29d", "hi"],
+        behaviour={"alice": "queued"},
+    )
+    assert code == 0
+
+
+def test_outbox_lists_scheduled_entry_next_try(tmp_path, capsys):
+    data_dir = _init_node(tmp_path, "node", "bob")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    box = Mailbox(config.mailbox_path)
+    box.enqueue(
+        to=b"\xbb" * 16,
+        text="later",
+        message_id="dd" + "44" * 15,
+        send_after=time.time() + 7200.0,
+    )
+    code = cli.main(["outbox", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "in 1h" in capsys.readouterr().out
+
+
 class _FakeSendNode:
     """Stub TauNode for `tau send`: per-target behaviour drives whether
     a recipient is delivered, queued (a real outbox entry is written,
@@ -96,6 +192,7 @@ class _FakeSendNode:
         self.started = False
         self.calls: list = []
         self.sent: list = []
+        self.send_kwargs: list = []
         self.flush_calls: list = []
         self.peer = SimpleNamespace(hexhash="ab" * 16, display_name="alice")
         _FakeSendNode.instances.append(self)
@@ -117,6 +214,7 @@ class _FakeSendNode:
 
         self.calls.append((target, text))
         self.sent.append((target, text, kwargs.get("in_reply_to")))
+        self.send_kwargs.append(kwargs)
         mode = _FakeSendNode.behaviour.get(target, "delivered")
         if mode == "error":
             raise NodeError(f"no path to {target}")
@@ -140,6 +238,7 @@ class _FakeSendNode:
                 to=b"\xbb" * 16,
                 text=text,
                 message_id=f"{len(self.calls):032x}",
+                send_after=kwargs.get("send_after"),
             )
             # The real node records the send when it queues (see
             # TauNode.send_message), so the sent record exists for the
@@ -150,6 +249,11 @@ class _FakeSendNode:
                 "queued": True,
                 "id": entry.id,
                 "to": entry.to_hex,
+                **(
+                    {"send_after": entry.send_after}
+                    if entry.send_after is not None
+                    else {}
+                ),
             }
         return {"ok": True, "echo": text, "_rtt": 0.05}
 
