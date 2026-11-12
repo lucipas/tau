@@ -1302,6 +1302,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_send.set_defaults(func=cmd_group_send)
 
+    group_send_file = group_sub.add_parser(
+        "send-file",
+        parents=[common],
+        help="send a file to every member of a group",
+    )
+    group_send_file.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_send_file.add_argument(
+        "path", type=Path, help="local file to send (at most 10 MiB)"
+    )
+    group_send_file.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long each member's transfer may take (default 300)",
+    )
+    group_send_file.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_send_file.set_defaults(func=cmd_group_send_file)
+
     tan = subparsers.add_parser(
         "tan",
         parents=[common],
@@ -6994,6 +7021,47 @@ def _report_group_reaction(
                 f"{_safe_text(str(result.get('error') or 'unknown error'))}"
             )
     return _EXIT_ERROR if failed_legs else _EXIT_OK
+
+
+def cmd_group_send_file(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        group = node.groups.find(args.group)
+        response = node.send_group_file(
+            group,
+            args.path,
+            timeout=float(getattr(args, "timeout", 300.0)),
+            discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+        )
+    finally:
+        node.stop()
+
+    failed_legs = [
+        r for r in response["results"] if not r.get("delivered")
+    ]
+    exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if _json_mode(args):
+        _emit(response, True)
+        return exit_code
+    if not response["results"]:
+        print(
+            f"group {response['name']} has no other members"
+            " — nothing to send to."
+        )
+        return _EXIT_OK
+    for result in response["results"]:
+        name = result.get("to_name") or result["to"][:8]
+        if result.get("delivered"):
+            print(
+                f"delivered {result['name']} ({result['size']} bytes) to {name}"
+            )
+        else:
+            print(
+                f"failed for {name}: {result.get('error') or 'unknown error'}"
+            )
+    return exit_code
 
 
 def cmd_react(args: argparse.Namespace) -> int:
