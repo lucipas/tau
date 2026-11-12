@@ -644,6 +644,16 @@ class PeerRegistry:
         with self._lock:
             del self._peers[peer.destination_hash]
             return peer
+
+    def restore(self, peer: Peer) -> None:
+        """Put back a record removed by :meth:`forget` after a failed save.
+
+        Only inserts when the destination is absent, so a record that was
+        re-announced in the meantime is never overwritten by the stale copy.
+        """
+        with self._lock:
+            self._peers.setdefault(peer.destination_hash, peer)
+
     def record_delivered(
         self, destination_hash: bytes, *, now: Optional[float] = None
     ) -> bool:

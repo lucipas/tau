@@ -7,8 +7,11 @@ store-and-forward outbox.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import RNS
@@ -397,6 +400,315 @@ def test_group_store_retired_roster_cannot_be_repinned(tmp_path):
         )
         is None
     )
+
+
+def test_group_store_leave_removes_and_refuses_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.get(group["id"]) is None
+    assert store.list_groups() == []
+    # A later message for the left group must not re-pin it — unlike
+    # delete, whose removal the next message undoes.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    assert store.get(group["id"]) is None
+    # Survives a restart.
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.is_left(group["id"]) is True
+    assert (
+        reloaded.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    left = reloaded.left_groups()
+    assert [entry["id"] for entry in left] == [group["id"]]
+    assert isinstance(left[0]["left_at"], float)
+
+
+def test_group_store_transaction_uses_msvcrt_when_fcntl_missing(
+    tmp_path, monkeypatch
+):
+    """Without fcntl (Windows) the store still takes a cross-process lock.
+
+    Regression test for the CodeRabbit Major on PR #265: with only the
+    per-instance lock, a serving process's ``record()`` could save
+    after a concurrent CLI ``leave()`` and drop the left marker, so
+    the next message re-pinned the group.
+    """
+    import tau.groups as groups_mod
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            calls.append(mode)
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert group is not None
+    assert calls == [FakeMsvcrt.LK_LOCK, FakeMsvcrt.LK_UNLCK]
+    assert (tmp_path / "groups.json.lock").exists()
+
+
+def test_group_store_leave_marker_survives_concurrent_record(
+    tmp_path, monkeypatch
+):
+    """A record() racing a leave() cannot drop the left marker.
+
+    Two stores on one path stand in for the serving process and the
+    CLI.  With fcntl missing, a fake msvcrt backed by a real lock
+    serialises the transactions; every interleaving must end with
+    the group left and unpinnable.
+    """
+    import tau.groups as groups_mod
+
+    gate = threading.Lock()
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            if mode == FakeMsvcrt.LK_LOCK:
+                gate.acquire()
+            else:
+                gate.release()
+
+    monkeypatch.setattr(groups_mod, "fcntl", None)
+    monkeypatch.setattr(groups_mod, "msvcrt", FakeMsvcrt)
+    group_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+    )
+    server = GroupStore(tmp_path / "groups.json")
+    cli_store = GroupStore(tmp_path / "groups.json")
+    assert (
+        server.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+
+    def hammer_record():
+        for _ in range(25):
+            server.record(
+                group_id,
+                "theirs",
+                [OWN_HASH, OTHER_HASH, THIRD_HASH],
+                creator=OTHER_HASH,
+            )
+
+    def hammer_leave():
+        for _ in range(25):
+            cli_store.leave(group_id)
+
+    first = threading.Thread(target=hammer_record)
+    second = threading.Thread(target=hammer_leave)
+    first.start()
+    second.start()
+    first.join(timeout=30)
+    second.join(timeout=30)
+    assert not first.is_alive() and not second.is_alive()
+    reloaded = GroupStore(tmp_path / "groups.json")
+    assert reloaded.get(group_id) is None
+    assert reloaded.is_left(group_id) is True
+    assert (
+        reloaded.record(
+            group_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+
+
+def test_group_store_leave_unknown_and_rejoin_never_left(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    assert store.leave("00" * 16) == []
+    assert store.rejoin("00" * 16) is False
+    assert store.is_left("00" * 16) is False
+    assert store.left_groups() == []
+    # Leaving twice reports nothing left to do, but stays left.
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.leave(group["id"]) == []
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_rejoin_allows_repin(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    assert store.leave(group["id"]) == [group["id"]]
+    assert store.rejoin(group["id"]) is True
+    assert store.is_left(group["id"]) is False
+    assert store.left_groups() == []
+    assert store.rejoin(group["id"]) is False
+    # The next message pins the group again.
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.get(group["id"]) is not None
+    # A re-invite under a changed roster is a new id and pins without
+    # a rejoin, even while the old id stays left.
+    assert store.leave(group["id"]) == [group["id"]]
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    assert (
+        store.record(
+            grown_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    assert store.is_left(group["id"]) is True
+
+
+def test_group_store_leave_also_leaves_pinned_successor(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    first = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    # A successor roster carried by another member pins alongside the
+    # predecessor instead of replacing it.
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    second = store.record(
+        grown_id,
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    assert second is not None
+    assert len(store.list_groups()) == 2
+    # Leaving by name leaves both versions of the same group: the
+    # successor would otherwise keep receiving.
+    assert sorted(store.leave(first["id"])) == sorted([first["id"], grown_id])
+    assert store.list_groups() == []
+    assert store.is_left(first["id"]) is True
+    assert store.is_left(grown_id) is True
+    assert (
+        store.record(
+            first["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    assert (
+        store.record(
+            grown_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+            creator=OTHER_HASH,
+        )
+        is None
+    )
+    # A genuinely new roster arriving after the leave is a new id and
+    # pins normally.
+    newer_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, "34" * 16]
+    )
+    assert (
+        store.record(
+            newer_id,
+            "theirs",
+            [OWN_HASH, OTHER_HASH, "34" * 16],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+
+
+def test_group_store_find_resolves_32_char_name(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group = store.create("n" * 32, [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    # A 32-character name resolves even though it is id-length.
+    assert store.find("n" * 32)["id"] == group["id"]
+    # An actual id still wins over a name that spells the same id.
+    other = store.create("other", [OWN_HASH, THIRD_HASH], created_by=OWN_HASH)
+    named = store.create(other["id"], [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    assert store.find(other["id"])["id"] == other["id"]
+    assert named["id"] != other["id"]
+
+
+def test_group_store_left_list_is_capped(tmp_path):
+    from tau.groups import MAX_LEFT_GROUPS
+
+    store = GroupStore(tmp_path / "groups.json")
+    left_ids = []
+    for i in range(MAX_LEFT_GROUPS + 5):
+        group = store.record(
+            derive_group_id(
+                OTHER_HASH, f"g{i}", [OWN_HASH, OTHER_HASH, THIRD_HASH]
+            ),
+            f"g{i}",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        assert store.leave(group["id"]) == [group["id"]]
+        left_ids.append(group["id"])
+    raw = json.loads((tmp_path / "groups.json").read_text())
+    assert len(raw["left"]) == MAX_LEFT_GROUPS
+    assert left_ids[0] not in [entry["id"] for entry in raw["left"]]
+    assert left_ids[-1] in [entry["id"] for entry in raw["left"]]
 
 
 def test_group_store_update_members_refusals(tmp_path):
@@ -1062,6 +1374,50 @@ def test_group_message_from_non_member_rejected(tmp_path):
     assert received == []
     assert len(node.inbox) == 0
     assert len(node.groups) == 0
+
+
+def test_group_message_after_leave_is_rejected(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    first = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "hi all",
+            message_id="gm-1",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert first["ok"] is True
+    assert len(received) == 1
+    assert node.groups.leave(group_id) == [group_id]
+    # A later message for the left group is rejected, never stored,
+    # and does not re-pin the group — unlike delete, whose removal the
+    # next message undoes.
+    second = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "are you still there?",
+            message_id="gm-2",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+        ),
+        remote_identity=sender,
+    )
+    assert second["ok"] is False
+    assert second["error"]["code"] == "not_a_member"
+    assert len(received) == 1
+    assert len(node.inbox) == 1
+    assert node.groups.get(group_id) is None
+    assert node.groups.is_left(group_id) is True
 
 
 def test_group_message_from_blocked_sender_dropped_silently(tmp_path):
@@ -1858,6 +2214,161 @@ def test_send_group_message_rejects_oversized_text_before_any_leg(tmp_path):
     assert node.mailbox.outbox_list() == []
 
 
+# -- group file fan-out ------------------------------------------------------
+
+
+def _stub_group_send_file(node, *, fail_for=()):
+    """Replace ``_send_file_bytes`` with a recorder; *fail_for* members raise."""
+    calls = []
+
+    def fake_send_file_bytes(
+        target,
+        data,
+        name,
+        digest,
+        *,
+        timeout=300.0,
+        discover_timeout=None,
+        deadline=None,
+    ):
+        calls.append((target, name, timeout, discover_timeout, data, deadline))
+        member = target if isinstance(target, str) else target.hexhash
+        if member in fail_for:
+            raise NodeError("unreachable")
+        return {
+            "ok": True,
+            "id": f"{member[:8]}-transfer",
+            "name": name,
+            "size": len(data),
+            "sha256": digest,
+            "to": member,
+        }
+
+    node._send_file_bytes = fake_send_file_bytes  # type: ignore[method-assign]
+    return calls
+
+
+def test_send_group_file_fans_out_to_every_member(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["group"] == group["id"]
+    assert result["name"] == "weekend"
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert set(by_to) == {OTHER_HASH, THIRD_HASH}
+    # The sender is skipped, and each leg is its own transfer.
+    assert by_to[OTHER_HASH]["delivered"] is True
+    assert by_to[OTHER_HASH]["id"] == f"{OTHER_HASH[:8]}-transfer"
+    assert by_to[OTHER_HASH]["name"] == "photo.png"
+    assert by_to[OTHER_HASH]["size"] == len(b"fake png bytes")
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert by_to[THIRD_HASH]["id"] != by_to[OTHER_HASH]["id"]
+    assert len(calls) == 2
+    assert {call[0] for call in calls} == {OTHER_HASH, THIRD_HASH}
+    # Every leg carries the same bytes, read once up front.
+    assert all(call[1] == "photo.png" for call in calls)
+    assert all(call[4] == b"fake png bytes" for call in calls)
+    # Each leg carries its own deadline, so one slow member cannot
+    # consume another member's window.
+    assert all(call[5] is not None for call in calls)
+    # Nothing is queued: files are direct links only in v1.
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_keeps_going_after_a_failed_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node, fail_for={OTHER_HASH})
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is False
+    by_to = {entry["to"]: entry for entry in result["results"]}
+    assert by_to[OTHER_HASH].get("delivered") is None
+    assert by_to[OTHER_HASH]["error"] == "unreachable"
+    assert by_to[THIRD_HASH]["delivered"] is True
+    assert len(calls) == 2
+    assert node.mailbox.outbox_list() == []
+
+
+def test_send_group_file_rejects_a_bad_file_before_any_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("tau.node.MAX_FILE_BYTES", 10)
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    calls = _stub_group_send_file(node)
+    with pytest.raises(NodeError, match="outside the"):
+        node.send_group_file(group, big)
+    assert calls == []
+
+
+def test_send_group_file_accepts_a_group_id_string(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group["id"], shared)
+    assert result["ok"] is True
+    assert [entry["to"] for entry in result["results"]] == [OTHER_HASH]
+    assert len(calls) == 1
+
+
+def test_send_group_file_self_only_group_sends_nowhere(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    # A group needs at least two members to be created through the
+    # store, so a self-only group only reaches the fan-out as a bare
+    # record (a corrupt or hand-edited groups.json). The fan-out
+    # must still be a no-op, not an error — and must never send to
+    # this node itself.
+    group = {"id": "a" * 64, "name": "solo", "members": [OWN_HASH]}
+    result = node.send_group_file(group, shared)
+    assert result["ok"] is True
+    assert result["results"] == []
+    assert calls == []
+
+
+def test_send_group_file_timeout_zero_attempts_no_leg(tmp_path):
+    node = make_node(tmp_path)
+    node.reticulum = object()
+    group = node.groups.create(
+        "weekend", [OWN_HASH, OTHER_HASH, THIRD_HASH], created_by=OWN_HASH
+    )
+    shared = tmp_path / "notes.txt"
+    shared.write_bytes(b"hello")
+    calls = _stub_group_send_file(node)
+    result = node.send_group_file(group, shared, timeout=0.0)
+    assert result["ok"] is False
+    assert all(
+        entry["error"] == "not attempted: group send time limit reached"
+        for entry in result["results"]
+    )
+    assert calls == []
+
+
 def test_deliver_entry_re_encodes_group_payload(tmp_path):
     node = make_node(tmp_path)
     node.reticulum = object()
@@ -2007,6 +2518,15 @@ def test_parser_group_arguments():
     assert ephemeral.expire == "5m"
     assert ephemeral.message == "vanish soon"
 
+    send_file_args = parser.parse_args(
+        ["group", "send-file", "weekend", "photo.png"]
+    )
+    assert send_file_args.group_command == "send-file"
+    assert send_file_args.group == "weekend"
+    assert str(send_file_args.path) == "photo.png"
+    assert send_file_args.timeout == 300.0
+    assert send_file_args.discover_timeout == 10.0
+
     list_args = parser.parse_args(["group", "list"])
     assert list_args.group_command == "list"
 
@@ -2030,6 +2550,85 @@ def test_parser_group_arguments():
 
     messages_args = parser.parse_args(["messages", "--group", "weekend"])
     assert messages_args.group == "weekend"
+
+
+class _FakeGroupSendFileNode:
+    """Stub TauNode for `tau group send-file`: canned fan-out results."""
+
+    response: dict = {}
+
+    def __init__(self, config, **kwargs):
+        self.config = config
+        self.groups = SimpleNamespace(
+            find=lambda target: {"id": "a" * 64, "name": "weekend"}
+        )
+        self.calls: list = []
+
+    def start(self, **kwargs):
+        pass
+
+    def stop(self):
+        pass
+
+    def send_group_file(self, group, path, **kwargs):
+        self.calls.append((group, str(path), kwargs))
+        return _FakeGroupSendFileNode.response
+
+
+def _run_group_send_file(tmp_path, monkeypatch, argv, response):
+    monkeypatch.setattr(cli, "TauNode", _FakeGroupSendFileNode)
+    _FakeGroupSendFileNode.response = response
+    shared = tmp_path / "photo.png"
+    shared.write_bytes(b"fake png bytes")
+    return cli.main(
+        ["group", "send-file", "--data-dir", str(tmp_path / "node"), "weekend", str(shared), *argv]
+    )
+
+
+def test_group_send_file_cli_reports_empty_group(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        [],
+        {"ok": True, "group": "a" * 64, "name": "weekend", "results": []},
+    )
+    assert code == 0
+    assert "has no other members" in capsys.readouterr().out
+
+
+def test_group_send_file_cli_json_reports_failed_leg(tmp_path, capsys, monkeypatch):
+    code = _run_group_send_file(
+        tmp_path,
+        monkeypatch,
+        ["--json"],
+        {
+            "ok": False,
+            "group": "a" * 64,
+            "name": "weekend",
+            "results": [
+                {
+                    "to": OTHER_HASH,
+                    "to_name": "bob",
+                    "delivered": True,
+                    "id": "x" * 32,
+                    "name": "photo.png",
+                    "size": 15,
+                    "sha256": "0" * 64,
+                },
+                {
+                    "to": THIRD_HASH,
+                    "to_name": "",
+                    "ok": False,
+                    "error": "unreachable",
+                },
+            ],
+        },
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["results"][0]["delivered"] is True
+    assert payload["results"][1]["error"] == "unreachable"
 
 
 def test_group_list_on_empty_store(tmp_path, capsys):
@@ -2067,6 +2666,153 @@ def test_group_delete_via_cli(tmp_path, capsys):
         cli.main(["group", "delete", "weekend", "--data-dir", str(tmp_path / "node")])
         != 0
     )
+
+
+def _seed_learned_group(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    return config, store, group
+
+
+def test_group_leave_via_cli(tmp_path, capsys):
+    _, store, group = _seed_learned_group(tmp_path)
+    code = cli.main(
+        ["group", "leave", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "left group theirs" in capsys.readouterr().out
+    assert store.list_groups() == []
+    # list_groups/left_groups reload from disk, so they see the CLI's
+    # leave; is_left alone reads the in-memory list.
+    assert [entry["id"] for entry in store.left_groups()] == [group["id"]]
+    # Leaving twice is not an error.
+    code = cli.main(
+        ["group", "leave", group["id"], "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "already left" in capsys.readouterr().out
+    # `group left` lists it, in text and JSON — the text listing prints
+    # the full id, so it round-trips straight into `group rejoin`.
+    code = cli.main(["group", "left", "--data-dir", str(tmp_path / "node")])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert group["id"] in out
+    printed_id = out.strip().splitlines()[0].split(" ")[0]
+    assert printed_id == group["id"]
+    code = cli.main(
+        ["group", "left", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["left"][0]["id"] == group["id"]
+    # `group rejoin` restores it, and the next message pins it again.
+    code = cli.main(
+        ["group", "rejoin", printed_id, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert "rejoined" in capsys.readouterr().out
+    assert store.left_groups() == []
+    assert (
+        store.record(
+            group["id"],
+            "theirs",
+            [OWN_HASH, OTHER_HASH, THIRD_HASH],
+            creator=OTHER_HASH,
+        )
+        is not None
+    )
+    # --json leave round-trips.
+    code = cli.main(
+        ["group", "leave", "--json", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"left": group["id"], "name": "theirs"}
+    # Unknown groups and never-left ids still error.
+    assert (
+        cli.main(["group", "leave", "nope", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert (
+        cli.main(
+            ["group", "rejoin", "00" * 16, "--data-dir", str(tmp_path / "node")]
+        )
+        != 0
+    )
+    assert (
+        cli.main(["group", "rejoin", "xyz", "--data-dir", str(tmp_path / "node")])
+        != 0
+    )
+    assert "invalid group id" in capsys.readouterr().err
+
+
+def test_group_leave_via_cli_leaves_pinned_successor_too(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    first = store.record(
+        derive_group_id(OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    grown_id = derive_group_id(
+        OTHER_HASH, "theirs", [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16]
+    )
+    store.record(
+        grown_id,
+        "theirs",
+        [OWN_HASH, OTHER_HASH, THIRD_HASH, "12" * 16],
+        creator=OTHER_HASH,
+        sender=THIRD_HASH,
+    )
+    code = cli.main(
+        ["group", "leave", "--json", "theirs", "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["left"] == first["id"]
+    assert payload["also_left"] == [grown_id]
+    assert store.list_groups() == []
+    code = cli.main(
+        ["group", "left", "--json", "--data-dir", str(tmp_path / "node")]
+    )
+    assert json.loads(capsys.readouterr().out)["count"] == 2
+
+
+def test_group_leave_via_cli_resolves_32_char_name(tmp_path, capsys):
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    group = store.record(
+        derive_group_id(OTHER_HASH, "n" * 32, [OWN_HASH, OTHER_HASH, THIRD_HASH]),
+        "n" * 32,
+        [OWN_HASH, OTHER_HASH, THIRD_HASH],
+        creator=OTHER_HASH,
+    )
+    code = cli.main(
+        ["group", "leave", "n" * 32, "--data-dir", str(tmp_path / "node")]
+    )
+    assert code == 0
+    assert store.list_groups() == []
+    assert [entry["id"] for entry in store.left_groups()] == [group["id"]]
+
+
+def test_group_leave_refuses_group_this_node_created(tmp_path, capsys):
+    # No identity file in this data dir: the refusal must come from
+    # the group's `local` flag alone, not from loading the identity.
+    config = TauConfig.resolve(data_dir=tmp_path / "node", name="alice")
+    store = GroupStore(config.groups_path)
+    store.create("mine", [OWN_HASH, OTHER_HASH], created_by=OWN_HASH)
+    code = cli.main(["group", "leave", "mine", "--data-dir", str(tmp_path / "node")])
+    assert code == 1
+    assert "delete your own group" in capsys.readouterr().err
+    assert len(store.list_groups()) == 1
 
 
 class _FakeGroupNode:

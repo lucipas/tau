@@ -303,6 +303,255 @@ def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
     assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
 
 
+def test_pin_by_full_id_and_unique_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a" * 32, text="one"))
+    inbox.append(_record(id="b" * 32, text="two"))
+
+    entry, changed = inbox.pin("a" * 32)
+    assert changed is True
+    assert entry["pinned"] is True
+    entry, changed = inbox.pin("b" * 28)
+    assert changed is True
+    # Pinning twice is a no-op, not an error.
+    _, changed = inbox.pin("a" * 32)
+    assert changed is False
+
+    pinned = inbox.list_messages(pinned_only=True)
+    assert [item["id"] for item in pinned] == ["b" * 32, "a" * 32]
+    # The default listing still shows everything, pinned included.
+    assert len(inbox.list_messages()) == 2
+
+
+def test_pin_32_char_prefix_of_64_char_lxmf_id(tmp_path):
+    """A 32-char prefix of a 64-char LXMF id pins when no full id matches."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 32, text="lxmf copy"))
+
+    entry, changed = inbox.pin("ab" * 16)
+    assert changed is True
+    assert entry["id"] == "ab" * 32
+    entry, changed = inbox.unpin("ab" * 16)
+    assert changed is True
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pin_32_char_prefix_ambiguous_across_lxmf_ids(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 16 + "11" * 16, text="first"))
+    inbox.append(_record(id="ab" * 16 + "22" * 16, text="second"))
+
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.pin("ab" * 16)
+
+
+def test_pin_exact_full_id_wins_over_lxmf_prefix(tmp_path):
+    """A full 32-char id still wins over a 64-char id sharing its prefix."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 16, text="short id"))
+    inbox.append(_record(id="ab" * 16 + "cd" * 16, text="long id"))
+
+    entry, _ = inbox.pin("ab" * 16)
+    assert entry["text"] == "short id"
+
+
+def test_delete_32_char_prefix_of_64_char_id(tmp_path):
+    """The shared matcher fixes delete the same way it fixes pin."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="ab" * 32, text="lxmf copy"))
+
+    removed = inbox.delete("ab" * 16)
+    assert removed["text"] == "lxmf copy"
+    assert len(inbox) == 0
+
+
+def test_sent_messages_are_never_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="sent-one", text="sent", direction="out"))
+    inbox.append(_record(id="recv-one", text="received"))
+
+    entries = inbox.list_messages(direction=None)
+    by_id = {entry["id"]: entry for entry in entries}
+    assert by_id["sent-one"]["unread"] is False
+    assert by_id["recv-one"]["unread"] is True
+
+
+def test_pin_unknown_and_ambiguous(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="one"))
+    inbox.append(_record(id="abcd" + "2" * 28, text="two"))
+
+    with pytest.raises(InboxError, match="unknown message"):
+        inbox.pin("zzzz")
+    with pytest.raises(InboxError, match="2 messages match prefix"):
+        inbox.pin("abcd")
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.pin("  ")
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pin_persists_across_instances_and_unpin_clears(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="keep", text="keep me"))
+    inbox.append(_record(id="other", text="other"))
+    inbox.pin("keep")
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages(pinned_only=True)] == [
+        "keep"
+    ]
+    entry, changed = reloaded.unpin("keep")
+    assert changed is True
+    assert "pinned" not in entry
+    assert Inbox(path).list_messages(pinned_only=True) == []
+
+
+def test_unpin_never_pinned_is_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="plain", text="nothing pinned here"))
+
+    entry, changed = inbox.unpin("plain")
+    assert changed is False
+    assert "pinned" not in entry
+
+
+def test_pin_write_failure_rolls_back(tmp_path, monkeypatch):
+    import tau.inbox
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="keep", text="keep me"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tau.inbox, "atomic_write_json", _boom)
+    with pytest.raises(InboxError, match="could not persist inbox"):
+        inbox.pin("keep")
+    # The pin was rolled back: the message is still unpinned.
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_delete_drops_pin_with_message(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="gone", text="bye"))
+    inbox.pin("gone")
+    assert len(inbox.list_messages(pinned_only=True)) == 1
+
+    inbox.delete("gone")
+    assert inbox.list_messages(pinned_only=True) == []
+
+
+def test_pinned_only_covers_sent_messages_too(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="sent-one", text="sent", direction="out"))
+    inbox.append(_record(id="recv-one", text="received"))
+    inbox.pin("sent-one")
+    inbox.pin("recv-one")
+
+    # The default listing is received-only, so only the received pin shows.
+    assert [entry["id"] for entry in inbox.list_messages(pinned_only=True)] == [
+        "recv-one"
+    ]
+    # With direction=None, pinned sent messages show up too, newest first.
+    assert [
+        entry["id"]
+        for entry in inbox.list_messages(pinned_only=True, direction=None)
+    ] == ["recv-one", "sent-one"]
+    assert [
+        entry["id"]
+        for entry in inbox.list_messages(pinned_only=True, direction="in")
+    ] == ["recv-one"]
+
+
+def test_pin_file_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "aa" * 16,
+            "name": "notes.txt",
+            "size": 12,
+            "sha256": "ab" * 32,
+            "path": "notes.txt",
+            "sent_at": 2.0,
+            "received_at": 2.0,
+            "id": "f1",
+        }
+    )
+
+    entry, changed = inbox.pin("f1")
+    assert changed is True
+    assert entry["kind"] == "file"
+    assert [item["id"] for item in inbox.list_messages(pinned_only=True)] == ["f1"]
+
+
+def test_export_import_preserves_pin(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    source.append(_record(id="one", text="first"))
+    source.append(_record(id="two", text="second"))
+    source.pin("one")
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(source.export_document())
+    assert result == {"imported": 2, "present": 0, "skipped": 0, "errors": []}
+    assert [entry["id"] for entry in target.list_messages(pinned_only=True)] == [
+        "one"
+    ]
+
+
+def test_delete_authorized_deletes_only_the_exact_match(tmp_path):
+    # The retract race: a short id must never delete a longer id that
+    # merely shares its prefix, and a second retract of the same id
+    # finds nothing instead of reselecting.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abc", text="short", direction="in", destination="ab" * 16)
+    )
+    inbox.append(
+        _record(id="abcdef" + "1" * 26, text="long", direction="out")
+    )
+
+    removed = inbox.delete_authorized("abc", direction="in", destination="ab" * 16)
+    assert removed is not None
+    assert removed["text"] == "short"
+    assert inbox.delete_authorized("abc", direction="in", destination="ab" * 16) is None
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "abcdef" + "1" * 26
+    ]
+
+
+def test_delete_authorized_never_matches_a_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abcd" + "1" * 28, text="one", direction="in", destination="ab" * 16)
+    )
+
+    assert inbox.delete_authorized("abcd", direction="in", destination="ab" * 16) is None
+    assert len(inbox) == 1
+
+
+def test_delete_authorized_refuses_a_mismatched_record(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="mine", direction="out", destination="ab" * 16)
+    )
+
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="in", destination="ab" * 16)
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="out", destination="cd" * 16)
+    assert len(inbox) == 1
+
+
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))
@@ -323,6 +572,39 @@ def test_export_document_round_trips_through_import(tmp_path):
     assert again["imported"] == 0
     assert again["present"] == 2
     assert len(target) == 2
+
+
+def test_import_skips_retracted_messages(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="gone", destination="aa" * 32, text="retracted"),
+            _record(id="kept", destination="aa" * 32, text="still here"),
+            # The sender's own copy of a message: its destination is
+            # the recipient, so it never matches a retraction marker.
+            _record(
+                id="mine",
+                destination="bb" * 32,
+                text="my copy",
+                direction="out",
+            ),
+        ],
+    }
+    # The check fires for the retracted id only: the received record
+    # is skipped — an export made before the retract must not resurrect
+    # the message — but the sender's own copy is unaffected.
+    result = inbox.import_messages(
+        document, is_retracted=lambda sender, message_id: message_id == "gone"
+    )
+    assert result["imported"] == 2
+    assert result["skipped"] == 1
+    assert result["errors"] == [
+        {"id": "gone", "error": "message was retracted by its sender"}
+    ]
+    assert [entry["id"] for entry in inbox.list_messages()] == ["kept"]
+    assert len(inbox) == 2  # the sent record was imported, not skipped
 
 
 def test_export_document_filters_by_peer(tmp_path):
@@ -612,6 +894,125 @@ def test_mark_read_advances_only_to_up_to(tmp_path):
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a3", "a2", "a1"]
     assert [entry["unread"] for entry in listed] == [True, False, False]
+
+
+def test_mark_unread_marks_newest_message_unread_again(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_all_marks_whole_conversation_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert all(entry["unread"] for entry in inbox.list_messages())
+
+
+def test_mark_unread_is_noop_when_nothing_was_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    assert inbox.mark_unread(peer="bb" * 16) is None
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_leaves_other_peers_alone(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    inbox.mark_unread(peer="aa" * 16)
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_ignores_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=3.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_does_not_mark_unread_messages_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="a3", received_at=3.0))
+    inbox.mark_read(up_to_seq=1)
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    listed = inbox.list_messages()
+    assert [entry["unread"] for entry in listed] == [True, True, False]
+
+
+def test_sent_records_do_not_inflate_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.mark_read()
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+
+    # A reply this node sent is never unread for its owner.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == counts
+
+
+def test_mark_unread_raises_when_the_cursor_cannot_persist(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Inbox, "_save", _fail)
+    with pytest.raises(OSError):
+        inbox.mark_unread(peer="ab" * 16)
+
+    # The in-memory cursor is restored, and the on-disk state is untouched.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert Inbox(tmp_path / "inbox.json").unread_counts() == {
+        "per_peer": {},
+        "total": 0,
+    }
 
 
 def test_mark_read_never_moves_a_cursor_backward(tmp_path):
