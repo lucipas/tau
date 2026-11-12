@@ -7078,6 +7078,168 @@ def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_live_group_message_shows_early_reaction_after_reconcile(
+    node, tmp_path
+):
+    """A live group copy shows a reaction that arrived before it (#304).
+
+    Ordering: a member's reaction names another member's copy of the
+    message (the foreign wire id), so the console caches it under an
+    id no entry will ever carry; the inbox retargets it onto this
+    node's copy when the copy lands.  The live event for the arriving
+    copy must carry the retargeted reaction — the snapshot read
+    already did — while still dropping a non-member's reaction.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        members = set(group.get("members") or [])
+        # Both reactions arrive before the copy, naming the foreign id.
+        for record in (
+            {
+                "target": "wire-foreign",
+                "destination": OTHER_HASH,
+                "from": "mallory",
+                "reaction": "👎",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+                "group": group["id"],
+                "target_author": PEER_HASH,
+                "target_sent_at": 100.0,
+            },
+            {
+                "target": "wire-foreign",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+                "group": group["id"],
+                "target_author": PEER_HASH,
+                "target_sent_at": 100.0,
+            },
+        ):
+            assert bridge.record_reaction(record) is None
+            node.inbox.record_reaction(record)
+        # The copy lands: the inbox retargets the member's reaction
+        # onto this node's wire id.
+        node.inbox.append_group_message(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-local",
+            },
+            group=group["id"],
+            author=PEER_HASH,
+            sent_at=100.0,
+            members=members,
+        )
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-local",
+                }
+            )
+            is not None
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-local"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_live_group_message_shows_inbox_only_reaction(node, tmp_path):
+    """A live group copy shows a reaction the console never cached.
+
+    Same gap as #304, without the foreign id: the reaction is stored
+    in the inbox only (recorded by another process), so the cache
+    seeds nothing and only the inbox overlay can carry it onto the
+    live event.  The snapshot read already showed it.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        assert (
+            bridge.record_inbound(
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "crew hello",
+                    "kind": "group",
+                    "group": group["id"],
+                    "group_name": "crew",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g1",
+                }
+            )
+            is not None
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-g1"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+        assert bridge.messages()[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {

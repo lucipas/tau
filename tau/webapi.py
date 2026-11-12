@@ -1023,12 +1023,32 @@ class WebBridge:
             # landed, and appending now would resurrect it after a
             # successful retraction.
             return None
+        # A group reaction can arrive before its target copy: the inbox
+        # retargets it onto this copy when it lands (see
+        # Inbox.append_group_message), but the bridge's own cache still
+        # names the foreign wire id, so _append_message seeds nothing
+        # from it.  Overlay the inbox's reactions for this wire id as
+        # well — the inbox is the durable authority, as in the snapshot
+        # read — so the live event carries them.  The roster filter
+        # below still runs over the merged set.
+        group_id = message.get("group")
+        if isinstance(group_id, str) and group_id:
+            wire_id = message.get("wire_id")
+            inbox = getattr(self.node, "inbox", None)
+            if isinstance(wire_id, str) and wire_id and inbox is not None:
+                try:
+                    stored = inbox.reactions_for(wire_id)
+                except Exception:  # pragma: no cover - defensive
+                    stored = []
+                if stored:
+                    message = self._with_inbox_reactions(
+                        message, {wire_id: stored}
+                    )
         # A voided reaction the bridge never heard about can still be
         # seeded from the cache into a fresh entry; the roster filters
         # it here, as the snapshot read and the import publish do, so
         # the stored entry and (when published) the live event are
         # both clean.
-        group_id = message.get("group")
         if isinstance(group_id, str) and group_id and message.get("reactions"):
             groups = getattr(self.node, "groups", None)
             if groups is not None:
