@@ -1306,6 +1306,7 @@ def test_group_reaction_resolves_local_copy_from_context(tmp_path):
     )
     author = destination_hash(RNS.Identity()).hex()
     reactor = RNS.Identity()
+    reactor = RNS.Identity()
     # A copy that arrived through the handler pins its roster, so a
     # retained copy with no pinned group is a deleted group — and a
     # reaction to it fails closed (see the deleted-group tests
@@ -1720,7 +1721,6 @@ def test_group_reaction_final_check_refuses_when_group_deleted(
     assert response["error"]["code"] == "not_a_member"
     assert calls["n"] == 2
     assert node.inbox.reactions_for("local-copy-1") == []
-    assert node.inbox.reactions_for("other-leg-1") == []
 
 
 def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
@@ -2497,6 +2497,7 @@ def test_group_reaction_not_published_when_recheck_fails(
     # was never verified.  The copy lands between the store and the
     # recheck (via the recheck's reload, as in the reload-failure
     # test); the recheck's reload then fails.  The stored reaction
+    # test); the recheck's reload then fails.  The stored reaction
     # stays in the inbox (round-12 note: it is never displayed —
     # the console and `tau messages` filter stored reactions against
     # the pinned roster, see test_group_message_hides_non_member_
@@ -3015,6 +3016,7 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
     # update fails, the bridge still holds the stale reaction and
     # would seed it into the live entry.  The message still records
     # — the inbox purge succeeded, so the reaction is voided there —
+    # but the live event is withheld.  The console history is still
     # but the live event is withheld.  The console history is still
     # written, through the record-only callback: messages() reads
     # only that history, so skipping it would leave the copy

@@ -2192,6 +2192,7 @@ class TauNode:
                 # is stored with its context and can only surface
                 # through reconciliation when the message arrives,
                 # which checks the roster then.  The lookup is by
+                # which checks the roster then.  The lookup is by
                 # exact id: a retired id that is also another group's
                 # name must not resolve to that group.
                 pinned = pinned_group(self.groups, reaction["group"])
@@ -2217,6 +2218,7 @@ class TauNode:
                 # non-member naming a known local group-message id
                 # must not get their reaction stored or displayed —
                 # including reactions that carry no group context.
+                # A missing roster fails closed: the group was deleted
                 # A missing roster fails closed: the group was deleted
                 # (or the message was imported without one), so there
                 # is no membership to verify — and a deleted group has
@@ -2281,6 +2283,7 @@ class TauNode:
                             final = None
                         if final is not None and final.get("kind") == "group":
                             # A missing roster fails closed, as above:
+                            # A missing roster fails closed, as above:
                             # the group was deleted, so no membership
                             # can be verified.  The lookup is by exact
                             # id, so a retired id that is also another
@@ -2342,6 +2345,7 @@ class TauNode:
                 )
                 if local is not None:
                     # Exact-id lookup: a retired id that is also
+                    # Exact-id lookup: a retired id that is also
                     # another group's name must not supply the
                     # roster the reconciliation filters against.
                     pinned = pinned_group(self.groups, reaction["group"])
@@ -2402,6 +2406,7 @@ class TauNode:
                         now_resolved is not None
                         and now_resolved.get("kind") == "group"
                     ):
+                        # Exact-id lookup: a retired id that is also
                         # Exact-id lookup: a retired id that is also
                         # another group's name must not supply the
                         # roster this void check runs against.  A
