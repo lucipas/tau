@@ -977,6 +977,14 @@ class Mailbox:
                         if delivered_at is not None
                         else None
                     )
+                delivered_via = record.get("delivered_via")
+                if delivered_via in ("direct", "lxmf"):
+                    # Which transport confirmed the delivery: a copy
+                    # delivered over LXMF is stored by the recipient
+                    # under an LXMF id, so a retract naming the tau
+                    # wire id cannot reach it. Records written before
+                    # the route was tracked carry no such key.
+                    parsed["delivered_via"] = delivered_via
                 sent[message_id] = parsed
 
         receipts: Dict[str, ReceiptEntry] = {}
@@ -1344,6 +1352,7 @@ class Mailbox:
                 "sent_at": float(timestamp),
                 "read_at": None,
                 "delivered_at": None,
+                "delivered_via": None,
                 "text": normalize_message(text),
             }
             self.save()
@@ -1354,13 +1363,22 @@ class Mailbox:
         *,
         now: Optional[float] = None,
         timeout: Optional[float] = None,
+        via: Optional[str] = None,
     ) -> None:
-        """Mark a sent message as having reached its recipient."""
+        """Mark a sent message as having reached its recipient.
+
+        ``via`` names the transport that confirmed the delivery
+        (``"direct"`` or ``"lxmf"``) and is stored on the sent record
+        alongside the timestamp, so a later retract can tell whether
+        the recipient holds the copy under this node's wire id.
+        """
         with self._transaction(timeout=timeout):
             record = self._sent.get(message_id)
             if record is None or record.get("delivered_at") is not None:
                 return
             record["delivered_at"] = now if now is not None else time.time()
+            if via is not None:
+                record["delivered_via"] = via
             self.save()
 
     def discard_sent(self, message_id: str) -> None:

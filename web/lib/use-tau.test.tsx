@@ -728,6 +728,35 @@ describe("useTau search", () => {
     expect(mockedGet).not.toHaveBeenCalled();
     expect(result.current.searchQuery).toBeNull();
   });
+
+  it("drops a retracted message from later searches", async () => {
+    const hit = makeMessage({ id: 2, text: "mesh hit" });
+    mockedGet.mockResolvedValue({ messages: [hit], count: 1 });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 2, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([hit]);
+
+    await act(async () => {
+      await result.current.retractMessage(2);
+    });
+
+    // The search ran before the retract, so its stale hit is still
+    // in state; a re-run must not bring the retracted message back.
+    await act(async () => {
+      await result.current.search("mesh");
+    });
+    expect(result.current.searchResults).toEqual([]);
+  });
 });
 
 describe("useTau rename", () => {

@@ -7093,6 +7093,88 @@ def test_retract_message_endpoint_keeps_bubble_when_peer_unreachable(
     assert node.inbox.export_document()["messages"] != []
 
 
+def test_retract_message_endpoint_rejects_file_entries(bridge, node):
+    # The peer refuses retracts of saved files (the bytes live on
+    # disk), so offering retract on a sent file would always fail.
+    _sent_console_entry(
+        bridge,
+        node,
+        file={"name": "notes.txt", "size": 10, "sha256": "ab" * 32},
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "file transfers cannot be retracted" in payload["error"]["message"]
+
+
+def test_retract_message_endpoint_rejects_lxmf_delivered_copy(bridge, node):
+    _sent_console_entry(bridge, node)
+    node.mailbox.record_delivered("wire-1", via="lxmf")
+    called = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        called.append((peer, message_id))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "delivered over LXMF" in payload["error"]["message"]
+    # The retract never went out: the recipient stores that copy
+    # under an `lxmf:` id, so naming the tau wire id could not
+    # delete it — and the sender's copies stay in place.
+    assert called == []
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+
+
+def test_retract_message_endpoint_never_deletes_a_prefix_sharing_record(
+    bridge, node
+):
+    # The sender's inbox copy is already gone, and another sender's
+    # record shares the wire id's prefix: the local delete must not
+    # fall through to that record.
+    node.inbox.append(
+        {
+            "id": "wire-1-other",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "another sender's message",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    node.mailbox.record_sent(
+        "wire-1", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+    )
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["deleted"] is True
+    assert [
+        entry["id"] for entry in node.inbox.list_messages()
+    ] == ["wire-1-other"]
+
+
 def test_delete_by_wire_id_removes_the_console_copy(bridge):
     bridge.record_inbound(
         {

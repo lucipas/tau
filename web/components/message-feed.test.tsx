@@ -233,6 +233,25 @@ describe("MessageFeed retract", () => {
     expect(screen.queryByTitle("Retract this message")).toBeNull();
   });
 
+  it("shows no retract button on file entries", () => {
+    // The peer refuses retracts of saved files, so offering retract
+    // on a sent file would always fail.
+    const onRetract = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[
+          sent({
+            file: { name: "notes.txt", size: 10, sha256: "ab".repeat(32) },
+          }),
+        ]}
+        node={null}
+        live={true}
+        onRetract={onRetract}
+      />,
+    );
+    expect(screen.queryByTitle("Retract this message")).toBeNull();
+  });
+
   it("shows no retract button without a wire id", () => {
     const onRetract = vi.fn(async () => {});
     render(

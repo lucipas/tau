@@ -199,6 +199,11 @@ export function useTau() {
 
   const searchQueryRef = useRef(searchQuery);
   const searchSeq = useRef(0);
+  // Console ids removed by a delete or retract in this tab. A search
+  // that ran before the removal keeps its stale hits in state, and a
+  // search re-run after it still lists the record until the inbox
+  // copy is gone — either way the removed id must not come back.
+  const removedMessageIds = useRef(new Set<number>());
 
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -1483,12 +1488,6 @@ export function useTau() {
     refreshHeldMail,
     dropHeldMail,
     refreshAllowlist,
-    addAllowlistPeer,
-    removeAllowlistPeer,
-    setAllowlistEnabled,
-  };
-}
-freshAllowlist,
     addAllowlistPeer,
     removeAllowlistPeer,
     setAllowlistEnabled,

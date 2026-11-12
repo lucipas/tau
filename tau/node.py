@@ -2776,7 +2776,11 @@ class TauNode:
         # so a waiter that sees the entry gone can tell it was delivered.
         self._delivered_ids.append(entry.id)
         try:
-            self.mailbox.record_delivered(entry.id, timeout=_remaining(deadline))
+            self.mailbox.record_delivered(
+                entry.id,
+                timeout=_remaining(deadline),
+                via="lxmf" if via_lxmf else "direct",
+            )
             self.mailbox.remove_outbox(entry.id, timeout=_remaining(deadline))
         except TimeoutError:
             # The delivery is confirmed, so report success; the entry
@@ -3754,7 +3758,7 @@ class TauNode:
                     "send_after": entry.send_after,
                 }
             response = self._request(peer, REQUEST_MESSAGE, payload, timeout)
-            self.mailbox.record_delivered(message_id)
+            self.mailbox.record_delivered(message_id, via="direct")
             if isinstance(response, dict):
                 # Only this node's own outbox may report a message as
                 # queued, with a real local entry id. A peer that claims
@@ -4106,7 +4110,7 @@ class TauNode:
                         }
                     )
                     continue
-                self.mailbox.record_delivered(message_id)
+                self.mailbox.record_delivered(message_id, via="direct")
                 sent_leg_ids.append(message_id)
                 results.append(
                     {

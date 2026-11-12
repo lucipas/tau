@@ -133,6 +133,32 @@ def test_sent_record_keeps_delivered_at_through_reload(tmp_path):
     assert "delivered_at" not in reloaded.sent_record("m2")
 
 
+def test_sent_record_keeps_delivery_route_through_reload(tmp_path):
+    """`delivered_via` must survive a reload: a later retract reads it
+    to tell whether the recipient holds the copy under the tau wire
+    id or under an LXMF id."""
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    box.record_sent("m1", to=BOB, text="hello", sent_at=1000.0)
+    box.record_sent("m2", to=BOB, text="later", sent_at=1001.0)
+    box.record_delivered("m1", now=1002.0, via="lxmf")
+    box.record_delivered("m2", now=1003.0, via="direct")
+
+    reloaded = Mailbox(path)
+    assert reloaded.sent_record("m1")["delivered_via"] == "lxmf"
+    assert reloaded.sent_record("m2")["delivered_via"] == "direct"
+
+    # A record written before route tracking has no such key, and an
+    # unknown route value is dropped on load rather than trusted.
+    raw = json.loads(path.read_text())
+    del raw["sent"]["m2"]["delivered_via"]
+    raw["sent"]["m1"]["delivered_via"] = "carrier-pigeon"
+    path.write_text(json.dumps(raw))
+    reloaded = Mailbox(path)
+    assert "delivered_via" not in reloaded.sent_record("m2")
+    assert "delivered_via" not in reloaded.sent_record("m1")
+
+
 def test_load_dedupes_duplicate_message_ids(tmp_path):
     """A mailbox.json with duplicate ids keeps the newest copy of each
     and is rewritten on load, so the duplicates do not survive a

@@ -2835,10 +2835,14 @@ class WebBridge:
         False, which is not an error — the local copies still go.
 
         Only your own sent DMs can be retracted: group messages are
-        not retractable in v1, a message still queued has not reached
-        its recipient yet (cancel it from the outbox instead), and
-        retracts ride the live link only, so an unreachable peer is a
-        failure, not a silent queue.
+        not retractable in v1, a file transfer's saved copy lives on
+        the recipient's disk (the peer refuses those retracts), a
+        message still queued has not reached its recipient yet
+        (cancel it from the outbox instead), and a message delivered
+        over LXMF is stored by the recipient under an LXMF id the
+        retract cannot name — that copy stays until LXMF carries the
+        tau id (see #248).  Retracts ride the live link only, so an
+        unreachable peer is a failure, not a silent queue.
 
         Ordering keeps every failure retryable from the console: the
         retract goes first, so a failed retract never erases the local
@@ -2847,7 +2851,10 @@ class WebBridge:
         same path as a delete, so other tabs learn through
         ``message_deleted``.  A retry after either failure re-sends the
         retract (idempotent — the peer answers ``deleted`` False) and
-        retries the local cleanup.
+        retries the local cleanup.  The local inbox delete is exact:
+        ``delete_authorized`` checks the id, direction and recipient
+        in one transaction, so a stale wire id can never delete a
+        different record sharing its prefix.
         """
         if not isinstance(target, int) or isinstance(target, bool) or target < 1:
             raise ValueError("message id is required")
@@ -2888,18 +2895,37 @@ class WebBridge:
                 raise ValueError(
                     f"message {target!r} is still queued; cancel it from the outbox first"
                 )
+            sent_record = self.node.mailbox.sent_record(wire_id)
+            if (
+                sent_record is not None
+                and sent_record.get("delivered_via") == "lxmf"
+            ):
+                # The recipient stores an LXMF-delivered copy under an
+                # `lxmf:` id, not this wire id: the retract would
+                # answer `deleted` False while the copy stays. Refuse
+                # instead of removing the sender's copies around a
+                # copy the retract cannot reach.
+                raise ValueError(
+                    "that message was delivered over LXMF; the recipient "
+                    "stores it under an LXMF id, so a retract cannot "
+                    "reach that copy yet"
+                )
         response = self.node.send_retraction(peer, wire_id, timeout=timeout)
         inbox = getattr(self.node, "inbox", None)
         if inbox is not None:
             try:
-                inbox.delete(wire_id)
+                inbox.delete_authorized(
+                    wire_id, direction="out", destination=peer
+                )
             except InboxError as exc:
-                # Already gone from the inbox (a stale wire id) is
-                # fine.  Any other inbox failure leaves the console
-                # entry in place, so the retract can be retried — the
-                # retract itself already succeeded.
-                if not str(exc).startswith("unknown message"):
-                    raise
+                # A record that exists but is not this node's sent
+                # copy, or a delete that could not be persisted,
+                # leaves the console entry in place, so the retract
+                # can be retried — the retract itself already
+                # succeeded. A missing record (None) is fine.
+                if str(exc).startswith("could not persist"):
+                    raise OSError(str(exc)) from exc
+                raise ValueError(str(exc)) from exc
         # The sent record lives in mailbox.json, not the inbox: drop it
         # too, or `tau messages --sent` keeps showing the retracted text.
         # Only after the retract and the inbox delete succeeded, so a
