@@ -33,6 +33,7 @@ from tau.webapi import (
     WebBridge,
     WebBridgeError,
     _backup_name,
+    _clean_stored_message,
     check_web_console_bind,
 )
 
@@ -7091,6 +7092,88 @@ def test_retract_message_endpoint_keeps_bubble_when_peer_unreachable(
     _, _, feed = _json(bridge, "/api/messages")
     assert [entry["id"] for entry in feed["messages"]] == [1]
     assert node.inbox.export_document()["messages"] != []
+
+
+def test_retract_still_refuses_lxmf_copy_after_sent_record_evicted(
+    bridge, node
+):
+    # A queued entry, delivered over LXMF: the delivery flip stamps
+    # the route on the console entry itself.
+    entry = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="queued",
+        wire_id="wire-1",
+        mail_id="wire-1",
+    )
+    assert entry is not None
+    node.mailbox.record_sent(
+        "wire-1", to=bytes.fromhex(PEER_HASH), text="hello", sent_at=100.0
+    )
+    node.mailbox.record_delivered("wire-1", via="lxmf")
+    updated = bridge.record_delivery("wire-1")
+    assert updated is not None
+    assert updated["status"] == "delivered"
+    assert updated["delivered_via"] == "lxmf"
+
+    # The sent record is evicted (256-send cap / 30-day sweep) while
+    # the console entry remains retractable: the entry's own stamp
+    # still refuses the retract, and nothing goes out.
+    node.mailbox.discard_sent("wire-1")
+    called = []
+
+    def send_retraction(peer, message_id, *, timeout=20.0, discover_timeout=None):
+        called.append((peer, message_id))
+        return {"ok": True, "deleted": True, "id": "retract-1"}
+
+    node.send_retraction = send_retraction
+    status, _, payload = _json(
+        bridge, "/api/messages/retract", method="POST", body={"id": entry["id"]}
+    )
+    assert status == 400
+    assert "delivered over LXMF" in payload["error"]["message"]
+    assert called == []
+
+
+def test_stored_message_keeps_delivery_route(bridge):
+    entry = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+        delivered_via="direct",
+    )
+    assert entry is not None
+    assert entry["delivered_via"] == "direct"
+
+    # The loader keeps a known route across a restart, and drops an
+    # unknown one instead of trusting it.
+    stored = {
+        "id": 1,
+        "direction": "out",
+        "peer": PEER_HASH,
+        "peer_name": "alice",
+        "text": "hello",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "status": "delivered",
+        "wire_id": "wire-1",
+        "delivered_via": "lxmf",
+    }
+    cleaned = _clean_stored_message(stored)
+    assert cleaned is not None
+    assert cleaned["delivered_via"] == "lxmf"
+    assert "delivered_via" not in _clean_stored_message(
+        {**stored, "delivered_via": "carrier-pigeon"}
+    )
 
 
 def test_retract_message_endpoint_rejects_file_entries(bridge, node):

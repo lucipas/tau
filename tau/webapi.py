@@ -545,6 +545,13 @@ def _clean_stored_message(entry: Any) -> Optional[Dict[str, Any]]:
         # how reactions (which name their target by wire id) attach to
         # the right history entry.
         message["wire_id"] = wire_id
+    delivered_via = entry.get("delivered_via")
+    if delivered_via in ("direct", "lxmf"):
+        # Which transport confirmed the delivery: kept so a retract
+        # can still tell an LXMF-delivered copy from a direct one
+        # after the mailbox sent record is evicted. Entries written
+        # before the route was tracked carry no such key.
+        message["delivered_via"] = delivered_via
     reactions = entry.get("reactions")
     if isinstance(reactions, list):
         cleaned = [_clean_stored_reaction(item) for item in reactions]
@@ -1024,6 +1031,23 @@ class WebBridge:
             self.mark_displayed_read()
         return message
 
+    def _delivery_route(self, message_id: str) -> Optional[str]:
+        """Which transport confirmed a delivery, if it is known.
+
+        Read from the mailbox sent record: ``"direct"`` or ``"lxmf"``.
+        ``None`` when the record is gone (evicted) or was written
+        before the route was tracked — the caller keeps the previous
+        behavior in that case.
+        """
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            return None
+        record = mailbox.sent_record(message_id)
+        if record is None:
+            return None
+        via = record.get("delivered_via")
+        return via if via in ("direct", "lxmf") else None
+
     def record_delivery(self, mail_id: str) -> Optional[Dict[str, Any]]:
         """Mark a queued outbound message delivered.
 
@@ -1047,6 +1071,13 @@ class WebBridge:
                         and message.get("mail_id") == mail_id
                     ):
                         message["status"] = "delivered"
+                        # Stamp the route on the entry itself: the
+                        # mailbox sent record can be evicted while
+                        # this entry remains retractable, and only the
+                        # entry outlives that eviction.
+                        route = self._delivery_route(mail_id)
+                        if route is not None:
+                            message["delivered_via"] = route
                         updated = dict(message)
                         break
                 if updated is None:
@@ -2506,12 +2537,18 @@ class WebBridge:
                 mail_id=mail_id,
                 expires_at=expires_at,
                 wire_id=wire_id,
+                # A live send went out over the direct link by
+                # construction: a failed direct send queues instead.
+                delivered_via="direct" if not queued else None,
                 in_reply_to=in_reply_to,
             )
             with self._lock:
                 if mail_id is not None and mail_id in self._early_deliveries:
                     del self._early_deliveries[mail_id]
                     message["status"] = "delivered"
+                    route = self._delivery_route(mail_id)
+                    if route is not None:
+                        message["delivered_via"] = route
                     flipped = True
                 read_key = wire_id or mail_id
                 if read_key is not None:
@@ -2841,8 +2878,11 @@ class WebBridge:
         (cancel it from the outbox instead), and a message delivered
         over LXMF is stored by the recipient under an LXMF id the
         retract cannot name — that copy stays until LXMF carries the
-        tau id (see #248).  Retracts ride the live link only, so an
-        unreachable peer is a failure, not a silent queue.
+        tau id (see #248).  The route is stamped on the console entry
+        when delivery is confirmed (and falls back to the mailbox
+        sent record for older entries), so it survives the sent
+        record being evicted.  Retracts ride the live link only, so
+        an unreachable peer is a failure, not a silent queue.
 
         Ordering keeps every failure retryable from the console: the
         retract goes first, so a failed retract never erases the local
@@ -2895,11 +2935,17 @@ class WebBridge:
                 raise ValueError(
                     f"message {target!r} is still queued; cancel it from the outbox first"
                 )
-            sent_record = self.node.mailbox.sent_record(wire_id)
-            if (
-                sent_record is not None
-                and sent_record.get("delivered_via") == "lxmf"
-            ):
+            # The route lives on the console entry itself, so it
+            # survives the mailbox sent record being evicted; the
+            # sent record is the fallback for entries written before
+            # the route was stamped. A missing route keeps the prior
+            # behavior — it is not, by itself, a reason to refuse.
+            delivered_via = removed.get("delivered_via")
+            if delivered_via is None:
+                sent_record = self.node.mailbox.sent_record(wire_id)
+                if sent_record is not None:
+                    delivered_via = sent_record.get("delivered_via")
+            if delivered_via == "lxmf":
                 # The recipient stores an LXMF-delivered copy under an
                 # `lxmf:` id, not this wire id: the retract would
                 # answer `deleted` False while the copy stays. Refuse
@@ -4307,6 +4353,7 @@ class WebBridge:
         group_name: Optional[str] = None,
         expires_at: Optional[float] = None,
         wire_id: Optional[str] = None,
+        delivered_via: Optional[str] = None,
         in_reply_to: Optional[Dict[str, Any]] = None,
         file: Optional[Dict[str, Any]] = None,
         save: bool = True,
@@ -4354,6 +4401,8 @@ class WebBridge:
                         message["reactions"] = _with_reaction(
                             message["reactions"], entry["destination"], entry
                         )
+            if delivered_via in ("direct", "lxmf"):
+                message["delivered_via"] = delivered_via
             message["excerpt_hash"] = excerpt_hash(text)
             reply_to = clean_in_reply_to(in_reply_to)
             if reply_to is not None:
