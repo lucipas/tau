@@ -2751,6 +2751,31 @@ def test_messages_count_does_not_advance_the_cursor(tmp_path, capsys):
     assert "unknown peer" in capsys.readouterr().err
 
 
+def test_messages_count_ignores_sent_records(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+
+    # A reply sent after reading the conversation must not inflate
+    # the unread count: your own mail is never unread for you.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    inbox.mark_read()
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": sender_hash.hex(),
+            "text": "my reply",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-sent",
+            "direction": "out",
+        }
+    )
+
+    code = cli.main(["messages", "--data-dir", str(data_dir), "--count", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"unread": {}, "total": 0}
+
+
 def test_messages_unread_filter_applies_before_limit(tmp_path, capsys):
     """An older unread message is not crowded out by newer read ones."""
     data_dir = tmp_path / "node"
