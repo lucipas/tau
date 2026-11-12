@@ -3461,6 +3461,12 @@ class TauNode:
             # delivery that fails transiently keeps the copy held
             # for a later sweep: dropping it first would lose the
             # only copy of a message this node never recorded.
+            # This check is a fast path only: it reads the serving
+            # process's cached held pool, so a drop by another
+            # process after the sweep listed the envelope still
+            # passes it — the delivery rechecks ownership inside
+            # its mailbox transaction (see _deliver_collected)
+            # before anything is stored or published.
             if not self.mailbox.is_held(
                 envelope.id, to=self.destination.hash
             ):
@@ -3468,7 +3474,11 @@ class TauNode:
                 # sweep listed it: do not surface a copy we no longer hold.
                 continue
             try:
-                delivered = self._deliver_collected(payload)
+                delivered = self._deliver_collected(
+                    payload,
+                    held_id=envelope.id,
+                    held_to=self.destination.hash,
+                )
             except DeliveryDeferredError as exc:
                 log.warning(
                     "Delivery of local held mail %s deferred: %s",
@@ -3481,8 +3491,26 @@ class TauNode:
             self.mailbox.drop_held(envelope.id, to=self.destination.hash)
         return received
 
-    def _deliver_collected(self, message: Dict[str, Any]) -> bool:
-        """Hand a decrypted relayed message to the user, at most once."""
+    def _deliver_collected(
+        self,
+        message: Dict[str, Any],
+        *,
+        held_id: Optional[str] = None,
+        held_to: Optional[bytes] = None,
+    ) -> bool:
+        """Hand a decrypted relayed message to the user, at most once.
+
+        ``held_id`` names the local held envelope this copy came
+        from (the local-held sweep passes it; the fetch path does
+        not).  When given, ownership is rechecked inside the mailbox
+        transaction that guards the store: the sweep's pre-delivery
+        ``is_held`` reads the serving process's cached held pool, so
+        a drop by another process (``tau outbox drop-held``) after
+        the sweep listed the envelope is invisible to it — but the
+        transaction reloads the mailbox from disk, so the recheck
+        sees the drop and the delivery is deferred before anything
+        is stored or published.
+        """
         sender = message.get("from")
         if self.blocklist.is_blocked(
             sender if isinstance(sender, str) else None
@@ -3584,6 +3612,18 @@ class TauNode:
         if pinned is not None:
             try:
                 with self.mailbox.transaction():
+                    if held_id is not None and not self.mailbox.is_held(
+                        held_id, to=held_to
+                    ):
+                        # Dropped by the owner (tau outbox drop-held)
+                        # after this sweep listed it.  The transaction
+                        # reloaded the mailbox, so this reads the
+                        # current on-disk state, not the serving
+                        # process's cache — defer before anything is
+                        # stored or published.
+                        raise DeliveryDeferredError(
+                            f"held envelope {held_id} no longer held"
+                        )
                     if self.mailbox.is_seen(message["id"]):
                         return False
                     voided = self.inbox.append_group_message(
@@ -3615,6 +3655,17 @@ class TauNode:
             recorded = True
         else:
             with self.mailbox.transaction():
+                if held_id is not None and not self.mailbox.is_held(
+                    held_id, to=held_to
+                ):
+                    # Dropped by the owner (tau outbox drop-held)
+                    # after this sweep listed it.  The transaction
+                    # reloaded the mailbox, so this reads the current
+                    # on-disk state, not the serving process's cache
+                    # — defer before anything is stored or published.
+                    raise DeliveryDeferredError(
+                        f"held envelope {held_id} no longer held"
+                    )
                 if self.mailbox.is_seen(message["id"]):
                     pass
                 elif message.get("group") is None and self.mailbox.is_retracted(

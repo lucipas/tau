@@ -768,6 +768,102 @@ def test_local_held_delivery_skips_dropped_envelope(tmp_path, monkeypatch):
     assert len(received) == 1
 
 
+def test_local_held_delivery_skips_envelope_dropped_by_another_process(
+    tmp_path,
+):
+    # CodeRabbit round-10 (fp4P): the pre-delivery is_held check
+    # reads the serving process's cached held pool, so a drop by
+    # another process (tau outbox drop-held) after the sweep listed
+    # the envelope was invisible to it — the message was stored and
+    # published anyway.  The delivery now rechecks ownership inside
+    # the mailbox transaction that guards the store, which reloads
+    # from disk.  Drop via a second Mailbox instance, exactly as the
+    # CLI would, and assert the serving process's stale cache still
+    # lists it — the pre-check passes, and only the in-transaction
+    # recheck stops the delivery.
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    sender = RNS.Identity()
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-1",
+        text="dropped by another process",
+        sent_at=55.0,
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-1",
+        expires_at=time.time() + 3600,
+    )
+    other_process = Mailbox(node.config.mailbox_path)
+    assert other_process.drop_held("self-1") is True
+    assert node.mailbox.is_held("self-1", to=recipient_hash) is True
+    assert node._process_local_held() == 0
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+
+def test_local_held_group_delivery_skips_envelope_dropped_by_another_process(
+    tmp_path,
+):
+    # The group branch of _deliver_collected guards its store with
+    # its own mailbox transaction, so it rechecks held ownership
+    # there too — a group copy dropped by another process after the
+    # sweep listed it is not stored or published either.
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    identity = RNS.Identity()
+    recipient_hash = destination_hash(identity)
+    node.identity = identity
+    node.destination = SimpleNamespace(
+        hash=recipient_hash, hexhash=recipient_hash.hex()
+    )
+    own = recipient_hash.hex()
+    sender = RNS.Identity()
+    author_hash = destination_hash(sender).hex()
+    members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id(author_hash, "crew", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=identity.get_public_key(),
+        message_id="self-group-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    node.mailbox.hold(
+        to=recipient_hash,
+        blob=blob,
+        message_id="self-group-1",
+        expires_at=time.time() + 3600,
+    )
+    other_process = Mailbox(node.config.mailbox_path)
+    assert other_process.drop_held("self-group-1") is True
+    assert node.mailbox.is_held("self-group-1", to=recipient_hash) is True
+    assert node._process_local_held() == 0
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+
 def test_fetch_ignores_envelope_dropped_by_another_process(tmp_path):
     from tau.mailbox import Mailbox
 
