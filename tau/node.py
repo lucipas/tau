@@ -3011,6 +3011,7 @@ class TauNode:
                     if peer is not None:
                         self._mail_round_for_peer(peer)
                 self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
+                self._publish_due_scheduled_posts()
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
             try:
@@ -3019,6 +3020,36 @@ class TauNode:
                 log.debug("Peer exchange sweep failed", exc_info=True)
             if self._stop_event.wait(_MAIL_INTERVAL):
                 break
+
+    def _publish_due_scheduled_posts(self) -> None:
+        """Publish Tan posts whose scheduled time has come.
+
+        Only when a Tan app is attached (``tau serve --social``):
+        without one there is no publisher, and the queue simply waits
+        for a serving node that has one.  A publish failure keeps the
+        entry queued — see ``tau.scheduled_posts`` — so this never
+        raises into the mail loop.
+        """
+        app = self.app
+        if app is None:
+            return
+        if not (hasattr(app, "create_post") and hasattr(app, "publish")):
+            return
+        from .scheduled_posts import publish_due_scheduled_posts
+
+        try:
+            result = publish_due_scheduled_posts(
+                self.config.scheduled_posts_path,
+                app,
+                resolve_peer=self.resolve_peer,
+            )
+        except Exception:  # pragma: no cover - defensive; helper logs
+            log.debug("Scheduled-post publish failed", exc_info=True)
+            return
+        if result["published"]:
+            log.info(
+                "Published %d scheduled Tan post(s)", result["published"]
+            )
 
     def _exchange_sweep(self, *, max_peers: int) -> None:
         """Ask a few known peers for their peers, outside the mail lock.

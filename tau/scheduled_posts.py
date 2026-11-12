@@ -1,0 +1,407 @@
+"""Scheduled Tan posts: queue a post to publish later.
+
+The Tan analogue of a scheduled DM (``tau send --delay``): ``tau tan
+post --delay 5m`` stores the post instead of publishing it, and a
+node serving with ``--social`` publishes due posts on its mail-loop
+pass.  A post whose publish time has come goes out at the next pass,
+about every 45 seconds.
+
+The queue lives in the data directory (``scheduled-posts.json``) so
+scheduled posts survive restarts.  A publish that fails keeps the
+entry queued and retries on the next pass instead of dropping the
+post — the same failure direction as the outbox: never lose a queued
+post silently.  Cancelling removes the entry before it goes out.
+
+Entries are validated on load the way the other small JSON stores
+are: a malformed file raises rather than silently dropping queued
+posts, and the mail-loop publisher treats a corrupt queue as
+nothing-due (with a warning) so one bad file cannot stall mail.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import secrets
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+
+from .util import atomic_write_json, ensure_dir
+
+log = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows only; the lock uses msvcrt there, as identity.py does.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
+
+SCHEDULED_POSTS_FILE_MODE = 0o600
+SCHEDULED_POST_ID_BYTES = 8
+MAX_SCHEDULED_POST_DELAY = 7 * 24 * 60 * 60
+MAX_SCHEDULED_POST_TTL = 255
+
+
+class ScheduledPostsError(ValueError):
+    """Raised when a scheduled-posts file or value is malformed."""
+
+
+def new_scheduled_post_id() -> str:
+    """A fresh queue id: 16 lowercase hex characters."""
+    return secrets.token_hex(SCHEDULED_POST_ID_BYTES)
+
+
+def _clean_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ScheduledPostsError(f"not a scheduled post id: {value!r}")
+    lowered = value.lower()
+    if len(lowered) != 2 * SCHEDULED_POST_ID_BYTES:
+        raise ScheduledPostsError(f"not a scheduled post id: {value!r}")
+    try:
+        bytes.fromhex(lowered)
+    except ValueError:
+        raise ScheduledPostsError(f"not a scheduled post id: {value!r}") from None
+    return lowered
+
+
+def _clean_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ScheduledPostsError("scheduled post text must not be empty")
+    return value
+
+
+def _clean_reply_to(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ScheduledPostsError(f"not a post hash: {value!r}")
+    lowered = value.lower()
+    if len(lowered) != 64:
+        raise ScheduledPostsError(f"not a post hash: {value!r}")
+    try:
+        bytes.fromhex(lowered)
+    except ValueError:
+        raise ScheduledPostsError(f"not a post hash: {value!r}") from None
+    return lowered
+
+
+def _clean_targets(value: Any) -> Tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ScheduledPostsError("scheduled post targets must be a list")
+    cleaned = []
+    for target in value:
+        if not isinstance(target, str) or not target.strip():
+            raise ScheduledPostsError(f"not a publish target: {target!r}")
+        cleaned.append(target)
+    return tuple(cleaned)
+
+
+def _clean_ttl(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ScheduledPostsError(f"not a gossip TTL: {value!r}")
+    if value < 0 or value > MAX_SCHEDULED_POST_TTL:
+        raise ScheduledPostsError(f"not a gossip TTL: {value!r}")
+    return value
+
+
+def _clean_timestamp(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ScheduledPostsError(f"not a timestamp: {label}={value!r}")
+    stamp = float(value)
+    if stamp <= 0 or stamp != stamp or stamp in (float("inf"), float("-inf")):
+        raise ScheduledPostsError(f"not a timestamp: {label}={value!r}")
+    return stamp
+
+
+@dataclass(frozen=True)
+class ScheduledPost:
+    """One queued Tan post, waiting for its publish time."""
+
+    id: str
+    text: str
+    publish_at: float
+    created_at: float
+    reply_to: Optional[str] = None
+    to: Tuple[str, ...] = ()
+    ttl: int = 3
+
+    def __post_init__(self) -> None:
+        # A frozen dataclass still builds through __init__: validate
+        # here so a hand-built entry cannot slip past from_dict's
+        # checks with an empty text or an out-of-range TTL.
+        object.__setattr__(self, "id", _clean_id(self.id))
+        object.__setattr__(self, "text", _clean_text(self.text))
+        object.__setattr__(self, "reply_to", _clean_reply_to(self.reply_to))
+        object.__setattr__(self, "to", _clean_targets(list(self.to)))
+        object.__setattr__(self, "ttl", _clean_ttl(self.ttl))
+        object.__setattr__(self, "publish_at", _clean_timestamp(self.publish_at, "publish_at"))
+        object.__setattr__(self, "created_at", _clean_timestamp(self.created_at, "created_at"))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "reply_to": self.reply_to,
+            "to": list(self.to),
+            "ttl": self.ttl,
+            "publish_at": self.publish_at,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ScheduledPost":
+        if not isinstance(data, dict):
+            raise ScheduledPostsError("scheduled post must be a JSON object")
+        return cls(
+            id=_clean_id(data.get("id")),
+            text=_clean_text(data.get("text")),
+            reply_to=_clean_reply_to(data.get("reply_to")),
+            to=_clean_targets(data.get("to")),
+            ttl=_clean_ttl(data.get("ttl", 3)),
+            publish_at=_clean_timestamp(data.get("publish_at"), "publish_at"),
+            created_at=_clean_timestamp(data.get("created_at"), "created_at"),
+        )
+
+
+@dataclass(frozen=True)
+class ScheduledPosts:
+    """The queued posts, oldest publish time first."""
+
+    posts: Tuple[ScheduledPost, ...] = ()
+
+    def __len__(self) -> int:
+        return len(self.posts)
+
+    def due(self, now: Optional[float] = None) -> List[ScheduledPost]:
+        """Queued posts whose publish time has come, oldest first."""
+        at = now if now is not None else time.time()
+        return [post for post in self.posts if post.publish_at <= at]
+
+    def resolve(self, prefix: str) -> ScheduledPost:
+        """Find one queued post by full id or unique prefix."""
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ScheduledPostsError("a scheduled post id is required")
+        matches = [post for post in self.posts if post.id.startswith(prefix.lower())]
+        if not matches:
+            raise ScheduledPostsError(f"no scheduled post {prefix!r}")
+        if len(matches) > 1:
+            raise ScheduledPostsError(
+                f"ambiguous scheduled post id {prefix!r} "
+                f"({len(matches)} match)"
+            )
+        return matches[0]
+
+    def with_added(self, post: ScheduledPost) -> "ScheduledPosts":
+        if any(existing.id == post.id for existing in self.posts):
+            raise ScheduledPostsError(f"scheduled post {post.id} is already queued")
+        ordered = tuple(sorted((*self.posts, post), key=lambda p: p.publish_at))
+        return ScheduledPosts(posts=ordered)
+
+    def with_removed(self, post_id: str) -> "ScheduledPosts":
+        kept = tuple(post for post in self.posts if post.id != post_id)
+        if len(kept) == len(self.posts):
+            raise ScheduledPostsError(f"no scheduled post {post_id!r}")
+        return ScheduledPosts(posts=kept)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"posts": [post.to_dict() for post in self.posts]}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ScheduledPosts":
+        if not isinstance(data, dict):
+            raise ScheduledPostsError("scheduled-posts must be a JSON object")
+        if "posts" not in data:
+            raise ScheduledPostsError("posts is required")
+        raw = data.get("posts")
+        if not isinstance(raw, list):
+            raise ScheduledPostsError("posts must be a list")
+        return cls(posts=tuple(ScheduledPost.from_dict(item) for item in raw))
+
+
+def load_scheduled_posts(path: Optional[Union[str, Path]]) -> ScheduledPosts:
+    """Load the queue at *path*; a missing file means nothing scheduled."""
+    if path is None:
+        return ScheduledPosts()
+    target = Path(path).expanduser()
+    try:
+        target.stat()
+    except FileNotFoundError:
+        return ScheduledPosts()
+    except OSError as exc:
+        raise ScheduledPostsError(
+            f"could not read scheduled-posts {target}: {exc}"
+        ) from exc
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScheduledPostsError(
+            f"could not read scheduled-posts {target}: {exc}"
+        ) from exc
+    return ScheduledPosts.from_dict(data)
+
+
+def save_scheduled_posts(path: Union[str, Path], posts: ScheduledPosts) -> Path:
+    """Persist *posts* to *path* as JSON (mode 0600) and return the path."""
+    target = Path(path).expanduser()
+    return atomic_write_json(target, posts.to_dict(), mode=SCHEDULED_POSTS_FILE_MODE)
+
+
+@contextmanager
+def scheduled_posts_lock(path: Union[str, Path]) -> Iterator[None]:
+    """Serialize read-modify-write updates of the scheduled-posts queue.
+
+    Same shape as the ignored-groups lock: a flock on a
+    ``.scheduled-posts.json.lock`` sidecar.  An atomic file replacement
+    alone does not protect the whole update — without the lock, two
+    commands racing load the same file and the last save discards the
+    other's change.  Callers must reload inside the lock.
+    """
+    if fcntl is None and msvcrt is None:  # pragma: no cover - neither platform
+        yield
+        return
+    target = Path(path).expanduser()
+    # The data directory may not exist yet (a first schedule on a
+    # fresh node): the lock sidecar cannot be opened until it does.
+    ensure_dir(target.parent)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with open(lock_path, "a+") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - exercised on Windows
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(" ")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            else:  # pragma: no cover - exercised on Windows
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def schedule_post(
+    path: Union[str, Path],
+    *,
+    text: str,
+    publish_at: float,
+    reply_to: Optional[str] = None,
+    to: Optional[Sequence[str]] = None,
+    ttl: int = 3,
+    now: Optional[float] = None,
+) -> ScheduledPost:
+    """Queue a post for *publish_at*; returns the stored entry."""
+    post = ScheduledPost(
+        id=new_scheduled_post_id(),
+        text=_clean_text(text),
+        reply_to=_clean_reply_to(reply_to),
+        to=_clean_targets(list(to) if to is not None else None),
+        ttl=_clean_ttl(ttl),
+        publish_at=_clean_timestamp(publish_at, "publish_at"),
+        created_at=now if now is not None else time.time(),
+    )
+    with scheduled_posts_lock(path):
+        queue = load_scheduled_posts(path)
+        save_scheduled_posts(path, queue.with_added(post))
+    return post
+
+
+def cancel_scheduled_post(path: Union[str, Path], prefix: str) -> ScheduledPost:
+    """Drop one queued post by full id or unique prefix; returns it."""
+    with scheduled_posts_lock(path):
+        queue = load_scheduled_posts(path)
+        post = queue.resolve(prefix)
+        save_scheduled_posts(path, queue.with_removed(post.id))
+    return post
+
+
+def publish_due_scheduled_posts(
+    path: Union[str, Path],
+    app: Any,
+    *,
+    resolve_peer: Optional[Callable[[str], Any]] = None,
+    now: Optional[float] = None,
+) -> Dict[str, int]:
+    """Publish every due queued post through *app* (a ``TanApp``).
+
+    A post is published when ``app.create_post`` + ``app.publish``
+    return without raising — the same bar as an immediate ``tau tan
+    post``, where zero known peers still counts as published.  A post
+    whose publish fails stays queued and retries on the next pass;
+    a target that cannot be resolved yet (a peer that has not
+    announced) likewise waits.  Returns ``{"published": n,
+    "kept": m}``.  A corrupt queue file logs a warning and publishes
+    nothing, so one bad file cannot stall the mail loop that calls
+    this.
+    """
+    try:
+        queue = load_scheduled_posts(path)
+    except ScheduledPostsError as exc:
+        log.warning("Scheduled-posts at %s is unusable (%s); skipping", path, exc)
+        return {"published": 0, "kept": 0}
+    due = queue.due(now)
+    if not due:
+        return {"published": 0, "kept": 0}
+    published: List[str] = []
+    kept = 0
+    for post in due:
+        try:
+            targets = None
+            if post.to:
+                if resolve_peer is None:
+                    raise ScheduledPostsError(
+                        "scheduled post has targets but no peer resolver"
+                    )
+                targets = [resolve_peer(target) for target in post.to]
+            created = app.create_post(post.text, reply_to=post.reply_to)
+            # create_post stores the post locally before publish: if
+            # publish raises, the stored copy stays and the retry
+            # creates a second one.  The retry still goes out (the
+            # queued text is what matters), and the extra local copy
+            # is the same shape as a --no-publish draft.
+            app.publish(created, targets=targets, ttl=post.ttl)
+        except Exception as exc:  # noqa: BLE001 - a failed publish retries
+            log.warning(
+                "Scheduled post %s could not publish (%s); keeping it queued",
+                post.id,
+                exc,
+            )
+            kept += 1
+            continue
+        published.append(post.id)
+    if published:
+        # Reload under the lock: a cancel that landed while a publish
+        # was in flight already removed its entry, and must not be
+        # resurrected by saving the stale snapshot.
+        with scheduled_posts_lock(path):
+            try:
+                queue = load_scheduled_posts(path)
+            except ScheduledPostsError as exc:
+                log.warning(
+                    "Scheduled-posts at %s became unusable (%s); published "
+                    "posts stay queued and will retry",
+                    path,
+                    exc,
+                )
+                return {"published": 0, "kept": len(due)}
+            for post_id in published:
+                try:
+                    queue = queue.with_removed(post_id)
+                except ScheduledPostsError:
+                    pass
+            save_scheduled_posts(path, queue)
+    return {"published": len(published), "kept": kept}

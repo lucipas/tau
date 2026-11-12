@@ -255,6 +255,10 @@ tau tan post --no-publish "draft"
 # Publish only to one peer
 tau tan post --to alice "direct delivery"
 
+# Schedule a post for the morning crowd (publishes while serving with --social)
+tau tan post --delay 8h "good morning, mesh"
+tau tan scheduled
+
 # Show every cached post, or one author's chain
 tau tan timeline --all
 tau tan timeline --author alice
@@ -367,6 +371,9 @@ Global options may appear before or after the command:
 | `tau id rename NEWNAME` | Change this node's display name (identity and destination unchanged) |
 | `tau tan post TEXT` | Sign, store and publish a social post |
 | `tau tan post --reply-to POST TEXT` | Reply to a post (signed entry on your chain) |
+| `tau tan post --delay 5m TEXT` | Queue a post to publish in 5 minutes (needs `tau serve --social` running) |
+| `tau tan scheduled` | List Tan posts queued for later publishing |
+| `tau tan cancel-scheduled ID` | Drop a queued Tan post before it publishes |
 | `tau tan like POST` | Like a post (signed reaction on your chain) |
 | `tau tan unlike POST` | Remove your like from a post |
 | `tau tan repost POST` | Repost a post to your followers (signed entry on your chain) |
