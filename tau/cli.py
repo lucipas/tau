@@ -3645,12 +3645,13 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
             detail = ""
             if entry.get("kind") or entry.get("created_at") is not None:
                 detail = (
-                    f" {entry.get('kind') or '?'}"
+                    f" {_safe_text(str(entry.get('kind') or '?'))}"
                     f" ({_when(entry.get('created_at'))})"
                 )
             print(
                 f"  {label} by {author}{detail}"
-                f" — signature invalid: {entry.get('error')}"
+                f" — signature invalid: "
+                f"{_safe_text(str(entry.get('error') or ''))}"
             )
     return _EXIT_OK
 
@@ -6061,6 +6062,17 @@ def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """
     cleaned = "".join(char for char in ref if char.isprintable())
     return cleaned[:length]
+
+
+def _safe_text(value: str) -> str:
+    """*value* with control characters dropped, for terminal output.
+
+    Raw metadata from a bundle entry that failed verification can
+    carry terminal escapes (an attacker signs the bundle with their
+    own key); JSON output keeps the raw value, but text output must
+    never print it verbatim.
+    """
+    return "".join(char for char in value if char.isprintable())
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:

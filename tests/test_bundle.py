@@ -859,3 +859,41 @@ def test_cli_bundle_inspect_unverified_tan_metadata(tmp_path, capsys):
     assert "(unverified)" in out
     assert "post" in out
     assert "signature invalid" in out
+
+
+def test_cli_bundle_inspect_escapes_unverified_kind(tmp_path, capsys):
+    sender, recipient, _ = _identities()
+    document, post = _build_with_tan(tmp_path, sender, recipient)
+    document["tan"]["entries"][0]["kind"] = "\x1b[2J\x1b[Hevil"
+    _resign(sender, document)
+    bundle_file = tmp_path / "bundle.json"
+    bundle_file.write_bytes(serialize_bundle(document))
+
+    assert (
+        main(["bundle", "inspect", str(bundle_file), "--data-dir", str(tmp_path)])
+        == 0
+    )
+    out = capsys.readouterr().out
+    # No raw escape byte may reach the terminal; the printable
+    # remainder still shows so the entry is identifiable.
+    assert "\x1b" not in out
+    assert "evil" in out
+    assert "(unverified)" in out
+
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "bundle",
+                "inspect",
+                str(bundle_file),
+                "--data-dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tan"][0]["verified"] is False
+    assert payload["tan"][0]["kind"] == "\x1b[2J\x1b[Hevil"
