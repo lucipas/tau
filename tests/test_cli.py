@@ -811,6 +811,92 @@ def test_status_reports_empty_node(tmp_path, capsys):
     assert not (data_dir / "tan.sqlite3").exists()
 
 
+def test_parser_group_topic_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["group", "topic", "weekend", "planning the meetup"])
+    assert args.group_command == "topic"
+    assert args.group == "weekend"
+    assert args.text == "planning the meetup"
+    assert args.clear is False
+    assert args.file is None
+
+    shown = parser.parse_args(["group", "topic", "weekend"])
+    assert shown.text is None
+
+    cleared = parser.parse_args(["group", "topic", "weekend", "--clear"])
+    assert cleared.clear is True
+
+
+def test_group_topic_set_show_and_clear(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    assert cli.main(base) == 0
+    assert "has no topic set" in capsys.readouterr().out
+
+    assert cli.main([*base, "planning the meetup"]) == 0
+    out = capsys.readouterr().out
+    assert "planning the meetup" in out
+    assert "next message" in out
+    # The CLI wrote through its own store instance: re-read from disk.
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"])["topic"]
+        == "planning the meetup"
+    )
+
+    assert cli.main([*base, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["group"]["topic"] == "planning the meetup"
+
+    assert cli.main(["group", "list", "--data-dir", str(data_dir)]) == 0
+    assert "topic: planning the meetup" in capsys.readouterr().out
+
+    assert cli.main([*base, "--clear"]) == 0
+    assert "cleared the topic" in capsys.readouterr().out
+    assert GroupStore(data_dir / "groups.json").get(group["id"])["topic"] == ""
+
+    # A group this node did not create refuses a topic change.
+    store.create("other", ["cd" * 16, "ef" * 16], created_by="cd" * 16)
+    assert (
+        cli.main(["group", "topic", "--data-dir", str(data_dir), "other", "forged"])
+        == 1
+    )
+    assert "only the creator" in capsys.readouterr().err
+
+
+def test_group_topic_flag_conflicts_rejected(tmp_path, capsys):
+    from tau.groups import GroupStore
+
+    data_dir = _init_node(tmp_path, "node", "alice")
+    capsys.readouterr()  # drain the --json output of `tau init`
+    own_hash = _id_destination(data_dir, capsys)
+    store = GroupStore(data_dir / "groups.json")
+    group = store.create("weekend", [own_hash, "cd" * 16], created_by=own_hash)
+
+    base = ["group", "topic", "--data-dir", str(data_dir), "weekend"]
+    # --file together with a positional text is rejected, not silently won.
+    assert cli.main([*base, "some text", "--file", "whatever.txt"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # --file together with --clear is rejected, not silently dropped.
+    assert cli.main([*base, "--file", "whatever.txt", "--clear"]) == 1
+    assert "not both" in capsys.readouterr().err
+    # A blank file is rejected instead of silently clearing the topic.
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n", encoding="utf-8")
+    assert cli.main([*base, "--file", str(blank)]) == 1
+    assert "blank" in capsys.readouterr().err
+    assert (
+        GroupStore(data_dir / "groups.json").get(group["id"]).get("topic", "")
+        == ""
+    )
+
+
 def test_status_text_output(tmp_path, capsys):
     data_dir = _init_node(tmp_path, "node", "bob")
     code = cli.main(["status", "--data-dir", str(data_dir)])
@@ -5502,6 +5588,173 @@ def _seed_sent_message(tmp_path):
     return data_dir, recipient_hash
 
 
+def _seed_editable_message(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    return data_dir, recipient_hash
+
+
+def test_parser_edit_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["edit", "abcdef12", "fixed text"])
+    assert args.command == "edit"
+    assert args.target == "abcdef12"
+    assert args.text == "fixed text"
+
+    from_stdin = parser.parse_args(["edit", "abcdef12"])
+    assert from_stdin.text is None
+
+
+def test_edit_sends_to_the_message_recipient(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed here"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited your message to alice" in out
+    node = _FakeReactNode.instances[0]
+    assert node.started is False
+    assert node.edited == [(recipient_hash.hex(), "m-1", "fixed here")]
+
+
+def test_edit_json(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["edit", "--data-dir", str(data_dir), "m-1", "fixed here", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-1"
+    assert payload["to"] == recipient_hash.hex()
+    assert payload["to_name"] == "alice"
+    assert payload["text"] == "fixed here"
+    assert payload["edited"] is True
+    assert payload["id"] == "e-1"
+
+
+def test_edit_rejects_blank_and_oversized_text(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "must not be empty" in capsys.readouterr().err
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "x" * 2001])
+    assert code == cli._EXIT_ERROR
+    assert "longer than 2000" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_editable_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "zzz", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_group_message(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "weekend",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "g-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "group messages cannot be edited" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_received_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "only your own sent messages can be edited" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
+    # An edit answered "not found" while the queued copy is still in
+    # the outbox would let that copy arrive later with the old text;
+    # refuse and point at outbox cancel instead.
+    data_dir, recipient_hash = _seed_editable_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).enqueue(
+        to=recipient_hash, text="typo here", message_id="m-1"
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "still queued" in err
+    assert "outbox cancel" in err
+    assert _FakeReactNode.instances == []
+
+
+def test_messages_shows_edited_marker(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.apply_edit("m-1", "fixed here", edited_at=42.0)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "fixed here" in out
+    assert "(edited)" in out
+
 class _FakeRetractNode:
     instances = []
 
@@ -5694,6 +5947,7 @@ class _FakeReactNode:
         self.config = config
         self.sent = []
         self.group_sent = []
+        self.edited = []
         self.started = False
         self.groups = _FakeGroupStore()
         type(self).instances.append(self)
@@ -5754,3 +6008,9 @@ class _FakeReactNode:
             "id": "r-group-1",
             "results": results,
         }
+
+    def send_edit(
+        self, target, message_id, text, *, timeout=20.0, discover_timeout=None
+    ):
+        self.edited.append((target, message_id, text))
+        return {"ok": True, "edited": True, "target": message_id, "id": "e-1"}

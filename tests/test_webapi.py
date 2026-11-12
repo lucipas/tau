@@ -1317,6 +1317,7 @@ def test_api_groups_lists_known_groups(bridge, node, tmp_path):
     assert payload["count"] == 1
     group = payload["groups"][0]
     assert group["name"] == "weekend"
+    assert group["topic"] == ""
     assert [member["hash"] for member in group["members"]] == [
         PEER_HASH,
         OTHER_HASH,
@@ -6928,6 +6929,79 @@ def test_imported_group_message_event_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+
+def test_imported_group_message_hides_all_reactions_without_pinned_roster(
+    node, tmp_path
+):
+    """A copy imported without a pinned roster shows no reactions at
+    all — not even a member's — until a roster pins (CodeRabbit
+    round-13 follow-up).
+
+    The group id was never created, so pinned_rosters returns None
+    for it; visible_reactions(None) is fail-closed, so the live import
+    event and the snapshot read both hide every stored reaction.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        unpinned = "ff" * 16
+        # A member's reaction arrives before its target and is cached.
+        assert (
+            bridge.record_reaction(
+                {
+                    "target": "wire-g2",
+                    "destination": PEER_HASH,
+                    "from": "alice",
+                    "reaction": "👍",
+                    "sent_at": 102.0,
+                    "received_at": 103.0,
+                    "id": "react-3",
+                }
+            )
+            is None
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g2",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-3",
+            }
+        )
+        bridge._mirror_imported_messages(
+            [
+                {
+                    "from": "alice",
+                    "destination": PEER_HASH,
+                    "text": "orphan crew hello",
+                    "kind": "group",
+                    "group": unpinned,
+                    "group_name": "orphan",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "wire-g2",
+                }
+            ]
+        )
+        events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "wire-g2"
+        ]
+        assert len(events) == 1
+        assert events[0]["message"]["reactions"] == []
+        assert bridge.messages()[0]["reactions"] == []
+    finally:
+        bridge.stop()
+
 def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
     """A delayed live reaction never reaches the console unfiltered
     (CodeRabbit round-13 follow-up on the import-event fix).
@@ -7166,6 +7240,39 @@ def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
     assert payload["group"] == group_id
     assert node.group_reactions == [("crew", "wire-g", "🎉", PEER_HASH, 100.0)]
 
+
+
+def test_react_endpoint_uses_own_hash_for_outbound_group_record_in_inbox(bridge, node):
+    # The message is past the console's window, so the bridge resolves
+    # it from the node inbox.  An outbound record's destination is
+    # empty — the author is this node, not "" — so the fan-out names
+    # this node's hash (CodeRabbit round-13 follow-up).
+    group_id = node.groups.list_groups()[0]["id"]
+    node.inbox.append(
+        {
+            "from": "tester",
+            "destination": "",
+            "text": "crew hi",
+            "kind": "group",
+            "group": group_id,
+            "group_name": "crew",
+            "direction": "out",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-g",
+        }
+    )
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-g", "reaction": "🎉"},
+    )
+    assert status == 200
+    assert payload["group"] == group_id
+    assert node.group_reactions == [
+        ("crew", "wire-g", "🎉", node.destination_hexhash, 100.0)
+    ]
 
 def test_react_endpoint_uses_own_hash_for_outbound_group_leg(bridge, node):
     # Reacting to a leg this node sent: the history entry's peer is

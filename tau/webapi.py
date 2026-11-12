@@ -23,7 +23,8 @@ script) can read what arrives from the mesh and send messages back:
     POST /api/messages     send ``{"to": "...", "text": "..."}`` (optional ``"reply_to"`` wire id,
                            ``"expires_in"`` seconds for a disappearing message)
                            or to a group with ``{"group": "<id | prefix | name>", "text": "..."}``
-                           (one outbound entry per member; replies and expiry are peer-DM-only)
+                           (one outbound entry per member; replies are peer-DM-only,
+                           ``expires_in`` works for DM and group sends)
     GET  /api/messages/export export stored DMs as the CLI's JSON document (loopback only)
     POST /api/messages/import import a DM export document (loopback only)
     GET  /api/files/<sender>/<name>
@@ -2416,11 +2417,10 @@ class WebBridge:
             if (
                 isinstance(group_id, str)
                 and group_id
-                and rosters.get(group_id) is not None
                 and message.get("reactions")
             ):
                 message["reactions"] = visible_reactions(
-                    message["reactions"], rosters[group_id]
+                    message["reactions"], rosters.get(group_id)
                 )
             self.bus.publish({"type": "message", "message": message})
 
@@ -2866,9 +2866,15 @@ class WebBridge:
                 record.get("group"), str
             ):
                 group_id = record["group"]
-                author = record.get("destination")
-                if isinstance(author, str):
-                    target_author = author
+                if record.get("direction") == "out":
+                    # An outbound record's destination is empty: the
+                    # author is this node, as the console-history
+                    # branch above already does.
+                    target_author = self.node.destination_hexhash
+                else:
+                    author = record.get("destination")
+                    if isinstance(author, str):
+                        target_author = author
                 sent_at = record.get("sent_at")
                 if isinstance(sent_at, (int, float)) and not isinstance(
                     sent_at, bool
@@ -3901,6 +3907,7 @@ class WebBridge:
             "name": group["name"],
             "members": members,
             "created_at": group["created_at"],
+            "topic": group.get("topic", ""),
             # The console only offers member changes on groups this
             # node created; the store refuses anyone else.  A learned
             # group only claims its creator in the message, so it never
@@ -4279,11 +4286,10 @@ class WebBridge:
             isinstance(group_id, str)
             and group_id
             and rosters is not None
-            and rosters.get(group_id) is not None
             and message.get("reactions")
         ):
             message["reactions"] = visible_reactions(
-                message["reactions"], rosters[group_id]
+                message["reactions"], rosters.get(group_id)
             )
         return message
 

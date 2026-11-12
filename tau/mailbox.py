@@ -66,6 +66,7 @@ from .protocol import (
     MAX_MAIL_BLOB_BYTES,
     MAX_MAIL_TTL,
     ProtocolError,
+    clean_group_topic,
     clean_in_reply_to,
     decode,
     encode,
@@ -952,6 +953,10 @@ class Mailbox:
                         delivered_at is not None
                         and not isinstance(delivered_at, (int, float))
                     )
+                    or (
+                        record.get("edited_at") is not None
+                        and not isinstance(record.get("edited_at"), (int, float))
+                    )
                     or not isinstance(text, str)
                 ):
                     continue
@@ -975,6 +980,14 @@ class Mailbox:
                         float(delivered_at)
                         if delivered_at is not None
                         else None
+                    )
+                if "edited_at" in record:
+                    # An edit's timestamp must survive a reload: the
+                    # staleness check in update_sent_text compares
+                    # against it after the transaction reloads.
+                    edited_at = record.get("edited_at")
+                    parsed["edited_at"] = (
+                        float(edited_at) if edited_at is not None else None
                     )
                 sent[message_id] = parsed
 
@@ -1367,6 +1380,35 @@ class Mailbox:
         with self._transaction():
             if self._sent.pop(message_id, None) is not None:
                 self.save()
+
+    def update_sent_text(
+        self, message_id: str, text: str, *, edited_at: Optional[float] = None
+    ) -> None:
+        """Replace a sent record's text after an applied edit.
+
+        ``tau messages --sent`` reads its text from the sent record, not
+        the inbox, so an edit that only rewrote the inbox copy would
+        leave the sender's own history showing the original text.  A
+        missing record (pruned since the send) is not an error.  When
+        ``edited_at`` is given, an older edit never overwrites a newer
+        stored one: two overlapping sends can finish their local writes
+        out of order, and the receiver keeps the newer edit.
+        """
+        with self._transaction():
+            record = self._sent.get(message_id)
+            if record is None:
+                return
+            if edited_at is not None:
+                stored = record.get("edited_at")
+                if (
+                    isinstance(stored, (int, float))
+                    and float(edited_at) <= float(stored)
+                ):
+                    return
+            record["text"] = normalize_message(text)
+            if edited_at is not None:
+                record["edited_at"] = float(edited_at)
+            self.save()
 
     def sent_record(self, message_id: str) -> Optional[Dict[str, Any]]:
         """A copy of one sent record, or ``None`` when unknown."""
@@ -2030,6 +2072,25 @@ def seal_message(
                 raise MailboxError("group context renamed_from repeats a group id")
             sealed_group["renamed_from"] = cleaned
         inner["group"] = sealed_group
+        # The topic is covered by the signature.  Present "" is an
+        # explicit clear; absent means the sender predates topics.
+        group_topic = group.get("topic")
+        if isinstance(group_topic, str):
+            inner["group"]["topic"] = clean_group_topic(group_topic)
+            topic_at = group.get("topic_sent_at")
+            if isinstance(topic_at, bool) or not isinstance(
+                topic_at, (int, float)
+            ):
+                topic_at = None
+            else:
+                try:
+                    topic_at = float(topic_at)
+                except OverflowError:
+                    topic_at = None
+                if topic_at is not None and not math.isfinite(topic_at):
+                    topic_at = None
+            if topic_at is not None:
+                inner["group"]["topic_sent_at"] = topic_at
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -2226,6 +2287,18 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     except ProtocolError as exc:
         raise MailboxError(f"sealed message kind is invalid: {exc}") from exc
     sent_at = payload.get("sent_at")
+    # A huge JSON integer overflows float(): guard the conversion the
+    # same way expires_at is guarded below, so a crafted envelope
+    # cannot jam mail collection with an OverflowError.
+    if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
+        sent_at = None
+    else:
+        try:
+            sent_at = float(sent_at)
+        except OverflowError:
+            sent_at = None
+        if sent_at is not None and not math.isfinite(sent_at):
+            sent_at = None
     expires_at = payload.get("expires_at")
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
@@ -2246,7 +2319,7 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
         "from_name": sanitize_name(payload.get("from_name")),
         "text": text,
         "kind": kind,
-        "sent_at": float(sent_at) if isinstance(sent_at, (int, float)) else None,
+        "sent_at": sent_at,
         "expires_at": expires_at,
         "in_reply_to": in_reply_to,
     }
@@ -2300,6 +2373,27 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
             sealed_group["renamed_from"] = cleaned
         result["group"] = sealed_group
+        # The topic rides in the sealed envelope with its own set time,
+        # so a relayed copy is judged exactly like a direct one.  A
+        # present "" is an explicit clear; absent means the sender
+        # predates topics and the local topic is left alone.
+        group_topic = group_raw.get("topic")
+        if isinstance(group_topic, str):
+            result["group"]["topic"] = clean_group_topic(group_topic)
+            topic_at = group_raw.get("topic_sent_at")
+            if isinstance(topic_at, bool) or not isinstance(
+                topic_at, (int, float)
+            ):
+                topic_at = None
+            else:
+                try:
+                    topic_at = float(topic_at)
+                except OverflowError:
+                    topic_at = None
+                if topic_at is not None and not math.isfinite(topic_at):
+                    topic_at = None
+            if topic_at is not None:
+                result["group"]["topic_sent_at"] = topic_at
     return result
 
 

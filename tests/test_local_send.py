@@ -57,6 +57,10 @@ class _FakeRunningNode:
         self.calls.append(("retract", target, message_id))
         return {"ok": True, "target": message_id, "deleted": True, "id": "r-1"}
 
+    def send_edit(self, target, message_id, text, **kwargs):
+        self.calls.append(("edit", target, message_id, text))
+        return {"ok": True, "target": message_id, "edited": True, "id": "e-1"}
+
     def flush_outbox(self, **kwargs):
         self.flush_calls.append(kwargs)
         if self.deliver_on_flush:
@@ -184,6 +188,61 @@ def test_retract_uses_running_node(tmp_path, capsys, monkeypatch):
         assert "retracted" in capsys.readouterr().out
         assert Inbox(config.inbox_path).list_messages(direction="out") == []
         assert Mailbox(config.mailbox_path).sent_list() == []
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_edit_uses_running_node(tmp_path, capsys, monkeypatch):
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-9",
+            "direction": "out",
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+    node = _FakeRunningNode(config)
+    server = SendServer(
+        data_dir, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert (
+            cli.main(["edit", "--data-dir", str(data_dir), "m-9", "fixed hello"])
+            == 0
+        )
+        # No one-shot node started: the serving node carried the edit.
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [
+            ("edit", recipient_hash.hex(), "m-9", "fixed hello")
+        ]
+        assert "edited your message to alice" in capsys.readouterr().out
     finally:
         server.stop()
     assert not server.path.exists()
