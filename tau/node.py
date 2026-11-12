@@ -3018,9 +3018,12 @@ class TauNode:
                     if peer is not None:
                         self._mail_round_for_peer(peer)
                 self.flush_outbox(max_peers=_MAIL_SWEEP_PEERS)
-                self._publish_due_scheduled_posts()
             except Exception:  # pragma: no cover - network dependent
                 log.debug("Mail round failed", exc_info=True)
+            try:
+                self._publish_due_scheduled_posts()
+            except Exception:  # pragma: no cover - defensive
+                log.debug("Scheduled-post publish failed", exc_info=True)
             try:
                 self._exchange_sweep(max_peers=_EXCHANGE_SWEEP_PEERS)
             except Exception:  # pragma: no cover - network dependent

@@ -400,6 +400,68 @@ def test_node_publish_hook_stops_pass_when_stopping(tmp_path):
     assert len(load_scheduled_posts(path)) == 1
 
 
+def test_publish_pass_keeps_post_queued_when_deadline_expires_during_resolution(
+    monkeypatch, tmp_path
+):
+    # The resolve step checks the pass budget too: when it expires
+    # mid-resolution, the post stays queued with no attempt burned
+    # and no peer resolved after the expiry.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(
+        path, text="now", publish_at=1000.0, to=["alice", "bob"], now=900.0
+    )
+    app = _FakeTanApp()
+    resolved = []
+
+    def resolve_peer(name):
+        resolved.append(name)
+        return SimpleNamespace(hexhash="a" * 64 if name == "alice" else "b" * 64)
+
+    # time.monotonic() reads in order: pass start (deadline = 1020.0),
+    # the per-post budget check, the check before resolving alice,
+    # the check before resolving bob — which finds the budget gone.
+    ticks = iter([1000.0, 1000.0, 1000.0, 1021.0])
+    monkeypatch.setattr(
+        "tau.scheduled_posts.time.monotonic", lambda: next(ticks)
+    )
+    result = publish_due_scheduled_posts(
+        path, app, resolve_peer=resolve_peer, now=2000.0
+    )
+    assert result == {"published": 0, "kept": 1}
+    assert resolved == ["alice"]
+    assert app.created == []
+    queued = load_scheduled_posts(path).posts[0]
+    assert queued.attempts == 0
+    assert queued.pending_peers == ()
+    assert queued.post_hash is None
+
+
+def test_mail_loop_still_publishes_scheduled_posts_when_flush_fails(tmp_path):
+    # A mail-round failure must not skip scheduled publishing: the
+    # publish step runs outside the mail round's exception handler.
+    published = []
+    stop_event = threading.Event()
+
+    def fake_publish():
+        published.append(True)
+        stop_event.set()
+
+    def failing_flush(*args, **kwargs):
+        raise RuntimeError("no route")
+
+    node = SimpleNamespace(
+        _stop_event=stop_event,
+        _mail_pending=set(),
+        registry=SimpleNamespace(get=lambda h: None),
+        _mail_round_for_peer=lambda peer: None,
+        flush_outbox=failing_flush,
+        _publish_due_scheduled_posts=fake_publish,
+        _exchange_sweep=lambda **kwargs: None,
+    )
+    TauNode._mail_loop(node)
+    assert published == [True]
+
+
 def test_publish_pass_keeps_unsent_peers_when_stopping(tmp_path):
     # A stop mid-send leaves the peers never attempted queued for the
     # next pass — no attempt burned, and the retry sends only to them.

@@ -445,9 +445,12 @@ def publish_due_scheduled_posts(
     early — between posts, between peer resolutions, and between
     sends — so ``stop()`` never waits out a whole publish pass; the
     entry being worked on stays queued with its attempts untouched
-    and its unsent peers kept for the next pass.  The in-flight peer
-    resolution or send still runs to its own timeout, so a stop waits
-    at most one such wait, not a whole pass.
+    and its unsent peers kept for the next pass.  The pass budget
+    (``deadline``) is checked at the same points, so several peers
+    that each announce near their timeout cannot stretch one pass
+    into minutes either.  The in-flight peer resolution or send
+    still runs to its own timeout, so a stop waits at most one such
+    wait, not a whole pass.
 
     Returns ``{"published": n, "kept": m}``.  A corrupt queue file logs a
     warning and publishes nothing, so one bad file cannot stall the mail
@@ -475,7 +478,9 @@ def publish_due_scheduled_posts(
                     break
                 failed_peers: Optional[Tuple[str, ...]] = None
                 try:
-                    targets = _resolve_publish_targets(post, resolve_peer, should_stop)
+                    targets = _resolve_publish_targets(
+                        post, resolve_peer, should_stop, deadline
+                    )
                     created = app.get_post(post.post_hash) if post.post_hash else None
                     if created is None:
                         created = app.create_post(post.text, reply_to=post.reply_to)
@@ -563,8 +568,14 @@ def _resolve_publish_targets(
     post: ScheduledPost,
     resolve_peer: Optional[Callable[[str], Any]],
     should_stop: Optional[Callable[[], bool]] = None,
+    deadline: Optional[float] = None,
 ) -> Optional[List[Any]]:
-    """Peers for one publish attempt: the still-owed ones, else ``to``."""
+    """Peers for one publish attempt: the still-owed ones, else ``to``.
+
+    A stop or an expired pass budget between resolutions pauses the
+    pass (``_PassPaused``) before the next peer is resolved, so a
+    queue of slow announcers cannot stretch one pass into minutes.
+    """
     names = post.pending_peers or post.to
     if not names:
         return None
@@ -573,6 +584,8 @@ def _resolve_publish_targets(
     resolved: List[Any] = []
     for name in names:
         if should_stop is not None and should_stop():
+            raise _PassPaused()
+        if deadline is not None and time.monotonic() > deadline:
             raise _PassPaused()
         resolved.append(resolve_peer(name))
     return resolved
