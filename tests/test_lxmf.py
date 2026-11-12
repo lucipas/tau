@@ -442,6 +442,33 @@ def test_deliver_lxmf_message_dedupes_redelivery(tmp_path):
     assert len(seen) == 1
 
 
+def test_deliver_lxmf_message_dedupes_concurrent_delivery(tmp_path):
+    # Concurrent deliveries of the same hash must store exactly one
+    # record and fire on_message exactly once: the check and the
+    # append are one atomic operation.  Repeated rounds with a
+    # barrier release, so the threads genuinely race each delivery.
+    for round_index in range(20):
+        seen = []
+        node, sender = _node_with_sender(
+            tmp_path / f"round-{round_index}", on_message=seen.append
+        )
+        message = _FakeLXMessage(
+            sender, message_hash=bytes([round_index]) * 32
+        )
+        barrier = threading.Barrier(8)
+        def deliver():
+            barrier.wait(timeout=10)
+            node._deliver_lxmf_message(message)
+        threads = [threading.Thread(target=deliver) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads)
+        assert len(node.inbox.list_messages()) == 1
+        assert len(seen) == 1
+
+
 def test_deliver_lxmf_message_never_raises(tmp_path):
     node, sender = _node_with_sender(tmp_path)
     # A bare object: every attribute lookup falls back to a drop.

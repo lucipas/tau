@@ -831,16 +831,15 @@ class TauNode:
                 sender_hash,
                 text,
             )
-            # A crash between the inbox append and mark_seen would leave
-            # the message unmarked; check for the stored copy first so a
-            # redelivery does not duplicate it.
-            already_stored = self.inbox.find(message_id) is not None
-            if not already_stored:
-                # Raises on a failed write, leaving the message unseen so
-                # the router's redelivery gets another attempt.
-                self.inbox.append(record, strict=True)
+            # The duplicate check and the append are one atomic
+            # operation: concurrent deliveries of the same hash cannot
+            # both insert it, so a redelivery racing the first copy
+            # neither duplicates the record nor fires on_message twice.
+            # Raises on a failed write, leaving the message unseen so
+            # the router's redelivery gets another attempt.
+            inserted = self.inbox.append_if_absent(record, strict=True)
             self.mailbox.mark_seen(message_id)
-            if already_stored or self.on_message is None:
+            if not inserted or self.on_message is None:
                 return
             try:
                 self.on_message(record)

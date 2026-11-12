@@ -23,6 +23,16 @@ def _record(**overrides):
     return record
 
 
+def test_append_if_absent_dedupes_by_id(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    assert inbox.append_if_absent(_record(id="msg-1")) is True
+    assert inbox.append_if_absent(_record(id="msg-1", text="again")) is False
+    assert inbox.append_if_absent(_record(id="msg-2")) is True
+    entries = inbox.list_messages()
+    assert [entry["id"] for entry in entries] == ["msg-2", "msg-1"]
+    assert entries[1]["text"] == "hello"
+
+
 def test_append_lists_newest_first(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="first", received_at=20.0, text="one"))

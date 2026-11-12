@@ -591,6 +591,34 @@ class Inbox:
                 raise
         return entry
 
+    def append_if_absent(self, record: Dict[str, Any], *, strict: bool = False) -> bool:
+        """Append one message only when no stored message has its id.
+
+        The duplicate check and the append run inside a single
+        transaction, so concurrent deliveries of the same message —
+        an LXMF redelivery racing the first copy, for example — cannot
+        both insert it.  Returns ``True`` when the record was inserted
+        and ``False`` when a record with the same id was already
+        stored (nothing is appended, retained, or re-saved then).
+        Strict-write semantics match :meth:`append`: a failed persist
+        raises ``OSError`` and the entry is withdrawn.
+        """
+        entry = _valid_record(record)
+        if entry is None:
+            raise ValueError("inbox record needs text")
+        with self._transaction():
+            if any(item.get("id") == entry["id"] for item in self._messages):
+                return False
+            entry["seq"] = self._next_seq()
+            self._messages.append(entry)
+            self._messages = _retain(self._messages)
+            try:
+                self._save(strict=strict)
+            except OSError:
+                self._messages = [m for m in self._messages if m is not entry]
+                raise
+        return True
+
     def delete(self, ref: str) -> Dict[str, Any]:
         """Remove one stored message by full id or unique prefix.
 
