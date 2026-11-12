@@ -923,7 +923,7 @@ export function SocialConsole() {
                     onOpenThread={(target) => void tan.openThread(target.hash)}
                     deleting={deleting}
                   />
-                ) : showPinned ? (
+                ) : showPinned && !showingSearch ? (
                   tan.pinned.length === 0 ? (
                     tan.pinnedLoading ? (
                       <p className="py-8 text-center font-mono text-[11px] text-mist">
@@ -961,7 +961,7 @@ export function SocialConsole() {
                       ) : null}
                     </>
                   )
-                ) : showSaved ? (
+                ) : showSaved && !showingSearch ? (
                   tan.saved.length === 0 ? (
                     tan.savedLoading ? (
                       <p className="py-8 text-center font-mono text-[11px] text-mist">
@@ -999,7 +999,7 @@ export function SocialConsole() {
                       ) : null}
                     </>
                   )
-                ) : tan.showMentions ? (
+                ) : tan.showMentions && !showingSearch ? (
                   shown.length === 0 && tan.error ? (
                     <p className="px-4 py-10 text-center text-xs leading-relaxed text-rose-300">
                       {tan.error}
@@ -1014,7 +1014,7 @@ export function SocialConsole() {
                         onToggleLike={toggleLike}
                         onRepost={submitRepost}
                         onToggleSave={toggleSave}
-                          onTogglePin={togglePin}
+                        onTogglePin={togglePin}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
                         deleting={deleting.has(post.hash)}

@@ -1098,6 +1098,38 @@ describe("SocialConsole pinned view", () => {
     fireEvent.click(screen.getByText("pinned"));
     expect(screen.getByText("No pinned posts yet")).toBeTruthy();
   });
+
+  it("shows search results instead of pinned posts while searching", async () => {
+    const pinnedPost = makePost({
+      hash: "e".repeat(64),
+      text: "keep me on top",
+      pinned: true,
+    });
+    const hit = makePost({
+      hash: "f".repeat(64),
+      text: "mesh post",
+      own: false,
+    });
+    const state = hookState({ pinned: [pinnedPost] });
+    mockedUseTan.mockReturnValue(state);
+
+    const { rerender } = render(<SocialConsole />);
+    fireEvent.click(screen.getByText("pinned"));
+    await waitFor(() => expect(state.loadPinned).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("keep me on top")).toBeTruthy();
+
+    // A search started from the pinned view shows its results; clearing
+    // it returns to the pinned list.
+    mockedUseTan.mockReturnValue({
+      ...state,
+      searchResults: [hit],
+      searchQuery: "mesh",
+    });
+    rerender(<SocialConsole />);
+    expect(screen.getByText("mesh post")).toBeTruthy();
+    expect(screen.queryByText("keep me on top")).toBeNull();
+    expect(screen.getByText("search results")).toBeTruthy();
+  });
 });
 
 describe("SocialConsole authors directory", () => {
