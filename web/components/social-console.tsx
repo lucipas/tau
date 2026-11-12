@@ -43,6 +43,17 @@ export function SocialConsole() {
       );
     });
   }, [showSaved, tan.loadSaved]);
+  // Whether the feed shows the pinned list instead of the timeline.
+  // Pinned posts load on demand, not on the feed's poll tick.
+  const [showPinned, setShowPinned] = useState(false);
+  useEffect(() => {
+    if (!showPinned) return;
+    tan.loadPinned().catch((caught) => {
+      setError(
+        caught instanceof Error ? caught.message : "could not load pinned posts",
+      );
+    });
+  }, [showPinned, tan.loadPinned]);
   // Hashes with a delete request in flight. While one is pending the card
   // shows a disabled state instead of the confirm button, so a second
   // click cannot report the already-deleted post as a failure.
@@ -230,6 +241,21 @@ export function SocialConsole() {
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "could not save");    }
+  }
+
+  // Pins are own-posts-only, so the button only renders on your own
+  // cards; a pin from another surface refreshes the same way a save does.
+  async function togglePin(post: TanPost) {
+    setError(null);
+    try {
+      if (post.pinned) {
+        await tan.unpin(post.hash);
+      } else {
+        await tan.pin(post.hash);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "could not pin");
+    }
   }
 
   async function submitDelete(post: TanPost) {
@@ -719,6 +745,8 @@ export function SocialConsole() {
                           ? "search results"
                           : showSaved
                             ? "saved"
+                          : showPinned
+                            ? "pinned"
                           : tan.showMentions
                             ? "mentions"
                             : tan.view === "top"
@@ -732,6 +760,8 @@ export function SocialConsole() {
                           ? `${visiblePosts.length} post(s)`
                           : showSaved
                             ? `${tan.saved.length} post(s)`
+                          : showPinned
+                            ? `${tan.pinned.length} post(s)`
                           : tan.showMentions
                             ? `${shown.length} post(s)`
                             : `${tan.posts.length} post(s)`}
@@ -751,6 +781,7 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          setShowPinned(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(false);
@@ -758,6 +789,7 @@ export function SocialConsole() {
                         className={`rounded px-2 py-1 ${
                           tan.view === "timeline" &&
                           !showSaved &&
+                          !showPinned &&
                           !tan.showMentions &&
                           !tan.all
                             ? "bg-signal/15 text-signal"
@@ -770,6 +802,7 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          setShowPinned(false);
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           tan.setAll(true);
@@ -777,6 +810,7 @@ export function SocialConsole() {
                         className={`rounded px-2 py-1 ${
                           tan.view === "timeline" &&
                           !showSaved &&
+                          !showPinned &&
                           !tan.showMentions &&
                           tan.all
                             ? "bg-signal/15 text-signal"
@@ -789,12 +823,14 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          setShowPinned(false);
                           tan.setShowMentions(false);
                           tan.setView("top");
                         }}
                         className={`rounded px-2 py-1 ${
                           tan.view === "top" &&
                           !showSaved &&
+                          !showPinned &&
                           !tan.showMentions
                             ? "bg-signal/15 text-signal"
                             : "text-mist"
@@ -806,6 +842,7 @@ export function SocialConsole() {
                         type="button"
                         onClick={() => {
                           setShowSaved(false);
+                          setShowPinned(false);
                           tan.setShowMentions(true);
                           tan.setView("timeline");
                         }}
@@ -821,12 +858,27 @@ export function SocialConsole() {
                           tan.setShowMentions(false);
                           tan.setView("timeline");
                           setShowSaved(true);
+                          setShowPinned(false);
                         }}
                         className={`rounded px-2 py-1 ${
                           showSaved ? "bg-signal/15 text-signal" : "text-mist"
                         }`}
                       >
                         saved
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          tan.setShowMentions(false);
+                          tan.setView("timeline");
+                          setShowSaved(false);
+                          setShowPinned(true);
+                        }}
+                        className={`rounded px-2 py-1 ${
+                          showPinned ? "bg-signal/15 text-signal" : "text-mist"
+                        }`}
+                      >
+                        pinned
                       </button>
                     </div>
                     )}
@@ -871,7 +923,50 @@ export function SocialConsole() {
                     onOpenThread={(target) => void tan.openThread(target.hash)}
                     deleting={deleting}
                   />
-                ) : showSaved ? (
+                ) : showPinned && !showingSearch ? (
+                  tan.pinned.length === 0 ? (
+                    tan.pinnedLoading ? (
+                      <p className="py-8 text-center font-mono text-[11px] text-mist">
+                        loading pinned posts…
+                      </p>
+                    ) : (
+                      <PinnedEmptyState />
+                    )
+                  ) : (
+                    <>
+                      {tan.pinned.map((post) => (
+                        <PostCard
+                          key={post.hash}
+                          post={post}
+                          onToggleLike={toggleLike}
+                          onRepost={submitRepost}
+                          onToggleLikers={toggleLikers}
+                          likersOpen={likersOpen === post.hash}
+                          likers={likersOpen === post.hash ? likers : null}
+                          likersTotal={likersOpen === post.hash ? likersTotal : 0}
+                          onToggleSave={toggleSave}
+                          onTogglePin={togglePin}
+                          onReply={(target) => setReplyTarget(target)}
+                          onDelete={submitDelete}
+                          deleting={deleting.has(post.hash)}
+                          onOpenThread={(target) => void tan.openThread(target.hash)}
+                        />
+                      ))}
+                      {tan.pinnedHasMore ? (
+                        <button
+                          type="button"
+                          onClick={() => void tan.loadMorePinned()}
+                          disabled={tan.pinnedLoading}
+                          className="w-full rounded-xl border border-line/70 bg-void/40 px-3 py-2.5 text-xs text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          {tan.pinnedLoading
+                            ? "loading…"
+                            : "load more pinned posts"}
+                        </button>
+                      ) : null}
+                    </>
+                  )
+                ) : showSaved && !showingSearch ? (
                   tan.saved.length === 0 ? (
                     tan.savedLoading ? (
                       <p className="py-8 text-center font-mono text-[11px] text-mist">
@@ -889,6 +984,7 @@ export function SocialConsole() {
                           onToggleLike={toggleLike}
                           onRepost={submitRepost}
                           onToggleSave={toggleSave}
+                          onTogglePin={togglePin}
                           onReply={(target) => setReplyTarget(target)}
                           onDelete={submitDelete}
                           deleting={deleting.has(post.hash)}
@@ -908,7 +1004,7 @@ export function SocialConsole() {
                       ) : null}
                     </>
                   )
-                ) : tan.showMentions ? (
+                ) : tan.showMentions && !showingSearch ? (
                   shown.length === 0 && tan.error ? (
                     <p className="px-4 py-10 text-center text-xs leading-relaxed text-rose-300">
                       {tan.error}
@@ -923,6 +1019,7 @@ export function SocialConsole() {
                         onToggleLike={toggleLike}
                         onRepost={submitRepost}
                         onToggleSave={toggleSave}
+                        onTogglePin={togglePin}
                         onReply={(target) => setReplyTarget(target)}
                         onDelete={submitDelete}
                         deleting={deleting.has(post.hash)}
@@ -948,6 +1045,7 @@ export function SocialConsole() {
                       likers={likersOpen === post.hash ? likers : null}
                       likersTotal={likersOpen === post.hash ? likersTotal : 0}
                       onToggleSave={toggleSave}
+                      onTogglePin={togglePin}
                       onReply={(target) => {
                         setQuoteTarget(null);
                         setReplyTarget(target);
@@ -1374,6 +1472,24 @@ function SavedEmptyState() {
   );
 }
 
+function PinnedEmptyState() {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center px-4 text-center">
+      <div className="grid h-20 w-20 place-items-center rounded-full border border-signal/20 bg-signal/[0.04] font-mono text-3xl text-signal/80">
+        📌
+      </div>
+      <h3 className="mt-4 text-sm font-medium text-zinc-200">
+        No pinned posts yet
+      </h3>
+      <p className="mt-1.5 max-w-md text-xs leading-relaxed text-mist">
+        Pin one of your own posts from the timeline to keep it at the top
+        of this list. Pins stay on this node — they are never published or
+        shared with peers.
+      </p>
+    </div>
+  );
+}
+
 // Whether the console offers a Repost button for this card. The store
 // only accepts posts and replies as repost targets (a missing kind reads
 // as a plain post, the same default the store uses), and refuses your own
@@ -1434,6 +1550,7 @@ export function PostCard({
   likers,
   likersTotal,
   onToggleSave,
+  onTogglePin,
   onReply,
   onQuote,
   onDelete,
@@ -1455,6 +1572,9 @@ export function PostCard({
   // Full liker count before the server's cap; 0 when unknown.
   likersTotal?: number;
   onToggleSave?: (post: TanPost) => void;
+  // Pins are own-posts-only, so the button renders only on your own
+  // cards; when absent the card shows no pin control.
+  onTogglePin?: (post: TanPost) => void;
   onReply: (post: TanPost) => void;
   onQuote?: (post: TanPost) => void;
   onDelete: (post: TanPost) => void;
@@ -1516,6 +1636,11 @@ export function PostCard({
             {post.saved_at ? (
               <span className="font-mono text-[10px] text-mist/60">
                 saved {formatDateTime(post.saved_at)}
+              </span>
+            ) : null}
+            {post.pinned_at ? (
+              <span className="font-mono text-[10px] text-mist/60">
+                pinned {formatDateTime(post.pinned_at)}
               </span>
             ) : null}
           </div>
@@ -1709,6 +1834,25 @@ export function PostCard({
                 }`}
               >
                 {post.saved ? "★ saved" : "☆ save"}
+              </button>
+            ) : null}
+            {onTogglePin && post.own ? (
+              <button
+                type="button"
+                onClick={() => onTogglePin(post)}
+                aria-pressed={Boolean(post.pinned)}
+                title={
+                  post.pinned
+                    ? "Remove from pinned posts"
+                    : "Pin this post to the top of your pinned list"
+                }
+                className={`rounded border px-1.5 py-0.5 transition-colors ${
+                  post.pinned
+                    ? "border-sky-400/40 bg-sky-400/10 text-sky-300"
+                    : "border-line/70 bg-panel/60 text-mist/80 hover:text-sky-300"
+                }`}
+              >
+                {post.pinned ? "📌 pinned" : "📌 pin"}
               </button>
             ) : null}
             {post.deleted || post.kind === "repost" ? null : (

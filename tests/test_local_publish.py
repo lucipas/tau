@@ -27,7 +27,12 @@ def test_post_uses_lock_owner(tmp_path, capsys):
         assert cli.main(["tan", "post", "hello mesh", "--data-dir", str(tmp_path), "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["post"]["text"] == "hello mesh"
-        assert result["published"] == {"delivered": 0, "peers": 0, "errors": []}
+        assert result["published"] == {
+            "delivered": 0,
+            "peers": 0,
+            "errors": [],
+            "unsent": [],
+        }
         with pytest.raises(NodeError, match="already serving"):
             TauNode(config).start(exclusive=True)
         # Invalid targets must fail before signing/storing a post.
