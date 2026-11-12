@@ -1942,8 +1942,9 @@ def seal_message(
     The plaintext envelope carries the sender's public key and a signature
     over every other field, so the recipient can authenticate the message
     without trusting whichever peer happened to hold it.  ``group``
-    (``{"id", "name", "creator", "members"}``) marks the envelope as one
-    leg of a group message; it is covered by the same signature.
+    (``{"id", "name", "creator", "members"}``, plus ``"renamed_from"``
+    when the group was renamed) marks the envelope as one leg of a group
+    message; it is covered by the same signature.
     without trusting whichever peer happened to hold it.  ``expires_at``
     (when given) travels inside that signed envelope, so a holder cannot
     extend a disappearing message's deadline.
@@ -1984,12 +1985,33 @@ def seal_message(
                 bytes.fromhex(member)
         except ValueError as exc:
             raise MailboxError("group context has a non-hex hash") from exc
-        inner["group"] = {
+        sealed_group = {
             "id": group_id.lower(),
             "name": sanitize_group_name(group.get("name")),
             "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
+        lineage = group.get("renamed_from")
+        if lineage:
+            if not isinstance(lineage, list) or any(
+                not isinstance(entry, str) or len(entry) != 32
+                for entry in lineage
+            ):
+                raise MailboxError(
+                    "group context renamed_from must be a list of group ids"
+                )
+            try:
+                for entry in lineage:
+                    bytes.fromhex(entry)
+            except ValueError as exc:
+                raise MailboxError(
+                    "group context renamed_from has a non-hex hash"
+                ) from exc
+            cleaned = list(dict.fromkeys(e.lower() for e in lineage))
+            if len(cleaned) != len(lineage):
+                raise MailboxError("group context renamed_from repeats a group id")
+            sealed_group["renamed_from"] = cleaned
+        inner["group"] = sealed_group
     if expires_at is not None:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise MailboxError("expires_at must be a finite number")
@@ -2233,12 +2255,33 @@ def _validated_sealed_message(payload: Dict[str, Any]) -> Dict[str, Any]:
                 bytes.fromhex(member)
         except ValueError as exc:
             raise MailboxError("sealed message group has a non-hex hash") from exc
-        result["group"] = {
+        sealed_group = {
             "id": group_id.lower(),
             "name": sanitize_group_name(group_raw.get("name")),
             "creator": group_creator.lower(),
             "members": [m.lower() for m in group_members],
         }
+        lineage = group_raw.get("renamed_from")
+        if lineage is not None:
+            if not isinstance(lineage, list) or any(
+                not isinstance(entry, str) or len(entry) != 32
+                for entry in lineage
+            ):
+                raise MailboxError("sealed message group renamed_from is invalid")
+            try:
+                for entry in lineage:
+                    bytes.fromhex(entry)
+            except ValueError as exc:
+                raise MailboxError(
+                    "sealed message group renamed_from has a non-hex hash"
+                ) from exc
+            cleaned = list(dict.fromkeys(e.lower() for e in lineage))
+            if len(cleaned) != len(lineage):
+                raise MailboxError(
+                    "sealed message group renamed_from repeats a group id"
+                )
+            sealed_group["renamed_from"] = cleaned
+        result["group"] = sealed_group
     return result
 
 
