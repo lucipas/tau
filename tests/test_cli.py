@@ -140,6 +140,10 @@ class _FakeSendNode:
                 text=text,
                 message_id=f"{len(self.calls):032x}",
             )
+            # The real node records the send when it queues (see
+            # TauNode.send_message), so the sent record exists for the
+            # queued-to-delivered flip to confirm against.
+            self.mailbox.record_sent(entry.id, to=b"\xbb" * 16, text=text)
             return {
                 "ok": True,
                 "queued": True,
@@ -152,6 +156,8 @@ class _FakeSendNode:
         self.flush_calls.append(kwargs)
         if _FakeSendNode.deliver_on_flush:
             for entry in self.mailbox.outbox_list():
+                # The real node records delivery before leaving the outbox.
+                self.mailbox.record_delivered(entry.id)
                 self.mailbox.remove_outbox(entry.id)
 
 
@@ -3093,7 +3099,10 @@ def test_serve_stops_node_when_bridge_start_fails_late(tmp_path, monkeypatch):
             self.config = config
             self.identity = None
 
-        def start(self, *, announce=True, exclusive=False, lxmf=False):
+        def start(
+            self, *, announce=True, exclusive=False, lxmf=False,
+            lxmf_propagation=False
+        ):
             events.append("node.start")
 
         def stop(self):
@@ -3308,6 +3317,34 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     )
     assert code == 0
     assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
+
+
+def test_messages_import_skips_retracted_messages(tmp_path, capsys):
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    export_path = tmp_path / "messages-backup.json"
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--output", str(export_path)]
+    )
+    assert code == 0
+
+    target_dir = tmp_path / "other-node"
+    # The sender retracted m-1 on the target node before the import.
+    mailbox = Mailbox(target_dir / "mailbox.json")
+    mailbox.record_retraction(sender_hash.hex(), "m-1")
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "Imported 1 messages (0 already present, 1 skipped)" in out
+    assert "skipped m-1: message was retracted by its sender" in out
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2"]
 
 
 def test_messages_export_to_stdout_and_peer_filter(tmp_path, capsys):
@@ -3665,6 +3702,198 @@ def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
     node = _FakeReactNode.instances[0]
     assert node.started is False
     assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
+
+
+def _seed_sent_message(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-9",
+            "direction": "out",
+        }
+    )
+    return data_dir, recipient_hash
+
+
+class _FakeRetractNode:
+    instances = []
+
+    def __init__(self, config, name=None):
+        self.config = config
+        self.sent = []
+        self.started = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def send_retraction(
+        self, target, message_id, *, timeout=20.0, discover_timeout=None
+    ):
+        self.sent.append((target, message_id))
+        return {"ok": True, "target": message_id, "deleted": True, "id": "r-1"}
+
+
+def test_retract_sends_to_the_recipient_and_deletes_the_local_copy(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retracted" in out
+    assert "alice" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.started is False
+    assert node.sent == [(recipient_hash.hex(), "m-9")]
+    # The local sent copy is gone too.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    assert inbox.list_messages(direction="out") == []
+    # So is the sent record: `tau messages --sent` must not keep
+    # showing the retracted text.
+    assert Mailbox(config.mailbox_path).sent_list() == []
+
+
+def test_retract_reports_when_the_peer_had_no_copy(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, _ = _seed_sent_message(tmp_path)
+
+    class _NoCopyNode(_FakeRetractNode):
+        def send_retraction(
+            self, target, message_id, *, timeout=20.0, discover_timeout=None
+        ):
+            self.sent.append((target, message_id))
+            return {"ok": True, "target": message_id, "deleted": False, "id": "r-1"}
+
+    monkeypatch.setattr(cli, "TauNode", _NoCopyNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-9"
+    assert payload["deleted"] is False
+
+
+def test_retract_refuses_a_received_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_messages(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-1"])
+    assert code == cli._EXIT_ERROR
+    assert "not sent by this node" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
+def test_retract_refuses_group_messages(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "team",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
+    assert code == cli._EXIT_ERROR
+    assert "group messages cannot be retracted" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
+def test_retract_rejects_unknown_messages(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_sent_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "zzz"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeRetractNode.instances == []
+
+
+def test_retract_refuses_a_queued_message(tmp_path, capsys, monkeypatch):
+    # A retract answered "not found" while the queued copy is still in
+    # the outbox would let that copy arrive later; refuse and point at
+    # outbox cancel instead.
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).enqueue(
+        to=recipient_hash, text="sent hello", message_id="m-9"
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "still queued" in err
+    assert "outbox cancel" in err
+    assert _FakeRetractNode.instances == []
+
+
+def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+
+    class _OfflineNode(_FakeRetractNode):
+        def send_retraction(
+            self, target, message_id, *, timeout=20.0, discover_timeout=None
+        ):
+            raise cli.NodeError("no path to peer")
+
+    monkeypatch.setattr(cli, "TauNode", _OfflineNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-9"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "could not deliver retract" in err
+    assert "online" in err
+    # The failed retract leaves the local sent copy in place.
+    inbox = Inbox(TauConfig.resolve(data_dir=data_dir, name="bob").inbox_path)
+    assert len(inbox.list_messages(direction="out")) == 1
+    assert len(Mailbox(config.mailbox_path).sent_list()) == 1
 
 
 class _FakeReactNode:
