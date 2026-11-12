@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiGet, apiPost } from "./api";
 import type {
+  TanAuthor,
+  TanAuthorsResponse,
   TanExportDocument,
   TanFollow,
   TanFollowingResponse,
@@ -16,16 +18,30 @@ import type {
   TanMutedResponse,
   TanPost,
   TanPostResponse,
+  TanRules,
+  TanRulesResponse,
+  TanRulesUpdateResponse,
   TanSavedResponse,
+  TanSuggestResponse,
+  TanSuggestion,
   TanSyncResponse,
   TanTimelineResponse,
+  TanVerifyReport,
 } from "./types";
 
 const POLL_INTERVAL_MS = 5000;
+// Suggestion ranking scans the whole cache, so it refreshes on a slower
+// cadence than the feed and stays off the feed's poll critical path.
+const SUGGEST_INTERVAL_MS = 60000;
 const SAVED_PAGE_SIZE = 100;
+// Authors per directory page, matching the API's default limit.
+const AUTHORS_PAGE_SIZE = 50;
 
 export function useTan() {
   const [posts, setPosts] = useState<TanPost[]>([]);
+  // The view that produced `posts`. After a switch the old posts belong to
+  // the previous ranking, so they are hidden until the new view loads.
+  const [postsView, setPostsView] = useState<"timeline" | "top" | null>(null);
   const [searchResults, setSearchResults] = useState<TanPost[]>([]);
   // The search the feed is showing, or null for the timeline. Kept beside
   // `all` so a search mid-action reloads the search, the same way `all`
@@ -33,12 +49,32 @@ export function useTan() {
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [mentions, setMentions] = useState<TanPost[]>([]);
   const [following, setFollowing] = useState<TanFollow[]>([]);
+  // Every known author in the local store, not just the followed ones:
+  // the directory the console uses to discover who to follow.
+  const [authors, setAuthors] = useState<TanAuthor[]>([]);
+  // How many authors the directory holds in total, behind the pages
+  // currently shown; the console offers the next page while the shown
+  // count is below this.
+  const [authorsTotal, setAuthorsTotal] = useState(0);
+  // The shown authors, mirrored for refreshes that re-read the loaded
+  // pages, and a generation for the directory's own loads: a newer
+  // refresh supersedes an older one, as the feed's does.
+  const authorsRef = useRef(authors);
+  useEffect(() => {
+    authorsRef.current = authors;
+  }, [authors]);
+  const authorsGenerationRef = useRef(0);
+  const [suggestions, setSuggestions] = useState<TanSuggestion[]>([]);
   const [mutedAuthors, setMutedAuthors] = useState<TanMutedAuthor[]>([]);
   const [mutedKeywords, setMutedKeywords] = useState<TanMutedKeyword[]>([]);
   const [saved, setSaved] = useState<TanPost[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedHasMore, setSavedHasMore] = useState(false);
   const [all, setAll] = useState(false);
+  // Which ranking the feed shows: the chronological timeline, or the
+  // most-liked posts. The top view ignores the following/everything
+  // filter — it ranks the whole visible store, like `tau tan top`.
+  const [view, setView] = useState<"timeline" | "top">("timeline");
   // Whether the feed shows replies to your own posts instead of the
   // timeline. Kept beside `all` so a view switch mid-action reloads
   // the view that is actually selected, the same way `all` works.
@@ -46,15 +82,38 @@ export function useTan() {
   const [loading, setLoading] = useState(true);
   const [posting, setPosting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyReport, setVerifyReport] = useState<TanVerifyReport | null>(
+    null,
+  );
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rules, setRules] = useState<TanRules | null>(null);
+  const [availableKinds, setAvailableKinds] = useState<string[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(true);
+  const [rulesError, setRulesError] = useState<string | null>(null);
+  // Generation of rules requests; a response from an older request, or
+  // one superseded by a confirmed save, is discarded.
+  const rulesGenerationRef = useRef(0);
+
   // The thread currently open in the console, if any: the reference it
   // was opened with and its entries (null while none is open).
   const [threadPosts, setThreadPosts] = useState<TanPost[] | null>(null);
   const [threadRef, setThreadRef] = useState<string | null>(null);
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
+
+  // A displayed audit is only as fresh as the store it read. Every
+  // action that writes posts bumps this generation and drops the
+  // report, so the sidebar never presents a stale audit as the
+  // store's current health; an audit that resolves after a mutation
+  // is discarded the same way.
+  const verifyGenerationRef = useRef(0);
+  const invalidateVerify = useCallback(() => {
+    verifyGenerationRef.current += 1;
+    setVerifyReport(null);
+  }, []);
 
   // The filter the timeline is showing right now. Actions refresh through
   // this ref instead of a captured `all`, so a filter switch mid-action
@@ -64,6 +123,10 @@ export function useTan() {
     allRef.current = all;
   }, [all]);
 
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
   const searchQueryRef = useRef(searchQuery);
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -105,8 +168,12 @@ export function useTan() {
     const generation = ++generationRef.current;
     pendingRef.current = { generation, startedAt: Date.now() };
     try {
+      const isTop = viewRef.current === "top";
       const activeSearch = searchQueryRef.current;
       const suffix = allRef.current ? "?all=1&limit=100" : "?limit=100";
+      // A search stays a search even from the top view: the search form
+      // is always visible, so a search submitted there must fetch the
+      // search endpoint, not the top ranking.
       // A failed mute list keeps its previous contents rather than blocking
       // the timeline and following refresh.
       const [feed, follows, muted, mutedKeywords] = await Promise.all([
@@ -114,9 +181,11 @@ export function useTan() {
           ? apiGet<TanTimelineResponse>(
               `/api/tan/search?q=${encodeURIComponent(activeSearch)}&limit=100`,
             )
-          : showMentionsRef.current
-            ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
-          : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
+          : isTop
+            ? apiGet<TanTimelineResponse>("/api/tan/top?limit=10")
+            : showMentionsRef.current
+              ? apiGet<TanTimelineResponse>("/api/tan/mentions?limit=100")
+              : apiGet<TanTimelineResponse>(`/api/tan/timeline${suffix}`),
         apiGet<TanFollowingResponse>("/api/tan/following"),
         apiGet<TanMutedResponse>("/api/tan/muted").catch(() => null),
         apiGet<TanMutedKeywordsResponse>("/api/tan/muted-keywords").catch(
@@ -126,10 +195,14 @@ export function useTan() {
       if (generationRef.current !== generation) return false;
       if (activeSearch !== null) {
         setSearchResults(feed.posts);
+      } else if (isTop) {
+        setPosts(feed.posts);
+        setPostsView("top");
       } else if (showMentionsRef.current) {
         setMentions(feed.posts);
       } else {
         setPosts(feed.posts);
+        setPostsView("timeline");
       }
       setFollowing(follows.following);
       if (muted !== null) setMutedAuthors(muted.muted ?? []);
@@ -185,6 +258,49 @@ export function useTan() {
     }
   }, []);
 
+  // Re-read the directory pages currently shown, in offset-sized
+  // pages, so a follow, unfollow or sync refreshes the followed flags
+  // without losing the user's place. The directory loads on its own
+  // generation, not the feed's: a failed or stalled authors request
+  // never blocks the feed, and on failure the previous directory
+  // stays in place.
+  const refreshAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    // Re-read at least one page, even before anything is shown.
+    const target = Math.max(authorsRef.current.length, AUTHORS_PAGE_SIZE);
+    const pages: TanAuthor[] = [];
+    let total = 0;
+    let offset = 0;
+    while (offset < target) {
+      const result = await apiGet<TanAuthorsResponse>(
+        `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+      );
+      if (authorsGenerationRef.current !== generation) return;
+      pages.push(...result.authors);
+      total = result.total;
+      offset += result.authors.length;
+      if (result.authors.length === 0) break;
+    }
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors(pages);
+    setAuthorsTotal(total);
+  }, []);
+
+  // Fetch the next directory page and append it. Offset paging, not a
+  // growing limit: the API caps a single request at 200 rows, so
+  // growing the limit would fetch the same first 200 rows forever and
+  // never reach author 201.
+  const loadMoreAuthors = useCallback(async () => {
+    const generation = ++authorsGenerationRef.current;
+    const offset = authorsRef.current.length;
+    const result = await apiGet<TanAuthorsResponse>(
+      `/api/tan/authors?limit=${AUTHORS_PAGE_SIZE}&offset=${offset}`,
+    );
+    if (authorsGenerationRef.current !== generation) return;
+    setAuthors((previous) => [...previous, ...result.authors]);
+    setAuthorsTotal(result.total);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     async function tick(supersede: boolean) {
@@ -203,17 +319,122 @@ export function useTan() {
     // Re-running on a filter change must load the newly selected filter
     // even if a poll for the old one is still in flight; routine polls
     // skip while a load is pending instead of invalidating it.
+    setLoading(true);
     void tick(true);
+    // The directory loads once with the feed; the poll tick does not
+    // re-read it (a follow, unfollow or sync refreshes it instead),
+    // so paging past the first page is never undone by a poll.
+    void refreshAuthors().catch(() => {});
+    // The top ranking changes only when someone likes, unlikes, posts
+    // or deletes, and every one of those actions reloads the current
+    // view — so the top view loads on demand and on manual refresh,
+    // and never joins the timeline's 5s poll. A search submitted from
+    // the top view still polls like any other search.
+    if (view === "top" && searchQuery === null) {
+      return () => {
+        disposed = true;
+      };
+    }
     const timer = setInterval(() => void tick(false), POLL_INTERVAL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
     };
-  }, [all, searchQuery, showMentions, load]);
+  }, [all, view, searchQuery, showMentions, load, refreshAuthors]);
+
+  // Suggestions have their own generation so a slow ranking response cannot
+  // overwrite a newer one, and they never block the feed load.
+  const suggestGenerationRef = useRef(0);
+  const loadSuggestions = useCallback(async () => {
+    const generation = ++suggestGenerationRef.current;
+    const suggested = await apiGet<TanSuggestResponse>("/api/tan/suggest");
+    if (suggestGenerationRef.current !== generation) return;
+    setSuggestions(suggested.suggestions);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    async function tickSuggest() {
+      try {
+        await loadSuggestions();
+      } catch {
+        // Suggestions are optional; keep the last good list on failure.
+      }
+      if (disposed) return;
+    }
+    void tickSuggest();
+    const timer = setInterval(() => void tickSuggest(), SUGGEST_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [loadSuggestions]);
 
   const refresh = useCallback(async () => {
     await load();
   }, [load]);
+
+  // Admission rules change rarely, so they load once and on demand
+  // rather than on the feed's poll: a rules edit on the CLI shows up
+  // after a manual refresh (or a page reload), not mid-scroll.
+  const refreshRules = useCallback(async () => {
+    // A newer rules request (a refresh or a confirmed save) supersedes
+    // this one, so a slow GET cannot overwrite a newer policy.
+    const generation = ++rulesGenerationRef.current;
+    try {
+      const result = await apiGet<TanRulesResponse>("/api/tan/rules");
+      if (generation !== rulesGenerationRef.current) return;
+      if (!result || typeof result.rules !== "object" || result.rules === null) {
+        throw new Error("could not load rules");
+      }
+      setRules(result.rules);
+      setAvailableKinds(
+        Array.isArray(result.available_kinds) ? result.available_kinds : [],
+      );
+      setRulesError(null);
+    } catch (caught) {
+      if (generation !== rulesGenerationRef.current) return;
+      setRulesError(
+        caught instanceof Error ? caught.message : "could not load rules",
+      );
+    } finally {
+      if (generation === rulesGenerationRef.current) {
+        setRulesLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshRules();
+  }, [refreshRules]);
+
+  const updateRules = useCallback(
+    async (next: TanRules) => {
+      const result = await apiPost<TanRulesUpdateResponse>(
+        "/api/tan/rules",
+        // apiPost takes a plain JSON object; a TanRules is exactly that.
+        { ...next } as Record<string, unknown>,
+      );
+      // The save is confirmed: supersede any GET still in flight so it
+      // cannot restore the policy from before the save.
+      rulesGenerationRef.current += 1;
+      setRules(result.rules);
+      setRulesError(null);
+      setRulesLoading(false);
+      // A kinds change re-filters the timeline; reload it at once. A
+      // failed feed reload is reported as a feed error, not as a failed
+      // rules save, since the policy above is already saved.
+      try {
+        await load();
+      } catch (caught) {
+        setError(
+          caught instanceof Error ? caught.message : "could not load the feed",
+        );
+      }
+      return result.rules;
+    },
+    [load],
+  );
 
   // A search is a view switch, like `all`: setting the query re-runs the
   // load effect, which fetches the search endpoint instead of the
@@ -401,6 +622,7 @@ export function useTan() {
 
   const publish = useCallback(
     async (text: string, replyTo?: string) => {
+      invalidateVerify();
       setPosting(true);
       try {
         const result = await apiPost<TanPostResponse>("/api/tan/posts", {
@@ -419,7 +641,7 @@ export function useTan() {
         setPosting(false);
       }
     },
-    [load],
+    [load, invalidateVerify],
   );
 
   const quote = useCallback(
@@ -453,17 +675,19 @@ export function useTan() {
   const follow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/follow", { target });
-      await load();
+      await Promise.all([load(), refreshAuthors()]);
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, refreshAuthors, loadSuggestions],
   );
 
   const unfollow = useCallback(
     async (target: string) => {
       await apiPost("/api/tan/unfollow", { target });
-      await load();
+      await Promise.all([load(), refreshAuthors()]);
+      void loadSuggestions().catch(() => undefined);
     },
-    [load],
+    [load, refreshAuthors, loadSuggestions],
   );
 
   const muteAuthor = useCallback(
@@ -500,20 +724,31 @@ export function useTan() {
 
   const like = useCallback(
     async (target: string) => {
+      // Likes are chain entries in the store, so they invalidate an
+      // audit exactly like a post does.
+      invalidateVerify();
       await apiPost("/api/tan/like", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded],
   );
 
   const unlike = useCallback(
     async (target: string) => {
+      invalidateVerify();
       await apiPost("/api/tan/unlike", { target });
+      await Promise.all([load(), refreshSavedIfLoaded()]);
+    },
+    [load, invalidateVerify, refreshSavedIfLoaded],
+  );
+
+  const repost = useCallback(
+    async (target: string) => {
+      await apiPost("/api/tan/repost", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
     [load, refreshSavedIfLoaded],
   );
-
   // Who liked one post, newest like first. Fetched on demand when the
   // liker list is opened, not with the timeline, so the feed payload
   // stays small. Returns the whole response so the caller can tell a
@@ -526,24 +761,63 @@ export function useTan() {
 
   const deletePost = useCallback(
     async (target: string) => {
+      invalidateVerify();
       await apiPost("/api/tan/delete", { target });
       await Promise.all([load(), refreshSavedIfLoaded()]);
     },
-    [load, refreshSavedIfLoaded],
+    [load, invalidateVerify, refreshSavedIfLoaded],
+  );
+
+  const editPost = useCallback(
+    async (target: string, text: string) => {
+      await apiPost("/api/tan/edit", { target, text });
+      // The edit is already committed. A refresh failure must not make the
+      // caller treat the edit as failed, so report it as a feed error instead.
+      try {
+        await load();
+      } catch (caught) {
+        setError(
+          caught instanceof Error ? caught.message : "could not load the feed",
+        );
+      }
+    },
+    [load],
   );
 
   const sync = useCallback(async () => {
+    invalidateVerify();
     setSyncing(true);
     try {
       const result = await apiPost<TanSyncResponse>("/api/tan/sync", {
         explore: true,
       });
-      await load();
+      // A sync can bring in new authors, so the directory refreshes
+      // alongside the feed.
+      await Promise.all([load(), refreshAuthors()]);
+      void loadSuggestions().catch(() => undefined);
       return result.sync;
     } finally {
       setSyncing(false);
     }
-  }, [load]);
+  }, [load, invalidateVerify, refreshAuthors, loadSuggestions]);
+
+  // A read-only audit: verifying never writes to the store and never
+  // reloads the feed, so it stays independent of the poll cadence.
+  // The report is kept only if no store-changing action landed while
+  // the audit was in flight.
+  const verify = useCallback(async () => {
+    setVerifying(true);
+    const generation = verifyGenerationRef.current;
+    try {
+      const report = await apiGet<TanVerifyReport>("/api/tan/verify");
+      if (verifyGenerationRef.current === generation) {
+        setVerifyReport(report);
+      }
+      return report;
+    } finally {
+      setVerifying(false);
+    }
+  }, []);
 
   // Download the signed export document the bridge returns. The anchor
   // click is the download: a blob URL keeps the file local, and the
@@ -599,11 +873,16 @@ export function useTan() {
   );
 
   return {
-    posts,
+    // Posts from the other view are never shown under this view's label.
+    posts: postsView === view ? posts : [],
     searchResults,
     searchQuery,
     mentions,
     following,
+    authors,
+    authorsTotal,
+    loadMoreAuthors,
+    suggestions,
     mutedAuthors,
     mutedKeywords,
     saved,
@@ -615,21 +894,31 @@ export function useTan() {
     unsave,
     all,
     setAll,
+    view,
+    setView,
     showMentions,
     setShowMentions,
     loading,
     posting,
     syncing,
+    verifying,
+    verifyReport,
     exporting,
     importing,
     error,
+    rules,
+    availableKinds,
+    rulesLoading,
+    rulesError,
+    refresh,
+    refreshRules,
+    updateRules,
     threadPosts,
     threadRef,
     threadLoading,
     threadError,
     openThread,
     closeThread,
-    refresh,
     search,
     clearSearch,
     publish,
@@ -642,9 +931,12 @@ export function useTan() {
     unmuteKeyword,
     like,
     unlike,
+    repost,
     fetchLikers,
     deletePost,
+    editPost,
     sync,
+    verify,
     exportTan,
     importTan,
   };

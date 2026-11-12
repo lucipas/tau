@@ -34,6 +34,7 @@ ALLOWLIST_FILE_NAME = "allowlist.json"
 FILES_DIR_NAME = "files"
 BLOCKLIST_FILE_NAME = "blocklist.json"
 IGNORED_GROUPS_FILE_NAME = "ignored-groups.json"
+ARCHIVED_FILE_NAME = "archived.json"
 NODE_LOCK_FILE_NAME = "node.lock"
 RNS_DIR_NAME = "reticulum"
 RNS_CONFIG_FILE_NAME = "config"
@@ -66,6 +67,7 @@ class TauConfig:
     allowlist_path: Path
     blocklist_path: Path
     ignored_groups_path: Path
+    archived_path: Path
     name: str
     rns_loglevel: int = 2
     announce_interval: float = 300.0
@@ -104,6 +106,7 @@ class TauConfig:
             allowlist_path=base / ALLOWLIST_FILE_NAME,
             blocklist_path=base / BLOCKLIST_FILE_NAME,
             ignored_groups_path=base / IGNORED_GROUPS_FILE_NAME,
+            archived_path=base / ARCHIVED_FILE_NAME,
             name=node_name,
             rns_loglevel=rns_loglevel,
             announce_interval=announce_interval,

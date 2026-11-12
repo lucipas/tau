@@ -27,7 +27,10 @@ Global options may appear before or after the command:
 | `tau peers` | List peers from the local registry (`--exchange` asks known peers for the peers they know; `--safety-number` shows each peer's pairwise safety number) |
 | `tau peers verify NAME\|HASH` | Record that the safety number was compared with a peer out of band and matched — the peer is marked verified and kept through pruning |
 | `tau peers forget NAME\|HASH` | Remove a peer from the local registry (the next genuine announce re-adds it; the recovery path for a corrupt record — refuses while mail is queued unless `--force`, and while mail acknowledgements are owed). Stop a running `tau serve` first: its in-memory registry would restore the peer on its next save. |
-| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; `--ignored` for only ignored groups — ignored ones are hidden by default and their unread count is reported instead; listing marks shown messages read) |
+| `tau messages` | List received direct messages kept in the node inbox (`--group ID` filters to one group; `--search TEXT` keeps only messages whose text contains it; `--sent` lists messages this node sent, with delivery/read state; `--unread` for only unread, `--count` for per-peer unread counts; `--ignored` for only ignored groups and `--archived` for only archived conversations — ignored ones and archived ones are hidden by default and their unread counts are reported instead; listing marks shown messages read) |
+| `tau archive PEER` | Hide a peer's conversation from `tau messages` (history kept, mail keeps arriving; idempotent) |
+| `tau unarchive PEER` | Restore an archived conversation to `tau messages` (idempotent) |
+| `tau archived` | List archived conversations (peer name + hash, message count) |
 | `tau messages export` | Back up stored direct messages as a JSON export (`--peer` for one sender, `--output` for a file) |
 | `tau messages import FILE` | Restore direct messages from a JSON export (skips entries already present) |
 | `tau messages delete ID` | Delete one stored direct message from the local inbox (full id or unique prefix) |
@@ -158,6 +161,13 @@ tau send --to alice --reply-to a1b2c3d4 "seconded"
 # Only what arrived since you last read, and per-peer unread counts
 tau messages --unread
 tau messages --count            # read-only, for scripts; does not mark read
+
+# Put a conversation aside without deleting its history
+tau archive alice
+tau messages                    # alice's thread is hidden; unread there is reported
+tau messages --archived         # only archived conversations
+tau archived
+tau unarchive alice
 
 # React to a received message (id or unique prefix from `tau messages`)
 tau react a1b2c3d4 👍

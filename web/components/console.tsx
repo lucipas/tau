@@ -5,12 +5,16 @@ import { useEffect, useRef, useState } from "react";
 import { useTau } from "@/lib/use-tau";
 import type { TauMessage } from "@/lib/types";
 
+import { BundleSection } from "./bundle-section";
 import { Composer } from "./composer";
 import { AllowlistSection } from "./allowlist-section";
+import { DoctorSection } from "./doctor-section";
 import { Header } from "./header";
 import { MessageFeed } from "./message-feed";
+import { MessagesBackupSection } from "./messages-backup-section";
 import { OutboxSection } from "./outbox-section";
 import { PeerSidebar } from "./peer-sidebar";
+import { SettingsSection } from "./settings-section";
 
 export function Console() {
   const tau = useTau();
@@ -18,6 +22,13 @@ export function Console() {
   const [mode, setMode] = useState<"peer" | "custom" | "group">("peer");
   const [replyTo, setReplyTo] = useState<TauMessage | null>(null);
   const customPicked = useRef(false);
+  // The selection as it is now, for async completions that must not act
+  // on a conversation the user has since switched to.
+  const targetRef = useRef(target);
+
+  useEffect(() => {
+    targetRef.current = target;
+  }, [target]);
 
   useEffect(() => {
     if (tau.peers.length === 0 && tau.groups.length === 0) {
@@ -69,6 +80,15 @@ export function Console() {
     setTarget(value);
   }
 
+  // A deleted message can no longer be quoted: the bridge rejects its
+  // wire id. This also covers deletes that arrive from another tab.
+  useEffect(() => {
+    if (!replyTo) return;
+    if (!tau.messages.some((message) => message.id === replyTo.id)) {
+      setReplyTo(null);
+    }
+  }, [replyTo, tau.messages]);
+
   const { markRead } = tau;
   const openUnread =
     mode === "peer" && target ? (tau.unread.per_peer[target] ?? 0) : 0;
@@ -114,6 +134,14 @@ export function Console() {
           onAnnounce={() => {
             void tau.announce().catch(() => undefined);
           }}
+          onRename={async (name) => {
+            await tau.renameNode(name);
+          }}
+          backingUp={tau.backingUp}
+          backupError={tau.backupError}
+          onBackup={() => {
+            void tau.backup();
+          }}
         />
 
         {tau.connection === "reconnecting" ? (
@@ -132,6 +160,7 @@ export function Console() {
             bridge={tau.bridge}
             social={tau.social}
             pings={tau.pings}
+            infos={tau.infos}
             verifications={tau.verifications}
             blocks={tau.blocks}
             unread={tau.unread.per_peer}
@@ -139,6 +168,24 @@ export function Console() {
             onPing={(destination) => {
               void tau.ping(destination);
             }}
+            onInfo={(destination) => {
+              void tau.fetchInfo(destination);
+            }}
+            onForgetPeer={async (destination, force) => {
+              const removed = await tau.forgetPeer(destination, force);
+              // The forgotten peer's conversation is gone: clear the
+              // selection and let the auto-select pick the next peer. Only
+              // if it is still selected; the user may have picked another
+              // peer while the forget was pending.
+              if (targetRef.current === removed.destination) {
+                targetRef.current = "";
+                setTarget("");
+                setReplyTo(null);
+              }
+            }}
+            onSetAlias={(destination, alias) =>
+              tau.setPeerAlias(destination, alias)
+            }
             onVerify={(destination) => {
               void tau.verifyPeer(destination).catch(() => undefined);
             }}
@@ -155,6 +202,8 @@ export function Console() {
               void tau.unblockPeer(destination).catch(() => undefined);
             }}
             onSelectPeer={selectPeer}
+            onCreateGroup={(name, members) => tau.createGroup(name, members)}
+            onDeleteGroup={(group) => tau.deleteGroup(group)}
           />
             <AllowlistSection
               allowlist={tau.allowlist}
@@ -184,6 +233,17 @@ export function Console() {
                   setMode("peer");
                 }
               }}
+              onDelete={async (message) => {
+                await tau.deleteMessage(message.id);
+              }}
+              onReact={async (message, reaction) => {
+                if (!message.wire_id) return;
+                if (reaction === null) {
+                  await tau.clearReaction(message.wire_id);
+                } else {
+                  await tau.reactToMessage(message.wire_id, reaction);
+                }
+              }}
             />
             {/* Stays mounted when the queue empties so a retry's result
                 line survives the last entry leaving; it renders nothing
@@ -198,6 +258,15 @@ export function Console() {
                 onDropHeld={tau.dropHeldMail}
               />
             </div>
+            <div className="mt-4">
+              <BundleSection
+                onExport={tau.exportBundle}
+                onImport={tau.importBundle}
+              />
+            </div>
+            <div className="mt-4">
+              <DoctorSection onRun={tau.runDoctor} />
+            </div>
             <Composer
               peers={tau.peers}
               groups={tau.groups}
@@ -211,7 +280,21 @@ export function Console() {
               replyTo={replyTo}
               onCancelReply={() => setReplyTo(null)}
             />
+            <div className="mt-4">
+              <SettingsSection
+                settings={tau.settings}
+                loadError={tau.settingsError}
+                onToggle={tau.updateSetting}
+              />
+            </div>
           </div>
+
+          <MessagesBackupSection
+            exporting={tau.exporting}
+            importing={tau.importing}
+            onExport={tau.exportMessages}
+            onImport={tau.importMessages}
+          />
         </main>
 
         <footer className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-2 px-4 pb-6 font-mono text-[10px] text-mist/60 lg:px-8">
