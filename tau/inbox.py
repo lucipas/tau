@@ -512,8 +512,16 @@ class Inbox:
     peer registry and mailbox; a failed write only logs a warning.
     """
 
-    def __init__(self, path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self.path = Path(path).expanduser() if path is not None else None
+        # A read-only inbox (dry runs) filters expired messages in memory
+        # but never persists the automatic expiry purge.
+        self._read_only = read_only
         self._lock = threading.RLock()
         self._txn_depth = 0
         self._messages: List[Dict[str, Any]] = []
@@ -571,7 +579,7 @@ class Inbox:
                         "last_read_id": entry.get("id"),
                     }
         self._read_cursors = cursors
-        if purged:
+        if purged and not self._read_only:
             # Disappearing messages whose deadline passed are gone for
             # good: persist the purge so a later load does not resurrect
             # them, and so `tau messages` never shows an expired entry.
@@ -707,6 +715,85 @@ class Inbox:
                 ) from exc
         return dict(removed)
 
+
+    def prune(
+        self,
+        older_than: float,
+        *,
+        peer: Optional[str] = None,
+        group: Optional[str] = None,
+        dry_run: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Delete stored messages older than *older_than* seconds.
+
+        The cutoff is arrival time (``received_at``), the same clock
+        the retention cap and the expiry purge use, so a sent record
+        prunes on when this node stored it.  ``peer`` scopes the prune
+        to one sender destination hash and ``group`` to one group id;
+        both may be given, and both must match.  Reactions targeting a
+        pruned message go with it, so no orphaned reaction rows linger.
+        Read cursors are untouched: they are sequence numbers, so they
+        stay valid after older records are gone, and unread counts for
+        surviving messages are unchanged.  The outbox is never touched:
+        a queued message to an offline peer is not history.  Sent
+        history is a separate store: the mailbox keeps its own sent
+        log (what ``tau messages --sent`` shows), so pruning the inbox
+        does not erase sent text from there.  A dry run
+        reports the count without deleting or saving.
+
+        Returns ``{"pruned": n, "per_peer": {destination: n},
+        "dry_run": bool}``.
+        """
+        if not older_than > 0:
+            raise InboxError("prune cutoff must be positive")
+        cutoff = (now if now is not None else time.time()) - older_than
+        with self._transaction():
+            doomed = [
+                entry
+                for entry in self._messages
+                if float(entry.get("received_at") or 0.0) < cutoff
+                and (peer is None or (entry.get("destination") or "") == peer)
+                and (group is None or entry.get("group") == group)
+            ]
+            per_peer: Dict[str, int] = {}
+            for entry in doomed:
+                destination = entry.get("destination") or ""
+                per_peer[destination] = per_peer.get(destination, 0) + 1
+            if dry_run or not doomed:
+                return {
+                    "pruned": len(doomed),
+                    "per_peer": per_peer,
+                    "dry_run": dry_run,
+                }
+            pruned_ids = {
+                str(entry.get("id"))
+                for entry in doomed
+                if isinstance(entry.get("id"), str) and entry.get("id")
+            }
+            previous_messages = self._messages
+            previous_reactions = self._reactions
+            doomed_ids = {id(entry) for entry in doomed}
+            self._messages = [
+                entry for entry in self._messages if id(entry) not in doomed_ids
+            ]
+            self._reactions = [
+                reaction
+                for reaction in self._reactions
+                if reaction.get("target") not in pruned_ids
+            ]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                self._messages = previous_messages
+                self._reactions = previous_reactions
+                raise InboxError(
+                    f"could not persist inbox; messages were not pruned: {exc}"
+                ) from exc
+            return {"pruned": len(doomed), "per_peer": per_peer, "dry_run": False}
+
+
     def pin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
         """Pin one stored message by full id or unique prefix.
 
@@ -798,6 +885,7 @@ class Inbox:
                     ) from exc
                 return dict(removed)
             return None
+
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.

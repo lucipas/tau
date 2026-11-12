@@ -275,6 +275,118 @@ def test_delete_memory_only_inbox():
     assert len(inbox) == 0
 
 
+def test_prune_drops_only_messages_older_than_cutoff(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="edge", received_at=99000.0, text="at the cutoff"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.append(
+        _record(id="old-sent", received_at=10.0, direction="out", text="old sent")
+    )
+
+    result = inbox.prune(1000.0, now=100000.0)
+    assert result == {"pruned": 2, "per_peer": {"ab" * 16: 2}, "dry_run": False}
+    assert [
+        entry["id"] for entry in inbox.list_messages(direction=None)
+    ] == ["new", "edge"]
+
+
+def test_prune_scopes_to_one_peer(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="alice-old", received_at=10.0, text="alice old"))
+    inbox.append(
+        _record(id="bob-old", destination="cd" * 16, received_at=10.0, text="bob old")
+    )
+    inbox.append(_record(id="alice-new", received_at=100000.0, text="alice new"))
+
+    result = inbox.prune(1000.0, peer="cd" * 16, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"cd" * 16: 1}, "dry_run": False}
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "alice-new",
+        "alice-old",
+    ]
+
+
+def test_prune_scopes_to_one_group(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="group-old",
+            kind="group",
+            group="cd" * 16,
+            group_name="team",
+            received_at=10.0,
+            text="group old",
+        )
+    )
+    inbox.append(_record(id="dm-old", received_at=10.0, text="dm old"))
+
+    result = inbox.prune(1000.0, group="cd" * 16, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"ab" * 16: 1}, "dry_run": False}
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "dm-old"
+    ]
+
+
+def test_prune_dry_run_deletes_nothing(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+
+    result = inbox.prune(1000.0, dry_run=True, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"ab" * 16: 1}, "dry_run": True}
+    assert len(inbox) == 2
+    assert [entry["id"] for entry in Inbox(path).list_messages()] == ["new", "old"]
+
+
+def test_prune_drops_reactions_to_pruned_messages(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.record_reaction(_reaction(target="old", id="react-old"))
+    inbox.record_reaction(_reaction(target="new", id="react-new"))
+
+    inbox.prune(1000.0, now=100000.0)
+    assert inbox.reactions_for("old") == []
+    assert len(inbox.reactions_for("new")) == 1
+
+
+def test_prune_leaves_read_cursor_and_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="mid", received_at=1000.0, text="mid"))
+    inbox.mark_read()
+    inbox.append(_record(id="new", received_at=2000.0, text="new"))
+
+    result = inbox.prune(1500.0, now=2000.0)
+    assert result["pruned"] == 1
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_prune_rejects_non_positive_cutoff(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    with pytest.raises(InboxError, match="must be positive"):
+        inbox.prune(0)
+    with pytest.raises(InboxError, match="must be positive"):
+        inbox.prune(-5.0)
+    assert len(inbox) == 1
+
+
+def test_prune_persists_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.prune(1000.0, now=100000.0)
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages()] == ["new"]
+
+
 def test_delete_exact_match_wins_over_folded_prefix(tmp_path):
     """An exact id wins even when a case-folded prefix would be ambiguous."""
     inbox = Inbox(tmp_path / "inbox.json")
@@ -1570,6 +1682,32 @@ def test_expired_messages_are_purged_on_load(tmp_path):
     ]
     # The purge is persisted: a later load does not resurrect the entry.
     assert "gone" not in path.read_text(encoding="utf-8")
+
+
+def test_read_only_prune_dry_run_does_not_persist_expiry_purge(tmp_path):
+    import json as _json
+    import time as _time
+
+    now = _time.time()
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="gone", received_at=10.0, expires_at=now + 3600))
+    inbox.append(_record(id="kept", received_at=10.0))
+    # Expire "gone" on disk without the instance noticing.
+    raw = _json.loads(path.read_text(encoding="utf-8"))
+    for entry in raw["messages"]:
+        if entry["id"] == "gone":
+            entry["expires_at"] = now - 10
+    path.write_text(_json.dumps(raw), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+
+    preview = Inbox(path, read_only=True)
+    result = preview.prune(1000.0, dry_run=True, now=now)
+    assert result["pruned"] == 1
+    assert result["dry_run"] is True
+    # The expired record is not in the preview and nothing was written.
+    assert [entry["id"] for entry in preview.list_messages()] == ["kept"]
+    assert path.read_text(encoding="utf-8") == before
 
 
 def test_expiry_is_recorded(tmp_path):
