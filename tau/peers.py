@@ -281,9 +281,11 @@ class Peer:
         Verification is a local judgement, never shared with other peers:
         it stays out of ``public_dict`` (and therefore out of exchange
         payloads) and is only shown to this node's owner — the CLI, the
-        web console, and the persisted registry.
+        web console, and the persisted registry.  The local alias is the
+        same kind of owner-only label.
         """
         payload = self.public_dict(now)
+        payload["alias"] = self.alias
         payload["verified"] = self.is_verified
         payload["verified_at"] = self.verified_at
         payload["key_change_at"] = self.key_change_at
@@ -642,6 +644,16 @@ class PeerRegistry:
         with self._lock:
             del self._peers[peer.destination_hash]
             return peer
+
+    def restore(self, peer: Peer) -> None:
+        """Put back a record removed by :meth:`forget` after a failed save.
+
+        Only inserts when the destination is absent, so a record that was
+        re-announced in the meantime is never overwritten by the stale copy.
+        """
+        with self._lock:
+            self._peers.setdefault(peer.destination_hash, peer)
+
     def record_delivered(
         self, destination_hash: bytes, *, now: Optional[float] = None
     ) -> bool:

@@ -1,7 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TauMessage } from "@/lib/types";
+import type { NodeInfo, TauMessage } from "@/lib/types";
 
 import { MessageFeed } from "./message-feed";
 
@@ -50,7 +50,235 @@ describe("MessageFeed reactions", () => {
   });
 });
 
+describe("MessageFeed delete", () => {
+  it("shows no delete button without an onDelete handler", () => {
+    render(<MessageFeed messages={[makeMessage()]} node={null} live={true} />);
+    expect(screen.queryByTitle("Delete this message")).toBeNull();
+  });
+
+  it("asks for confirmation before deleting", async () => {
+    const message = makeMessage();
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(screen.getByText("confirm delete")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("confirm delete"));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith(message);
+  });
+
+  it("keeps the message when the confirmation is cancelled", () => {
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    fireEvent.click(screen.getByText("keep"));
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(screen.queryByText("confirm delete")).toBeNull();
+    expect(screen.getByTitle("Delete this message")).toBeTruthy();
+  });
+
+  it("reports a failed delete inline and keeps the message", async () => {
+    const onDelete = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle("Delete this message"));
+    fireEvent.click(screen.getByText("confirm delete"));
+    expect(await screen.findByText("boom")).toBeTruthy();
+    // The bubble stays, with the plain delete button back for a retry.
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.getByTitle("Delete this message")).toBeTruthy();
+  });
+
+  it("hides the delete button while the message is still queued", () => {
+    // A queued message is removed by cancelling its outbox entry, not
+    // by deleting the bubble: deleting here would leave the outbox
+    // entry to deliver it anyway.
+    const onDelete = vi.fn(async () => {});
+    render(
+      <MessageFeed
+        messages={[makeMessage({ status: "queued" })]}
+        node={null}
+        live={true}
+        onDelete={onDelete}
+      />,
+    );
+    expect(screen.queryByTitle("Delete this message")).toBeNull();
+  });
+});
+
+describe("MessageFeed react picker", () => {
+  const NODE: NodeInfo = {
+    name: "me",
+    destination: "ff".repeat(16),
+    protocol: 1,
+    version: "0.0.0",
+    rns_version: "0.0.0",
+    uptime: 1,
+    peers: 0,
+    interfaces: [],
+  };
+
+  it("shows no react button when no handler is wired", () => {
+    render(
+      <MessageFeed
+        messages={[makeMessage({ wire_id: "a".repeat(32) })]}
+        node={NODE}
+        live={true}
+      />,
+    );
+    expect(screen.queryByLabelText("React to this message")).toBeNull();
+  });
+
+  it("shows no react button on messages without a wire id", () => {
+    const onReact = vi.fn().mockResolvedValue(undefined);
+    render(
+      <MessageFeed
+        messages={[makeMessage()]}
+        node={NODE}
+        live={true}
+        onReact={onReact}
+      />,
+    );
+    expect(screen.queryByLabelText("React to this message")).toBeNull();
+  });
+
+  it("opens the picker and posts the chosen reaction", async () => {
+    const message = makeMessage({ wire_id: "a".repeat(32) });
+    const onReact = vi.fn().mockResolvedValue(undefined);
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={NODE}
+        live={true}
+        onReact={onReact}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("React to this message"));
+    expect(screen.getByLabelText("Choose a reaction")).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("React with 👍"));
+    await waitFor(() =>
+      expect(onReact).toHaveBeenCalledWith(message, "👍"),
+    );
+    await waitFor(() =>
+      expect(screen.queryByLabelText("Choose a reaction")).toBeNull(),
+    );
+  });
+
+  it("marks your own reaction and retracts it on a second tap", async () => {
+    const message = makeMessage({
+      wire_id: "a".repeat(32),
+      reactions: [
+        { reactor: NODE.destination, name: "me", reaction: "👍" },
+      ],
+    });
+    const onReact = vi.fn().mockResolvedValue(undefined);
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={NODE}
+        live={true}
+        onReact={onReact}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("React to this message"));
+    const mine = screen.getByLabelText("Remove your 👍 reaction");
+    expect(mine.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(mine);
+    await waitFor(() =>
+      expect(onReact).toHaveBeenCalledWith(message, null),
+    );
+  });
+
+  it("keeps the picker open and reports a failed reaction", async () => {
+    const message = makeMessage({ wire_id: "a".repeat(32) });
+    const onReact = vi.fn().mockRejectedValue(new Error("peer unreachable"));
+    render(
+      <MessageFeed
+        messages={[message]}
+        node={NODE}
+        live={true}
+        onReact={onReact}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText("React to this message"));
+    fireEvent.click(screen.getByLabelText("React with ❤️"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("peer unreachable");
+    expect(screen.getByLabelText("Choose a reaction")).toBeTruthy();
+  });
+});
+
 describe("MessageFeed file entries", () => {
+  const file = {
+    name: "report.pdf",
+    size: 2048,
+    sha256: "ab".repeat(32),
+  };
+
+  it("shows a download link for a received file", () => {
+    const message = makeMessage({
+      text: "Received file: report.pdf (2048 bytes, sha256 ab…)",
+      file,
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    expect(screen.getByText("2.0 KB")).toBeTruthy();
+    const link = screen.getByRole("link", { name: "Download" });
+    // jsdom runs on :3000, so the configured API base points at the
+    // bridge on :8787 — the link must target the bridge, not the
+    // page's own origin.
+    expect(link.getAttribute("href")).toBe(
+      `http://localhost:8787/api/files/${message.peer}/report.pdf`,
+    );
+  });
+
+  it("shows file metadata but no download link for an outbound file", () => {
+    const message = makeMessage({ direction: "out", file });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Download" })).toBeNull();
+  });
+
+  it("renders no file block when a message has no file", () => {
+    render(
+      <MessageFeed messages={[makeMessage()]} node={null} live={true} />,
+    );
+    expect(screen.queryByRole("link", { name: "Download" })).toBeNull();
+    expect(screen.queryByText("📎")).toBeNull();
+  });
+
   it("renders the file name, size and hash for a sent file", () => {
     const message = makeMessage({
       direction: "out",
@@ -176,5 +404,20 @@ describe("MessageFeed search", () => {
     );
 
     expect(screen.getByText(/original thought/)).toBeTruthy();
+  });
+});
+
+describe("MessageFeed outbound status", () => {
+  it("renders a failed group leg as failed, not delivered", () => {
+    const message = makeMessage({
+      direction: "out",
+      status: "failed",
+      group: "a".repeat(32),
+      group_name: "crew",
+    });
+    render(<MessageFeed messages={[message]} node={null} live={true} />);
+
+    expect(screen.getByText("failed")).toBeTruthy();
+    expect(screen.getByText("crew")).toBeTruthy();
   });
 });

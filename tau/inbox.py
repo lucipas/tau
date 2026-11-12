@@ -96,6 +96,12 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
     text = raw.get("text")
     if not isinstance(text, str) or not text:
         return None
+    # A lone surrogate passes the checks above but cannot be stored as
+    # UTF-8, so it is rejected per record instead of failing the save.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
     try:
         sent_at = float(raw.get("sent_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
@@ -399,6 +405,10 @@ def _record_error(raw: Any) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return "inbox record needs text"
     try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "text is not valid UTF-8"
+    try:
         float(raw.get("sent_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
         return "invalid sent_at"
@@ -701,6 +711,49 @@ class Inbox:
                 ) from exc
         return dict(entry), True
 
+    def delete_authorized(
+        self, message_id: str, *, direction: str, destination: str
+    ) -> Optional[Dict[str, Any]]:
+        """Delete the record with exactly this id, when it matches.
+
+        The exact-id match and the direction/destination checks run
+        inside the same cross-process transaction as the delete, so a
+        retraction authorized against one record can never delete a
+        different record: a concurrent retract of the same id either
+        wins this record first (then this call finds nothing) or loses
+        it, and no prefix fallback ever re-selects another entry —
+        unlike :meth:`delete`, which re-matches by prefix inside its
+        own transaction.  Returns the deleted record, or ``None`` when
+        no record has exactly this id.  Raises :class:`InboxError`
+        when the record exists but fails a supplied check, or when the
+        delete cannot be persisted.
+        """
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise InboxError("message reference must not be empty")
+        value = message_id.strip()
+        with self._transaction():
+            for entry in self._messages:
+                if str(entry.get("id") or "") != value:
+                    continue
+                if entry.get("direction") != direction:
+                    raise InboxError("message was not received from this sender")
+                if entry.get("destination") != destination:
+                    raise InboxError("message was not sent by this sender")
+                removed = entry
+                previous = self._messages
+                self._messages = [
+                    other for other in self._messages if other is not removed
+                ]
+                try:
+                    self._save(strict=True)
+                except OSError as exc:
+                    # Roll back so this instance matches what is still on disk.
+                    self._messages = previous
+                    raise InboxError(
+                        f"could not persist inbox; message was not deleted: {exc}"
+                    ) from exc
+                return dict(removed)
+            return None
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.
@@ -1093,9 +1146,12 @@ class Inbox:
         Messages are in stored (oldest-first) order so an import replays
         them in order; ``peer`` restricts the export to one sender
         destination hash.  The document is the same shape
-        :meth:`import_messages` accepts.
+        :meth:`import_messages` accepts.  The snapshot is read through
+        the cross-process transaction, so messages another process
+        committed since this inbox last loaded are included instead of
+        silently omitted from the backup.
         """
-        with self._lock:
+        with self.transaction():
             entries = [dict(item) for item in self._messages]
         if peer is not None:
             entries = [item for item in entries if item.get("destination") == peer]
@@ -1106,20 +1162,34 @@ class Inbox:
             "messages": entries,
         }
 
-    def import_messages(self, document: Any) -> Dict[str, Any]:
+    def import_messages(
+        self,
+        document: Any,
+        inserted: Optional[List[Dict[str, Any]]] = None,
+        *,
+        is_retracted: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
         Returns ``{"imported": n, "present": n, "skipped": n, "errors":
         [...]}``.  An entry that fails validation is skipped with its
         error recorded; it never aborts the rest of the import, and
         entries already in the inbox are counted as present rather than
-        stored twice.  The whole merge runs in one transaction, so a
-        concurrent ``tau serve`` cannot lose entries, and the
+        stored twice.  When *inserted* is given, the records this call
+        actually stored are appended to it, in arrival order, so a
+        caller mirrors exactly what this import added.  The whole merge
+        runs in one transaction, so a concurrent ``tau serve`` cannot
+        lose entries, and the
         per-direction 500-record caps still apply.  Imported records
         get local arrival sequences (an export carries the source
         node's, which mean nothing here), and a failed persist raises
         :class:`OSError` instead of reporting a restore that never
         landed — the in-memory merge is rolled back with it.
+
+        With ``is_retracted`` given (a ``(sender_hash, message_id) ->
+        bool`` check), a received record its sender retracted is
+        skipped with its reason recorded instead of being stored: an
+        export made before the retract must not resurrect the message.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -1137,6 +1207,7 @@ class Inbox:
 
         imported = present = skipped = 0
         errors: List[Dict[str, Any]] = []
+        added: List[Dict[str, Any]] = []
         with self._transaction():
             previous = list(self._messages)
             seen = {_dedupe_key(item) for item in self._messages}
@@ -1158,8 +1229,32 @@ class Inbox:
                 if key in seen:
                     present += 1
                     continue
+                if (
+                    is_retracted is not None
+                    and record.get("direction") == "in"
+                    # Group and file records are never retractable (see
+                    # the retract handler), so a marker can't cover them.
+                    and record.get("kind") not in ("group", "file")
+                    and isinstance(record.get("destination"), str)
+                    and isinstance(record.get("id"), str)
+                    and is_retracted(record["destination"], record["id"])
+                ):
+                    # A retracted message stays retracted: an export
+                    # made before the retract must not resurrect it.
+                    # Sent records are never checked — their
+                    # destination is the recipient, not the sender, so
+                    # they cannot match a marker for this message.
+                    skipped += 1
+                    errors.append(
+                        {
+                            "id": record["id"],
+                            "error": "message was retracted by its sender",
+                        }
+                    )
+                    continue
                 seen.add(key)
                 self._messages.append(record)
+                added.append(record)
                 imported += 1
             self._messages = _retain(self._messages)
             _number_sequence(self._messages)
@@ -1169,6 +1264,15 @@ class Inbox:
                 # never stored.
                 self._messages = previous
                 raise OSError(f"could not persist inbox to {self.path}")
+            if inserted is not None:
+                # Only records that survived the retention cap were
+                # stored. Collect them while the transaction still holds
+                # the lock: a concurrent reload replaces the record
+                # objects in self._messages, so an identity check after
+                # the transaction would find none of them and the caller
+                # would mirror nothing.
+                kept = {id(item) for item in self._messages}
+                inserted.extend(item for item in added if id(item) in kept)
         return {
             "imported": imported,
             "present": present,

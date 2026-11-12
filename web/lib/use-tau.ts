@@ -2,32 +2,51 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiGet, apiPost, eventsUrl } from "./api";
+import { apiDownload, apiGet, apiPost, apiPostText, eventsUrl } from "./api";
 import type {
   AllowlistResponse,
   BlockPeerResponse,
   BridgeInfo,
+  BundleExportResponse,
+  BundleImportResponse,
   CancelOutboxResponse,
+  CreateGroupResponse,
+  DeleteGroupResponse,
+  DeleteMessageResponse,
+  DoctorResponse,
   DropHeldResponse,
+  ForgetPeerResponse,
   GroupsResponse,
   HeldMailEntry,
   HeldMailResponse,
   MarkReadResponse,
+  MessagesExportDocument,
+  MessagesImportResponse,
+  MessagesImportResult,
+  MessagesResponse,
   MessagesSearchResponse,
   NodeInfo,
+  NodeSettings,
   OutboxEntry,
   OutboxResponse,
   Peer,
+  PeerInfo,
+  PeerInfoResult,
+  PeersResponse,
   PingResult,
+  ReactResponse,
+  RenameResponse,
   RetryOutboxResponse,
   SafetyNumberResponse,
   SendFileResponse,
+  SendGroupResponse,
   SendResponse,
   Snapshot,
   SocialInfo,
   TauGroup,
   TauMessage,
   UnreadCounts,
+  UpdateSettingsResponse,
   VerifyPeerResponse,
   VerifyState,
 } from "./types";
@@ -45,6 +64,12 @@ export interface PingState {
   error?: string;
 }
 
+export interface PeerInfoState {
+  pending?: boolean;
+  info?: PeerInfo;
+  error?: string;
+}
+
 export interface BlockState {
   pending?: boolean;
   error?: string;
@@ -52,6 +77,17 @@ export interface BlockState {
 
 function sortPeers(peers: Peer[]): Peer[] {
   return [...peers].sort((a, b) => b.last_seen - a.last_seen);
+}
+
+// A peer removed by a forget carries the last_seen it had at that moment.
+// Snapshots or peer events queued before the forget are at or below that
+// cutoff and must not bring the peer back; a genuine re-announce is newer.
+function predatesForget(
+  forgotten: Map<string, number>,
+  peer: Peer,
+): boolean {
+  const cutoff = forgotten.get(peer.destination);
+  return cutoff !== undefined && peer.last_seen <= cutoff;
 }
 
 function readEventData<T>(event: Event): T | null {
@@ -96,19 +132,52 @@ export function useTau() {
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
+  const [settings, setSettings] = useState<NodeSettings | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [heldMail, setHeldMail] = useState<HeldMailEntry[]>([]);
   const [allowlist, setAllowlist] = useState<AllowlistResponse | null>(null);
   const [bridge, setBridge] = useState<BridgeInfo | null>(null);
   const [social, setSocial] = useState<SocialInfo | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [pings, setPings] = useState<Record<string, PingState>>({});
+  const [infos, setInfos] = useState<Record<string, PeerInfoState>>({});
   const [verifications, setVerifications] = useState<
     Record<string, VerifyState>
   >({});
   const [blocks, setBlocks] = useState<Record<string, BlockState>>({});
   const [announcing, setAnnouncing] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupError, setBackupError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
   const snapshotMax = useRef(0);
   const unreadRevision = useRef(-1);
+  // Bumped on every peer event per destination, so a slow alias response
+  // cannot overwrite a newer event that arrived while it was in flight.
+  const peerEventVersion = useRef<Record<string, number>>({});
+  // Bumped whenever a snapshot replaces the peer list: a reconnect
+  // snapshot is newer than any alias response that was already in
+  // flight, and peer events alone do not cover it.
+  const snapshotGeneration = useRef(0);
+  // Live (SSE) updates to feed entries, stamped with a rising epoch, so
+  // a feed refresh can tell which entries changed while its GET was in
+  // flight and keep those newer versions.
+  const liveEpoch = useRef(0);
+  const liveTouched = useRef(new Map<number, number>());
+  // Counts completed group creates/deletes, so a snapshot that predates
+  // one is not allowed to restore the old roster.
+  const groupEdits = useRef(0);
+  const groupsSeq = useRef(0);
+
+  const refreshGroups = useCallback(async () => {
+    // Same polling shape as the outbox: a group learned from an
+    // incoming message shows up here without waiting for a reload.
+    const requestId = ++groupsSeq.current;
+    const result = await apiGet<GroupsResponse>("/api/groups");
+    if (requestId !== groupsSeq.current) return;
+    setGroups(result.groups);
+  }, []);
+
   // Verification time the console last applied per peer. Peer events
   // queued before a successful verify carry the older trust state and
   // must not undo the badge.
@@ -140,11 +209,28 @@ export function useTau() {
     [],
   );
 
+  // The node's identity and name live on the snapshot; a rename (or an
+  // announce) publishes a `status` event instead of a full snapshot, so
+  // a status event re-reads the snapshot's node record on its own.
+  // Only the newest node update may apply: a refresh issued before a
+  // rename or snapshot that resolves late must not restore an old name.
+  const nodeSeq = useRef(0);
+  const refreshNode = useCallback(async () => {
+    const requestId = ++nodeSeq.current;
+    const snapshot = await apiGet<Snapshot>("/api/status");
+    if (requestId !== nodeSeq.current) return;
+    setNode(snapshot.node);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
+    // Edits made before this connection opened are in its snapshot;
+    // edits made after may not be.
+    let editsAtOpen = groupEdits.current;
     const source = new EventSource(eventsUrl(0));
 
     const onOpen = () => {
+      editsAtOpen = groupEdits.current;
       if (!disposed) setConnection("live");
     };
 
@@ -156,12 +242,28 @@ export function useTau() {
         snapshot.messages.length > 0
           ? snapshot.messages[snapshot.messages.length - 1].id
           : 0;
+      nodeSeq.current += 1;
       setNode(snapshot.node);
       peerEventSeq.current += 1;
       snapshotRevision.current = peerEventSeq.current;
       localVerifiedAt.current = {};
-      setPeers(sortPeers(snapshot.peers));
-      setGroups(snapshot.groups ?? []);
+      setPeers(
+        sortPeers(
+          snapshot.peers.filter(
+            (peer) => !predatesForget(forgottenPeers.current, peer),
+          ),
+        ),
+      );
+      snapshotGeneration.current += 1;
+      if (groupEdits.current !== editsAtOpen) {
+        // A group edit completed after this connection opened, so the
+        // snapshot's roster may predate it. Re-fetch instead.
+        refreshGroups().catch(() => {
+          // The next poll reconciles.
+        });
+      } else {
+        setGroups(snapshot.groups ?? []);
+      }
       setMessages(snapshot.messages);
       // A snapshot is authoritative for its connection: reset the
       // revision baseline so a delayed event from the old connection
@@ -180,6 +282,7 @@ export function useTau() {
       if (!payload?.message) return;
       const message = payload.message;
       if (payload.unread) applyUnread(payload.unread);
+      liveTouched.current.set(message.id, ++liveEpoch.current);
       if (message.id <= snapshotMax.current) return;
       snapshotMax.current = Math.max(snapshotMax.current, message.id);
       setMessages((previous) => {
@@ -192,6 +295,7 @@ export function useTau() {
       const payload = readEventData<{ message: TauMessage }>(event);
       if (!payload?.message) return;
       const message = payload.message;
+      liveTouched.current.set(message.id, ++liveEpoch.current);
       // A queued message that the mail sweep has since delivered: the
       // server re-sends the same console id with status "delivered".
       // Replace it in place rather than appending a duplicate.
@@ -200,10 +304,23 @@ export function useTau() {
       );
     };
 
+    const onMessageDeleted = (event: Event) => {
+      // The bus stamps its own sequence into `id`, so the deleted
+      // console id arrives under `message_id` instead.
+      const payload = readEventData<{ message_id: number }>(event);
+      if (!payload || typeof payload.message_id !== "number") return;
+      setMessages((previous) =>
+        previous.filter((entry) => entry.id !== payload.message_id),
+      );
+    };
+
     const onPeer = (event: Event) => {
       const payload = readEventData<{ peer: Peer }>(event);
       if (!payload?.peer) return;
       const peer = payload.peer;
+      if (predatesForget(forgottenPeers.current, peer)) return;
+      peerEventVersion.current[peer.destination] =
+        (peerEventVersion.current[peer.destination] ?? 0) + 1;
       // Ordering for block/unblock replies: a peer event that arrives
       // after a block request was sent is newer than the reply, so the
       // reply must not overwrite the flag it already delivered.
@@ -252,6 +369,13 @@ export function useTau() {
       applyUnread(payload.unread);
     };
 
+    const onStatus = () => {
+      // A rename or announce in another tab: re-read the node record
+      // rather than waiting for the next snapshot. A failed refresh
+      // leaves the last known name in place until the next one.
+      void refreshNode().catch(() => undefined);
+    };
+
     const onError = () => {
       if (!disposed) setConnection("reconnecting");
     };
@@ -260,8 +384,10 @@ export function useTau() {
     source.addEventListener("snapshot", onSnapshot);
     source.addEventListener("message", onMessage);
     source.addEventListener("message_updated", onMessageUpdated);
+    source.addEventListener("message_deleted", onMessageDeleted);
     source.addEventListener("peer", onPeer);
     source.addEventListener("unread", onUnread);
+    source.addEventListener("status", onStatus);
     source.addEventListener("error", onError);
 
     return () => {
@@ -270,12 +396,14 @@ export function useTau() {
       source.removeEventListener("snapshot", onSnapshot);
       source.removeEventListener("message", onMessage);
       source.removeEventListener("message_updated", onMessageUpdated);
+      source.removeEventListener("message_deleted", onMessageDeleted);
       source.removeEventListener("peer", onPeer);
       source.removeEventListener("unread", onUnread);
+      source.removeEventListener("status", onStatus);
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [applyUnread]);
+  }, [applyUnread, refreshGroups, refreshNode]);
 
   // The unread total rides on the tab title, like a mail client.
   useEffect(() => {
@@ -286,8 +414,45 @@ export function useTau() {
   }, [unread.total]);
 
   const refreshSeq = useRef(0);
+  const settingsSeq = useRef(0);
+
+  const refreshSettings = useCallback(async () => {
+    // Same polling shape as the outbox: a setting changed on the CLI
+    // shows up here without waiting for a reload.
+    const requestId = ++settingsSeq.current;
+    try {
+      const result = await apiGet<NodeSettings>("/api/settings");
+      if (requestId !== settingsSeq.current) return;
+      setSettings(result);
+      setSettingsError(null);
+    } catch (caught) {
+      // Record the failure so the section can explain why the switches
+      // are disabled, then rethrow for callers that care.
+      if (requestId === settingsSeq.current) {
+        setSettingsError(
+          caught instanceof Error && caught.message
+            ? caught.message
+            : "couldn't load settings",
+        );
+      }
+      throw caught;
+    }
+  }, []);
+
+  const peersSeq = useRef(0);
+  const forgottenPeers = useRef(new Map<string, number>());
+
+  const refreshPeers = useCallback(async () => {
+    // Same polling shape as the outbox: only the newest issued request
+    // may replace state, so a slow poll cannot restore a peer a forget
+    // already removed.
+    const requestId = ++peersSeq.current;
+    const result = await apiGet<PeersResponse>("/api/peers");
+    if (requestId !== peersSeq.current) return;
+    setPeers(sortPeers(result.peers));
+  }, []);
+
   const refreshHeldSeq = useRef(0);
-  const groupsSeq = useRef(0);
 
   const refreshOutbox = useCallback(async () => {
     // Polls and action-triggered refreshes overlap; only the newest
@@ -309,26 +474,18 @@ export function useTau() {
     setHeldMail(result.held);
   }, []);
 
-  const refreshGroups = useCallback(async () => {
-    // Same polling shape as the outbox: a group learned from an
-    // incoming message shows up here without waiting for a reload.
-    const requestId = ++groupsSeq.current;
-    const result = await apiGet<GroupsResponse>("/api/groups");
-    if (requestId !== groupsSeq.current) return;
-    setGroups(result.groups);
-  }, []);
-
   useEffect(() => {
     if (connection !== "live") return;
     async function tick() {
-      // The three endpoints are independent: a failure on one must not
-      // stop the others from updating their state. The outbox is a side
-      // panel: a failed poll leaves the last known entries in place
-      // instead of flashing an error.
+      // The endpoints are independent: a failure on one must not stop
+      // the others from updating their state. Each is a side panel: a
+      // failed poll leaves the last known values in place instead of
+      // flashing an error.
       await Promise.allSettled([
         refreshOutbox(),
         refreshHeldMail(),
         refreshGroups(),
+        refreshSettings(),
       ]);
     }
     void tick();
@@ -336,7 +493,7 @@ export function useTau() {
     return () => {
       clearInterval(timer);
     };
-  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups]);
+  }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings]);
 
   const allowlistSeq = useRef(0);
 
@@ -438,6 +595,38 @@ export function useTau() {
     [refreshOutbox],
   );
 
+  const updateSetting = useCallback(
+    async (setting: keyof NodeSettings, value: boolean) => {
+      const result = await apiPost<UpdateSettingsResponse>("/api/settings", {
+        setting,
+        value,
+      });
+      // The update already succeeded: apply the returned settings at
+      // once, and treat the follow-up refresh as best-effort so a
+      // failed GET cannot make a successful change look like a failure.
+      setSettings(result.settings);
+      try {
+        await refreshSettings();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.settings;
+    },
+    [refreshSettings],
+  );
+
+  const deleteMessage = useCallback(async (id: number) => {
+    const result = await apiPost<DeleteMessageResponse>(
+      "/api/messages/delete",
+      { id },
+    );
+    // The delete already succeeded: drop the bubble locally at once,
+    // and let the message_deleted event reconcile other tabs.
+    setMessages((previous) =>
+      previous.filter((entry) => entry.id !== result.deleted.id),
+    );
+    return result.deleted;
+  }, []);
   const retryOutbox = useCallback(
     async (id?: string) => {
       const result = await apiPost<RetryOutboxResponse>(
@@ -522,6 +711,70 @@ export function useTau() {
     return result.message;
   }, [refreshOutbox]);
 
+  const sendGroup = useCallback(
+    async (group: string, text: string) => {
+      const result = await apiPost<SendGroupResponse>("/api/messages", {
+        group,
+        text,
+      });
+      setMessages((previous) => {
+        const fresh = result.messages.filter(
+          (entry) => !previous.some((known) => known.id === entry.id),
+        );
+        if (fresh.length === 0) return previous;
+        return [...previous, ...fresh].sort((a, b) => a.id - b.id);
+      });
+      // Do not advance snapshotMax here: the legs are not a complete
+      // view up to their highest id, and an inbound message recorded
+      // between two legs must still be accepted from its SSE event.
+      // Duplicate leg events are dropped by the dedupe in onMessage.
+      // A queued leg lands in the outbox; refresh so it shows at once
+      // instead of waiting for the next poll. Best-effort: a failed
+      // refresh must not report a successful send as failed.
+      try {
+        await refreshOutbox();
+      } catch {
+        // The next poll picks the entry up.
+      }
+      if (!result.ok) {
+        // The legs are already in the feed with their own statuses, so
+        // this only surfaces the summary: the message stays sendable.
+        // Name the members who already received it — or have a copy
+        // queued and will still receive it — so a retry is a
+        // deliberate duplicate fan-out, not a silent one.
+        const legs = (result.response.results as Array<
+          Record<string, unknown>
+        >) ?? [];
+        const failed = legs.filter((leg) => !leg.delivered && !leg.queued);
+        const deliveredNames = legs
+          .filter((leg) => leg.delivered)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const queuedNames = legs
+          .filter((leg) => leg.queued)
+          .map((leg) => String(leg.to_name || leg.to || "a member").slice(0, 8));
+        const names = failed.map((leg) =>
+          String(leg.to_name || leg.to || "a member").slice(0, 8),
+        );
+        const already = [
+          ...(deliveredNames.length > 0
+            ? [`${deliveredNames.join(", ")} already received this`]
+            : []),
+          ...(queuedNames.length > 0
+            ? [`${queuedNames.join(", ")} have a copy queued`]
+            : []),
+        ].join("; ");
+        throw new Error(
+          names.length > 0
+            ? already.length > 0
+              ? `could not send to ${names.join(", ")} — ${already}; sending again resends it to the whole group`
+              : `could not send to ${names.join(", ")}`
+            : "some group members did not receive the message",
+        );
+      }
+      return result.messages;
+    },
+    [refreshOutbox],
+  );
   const sendFile = useCallback(async (to: string, file: File) => {
     const data = await fileToBase64(file);
     const result = await apiPost<SendFileResponse>("/api/send-file", {
@@ -562,6 +815,29 @@ export function useTau() {
     }
   }, []);
 
+  const fetchInfo = useCallback(async (destination: string) => {
+    setInfos((previous) => ({
+      ...previous,
+      [destination]: { pending: true },
+    }));
+    try {
+      const result = await apiPost<PeerInfoResult>("/api/info", {
+        to: destination,
+      });
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: { info: result.info },
+      }));
+    } catch (error) {
+      setInfos((previous) => ({
+        ...previous,
+        [destination]: {
+          error: error instanceof Error ? error.message : "info failed",
+        },
+      }));
+    }
+  }, []);
+
   const announce = useCallback(async () => {
     setAnnouncing(true);
     try {
@@ -570,6 +846,130 @@ export function useTau() {
       setAnnouncing(false);
     }
   }, []);
+
+  const renameNode = useCallback(
+    async (name: string) => {
+      const result = await apiPost<RenameResponse>("/api/id/rename", {
+        name,
+      });
+      // The rename already succeeded: show the new name at once, and
+      // treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful rename look like a failure. Invalidate
+      // any refresh still in flight so it cannot restore the old name.
+      nodeSeq.current += 1;
+      setNode((previous) =>
+        previous ? { ...previous, name: result.name } : previous,
+      );
+      try {
+        await refreshNode();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result;
+    },
+    [refreshNode],
+  );
+
+  const backup = useCallback(async () => {
+    // A failed download leaves the error on the button until the next
+    // attempt; a success needs no confirmation — the file is in the
+    // browser's download folder.
+    setBackingUp(true);
+    setBackupError(null);
+    try {
+      const { blob, filename } = await apiDownload("/api/backup");
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setBackupError(
+        error instanceof Error ? error.message : "backup failed",
+      );
+    } finally {
+      setBackingUp(false);
+    }
+  }, []);
+
+
+  const forgetPeer = useCallback(
+    async (destination: string, force = false) => {
+      const result = await apiPost<ForgetPeerResponse>("/api/peers/forget", {
+        target: destination,
+        force,
+      });
+      // The forget already succeeded: drop the peer locally at once,
+      // and treat the follow-up refresh as best-effort so a failed GET
+      // cannot make a successful forget look like a failure.
+      const removed = result.peer.destination;
+      forgottenPeers.current.set(removed, result.peer.last_seen);
+      setPeers((previous) =>
+        previous.filter((entry) => entry.destination !== removed),
+      );
+      try {
+        await refreshPeers();
+      } catch {
+        // The next snapshot reconciles.
+      }
+      return result.peer;
+    },
+    [refreshPeers],
+  );
+
+  const runDoctor = useCallback(async () => {
+    // On demand only: the checks read the data directory, and a
+    // periodic run would re-read files the node is writing to.
+    return apiGet<DoctorResponse>("/api/doctor");
+  }, []);
+
+  const createGroup = useCallback(
+    async (name: string, members: string[]) => {
+      const result = await apiPost<CreateGroupResponse>("/api/groups", {
+        name,
+        members,
+      });
+      // The create already succeeded: add the group locally at once,
+      // then refresh best-effort so a failed GET cannot hide it.
+      const created = result.group;
+      groupEdits.current += 1;
+      setGroups((previous) =>
+        previous.some((entry) => entry.id === created.id)
+          ? previous.map((entry) => (entry.id === created.id ? created : entry))
+          : [...previous, created],
+      );
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.group;
+    },
+    [refreshGroups],
+  );
+
+  const deleteGroup = useCallback(
+    async (group: string) => {
+      const result = await apiPost<DeleteGroupResponse>("/api/groups/delete", {
+        group,
+      });
+      // Drop the group locally at once; the best-effort refresh below
+      // must not be the only thing that removes it.
+      const deletedId = result.deleted.id;
+      groupEdits.current += 1;
+      setGroups((previous) => previous.filter((entry) => entry.id !== deletedId));
+      try {
+        await refreshGroups();
+      } catch {
+        // The next poll reconciles.
+      }
+      return result.deleted;
+    },
+    [refreshGroups],
+  );
 
   const editBlock = useCallback(
     async (destination: string, block: boolean) => {
@@ -725,7 +1125,6 @@ export function useTau() {
       return next;
     });
   }, []);
-
   const markRead = useCallback(async (peer?: string) => {
     // Opening a conversation advances its read cursor on the node, so
     // the badge clears. A failed call leaves the badge in place; the
@@ -737,6 +1136,140 @@ export function useTau() {
     applyUnread(result.unread);
     return result.unread;
   }, [applyUnread]);
+
+  const exportBundle = useCallback(async (includeTan: boolean) => {
+    return apiPost<BundleExportResponse>("/api/bundle/export", {
+      include_tan: includeTan,
+    });
+  }, []);
+
+  const importBundle = useCallback(async (documentText: string) => {
+    // The file's text goes to the server verbatim: the bundle is
+    // signed, and a JSON parse/stringify round trip here can rewrite
+    // a number the signature covers.
+    return apiPostText<BundleImportResponse>("/api/bundle/import", documentText);
+  }, []);
+
+  const setPeerAlias = useCallback(
+    async (destination: string, alias: string | null) => {
+      const versionBefore = peerEventVersion.current[destination] ?? 0;
+      const snapshotBefore = snapshotGeneration.current;
+      const result = await apiPost<{ ok: boolean; peer: Peer }>(
+        "/api/peers/alias",
+        { destination, alias },
+      );
+      // The server also publishes a peer event, so other tabs learn at
+      // once; apply the returned record now so this edit reflects
+      // without waiting for it. Skip it if a peer event for this peer
+      // arrived meanwhile, or a reconnect snapshot replaced the list:
+      // either one is newer than this response.
+      if (
+        (peerEventVersion.current[destination] ?? 0) === versionBefore &&
+        snapshotGeneration.current === snapshotBefore
+      ) {
+        setPeers((previous) =>
+          sortPeers([
+            ...previous.filter((entry) => entry.destination !== destination),
+            result.peer,
+          ]),
+        );
+      }
+      return result.peer;
+    },
+    [],
+  );
+
+  // Re-read the console feed. The merge never drops a message: a live
+  // message that arrived after this GET started is already in state,
+  // and a stale response must not overwrite it — the SSE stream stays
+  // the live source, this only picks up entries the stream never
+  // announced (imported messages mirrored into the log).
+  const refreshMessages = useCallback(async () => {
+    const startEpoch = liveEpoch.current;
+    const result = await apiGet<MessagesResponse>("/api/messages?limit=200");
+    setMessages((previous) => {
+      const byId = new Map(previous.map((entry) => [entry.id, entry]));
+      for (const entry of result.messages) {
+        // A live update that landed after this GET started is newer than
+        // the response, which may predate it: keep the live version.
+        if ((liveTouched.current.get(entry.id) ?? 0) > startEpoch) continue;
+        byId.set(entry.id, entry);
+      }
+      const merged = [...byId.values()].sort((a, b) => a.id - b.id);
+      snapshotMax.current = Math.max(
+        snapshotMax.current,
+        merged.length > 0 ? merged[merged.length - 1].id : 0,
+      );
+      return merged;
+    });
+  }, []);
+
+  // Download the export document the bridge returns. The anchor
+  // click is the download: a blob URL keeps the file local, and the
+  // revoke is deferred a beat so the browser has started the save.
+  const exportMessages = useCallback(async () => {
+    setExporting(true);
+    try {
+      const doc =
+        await apiGet<MessagesExportDocument>("/api/messages/export");
+      const blob = new Blob([`${JSON.stringify(doc, null, 2)}\n`], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "tau-messages-export.json";
+        anchor.click();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      return doc;
+    } finally {
+      setExporting(false);
+    }
+  }, []);
+
+  const importMessages = useCallback(
+    async (doc: MessagesExportDocument): Promise<MessagesImportResult> => {
+      setImporting(true);
+      try {
+        const result = await apiPost<MessagesImportResponse>(
+          "/api/messages/import",
+          doc as unknown as Record<string, unknown>,
+        );
+        // The entries are already stored once the POST succeeds, so a
+        // feed refresh failure must not turn the import into a reported
+        // failure.
+        // Restored mail can advance unread counts; apply the fresh ones so
+        // the badge (and an open conversation's mark-read) follows.
+        if (result.import.unread) applyUnread(result.import.unread);
+        try {
+          await refreshMessages();
+        } catch {
+          // The next snapshot reconciles.
+        }
+        return result.import;
+      } finally {
+        setImporting(false);
+      }
+    },
+    [refreshMessages, applyUnread],
+  );
+
+  const reactToMessage = useCallback(
+    async (target: string, reaction: string) => {
+      // The node records the outgoing reaction and the bridge re-sends
+      // the message as `message_updated`, so the bubble updates through
+      // the SSE stream — no local state change here.
+      return apiPost<ReactResponse>("/api/react", { target, reaction });
+    },
+    [],
+  );
+
+  const clearReaction = useCallback(async (target: string) => {
+    return apiPost<ReactResponse>("/api/react", { target, clear: true });
+  }, []);
 
   // A search is a view switch, like the Tan search: setting the query
   // fetches the search endpoint instead of showing the live feed.
@@ -804,28 +1337,55 @@ export function useTau() {
     unread,
     outbox,
     heldForOthers,
+    settings,
+    settingsError,
     heldMail,
     allowlist,
     bridge,
     social,
     connection,
     pings,
+    infos,
     verifications,
     blocks,
     announcing,
+    backingUp,
+    backupError,
+    exporting,
+    importing,
     send,
+    deleteMessage,
+    sendGroup,
     sendFile,
     ping,
+    fetchInfo,
     showSafetyNumber,
     verifyPeer,
     clearVerification,
     blockPeer,
     unblockPeer,
     announce,
+    renameNode,
+    backup,
+    runDoctor,
     markRead,
+    setPeerAlias,
+    reactToMessage,
+    clearReaction,
+    createGroup,
+    deleteGroup,
     refreshOutbox,
     refreshGroups,
+    refreshSettings,
+    updateSetting,
+    refreshPeers,
+    refreshMessages,
     cancelOutbox,
+    forgetPeer,
+    exportBundle,
+    importBundle,
+    exportMessages,
+    importMessages,
     retryOutbox,
     refreshHeldMail,
     dropHeldMail,

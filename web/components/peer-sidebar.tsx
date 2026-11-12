@@ -1,9 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
-import type { BridgeInfo, NodeInfo, Peer, SocialInfo, TauGroup, VerifyState } from "@/lib/types";
-import type { BlockState, PingState } from "@/lib/use-tau";
+import { ApiError } from "@/lib/api";
+import type {
+  BridgeInfo,
+  NodeInfo,
+  Peer,
+  SocialInfo,
+  TauGroup,
+  VerifyState,
+} from "@/lib/types";
+import type { BlockState, PeerInfoState, PingState } from "@/lib/use-tau";
 import {
   formatAge,
   formatRtt,
@@ -12,7 +20,7 @@ import {
 } from "@/lib/format";
 import { useNow } from "@/lib/use-now";
 
-import { CopyButton, PingIcon, SectionLabel, SignalIcon } from "./ui";
+import { CopyButton, InfoIcon, PingIcon, SectionLabel, SignalIcon } from "./ui";
 
 export function PeerSidebar({
   node,
@@ -21,17 +29,23 @@ export function PeerSidebar({
   bridge,
   social,
   pings,
+  infos,
   blocks,
   verifications,
   unread,
   selected,
   onPing,
+  onInfo,
+  onForgetPeer,
   onBlock,
   onUnblock,
   onVerify,
   onShowSafetyNumber,
   onDismissVerification,
   onSelectPeer,
+  onSetAlias,
+  onCreateGroup,
+  onDeleteGroup,
 }: {
   node: NodeInfo | null;
   peers: Peer[];
@@ -39,23 +53,192 @@ export function PeerSidebar({
   bridge: BridgeInfo | null;
   social: SocialInfo | null;
   pings: Record<string, PingState>;
+  infos: Record<string, PeerInfoState>;
   blocks: Record<string, BlockState>;
   verifications: Record<string, VerifyState>;
   unread: Record<string, number>;
   selected: string;
   onPing: (destination: string) => void;
+  onInfo: (destination: string) => void;
+  onForgetPeer: (destination: string, force: boolean) => Promise<void>;
   onBlock: (destination: string) => void;
   onUnblock: (destination: string) => void;
   onVerify: (destination: string) => void;
   onShowSafetyNumber: (destination: string) => void;
   onDismissVerification: (destination: string) => void;
   onSelectPeer: (destination: string) => void;
+  onSetAlias?: (destination: string, alias: string | null) => Promise<Peer>;
+  onCreateGroup?: (name: string, members: string[]) => Promise<TauGroup>;
+  onDeleteGroup?: (group: string) => Promise<{ id: string; name: string }>;
 }) {
   const now = useNow();
+  const [confirmingForget, setConfirmingForget] = useState<string | null>(
+    null,
+  );
+  const [forgettingId, setForgettingId] = useState<string | null>(null);
+  const [forgetErrors, setForgetErrors] = useState<
+    Record<string, { message: string; code?: string; queued?: number }>
+  >({});
+  const forgetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    };
+  }, []);
+
+  function armForget(destination: string) {
+    setForgetErrors((previous) => {
+      const next = { ...previous };
+      delete next[destination];
+      return next;
+    });
+    setConfirmingForget(destination);
+    if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    forgetTimer.current = setTimeout(() => setConfirmingForget(null), 5000);
+  }
+
+  async function confirmForget(destination: string, force: boolean) {
+    if (forgetTimer.current) clearTimeout(forgetTimer.current);
+    setConfirmingForget(null);
+    setForgettingId(destination);
+    try {
+      await onForgetPeer(destination, force);
+      setForgetErrors((previous) => {
+        const next = { ...previous };
+        delete next[destination];
+        return next;
+      });
+    } catch (caught) {
+      const apiError = caught instanceof ApiError ? caught : null;
+      setForgetErrors((previous) => ({
+        ...previous,
+        [destination]: {
+          message:
+            caught instanceof Error ? caught.message : "could not forget peer",
+          code: apiError?.code,
+          queued: apiError?.queued,
+        },
+      }));
+    } finally {
+      setForgettingId(null);
+    }
+  }
+
+  const [editingAlias, setEditingAlias] = useState<string | null>(null);
+  const [aliasDraft, setAliasDraft] = useState("");
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [aliasSaving, setAliasSaving] = useState(false);
+
+  const startAliasEdit = (peer: Peer) => {
+    // A save is pending for another peer: opening a second editor now
+    // would let that save's completion close or mislabel this one.
+    if (aliasSaving) return;
+    setEditingAlias(peer.destination);
+    setAliasDraft(peer.alias ?? "");
+    setAliasError(null);
+  };
+
+  const saveAlias = async (event: FormEvent, peer: Peer) => {
+    event.preventDefault();
+    if (!onSetAlias) return;
+    const alias = aliasDraft.trim();
+    // Saving a blank label for a peer with no alias is a no-op, not a
+    // trip to the server (which would 400: nothing to clear).
+    if (alias === "" && !peer.alias) {
+      setEditingAlias(null);
+      return;
+    }
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      await onSetAlias(peer.destination, alias === "" ? null : alias);
+      setEditingAlias(null);
+    } catch (error) {
+      setAliasError(
+        error instanceof Error ? error.message : "could not save alias",
+      );
+    } finally {
+      setAliasSaving(false);
+    }
+  };
+
+  const clearAlias = async (peer: Peer) => {
+    if (!onSetAlias) return;
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      await onSetAlias(peer.destination, null);
+      setEditingAlias(null);
+    } catch (error) {
+      setAliasError(
+        error instanceof Error ? error.message : "could not clear alias",
+      );
+    } finally {
+      setAliasSaving(false);
+    }
+  };
+
+  const [showCreate, setShowCreate] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [pickedMembers, setPickedMembers] = useState<string[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [groupError, setGroupError] = useState<string | null>(null);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    };
+  }, []);
+
+  function armDeleteConfirm(id: string) {
+    setGroupError(null);
+    setConfirmingId(id);
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    confirmTimer.current = setTimeout(() => setConfirmingId(null), 5000);
+  }
+
+  async function confirmDelete(id: string) {
+    if (!onDeleteGroup) return;
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    setConfirmingId(null);
+    setDeletingId(id);
+    setGroupError(null);
+    try {
+      await onDeleteGroup(id);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "delete failed");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  async function submitCreate(event: React.FormEvent) {
+    event.preventDefault();
+    if (!onCreateGroup) return;
+    const name = groupName.trim();
+    if (!name || pickedMembers.length === 0) return;
+    setCreating(true);
+    setGroupError(null);
+    try {
+      await onCreateGroup(name, pickedMembers);
+      setGroupName("");
+      setPickedMembers([]);
+      setShowCreate(false);
+    } catch (caught) {
+      setGroupError(caught instanceof Error ? caught.message : "create failed");
+    } finally {
+      setCreating(false);
+    }
+  }
   // Blocking is the one peer action that silences someone, so it takes
   // two clicks: arm on the first, confirm on the second. Unblocking is
   // directly reversible and needs only one.
   const [confirmBlock, setConfirmBlock] = useState<string | null>(null);
+
 
   return (
     <aside className="flex flex-col gap-4 lg:sticky lg:top-[86px] lg:self-start">
@@ -218,6 +401,26 @@ export function PeerSidebar({
           <ul className="mt-2 -mx-1 max-h-[46vh] space-y-1 overflow-y-auto px-1 py-1 thin-scroll">
             {peers.map((peer) => {
               const ping = pings[peer.destination];
+              const info = infos[peer.destination];
+              const infoParts: string[] = [];
+              if (info?.info) {
+                const reported = info.info;
+                if (reported.version) infoParts.push(`tau ${reported.version}`);
+                if (reported.rns_version)
+                  infoParts.push(`RNS ${reported.rns_version}`);
+                if (reported.protocol !== undefined)
+                  infoParts.push(`protocol ${reported.protocol}`);
+                if (reported.uptime !== undefined)
+                  infoParts.push(`up ${formatUptime(reported.uptime)}`);
+                if (reported.peers !== undefined)
+                  infoParts.push(
+                    `${reported.peers} peer${reported.peers === 1 ? "" : "s"}`,
+                  );
+                if (reported.lxmf_enabled !== undefined)
+                  infoParts.push(
+                    reported.lxmf_enabled ? "lxmf on" : "lxmf off",
+                  );
+              }
               const block = blocks[peer.destination];
               const verification = verifications[peer.destination];
               const age = now
@@ -225,6 +428,8 @@ export function PeerSidebar({
                 : peer.age;
               const isSelected = peer.destination === selected;
               const unreadCount = unread[peer.destination] ?? 0;
+              const displayName = peer.alias || peer.name || "unknown";
+              const isEditingAlias = editingAlias === peer.destination;
               const armingBlock = confirmBlock === peer.destination;
               return (
                 <li key={peer.destination}>
@@ -240,16 +445,24 @@ export function PeerSidebar({
                         type="button"
                         onClick={() => onSelectPeer(peer.destination)}
                         className="flex min-w-0 flex-1 items-center gap-2.5 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60"
-                        title={`Message ${peer.name} (${peer.destination})`}
+                        title={`Message ${displayName} (${peer.destination})`}
                       >
                         <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-void/60 font-mono text-xs uppercase text-signal">
-                          {peer.name.slice(0, 1) || "?"}
+                          {displayName.slice(0, 1) || "?"}
                         </span>
                         <span className="min-w-0">
                           <span className="flex items-center gap-1.5">
                             <span className="block truncate text-xs font-medium text-zinc-200">
-                              {peer.name || "unknown"}
+                              {displayName}
                             </span>
+                            {peer.alias ? (
+                              <span
+                                className="ml-1.5 shrink-0 rounded-full border border-line/70 bg-void/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-wide text-mist"
+                                title={`Announced as ${peer.name}`}
+                              >
+                                alias
+                              </span>
+                            ) : null}
                             {peer.verified ? (
                               <span
                                 className="ml-1.5 rounded-full border border-signal/40 bg-signal/10 px-1.5 py-px text-[10px] text-signal"
@@ -279,6 +492,11 @@ export function PeerSidebar({
                             {shortHash(peer.destination, 10)} · {peer.hops} hop
                             {peer.hops === 1 ? "" : "s"} · {formatAge(age)}
                           </span>
+                          {peer.alias ? (
+                            <span className="block truncate font-mono text-[10px] text-mist">
+                              announced as {peer.name}
+                            </span>
+                          ) : null}
                           {peer.key_change_at ? (
                             <span
                               className="block truncate font-mono text-[10px] text-amber-300"
@@ -297,6 +515,18 @@ export function PeerSidebar({
                           ) : null}
                         </span>
                       </button>
+                      {onSetAlias ? (
+                        <button
+                          type="button"
+                          onClick={() => startAliasEdit(peer)}
+                          disabled={aliasSaving}
+                          aria-label={`Set alias for ${displayName}`}
+                          title="Set a local alias for this peer"
+                          className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                        >
+                          ✎
+                        </button>
+                      ) : null}
                       <div className="flex shrink-0 items-center gap-1">
                         <button
                           type="button"
@@ -369,8 +599,100 @@ export function PeerSidebar({
                         >
                           {verification?.pending ? "verifying…" : "Verify"}
                         </button>
+                      <button
+                        type="button"
+                        disabled={forgettingId === peer.destination}
+                        onClick={() => {
+                          if (confirmingForget === peer.destination) {
+                            void confirmForget(peer.destination, false);
+                          } else {
+                            armForget(peer.destination);
+                          }
+                        }}
+                        aria-label={`Forget ${peer.name}`}
+                        title="Forget this peer — removes it from the registry; the next genuine announce re-adds it"
+                        className={`shrink-0 rounded-md border px-1.5 py-1 font-mono text-[10px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                          confirmingForget === peer.destination
+                            ? "border-amber/60 bg-amber/10 text-amber"
+                            : "border-line/70 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                        }`}
+                      >
+                        {forgettingId === peer.destination
+                          ? "forgetting…"
+                          : confirmingForget === peer.destination
+                            ? "confirm forget"
+                            : "forget"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onInfo(peer.destination)}
+                        disabled={info?.pending}
+                        aria-label={`Show info for ${peer.name}`}
+                        title="Show peer info (version, uptime, peers)"
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line/70 text-mist transition hover:border-signal/50 hover:text-signal disabled:opacity-50"
+                      >
+                        <InfoIcon
+                          className={`h-3.5 w-3.5 ${
+                            info?.pending ? "animate-pulse" : ""
+                          }`}
+                        />
+                      </button>
                       </div>
                     </div>
+                    {isEditingAlias ? (
+                      <form
+                        className="mt-2 pl-[42px]"
+                        onSubmit={(event) => void saveAlias(event, peer)}
+                      >
+                        <label className="sr-only" htmlFor={`alias-${peer.destination}`}>
+                          Local alias for {displayName}
+                        </label>
+                        <input
+                          id={`alias-${peer.destination}`}
+                          type="text"
+                          value={aliasDraft}
+                          maxLength={48}
+                          autoFocus
+                          placeholder={peer.name || "alias"}
+                          onChange={(event) =>
+                            setAliasDraft(event.target.value)
+                          }
+                          className="w-full rounded-md border border-line bg-void/60 px-2 py-1 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+                        />
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="submit"
+                            disabled={aliasSaving}
+                            className="rounded-md border border-signal/50 bg-signal/10 px-2 py-0.5 text-[11px] font-medium text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                          >
+                            {aliasSaving ? "saving…" : "save"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={aliasSaving}
+                            onClick={() => setEditingAlias(null)}
+                            className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-zinc-200 disabled:opacity-50"
+                          >
+                            cancel
+                          </button>
+                          {peer.alias ? (
+                            <button
+                              type="button"
+                              disabled={aliasSaving}
+                              onClick={() => void clearAlias(peer)}
+                              className="rounded-md border border-line/70 px-2 py-0.5 text-[11px] text-mist transition hover:text-rose-300 disabled:opacity-50"
+                            >
+                              clear alias
+                            </button>
+                          ) : null}
+                        </div>
+                        {aliasError ? (
+                          <p className="mt-1.5 text-[11px] leading-relaxed text-rose-300">
+                            {aliasError}
+                          </p>
+                        ) : null}
+                      </form>
+                    ) : null}
                     {ping ? (
                       <p
                         className={`mt-1 pl-[42px] font-mono text-[10px] ${
@@ -387,6 +709,50 @@ export function PeerSidebar({
                             ? ping.error
                             : `pong ${formatRtt(ping.rtt_ms)}`}
                       </p>
+                    ) : null}
+                    {info ? (
+                      <p
+                        className={`mt-1 pl-[42px] font-mono text-[10px] ${
+                          info.error
+                            ? "text-rose-300"
+                            : info.pending
+                              ? "text-mist"
+                              : "text-zinc-300"
+                        }`}
+                      >
+                        {info.pending
+                          ? "asking peer…"
+                          : info.error
+                            ? info.error
+                            : infoParts.length > 0
+                              ? infoParts.join(" · ")
+                              : "answered with no usable info"}
+                      </p>
+                    ) : null}
+                    {forgetErrors[peer.destination] ? (
+                      <div className="mt-1 pl-[42px]">
+                        <p className="font-mono text-[10px] leading-relaxed text-rose-300">
+                          {forgetErrors[peer.destination].message}
+                        </p>
+                        {forgetErrors[peer.destination].code ===
+                        "queued_mail" ? (
+                          <button
+                            type="button"
+                            disabled={forgettingId === peer.destination}
+                            onClick={() =>
+                              void confirmForget(peer.destination, true)
+                            }
+                            className="mt-1 rounded-md border border-amber/60 bg-amber/10 px-1.5 py-1 font-mono text-[10px] text-amber transition hover:bg-amber/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50"
+                          >
+                            forget anyway — strand{" "}
+                            {forgetErrors[peer.destination].queued ?? 0}{" "}
+                            queued message
+                            {(forgetErrors[peer.destination].queued ?? 0) === 1
+                              ? ""
+                              : "s"}
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
                     {verification?.safetyNumber && !verification?.result ? (
                       <div className="mt-1 pl-[42px]">
@@ -481,13 +847,107 @@ export function PeerSidebar({
           </span>
         </div>
 
+        {onCreateGroup ? (
+          showCreate ? (
+            <form onSubmit={submitCreate} className="mt-3 space-y-2">
+              <input
+                type="text"
+                value={groupName}
+                onChange={(event) => setGroupName(event.target.value)}
+                placeholder="Group name"
+                aria-label="Group name"
+                maxLength={64}
+                className="w-full rounded-lg border border-line/80 bg-void/60 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-mist focus:border-signal/60 focus:outline-none"
+              />
+              {peers.length === 0 ? (
+                <p className="text-[11px] leading-relaxed text-mist">
+                  No peers yet — a group needs at least one other peer.
+                </p>
+              ) : (
+                <fieldset>
+                  <legend className="sr-only">Members</legend>
+                  <ul className="max-h-32 space-y-1 overflow-y-auto thin-scroll">
+                    {peers.map((peer) => (
+                      <li key={peer.destination}>
+                        <label className="flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-xs text-zinc-200 hover:bg-void/40">
+                          <input
+                            type="checkbox"
+                            checked={pickedMembers.includes(peer.destination)}
+                            onChange={(event) => {
+                              setPickedMembers((previous) =>
+                                event.target.checked
+                                  ? [...previous, peer.destination]
+                                  : previous.filter(
+                                      (hash) => hash !== peer.destination,
+                                    ),
+                              );
+                            }}
+                            className="h-3.5 w-3.5 accent-emerald-400"
+                          />
+                          <span className="min-w-0 truncate">
+                            {peer.name || "unknown"}{" "}
+                            <span className="font-mono text-[10px] text-mist">
+                              {shortHash(peer.destination, 10)}
+                            </span>
+                          </span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                </fieldset>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={
+                    creating ||
+                    !groupName.trim() ||
+                    pickedMembers.length === 0
+                  }
+                  className="rounded-md border border-signal/50 bg-signal/10 px-2.5 py-1 font-mono text-[11px] text-signal transition hover:bg-signal/20 disabled:opacity-50"
+                >
+                  {creating ? "creating…" : "create group"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCreate(false);
+                    setGroupName("");
+                    setPickedMembers([]);
+                    setGroupError(null);
+                  }}
+                  className="rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-mist transition hover:text-zinc-200"
+                >
+                  cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setGroupError(null);
+                setShowCreate(true);
+              }}
+              className="mt-3 rounded-md border border-line/80 px-2.5 py-1 font-mono text-[11px] text-zinc-200 transition hover:border-signal/50 hover:text-signal"
+            >
+              + new group
+            </button>
+          )
+        ) : null}
+
+        {groupError ? (
+          <p className="mt-2 font-mono text-[11px] text-rose-400">
+            {groupError}
+          </p>
+        ) : null}
+
         {groups.length === 0 ? (
           <p className="mt-3 text-[11px] leading-relaxed text-mist">
-            No group chats yet. Create one with{" "}
-            <code className="text-zinc-300">
-              tau group create NAME --peer ...
-            </code>
-            ; composing from the console comes later.
+            No group chats yet.
+            {onCreateGroup
+              ? " Create one above — pick a name and at least one peer."
+              : " Create one with tau group create NAME --peer ..."}
           </p>
         ) : (
           <ul className="mt-2 space-y-2">
@@ -496,12 +956,40 @@ export function PeerSidebar({
                 key={group.id}
                 className="rounded-xl border border-line/70 bg-void/40 px-2.5 py-2"
               >
-                <p className="truncate text-xs font-medium text-zinc-200">
-                  {group.name}
-                </p>
-                <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
-                  {group.members.map((member) => member.name).join(", ")}
-                </p>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-medium text-zinc-200">
+                      {group.name}
+                    </p>
+                    <p className="mt-0.5 truncate font-mono text-[10px] text-mist">
+                      {group.members.map((member) => member.name).join(", ")}
+                    </p>
+                  </div>
+                  {onDeleteGroup ? (
+                    <button
+                      type="button"
+                      disabled={deletingId === group.id}
+                      onClick={() => {
+                        if (confirmingId === group.id) {
+                          void confirmDelete(group.id);
+                        } else {
+                          armDeleteConfirm(group.id);
+                        }
+                      }}
+                      className={`shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-signal/60 disabled:opacity-50 ${
+                        confirmingId === group.id
+                          ? "border-amber/60 bg-amber/10 text-amber"
+                          : "border-line/80 bg-panel/60 text-mist hover:border-rose-400/50 hover:text-rose-300"
+                      }`}
+                    >
+                      {deletingId === group.id
+                        ? "deleting…"
+                        : confirmingId === group.id
+                          ? "confirm delete"
+                          : "delete"}
+                    </button>
+                  ) : null}
+                </div>
               </li>
             ))}
           </ul>

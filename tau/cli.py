@@ -15,6 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
@@ -74,6 +75,7 @@ from .protocol import DEFAULT_TCP_PORT as PROTOCOL_TCP_PORT
 from .protocol import (
     DEFAULT_MESSAGE_KIND,
     MAX_MAIL_TTL,
+    MAX_MESSAGE_CHARS,
     PROTOCOL_VERSION,
     ProtocolError,
     clean_in_reply_to,
@@ -122,6 +124,7 @@ from .tangents.tan import (
     save_post,
     search_posts,
     suggest_authors,
+    tags,
     thread,
     timeline,
     top_posts,
@@ -396,7 +399,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="disappearing message: purge it from the receiver's inbox "
         "after this long (e.g. 30s, 5m, 2h, 7d; at most 30d)",
     )
+    send.add_argument(
+        "--delay",
+        metavar="DURATION",
+        help="schedule the message: queue it now and deliver it after "
+        "this long (e.g. 30s, 5m, 2h, 7d; at most 29d23h — the 30d "
+        "mail TTL less an hour of delivery slack)",
+    )
     send.set_defaults(func=cmd_send)
+
+    # `tau forward` shares `tau send`'s delivery flags: a forward is a
+    # new message carrying the original text plus an attribution line.
+    forward = subparsers.add_parser(
+        "forward",
+        parents=[common],
+        help="forward a stored message to a peer",
+    )
+    forward.add_argument(
+        "--to",
+        action="append",
+        required=True,
+        metavar="NAME|HASH",
+        help="peer name or destination hash (repeatable: forward to several peers)",
+    )
+    forward.add_argument(
+        "message",
+        metavar="ID|PREFIX",
+        help="message id or unique prefix (see tau messages)",
+    )
+    forward.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    forward.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    forward.add_argument(
+        "--no-queue",
+        action="store_true",
+        help="fail instead of queueing the message when the peer is offline",
+    )
+    forward.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="after queueing, wait up to SECONDS for the message to be delivered",
+    )
+    forward.set_defaults(func=cmd_forward)
 
     # `send --file` already means "read the message text from a file",
     # so file transfer gets its own subcommand instead of overloading it.
@@ -500,6 +551,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the newest N pinned messages (default 30)",
     )
     pinned.set_defaults(func=cmd_pinned)
+    retract = subparsers.add_parser(
+        "retract",
+        parents=[common],
+        help="retract a sent message from the recipient's inbox",
+    )
+    retract.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    retract.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    retract.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    retract.set_defaults(func=cmd_retract)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -1035,6 +1105,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_delete.set_defaults(func=cmd_group_delete)
 
+    group_add_member = group_sub.add_parser(
+        "add-member",
+        parents=[common],
+        help="add peers to a group you created",
+    )
+    group_add_member.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_add_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to add (repeatable)",
+    )
+    group_add_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_add_member.set_defaults(func=cmd_group_add_member)
+
+    group_remove_member = group_sub.add_parser(
+        "remove-member",
+        parents=[common],
+        help="remove peers from a group you created",
+    )
+    group_remove_member.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_remove_member.add_argument(
+        "--peer",
+        required=True,
+        action="append",
+        default=[],
+        metavar="NAME|HASH",
+        help="a peer to remove (repeatable)",
+    )
+    group_remove_member.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    group_remove_member.set_defaults(func=cmd_group_remove_member)
+
     group_send = group_sub.add_parser(
         "send",
         parents=[common],
@@ -1243,6 +1363,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--author", metavar="NAME|HASH", help="show one author's posts"
     )
     tan_timeline.add_argument(
+        "--tag", metavar="TAG", help="show only posts carrying this tag"
+    )
+    tan_timeline.add_argument(
         "--limit", type=int, default=30, metavar="N", help="maximum posts"
     )
     tan_timeline.set_defaults(func=cmd_tan_timeline)
@@ -1281,6 +1404,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum posts (default 10)",
     )
     tan_top.set_defaults(func=cmd_tan_top)
+
+    tan_tags = tan_sub.add_parser(
+        "tags",
+        parents=[common],
+        help="list hashtags used in stored posts, most-used first",
+    )
+    tan_tags.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="maximum tags (default 30)",
+    )
+    tan_tags.set_defaults(func=cmd_tan_tags)
 
     tan_verify = tan_sub.add_parser(
         "verify",
@@ -1726,12 +1863,22 @@ def _ago(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
+def _next_try_at(entry: Any) -> Optional[float]:
+    """When an outbox entry may next be attempted: the later of its
+    delivery backoff and its scheduled send time, if either is set."""
+    next_try = entry.next_attempt_at
+    send_after = getattr(entry, "send_after", None)
+    if send_after is not None and (next_try is None or send_after > next_try):
+        return send_after
+    return next_try
+
+
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
 
-def _parse_duration(value: str) -> float:
-    """Parse a ``--expire`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _parse_duration(value: str, *, flag: str = "--expire") -> float:
+    """Parse a ``--expire``/``--delay`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
@@ -1740,7 +1887,7 @@ def _parse_duration(value: str) -> float:
     """
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError("--expire needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{flag} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -1749,13 +1896,13 @@ def _parse_duration(value: str) -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid --expire duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {flag} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError("--expire duration must be positive")
+        raise ValueError(f"{flag} duration must be positive")
     if seconds > MAX_MAIL_TTL:
-        raise ValueError("--expire duration must be at most 30d")
+        raise ValueError(f"{flag} duration must be at most 30d")
     return seconds
 
 def _print_peer_table(
@@ -2545,6 +2692,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         elif getattr(args, "all", False):
             posts = timeline(
@@ -2554,6 +2702,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
         else:
             authors = [record["author"] for record in following(conn)]
@@ -2563,6 +2712,7 @@ def cmd_tan_timeline(args: argparse.Namespace) -> int:
                 conn, authors, limit=args.limit, viewer=viewer,
                 exclude_authors=blocked,
                 exclude_all=blocked is None,
+                tag=getattr(args, "tag", None),
             )
     finally:
         conn.close()
@@ -2643,6 +2793,32 @@ def cmd_tan_top(args: argparse.Namespace) -> int:
         json_output=json_output,
         empty_message="No stored posts yet.",
     )
+    return _EXIT_OK
+
+
+def cmd_tan_tags(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    json_output = _json_mode(args)
+    blocked = load_blocked_set(config.blocklist_path)
+    conn = init_db(config.social_db_path)
+    try:
+        entries = tags(
+            conn,
+            limit=args.limit,
+            exclude_authors=blocked,
+            exclude_all=blocked is None,
+        )
+    finally:
+        conn.close()
+    if json_output:
+        _emit({"tags": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No hashtags in stored posts yet.")
+        return _EXIT_OK
+    width = max(len(str(entry["count"])) for entry in entries)
+    for entry in entries:
+        print(f"{entry['count']:>{width}}  #{entry['tag']}")
     return _EXIT_OK
 
 
@@ -3501,7 +3677,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         on_file=console_file,
     )
     if web_settings is not None:
-        from .webapi import WebBridge, WebBridgeError, check_web_console_bind
+        from .webapi import (
+            WebBridge,
+            WebBridgeError,
+            check_web_console_bind,
+            file_arrival_text,
+        )
 
         host, port, web_dir = web_settings
         try:
@@ -3526,25 +3707,35 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def on_file(record: Dict[str, Any]) -> None:
             console_file(record)
             # The console lists messages, not files: record the arrival
-            # as an inbound message so the file shows up in its feed
-            # (a download link can follow later).
+            # as an inbound message so the file shows up in its feed.
+            # The file metadata rides along so the feed can offer the
+            # bytes back as a download (GET /api/files/<sender>/<name>).
             bridge.record_inbound(
                 {
                     "destination": record.get("destination"),
                     "from": record.get("from"),
-                    "text": (
-                        f"Received file: {record.get('name')} "
-                        f"({record.get('size')} bytes, "
-                        f"sha256 {short_hash(str(record.get('sha256') or ''), 12)})"
-                    ),
+                    "text": file_arrival_text(record),
                     "sent_at": record.get("sent_at"),
                     "received_at": record.get("received_at"),
+                    "file": {
+                        "name": record.get("name"),
+                        "size": record.get("size"),
+                        "sha256": record.get("sha256"),
+                    },
                 }
             )
 
         node.on_peer = on_peer
         node.on_message = on_message
         node.on_file = on_file
+
+        def on_retract(record: Dict[str, Any]) -> None:
+            # The node already deleted the inbox record; drop the
+            # console's own copy so a retracted DM leaves the feed
+            # and never comes back after a restart.
+            bridge.delete_by_wire_id(str(record.get("id") or ""))
+
+        node.on_retract = on_retract
     # The data-directory lock is the more specific guard, so probe it
     # before the port check: a second serve on the same directory
     # reports the instance error even though it would also trip the
@@ -3665,7 +3856,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             send_server = SendServer(
                 config.data_dir,
-                lambda **request: _send_local_message(node, **request),
+                lambda **request: _dispatch_local_send(node, **request),
             )
         except Exception:
             # The send socket is best-effort: a data directory too long
@@ -4495,6 +4686,7 @@ def _send_local_message(
     reply_to: Optional[str] = None,
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Send one DM on the running node, for the local send server.
 
@@ -4521,6 +4713,7 @@ def _send_local_message(
         in_reply_to=in_reply_to,
         expires_at=expires_at,
         kind=kind,
+        send_after=send_after,
     )
     result = _finalize_send_result(
         response, target=target, expires_at=expires_at, queued_before=queued_before
@@ -4534,6 +4727,40 @@ def _send_local_message(
     return result
 
 
+def _retract_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Retract one DM on the running node, for the local send server."""
+    return node.send_retraction(
+        target,
+        message_id,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
+
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send or a retraction.
+
+    The socket carries both, distinguished by ``op``: ``"send"`` (the
+    default, so older one-shot clients keep working) runs
+    :func:`_send_local_message`, while ``"retract"`` runs the
+    retraction on the serving node, so ``tau retract`` works while
+    ``tau serve`` holds the data directory.
+    """
+    op = request.pop("op", "send")
+    if op == "retract":
+        return _retract_local_message(node, **request)
+    if op == "send":
+        return _send_local_message(node, **request)
+    raise NodeError(f"unknown local send operation: {op!r}")
+
+
 def _send_via_local_node(
     args: argparse.Namespace,
     config: TauConfig,
@@ -4543,6 +4770,7 @@ def _send_via_local_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """One-shot send on a node this process starts and stops itself."""
     node = TauNode(config, name=config.name)
@@ -4576,6 +4804,7 @@ def _send_via_local_node(
                     in_reply_to=reply_to,
                     expires_at=expires_at,
                     kind=kind,
+                    send_after=send_after,
                 )
             except (NodeError, PeerError, MailboxError) as exc:
                 if len(targets) == 1:
@@ -4615,6 +4844,7 @@ def _send_via_running_node(
     reply_ids: Dict[str, str],
     kind: Optional[str] = None,
     wait: float = 0.0,
+    send_after: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Send through the serving node on its local socket."""
     from .local_ipc import LocalIPCUnavailable
@@ -4634,6 +4864,7 @@ def _send_via_running_node(
                 reply_to=getattr(args, "reply_to", None),
                 kind=kind,
                 wait=wait,
+                send_after=send_after,
             )
         except LocalIPCUnavailable as exc:
             raise NodeError(
@@ -4649,6 +4880,33 @@ def _send_via_running_node(
             reply_ids[target] = reply_id
         results.append(result)
     return results
+
+
+def _retract_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Retract through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="retract",
+            target=recipient,
+            message_id=message_id,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
 
 
 #: How long a one-shot send waits for a serving node's socket to appear
@@ -4831,18 +5089,44 @@ def cmd_send(args: argparse.Namespace) -> int:
     expire_text = getattr(args, "expire", None)
     if expire_text is not None:
         expires_at = time.time() + _parse_duration(expire_text)
-
+    send_after = None
+    delay_text = getattr(args, "delay", None)
+    if delay_text is not None:
+        if getattr(args, "no_queue", False):
+            print(
+                "error: --delay cannot be combined with --no-queue",
+                file=sys.stderr,
+            )
+            return 2
+        delay = _parse_duration(delay_text, flag="--delay")
+        if delay > MAX_MAIL_TTL - 3600.0:
+            print(
+                "error: --delay must be at most 29d23h (the 30d mail TTL "
+                "less an hour of delivery slack)",
+                file=sys.stderr,
+            )
+            return 2
+        send_after = time.time() + delay
+        if expires_at is not None and send_after >= expires_at:
+            print(
+                "error: --delay must be shorter than --expire — the "
+                "message would expire before it is sent",
+                file=sys.stderr,
+            )
+            return 2
     targets = args.to if isinstance(args.to, list) else [args.to]
     reply_ids: Dict[str, str] = {}
     # A serving node owns the data directory: send through it instead of
     # starting a second Reticulum instance on the same identity.
     if _send_routes_via_running_node(config):
         results = _send_via_running_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
     else:
         results = _send_via_local_node(
-            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait
+            args, config, text, targets, expires_at, reply_ids, kind=kind, wait=wait,
+            send_after=send_after,
         )
 
     failed = [result for result in results if not result.get("ok", True)]
@@ -4894,6 +5178,11 @@ def cmd_send(args: argparse.Namespace) -> int:
                 waited = result.get("waited")
                 if waited is not None:
                     print(f"still queued for {target} after {waited:.1f}s")
+                elif result.get("send_after"):
+                    print(
+                        f"scheduled for {target} — sends in "
+                        f"{_ago(result['send_after'] - time.time())}"
+                    )
                 else:
                     print(f"queued for {target} — they are unreachable right now")
                 print(f"  id:      {result['id']}")
@@ -4929,12 +5218,89 @@ def cmd_send(args: argparse.Namespace) -> int:
                     print("  the receiver dropped it — past its expiry")
                 if expires_at is not None:
                     print(f"  disappears in {_ago(expires_at - time.time())}")
-        if any(result.get("queued") for result in results):
-            print("  it will be delivered automatically when they are heard from;")
+        queued = [result for result in results if result.get("queued")]
+        if queued:
+            if all(result.get("send_after") for result in queued):
+                print("  it will be delivered at its scheduled time;")
+            else:
+                print(
+                    "  it will be delivered automatically when they are heard from;"
+                )
             print("  check `tau outbox` for the queue, or just leave a node serving")
     return _EXIT_ERROR if (failed or wait_failed) else _EXIT_OK
 
 
+def cmd_forward(args: argparse.Namespace) -> int:
+    """Forward a stored message to another peer, attributed to its sender.
+
+    The forwarded text is the original prefixed with one attribution
+    line, so the recipient sees who said it on any transport with no
+    protocol change.  Delivery reuses :func:`cmd_send` wholesale — the
+    forward is a new message, so it carries no expiry, kind, or reply
+    chain from the original.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    try:
+        record = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if record.get("kind") == "group":
+        # Group messages live in the same inbox but belong to the group:
+        # forwarding one would leak the group's text as a DM to any
+        # --to recipient, including a nonmember.
+        raise NodeError("cannot forward a group message: forward a DM instead")
+    # Messages hidden by the block-list are hidden from `tau messages`
+    # and must not be forwarded either.  An unreadable block-list fails
+    # closed, matching the listing.  Sent messages carry the *recipient*
+    # in `destination`, so the check only applies to received ones —
+    # forwarding your own message must not trip on its old recipient.
+    if record.get("direction") != "out":
+        blocked = load_blocked_set(config.blocklist_path)
+        if blocked is None:
+            raise NodeError("cannot forward: the block-list could not be read")
+        if record.get("destination") in blocked:
+            raise NodeError("cannot forward a message from a blocked peer")
+    text = record.get("text")
+    if not text:
+        # File records carry no text (see inbox._valid_record).
+        raise NodeError("cannot forward a file message: it has no text to send")
+    if record.get("direction") == "out":
+        # The message is one this node sent; the recipient already knows
+        # the forwarder, so the attribution names the forwarder as "you".
+        label = "you"
+    else:
+        # Inbox records already store the sender's display name as known
+        # when the message arrived; re-resolve it so a newer alias wins,
+        # falling back to the stored label (a name, or the short hash).
+        sender_hash = record.get("destination")
+        stored_name = record.get("from")
+        if not stored_name or stored_name == "unknown":
+            # No real name was ever recorded: attribute by short hash.
+            label = (
+                short_hash(sender_hash)
+                if isinstance(sender_hash, str) and sender_hash
+                else "unknown"
+            )
+        else:
+            label = str(stored_name)
+        peer = (
+            PeerRegistry(config.peers_path).get(sender_hash)
+            if isinstance(sender_hash, str) and sender_hash
+            else None
+        )
+        if peer is not None:
+            label = peer.display_name
+    forwarded = f"Forwarded from {label}:\n{text}"
+    if len(forwarded) > MAX_MESSAGE_CHARS:
+        raise NodeError(
+            f"message is too long to forward "
+            f"({len(forwarded)} > {MAX_MESSAGE_CHARS} characters)"
+        )
+    # `cmd_send` reads its text from `args.message`; hand it the
+    # attributed text and let it own delivery, queueing, and output.
+    args.message = forwarded
+    return cmd_send(args)
 
 
 def cmd_send_file(args: argparse.Namespace) -> int:
@@ -5014,7 +5380,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
             for entry in entries:
                 peer = registry.get(entry.to)
                 name = peer.display_name if peer is not None else entry.to_name
-                next_try = entry.next_attempt_at
+                next_try = _next_try_at(entry)
                 if next_try is None or next_try <= now:
                     next_try_text = "now"
                 else:
@@ -5632,7 +5998,12 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         raise NodeError(f"export file is not valid JSON: {exc}") from exc
     inbox = Inbox(config.inbox_path)
-    result = inbox.import_messages(document)
+    mailbox = Mailbox(config.mailbox_path)
+    # Hold the mailbox transaction across the import: it reloads the
+    # markers from disk, so a retract persisted by a running `tau serve`
+    # is seen, and it cannot land between the check and the insert.
+    with mailbox.transaction():
+        result = inbox.import_messages(document, is_retracted=mailbox.is_retracted)
     if _json_mode(args):
         _emit(result, True)
     else:
@@ -5732,6 +6103,114 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
         return _EXIT_OK
     print(f"deleted group {group['name']} ({group['id'][:8]})")
     return _EXIT_OK
+
+
+def _roster_hash(target: Any, members: List[str]) -> Optional[str]:
+    """A 32-hex target already in the roster, or ``None``."""
+    if not isinstance(target, str):
+        return None
+    cleaned = target.strip().lower()
+    if len(cleaned) != 32 or cleaned not in members:
+        return None
+    try:
+        bytes.fromhex(cleaned)
+    except ValueError:
+        return None
+    return cleaned
+
+
+def _change_group_members(args: argparse.Namespace, *, adding: bool) -> int:
+    """Add peers to, or remove peers from, a group this node created.
+
+    The id derives from the roster, so the change is a successor group
+    (same name, new id); the store swaps the old record for the new one
+    in a single transaction.
+    """
+    config = _make_config(args)
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        own_hash = node.destination_hexhash
+        group = node.groups.find(args.group)
+        if not group["local"] or group["creator"] != own_hash:
+            raise NodeError("only the creator can change a group's members")
+        members = list(group["members"])
+        peers: List[Any] = []
+        for target in getattr(args, "peer", []):
+            # Removing a member only needs the hash already in the
+            # roster: an offline member may have left the registry,
+            # and resolving it would wait out the whole discover
+            # timeout.  Adding still resolves, so a mistyped or
+            # unknown peer is refused before the roster changes.
+            fast = None if adding else _roster_hash(target, members)
+            if fast is not None:
+                known = node.registry.get(fast)
+                peers.append(
+                    SimpleNamespace(
+                        hexhash=fast,
+                        display_name=(
+                            known.display_name
+                            if known is not None
+                            else fast[:8]
+                        ),
+                    )
+                )
+            else:
+                peers.append(
+                    node.resolve_peer(
+                        target,
+                        timeout=float(getattr(args, "discover_timeout", 10.0)),
+                    )
+                )
+        for peer in peers:
+            if adding:
+                if peer.hexhash == own_hash:
+                    raise NodeError(
+                        "the creator is already a member; drop --peer self"
+                    )
+                if peer.hexhash in members:
+                    raise NodeError(
+                        f"{peer.display_name} is already a member of"
+                        f" {group['name']!r}"
+                    )
+                members.append(peer.hexhash)
+            else:
+                if peer.hexhash == own_hash:
+                    raise NodeError("cannot remove the creator from the group")
+                if peer.hexhash not in members:
+                    raise NodeError(
+                        f"{peer.display_name} is not a member of"
+                        f" {group['name']!r}"
+                    )
+                members.remove(peer.hexhash)
+        new_group = node.groups.update_members(
+            group["id"], members, created_by=own_hash
+        )
+    finally:
+        node.stop()
+
+    described = _describe_group(new_group, node.registry)
+    if _json_mode(args):
+        _emit({"group": described, "previous_id": group["id"]}, True)
+        return _EXIT_OK
+    action = "added to" if adding else "removed from"
+    names = ", ".join(peer.display_name for peer in peers)
+    print(
+        f"{names} {action} group {new_group['name']}"
+        f" ({group['id'][:8]} -> {new_group['id'][:8]})"
+    )
+    for member in described["members"]:
+        print(f"  {member['name']} ({member['hash'][:8]})")
+    print("Members learn the new roster from the next message sent to it.")
+    return _EXIT_OK
+
+
+def cmd_group_add_member(args: argparse.Namespace) -> int:
+    return _change_group_members(args, adding=True)
+
+
+def cmd_group_remove_member(args: argparse.Namespace) -> int:
+    return _change_group_members(args, adding=False)
 
 
 def cmd_group_send(args: argparse.Namespace) -> int:
@@ -5858,6 +6337,122 @@ def cmd_react(args: argparse.Namespace) -> int:
         print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
     else:
         print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
+def cmd_retract(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.message)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to retract")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be retracted"
+        )
+    if target.get("kind") == "group":
+        raise NodeError("group messages cannot be retracted in v1")
+    recipient = target.get("destination") or ""
+    if not recipient:
+        raise NodeError("that message has no known recipient to retract from")
+    # A message still in the outbox has not reached its recipient yet; a
+    # retract answered "not found" would let the queued copy arrive later.
+    # Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it instead"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: retract through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _retract_via_running_node(
+                config,
+                recipient,
+                str(target["id"]),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Retracts ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver retract: {exc} "
+                "(retracts need the peer online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_retraction(
+                    recipient,
+                    str(target["id"]),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Retracts ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver retract: {exc} "
+                    "(retracts need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    # The peer confirmed (or already had it gone): drop this node's own
+    # sent copy too, so the message is gone on both sides.  A local
+    # delete failure is reported, not hidden — the retract itself
+    # already succeeded.
+    try:
+        inbox.delete(str(target["id"]))
+    except InboxError as exc:
+        raise NodeError(
+            "retract delivered but the local copy could not be deleted:"
+            f" {exc}"
+        ) from exc
+    # The sent record lives in mailbox.json, not the inbox: drop it
+    # too, or `tau messages --sent` keeps showing the retracted text.
+    # Only after the retract and the inbox delete succeeded, so a
+    # failed retract never erases the sent record.
+    Mailbox(config.mailbox_path).discard_sent(str(target["id"]))
+
+    peer = registry.get(recipient)
+    name = peer.display_name if peer is not None else short_hash(recipient)
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": recipient,
+                "to_name": name,
+                "deleted": bool(response.get("deleted")),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("deleted"):
+        print(
+            f"retracted your message {_safe_id_prefix(str(target['id']))}"
+            f" from {name}'s inbox"
+        )
+    else:
+        print(
+            f"{name} had no copy of {_safe_id_prefix(str(target['id']))}"
+            " to retract"
+        )
     return _EXIT_OK
 
 
@@ -6183,7 +6778,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
         payload["target_delivered"] = target_entry.id in delivered_ids
         if fresh is not None:
             payload["target_attempts"] = fresh.attempts
-            payload["target_next_attempt_at"] = fresh.next_attempt_at
+            payload["target_next_attempt_at"] = _next_try_at(fresh)
 
     if _json_mode(args):
         _emit(payload, True)
@@ -6198,7 +6793,7 @@ def cmd_outbox_retry(args: argparse.Namespace) -> int:
                 " delivered by another process)"
             )
         else:
-            next_try = fresh.next_attempt_at
+            next_try = _next_try_at(fresh)
             if next_try is None or next_try <= time.time():
                 next_text = "now"
             else:
