@@ -36,6 +36,7 @@ import type {
   PeerInfoResult,
   PeersResponse,
   PingResult,
+  PinMessageResponse,
   ReactResponse,
   RenameResponse,
   RetryOutboxResponse,
@@ -47,6 +48,7 @@ import type {
   SocialInfo,
   TauGroup,
   TauMessage,
+  UnpinMessageResponse,
   UnreadCounts,
   UpdateSettingsResponse,
   VerifyPeerResponse,
@@ -142,6 +144,13 @@ export function useTau() {
   const [searchResults, setSearchResults] = useState<TauMessage[]>([]);
   const [searchQuery, setSearchQuery] = useState<string | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  // The pinned view, or null for the live traffic. Like search, it is a
+  // snapshot kept beside `messages`: pinning and unpinning keep updating
+  // `messages` underneath, and clearing the view returns to it.
+  const [pinnedMessages, setPinnedMessages] = useState<TauMessage[] | null>(
+    null,
+  );
+  const [pinnedError, setPinnedError] = useState<string | null>(null);
   const [unread, setUnread] = useState<UnreadCounts>(EMPTY_UNREAD);
   const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [heldForOthers, setHeldForOthers] = useState(0);
@@ -213,6 +222,12 @@ export function useTau() {
     const query = searchQueryRef.current;
     if (query) void runSearchRef.current?.(query);
   }, []);
+  const pinnedSeq = useRef(0);
+  // Bumped on every live pin or unpin, so a pinned GET that raced one
+  // is asked again rather than overwriting the newer event.
+  const pinnedEvents = useRef(0);
+  // Re-reads the pinned view on a reconnect; set once showPinned exists.
+  const refreshPinnedView = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     searchQueryRef.current = searchQuery;
@@ -293,6 +308,8 @@ export function useTau() {
       applyUnread(snapshot.unread ?? EMPTY_UNREAD, true);
       setBridge(snapshot.bridge);
       setSocial(snapshot.social ?? null);
+      // A reconnect may have missed pin changes: re-read an open pinned view.
+      refreshPinnedView.current?.();
       setConnection("live");
     };
 
@@ -318,6 +335,13 @@ export function useTau() {
       if (!payload?.message) return;
       const message = payload.message;
       liveTouched.current.set(message.id, ++liveEpoch.current);
+      if (message.pinned !== undefined) pinnedEvents.current += 1;
+      // An update that omits `pinned` keeps the pin state the console
+      // already shows; only an explicit `pinned: false` clears it.
+      const withPinState = (prior: TauMessage): TauMessage =>
+        message.pinned === undefined && prior.pinned
+          ? { ...message, pinned: true }
+          : message;
       // A queued message that the mail sweep has since delivered: the
       // server re-sends the same console id with status "delivered".
       // Replace it in place rather than appending a duplicate.  A
@@ -325,11 +349,37 @@ export function useTau() {
       setMessages((previous) =>
         previous.map((entry) =>
           entry.id === message.id && !holdsNewerEdit(entry, message)
-            ? message
+            ? withPinState(entry)
             : entry,
         ),
       );
       if (message.edited_at !== undefined) refreshActiveSearch();
+      // Search hits show the same bubble, so they follow pin changes too.
+      setSearchResults((previous) =>
+        previous.some((entry) => entry.id === message.id)
+          ? previous.map((entry) =>
+              entry.id === message.id ? withPinState(entry) : entry,
+            )
+          : previous,
+      );
+      // A pin or unpin lands here too: keep an open pinned view in
+      // step. An unpin removes the entry; a pin replaces it, or inserts
+      // it newest first when another tab pinned a message this view
+      // does not list yet.
+      setPinnedMessages((previous) => {
+        if (previous === null) return null;
+        if (message.pinned === false) {
+          return previous.filter((entry) => entry.id !== message.id);
+        }
+        const existing = previous.find((entry) => entry.id === message.id);
+        if (existing) {
+          return previous.map((entry) =>
+            entry.id === message.id ? withPinState(entry) : entry,
+          );
+        }
+        if (message.pinned !== true) return previous;
+        return [message, ...previous].sort((a, b) => b.id - a.id);
+      });
     };
 
     const onMessageDeleted = (event: Event) => {
@@ -339,6 +389,11 @@ export function useTau() {
       if (!payload || typeof payload.message_id !== "number") return;
       setMessages((previous) =>
         previous.filter((entry) => entry.id !== payload.message_id),
+      );
+      setPinnedMessages((previous) =>
+        previous === null
+          ? null
+          : previous.filter((entry) => entry.id !== payload.message_id),
       );
     };
 
@@ -681,6 +736,17 @@ export function useTau() {
     }
     return result;
   }, [refreshActiveSearch]);
+
+  const pinMessage = useCallback(async (id: number) => {
+    // The node records the pin and the bridge re-sends the message as
+    // `message_updated`, so the bubble updates through the SSE stream —
+    // no local state change here, like `reactToMessage`.
+    return apiPost<PinMessageResponse>("/api/messages/pin", { id });
+  }, []);
+
+  const unpinMessage = useCallback(async (id: number) => {
+    return apiPost<UnpinMessageResponse>("/api/messages/unpin", { id });
+  }, []);
   const retryOutbox = useCallback(
     async (id?: string) => {
       const result = await apiPost<RetryOutboxResponse>(
@@ -1380,6 +1446,22 @@ export function useTau() {
   // A search is a view switch, like the Tan search: setting the query
   // fetches the search endpoint instead of showing the live feed.
   // Clearing it returns to the live traffic the same way.
+  const clearSearch = useCallback(() => {
+    // Invalidate any in-flight search so its late response is discarded.
+    searchSeq.current += 1;
+    setSearchQuery(null);
+    setSearchResults([]);
+    setSearchError(null);
+  }, []);
+
+  const clearPinned = useCallback(() => {
+    // Invalidate any in-flight pinned fetch so its late response is
+    // discarded.
+    pinnedSeq.current += 1;
+    setPinnedMessages(null);
+    setPinnedError(null);
+  }, []);
+
   const runSearch = useCallback(async (trimmed: string) => {
     // Each request takes a sequence number; a response only applies if it
     // is still the latest request, so superseded or cleared searches
@@ -1408,6 +1490,9 @@ export function useTau() {
     async (query: string) => {
       const trimmed = query.trim();
       if (!trimmed) return;
+      // Opening a search leaves the pinned view: the two switches are
+      // exclusive, and a stale pinned list must not survive underneath.
+      clearPinned();
       if (trimmed === searchQueryRef.current) {
         // Resubmitting the current query: setting the same state would
         // bail out without reloading, so refresh directly — and keep
@@ -1423,16 +1508,47 @@ export function useTau() {
       setSearchQuery(trimmed);
       await runSearch(trimmed);
     },
-    [runSearch],
+    [runSearch, clearPinned],
   );
 
-  const clearSearch = useCallback(() => {
-    // Invalidate any in-flight search so its late response is discarded.
-    searchSeq.current += 1;
-    setSearchQuery(null);
-    setSearchResults([]);
-    setSearchError(null);
-  }, []);
+  // A pinned view is a view switch, like the Tan search: opening it
+  // fetches the pinned endpoint instead of showing the live feed, and
+  // clearing it returns to the live traffic. The two switches are
+  // exclusive — a search and the pinned view never show at once.
+  const showPinned = useCallback(async () => {
+    const seq = ++pinnedSeq.current;
+    try {
+      let result: MessagesResponse;
+      let events: number;
+      do {
+        events = pinnedEvents.current;
+        result = await apiGet<MessagesResponse>("/api/messages?pinned=1");
+        // A pin or unpin that landed while this GET was in flight may
+        // be missing from it: fetch again rather than apply it over the event.
+      } while (seq === pinnedSeq.current && events !== pinnedEvents.current);
+      if (seq !== pinnedSeq.current) return;
+      // The endpoint returns oldest first; the view shows newest first,
+      // like search results.
+      setPinnedMessages([...result.messages].reverse());
+      setPinnedError(null);
+      clearSearch();
+    } catch (caught) {
+      if (seq !== pinnedSeq.current) return;
+      setPinnedError(
+        caught instanceof Error ? caught.message : "pinned view failed",
+      );
+    }
+  }, [clearSearch]);
+
+  // Only an open pinned view needs the reconnect re-read.
+  useEffect(() => {
+    refreshPinnedView.current =
+      pinnedMessages === null
+        ? null
+        : () => {
+            void showPinned().catch(() => undefined);
+          };
+  }, [pinnedMessages, showPinned]);
 
   return {
     node,
@@ -1444,6 +1560,12 @@ export function useTau() {
     searchError,
     search,
     clearSearch,
+    pinnedMessages,
+    pinnedError,
+    showPinned,
+    clearPinned,
+    pinMessage,
+    unpinMessage,
     unread,
     outbox,
     heldForOthers,

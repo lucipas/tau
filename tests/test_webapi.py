@@ -7078,6 +7078,80 @@ def test_delayed_reaction_event_hides_non_member_reaction(node, tmp_path):
         bridge.stop()
 
 
+def test_pin_event_hides_non_member_group_reaction(bridge, node, tmp_path):
+    """Pinning a group message must not leak a non-member reaction
+    (CodeRabbit Major on PR #303).
+
+    The pin endpoint publishes a ``message_updated`` carrying the
+    inbox's overlays; it overlaid reactions without the group-roster
+    filter that :meth:`messages` applies, so an open tab learned of
+    a CLI-made reaction a fresh read hides.  The event must agree
+    with the listing.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+    node.inbox = Inbox(inbox_path)
+    cli_inbox = Inbox(inbox_path)
+    group = node.groups.find("crew")
+    message = {
+        "from": "alice",
+        "destination": PEER_HASH,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group["id"],
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "wire-g1",
+    }
+    node.inbox.append(dict(message))
+    assert bridge.record_inbound(dict(message)) is not None
+    # CLI-made reactions, written by a second process: one from a
+    # non-member, one from a member.
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": OTHER_HASH,
+            "from": "mallory",
+            "reaction": "👎",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-1",
+        }
+    )
+    cli_inbox.record_reaction(
+        {
+            "target": "wire-g1",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "reaction": "👍",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "react-2",
+        }
+    )
+    status, _, _ = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    updates = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+        and event.get("message", {}).get("wire_id") == "wire-g1"
+    ]
+    assert len(updates) == 1
+    assert updates[0]["message"]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+    assert updates[0]["message"]["pinned"] is True
+    assert bridge.messages()[0]["reactions"] == [
+        {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+    ]
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {
@@ -7510,6 +7584,223 @@ def test_delete_message_endpoint_rejects_unknown_and_bad_ids(bridge):
     )
     assert status == 400
     assert "field 'id'" in payload["error"]["message"]
+
+
+def _seed_pinnable_message(bridge, node, wire_id="wire-1"):
+    node.inbox.append(
+        {
+            "id": wire_id,
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+        }
+    )
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": wire_id,
+        }
+    )
+
+
+def test_pin_message_endpoint_pins_inbox_and_annotates_feed(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "pinned": {"id": 1, "wire_id": "wire-1", "already_pinned": False},
+    }
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+    assert [entry["id"] for entry in node.inbox.list_messages(pinned_only=True)] == [
+        "wire-1"
+    ]
+    # Other tabs learn through a message_updated event carrying the
+    # annotated entry, like a reaction does.
+    updated_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ]
+    assert len(updated_events) == 1
+    assert updated_events[0]["message"]["id"] == 1
+    assert updated_events[0]["message"]["pinned"] is True
+
+
+def test_pin_message_endpoint_is_a_noop_when_already_pinned(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["already_pinned"] is True
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+
+
+def test_unpin_message_endpoint_clears_pin(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    _json(bridge, "/api/messages/pin", method="POST", body={"id": 1})
+    status, _, payload = _json(
+        bridge, "/api/messages/unpin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "unpinned": {"id": 1, "wire_id": "wire-1", "was_pinned": True},
+    }
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "pinned" not in feed["messages"][0]
+    assert node.inbox.list_messages(pinned_only=True) == []
+    # Unpinning again is a no-op, not an error.
+    status, _, payload = _json(
+        bridge, "/api/messages/unpin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["unpinned"]["was_pinned"] is False
+
+
+def test_console_feed_shows_cli_pin(bridge, node):
+    # A pin made from another process (``tau pin``) lands in the shared
+    # inbox.json only; the listing must still show it on the next read.
+    _seed_pinnable_message(bridge, node)
+    node.inbox.pin("wire-1")
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["pinned"] is True
+
+
+def test_messages_pinned_filter_lists_only_pinned(bridge, node):
+    _seed_pinnable_message(bridge, node)
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "not pinned",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "wire-2",
+        }
+    )
+    node.inbox.append(
+        {
+            "id": "wire-2",
+            "destination": PEER_HASH,
+            "from": "alice",
+            "text": "not pinned",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+        }
+    )
+    _json(bridge, "/api/messages/pin", method="POST", body={"id": 1})
+    _, _, feed = _json(bridge, "/api/messages?pinned=1")
+    assert [entry["id"] for entry in feed["messages"]] == [1]
+    assert feed["messages"][0]["pinned"] is True
+    _, _, feed = _json(bridge, "/api/messages")
+    assert len(feed["messages"]) == 2
+
+
+def test_pin_message_endpoint_rejects_unknown_and_bad_ids(bridge):
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 7}
+    )
+    assert status == 400
+    assert "unknown message" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": "1"}
+    )
+    assert status == 400
+    assert "field 'id'" in payload["error"]["message"]
+
+
+def test_pin_message_endpoint_rejects_message_without_stored_copy(bridge):
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            # No wire id: an entry from before ids existed, or one the
+            # node inbox never stored. There is no inbox record to pin.
+        }
+    )
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "no stored copy" in payload["error"]["message"]
+
+
+def test_pin_message_endpoint_rejects_queued_entry(bridge, node):
+    _queue_send(node)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 200
+    assert payload["message"]["status"] == "queued"
+
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 400
+    assert "still queued" in payload["error"]["message"]
+
+
+def test_pin_message_does_not_publish_blocked_message(bridge, node):
+    # A message received before its sender was blocked is retained but
+    # hidden from the listing; pinning it must not publish its text to
+    # /api/events, where a remote client could read it back by id.
+    _seed_pinnable_message(bridge, node)
+    node.blocklist = BlockList(blocked=frozenset({PEER_HASH}))
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["already_pinned"] is False
+    # The pin itself landed — only the event is suppressed.
+    assert [
+        entry["id"] for entry in node.inbox.list_messages(pinned_only=True)
+    ] == ["wire-1"]
+    assert [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_updated"
+    ] == []
+
+
+def test_messages_pinned_reports_inbox_read_failure(bridge, node, monkeypatch):
+    _seed_pinnable_message(bridge, node)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("inbox unreadable")
+
+    monkeypatch.setattr(node.inbox, "list_messages", _boom)
+    # The pinned view reports the failure instead of an empty pin list.
+    with pytest.raises(RuntimeError, match="inbox unreadable"):
+        bridge.messages(limit=-1, strict_pins=True)
+    # The live feed stays up: a failed pin overlay degrades to no pins.
+    _, _, feed = _json(bridge, "/api/messages")
+    assert "pinned" not in feed["messages"][0]
 
 
 def test_delete_by_wire_id_removes_the_console_copy(bridge):
