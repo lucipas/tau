@@ -141,6 +141,17 @@ def test_schedule_post_rejects_text_that_cannot_fit_a_tan_request(tmp_path):
     assert load_scheduled_posts(path).posts == ()
 
 
+def test_schedule_post_rejects_text_that_only_fits_with_short_key(tmp_path):
+    # The preflight check once reserved 64 characters for the author's
+    # key, but a real post key is 128 hex characters: 1,900 four-byte
+    # characters passed the old check yet overflowed the 8 KiB request
+    # once the real key was encoded.  Refuse at schedule time.
+    path = tmp_path / "scheduled-posts.json"
+    with pytest.raises(ScheduledPostsError, match="encoded limit"):
+        schedule_post(path, text="😀" * 1900, publish_at=1000.0, now=900.0)
+    assert load_scheduled_posts(path).posts == ()
+
+
 def test_schedule_post_accepts_long_text_that_fits(tmp_path):
     # 1,500 four-byte characters (6,000 bytes) fit the request with
     # room to spare.
@@ -310,6 +321,29 @@ def test_failed_publish_backs_off_before_retrying(tmp_path):
     assert result == {"published": 1, "kept": 0}
     assert len(app.created) == 1
     assert len(load_scheduled_posts(path)) == 0
+
+
+def test_retry_publishes_canonical_post_without_storage_fields(tmp_path):
+    # The real TanApp.get_post returns the canonical post plus the
+    # storage-only "seq"/"linked" fields; publish() encodes the dict
+    # unchanged, so the retry path must strip them before publishing.
+    path = tmp_path / "scheduled-posts.json"
+    schedule_post(path, text="now", publish_at=1000.0, now=900.0)
+
+    class _MetaApp(_FakeTanApp):
+        def get_post(self, digest):
+            stored = super().get_post(digest)
+            return {**stored, "seq": 3, "linked": True} if stored else None
+
+    app = _MetaApp(fail_publish=True)
+    result = publish_due_scheduled_posts(path, app, now=2000.0)
+    assert result == {"published": 0, "kept": 1}
+
+    app.fail_publish = False
+    result = publish_due_scheduled_posts(path, app, now=2100.0)
+    assert result == {"published": 1, "kept": 0}
+    assert "seq" not in app.published[-1][0]
+    assert "linked" not in app.published[-1][0]
 
 
 def test_partial_failure_retries_only_failed_peers(tmp_path):

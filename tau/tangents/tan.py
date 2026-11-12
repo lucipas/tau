@@ -419,7 +419,7 @@ def check_post_text_fits(
         {
             "v": TAN_VERSION,
             "author": "0" * AUTHOR_HEX_LENGTH,
-            "key": "0" * 64,
+            "key": "0" * KEY_HEX_LENGTH,
             "name": (
                 sanitize_name(name)
                 if name is not None

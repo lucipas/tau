@@ -494,7 +494,16 @@ def publish_due_scheduled_posts(
                     targets = _resolve_publish_targets(
                         post, resolve_peer, should_stop, deadline
                     )
-                    created = app.get_post(post.post_hash) if post.post_hash else None
+                    stored = app.get_post(post.post_hash) if post.post_hash else None
+                    # get_post returns the canonical post plus storage-only
+                    # "seq"/"linked" fields; publish() encodes the dict
+                    # unchanged, so strip them — _check_wire_size only
+                    # measures the canonical post.
+                    created = (
+                        {k: v for k, v in stored.items() if k not in ("seq", "linked")}
+                        if stored is not None
+                        else None
+                    )
                     if created is None:
                         created = app.create_post(post.text, reply_to=post.reply_to)
                         # Persist the signed post's identity before sending, so
