@@ -38,6 +38,7 @@ function renderCard(
     <PostCard
       post={post}
       onToggleLike={() => {}}
+      onRepost={() => {}}
       onToggleLikers={onToggleLikers}
       likersOpen={props.likersOpen}
       likers={props.likers}

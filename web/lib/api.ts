@@ -29,11 +29,22 @@ export const API_BASE = resolveApiBase();
 
 export class ApiError extends Error {
   status: number;
+  // Machine-readable refusal code from the bridge, when it sent one
+  // (e.g. "queued_mail"); queued carries the count behind that code.
+  code?: string;
+  queued?: number;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    code?: string,
+    queued?: number,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.queued = queued;
   }
 }
 
@@ -52,6 +63,8 @@ async function parseResponse<T>(response: Response): Promise<T> {
     throw new ApiError(
       body?.error?.message ?? `request failed (${response.status})`,
       response.status,
+      body?.error?.code,
+      body?.error?.queued,
     );
   }
   return payload as T;
@@ -82,6 +95,62 @@ export async function apiPost<T>(
   return parseResponse<T>(response);
 }
 
+// POST a body that must reach the server byte-for-byte: a signed
+// bundle document, where parsing and re-stringifying on the way in can
+// rewrite a number the signature covers.
+export async function apiPostText<T>(path: string, text: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: text,
+  });
+  return parseResponse<T>(response);
+}
+
 export function eventsUrl(since = 0): string {
   return `${API_BASE}/api/events?since=${since}`;
+}
+
+export interface DownloadResult {
+  blob: Blob;
+  filename: string;
+}
+
+function filenameFromDisposition(header: string | null): string {
+  if (!header) return "tau-backup.tar.gz";
+  const match = /filename\*?=(?:UTF-8''|")?([^";]+)"?/.exec(header);
+  if (!match) return "tau-backup.tar.gz";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+export async function apiDownload(path: string): Promise<DownloadResult> {
+  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+  if (!response.ok) {
+    // A failed download carries the usual JSON error body, not a blob.
+    const raw = await response.text();
+    let message = `request failed (${response.status})`;
+    if (raw) {
+      try {
+        const body = JSON.parse(raw) as ApiErrorBody | null;
+        if (body?.error?.message) message = body.error.message;
+      } catch {
+        // Non-JSON error body: keep the status fallback.
+      }
+    }
+    throw new ApiError(message, response.status);
+  }
+  const blob = await response.blob();
+  return {
+    blob,
+    filename: filenameFromDisposition(
+      response.headers.get("Content-Disposition"),
+    ),
+  };
 }
