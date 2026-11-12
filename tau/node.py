@@ -1331,6 +1331,20 @@ class TauNode:
         except Exception:  # pragma: no cover - defensive
             log.warning("Could not record received message", exc_info=True)
 
+    def _record_retraction(
+        self, sender_hash: str, message_id: str, *, confirmed: bool = False
+    ) -> None:
+        """Persist a retraction marker.
+
+        The marker is the durable half of a retract, so a failure to
+        persist it propagates: the caller must report the retract as
+        failed rather than confirm one a relayed copy could undo.
+        With ``confirmed=True`` the retract deleted a stored copy, so
+        the marker is confirmed — a flood of unknown-ID markers cannot
+        evict it at the cap.
+        """
+        self.mailbox.record_retraction(sender_hash, message_id, confirmed=confirmed)
+
     def _record_reaction(self, record: Dict[str, Any], *, strict: bool = False) -> None:
         """Persist a reaction and fan it out.
 
@@ -1426,56 +1440,68 @@ class TauNode:
         # Store-and-forward retries and relay copies can deliver the same
         # message twice; the id makes delivery idempotent.
         message_id = message.get("id")
-        duplicate = bool(message_id and self.mailbox.is_seen(message_id))
         # A delayed direct request past the sender's deadline is dropped
         # unrecorded (and not marked seen), so it is never shown.
         expires_at = message.get("expires_at")
         expired = expires_at is not None and expires_at <= received_at
         if expired:
             log.info("Dropping expired message %s from %s", message_id, caller_hash)
-        if not duplicate and not expired:
-            record = {
-                "from": caller_name,
-                "destination": caller_hash,
-                "text": message["text"],
-                "kind": message["kind"],
-                "sent_at": message["sent_at"],
-                "received_at": received_at,
-                "id": message_id,
-                "expires_at": message.get("expires_at"),
-                "direction": "in",
-            }
-            if message.get("in_reply_to") is not None:
-                record["in_reply_to"] = message["in_reply_to"]
-            log.info(
-                "Message from %s (%s): %s",
-                caller_name,
-                caller_hash or "anonymous",
-                message["text"],
-            )
-            # Marking seen and recording the message are one delivery:
-            # hold the mailbox transaction across both, so a live
-            # backup never restores a seen marker with no inbox entry
-            # (the message would then be rejected as already seen and
-            # lost).  The record step takes the inbox transaction
-            # inside this one; the order is mailbox first everywhere.
+        stored_record: Optional[Dict[str, Any]] = None
+        # The seen and retraction checks and the insert run under one
+        # mailbox transaction, so a concurrent retract cannot land
+        # between the marker check and the append.  Marking seen and
+        # recording the message are one delivery: holding the mailbox
+        # transaction across both means a live backup never restores a
+        # seen marker with no inbox entry (the message would then be
+        # rejected as already seen and lost).  The record step takes
+        # the inbox transaction inside this one; the order is mailbox
+        # first everywhere.
+        with self.mailbox.transaction():
             # Re-check inside the transaction: a duplicate delivery
             # that landed while this one was in flight already marked
             # the id seen, and the transaction reloaded that mark —
             # without the re-check both copies would be stored, and a
             # later retract would leave one behind.
-            recorded = False
-            with self.mailbox.transaction():
-                if not message_id or not self.mailbox.is_seen(message_id):
-                    if message_id:
-                        self.mailbox.mark_seen(message_id)
-                    self._record_received(record)
-                    recorded = True
-            if recorded and self.on_message is not None:
-                try:
-                    self.on_message(record)
-                except Exception:  # pragma: no cover - user callback
-                    log.warning("on_message callback failed", exc_info=True)
+            duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+            # A message its sender retracted is dropped the same way: the
+            # marker outlives the seen cache, so a copy that arrives after
+            # the id was evicted still loses to the retract.
+            retracted = bool(
+                message_id
+                and caller_hash
+                and self.mailbox.is_retracted(caller_hash, message_id)
+            )
+            if retracted:
+                log.info("Dropping retracted message %s from %s", message_id, caller_hash)
+            if not duplicate and not expired and not retracted:
+                if message_id:
+                    self.mailbox.mark_seen(message_id)
+                record = {
+                    "from": caller_name,
+                    "destination": caller_hash,
+                    "text": message["text"],
+                    "kind": message["kind"],
+                    "sent_at": message["sent_at"],
+                    "received_at": received_at,
+                    "id": message_id,
+                    "expires_at": message.get("expires_at"),
+                    "direction": "in",
+                }
+                if message.get("in_reply_to") is not None:
+                    record["in_reply_to"] = message["in_reply_to"]
+                log.info(
+                    "Message from %s (%s): %s",
+                    caller_name,
+                    caller_hash or "anonymous",
+                    message["text"],
+                )
+                self._record_received(record)
+                stored_record = record
+        if stored_record is not None and self.on_message is not None:
+            try:
+                self.on_message(stored_record)
+            except Exception:  # pragma: no cover - user callback
+                log.warning("on_message callback failed", exc_info=True)
 
         return response_ok(
             echo=message["text"],
@@ -1485,6 +1511,7 @@ class TauNode:
             node=self.destination_hexhash,
             duplicate=duplicate,
             expired=expired,
+            retracted=retracted,
         )
 
     def _accept_group_message(
@@ -1908,89 +1935,133 @@ class TauNode:
         # deleted False instead of failing.  The match must be exact:
         # resolve also matches unique prefixes, and a short target
         # must never delete a different message from the same sender.
-        # Reload first: another process (a one-shot CLI import) may have
-        # persisted the target after this node's in-memory copy was read.
-        try:
-            self.inbox.reload()
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not read inbox: {exc}"
-            )
-        try:
-            stored = self.inbox.resolve(retract["target"])
-        except ValueError:
-            stored = None
-        if stored is None or stored.get("id") != retract["target"]:
-            return response_ok(
-                target=retract["target"],
-                received_at=received_at,
-                deleted=False,
-            )
-        # Only a received record counts: an outgoing record also has the
-        # caller's hash in ``destination`` (the recipient), so without the
-        # direction check a recipient could delete the sender's own copy.
-        if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
-            return response_error(
-                "not_sender", "only the message's sender can retract it"
-            )
-        if stored.get("kind") == "file":
-            # A saved file lives on disk; Inbox.delete drops only the
-            # record, so retracting it would leave the file behind.
-            return response_error(
-                "not_supported",
-                "file transfers cannot be retracted",
-            )
-        if stored.get("kind") == "group":
-            # A group message lives in every member's inbox; deleting
-            # it from one member alone would silently half-retract it.
-            # Group fan-out retract is a follow-up, not v1.
-            return response_error(
-                "not_supported",
-                "group messages cannot be retracted in v1",
-            )
-        # Authorize and delete as one exact-ID operation: the checks
-        # above pick the error code, but the delete itself re-verifies
-        # the exact id, direction, and sender inside the same inbox
-        # transaction, so two concurrent retracts of one short id can
-        # never reselect a different record by prefix.  Kind is
-        # immutable after append, so the kind checks above cannot go
-        # stale between here and the delete.
-        try:
-            removed = self.inbox.delete_authorized(
-                retract["target"], direction="in", destination=caller_hash
-            )
-        except InboxError as exc:
-            return response_error(
-                "storage_failed", f"could not retract message: {exc}"
-            )
-        if removed is None:
-            # A concurrent retract deleted it first: the message is
-            # already gone, so answer the same as "not found".
-            return response_ok(
-                target=retract["target"],
-                received_at=received_at,
-                deleted=False,
-            )
-        # The inbox record is gone; a serving console keeps its own
-        # copy of the message, so tell it to drop that too — otherwise
-        # /api/messages keeps showing the retracted text, including
-        # after a restart.  A failing console callback must not fail
-        # the retraction itself: the inbox delete already landed.
-        if self.on_retract is not None:
+        # The mailbox transaction is held across the marker decision and
+        # the inbox mutation, so a concurrent delivery or import cannot
+        # check for the marker, miss this retract, and insert afterwards.
+        # Lock order is mailbox, then inbox, everywhere.
+        with self.mailbox.transaction():
+            # Reload first: another process (a one-shot CLI import) may
+            # have persisted the target after this node's in-memory copy
+            # was read.
             try:
-                self.on_retract(removed)
-            except Exception:  # pragma: no cover - console callback
-                log.warning("on_retract callback failed", exc_info=True)
-        log.info(
-            "Retraction from %s deleted %s",
-            caller_hash[:8],
-            retract["target"][:8],
-        )
-        return response_ok(
-            target=retract["target"],
-            received_at=received_at,
-            deleted=True,
-        )
+                self.inbox.reload()
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not read inbox: {exc}"
+                )
+            try:
+                stored = self.inbox.resolve(retract["target"])
+            except ValueError:
+                stored = None
+            if stored is None or stored.get("id") != retract["target"]:
+                # No stored copy to check the sender against — the message
+                # may already be deleted or never have arrived.  Record the
+                # marker anyway: the retract is authenticated, and a copy
+                # arriving later (a relayed copy, or one that outlives the
+                # seen cache) must still lose to it.  The key carries the
+                # caller's own hash, so a sender can only ever suppress
+                # their own messages this way.  If the marker cannot be
+                # persisted the retract is not confirmed.
+                try:
+                    self._record_retraction(caller_hash, retract["target"])
+                except Exception as exc:
+                    log.warning(
+                        "Could not record retraction marker for %s",
+                        retract["target"][:8],
+                        exc_info=True,
+                    )
+                    return response_error(
+                        "storage_failed", f"could not record retraction: {exc}"
+                    )
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # Only a received record counts: an outgoing record also has the
+            # caller's hash in ``destination`` (the recipient), so without the
+            # direction check a recipient could delete the sender's own copy.
+            if stored.get("direction") != "in" or stored.get("destination") != caller_hash:
+                return response_error(
+                    "not_sender", "only the message's sender can retract it"
+                )
+            if stored.get("kind") == "file":
+                # A saved file lives on disk; Inbox.delete drops only the
+                # record, so retracting it would leave the file behind.
+                return response_error(
+                    "not_supported",
+                    "file transfers cannot be retracted",
+                )
+            if stored.get("kind") == "group":
+                # A group message lives in every member's inbox; deleting
+                # it from one member alone would silently half-retract it.
+                # Group fan-out retract is a follow-up, not v1.
+                return response_error(
+                    "not_supported",
+                    "group messages cannot be retracted in v1",
+                )
+            # Record the marker before deleting the copy: if it cannot be
+            # persisted, nothing is deleted and the retract fails cleanly.
+            # (A refused retract records nothing: the message stays, so it
+            # must stay deliverable.)  The marker is confirmed: the
+            # retract was honoured against a stored copy, so a flood of
+            # unknown-ID markers must not evict it at the cap.
+            try:
+                self._record_retraction(
+                    caller_hash, retract["target"], confirmed=True
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not record retraction marker for %s",
+                    retract["target"][:8],
+                    exc_info=True,
+                )
+                return response_error(
+                    "storage_failed", f"could not record retraction: {exc}"
+                )
+            # Authorize and delete as one exact-ID operation: the checks
+            # above pick the error code, but the delete itself re-verifies
+            # the exact id, direction, and sender inside the same inbox
+            # transaction, so two concurrent retracts of one short id can
+            # never reselect a different record by prefix.  Kind is
+            # immutable after append, so the kind checks above cannot go
+            # stale between here and the delete.
+            try:
+                removed = self.inbox.delete_authorized(
+                    retract["target"], direction="in", destination=caller_hash
+                )
+            except InboxError as exc:
+                return response_error(
+                    "storage_failed", f"could not retract message: {exc}"
+                )
+            if removed is None:
+                # A concurrent retract deleted it first: the message is
+                # already gone, so answer the same as "not found".
+                return response_ok(
+                    target=retract["target"],
+                    received_at=received_at,
+                    deleted=False,
+                )
+            # The inbox record is gone; a serving console keeps its own
+            # copy of the message, so tell it to drop that too — otherwise
+            # /api/messages keeps showing the retracted text, including
+            # after a restart.  A failing console callback must not fail
+            # the retraction itself: the inbox delete already landed.
+            if self.on_retract is not None:
+                try:
+                    self.on_retract(removed)
+                except Exception:  # pragma: no cover - console callback
+                    log.warning("on_retract callback failed", exc_info=True)
+            log.info(
+                "Retraction from %s deleted %s",
+                caller_hash[:8],
+                retract["target"][:8],
+            )
+            return response_ok(
+                target=retract["target"],
+                received_at=received_at,
+                deleted=True,
+            )
 
     def _record_receipt(
         self, *, reader_hash: str, message_ids: List[str], read_at: float
@@ -3060,10 +3131,26 @@ class TauNode:
         # transaction, so a live backup never restores a seen marker
         # with no inbox entry (see _handle_message).  Re-check inside
         # the transaction, as there: a duplicate that landed while
-        # this one was in flight already marked the id seen.
+        # this one was in flight already marked the id seen.  The
+        # retraction check runs inside the same transaction, so a
+        # concurrent retract cannot land between the marker check and
+        # the append — the marker outlives the seen cache, so a relayed
+        # copy arriving after the id was evicted still loses to it.
+        # Group messages are not retractable in v1, so they never
+        # match a marker.
         recorded = False
         with self.mailbox.transaction():
-            if not self.mailbox.is_seen(message["id"]):
+            if self.mailbox.is_seen(message["id"]):
+                pass
+            elif message.get("group") is None and self.mailbox.is_retracted(
+                sender if isinstance(sender, str) else "", message["id"]
+            ):
+                # A retract the sender issued after this copy was sealed
+                # still wins: the marker outlives the seen cache, so a
+                # relayed copy is dropped, never stored.  Group messages
+                # are not retractable in v1, so they never match a marker.
+                log.info("Dropping retracted relayed message %s", message["id"])
+            else:
                 self.mailbox.mark_seen(message["id"])
                 self._record_received(record)
                 recorded = True

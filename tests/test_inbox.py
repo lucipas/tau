@@ -371,6 +371,39 @@ def test_export_document_round_trips_through_import(tmp_path):
     assert len(target) == 2
 
 
+def test_import_skips_retracted_messages(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(id="gone", destination="aa" * 32, text="retracted"),
+            _record(id="kept", destination="aa" * 32, text="still here"),
+            # The sender's own copy of a message: its destination is
+            # the recipient, so it never matches a retraction marker.
+            _record(
+                id="mine",
+                destination="bb" * 32,
+                text="my copy",
+                direction="out",
+            ),
+        ],
+    }
+    # The check fires for the retracted id only: the received record
+    # is skipped — an export made before the retract must not resurrect
+    # the message — but the sender's own copy is unaffected.
+    result = inbox.import_messages(
+        document, is_retracted=lambda sender, message_id: message_id == "gone"
+    )
+    assert result["imported"] == 2
+    assert result["skipped"] == 1
+    assert result["errors"] == [
+        {"id": "gone", "error": "message was retracted by its sender"}
+    ]
+    assert [entry["id"] for entry in inbox.list_messages()] == ["kept"]
+    assert len(inbox) == 2  # the sent record was imported, not skipped
+
+
 def test_export_document_filters_by_peer(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16))

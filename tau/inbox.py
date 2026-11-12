@@ -1094,6 +1094,8 @@ class Inbox:
         self,
         document: Any,
         inserted: Optional[List[Dict[str, Any]]] = None,
+        *,
+        is_retracted: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
@@ -1111,6 +1113,11 @@ class Inbox:
         node's, which mean nothing here), and a failed persist raises
         :class:`OSError` instead of reporting a restore that never
         landed — the in-memory merge is rolled back with it.
+
+        With ``is_retracted`` given (a ``(sender_hash, message_id) ->
+        bool`` check), a received record its sender retracted is
+        skipped with its reason recorded instead of being stored: an
+        export made before the retract must not resurrect the message.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -1149,6 +1156,29 @@ class Inbox:
                 key = _dedupe_key(record)
                 if key in seen:
                     present += 1
+                    continue
+                if (
+                    is_retracted is not None
+                    and record.get("direction") == "in"
+                    # Group and file records are never retractable (see
+                    # the retract handler), so a marker can't cover them.
+                    and record.get("kind") not in ("group", "file")
+                    and isinstance(record.get("destination"), str)
+                    and isinstance(record.get("id"), str)
+                    and is_retracted(record["destination"], record["id"])
+                ):
+                    # A retracted message stays retracted: an export
+                    # made before the retract must not resurrect it.
+                    # Sent records are never checked — their
+                    # destination is the recipient, not the sender, so
+                    # they cannot match a marker for this message.
+                    skipped += 1
+                    errors.append(
+                        {
+                            "id": record["id"],
+                            "error": "message was retracted by its sender",
+                        }
+                    )
                     continue
                 seen.add(key)
                 self._messages.append(record)

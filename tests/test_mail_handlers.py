@@ -1559,6 +1559,143 @@ def test_send_retraction_validates_before_resolving(tmp_path):
         node.send_reaction("alice", "", "👍")
 
 
+def test_retract_records_a_marker_for_an_unknown_id(tmp_path):
+    # A retract that arrives before the message still wins: the marker
+    # is recorded for the authenticated unknown target, so a copy
+    # arriving later is dropped, never stored.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert node.mailbox.is_retracted(sender_hash, "msg-1") is True
+
+    delivery = call_handler(
+        node._handle_message,
+        encode_message("too late", message_id="msg-1"),
+        remote_identity=sender,
+    )
+    assert delivery["ok"] is True
+    assert delivery["retracted"] is True
+    assert received == []
+    assert node.inbox.list_messages() == []
+
+
+def test_retracted_direct_message_is_dropped_after_seen_eviction(tmp_path):
+    # The marker outlives the bounded seen cache: a copy that arrives
+    # after the id was evicted still loses to the retract.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+    assert len(received) == 1
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+    # Simulate the seen cache evicting the id.
+    del node.mailbox._seen["msg-1"]
+    redelivery = call_handler(
+        node._handle_message,
+        encode_message("take this back", message_id="msg-1"),
+        remote_identity=sender,
+    )
+    assert redelivery["ok"] is True
+    assert redelivery["retracted"] is True
+    assert len(received) == 1
+    assert node.inbox.list_messages() == []
+
+
+def test_relayed_copy_after_retract_is_dropped(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    message = {
+        "id": "relay-retract-1",
+        "from": sender_hash,
+        "from_name": "alice",
+        "text": "doorbell rang",
+        "kind": "chat",
+        "sent_at": 42.0,
+    }
+    assert node._deliver_collected(message) is True
+    assert len(received) == 1
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "relay-retract-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["deleted"] is True
+
+    # The seen cache evicts the id; the relayed copy still loses.
+    del node.mailbox._seen["relay-retract-1"]
+    assert node._deliver_collected(message) is False
+    assert len(received) == 1
+    assert node.inbox.list_messages() == []
+
+
+def test_refused_retract_records_no_marker(tmp_path):
+    # A retract the handler refuses must not suppress the message:
+    # only a retract that is honoured leaves a marker behind.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(other, "msg-1", "retract-1"),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.mailbox.is_retracted(destination_hash(sender).hex(), "msg-1") is False
+    assert node.mailbox.counts()["retracted"] == 0
+
+
+def test_retract_marks_a_deleted_message_confirmed(tmp_path, monkeypatch):
+    # A marker for a message the node actually deleted is confirmed:
+    # a flood of unknown-ID markers from another sender cannot evict
+    # it at the cap.
+    monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 2)
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["deleted"] is True
+
+    other_hash = destination_hash(RNS.Identity()).hex()
+    for target in ("junk-1", "junk-2", "junk-3"):
+        node.mailbox.record_retraction(other_hash, target)
+    assert node.mailbox.counts()["retracted"] == 2
+    assert node.mailbox.is_retracted(destination_hash(sender).hex(), "msg-1") is True
+
+
 def test_collected_message_drops_expired_arrival(tmp_path):
     import time as _time
 
