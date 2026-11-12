@@ -303,6 +303,52 @@ def test_delete_write_failure_rolls_back(tmp_path, monkeypatch):
     assert [entry["id"] for entry in inbox.list_messages()] == ["keep"]
 
 
+def test_delete_authorized_deletes_only_the_exact_match(tmp_path):
+    # The retract race: a short id must never delete a longer id that
+    # merely shares its prefix, and a second retract of the same id
+    # finds nothing instead of reselecting.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abc", text="short", direction="in", destination="ab" * 16)
+    )
+    inbox.append(
+        _record(id="abcdef" + "1" * 26, text="long", direction="out")
+    )
+
+    removed = inbox.delete_authorized("abc", direction="in", destination="ab" * 16)
+    assert removed is not None
+    assert removed["text"] == "short"
+    assert inbox.delete_authorized("abc", direction="in", destination="ab" * 16) is None
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "abcdef" + "1" * 26
+    ]
+
+
+def test_delete_authorized_never_matches_a_prefix(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="abcd" + "1" * 28, text="one", direction="in", destination="ab" * 16)
+    )
+
+    assert inbox.delete_authorized("abcd", direction="in", destination="ab" * 16) is None
+    assert len(inbox) == 1
+
+
+def test_delete_authorized_refuses_a_mismatched_record(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="mine", direction="out", destination="ab" * 16)
+    )
+
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="in", destination="ab" * 16)
+    with pytest.raises(InboxError):
+        inbox.delete_authorized("msg-1", direction="out", destination="cd" * 16)
+    assert len(inbox) == 1
+
+
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")
     source.append(_record(id="one", text="first"))

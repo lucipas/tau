@@ -22,9 +22,11 @@ from tau.protocol import (
     encode,
     encode_message,
     encode_reaction,
+    encode_retract,
     excerpt_hash,
     parse_message,
     reaction_dict,
+    retract_dict,
 )
 
 
@@ -1157,6 +1159,402 @@ def test_send_reaction_validates_before_resolving(tmp_path):
     node = make_node(tmp_path)
     with pytest.raises(ProtocolError):
         node.send_reaction("alice", "msg-1", "x" * 33)
+
+
+def signed_retract(sender, target, message_id, *, sent_at=None):
+    """A retract payload signed by *sender*, as send_retraction builds it."""
+    import base64
+
+    payload = retract_dict(target, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _store_received_message(node, sender, message_id):
+    """Store one DM from *sender* in the node's inbox, as _handle_message does."""
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    payload = encode_message("take this back", message_id=message_id)
+    response = call_handler(
+        node._handle_message, payload, remote_identity=sender
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_deletes_the_senders_own_message(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["target"] == "msg-1"
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_is_idempotent_for_an_unknown_id(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+
+
+def test_retract_requires_an_exact_target_id(tmp_path):
+    # resolve also matches unique prefixes: a retract for "msg-1"
+    # must not delete "msg-123" from the same sender.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-123")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_rejects_a_non_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(other, "msg-1", "retract-1"),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+
+
+def test_retract_rejects_an_unsigned_payload(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    payload = encode_retract("msg-1", message_id="retract-1")
+    response = call_handler(
+        node._handle_retract, payload, remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_retraction"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_rejects_a_bad_signature(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    # Signed by someone else, presented as the sender: the link
+    # identity cannot verify it.
+    payload = signed_retract(other, "msg-1", "retract-1")
+    response = call_handler(
+        node._handle_retract, payload, remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_retraction"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+    # Enable an empty allow-list after the message arrived: the sender
+    # is no longer allowed, so the retract is refused.  The list loads
+    # lazily, so swap the cached value directly.
+    node._allowlist = AllowList(enabled=True, allow=frozenset())
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_refuses_group_messages(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "team",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_supported"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_rejects_an_outgoing_record(tmp_path):
+    # Regression test for the CodeRabbit Major: a recipient knows the
+    # wire id of a message they received, and the sender's own sent
+    # copy carries the recipient's hash in ``destination`` — so without
+    # the direction check the recipient could delete the sender's
+    # sent-message history.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient).hex()
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": recipient_hash,
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(recipient, "msg-1", "retract-1"),
+        remote_identity=recipient,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages(direction="out")) == 1
+
+
+def test_concurrent_retracts_cannot_delete_a_different_record(tmp_path):
+    # Regression test for the CodeRabbit Major TOCTOU: two concurrent
+    # retracts of one short id must not let the loser reselect another
+    # record by prefix — the node's own outgoing copy shares the id
+    # prefix and must survive.
+    import threading
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "abc")
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": "cd" * 16,
+            "text": "my sent copy",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "abcdef" + "1" * 26,
+            "direction": "out",
+        }
+    )
+
+    barrier = threading.Barrier(2)
+    responses = []
+
+    def _retract(suffix):
+        barrier.wait(timeout=10)
+        responses.append(
+            call_handler(
+                node._handle_retract,
+                signed_retract(sender, "abc", f"retract-{suffix}"),
+                remote_identity=sender,
+            )
+        )
+
+    threads = [
+        threading.Thread(target=_retract, args=(1,)),
+        threading.Thread(target=_retract, args=(2,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert [response["ok"] for response in responses] == [True, True]
+    assert sorted(response["deleted"] for response in responses) == [False, True]
+    # The short id is gone; the longer outgoing record sharing its
+    # prefix is untouched.
+    assert [entry["id"] for entry in node.inbox.list_messages(direction=None)] == [
+        "abcdef" + "1" * 26
+    ]
+
+
+def test_retract_notifies_the_console_callback(tmp_path):
+    # A serving console keeps its own copy of the message; the node
+    # tells it the wire id so it can drop that copy too.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+    notified = []
+    node.on_retract = notified.append
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert [record["id"] for record in notified] == ["msg-1"]
+
+
+def test_retract_callback_failure_does_not_fail_the_retract(tmp_path):
+    # The inbox delete already landed; a failing console callback
+    # must not turn the retraction into an error.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _store_received_message(node, sender, "msg-1")
+
+    def _boom(record):
+        raise RuntimeError("console is down")
+
+    node.on_retract = _boom
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_concurrent_deliveries_store_only_one_copy(tmp_path):
+    # Regression test for the CodeRabbit Minor: two deliveries of the
+    # same id that both pass the pre-check must still store once —
+    # the in-transaction re-check sees the first delivery's mark.
+    import threading
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender = RNS.Identity()
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    payload = encode_message("take this back", message_id="dup-1")
+
+    barrier = threading.Barrier(2)
+
+    def _deliver():
+        barrier.wait(timeout=10)
+        call_handler(node._handle_message, payload, remote_identity=sender)
+
+    threads = [threading.Thread(target=_deliver) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(node.inbox.list_messages()) == 1
+    assert len(received) == 1
+
+
+def test_retract_refuses_file_records(tmp_path):
+    # A received file lives on disk; deleting only the inbox record
+    # would orphan it, so file records are not retractable.
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "name": "photo.jpg",
+            "size": 123,
+            "sha256": "ab" * 32,
+            "path": "/tmp/tau-files/photo.jpg",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "file",
+        }
+    )
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_supported"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_finds_a_message_imported_by_another_process(tmp_path):
+    # A one-shot CLI import can persist a message after this node's
+    # in-memory inbox was read; the handler reloads first, so the
+    # retract still finds and deletes it.
+    from tau.inbox import Inbox
+
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    other = Inbox(config.inbox_path)
+    other.append(
+        {
+            "from": "alice",
+            "destination": sender_hash,
+            "text": "imported hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+        }
+    )
+    assert node.inbox.list_messages() == []
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_send_retraction_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(NodeError):
+        node.send_retraction("alice", "")
+    with pytest.raises(NodeError):
+        node.send_retraction("alice", "x" * 65)
     with pytest.raises(NodeError):
         node.send_reaction("alice", "", "👍")
 
