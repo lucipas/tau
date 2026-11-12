@@ -2348,6 +2348,72 @@ def test_group_message_expired_is_dropped_unrecorded(tmp_path):
     assert node.groups.get(group_id) is None
 
 
+def test_group_message_expired_never_reports_duplicate(tmp_path):
+    # Issue #273: the expired path used to return
+    # ``duplicate=mailbox.is_seen(message_id)`` before the roster was
+    # checked, so any allow-listed caller could probe whether this node
+    # had seen an arbitrary id — from a group they do not belong to, or
+    # a direct message — by sending a well-formed expired payload
+    # carrying it.  The flag is now always False on the expired path.
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    sender, sender_hash = make_sender()
+    members = [OWN_HASH, sender_hash, THIRD_HASH]
+    group_id = derive_group_id(sender_hash, "weekend", members)
+    # Deliver a live copy first, so the id is genuinely in the seen
+    # store before the expired probes arrive.
+    live = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "already there",
+            message_id="gm-seen",
+            group_id=group_id,
+            group_name="weekend",
+            creator=sender_hash,
+            members=members,
+            expires_at=time.time() + 300,
+        ),
+        remote_identity=sender,
+    )
+    assert live["ok"] is True and live["duplicate"] is False
+    assert node.mailbox.is_seen("gm-seen") is True
+    assert len(received) == 1
+
+    def expired_probe(caller):
+        return call_handler(
+            node._handle_group_message,
+            encode_group_message(
+                "too late",
+                message_id="gm-seen",
+                group_id=group_id,
+                group_name="weekend",
+                creator=sender_hash,
+                members=members,
+                expires_at=time.time() - 60,
+            ),
+            remote_identity=caller,
+        )
+
+    # A stranger who is not on the roster at all learns nothing.
+    stranger, _ = make_sender()
+    response = expired_probe(stranger)
+    assert response["ok"] is True
+    assert response["expired"] is True
+    assert response["duplicate"] is False
+    # And a member probing the same seen id gets the same answer:
+    # the flag carries no seen-state for anyone on this path.
+    response = expired_probe(sender)
+    assert response["ok"] is True
+    assert response["expired"] is True
+    assert response["duplicate"] is False
+    # Neither probe stored anything or disturbed the live copy.
+    assert len(received) == 1
+    stored = node.inbox.list_messages()
+    assert len(stored) == 1
+    assert stored[0]["id"] == "gm-seen"
+    assert node.mailbox.is_seen("gm-seen") is True
+
+
 def test_group_message_stores_expiry(tmp_path):
     received = []
     node = make_node(tmp_path, on_message=received.append)
@@ -3243,6 +3309,13 @@ def test_send_group_message_expired_leg_is_not_delivered(tmp_path):
 
 
 def test_send_group_message_expired_duplicate_still_counts_delivered(tmp_path):
+    """Compatibility with pre-fix peers only.
+
+    Current receivers always answer an expired group message with
+    ``duplicate=False``, so this ``expired+duplicate`` response can only
+    come from a peer that predates that change. Such a peer already saw
+    the message, so the leg still counts as delivered.
+    """
     node = make_node(tmp_path)
     node.reticulum = object()  # started enough for queueing
     group = node.groups.create(
@@ -3765,6 +3838,13 @@ def test_deliver_entry_drops_expired_group_message(tmp_path):
 
 
 def test_deliver_entry_counts_expired_duplicate_group_message_delivered(tmp_path):
+    """Compatibility with pre-fix peers only.
+
+    Current receivers always answer an expired group message with
+    ``duplicate=False``, so this ``expired+duplicate`` response can only
+    come from a peer that predates that change. Such a peer already saw
+    the message, so the queued entry still counts as delivered.
+    """
     node = make_node(tmp_path)
     node.reticulum = object()
     group = node.groups.create(

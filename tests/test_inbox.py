@@ -664,6 +664,153 @@ def test_delete_authorized_refuses_a_mismatched_record(tmp_path):
         inbox.delete_authorized("msg-1", direction="out", destination="cd" * 16)
     assert len(inbox) == 1
 
+def test_apply_edit_replaces_text_and_marks_edited(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="typo here"))
+
+    updated = inbox.apply_edit("msg-1", "fixed here", edited_at=42.0)
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert updated["edited_at"] == 42.0
+    assert inbox.list_messages()[0]["text"] == "fixed here"
+    assert inbox.list_messages()[0]["edited_at"] == 42.0
+
+    reloaded = Inbox(tmp_path / "inbox.json")
+    assert reloaded.list_messages()[0]["text"] == "fixed here"
+    assert reloaded.list_messages()[0]["edited_at"] == 42.0
+
+
+def test_apply_edit_unknown_id_returns_none(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="keep me"))
+
+    assert inbox.apply_edit("nope", "new", edited_at=1.0) is None
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_needs_exact_id(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="keep me"))
+
+    # A unique prefix is not an edit target: only the full id applies.
+    assert inbox.apply_edit("abcd", "new", edited_at=1.0) is None
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_refuses_file_records(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "name": "notes.txt",
+            "size": 4,
+            "sha256": "a" * 64,
+            "path": "/tmp/notes.txt",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "file-1",
+        }
+    )
+    with pytest.raises(InboxError, match="no text to edit"):
+        inbox.apply_edit("file-1", "new", edited_at=1.0)
+
+
+def test_apply_edit_rejects_empty_text(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="keep me"))
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.apply_edit("msg-1", "", edited_at=1.0)
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_rejects_a_stale_edit_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="newer text", edited_at=200.0)
+    )
+
+    # An edit older than the stored one must not overwrite it, even
+    # when the caller's snapshot check already passed — the transaction
+    # re-checks after its reload.
+    assert (
+        inbox.apply_edit(
+            "msg-1", "older text", edited_at=100.0, newer_than_existing=True
+        )
+        is None
+    )
+    assert inbox.list_messages()[0]["text"] == "newer text"
+    assert inbox.list_messages()[0]["edited_at"] == 200.0
+
+    updated = inbox.apply_edit(
+        "msg-1", "newest text", edited_at=300.0, newer_than_existing=True
+    )
+    assert updated is not None
+    assert updated["text"] == "newest text"
+    assert updated["edited_at"] == 300.0
+
+
+def test_apply_edit_rechecks_direction_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="msg-1",
+            text="mine",
+            direction="out",
+            destination="ab" * 16,
+        )
+    )
+
+    # A record that is not inbound to the caller cannot be edited by
+    # them, even when the caller's snapshot said otherwise.
+    assert (
+        inbox.apply_edit(
+            "msg-1",
+            "not yours",
+            edited_at=42.0,
+            direction="in",
+            destination="ab" * 16,
+        )
+        is None
+    )
+    assert inbox.list_messages(direction="out")[0]["text"] == "mine"
+
+    updated = inbox.apply_edit(
+        "msg-1",
+        "fixed here",
+        edited_at=42.0,
+        direction="out",
+        destination="ab" * 16,
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+
+
+def test_edited_at_survives_reload(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1", text="original", edited_at=7.0))
+
+    reloaded = Inbox(path)
+    assert reloaded.list_messages()[0]["edited_at"] == 7.0
+
+
+def test_corrupt_edited_at_drops_the_record(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1", text="original", edited_at=7.0))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["messages"][0]["edited_at"] = "not-a-time"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    reloaded = Inbox(path)
+    assert reloaded.list_messages() == []
+
 
 def test_export_document_round_trips_through_import(tmp_path):
     source = Inbox(tmp_path / "source.json")

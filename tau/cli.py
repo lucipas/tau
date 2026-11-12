@@ -44,6 +44,7 @@ from .bundle import (
     DEFAULT_MAX_BUNDLE_BYTES,
     apply_bundle,
     build_bundle,
+    inspect_bundle,
     parse_bundle,
     serialize_bundle,
 )
@@ -601,6 +602,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     retract.set_defaults(func=cmd_retract)
+
+    edit = subparsers.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a message you sent",
+    )
+    edit.add_argument(
+        "target",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    edit.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    edit.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    edit.set_defaults(func=cmd_edit)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -2006,6 +2031,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse to read a bundle larger than N bytes (default: %(default)s)",
     )
     bundle_import.set_defaults(func=cmd_bundle_import)
+
+    bundle_inspect = bundle_sub.add_parser(
+        "inspect",
+        parents=[common],
+        help="describe a bundle file without importing it",
+    )
+    bundle_inspect.add_argument(
+        "file",
+        metavar="FILE",
+        type=Path,
+        help='bundle file to read ("-" reads stdin)',
+    )
+    bundle_inspect.add_argument(
+        "--max-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUNDLE_BYTES,
+        metavar="N",
+        help="refuse to read a bundle larger than N bytes (default: %(default)s)",
+    )
+    bundle_inspect.set_defaults(func=cmd_bundle_inspect)
 
     return parser
 
@@ -3929,6 +3974,165 @@ def cmd_bundle_import(args: argparse.Namespace) -> int:
     return _EXIT_OK if result["skipped"] == 0 and tan_clean else _EXIT_ERROR
 
 
+def _bundle_inspect_names(
+    config: TauConfig, summary: Dict[str, Any]
+) -> Dict[str, str]:
+    """Best-effort display names for the hashes in an inspect summary.
+
+    Names are a convenience only — the registry is read, never
+    written, and a missing or unreadable registry leaves every hash
+    unnamed rather than failing the inspect.
+    """
+    try:
+        registry = PeerRegistry(config.peers_path)
+    except (OSError, ValueError):
+        return {}
+    hashes = set()
+    for value in (
+        [summary.get("exporter")]
+        + [entry.get("to") for entry in summary.get("mail", [])]
+        + [
+            entry.get("author")
+            for entry in summary.get("tan", [])
+            if entry.get("author")
+        ]
+    ):
+        # Only strings can be looked up; a malformed recipient (a
+        # list or object in a signed bundle) stays unnamed instead
+        # of crashing the lookup with an unhashable value.
+        if isinstance(value, str) and value:
+            hashes.add(value)
+    names: Dict[str, str] = {}
+    for hexhash in hashes:
+        try:
+            peer = registry.get(hexhash)
+        except (ValueError, TypeError):
+            continue
+        if peer is not None:
+            names[hexhash] = peer.display_name
+    return names
+
+
+def cmd_bundle_inspect(args: argparse.Namespace) -> int:
+    """Describe a bundle file without importing it.
+
+    Read-only by construction: no identity is loaded and no mailbox
+    or Tan store is opened, so this works on a data directory that
+    has never run ``tau init`` and leaves local state untouched.  The
+    container signature is verified by :func:`parse_bundle` before
+    anything is listed, so a tampered bundle is rejected whole.
+    """
+    max_bytes = int(getattr(args, "max_bytes", DEFAULT_MAX_BUNDLE_BYTES))
+    if max_bytes <= 0:
+        raise NodeError("max bundle size must be positive")
+    # Read at most one byte past the cap, so an oversized input is
+    # detected without being loaded whole.
+    if str(args.file) == "-":
+        raw = sys.stdin.buffer.read(max_bytes + 1)
+    else:
+        try:
+            with Path(args.file).expanduser().open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+        except OSError as exc:
+            raise NodeError(f"could not read {args.file}: {exc}") from exc
+    if len(raw) > max_bytes:
+        raise NodeError(f"bundle is over the {max_bytes} byte cap")
+    document = parse_bundle(raw, max_bytes=max_bytes)
+    summary = inspect_bundle(document)
+    try:
+        names = _bundle_inspect_names(_make_config(args), summary)
+    except (OSError, ValueError):
+        names = {}
+    exporter = summary.get("exporter")
+    summary["exporter_name"] = (
+        names.get(exporter) if isinstance(exporter, str) else None
+    )
+    for entry in summary["mail"]:
+        recipient = entry.get("to")
+        entry["to_name"] = (
+            names.get(recipient) if isinstance(recipient, str) else None
+        )
+    for entry in summary["tan"]:
+        author = entry.get("author")
+        entry["author_name"] = (
+            names.get(author) if isinstance(author, str) else None
+        )
+    if _json_mode(args):
+        _emit(summary, True)
+        return _EXIT_OK
+
+    def _when(value: Any) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            try:
+                return datetime.fromtimestamp(float(value)).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except (OverflowError, OSError, ValueError):
+                return "out of range"
+        return "unknown"
+
+    def _who(hexhash: Any, name: Optional[str]) -> str:
+        if name:
+            return name
+        if isinstance(hexhash, str) and hexhash:
+            return _safe_id_prefix(hexhash)
+        return "?"
+
+    print(f"Bundle {summary.get('format')} v{summary.get('version')} — signature valid")
+    print(f"  exporter: {_who(exporter, summary['exporter_name'])}")
+    print(f"  created: {_when(summary.get('created_at'))}")
+    print(f"Sealed mail ({summary['mail_count']}):")
+    if not summary["mail"]:
+        print("  (none)")
+    for entry in summary["mail"]:
+        if not entry["valid"]:
+            ref = _safe_id_prefix(str(entry.get("id") or "")) or "?"
+            print(
+                f"  {ref} -> "
+                f"{_who(entry.get('to'), entry.get('to_name'))} "
+                f"— invalid: {entry.get('error')}"
+            )
+            continue
+        print(
+            f"  {_safe_id_prefix(str(entry.get('id') or ''))} -> "
+            f"{_who(entry.get('to'), entry.get('to_name'))}, "
+            f"expires {_when(entry.get('expires_at'))}"
+        )
+    print(f"Tan posts ({summary['tan_count']}):")
+    if summary.get("tan_error"):
+        print(f"  Tan section unusable: {summary['tan_error']}")
+    if not summary["tan"]:
+        print("  (none)")
+    for entry in summary["tan"]:
+        digest = entry.get("hash")
+        label = _safe_id_prefix(str(digest)) if digest else "?"
+        if entry["verified"]:
+            print(
+                f"  {label} {entry.get('kind')} by "
+                f"{_who(entry.get('author'), entry.get('author_name'))} "
+                f"({_when(entry.get('created_at'))}) — signature valid"
+            )
+        else:
+            # Raw metadata survives verification failure, labelled
+            # unverified: the author/kind/time are claims from the
+            # entry itself, not authenticated facts.
+            author = _who(entry.get("author"), entry.get("author_name"))
+            if entry.get("author"):
+                author += " (unverified)"
+            detail = ""
+            if entry.get("kind") or entry.get("created_at") is not None:
+                detail = (
+                    f" {_safe_text(str(entry.get('kind') or '?'))}"
+                    f" ({_when(entry.get('created_at'))})"
+                )
+            print(
+                f"  {label} by {author}{detail}"
+                f" — signature invalid: "
+                f"{_safe_text(str(entry.get('error') or ''))}"
+            )
+    return _EXIT_OK
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if getattr(args, "lxmf_propagation", False) and not getattr(
         args, "lxmf", False
@@ -5028,18 +5232,39 @@ def _retract_local_message(
     )
 
 
-def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send or a retraction.
+def _edit_local_message(
+    node: TauNode,
+    *,
+    target: str,
+    message_id: str,
+    text: str,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Edit one DM on the running node, for the local send server."""
+    return node.send_edit(
+        target,
+        message_id,
+        text,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+    )
 
-    The socket carries both, distinguished by ``op``: ``"send"`` (the
+
+def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+    """Serve one local send-socket request: a DM send, a retraction, or an edit.
+
+    The socket carries all three, distinguished by ``op``: ``"send"`` (the
     default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"`` runs the
-    retraction on the serving node, so ``tau retract`` works while
-    ``tau serve`` holds the data directory.
+    :func:`_send_local_message`, while ``"retract"`` and ``"edit"`` run the
+    retraction and the edit on the serving node, so ``tau retract`` and
+    ``tau edit`` work while ``tau serve`` holds the data directory.
     """
     op = request.pop("op", "send")
     if op == "retract":
         return _retract_local_message(node, **request)
+    if op == "edit":
+        return _edit_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
@@ -5190,6 +5415,35 @@ def _retract_via_running_node(
     except LocalIPCUnavailable as exc:
         raise NodeError(
             "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _edit_via_running_node(
+    config: TauConfig,
+    recipient: str,
+    message_id: str,
+    text: str,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Edit through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="edit",
+            target=recipient,
+            message_id=message_id,
+            text=text,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-edit; retry the edit"
         ) from exc
 
 
@@ -6061,7 +6315,8 @@ def _print_message_entry(
         if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
         else ""
     )
-    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}")
+    edited_suffix = " (edited)" if entry.get("edited_at") else ""
+    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}{edited_suffix}")
     if entry.get("kind") == "file":
         print(
             f"  file: {entry.get('name')} "
@@ -7362,6 +7617,8 @@ def cmd_group_send(args: argparse.Namespace) -> int:
         r for r in response["results"] if not r.get("delivered") and not r.get("queued")
     ]
     exit_code = _EXIT_ERROR if failed_legs else _EXIT_OK
+    if expires_at is not None:
+        response["expires_at"] = expires_at
     if _json_mode(args):
         _emit(response, True)
         return exit_code
@@ -7641,6 +7898,114 @@ def cmd_retract(args: argparse.Namespace) -> int:
         )
     return _EXIT_OK
 
+def cmd_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    try:
+        cleaned = normalize_message(text)
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.target)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to edit")
+    if target.get("kind") == "group":
+        raise NodeError(
+            "group messages cannot be edited; send a new message instead"
+        )
+    if target.get("kind") == "file":
+        raise NodeError("a file record has no text to edit")
+    if target.get("direction") != "out":
+        raise NodeError(
+            "that message was not sent by this node;"
+            " only your own sent messages can be edited"
+        )
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known recipient to edit it for")
+    # A message still in the outbox has not reached its recipient yet; an
+    # edit answered "not found" would let the queued copy arrive later
+    # with the old text. Cancel the queued send instead.
+    if Mailbox(config.mailbox_path).get_outbox(str(target["id"])) is not None:
+        raise NodeError(
+            "that message is still queued for delivery;"
+            " use `tau outbox cancel` to stop it and send a new message instead"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: edit through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _edit_via_running_node(
+                config,
+                author,
+                str(target["id"]),
+                cleaned,
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Edits ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver edit: {exc} "
+                "(edits need the peer online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_edit(
+                    author,
+                    str(target["id"]),
+                    cleaned,
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                )
+            except NodeError as exc:
+                # Edits ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable peer is a
+                # plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver edit: {exc} "
+                    "(edits need the peer online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "text": cleaned,
+                "edited": bool(response.get("edited", True)),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("edited") is False:
+        print(
+            f"edit was not applied to {name}'s copy of "
+            f"{_safe_id_prefix(str(target['id']))} "
+            "(unknown message, or a newer edit already applied)"
+        )
+    else:
+        print(f"edited your message to {name} {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
 
 def _print_more_unread(
     registry: PeerRegistry, more_unread: Dict[str, int]
@@ -7682,6 +8047,17 @@ def _safe_id_prefix(ref: str, length: int = 8) -> str:
     """
     cleaned = "".join(char for char in ref if char.isprintable())
     return cleaned[:length]
+
+
+def _safe_text(value: str) -> str:
+    """*value* with control characters dropped, for terminal output.
+
+    Raw metadata from a bundle entry that failed verification can
+    carry terminal escapes (an attacker signs the bundle with their
+    own key); JSON output keeps the raw value, but text output must
+    never print it verbatim.
+    """
+    return "".join(char for char in value if char.isprintable())
 
 
 def cmd_outbox_held(args: argparse.Namespace) -> int:
