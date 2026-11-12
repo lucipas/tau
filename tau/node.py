@@ -2974,7 +2974,7 @@ class TauNode:
             encode_group_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
@@ -2984,7 +2984,7 @@ class TauNode:
             else encode_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3164,7 +3164,7 @@ class TauNode:
                 recipient_public_key=recipient.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group=(
                     {
                         "id": entry.group_id,
@@ -4379,6 +4379,7 @@ class TauNode:
                         to_name="",
                         message_id=message_id,
                         group=context,
+                        sent_at=sent_at,
                     )
                 except MailboxError as queue_exc:
                     results.append(
@@ -4395,7 +4396,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 any_queued = True
                 results.append(
@@ -4482,6 +4483,7 @@ class TauNode:
                         to_name=peer.display_name if peer is not None else "",
                         message_id=message_id,
                         group=context,
+                        sent_at=sent_at,
                     )
                 except MailboxError as queue_exc:
                     # The outbox is full (or the write failed): record the
@@ -4509,7 +4511,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 any_queued = True
                 log.info(
