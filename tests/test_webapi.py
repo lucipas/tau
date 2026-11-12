@@ -8047,6 +8047,29 @@ def test_pin_message_endpoint_pins_inbox_and_annotates_feed(bridge, node):
     assert updated_events[0]["message"]["pinned"] is True
 
 
+def test_pin_message_endpoint_writes_exactly_one_response(bridge, node, monkeypatch):
+    # A merge left two _send_json calls at the end of the pin handler:
+    # on a persistent connection the second response is read as the
+    # answer to the client's next request.
+    import tau.webapi as webapi
+
+    _seed_pinnable_message(bridge, node)
+    calls = []
+    original = webapi._WebHandler._send_json
+
+    def counting(self, payload, head_only=False, status=200):
+        calls.append(payload)
+        return original(self, payload, head_only, status)
+
+    monkeypatch.setattr(webapi._WebHandler, "_send_json", counting)
+    status, _, payload = _json(
+        bridge, "/api/messages/pin", method="POST", body={"id": 1}
+    )
+    assert status == 200
+    assert payload["pinned"]["id"] == 1
+    assert len(calls) == 1
+
+
 def test_pin_message_endpoint_is_a_noop_when_already_pinned(bridge, node):
     _seed_pinnable_message(bridge, node)
     status, _, payload = _json(

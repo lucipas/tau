@@ -6708,7 +6708,6 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"message": str(exc)}}, head_only, 400)
             return
         self._send_json(result, head_only)
-        self._send_json(result, head_only)
 
     def _handle_outbox_cancel(self, body: Dict[str, Any], head_only: bool) -> None:
         target = body.get("target") or body.get("id")
