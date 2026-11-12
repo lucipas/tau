@@ -2172,10 +2172,12 @@ class TauNode:
                 # instead — the context is covered by the signature
                 # verified above, so a relay cannot retarget the
                 # reaction onto a different message.  A copy that
-                # arrived through an outbox retry carries a re-stamped
-                # send time and cannot resolve; the reaction is still
-                # stored under the wire target, and shows for the
-                # author, exactly as before.
+                # arrived through an outbox retry carries the shared
+                # send time and resolves the same way; only a copy
+                # queued before the shared time was recorded falls
+                # back to its enqueue time, and then the reaction is
+                # still stored under the wire target, and shows for
+                # the author, exactly as before.
                 # The signed context names the logical message, but
                 # a valid signature only proves who chose the
                 # context, not that they belong to the group: an
@@ -3355,7 +3357,7 @@ class TauNode:
         if entry.group_id is not None:
             group_kwargs: Dict[str, Any] = dict(
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group_id=entry.group_id,
                 group_name=entry.group_name,
                 creator=entry.group_creator,
@@ -3401,7 +3403,7 @@ class TauNode:
             payload = encode_message(
                 entry.text,
                 message_id=entry.id,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
                 kind=getattr(entry, "kind", None),
@@ -3641,7 +3643,7 @@ class TauNode:
                 recipient_public_key=recipient.public_key,
                 message_id=entry.id,
                 text=entry.text,
-                sent_at=entry.created_at,
+                sent_at=entry.wire_sent_at,
                 group=sealed_group,
                 expires_at=entry.message_expires_at,
                 in_reply_to=entry.in_reply_to,
@@ -4894,6 +4896,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -4911,7 +4914,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -5037,6 +5040,7 @@ class TauNode:
                         message_id=message_id,
                         expires_at=expires_at,
                         group=context,
+                        sent_at=sent_at,
                         in_reply_to=reply_to,
                     )
                 except MailboxError as queue_exc:
@@ -5065,7 +5069,7 @@ class TauNode:
                     entry.id,
                     to=bytes.fromhex(member),
                     text=normalized,
-                    sent_at=entry.created_at,
+                    sent_at=entry.wire_sent_at,
                 )
                 sent_leg_ids.append(entry.id)
                 any_queued = True
@@ -5523,9 +5527,11 @@ class TauNode:
         being reacted to), and a receiver that does not hold the
         target id resolves its own copy from that context instead —
         see :meth:`_handle_reaction`.  Copies that arrived through an
-        outbox retry carry a re-stamped send time and cannot resolve
-        this way; their reaction is still stored, and shows for the
-        author, exactly as a DM reaction to an unknown target would.
+        outbox retry carry the shared send time and resolve the same
+        way; only a copy queued before the shared time was recorded
+        falls back to its enqueue time, and then its reaction is
+        still stored, and shows for the author, exactly as a DM
+        reaction to an unknown target would.
 
         A failed leg reports an ``error`` instead of queueing: like
         DM reactions, group reactions are live-only in v1.  Returns

@@ -26,6 +26,8 @@ from tau.protocol import (
     encode_reaction,
     encode_retract,
     excerpt_hash,
+    parse_group_message,
+    parse_mail_store,
     parse_message,
     reaction_dict,
     retract_dict,
@@ -1767,6 +1769,165 @@ def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
     assert delivered["ok"] is True
     assert node.inbox.reactions_for("other-leg-1") == []
     shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_group_reaction_reconciles_when_relayed_copy_arrives_late(tmp_path):
+    # The same late arrival, but the copy comes through sealed relay
+    # mail: _deliver_collected must reconcile the stored reaction onto
+    # the local copy id too, not just the direct /tau/group path.
+    node = make_node(tmp_path)
+    recipient = RNS.Identity()
+    node.identity = recipient
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(node.inbox.reactions_for("other-leg-1")) == 1
+    assert node.inbox.reactions_for("local-copy-1") == []
+    blob = seal_message(
+        author,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="local-copy-1",
+        text="crew hello",
+        sent_at=100.0,
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+    )
+    message = open_message(recipient, blob)
+    assert node._deliver_collected(message) is True
+    assert node.inbox.reactions_for("other-leg-1") == []
+    shown = node.inbox.reactions_for("local-copy-1")
+    assert len(shown) == 1
+    assert shown[0]["reaction"] == "👍"
+    assert shown[0]["id"] == "react-1"
+
+
+def test_queued_group_leg_retry_reuses_shared_send_time(tmp_path):
+    # A queued leg was enqueued with the fan-out's shared send time;
+    # the retry must carry that time on the wire, not the later
+    # enqueue time — otherwise a reaction left on the live leg's copy
+    # can never reconcile onto the retried copy.
+    node = make_node(tmp_path)
+    peer = node.registry.upsert(bytes.fromhex("ab" * 16), b"\x02" * 64, name="alice")
+    calls, fake_request = _recorded_request()
+    node._request = fake_request
+
+    group = derive_group_id("ab" * 16, "crew", ["ab" * 16, "cd" * 16])
+    entry = node.mailbox.enqueue(
+        to=bytes.fromhex("ab" * 16),
+        text="crew hello",
+        message_id="leg-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": "ab" * 16,
+            "members": ["ab" * 16, "cd" * 16],
+        },
+        sent_at=100.0,
+    )
+    assert entry.created_at != 100.0
+    assert node._deliver_entry(peer, entry, timeout=5) is True
+    assert len(calls) == 1
+    payload = parse_group_message(calls[0][2])
+    assert payload["sent_at"] == 100.0
+
+
+def test_queued_group_leg_relay_copy_carries_shared_send_time(tmp_path):
+    # One leg live, one queued: the queued leg's copy arrives through
+    # sealed relay mail.  The deposit must seal it with the fan-out's
+    # shared send time, so an early reaction left on the live copy's
+    # id reconciles onto the relayed copy instead of staying stranded.
+    (tmp_path / "recipient").mkdir()
+    (tmp_path / "sender").mkdir()
+    recipient_node = make_node(tmp_path / "recipient")
+    recipient = RNS.Identity()
+    recipient_node.identity = recipient
+    recipient_node.destination = SimpleNamespace(
+        hexhash=destination_hash(recipient).hex(),
+        hash=destination_hash(recipient),
+    )
+    own = destination_hash(recipient).hex()
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    members = [own, author_hash, reactor_hash]
+    group = derive_group_id(author_hash, "crew", members)
+    response = call_handler(
+        recipient_node._handle_reaction,
+        _signed_group_reaction(
+            reactor,
+            "other-leg-1",
+            "👍",
+            "react-1",
+            group=group,
+            author=author_hash,
+            sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    assert len(recipient_node.inbox.reactions_for("other-leg-1")) == 1
+    assert recipient_node.inbox.reactions_for("local-copy-1") == []
+
+    sender_node = make_node(tmp_path / "sender")
+    sender_node.identity = author
+    holder = sender_node.registry.upsert(
+        bytes.fromhex("cd" * 16), b"\x03" * 64, name="holder"
+    )
+    sender_node.registry.upsert(
+        destination_hash(recipient), recipient.get_public_key(), name="bob"
+    )
+    calls, fake_request = _recorded_request()
+    sender_node._request = fake_request
+    entry = sender_node.mailbox.enqueue(
+        to=destination_hash(recipient),
+        text="crew hello",
+        message_id="local-copy-1",
+        group={
+            "id": group,
+            "name": "crew",
+            "creator": author_hash,
+            "members": members,
+        },
+        sent_at=100.0,
+    )
+    assert sender_node._deposit_entry(holder, entry, timeout=5) is True
+    assert len(calls) == 1
+    stored = parse_mail_store(calls[0][2])
+    message = open_message(recipient, stored["blob"])
+    assert recipient_node._deliver_collected(message) is True
+    assert recipient_node.inbox.reactions_for("other-leg-1") == []
+    shown = recipient_node.inbox.reactions_for("local-copy-1")
     assert len(shown) == 1
     assert shown[0]["reaction"] == "👍"
     assert shown[0]["id"] == "react-1"
