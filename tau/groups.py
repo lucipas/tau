@@ -819,6 +819,29 @@ class GroupStore:
             return len(self._groups)
 
 
+def pinned_group(
+    groups: "GroupStore", group_id: str
+) -> Optional[Dict[str, Any]]:
+    """The pinned record for *group_id*, by exact id only.
+
+    ``GroupStore.find`` falls back to a name match when the id lookup
+    misses, so a retired id that is also another group's name would
+    resolve to that group.  Authorization and roster filtering must
+    never use the wrong group's roster, so a record whose id does not
+    match the requested id is treated as no roster at all.  Returns
+    ``None`` when nothing is pinned for that exact id.
+    """
+    try:
+        group = groups.find(group_id)
+    except ValueError:
+        return None
+    if not isinstance(group, dict):
+        return None
+    if str(group.get("id") or "").lower() != str(group_id).lower():
+        return None
+    return group
+
+
 def pinned_rosters(
     groups: "GroupStore", group_ids: Iterable[str]
 ) -> Dict[str, Optional[Set[str]]]:
@@ -833,10 +856,7 @@ def pinned_rosters(
     """
     rosters: Dict[str, Optional[Set[str]]] = {}
     for group_id in group_ids:
-        try:
-            group = groups.find(group_id)
-        except ValueError:
-            group = None
+        group = pinned_group(groups, group_id)
         rosters[group_id] = (
             set(group.get("members") or []) if group is not None else None
         )

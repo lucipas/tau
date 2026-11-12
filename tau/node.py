@@ -35,7 +35,7 @@ from .config import (
     tcp_listen_endpoints,
     write_rns_config,
 )
-from .groups import GroupStore
+from .groups import GroupStore, pinned_group
 from .identity import (
     destination_hash as tau_destination_hash,
     load_or_create_identity,
@@ -2112,11 +2112,10 @@ class TauNode:
                 # the reaction outruns the message; that reaction
                 # is stored with its context and can only surface
                 # through reconciliation when the message arrives,
-                # which checks the roster then.
-                try:
-                    pinned = self.groups.find(reaction["group"])
-                except ValueError:
-                    pinned = None
+                # which checks the roster then.  The lookup is by
+                # exact id: a retired id that is also another group's
+                # name must not resolve to that group.
+                pinned = pinned_group(self.groups, reaction["group"])
                 if pinned is not None and caller_hash not in (
                     pinned.get("members") or []
                 ):
@@ -2144,11 +2143,10 @@ class TauNode:
                 # is no membership to verify — and a deleted group has
                 # no members left to authorize.  Treating the missing
                 # roster as permission let an outsider who learned a
-                # message id react to a retained copy.
-                try:
-                    pinned = self.groups.find(resolved["group"])
-                except ValueError:
-                    pinned = None
+                # message id react to a retained copy.  The lookup is
+                # by exact id: a retired id that is also another
+                # group's name must not resolve to that group.
+                pinned = pinned_group(self.groups, resolved["group"])
                 if pinned is None or caller_hash not in (
                     pinned.get("members") or []
                 ):
@@ -2203,13 +2201,12 @@ class TauNode:
                         except ValueError:
                             final = None
                         if final is not None and final.get("kind") == "group":
-                            try:
-                                pinned = self.groups.find(final["group"])
-                            except ValueError:
-                                pinned = None
                             # A missing roster fails closed, as above:
                             # the group was deleted, so no membership
-                            # can be verified.
+                            # can be verified.  The lookup is by exact
+                            # id, so a retired id that is also another
+                            # group's name does not resolve to it.
+                            pinned = pinned_group(self.groups, final["group"])
                             if pinned is None or caller_hash not in (
                                 pinned.get("members") or []
                             ):

@@ -1420,6 +1420,48 @@ def test_group_reaction_refused_when_group_deleted(tmp_path):
     assert node.inbox.reactions_for("local-copy-1") == []
 
 
+def test_group_reaction_refused_when_namesake_masks_deleted_group(tmp_path):
+    # CodeRabbit Major (node.py:2149, CWE-863): after a group is
+    # deleted, an outsider can deliver a group named after the
+    # deleted group's 32-character id — find() then returns the
+    # outsider's group by name, and the reaction passes the roster
+    # check against the wrong roster.  Authorization now uses an
+    # exact-id lookup, so the namesake does not substitute.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    # The outsider's group is named after the deleted group's id,
+    # and names the outsider as a member.
+    namesake = node.groups.create(
+        group, [reactor_hash, destination_hash(RNS.Identity()).hex()],
+        created_by=reactor_hash,
+    )
+    assert namesake["id"] != group
+    assert node.groups.delete(group) is True
+    # The name fallback still resolves the deleted id to the namesake.
+    assert node.groups.find(group)["id"] == namesake["id"]
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
 def test_group_reaction_final_check_refuses_when_group_deleted(
     tmp_path, monkeypatch
 ):
