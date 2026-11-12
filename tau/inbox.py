@@ -1263,9 +1263,21 @@ class Inbox:
                     allowed,
                     time.time(),
                 )
-                entry["seq"] = self._next_seq()
-                self._messages.append(entry)
-                self._messages = _retain(self._messages)
+                if isinstance(message_id, str) and message_id and any(
+                    m.get("id") == message_id for m in self._messages
+                ):
+                    # A retry after a failed seen-marker write: the
+                    # copy is already here.  Skip the append so the
+                    # retry does not store a second copy — at the cap
+                    # that duplicate would evict unrelated history —
+                    # but still persist the reconcile/purge above and
+                    # return the tombstones, so the caller can finish
+                    # mark_seen and the delivery resolves.
+                    pass
+                else:
+                    entry["seq"] = self._next_seq()
+                    self._messages.append(entry)
+                    self._messages = _retain(self._messages)
                 if not self._save():
                     raise OSError(f"could not persist inbox to {self.path}")
             except OSError:

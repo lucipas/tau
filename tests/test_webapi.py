@@ -7097,6 +7097,48 @@ def test_react_endpoint_fans_out_to_group_members(bridge, node):
     assert payload["results"][1]["error"] == "no route to peer"
 
 
+def test_react_endpoint_refuses_retired_group_id_matching_a_name(bridge, node):
+    # CodeRabbit Major (webapi.py:2885, CWE-706): GroupStore.find
+    # falls back to a name match when the id lookup misses, so a
+    # retired group id that is also some other group's name resolved
+    # to that group and the reaction fanned out to its members.  The
+    # stored id is resolved exactly now — a retired id fails instead
+    # of falling back to the name.
+    retired = node.groups.create(
+        "crew", [OTHER_HASH, BOB_HASH], created_by=OTHER_HASH
+    )
+    # A second group whose NAME is the retired id: find() would
+    # resolve the retired id to this group through the name fallback.
+    namesake = node.groups.create(
+        retired["id"], [PEER_HASH, BOB_HASH], created_by=PEER_HASH
+    )
+    bridge.record_inbound(
+        {
+            "from": "bob",
+            "destination": OTHER_HASH,
+            "text": "old crew hi",
+            "kind": "group",
+            "group": retired["id"],
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "wire-old",
+        }
+    )
+    assert node.groups.delete(retired["id"]) is True
+    # The name fallback still resolves the retired id to the namesake.
+    assert node.groups.find(retired["id"])["id"] == namesake["id"]
+    status, _, payload = _json(
+        bridge,
+        "/api/react",
+        method="POST",
+        body={"target": "wire-old", "reaction": "👍"},
+    )
+    assert status == 404
+    assert "unknown group" in payload["error"]["message"]
+    assert node.group_reactions == []
+
+
 def test_react_endpoint_fans_out_group_message_from_inbox(bridge, node):
     # The message is past the console's window, so the bridge resolves
     # it from the node inbox instead of its history.

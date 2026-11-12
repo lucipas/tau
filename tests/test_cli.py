@@ -4948,6 +4948,20 @@ def test_retract_reports_an_offline_peer(tmp_path, capsys, monkeypatch):
     assert len(Mailbox(config.mailbox_path).sent_list()) == 1
 
 
+class _FakeGroupStore:
+    """Stand-in for GroupStore.get: the seeded group only."""
+
+    def get(self, group_id):
+        if group_id == "ab" * 16:
+            return {
+                "id": "ab" * 16,
+                "name": "crew",
+                "members": ["aa" * 16, "bb" * 16],
+                "creator": "aa" * 16,
+            }
+        return None
+
+
 class _FakeReactNode:
     instances = []
     # Tests may override the fan-out results (monkeypatch restores it).
@@ -4958,6 +4972,7 @@ class _FakeReactNode:
         self.sent = []
         self.group_sent = []
         self.started = False
+        self.groups = _FakeGroupStore()
         type(self).instances.append(self)
 
     def start(self):
@@ -4983,8 +4998,11 @@ class _FakeReactNode:
         target_author=None,
         target_sent_at=None,
     ):
+        # The real node takes a group record and returns its id; mirror
+        # that so the fan-out report reads the id, not the record.
+        group_id = group["id"] if isinstance(group, dict) else group
         self.group_sent.append(
-            (group, message_id, reaction, target_author, target_sent_at)
+            (group_id, message_id, reaction, target_author, target_sent_at)
         )
         results = type(self).group_results
         if results is None:
@@ -5005,7 +5023,7 @@ class _FakeReactNode:
         return {
             "ok": all(r.get("delivered") for r in results),
             "v": 1,
-            "group": group,
+            "group": group_id,
             "name": "crew",
             "target": message_id,
             "reaction": reaction,

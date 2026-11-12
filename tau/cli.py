@@ -7244,11 +7244,18 @@ def cmd_react(args: argparse.Namespace) -> int:
             group_id = target.get("group")
             if not isinstance(group_id, str) or not group_id:
                 raise NodeError("that group message has no group to react to")
+            # Resolve the stored id exactly, as the console does: a
+            # retired id that also matches a group name must not
+            # resolve to that other group and send the reaction to
+            # its members.
+            group = node.groups.get(group_id)
+            if group is None:
+                raise NodeError(f"unknown group: {group_id!r}")
             author = target.get("destination")
             sent_at = target.get("sent_at")
             try:
                 response = node.send_group_reaction(
-                    group_id,
+                    group,
                     str(target["id"]),
                     token,
                     timeout=float(getattr(args, "timeout", 20.0)),

@@ -1577,6 +1577,36 @@ def test_append_group_message_purges_and_appends_in_one_persist(
     assert shown[0]["destination"] == "ab" * 16
 
 
+def test_append_group_message_skips_duplicate_id(tmp_path):
+    # CodeRabbit Major (inbox.py:1267): the append persisted before
+    # the seen marker, with no id check — a retry after a failed
+    # seen-marker write appended a second copy, which at the cap
+    # evicted unrelated history.  A duplicate id now skips the
+    # append (the reconcile/purge still run, and the tombstones
+    # return) so the retry can finish mark_seen.
+    inbox = Inbox(tmp_path / "inbox.json")
+    members = {"ab" * 16, "aa" * 16}
+    first = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert first == []
+    assert len(inbox.list_messages()) == 1
+    again = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert again == []
+    assert len(inbox.list_messages()) == 1
+    assert inbox.find("local-copy-1") is not None
+
+
 def test_append_group_message_reconcile_failure_does_not_break_arrival(
     tmp_path, monkeypatch
 ):

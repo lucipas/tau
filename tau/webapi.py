@@ -2879,10 +2879,16 @@ class WebBridge:
         if group_id is not None:
             # Reload the persisted store first: a group created or
             # deleted by another process (``tau group``) must be seen
-            # by this reaction.
+            # by this reaction.  Resolve the stored id exactly: the
+            # fan-out takes a record, never a name lookup — a retired
+            # id that also matches a group name must not resolve to
+            # that other group and send the reaction to its members.
             self.node.groups.list_groups()
+            group = self.node.groups.get(group_id)
+            if group is None:
+                raise ValueError(f"unknown group: {group_id!r}")
             return self.node.send_group_reaction(
-                group_id,
+                group,
                 target,
                 token,
                 timeout=timeout,
