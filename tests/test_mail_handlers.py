@@ -1916,7 +1916,12 @@ def test_group_reaction_not_published_when_recheck_fails(
     # sender retries instead of the console showing a reaction that
     # was never verified.  The copy lands between the store and the
     # recheck (via the recheck's reload, as in the reload-failure
-    # test); the recheck's reload then fails.
+    # test); the recheck's reload then fails.  The stored reaction
+    # stays in the inbox (round-12 note: it is never displayed —
+    # the console and `tau messages` filter stored reactions against
+    # the pinned roster, see test_group_message_hides_non_member_
+    # reaction and test_messages_hides_non_member_group_reaction),
+    # and the retry's refusal voids it.
     from tau.inbox import Inbox, InboxError
 
     published = []

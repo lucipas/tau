@@ -66,7 +66,7 @@ from .identity import (
     load_or_create_identity,
     save_identity,
 )
-from .groups import GroupStore
+from .groups import GroupStore, pinned_rosters, visible_reactions
 from .ignored_groups import (
     IgnoredGroups,
     IgnoredGroupsError,
@@ -5911,6 +5911,22 @@ def cmd_messages(args: argparse.Namespace) -> int:
     entries = inbox.list_messages(
         limit=None, peer=peer_hash, group=group_id, query=query, kind=kind
     )
+    # A stored reaction from a non-member must never be displayed on
+    # a group message, even when the authorization recheck or its
+    # cleanup failed and left it in the inbox: filter the listed
+    # reactions against each group's pinned roster before anything
+    # prints or is emitted as JSON.  With no pinned roster there is
+    # nothing to check against.
+    rosters = pinned_rosters(
+        GroupStore(config.groups_path),
+        {str(entry.get("group")) for entry in entries if entry.get("group")},
+    )
+    for entry in entries:
+        group = entry.get("group")
+        if group and entry.get("reactions"):
+            entry["reactions"] = visible_reactions(
+                entry["reactions"], rosters.get(str(group))
+            )
     blocked = load_blocked_set(config.blocklist_path)
     if blocked is None:
         entries = []

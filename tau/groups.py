@@ -59,7 +59,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Union
 
 try:  # POSIX only; Windows locks through msvcrt instead (see below).
     import fcntl
@@ -817,3 +817,52 @@ class GroupStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._groups)
+
+
+def pinned_rosters(
+    groups: "GroupStore", group_ids: Iterable[str]
+) -> Dict[str, Optional[Set[str]]]:
+    """Pinned rosters for *group_ids*, resolved once each.
+
+    Each value is the group's pinned member set, or ``None`` when
+    nothing is pinned for that id — there is no roster to check
+    against, so readers pass reactions through unchanged.  ``find``
+    reloads from disk, so a group pinned by another process is
+    seen.  Resolving once per listing keeps a large history from
+    re-reading the store once per entry.
+    """
+    rosters: Dict[str, Optional[Set[str]]] = {}
+    for group_id in group_ids:
+        try:
+            group = groups.find(group_id)
+        except ValueError:
+            group = None
+        rosters[group_id] = (
+            set(group.get("members") or []) if group is not None else None
+        )
+    return rosters
+
+
+def visible_reactions(
+    reactions: List[Dict[str, Any]], members: Optional[Set[str]]
+) -> List[Dict[str, Any]]:
+    """The reactions on a group message that a reader may display.
+
+    A reaction stored before its target's copy arrived — or left
+    behind when an authorization recheck or its cleanup failed —
+    can sit in the inbox from a reactor who is not on the group's
+    pinned roster.  It must never be displayed on that message, so
+    readers filter stored reactions here instead of trusting them.
+    *members* is ``None`` when no roster is pinned: there is
+    nothing to check against, so the reactions pass through
+    unchanged.  A reaction record carries its reactor under
+    ``reactor`` (console overlay) or ``destination`` (inbox).
+    """
+    if members is None:
+        return list(reactions)
+    return [
+        reaction
+        for reaction in reactions
+        if str(reaction.get("reactor") or reaction.get("destination") or "")
+        in members
+    ]

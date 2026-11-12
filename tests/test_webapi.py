@@ -6719,6 +6719,81 @@ def test_messages_reconciles_cli_made_reactions(node, tmp_path):
         bridge.stop()
 
 
+def test_group_message_hides_non_member_reaction(node, tmp_path):
+    """A stored reaction from a non-member never displays on a group
+    message, even when the authorization recheck or its cleanup failed
+    and left it in the inbox (CodeRabbit round-11 follow-up).
+
+    The copy is appended directly and the reaction stored directly —
+    the way a copy imported by another process lands, with no
+    arrival purge running in this process — so the console read is
+    the only thing standing between the stored reaction and the
+    display.  A member's reaction on the same message still shows.
+    """
+    from tau.config import TauConfig
+    from tau.inbox import Inbox
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        inbox_path = TauConfig.resolve(data_dir=tmp_path, name="tester").inbox_path
+        node.inbox = Inbox(inbox_path)
+        group = node.groups.find("crew")
+        node.inbox.append(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-g1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": OTHER_HASH,
+                "from": "mallory",
+                "reaction": "👎",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-1",
+            }
+        )
+        node.inbox.record_reaction(
+            {
+                "target": "wire-g1",
+                "destination": PEER_HASH,
+                "from": "alice",
+                "reaction": "👍",
+                "sent_at": 102.0,
+                "received_at": 103.0,
+                "id": "react-2",
+            }
+        )
+        bridge.record_inbound(
+            {
+                "from": "alice",
+                "destination": PEER_HASH,
+                "text": "crew hello",
+                "kind": "group",
+                "group": group["id"],
+                "group_name": "crew",
+                "sent_at": 100.0,
+                "received_at": 101.0,
+                "id": "wire-g1",
+            }
+        )
+        messages = bridge.messages()
+        assert messages[0]["reactions"] == [
+            {"reactor": PEER_HASH, "name": "alice", "reaction": "👍"}
+        ]
+    finally:
+        bridge.stop()
+
+
 def test_react_endpoint_reacts_to_a_history_message(bridge, node):
     bridge.record_inbound(
         {

@@ -131,6 +131,7 @@ from .config import (
     set_node_setting,
     write_node_metadata,
 )
+from .groups import pinned_rosters, visible_reactions
 from .inbox import MAX_REACTIONS, InboxError, merge_reaction
 from .mailbox import MailboxError
 from .node import NodeError, TauNode
@@ -3980,8 +3981,20 @@ class WebBridge:
                 )
             ]
         by_target = self._inbox_reactions_by_target()
+        groups = getattr(self.node, "groups", None)
+        rosters: Dict[str, Optional[Set[str]]] = {}
+        if groups is not None:
+            rosters = pinned_rosters(
+                groups,
+                {
+                    str(item.get("group"))
+                    for item in items
+                    if isinstance(item.get("group"), str) and item.get("group")
+                },
+            )
         return [
-            self._with_inbox_reactions(dict(item), by_target) for item in items
+            self._with_inbox_reactions(dict(item), by_target, rosters)
+            for item in items
         ]
 
     def received_file(
@@ -4120,7 +4133,10 @@ class WebBridge:
         return by_target
 
     def _with_inbox_reactions(
-        self, message: Dict[str, Any], by_target: Dict[str, List[Dict[str, Any]]]
+        self,
+        message: Dict[str, Any],
+        by_target: Dict[str, List[Dict[str, Any]]],
+        rosters: Optional[Dict[str, Optional[Set[str]]]] = None,
     ) -> Dict[str, Any]:
         """Overlay the node inbox's reaction state on one history entry.
 
@@ -4133,31 +4149,47 @@ class WebBridge:
         the history shows the current state.  A live push to an already
         open console tab for a CLI-made reaction is still a follow-up:
         this reconciles reads, not the SSE stream.
+
+        *rosters* maps group ids to their pinned member sets (``None``
+        when nothing is pinned): a stored reaction from a reactor who
+        is not on the group's roster — stored before its target's copy
+        arrived, or left behind when an authorization recheck or its
+        cleanup failed — is dropped here, whether it was seeded live
+        or overlaid from the inbox, so it is never displayed.
         """
         wire_id = message.get("wire_id")
-        if not wire_id:
-            return message
-        stored = by_target.get(wire_id)
-        if not stored:
-            return message
-        merged: Dict[str, Dict[str, Any]] = {
-            str(item.get("reactor")): dict(item)
-            for item in message.get("reactions") or []
-            if item.get("reactor")
-        }
-        for entry in stored:
-            reactor = str(entry.get("destination") or "")
-            if not reactor:
-                continue
-            if entry.get("reaction"):
-                merged[reactor] = {
-                    "reactor": reactor,
-                    "name": str(entry.get("from") or "unknown"),
-                    "reaction": entry["reaction"],
+        if wire_id:
+            stored = by_target.get(wire_id)
+            if stored:
+                merged: Dict[str, Dict[str, Any]] = {
+                    str(item.get("reactor")): dict(item)
+                    for item in message.get("reactions") or []
+                    if item.get("reactor")
                 }
-            else:
-                merged.pop(reactor, None)
-        message["reactions"] = list(merged.values())
+                for entry in stored:
+                    reactor = str(entry.get("destination") or "")
+                    if not reactor:
+                        continue
+                    if entry.get("reaction"):
+                        merged[reactor] = {
+                            "reactor": reactor,
+                            "name": str(entry.get("from") or "unknown"),
+                            "reaction": entry["reaction"],
+                        }
+                    else:
+                        merged.pop(reactor, None)
+                message["reactions"] = list(merged.values())
+        group_id = message.get("group")
+        if (
+            isinstance(group_id, str)
+            and group_id
+            and rosters is not None
+            and rosters.get(group_id) is not None
+            and message.get("reactions")
+        ):
+            message["reactions"] = visible_reactions(
+                message["reactions"], rosters[group_id]
+            )
         return message
 
     def counts(self) -> Dict[str, int]:
