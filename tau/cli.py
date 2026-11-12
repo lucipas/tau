@@ -1153,6 +1153,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     group_delete.set_defaults(func=cmd_group_delete)
 
+    group_leave = group_sub.add_parser(
+        "leave",
+        parents=[common],
+        help="leave a group you joined (stops its messages for good)",
+    )
+    group_leave.add_argument(
+        "group", metavar="GROUP", help="group id, id prefix or name"
+    )
+    group_leave.set_defaults(func=cmd_group_leave)
+
+    group_rejoin = group_sub.add_parser(
+        "rejoin",
+        parents=[common],
+        help="undo a leave so the next message pins the group again",
+    )
+    group_rejoin.add_argument(
+        "group", metavar="ID", help="full id of a group this node left"
+    )
+    group_rejoin.set_defaults(func=cmd_group_rejoin)
+
+    group_left = group_sub.add_parser(
+        "left",
+        parents=[common],
+        help="list groups this node has left",
+    )
+    group_left.set_defaults(func=cmd_group_left)
+
     group_ignore = group_sub.add_parser(
         "ignore",
         parents=[common],
@@ -6438,6 +6465,98 @@ def cmd_group_delete(args: argparse.Namespace) -> int:
         _emit({"deleted": group["id"], "name": group["name"]}, True)
         return _EXIT_OK
     print(f"deleted group {group['name']} ({group['id'][:8]})")
+    return _EXIT_OK
+
+
+def cmd_group_leave(args: argparse.Namespace) -> int:
+    """Leave a group this node joined: drop it and refuse to re-pin it.
+
+    The creator steps out with ``tau group delete`` instead — a group
+    this node created cannot be re-pinned by another member's message
+    the way a learned group can, so delete is durable for the creator.
+    Leaving is local only: the creator is not told and keeps the member
+    on the roster, so the messages keep coming and are rejected here.
+    """
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    try:
+        group = store.find(args.group)
+    except ValueError:
+        # Leaving twice is not an error: a full id already on the left
+        # list reports as already left instead of unknown.
+        query = args.group.strip().lower()
+        if len(query) == 32 and store.is_left(query):
+            if _json_mode(args):
+                _emit({"left": query, "already_left": True}, True)
+                return _EXIT_OK
+            print(f"already left group {query[:8]}")
+            return _EXIT_OK
+        raise
+    if group["local"]:
+        # The `local` flag is the durable marker of a group this node
+        # created — it survives even if the identity file is gone, and
+        # it cannot be forged by a member claiming this node as the
+        # creator of a learned group.
+        raise NodeError(
+            "only members can leave a group they did not create —"
+            " delete your own group with `tau group delete`"
+        )
+    left_ids = store.leave(group["id"])
+    if not left_ids:
+        raise NodeError(f"unknown group: {args.group!r}")
+    siblings = [gid for gid in left_ids if gid != group["id"]]
+    if _json_mode(args):
+        payload: Dict[str, Any] = {"left": group["id"], "name": group["name"]}
+        if siblings:
+            payload["also_left"] = siblings
+        _emit(payload, True)
+        return _EXIT_OK
+    print(f"left group {group['name']} ({group['id'][:8]})")
+    if siblings:
+        print(f"also left {len(siblings)} related roster(s) for the same group")
+    print("Future messages for it will be rejected; rejoin with `tau group rejoin <id>`.")
+    return _EXIT_OK
+
+
+def cmd_group_rejoin(args: argparse.Namespace) -> int:
+    """Undo a leave, so the next group message pins the group again."""
+    config = _make_config(args)
+    group_id = args.group.strip().lower()
+    valid = len(group_id) == 32
+    if valid:
+        try:
+            bytes.fromhex(group_id)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise NodeError(f"invalid group id: {args.group!r}")
+    store = GroupStore(config.groups_path)
+    if not store.rejoin(group_id):
+        raise NodeError(f"group {group_id} was never left")
+    if _json_mode(args):
+        _emit({"rejoined": group_id}, True)
+        return _EXIT_OK
+    print(f"rejoined group {group_id[:8]} — the next message will pin it again")
+    return _EXIT_OK
+
+
+def cmd_group_left(args: argparse.Namespace) -> int:
+    """List groups this node has left."""
+    config = _make_config(args)
+    store = GroupStore(config.groups_path)
+    entries = store.left_groups()
+    if _json_mode(args):
+        _emit({"left": entries, "count": len(entries)}, True)
+        return _EXIT_OK
+    if not entries:
+        print("No left groups.")
+        return _EXIT_OK
+    for entry in entries:
+        left_at = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(entry["left_at"])
+        )
+        # The full id: `tau group rejoin` needs all 32 characters.
+        print(f"{entry['id']} — left {left_at}")
     return _EXIT_OK
 
 
