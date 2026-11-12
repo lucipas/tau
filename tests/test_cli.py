@@ -2162,6 +2162,206 @@ def test_messages_delete_json_and_errors(tmp_path, capsys):
     assert payload["deleted"]["text"] == "first hello"
 
 
+def test_parser_pin_unpin_pinned_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["pin", "abcd1234"])
+    assert args.message == "abcd1234"
+    assert args.func is cli.cmd_pin
+
+    args = parser.parse_args(["unpin", "abcd1234"])
+    assert args.message == "abcd1234"
+    assert args.func is cli.cmd_unpin
+
+    args = parser.parse_args(["pinned", "--peer", "alice", "--limit", "5"])
+    assert args.peer == "alice"
+    assert args.limit == 5
+    assert args.func is cli.cmd_pinned
+
+    defaults = parser.parse_args(["pinned"])
+    assert defaults.peer is None
+    assert defaults.limit == 30
+
+
+def test_pin_unpin_round_trip(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["pin", "m-2", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "pinned [m-2] from alice" in out
+    assert "pins are local-only" in out
+
+    # The pin survives a fresh process and shows in both listings.
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "second hello" in out
+    assert "first hello" not in out
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "📌" in out
+    assert "#m-2" in out
+
+    code = cli.main(["unpin", "m-2", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "unpinned [m-2] from alice" in capsys.readouterr().out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No pinned messages." in capsys.readouterr().out
+
+
+def test_pin_json_and_errors(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    # Ambiguous prefix: both seeded ids start with "m-".
+    code = cli.main(["pin", "m-", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "2 messages match prefix" in capsys.readouterr().err
+
+    # Unknown id.
+    code = cli.main(["pin", "nope", "--data-dir", str(data_dir)])
+    assert code == 1
+    assert "unknown message" in capsys.readouterr().err
+
+    code = cli.main(["pin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pinned"]["id"] == "m-1"
+    assert payload["already_pinned"] is False
+
+    # Pinning twice reports the pin was already there.
+    code = cli.main(["pin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_pinned"] is True
+
+    code = cli.main(["unpin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unpinned"]["id"] == "m-1"
+    assert payload["was_pinned"] is True
+
+    # Unpinning an unpinned message is a no-op, not an error.
+    code = cli.main(["unpin", "m-1", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["was_pinned"] is False
+
+
+def test_pinned_peer_filter_and_json(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "No pinned messages." in capsys.readouterr().out
+
+    cli.main(["pin", "m-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    code = cli.main(["pinned", "--peer", "alice", "--data-dir", str(data_dir)])
+    assert code == 0
+    assert "first hello" in capsys.readouterr().out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["messages"][0]["id"] == "m-1"
+    assert payload["messages"][0]["pinned"] is True
+
+
+def test_pinned_peer_prefix_finds_sent_pin(tmp_path, capsys):
+    """A pinned sent message is findable by its recipient's hash prefix.
+
+    The recipient is not in the registry and never sent anything, so
+    only the sent record names them — the peer lookup must search
+    sent pins too.
+    """
+    data_dir, _ = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    code = cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(["pinned", "--peer", "cdcdcdcd", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "sent pinned note" in out
+    # Sent pins render as from you, never as unread.
+    assert "you →" in out
+    assert "●" not in out
+
+    code = cli.main(["pinned", "--data-dir", str(data_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    sent = [item for item in payload["messages"] if item["id"] == "s-1"]
+    assert sent and sent[0]["unread"] is False
+
+
+def test_pinned_blocked_filter_applies_to_received_only(tmp_path, capsys):
+    data_dir, sender_hash = _seed_messages(tmp_path)
+    recipient = "cd" * 16
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient,
+            "text": "sent pinned note",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "s-1",
+            "direction": "out",
+        }
+    )
+    cli.main(["pin", "m-1", "--data-dir", str(data_dir)])
+    cli.main(["pin", "s-1", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    def _pinned_text():
+        code = cli.main(["pinned", "--data-dir", str(data_dir)])
+        assert code == 0
+        return capsys.readouterr().out
+
+    # Blocking the sender hides the received pin, not the sent one.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [sender_hash.hex()]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+    # Blocking the recipient hides nothing: sent pins are your own.
+    (data_dir / "blocklist.json").write_text(
+        json.dumps({"blocked": [recipient]}), encoding="utf-8"
+    )
+    out = _pinned_text()
+    assert "first hello" in out
+    assert "sent pinned note" in out
+
+    # An unreadable list hides received pins (fail closed) but keeps sent ones.
+    (data_dir / "blocklist.json").write_text("{not json", encoding="utf-8")
+    out = _pinned_text()
+    assert "first hello" not in out
+    assert "sent pinned note" in out
+
+
 def test_parser_messages_unread_and_count_arguments():
     parser = cli.build_parser()
     args = parser.parse_args(["messages", "--unread", "--count"])

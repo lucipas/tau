@@ -169,6 +169,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["read_at"] = read_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
+    if raw.get("pinned"):
+        record["pinned"] = True
     kind = raw.get("kind")
     if kind == "group":
         group_id = raw.get("group")
@@ -370,7 +372,7 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     seq = raw.get("seq")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         seq = None
-    return {
+    record = {
         "kind": "file",
         "from": str(raw.get("from") or "unknown"),
         "destination": str(raw.get("destination") or ""),
@@ -384,6 +386,9 @@ def _valid_file_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "direction": "in",
         "seq": seq,
     }
+    if raw.get("pinned"):
+        record["pinned"] = True
+    return record
 
 
 def _record_error(raw: Any) -> Optional[str]:
@@ -435,6 +440,46 @@ def _dedupe_key(record: Dict[str, Any]) -> Any:
         str(record.get("text") or ""),
         float(record.get("sent_at") or 0.0),
     )
+
+
+def _match_ref(entries: List[Dict[str, Any]], ref: str) -> Dict[str, Any]:
+    """The stored entry addressed by *ref*, or raise :class:`InboxError`.
+
+    Same convention as :meth:`Mailbox.resolve_outbox`: a full id
+    matches exactly, a shorter prefix must match exactly one stored
+    message.  Peer-supplied ids are case-sensitive: an exact match
+    wins outright; only then fall back to a case-folded full match,
+    and then to a case-folded prefix match.  The prefix step runs
+    whatever the reference length — a 32-character prefix of a
+    64-character LXMF id still resolves when no full id matches.
+    Records with no id (older stores predate ids) cannot be addressed
+    this way.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise InboxError("message reference must not be empty")
+    value = ref.strip()
+    matches = [
+        entry for entry in entries if str(entry.get("id") or "") == value
+    ]
+    if not matches:
+        folded = value.lower()
+        matches = [
+            entry
+            for entry in entries
+            if str(entry.get("id") or "").lower() == folded
+        ]
+    if not matches:
+        folded = value.lower()
+        matches = [
+            entry
+            for entry in entries
+            if str(entry.get("id") or "").lower().startswith(folded)
+        ]
+    if not matches:
+        raise InboxError(f"unknown message: {ref!r}")
+    if len(matches) > 1:
+        raise InboxError(f"{len(matches)} messages match prefix {ref!r}")
+    return matches[0]
 
 
 class Inbox:
@@ -604,39 +649,10 @@ class Inbox:
         copies already held by relays are unaffected.  Records with no
         id (older stores predate ids) cannot be addressed this way.
         """
-        if not isinstance(ref, str) or not ref.strip():
-            raise InboxError("message reference must not be empty")
-        value = ref.strip()
         with self._transaction():
-            entries = list(self._messages)
-            # Peer-supplied ids are case-sensitive: an exact match wins
-            # outright; only then fall back to a case-folded prefix.
-            matches = [
-                entry for entry in entries if str(entry.get("id") or "") == value
-            ]
-            if not matches:
-                folded = value.lower()
-                if len(folded) == 32:
-                    matches = [
-                        entry
-                        for entry in entries
-                        if str(entry.get("id") or "").lower() == folded
-                    ]
-                else:
-                    matches = [
-                        entry
-                        for entry in entries
-                        if str(entry.get("id") or "").lower().startswith(folded)
-                    ]
-            if not matches:
-                raise InboxError(f"unknown message: {ref!r}")
-            if len(matches) > 1:
-                raise InboxError(
-                    f"{len(matches)} messages match prefix {ref!r}"
-                )
-            removed = matches[0]
+            removed = _match_ref(list(self._messages), ref)
             previous = self._messages
-            self._messages = [entry for entry in entries if entry is not removed]
+            self._messages = [entry for entry in self._messages if entry is not removed]
             try:
                 self._save(strict=True)
             except OSError as exc:
@@ -646,6 +662,54 @@ class Inbox:
                     f"could not persist inbox; message was not deleted: {exc}"
                 ) from exc
         return dict(removed)
+
+    def pin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
+        """Pin one stored message by full id or unique prefix.
+
+        Pins are local-only: nothing is sent to the peer, and the flag
+        lives on the stored record, so it survives restarts and rides
+        along with an export.  Deleting the message drops its pin with
+        it.  Returns the pinned record and whether the pin is new —
+        pinning an already-pinned message is a no-op, not an error.
+        The change runs inside the cross-process transaction, like
+        :meth:`delete`, so a concurrent ``tau serve`` cannot lose it.
+        """
+        with self._transaction():
+            entry = _match_ref(list(self._messages), ref)
+            if entry.get("pinned"):
+                return dict(entry), False
+            entry["pinned"] = True
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                del entry["pinned"]
+                raise InboxError(
+                    f"could not persist inbox; message was not pinned: {exc}"
+                ) from exc
+        return dict(entry), True
+
+    def unpin(self, ref: str) -> Tuple[Dict[str, Any], bool]:
+        """Remove the pin from one stored message.
+
+        Same addressing as :meth:`pin`.  Returns the record and
+        whether a pin was actually removed — unpinning a message that
+        was never pinned is a no-op, not an error.
+        """
+        with self._transaction():
+            entry = _match_ref(list(self._messages), ref)
+            if not entry.get("pinned"):
+                return dict(entry), False
+            del entry["pinned"]
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                entry["pinned"] = True
+                raise InboxError(
+                    f"could not persist inbox; message was not unpinned: {exc}"
+                ) from exc
+        return dict(entry), True
 
     def delete_authorized(
         self, message_id: str, *, direction: str, destination: str
@@ -887,6 +951,7 @@ class Inbox:
         group: Optional[str] = None,
         kind: Optional[str] = None,
         direction: Optional[str] = "in",
+        pinned_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Received messages, newest first.
 
@@ -899,10 +964,14 @@ class Inbox:
         own earlier message as often as the peer's — but they stay out
         of the default listing, which is the received-message view
         ``tau messages`` has always shown; pass ``direction="out"`` or
-        ``direction=None`` to see them.
+        ``direction=None`` to see them.  ``pinned_only`` keeps only
+        messages flagged by :meth:`pin`.
         Each entry carries ``unread``: whether it arrived after its
         sender's read cursor, and a ``reactions`` list when the message
         has any — derived from the reaction store, never stored counters.
+        Sent messages are never unread: the cursor belongs to the
+        conversation's received side, so comparing a sent record's
+        sequence against it would flag it arbitrarily.
         """
         if direction is not None and direction not in ("in", "out"):
             raise ValueError('direction must be "in" or "out"')
@@ -935,17 +1004,20 @@ class Inbox:
             ]
         if kind is not None:
             entries = [item for item in entries if item.get("kind") == kind]
+        if pinned_only:
+            entries = [item for item in entries if item.get("pinned")]
         entries.reverse()
         if limit is not None:
             entries = entries[: max(0, limit)]
         annotated = []
         for item in entries:
-            copy = dict(
-                item,
-                unread=_is_unread(
-                    item, cursors.get(item.get("destination") or "")
-                ),
+            # Unread is a received-message state: a message this node
+            # sent is never unread, whatever the conversation's read
+            # cursor says about its arrival sequence.
+            unread = item.get("direction") != "out" and _is_unread(
+                item, cursors.get(item.get("destination") or "")
             )
+            copy = dict(item, unread=unread)
             reactions = by_target.get(str(item.get("id") or ""))
             if reactions:
                 reactions.sort(key=lambda entry: entry["received_at"])

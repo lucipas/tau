@@ -508,6 +508,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     react.set_defaults(func=cmd_react)
 
+    pin = subparsers.add_parser(
+        "pin",
+        parents=[common],
+        help="pin a stored message so it stays easy to find",
+    )
+    pin.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    pin.set_defaults(func=cmd_pin)
+
+    unpin = subparsers.add_parser(
+        "unpin",
+        parents=[common],
+        help="remove the pin from a stored message",
+    )
+    unpin.add_argument(
+        "message",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages`)",
+    )
+    unpin.set_defaults(func=cmd_unpin)
+
+    pinned = subparsers.add_parser(
+        "pinned",
+        parents=[common],
+        help="list pinned stored messages",
+    )
+    pinned.add_argument(
+        "--peer",
+        default=None,
+        metavar="NAME|HASH",
+        help="only show pins from this peer (name, hash or hash prefix)",
+    )
+    pinned.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="show the newest N pinned messages (default 30)",
+    )
+    pinned.set_defaults(func=cmd_pinned)
     retract = subparsers.add_parser(
         "retract",
         parents=[common],
@@ -5383,7 +5426,12 @@ def _format_message_time(timestamp: float) -> str:
         return "unknown time"
 
 
-def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> str:
+def _resolve_inbox_peer(
+    inbox: Inbox,
+    registry: PeerRegistry,
+    target: str,
+    direction: Optional[str] = "in",
+) -> str:
     """Resolve ``--peer`` to a sender hash for inbox filtering.
 
     A full destination hash filters directly, and an exact name match
@@ -5392,6 +5440,8 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
     prefix shared by two distinct senders is ambiguous, even when one
     of them is registered and the other is not (pruned, or never
     discovered — a direct message needs no prior announce).
+    ``direction`` picks which inbox records are searched: ``"in"`` for
+    received messages (the default), ``None`` for both directions.
     """
     target = target.strip()
     if _is_hex32(target):
@@ -5409,7 +5459,7 @@ def _resolve_inbox_peer(inbox: Inbox, registry: PeerRegistry, target: str) -> st
         senders = {peer.hexhash for peer in peers if peer.hexhash.startswith(prefix)}
         senders |= {
             str(entry.get("destination") or "").casefold()
-            for entry in inbox.list_messages(limit=None)
+            for entry in inbox.list_messages(limit=None, direction=direction)
             if str(entry.get("destination") or "").casefold().startswith(prefix)
         }
         if len(senders) == 1:
@@ -5592,6 +5642,84 @@ def _quote_line(inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]) -> 
     return f"↩ {name}: {first_line}"
 
 
+def _message_peer_label(registry: PeerRegistry, entry: Dict[str, Any]) -> str:
+    """Who a stored message is from — or, for one this node sent, to."""
+    destination = str(entry.get("destination") or "")
+    peer = registry.get(destination)
+    if entry.get("direction") == "out":
+        name = peer.display_name if peer is not None else "unknown"
+        return f"to {name}"
+    name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+    return f"from {name}"
+
+
+def _print_message_entry(
+    inbox: Inbox, registry: PeerRegistry, entry: Dict[str, Any]
+) -> None:
+    """Print one stored message the way `tau messages` does.
+
+    Shared by `tau messages` and `tau pinned` so a pinned message
+    reads the same in both listings.  A message this node sent is
+    shown as from you, to its recipient; a received one as from its
+    sender.  Pinned entries carry a 📌 marker, like the ● unread one.
+    """
+    destination = str(entry.get("destination") or "")
+    peer = registry.get(destination)
+    sender = short_hash(destination)
+    if entry.get("direction") == "out":
+        name = peer.display_name if peer is not None else "unknown"
+        who = f"you → {name} ({sender})"
+    else:
+        name = peer.display_name if peer is not None else entry.get("from") or "unknown"
+        who = f"{name} ({sender})"
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    # Unread is a received-message state; a sent message is never unread.
+    marker = "● " if entry.get("unread") and entry.get("direction") != "out" else ""
+    pin_marker = "📌 " if entry.get("pinned") else ""
+    # The short id is what `tau react` takes: without it the
+    # listing gives the user no way to name a message to react to.
+    message_id = entry.get("id")
+    id_suffix = (
+        f" #{_safe_id_prefix(str(message_id))}"
+        if isinstance(message_id, str) and message_id
+        else ""
+    )
+    group_suffix = ""
+    if entry.get("kind") == "group":
+        group_suffix = f" in {entry.get('group_name') or 'group'}"
+    entry_kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
+    kind_tag = (
+        f" [{entry_kind}]"
+        if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
+        else ""
+    )
+    print(f"{marker}{pin_marker}[{when}] {who}{id_suffix}{kind_tag}{group_suffix}")
+    if entry.get("kind") == "file":
+        print(
+            f"  file: {entry.get('name')} "
+            f"({entry.get('size')} bytes, "
+            f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
+        )
+        print(f"  saved to {entry.get('path')}")
+        return
+    quote = _quote_line(inbox, registry, entry)
+    if quote is not None:
+        print(f"  {quote}")
+    for line in str(entry.get("text", "")).splitlines() or [""]:
+        print(f"  {line}")
+    for reaction in entry.get("reactions") or []:
+        reactor = registry.get(str(reaction.get("destination") or ""))
+        reactor_name = (
+            reactor.display_name
+            if reactor is not None
+            else str(reaction.get("from") or "unknown")
+        )
+        print(f"  {reaction.get('reaction')} {reactor_name}")
+    entry_expires_at = entry.get("expires_at")
+    if isinstance(entry_expires_at, (int, float)) and float(entry_expires_at) > time.time():
+        print(f"  disappears in {_ago(float(entry_expires_at) - time.time())}")
+
+
 def cmd_messages(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -5683,59 +5811,7 @@ def cmd_messages(args: argparse.Namespace) -> int:
             )
     else:
         for entry in shown:
-            peer = registry.get(entry.get("destination") or "")
-            name = peer.display_name if peer is not None else entry.get("from") or "unknown"
-            sender = short_hash(str(entry.get("destination") or ""))
-            when = _format_message_time(float(entry.get("received_at", 0)))
-            marker = "● " if entry.get("unread") else ""
-            # The short id is what `tau react` takes: without it the
-            # listing gives the user no way to name a message to react to.
-            message_id = entry.get("id")
-            id_suffix = (
-                f" #{_safe_id_prefix(str(message_id))}"
-                if isinstance(message_id, str) and message_id
-                else ""
-            )
-            group_suffix = ""
-            if entry.get("kind") == "group":
-                group_suffix = f" in {entry.get('group_name') or 'group'}"
-            entry_kind = entry.get("kind") or DEFAULT_MESSAGE_KIND
-            kind_tag = (
-                f" [{entry_kind}]"
-                if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
-                else ""
-            )
-            print(
-                f"{marker}[{when}] {name} ({sender}){id_suffix}{kind_tag}{group_suffix}"
-            )
-            if entry.get("kind") == "file":
-                print(
-                    f"  file: {entry.get('name')} "
-                    f"({entry.get('size')} bytes, "
-                    f"sha256 {short_hash(str(entry.get('sha256') or ''), 12)})"
-                )
-                print(f"  saved to {entry.get('path')}")
-                continue
-            quote = _quote_line(inbox, registry, entry)
-            if quote is not None:
-                print(f"  {quote}")
-            for line in str(entry.get("text", "")).splitlines() or [""]:
-                print(f"  {line}")
-            for reaction in entry.get("reactions") or []:
-                reactor = registry.get(str(reaction.get("destination") or ""))
-                reactor_name = (
-                    reactor.display_name
-                    if reactor is not None
-                    else str(reaction.get("from") or "unknown")
-                )
-                print(f"  {reaction.get('reaction')} {reactor_name}")
-            entry_expires_at = entry.get("expires_at")
-            if isinstance(entry_expires_at, (int, float)) and float(
-                entry_expires_at
-            ) > time.time():
-                print(
-                    f"  disappears in {_ago(float(entry_expires_at) - time.time())}"
-                )
+            _print_message_entry(inbox, registry, entry)
         if more_unread:
             _print_more_unread(registry, more_unread)
     # Reading a conversation advances its cursor to the newest message
@@ -5798,6 +5874,96 @@ def cmd_messages_delete(args: argparse.Namespace) -> int:
             " theirs, and sealed copies already held by relays are"
             " unaffected."
         )
+    return _EXIT_OK
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry, changed = inbox.pin(args.message)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"pinned": entry, "already_pinned": not changed}, True)
+        return _EXIT_OK
+    short = _safe_id_prefix(str(entry.get("id") or ""))
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    state = "pinned" if changed else "already pinned"
+    print(f"{state} [{short}] {_message_peer_label(registry, entry)} ({when})")
+    if changed:
+        print(
+            "note: pins are local-only; the peer's copy is unaffected"
+            " and the pin is never sent."
+        )
+    return _EXIT_OK
+
+
+def cmd_unpin(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        entry, changed = inbox.unpin(args.message)
+    except InboxError as exc:
+        raise NodeError(str(exc)) from exc
+    if _json_mode(args):
+        _emit({"unpinned": entry, "was_pinned": changed}, True)
+        return _EXIT_OK
+    short = _safe_id_prefix(str(entry.get("id") or ""))
+    when = _format_message_time(float(entry.get("received_at", 0)))
+    state = "unpinned" if changed else "was not pinned"
+    print(f"{state} [{short}] {_message_peer_label(registry, entry)} ({when})")
+    return _EXIT_OK
+
+
+def cmd_pinned(args: argparse.Namespace) -> int:
+    """List pinned messages, received and sent.
+
+    A read-only lookup, like `tau messages --search`: it never
+    advances the read cursor and never sends read receipts.
+    """
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    peer_hash = None
+    if getattr(args, "peer", None):
+        # The listing covers sent pins too, so the lookup must search
+        # recipients as well as senders.
+        peer_hash = _resolve_inbox_peer(
+            inbox, registry, args.peer, direction=None
+        )
+    limit = getattr(args, "limit", 30)
+    if limit is not None and limit < 0:
+        raise NodeError("--limit must not be negative")
+    entries = inbox.list_messages(
+        limit=None, peer=peer_hash, pinned_only=True, direction=None
+    )
+    # Blocked senders' history stays stored but is hidden locally,
+    # like `tau messages`; unblocking restores the view.  The filter
+    # applies to received pins only: sent pins are this node's own
+    # messages, not a blocked sender's, so blocking the recipient
+    # never hides them — and an unreadable list hides received pins
+    # (fail closed) while leaving sent ones visible.
+    blocked = load_blocked_set(config.blocklist_path)
+    if blocked is None:
+        entries = [entry for entry in entries if entry.get("direction") == "out"]
+    elif blocked:
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("direction") == "out"
+            or entry.get("destination") not in blocked
+        ]
+    shown = entries if limit is None else entries[:limit]
+    if _json_mode(args):
+        _emit({"messages": shown, "count": len(shown)}, True)
+    elif not shown:
+        print("No pinned messages.")
+    else:
+        for entry in shown:
+            _print_message_entry(inbox, registry, entry)
     return _EXIT_OK
 
 
