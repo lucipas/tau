@@ -3676,12 +3676,150 @@ def test_react_sends_to_the_message_author(tmp_path, capsys, monkeypatch):
     assert node.sent == [(sender_hash.hex(), "m-1", "👍")]
 
 
+def _seed_sent_message(tmp_path):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-1",
+            "direction": "out",
+        }
+    )
+    return data_dir, recipient_hash
+
+
+def test_parser_edit_arguments():
+    parser = cli.build_parser()
+    args = parser.parse_args(["edit", "abcdef12", "fixed text"])
+    assert args.command == "edit"
+    assert args.target == "abcdef12"
+    assert args.text == "fixed text"
+
+    from_stdin = parser.parse_args(["edit", "abcdef12"])
+    assert from_stdin.text is None
+
+
+def test_edit_sends_to_the_message_recipient(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "fixed here"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edited your message to alice" in out
+    node = _FakeReactNode.instances[0]
+    assert node.started is False
+    assert node.edited == [(recipient_hash.hex(), "m-1", "fixed here")]
+
+
+def test_edit_json(tmp_path, capsys, monkeypatch):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(
+        ["edit", "--data-dir", str(data_dir), "m-1", "fixed here", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"] == "m-1"
+    assert payload["to"] == recipient_hash.hex()
+    assert payload["to_name"] == "alice"
+    assert payload["text"] == "fixed here"
+    assert payload["edited"] is True
+    assert payload["id"] == "e-1"
+
+
+def test_edit_rejects_blank_and_oversized_text(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_sent_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "   "])
+    assert code == cli._EXIT_ERROR
+    assert "must not be empty" in capsys.readouterr().err
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-1", "x" * 2001])
+    assert code == cli._EXIT_ERROR
+    assert "longer than 2000" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_rejects_unknown_or_ambiguous_message(tmp_path, capsys, monkeypatch):
+    data_dir, _ = _seed_sent_message(tmp_path)
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "zzz", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "unknown message" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_edit_refuses_a_group_message(tmp_path, capsys, monkeypatch):
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(sender_hash, sender.get_public_key(), name="alice", now=100.0)
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "weekend",
+        }
+    )
+    monkeypatch.setattr(cli, "TauNode", _FakeReactNode)
+    _FakeReactNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "g-1", "fixed"])
+    assert code == cli._EXIT_ERROR
+    assert "group messages cannot be edited" in capsys.readouterr().err
+    assert _FakeReactNode.instances == []
+
+
+def test_messages_shows_edited_marker(tmp_path, capsys):
+    data_dir, _ = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.apply_edit("m-1", "fixed here", edited_at=42.0)
+
+    code = cli.main(["messages", "--data-dir", str(data_dir)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "fixed here" in out
+    assert "(edited)" in out
+
+
 class _FakeReactNode:
     instances = []
 
     def __init__(self, config, name=None):
         self.config = config
         self.sent = []
+        self.edited = []
         self.started = False
         type(self).instances.append(self)
 
@@ -3696,3 +3834,9 @@ class _FakeReactNode:
     ):
         self.sent.append((target, message_id, reaction))
         return {"ok": True, "reaction": reaction, "target": message_id, "id": "r-1"}
+
+    def send_edit(
+        self, target, message_id, text, *, timeout=20.0, discover_timeout=None
+    ):
+        self.edited.append((target, message_id, text))
+        return {"ok": True, "edited": True, "target": message_id, "id": "e-1"}

@@ -80,6 +80,7 @@ from .protocol import (
     clean_in_reply_to,
     clean_reaction,
     excerpt_hash,
+    normalize_message,
     normalize_message_kind,
     sanitize_name,
     short_hash,
@@ -457,6 +458,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to wait for an unknown peer to announce",
     )
     react.set_defaults(func=cmd_react)
+
+    edit = subparsers.add_parser(
+        "edit",
+        parents=[common],
+        help="edit a message you sent",
+    )
+    edit.add_argument(
+        "target",
+        metavar="MESSAGE-ID",
+        help="message id or unique prefix (see `tau messages --sent`)",
+    )
+    edit.add_argument(
+        "text", nargs="?", help="replacement text (reads stdin when omitted)"
+    )
+    edit.add_argument("--file", type=Path, help="read the replacement text from a file")
+    edit.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    edit.add_argument(
+        "--discover-timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for an unknown peer to announce",
+    )
+    edit.set_defaults(func=cmd_edit)
 
     ping = subparsers.add_parser(
         "ping", parents=[common], help="measure reachability of a peer"
@@ -5396,8 +5421,9 @@ def cmd_messages(args: argparse.Namespace) -> int:
                 if entry_kind not in (DEFAULT_MESSAGE_KIND, "group", "file")
                 else ""
             )
+            edited_suffix = " (edited)" if entry.get("edited_at") else ""
             print(
-                f"{marker}[{when}] {name} ({sender}){id_suffix}{kind_tag}{group_suffix}"
+                f"{marker}[{when}] {name} ({sender}){id_suffix}{kind_tag}{group_suffix}{edited_suffix}"
             )
             if entry.get("kind") == "file":
                 print(
@@ -5857,6 +5883,77 @@ def cmd_react(args: argparse.Namespace) -> int:
         print(f"retracted your reaction to {name}'s message {_safe_id_prefix(str(target['id']))}")
     else:
         print(f"reacted {token} to {name}'s message {_safe_id_prefix(str(target['id']))}")
+    return _EXIT_OK
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    text = _read_message(args)
+    try:
+        cleaned = normalize_message(text)
+    except ProtocolError as exc:
+        raise NodeError(str(exc)) from exc
+    config = _make_config(args)
+    inbox = Inbox(config.inbox_path)
+    registry = PeerRegistry(config.peers_path)
+    try:
+        target = inbox.resolve(args.target)
+    except ValueError as exc:
+        raise NodeError(str(exc)) from exc
+    if not target.get("id"):
+        raise NodeError("that message has no id to edit")
+    if target.get("kind") == "group":
+        raise NodeError(
+            "group messages cannot be edited; send a new message instead"
+        )
+    if target.get("kind") == "file":
+        raise NodeError("a file record has no text to edit")
+    author = target.get("destination") or ""
+    if not author:
+        raise NodeError("that message has no known recipient to edit it for")
+    node = TauNode(config, name=config.name)
+    node.start()
+    try:
+        try:
+            response = node.send_edit(
+                author,
+                str(target["id"]),
+                cleaned,
+                timeout=float(getattr(args, "timeout", 20.0)),
+                discover_timeout=float(getattr(args, "discover_timeout", 10.0)),
+            )
+        except NodeError as exc:
+            # Edits ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable peer is a
+            # plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver edit: {exc} "
+                "(edits need the peer online in v1)"
+            ) from exc
+    finally:
+        node.stop()
+
+    peer = registry.get(author)
+    name = peer.display_name if peer is not None else target.get("from") or author
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "to": author,
+                "to_name": name,
+                "text": cleaned,
+                "edited": bool(response.get("edited", True)),
+                "id": response.get("id"),
+            },
+            True,
+        )
+    elif response.get("edited") is False:
+        print(
+            f"edit was not applied to {name}'s copy of "
+            f"{_safe_id_prefix(str(target['id']))} "
+            "(unknown message, or a newer edit already applied)"
+        )
+    else:
+        print(f"edited your message to {name} {_safe_id_prefix(str(target['id']))}")
     return _EXIT_OK
 
 

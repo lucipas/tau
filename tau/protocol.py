@@ -90,6 +90,7 @@ REQUEST_MESSAGE = "/tau/message"
 REQUEST_FILE = "/tau/file"
 REQUEST_READ = "/tau/read"
 REQUEST_REACT = "/tau/react"
+REQUEST_DM_EDIT = "/tau/dm/edit"
 REQUEST_PEERS = "/tau/peers"
 REQUEST_MAIL_STORE = "/tau/mail/store"
 REQUEST_MAIL_FETCH = "/tau/mail/fetch"
@@ -101,6 +102,7 @@ REQUEST_PATHS = (
     REQUEST_FILE,
     REQUEST_READ,
     REQUEST_REACT,
+    REQUEST_DM_EDIT,
     REQUEST_PEERS,
     REQUEST_MAIL_STORE,
     REQUEST_MAIL_FETCH,
@@ -539,6 +541,108 @@ def parse_reaction(raw: Any) -> Dict[str, Any]:
 
 def reaction_unsigned_bytes(raw: Any) -> bytes:
     """Canonical bytes of a reaction payload without its signature.
+
+    Used to verify the signature: the signer signs exactly these bytes,
+    and the deterministic encoder reproduces them from the received
+    payload regardless of key order on the wire.
+    """
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    unsigned = {key: value for key, value in payload.items() if key != "sig"}
+    return encode(unsigned, max_bytes=MAX_REQUEST_BYTES)
+
+
+def edit_dict(
+    target: str,
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The ``/tau/dm/edit`` payload as a dict, unsigned unless signed.
+
+    The signature — when present — covers every other field, exactly
+    like a reaction: the sender signs the canonical encoding of the
+    payload without ``"sig"`` and attaches the base64 signature, so
+    the receiver can verify attribution against the link identity
+    independently of the transport.
+    """
+    target = _clean_message_id(target)
+    payload: Dict[str, Any] = {
+        "type": "dm_edit",
+        "v": PROTOCOL_VERSION,
+        "target": target,
+        "text": normalize_message(text),
+        "sent_at": sent_at if isinstance(sent_at, (int, float)) else time.time(),
+        "client": f"tau/{__version__}",
+    }
+    if message_id:
+        payload["id"] = message_id
+    if signature is not None:
+        payload["sig"] = signature
+    return payload
+
+
+def encode_edit(
+    target: str,
+    text: str,
+    *,
+    message_id: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    signature: Optional[str] = None,
+) -> bytes:
+    """Encode a DM edit for the ``/tau/dm/edit`` request.
+
+    ``target`` names the edited message id, ``text`` is the replacement
+    body.  ``signature`` is the base64 signature over the canonical
+    unsigned payload; see :func:`edit_dict`.
+    """
+    return encode(
+        edit_dict(
+            target,
+            text,
+            message_id=message_id,
+            sent_at=sent_at,
+            signature=signature,
+        ),
+        max_bytes=MAX_REQUEST_BYTES,
+    )
+
+
+def parse_edit(raw: Any) -> Dict[str, Any]:
+    """Validate an incoming ``/tau/dm/edit`` request body."""
+    payload = decode(raw, max_bytes=MAX_REQUEST_BYTES)
+    if payload.get("type") != "dm_edit":
+        raise ProtocolError("expected a dm_edit payload")
+    target = _clean_message_id(payload.get("target"))
+    text = normalize_message(payload.get("text"))
+    sent_at = payload.get("sent_at")
+    if not isinstance(sent_at, (int, float)):
+        sent_at = None
+    message_id = payload.get("id")
+    if not isinstance(message_id, str) or not message_id or len(message_id) > 64:
+        message_id = None
+    signature = payload.get("sig")
+    if signature is not None:
+        if not isinstance(signature, str) or not signature:
+            raise ProtocolError("edit signature must be a base64 string")
+        try:
+            base64.b64decode(signature, validate=True)
+        except ValueError as exc:
+            raise ProtocolError(
+                "edit signature is not valid base64"
+            ) from exc
+    return {
+        "target": target,
+        "text": text,
+        "sent_at": sent_at,
+        "id": message_id,
+        "sig": signature,
+    }
+
+
+def edit_unsigned_bytes(raw: Any) -> bytes:
+    """Canonical bytes of an edit payload without its signature.
 
     Used to verify the signature: the signer signs exactly these bytes,
     and the deterministic encoder reproduces them from the received

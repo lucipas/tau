@@ -131,6 +131,14 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
             return None
         if not math.isfinite(read_at):
             return None
+    edited_at = raw.get("edited_at")
+    if edited_at is not None:
+        try:
+            edited_at = float(edited_at)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(edited_at):
+            return None
     expires_at = raw.get("expires_at")
     if expires_at is not None:
         try:
@@ -167,6 +175,8 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
         record["receipt_sent_at"] = receipt_sent_at
     if read_at is not None:
         record["read_at"] = read_at
+    if edited_at is not None:
+        record["edited_at"] = edited_at
     if in_reply_to is not None:
         record["in_reply_to"] = in_reply_to
     kind = raw.get("kind")
@@ -647,6 +657,50 @@ class Inbox:
                 ) from exc
         return dict(removed)
 
+    def apply_edit(
+        self, message_id: str, text: str, *, edited_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """Replace one stored message's text, marking when it was edited.
+
+        Returns the updated record, or ``None`` when no stored message
+        has that id.  The id matches exactly — callers resolve a prefix
+        to the full id first.  File records carry no text, so an edit
+        naming one is refused with :class:`InboxError` instead of
+        silently rewriting a file entry.  The write runs inside the
+        cross-process transaction, so a concurrent ``tau serve`` cannot
+        lose an entry appended while this edit runs.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise InboxError("message id must not be empty")
+        if not isinstance(text, str) or not text:
+            raise InboxError("edited text must not be empty")
+        with self._transaction():
+            target = None
+            for entry in self._messages:
+                if entry.get("id") == message_id:
+                    target = entry
+                    break
+            if target is None:
+                return None
+            if target.get("kind") == "file":
+                raise InboxError("a file record has no text to edit")
+            previous_text = target.get("text")
+            previous_edited_at = target.get("edited_at")
+            target["text"] = text
+            target["edited_at"] = float(edited_at)
+            try:
+                self._save(strict=True)
+            except OSError as exc:
+                # Roll back so this instance matches what is still on disk.
+                target["text"] = previous_text
+                if previous_edited_at is None:
+                    target.pop("edited_at", None)
+                else:
+                    target["edited_at"] = previous_edited_at
+                raise InboxError(
+                    f"could not persist inbox; message was not edited: {exc}"
+                ) from exc
+        return dict(target)
 
     def reload(self) -> None:
         """Reload the on-disk inbox, discarding the in-memory copy.

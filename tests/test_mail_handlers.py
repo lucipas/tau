@@ -1161,6 +1161,373 @@ def test_send_reaction_validates_before_resolving(tmp_path):
         node.send_reaction("alice", "", "👍")
 
 
+def signed_edit(sender, target, text, message_id, *, sent_at=None):
+    """An edit payload signed by *sender*, as send_edit builds it."""
+    import base64
+
+    from tau.protocol import edit_dict
+
+    payload = edit_dict(target, text, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _seed_inbound(node, sender, *, message_id="msg-1", text="typo here"):
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": destination_hash(sender).hex(),
+            "text": text,
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": message_id,
+        }
+    )
+
+
+def test_edit_applies_the_senders_own_edit(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed here", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    assert response["target"] == "msg-1"
+    entry = node.inbox.list_messages()[0]
+    assert entry["text"] == "fixed here"
+    assert entry["edited_at"] == 30.0
+
+
+def test_edit_unknown_id_answers_ok_without_editing(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "missing", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    assert len(node.inbox) == 0
+
+
+def test_edit_rejects_a_non_sender(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(other, "msg-1", "forged", "edit-1", sent_at=30.0),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_an_outbound_record(tmp_path):
+    # The record is this node's own sent message: its `destination` is
+    # the recipient, so a destination-only check would wrongly admit the
+    # recipient as its editor.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    recipient = RNS.Identity()
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": destination_hash(recipient).hex(),
+            "text": "my message",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(recipient, "msg-1", "forged", "edit-1", sent_at=30.0),
+        remote_identity=recipient,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "my message"
+
+
+def test_edit_ignores_a_stale_edit(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    first = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "newer text", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert first["edited"] is True
+    stale = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "older text", "edit-2", sent_at=25.0),
+        remote_identity=sender,
+    )
+    assert stale["ok"] is True
+    assert stale["edited"] is False
+    assert node.inbox.list_messages()[0]["text"] == "newer text"
+    assert node.inbox.list_messages()[0]["edited_at"] == 30.0
+
+
+def test_edit_rejects_a_signature_from_another_identity(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    signer = RNS.Identity()
+    presenter = RNS.Identity()
+    _seed_inbound(node, signer)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(signer, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=presenter,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_a_tampered_payload(tmp_path):
+    import base64
+
+    from tau.protocol import edit_dict
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    payload = edit_dict("msg-1", "fixed", message_id="edit-1")
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    payload["text"] = "tampered"  # tampered after signing
+    response = call_handler(
+        node._handle_dm_edit, encode(payload), remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_invalid_payload(tmp_path):
+    node = make_node(tmp_path)
+    response = call_handler(node._handle_dm_edit, b"not json")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+
+
+def test_edit_requires_a_signature(tmp_path):
+    from tau.protocol import encode_edit
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        encode_edit("msg-1", "fixed", message_id="edit-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert "signature" in response["error"]["message"]
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_refuses_a_group_message(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": destination_hash(sender).hex(),
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "weekend",
+        }
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "group_message"
+    assert node.inbox.list_messages()[0]["text"] == "group hello"
+
+
+def test_edit_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    save_allowlist(
+        config.allowlist_path, AllowList(enabled=True, allow=frozenset())
+    )
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_send_edit_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(ProtocolError):
+        node.send_edit("alice", "msg-1", "   ")
+    with pytest.raises(ProtocolError):
+        node.send_edit("alice", "msg-1", "x" * 2001)
+    with pytest.raises(NodeError):
+        node.send_edit("alice", "", "fixed")
+
+
+def test_send_edit_sends_a_signed_payload_and_updates_the_local_copy(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_edit
+
+    node = make_node(tmp_path)
+    sender_identity = RNS.Identity()
+    node.identity = sender_identity
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(sender_identity).hex(),
+        hash=destination_hash(sender_identity),
+    )
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout, **kwargs):
+        sent["peer"] = peer_arg
+        sent["path"] = path
+        sent["payload"] = payload
+        return {"ok": True, "edited": True, "target": "msg-1"}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["ok"] is True
+    assert response["edited"] is True
+    assert response["id"]
+    assert sent["path"] == "/tau/dm/edit"
+    assert sent["peer"].hexhash == peer.hexhash
+    parsed = parse_edit(sent["payload"])
+    assert parsed["target"] == "msg-1"
+    assert parsed["text"] == "fixed here"
+    assert parsed["id"] == response["id"]
+    assert parsed["sig"]
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "fixed here"
+    assert entry["edited_at"]
+
+
+def test_send_edit_leaves_the_local_copy_when_the_receiver_did_not_apply(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": False, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is False
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
+    assert "edited_at" not in node.inbox.list_messages(direction="out")[0]
+
+
 def test_collected_message_drops_expired_arrival(tmp_path):
     import time as _time
 

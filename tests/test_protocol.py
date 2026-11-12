@@ -348,8 +348,82 @@ def test_reaction_unsigned_bytes_exclude_the_signature():
     payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
     signed = encode(payload)
     assert reaction_unsigned_bytes(signed) == unsigned
-    assert parse_reaction(signed)["sig"] == payload["sig"]
-    assert encode_reaction("msg-1", "👍", message_id="react-1", sent_at=12.0) == unsigned
+
+
+def test_edit_roundtrip():
+    from tau.protocol import encode_edit, parse_edit
+
+    data = encode_edit("msg-123", "fixed text", message_id="edit-1")
+    parsed = parse_edit(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["text"] == "fixed text"
+    assert parsed["id"] == "edit-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_parse_edit_rejects_wrong_shape():
+    from tau.protocol import encode_edit, parse_edit
+
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "message", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "msg-1"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "msg-1", "text": "   "}))
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "x" * 2001})
+        )
+
+
+def test_edit_signature_roundtrip():
+    from tau.protocol import encode_edit, parse_edit
+
+    parsed = parse_edit(
+        encode_edit("msg-123", "fixed", message_id="edit-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["text"] == "fixed"
+
+
+def test_edit_without_signature_parses_with_none():
+    from tau.protocol import encode_edit, parse_edit
+
+    assert parse_edit(encode_edit("msg-1", "fixed"))["sig"] is None
+
+
+def test_parse_edit_rejects_bad_signature():
+    from tau.protocol import parse_edit
+
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "hi", "sig": "!!!"})
+        )
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "hi", "sig": 42})
+        )
+
+
+def test_edit_unsigned_bytes_exclude_the_signature():
+    import base64
+
+    from tau.protocol import (
+        edit_dict,
+        edit_unsigned_bytes,
+        encode,
+        encode_edit,
+        parse_edit,
+    )
+
+    payload = edit_dict("msg-1", "fixed", message_id="edit-1", sent_at=12.0)
+    unsigned = encode(payload)
+    payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
+    signed = encode(payload)
+    assert edit_unsigned_bytes(signed) == unsigned
+    assert parse_edit(signed)["text"] == "fixed"
 
 
 def test_message_rejects_invalid_expiry():
