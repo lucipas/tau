@@ -2473,7 +2473,7 @@ def _print_saved_posts(
         saved = datetime.fromtimestamp(float(post.get("saved_at", 0))).strftime(
             "%Y-%m-%d %H:%M"
         )
-        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}")
+        print(f"[{when}] {name} ({author}) {short_hash(str(post.get('hash', '')))}{' (edited)' if post.get('edited') else ''}")
         print(f"  saved {saved}")
         if post.get("deleted"):
             print("  (deleted post)")
