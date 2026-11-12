@@ -1681,6 +1681,116 @@ def test_two_nodes_exchange_dm_reactions(tmp_path: Path) -> None:
         stop_process(bob_server)
 
 
+def _wait_for_inbox_text(
+    data_dir: Path, message_id: str, text: str, *, timeout: float = 60.0
+):
+    """Poll inbox.json until the message shows *text* with an edited marker."""
+    deadline = time.time() + timeout
+    inbox_path = data_dir / "inbox.json"
+    while time.time() < deadline:
+        if inbox_path.exists():
+            stored = json.loads(inbox_path.read_text(encoding="utf-8"))
+            matches = [
+                item
+                for item in stored.get("messages", [])
+                if item.get("id") == message_id
+            ]
+            if (
+                matches
+                and matches[0].get("text") == text
+                and matches[0].get("edited_at")
+            ):
+                return matches[0]
+        time.sleep(1.0)
+    raise AssertionError(
+        f"message {message_id} never showed edited text {text!r}"
+    )
+
+
+def test_two_nodes_exchange_dm_edit(tmp_path: Path) -> None:
+    """DM edits (issue #290): alice sends a DM, edits it, bob sees the fix."""
+    port = free_port()
+    init_node(tmp_path, "alice", "--tcp-listen", f"127.0.0.1:{port}")
+    bob_init = init_node(tmp_path, "bob", "--tcp-connect", f"127.0.0.1:{port}")
+    bob_hash = bob_init["destination"]
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+
+    bob_out = tmp_path / "bob.out"
+    bob_err = tmp_path / "bob.err"
+    bob = start_serve(bob_dir, bob_out, bob_err)
+    try:
+        time.sleep(2.0)
+        assert bob.poll() is None, bob_err.read_text()
+
+        sent = json.loads(
+            require_ok(
+                run_tau(
+                    "send",
+                    "--to",
+                    bob_hash,
+                    "typo here",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--timeout",
+                    "20",
+                    "--discover-timeout",
+                    "10",
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        assert sent.get("ok") is True
+        message_id = sent["id"]
+        assert message_id
+        assert wait_for_text(bob_out, "typo here"), bob_err.read_text()
+
+        edited = json.loads(
+            require_ok(
+                run_tau(
+                    "edit",
+                    message_id,
+                    "fixed here",
+                    "--data-dir",
+                    str(alice_dir),
+                    "--timeout",
+                    "20",
+                    "--discover-timeout",
+                    "10",
+                    "--json",
+                    timeout=120.0,
+                )
+            )
+        )
+        assert edited["edited"] is True
+        assert edited["target"] == message_id
+        assert edited["text"] == "fixed here"
+
+        # Bob's copy shows the new text, marked edited...
+        entry = _wait_for_inbox_text(bob_dir, message_id, "fixed here")
+        assert entry["edited_at"]
+        listed = require_ok(
+            run_tau("messages", "--data-dir", str(bob_dir), timeout=30.0)
+        )
+        assert "fixed here" in listed
+        assert "(edited)" in listed
+        assert "typo here" not in listed
+
+        # ...and so does alice's own sent copy.
+        stored = json.loads((alice_dir / "inbox.json").read_text(encoding="utf-8"))
+        own = [
+            item
+            for item in stored.get("messages", [])
+            if item.get("id") == message_id
+        ]
+        assert len(own) == 1
+        assert own[0]["text"] == "fixed here"
+        assert own[0]["edited_at"]
+    finally:
+        stop_process(bob)
+
+
 def test_disappearing_message_carries_expiry_to_receiver(tmp_path: Path) -> None:
     port = free_port()
     alice_dir = tmp_path / "alice"

@@ -11,7 +11,7 @@ import pytest
 import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash
-from tau.mailbox import open_message, seal_message
+from tau.mailbox import MailboxError, open_message, seal_message
 from tau.node import DeliveryDeferredError, NodeError, TauNode
 from tau.peers import Peer, PeerRegistry
 from tau.protocol import (
@@ -72,6 +72,82 @@ def test_direct_message_dedupes_by_id(tmp_path):
     assert len(node.inbox) == 1
     assert node.inbox.list_messages()[0]["text"] == "hello once"
     assert node.inbox.path.exists()
+
+
+def test_direct_group_delivery_skips_when_competitor_marks_seen(
+    tmp_path, monkeypatch
+):
+    """A direct group delivery rechecks seen-ness inside the
+    transaction (CodeRabbit review, flagged on the stacked PR #295).
+
+    Two direct deliveries can both pass the pre-check, then both
+    append and notify.  The relayed path already rechecks inside
+    the mailbox transaction; the direct group path did not.  Here a
+    competing delivery stores its copy and marks the id seen after
+    the pre-check — this delivery must skip both the append and the
+    notification, and report the duplicate.
+    """
+    from tau.inbox import Inbox
+    from tau.mailbox import Mailbox
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = RNS.Identity()
+    author_hash = destination_hash(author).hex()
+    members = ["ab" * 16, author_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    real_is_seen = node.mailbox.is_seen
+    calls = {"n": 0}
+
+    def flaky_is_seen(message_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The pre-check: not seen yet.  A competing delivery
+            # lands now — it stores its copy and marks the id seen
+            # via its own handles, then this handler's transaction
+            # reloads and must see the mark.
+            other_inbox = Inbox(node.config.inbox_path)
+            other_inbox.append(
+                {
+                    "from": "alice",
+                    "destination": author_hash,
+                    "text": "crew hello",
+                    "sent_at": 100.0,
+                    "received_at": 101.0,
+                    "id": "race-1",
+                    "kind": "group",
+                    "group": group,
+                    "group_name": "crew",
+                }
+            )
+            Mailbox(node.config.mailbox_path).mark_seen("race-1")
+            return False
+        return real_is_seen(message_id)
+
+    monkeypatch.setattr(node.mailbox, "is_seen", flaky_is_seen)
+    response = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="race-1",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=author,
+    )
+    assert response["ok"] is True
+    assert response["duplicate"] is True
+    assert received == []
+    assert calls["n"] == 2
+    # Exactly one copy is stored: the competitor's, not a second one.
+    fresh = Inbox(node.config.inbox_path)
+    assert [m["id"] for m in fresh.list_messages()] == ["race-1"]
 
 
 def test_direct_message_keeps_kind(tmp_path):
@@ -171,6 +247,102 @@ def test_relayed_message_keeps_kind(tmp_path):
     assert received[0]["kind"] == "alert"
     assert received[0]["relayed"] is True
     assert node.inbox.list_messages()[0]["kind"] == "alert"
+
+
+def test_sealed_group_message_carries_rename_lineage(tmp_path):
+    sender = RNS.Identity()
+    recipient = RNS.Identity()
+    creator_hash = destination_hash(sender).hex()
+    members = [creator_hash, "ab" * 16, "cd" * 16]
+    old_id = derive_group_id(creator_hash, "weekend", members)
+    new_id = derive_group_id(creator_hash, "road trip", members)
+    blob = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="seal-group-1",
+        text="after the rename",
+        sent_at=55.0,
+        group={
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+            "renamed_from": [old_id],
+        },
+    )
+    opened = open_message(recipient, blob)
+    assert opened["group"]["renamed_from"] == [old_id]
+    # A sealed envelope without lineage opens with no lineage key.
+    plain = seal_message(
+        sender,
+        sender_name="alice",
+        recipient_public_key=recipient.get_public_key(),
+        message_id="seal-group-2",
+        text="plain",
+        sent_at=56.0,
+        group={
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+        },
+    )
+    assert "renamed_from" not in open_message(recipient, plain)["group"]
+    # A malformed lineage is refused at seal time.
+    with pytest.raises(MailboxError):
+        seal_message(
+            sender,
+            sender_name="alice",
+            recipient_public_key=recipient.get_public_key(),
+            message_id="seal-group-3",
+            text="bad",
+            sent_at=57.0,
+            group={
+                "id": new_id,
+                "name": "road trip",
+                "creator": creator_hash,
+                "members": members,
+                "renamed_from": ["not-a-hash"],
+            },
+        )
+
+
+def test_relayed_group_message_retires_rename_predecessor(tmp_path):
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node_hash = "ab" * 16
+    node.destination = SimpleNamespace(
+        hexhash=node_hash, hash=bytes.fromhex(node_hash)
+    )
+    creator = RNS.Identity()
+    creator_hash = destination_hash(creator).hex()
+    members = [creator_hash, node_hash, "ef" * 16]
+    old_id = derive_group_id(creator_hash, "weekend", members)
+    old = node.groups.record(
+        old_id, "weekend", members, creator=creator_hash, sender="ef" * 16
+    )
+    assert old is not None
+    new_id = derive_group_id(creator_hash, "road trip", members)
+    message = {
+        "id": "relay-group-1",
+        "from": creator_hash,
+        "from_name": "alice",
+        "text": "after the rename",
+        "sent_at": 100.0,
+        "group": {
+            "id": new_id,
+            "name": "road trip",
+            "creator": creator_hash,
+            "members": members,
+            "renamed_from": [old_id],
+        },
+    }
+    assert node._deliver_collected(message) is True
+    assert node.groups.get(old_id) is None
+    assert node.groups.get(new_id) is not None
+    assert received[0]["kind"] == "group"
+    assert received[0]["group"] == new_id
 
 
 def test_direct_message_records_destination_hash_for_unknown_sender(tmp_path):
@@ -1133,11 +1305,23 @@ def test_group_reaction_resolves_local_copy_from_context(tmp_path):
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     author = destination_hash(RNS.Identity()).hex()
-    group = "cd" * 16
+    reactor = RNS.Identity()
+    reactor = RNS.Identity()
+    # A copy that arrived through the handler pins its roster, so a
+    # retained copy with no pinned group is a deleted group — and a
+    # reaction to it fails closed (see the deleted-group tests
+    # below).  Pin the group here, with the reactor as a member, so
+    # this test models a live group and keeps asserting the
+    # context resolution itself.  The id derives from the roster,
+    # so the group is pinned first and the copy seeded under it.
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(reactor).hex()],
+        creator="ab" * 16,
+    )
     _seed_group_copy(
         node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
     )
-    reactor = RNS.Identity()
     response = call_handler(
         node._handle_reaction,
         _signed_group_reaction(
@@ -1301,7 +1485,242 @@ def test_group_reaction_refused_for_non_member(tmp_path):
     assert response["ok"] is False
     assert response["error"]["code"] == "not_a_member"
     assert node.inbox.reactions_for("local-copy-1") == []
-    assert node.inbox.reactions_for("other-leg-1") == []
+
+
+def test_group_reaction_refused_when_group_deleted(tmp_path):
+    # Qodo Critical (flagged by the user from the stacked PR #297's
+    # reviews): a failed group-roster lookup used to count as
+    # permission, so after a group is deleted an allow-listed
+    # non-member who knows a retained message id could get a
+    # reaction stored and displayed.  A missing roster for a
+    # resolved group message now fails closed.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    assert node.groups.delete(group) is True
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_refused_when_namesake_masks_deleted_group(tmp_path):
+    # CodeRabbit Major (node.py:2149, CWE-863): after a group is
+    # deleted, an outsider can deliver a group named after the
+    # deleted group's 32-character id — find() then returns the
+    # outsider's group by name, and the reaction passes the roster
+    # check against the wrong roster.  Authorization now uses an
+    # exact-id lookup, so the namesake does not substitute.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    _seed_group_copy(
+        node, group=group, author=author, sent_at=100.0, message_id="local-copy-1"
+    )
+    # The outsider's group is named after the deleted group's id,
+    # and names the outsider as a member.
+    namesake = node.groups.create(
+        group, [reactor_hash, destination_hash(RNS.Identity()).hex()],
+        created_by=reactor_hash,
+    )
+    assert namesake["id"] != group
+    assert node.groups.delete(group) is True
+    # The name fallback still resolves the deleted id to the namesake.
+    assert node.groups.find(group)["id"] == namesake["id"]
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_recheck_voids_when_namesake_masks_deleted_group(
+    tmp_path, monkeypatch
+):
+    # Same finding, second net: the post-store recheck re-reads the
+    # roster, so a group deleted (and masked by a namesake) between
+    # the pre-store check and the recheck must void the stored
+    # reaction instead of letting the namesake's roster keep it.  A
+    # missing roster fails closed here too.  The copy arrives between
+    # the check and the recheck, so the reaction is stored with
+    # group context first and only the recheck sees the message.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, reactor_hash],
+        creator="ab" * 16,
+    )
+    copy = {
+        "from": "alice",
+        "destination": author,
+        "text": "crew hello",
+        "kind": "group",
+        "group": group,
+        "group_name": "crew",
+        "sent_at": 100.0,
+        "received_at": 101.0,
+        "id": "local-copy-1",
+    }
+    # Swap the roster between the pre-store resolve and the
+    # post-store recheck: the copy lands, the real group is deleted,
+    # and a namesake (named after the deleted id) that still lists
+    # the reactor is pinned.
+    calls = {"n": 0}
+    real_resolve = node.inbox.resolve
+
+    def swapping_resolve(target_id):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            node.inbox._messages.append(dict(copy))
+            assert node.groups.delete(group) is True
+            node.groups.create(
+                group,
+                [reactor_hash, destination_hash(RNS.Identity()).hex()],
+                created_by=reactor_hash,
+            )
+        return real_resolve(target_id)
+
+    monkeypatch.setattr(node.inbox, "resolve", swapping_resolve)
+    call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "local-copy-1", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
+
+
+def test_group_reaction_naming_a_leg_id_stores_under_canonical_id(
+    tmp_path,
+):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids.  A reaction naming the other leg
+    # must resolve to the stored record and be stored under the
+    # canonical id, or it never displays under the message listing.
+    # The target here is the author's own outbound record, whose
+    # destination is empty — so the signed-context lookup misses it
+    # too, and only the leg-aware resolve saves the reaction.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = "ab" * 16
+    reactor = RNS.Identity()
+    reactor_hash = destination_hash(reactor).hex()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, reactor_hash],
+        creator="ab" * 16,
+    )
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": "",
+            "text": "crew hello",
+            "kind": "group",
+            "group": group,
+            "group_name": "crew",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "g-1",
+            "leg_ids": ["g-1", "g-2"],
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_reaction,
+        _signed_group_reaction(
+            reactor, "g-2", "👍", "react-1",
+            group=group, author=author, sent_at=100.0,
+        ),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is True
+    reactions = node.inbox.reactions_for("g-1")
+    assert [r["reaction"] for r in reactions] == ["👍"]
+    assert node.inbox.reactions_for("g-2") == []
+
+
+def test_group_reaction_final_check_refuses_when_group_deleted(
+    tmp_path, monkeypatch
+):
+    # The same fail-closed rule in the atomic final check: a
+    # no-context reaction whose target lands between the first
+    # lookup and the final check, on a group that was deleted
+    # before the check runs.  The copy is stubbed into the final
+    # lookup because a real import cannot land inside the
+    # transaction — the flock is held there, and a second Inbox
+    # import would deadlock (the round-11 lesson).
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    author = destination_hash(RNS.Identity()).hex()
+    reactor = RNS.Identity()
+    group = _pinned_group(
+        node,
+        members=["ab" * 16, author, destination_hash(RNS.Identity()).hex()],
+        creator="ab" * 16,
+    )
+    assert node.groups.delete(group) is True
+    real_resolve = node.inbox.resolve
+    calls = {"n": 0}
+
+    def flaky_resolve(ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The first lookup: the copy has not landed yet.
+            return real_resolve(ref)
+        # The final check, inside the transaction: the copy is here
+        # now, on a group whose roster is gone.
+        return {"id": "local-copy-1", "kind": "group", "group": group}
+
+    monkeypatch.setattr(node.inbox, "resolve", flaky_resolve)
+    response = call_handler(
+        node._handle_reaction,
+        signed_reaction(reactor, "local-copy-1", "👍", "react-1"),
+        remote_identity=reactor,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert calls["n"] == 2
+    assert node.inbox.reactions_for("local-copy-1") == []
 
 
 def test_group_reaction_reconciles_when_message_arrives_late(tmp_path):
@@ -2077,7 +2496,13 @@ def test_group_reaction_not_published_when_recheck_fails(
     # sender retries instead of the console showing a reaction that
     # was never verified.  The copy lands between the store and the
     # recheck (via the recheck's reload, as in the reload-failure
-    # test); the recheck's reload then fails.
+    # test); the recheck's reload then fails.  The stored reaction
+    # test); the recheck's reload then fails.  The stored reaction
+    # stays in the inbox (round-12 note: it is never displayed —
+    # the console and `tau messages` filter stored reactions against
+    # the pinned roster, see test_group_message_hides_non_member_
+    # reaction and test_messages_hides_non_member_group_reaction),
+    # and the retry's refusal voids it.
     from tau.inbox import Inbox, InboxError
 
     published = []
@@ -2591,7 +3016,12 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
     # update fails, the bridge still holds the stale reaction and
     # would seed it into the live entry.  The message still records
     # — the inbox purge succeeded, so the reaction is voided there —
-    # but the live event is withheld.
+    # but the live event is withheld.  The console history is still
+    # but the live event is withheld.  The console history is still
+    # written, through the record-only callback: messages() reads
+    # only that history, so skipping it would leave the copy
+    # invisible in the console even though it is in the inbox.
+    # (CodeRabbit round-14 review, thread iB3I.)
     from tau.webapi import WebBridge
 
     node = make_node(tmp_path)
@@ -2608,7 +3038,11 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
             if message is not None:
                 published.append(message)
 
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
         node.on_message = _capture
+        node.on_message_record_only = _capture_record_only
         author = RNS.Identity()
         author_hash = destination_hash(author).hex()
         reactor = RNS.Identity()
@@ -2643,6 +3077,125 @@ def test_group_message_recorded_but_not_published_when_fan_out_fails(
         assert published == []
         assert len(node.inbox.list_messages()) == 1
         assert node.inbox.reactions_for("local-copy-1") == []
+        # The live event was withheld, but the console history holds
+        # the copy — with the stale reaction filtered out of the
+        # stored entry — and no live message event was published.
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "local-copy-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "local-copy-1"
+        ] == []
+    finally:
+        bridge.stop()
+
+
+def test_relayed_group_message_recorded_when_fan_out_fails(
+    tmp_path, monkeypatch
+):
+    """The relayed path writes the console history too when a
+    voided-reaction fan-out fails (CodeRabbit round-14 review,
+    thread iB3I).
+
+    Same ordering as the direct path, delivered through the fetch
+    path instead: a non-member reaction is cached before its target
+    arrives, the purge voids it, the tombstone fan-out fails, and
+    the live event is withheld — but the copy is recorded and the
+    console history holds it, and the delivery still resolves (the
+    envelope is acked, not deferred).
+    """
+    import base64
+
+    from tau.webapi import WebBridge
+
+    received = []
+    node = make_node(tmp_path, on_message=received.append)
+    node.identity = RNS.Identity()
+    own = destination_hash(node.identity).hex()
+    node.destination = SimpleNamespace(
+        hexhash=own, hash=destination_hash(node.identity)
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    bridge.start()
+    try:
+        def _capture_record_only(record):
+            bridge.record_inbound(record, publish=False)
+
+        node.on_message_record_only = _capture_record_only
+        holder = RNS.Identity()
+        holder_hash = destination_hash(holder)
+        peer = Peer(
+            destination_hash(holder_hash),
+            name="holder",
+            public_key=holder.get_public_key(),
+            first_seen=1.0,
+            last_seen=1.0,
+            caps=("message", "ping", "peers", "mail", "read"),
+        )
+        node.registry._peers[holder_hash] = peer
+        author = RNS.Identity()
+        author_hash = destination_hash(author).hex()
+        reactor = RNS.Identity()
+        members = [own, author_hash, destination_hash(RNS.Identity()).hex()]
+        group = derive_group_id(author_hash, "crew", members)
+        response = call_handler(
+            node._handle_reaction,
+            signed_reaction(reactor, "fetch-group-1", "👍", "react-1"),
+            remote_identity=reactor,
+        )
+        assert response["ok"] is True
+        assert len(bridge._reaction_state) == 1
+
+        def _raise(record):
+            raise RuntimeError("console callback failed")
+
+        monkeypatch.setattr(node, "on_reaction", _raise)
+        blob = seal_message(
+            author,
+            sender_name="alice",
+            recipient_public_key=node.identity.get_public_key(),
+            message_id="fetch-group-1",
+            text="crew hello",
+            sent_at=100.0,
+            group={
+                "id": group,
+                "name": "crew",
+                "creator": author_hash,
+                "members": members,
+            },
+        )
+        node._request = lambda peer, path, payload, timeout, deadline=None: {
+            "ok": True,
+            "messages": [
+                {
+                    "id": "fetch-group-1",
+                    "blob": base64.b64encode(blob).decode("ascii"),
+                    "expires_at": time.time() + 3600,
+                }
+            ],
+            "count": 1,
+        }
+        assert node._collect_mail(peer, timeout=5.0) == 1
+        assert received == []
+        assert len(node.inbox.list_messages()) == 1
+        assert node.inbox.reactions_for("fetch-group-1") == []
+        assert node.mailbox.take_pending_acks(peer.hexhash) == [
+            "fetch-group-1"
+        ]
+        history = bridge.messages()
+        assert len(history) == 1
+        assert history[0]["wire_id"] == "fetch-group-1"
+        assert history[0]["reactions"] == []
+        assert [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message"
+            and event.get("message", {}).get("wire_id") == "fetch-group-1"
+        ] == []
     finally:
         bridge.stop()
 
@@ -3422,6 +3975,513 @@ def test_send_retraction_validates_before_resolving(tmp_path):
         node.send_retraction("alice", "x" * 65)
     with pytest.raises(NodeError):
         node.send_reaction("alice", "", "👍")
+
+
+def signed_edit(sender, target, text, message_id, *, sent_at=None):
+    """An edit payload signed by *sender*, as send_edit builds it."""
+    import base64
+
+    from tau.protocol import edit_dict
+
+    payload = edit_dict(target, text, message_id=message_id, sent_at=sent_at)
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    return encode(payload)
+
+
+def _seed_inbound(node, sender, *, message_id="msg-1", text="typo here"):
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": destination_hash(sender).hex(),
+            "text": text,
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": message_id,
+        }
+    )
+
+
+def test_edit_applies_the_senders_own_edit(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed here", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is True
+    assert response["target"] == "msg-1"
+    entry = node.inbox.list_messages()[0]
+    assert entry["text"] == "fixed here"
+    assert entry["edited_at"] == 30.0
+
+
+def test_edit_unknown_id_answers_ok_without_editing(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "missing", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+    assert len(node.inbox) == 0
+
+
+def test_edit_reports_not_applied_when_the_record_vanished(
+    tmp_path, monkeypatch
+):
+    # A concurrent delete or retract can remove the record between the
+    # lookup and the edit: the handler must report not applied instead
+    # of acknowledging an edit that landed nowhere.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    monkeypatch.setattr(node.inbox, "apply_edit", lambda *args, **kwargs: None)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["edited"] is False
+
+
+def test_edit_rejects_a_non_sender(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(other, "msg-1", "forged", "edit-1", sent_at=30.0),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_an_outbound_record(tmp_path):
+    # The record is this node's own sent message: its `destination` is
+    # the recipient, so a destination-only check would wrongly admit the
+    # recipient as its editor.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    recipient = RNS.Identity()
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": destination_hash(recipient).hex(),
+            "text": "my message",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(recipient, "msg-1", "forged", "edit-1", sent_at=30.0),
+        remote_identity=recipient,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "my message"
+
+
+def test_edit_ignores_a_stale_edit(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    first = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "newer text", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert first["edited"] is True
+    stale = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "older text", "edit-2", sent_at=25.0),
+        remote_identity=sender,
+    )
+    assert stale["ok"] is True
+    assert stale["edited"] is False
+    assert node.inbox.list_messages()[0]["text"] == "newer text"
+    assert node.inbox.list_messages()[0]["edited_at"] == 30.0
+
+
+def test_edit_rejects_a_signature_from_another_identity(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    signer = RNS.Identity()
+    presenter = RNS.Identity()
+    _seed_inbound(node, signer)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(signer, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=presenter,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_a_tampered_payload(tmp_path):
+    import base64
+
+    from tau.protocol import edit_dict
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    payload = edit_dict("msg-1", "fixed", message_id="edit-1")
+    signature = sender.sign(encode(payload))
+    payload["sig"] = base64.b64encode(signature).decode("ascii")
+    payload["text"] = "tampered"  # tampered after signing
+    response = call_handler(
+        node._handle_dm_edit, encode(payload), remote_identity=sender
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_rejects_invalid_payload(tmp_path):
+    node = make_node(tmp_path)
+    response = call_handler(node._handle_dm_edit, b"not json")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+
+
+def test_edit_requires_a_signature(tmp_path):
+    from tau.protocol import encode_edit
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        encode_edit("msg-1", "fixed", message_id="edit-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_edit"
+    assert "signature" in response["error"]["message"]
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_requires_an_identified_sender(tmp_path):
+    node = make_node(tmp_path)
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unidentified"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_edit_refuses_a_group_message(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    node.inbox.append(
+        {
+            "from": "alice",
+            "destination": destination_hash(sender).hex(),
+            "text": "group hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "kind": "group",
+            "group": "c" * 32,
+            "group_name": "weekend",
+        }
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "group_message"
+    assert node.inbox.list_messages()[0]["text"] == "group hello"
+
+
+def test_edit_denied_by_allow_list(tmp_path):
+    from tau.allowlist import AllowList, save_allowlist
+
+    config = TauConfig.resolve(data_dir=tmp_path, name="holder")
+    save_allowlist(
+        config.allowlist_path, AllowList(enabled=True, allow=frozenset())
+    )
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    _seed_inbound(node, sender)
+    response = call_handler(
+        node._handle_dm_edit,
+        signed_edit(sender, "msg-1", "fixed", "edit-1", sent_at=30.0),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_allowed"
+    assert node.inbox.list_messages()[0]["text"] == "typo here"
+
+
+def test_send_edit_validates_before_resolving(tmp_path):
+    node = make_node(tmp_path)
+    with pytest.raises(ProtocolError):
+        node.send_edit("alice", "msg-1", "   ")
+    with pytest.raises(ProtocolError):
+        node.send_edit("alice", "msg-1", "x" * 2001)
+    with pytest.raises(NodeError):
+        node.send_edit("alice", "", "fixed")
+
+
+def test_send_edit_sends_a_signed_payload_and_updates_the_local_copy(
+    tmp_path, monkeypatch
+):
+    from tau.protocol import parse_edit
+
+    node = make_node(tmp_path)
+    sender_identity = RNS.Identity()
+    node.identity = sender_identity
+    node.destination = SimpleNamespace(
+        hexhash=destination_hash(sender_identity).hex(),
+        hash=destination_hash(sender_identity),
+    )
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    sent = {}
+
+    def fake_request(peer_arg, path, payload, timeout, **kwargs):
+        sent["peer"] = peer_arg
+        sent["path"] = path
+        sent["payload"] = payload
+        return {"ok": True, "edited": True, "target": "msg-1"}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["ok"] is True
+    assert response["edited"] is True
+    assert response["id"]
+    assert sent["path"] == "/tau/dm/edit"
+    assert sent["peer"].hexhash == peer.hexhash
+    parsed = parse_edit(sent["payload"])
+    assert parsed["target"] == "msg-1"
+    assert parsed["text"] == "fixed here"
+    assert parsed["id"] == response["id"]
+    assert parsed["sig"]
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "fixed here"
+    assert entry["edited_at"]
+
+
+def test_send_edit_leaves_the_local_copy_when_the_receiver_did_not_apply(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": False, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is False
+    assert node.inbox.list_messages(direction="out")[0]["text"] == "typo here"
+    assert "edited_at" not in node.inbox.list_messages(direction="out")[0]
+
+
+def test_send_edit_updates_the_sent_record(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent(
+        "msg-1", to=destination_hash(peer_identity), text="typo here"
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": True, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is True
+    # ``tau messages --sent`` reads the mailbox, not the inbox: the sent
+    # record must carry the new text too.
+    sent = node.mailbox.sent_record("msg-1")
+    assert sent is not None
+    assert sent["text"] == "fixed here"
+    assert sent["edited_at"]
+
+
+def test_send_edit_leaves_the_sent_record_when_the_receiver_did_not_apply(
+    tmp_path, monkeypatch
+):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "typo here",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+        }
+    )
+    node.mailbox.record_sent(
+        "msg-1", to=destination_hash(peer_identity), text="typo here"
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": False, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "fixed here")
+
+    assert response["edited"] is False
+    sent = node.mailbox.sent_record("msg-1")
+    assert sent is not None
+    assert sent["text"] == "typo here"
+    assert "edited_at" not in sent
+
+
+def test_send_edit_keeps_a_newer_local_edit(tmp_path, monkeypatch):
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    peer_identity = RNS.Identity()
+    peer = node.registry.upsert(
+        destination_hash(peer_identity),
+        peer_identity.get_public_key(),
+        name="alice",
+        now=1.0,
+    )
+    # The local copy already holds a newer edit than the one this send
+    # is delivering: its write must not rewind it, even though the
+    # receiver applied this (older) edit.
+    node.inbox.append(
+        {
+            "from": "holder",
+            "destination": peer.hexhash,
+            "text": "newest text",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "msg-1",
+            "direction": "out",
+            "edited_at": 9999999999.0,
+        }
+    )
+    monkeypatch.setattr(
+        node,
+        "_request",
+        lambda *args, **kwargs: {"ok": True, "edited": True, "target": "msg-1"},
+    )
+    response = node.send_edit("alice", "msg-1", "older edit")
+
+    assert response["edited"] is True
+    entry = node.inbox.list_messages(direction="out")[0]
+    assert entry["text"] == "newest text"
+    assert entry["edited_at"] == 9999999999.0
 
 
 def test_retract_records_a_marker_for_an_unknown_id(tmp_path):

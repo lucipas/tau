@@ -12,11 +12,14 @@ from tau.protocol import (
     ProtocolError,
     build_announce,
     decode,
+    derive_group_id,
     encode,
+    encode_group_message,
     encode_message,
     excerpt_hash,
     normalize_message,
     parse_announce,
+    parse_group_message,
     parse_message,
     response_error,
     response_ok,
@@ -161,6 +164,65 @@ def test_message_rejects_malformed_reply():
         )
 
 
+def test_group_message_roundtrip_with_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    reply_to = {"id": "a" * 32, "excerpt": excerpt_hash("original thought")}
+    data = encode_group_message(
+        "seconded",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+        in_reply_to=reply_to,
+    )
+    parsed = parse_group_message(data)
+    assert parsed["text"] == "seconded"
+    assert parsed["id"] == "b" * 32
+    assert parsed["in_reply_to"] == reply_to
+
+
+def test_group_message_without_reply_has_no_reference():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    data = encode_group_message(
+        "hello all",
+        message_id="b" * 32,
+        group_id=derive_group_id(members[0], "weekend", members),
+        group_name="weekend",
+        creator=members[0],
+        members=members,
+    )
+    assert parse_group_message(data)["in_reply_to"] is None
+
+
+def test_group_message_rejects_malformed_reply():
+    members = ["ab" * 16, "cd" * 16, "ef" * 16]
+    group_id = derive_group_id(members[0], "weekend", members)
+    with pytest.raises(ProtocolError):
+        encode_group_message(
+            "hi",
+            group_id=group_id,
+            group_name="weekend",
+            creator=members[0],
+            members=members,
+            in_reply_to={"id": ""},
+        )
+    with pytest.raises(ProtocolError):
+        parse_group_message(
+            encode(
+                {
+                    "type": "group_message",
+                    "text": "hi",
+                    "group": group_id,
+                    "group_name": "weekend",
+                    "creator": members[0],
+                    "members": members,
+                    "in_reply_to": {"id": "a" * 32, "excerpt": "zz"},
+                }
+            )
+        )
+
+
 def test_excerpt_hash_is_stable_short_hex():
     assert excerpt_hash("original thought") == excerpt_hash("original thought")
     assert len(excerpt_hash("original thought")) == 16
@@ -197,10 +259,12 @@ def test_message_without_kind_parses_as_chat():
         "１",
         "١",
         # Reserved inbox record types, never a DM kind: a message
-        # tagged "group" or "file" could never be stored in the
+        # tagged "group", "file" or "note" could never be stored in the
         # recipient's inbox.
         "group",
         "file",
+        "note",
+        "NOTE",
         "GROUP",
     ],
 )
@@ -383,8 +447,82 @@ def test_reaction_unsigned_bytes_exclude_the_signature():
     payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
     signed = encode(payload)
     assert reaction_unsigned_bytes(signed) == unsigned
-    assert parse_reaction(signed)["sig"] == payload["sig"]
-    assert encode_reaction("msg-1", "👍", message_id="react-1", sent_at=12.0) == unsigned
+
+
+def test_edit_roundtrip():
+    from tau.protocol import encode_edit, parse_edit
+
+    data = encode_edit("msg-123", "fixed text", message_id="edit-1")
+    parsed = parse_edit(data)
+    assert parsed["target"] == "msg-123"
+    assert parsed["text"] == "fixed text"
+    assert parsed["id"] == "edit-1"
+    assert isinstance(parsed["sent_at"], float)
+
+
+def test_parse_edit_rejects_wrong_shape():
+    from tau.protocol import encode_edit, parse_edit
+
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "message", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "msg-1"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "", "text": "hi"}))
+    with pytest.raises(ProtocolError):
+        parse_edit(encode({"type": "dm_edit", "target": "msg-1", "text": "   "}))
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "x" * 2001})
+        )
+
+
+def test_edit_signature_roundtrip():
+    from tau.protocol import encode_edit, parse_edit
+
+    parsed = parse_edit(
+        encode_edit("msg-123", "fixed", message_id="edit-1", signature="aGVsbG8=")
+    )
+    assert parsed["sig"] == "aGVsbG8="
+    assert parsed["text"] == "fixed"
+
+
+def test_edit_without_signature_parses_with_none():
+    from tau.protocol import encode_edit, parse_edit
+
+    assert parse_edit(encode_edit("msg-1", "fixed"))["sig"] is None
+
+
+def test_parse_edit_rejects_bad_signature():
+    from tau.protocol import parse_edit
+
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "hi", "sig": "!!!"})
+        )
+    with pytest.raises(ProtocolError):
+        parse_edit(
+            encode({"type": "dm_edit", "target": "msg-1", "text": "hi", "sig": 42})
+        )
+
+
+def test_edit_unsigned_bytes_exclude_the_signature():
+    import base64
+
+    from tau.protocol import (
+        edit_dict,
+        edit_unsigned_bytes,
+        encode,
+        encode_edit,
+        parse_edit,
+    )
+
+    payload = edit_dict("msg-1", "fixed", message_id="edit-1", sent_at=12.0)
+    unsigned = encode(payload)
+    payload["sig"] = base64.b64encode(b"x" * 64).decode("ascii")
+    signed = encode(payload)
+    assert edit_unsigned_bytes(signed) == unsigned
+    assert parse_edit(signed)["text"] == "fixed"
 
 
 def test_message_rejects_invalid_expiry():

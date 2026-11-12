@@ -618,6 +618,46 @@ def test_send_file_never_loads_a_file_with_unbounded_reads(
     assert reads == []
 
 
+def test_send_file_bytes_refuses_to_start_after_the_deadline(
+    tmp_path, monkeypatch
+):
+    """An offer answered at the cutoff must not start a doomed transfer.
+
+    The Resource wait has no time left once the deadline has passed,
+    so advertising it would start a transfer that can only be
+    cancelled — the leg must fail before the Resource is constructed.
+    """
+    import time
+
+    node = make_node(tmp_path)
+    node.identity = RNS.Identity()
+    node.resolve_peer = lambda target, timeout=10.0: SimpleNamespace(  # type: ignore[method-assign]
+        destination_hash=bytes.fromhex(RECIPIENT_HASH),
+        hexhash=RECIPIENT_HASH,
+    )
+    node._open_link = lambda peer, timeout, deadline=None: SimpleNamespace(  # type: ignore[method-assign]
+        teardown=lambda: None
+    )
+    node._request_on_link = lambda link, path, payload, timeout, deadline=None: {  # type: ignore[method-assign]
+        "ok": True
+    }
+    built = []
+    monkeypatch.setattr(
+        RNS,
+        "Resource",
+        lambda *args, **kwargs: built.append((args, kwargs)),
+    )
+    with pytest.raises(NodeError, match="deadline passed before sending file"):
+        node._send_file_bytes(
+            RECIPIENT_HASH,
+            b"hello",
+            "notes.txt",
+            hashlib.sha256(b"hello").hexdigest(),
+            deadline=time.monotonic() - 1.0,
+        )
+    assert built == []
+
+
 # -- inbox file records ----------------------------------------------------
 
 

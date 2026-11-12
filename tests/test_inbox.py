@@ -8,6 +8,7 @@ import stat
 import pytest
 
 from tau.inbox import Inbox
+from tau.protocol import ProtocolError
 
 
 def _record(**overrides):
@@ -273,6 +274,118 @@ def test_delete_memory_only_inbox():
     inbox.append(_record(id="gone", text="bye"))
     assert inbox.delete("gone")["text"] == "bye"
     assert len(inbox) == 0
+
+
+def test_prune_drops_only_messages_older_than_cutoff(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="edge", received_at=99000.0, text="at the cutoff"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.append(
+        _record(id="old-sent", received_at=10.0, direction="out", text="old sent")
+    )
+
+    result = inbox.prune(1000.0, now=100000.0)
+    assert result == {"pruned": 2, "per_peer": {"ab" * 16: 2}, "dry_run": False}
+    assert [
+        entry["id"] for entry in inbox.list_messages(direction=None)
+    ] == ["new", "edge"]
+
+
+def test_prune_scopes_to_one_peer(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="alice-old", received_at=10.0, text="alice old"))
+    inbox.append(
+        _record(id="bob-old", destination="cd" * 16, received_at=10.0, text="bob old")
+    )
+    inbox.append(_record(id="alice-new", received_at=100000.0, text="alice new"))
+
+    result = inbox.prune(1000.0, peer="cd" * 16, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"cd" * 16: 1}, "dry_run": False}
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "alice-new",
+        "alice-old",
+    ]
+
+
+def test_prune_scopes_to_one_group(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="group-old",
+            kind="group",
+            group="cd" * 16,
+            group_name="team",
+            received_at=10.0,
+            text="group old",
+        )
+    )
+    inbox.append(_record(id="dm-old", received_at=10.0, text="dm old"))
+
+    result = inbox.prune(1000.0, group="cd" * 16, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"ab" * 16: 1}, "dry_run": False}
+    assert [entry["id"] for entry in inbox.list_messages(direction=None)] == [
+        "dm-old"
+    ]
+
+
+def test_prune_dry_run_deletes_nothing(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+
+    result = inbox.prune(1000.0, dry_run=True, now=100000.0)
+    assert result == {"pruned": 1, "per_peer": {"ab" * 16: 1}, "dry_run": True}
+    assert len(inbox) == 2
+    assert [entry["id"] for entry in Inbox(path).list_messages()] == ["new", "old"]
+
+
+def test_prune_drops_reactions_to_pruned_messages(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.record_reaction(_reaction(target="old", id="react-old"))
+    inbox.record_reaction(_reaction(target="new", id="react-new"))
+
+    inbox.prune(1000.0, now=100000.0)
+    assert inbox.reactions_for("old") == []
+    assert len(inbox.reactions_for("new")) == 1
+
+
+def test_prune_leaves_read_cursor_and_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="mid", received_at=1000.0, text="mid"))
+    inbox.mark_read()
+    inbox.append(_record(id="new", received_at=2000.0, text="new"))
+
+    result = inbox.prune(1500.0, now=2000.0)
+    assert result["pruned"] == 1
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_prune_rejects_non_positive_cutoff(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    with pytest.raises(InboxError, match="must be positive"):
+        inbox.prune(0)
+    with pytest.raises(InboxError, match="must be positive"):
+        inbox.prune(-5.0)
+    assert len(inbox) == 1
+
+
+def test_prune_persists_across_instances(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="old", received_at=10.0, text="old"))
+    inbox.append(_record(id="new", received_at=100000.0, text="new"))
+    inbox.prune(1000.0, now=100000.0)
+
+    reloaded = Inbox(path)
+    assert [entry["id"] for entry in reloaded.list_messages()] == ["new"]
 
 
 def test_delete_exact_match_wins_over_folded_prefix(tmp_path):
@@ -550,6 +663,153 @@ def test_delete_authorized_refuses_a_mismatched_record(tmp_path):
     with pytest.raises(InboxError):
         inbox.delete_authorized("msg-1", direction="out", destination="cd" * 16)
     assert len(inbox) == 1
+
+def test_apply_edit_replaces_text_and_marks_edited(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="typo here"))
+
+    updated = inbox.apply_edit("msg-1", "fixed here", edited_at=42.0)
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+    assert updated["edited_at"] == 42.0
+    assert inbox.list_messages()[0]["text"] == "fixed here"
+    assert inbox.list_messages()[0]["edited_at"] == 42.0
+
+    reloaded = Inbox(tmp_path / "inbox.json")
+    assert reloaded.list_messages()[0]["text"] == "fixed here"
+    assert reloaded.list_messages()[0]["edited_at"] == 42.0
+
+
+def test_apply_edit_unknown_id_returns_none(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="keep me"))
+
+    assert inbox.apply_edit("nope", "new", edited_at=1.0) is None
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_needs_exact_id(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="abcd" + "1" * 28, text="keep me"))
+
+    # A unique prefix is not an edit target: only the full id applies.
+    assert inbox.apply_edit("abcd", "new", edited_at=1.0) is None
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_refuses_file_records(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        {
+            "kind": "file",
+            "from": "alice",
+            "destination": "ab" * 16,
+            "name": "notes.txt",
+            "size": 4,
+            "sha256": "a" * 64,
+            "path": "/tmp/notes.txt",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "file-1",
+        }
+    )
+    with pytest.raises(InboxError, match="no text to edit"):
+        inbox.apply_edit("file-1", "new", edited_at=1.0)
+
+
+def test_apply_edit_rejects_empty_text(tmp_path):
+    from tau.inbox import InboxError
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="msg-1", text="keep me"))
+    with pytest.raises(InboxError, match="must not be empty"):
+        inbox.apply_edit("msg-1", "", edited_at=1.0)
+    assert inbox.list_messages()[0]["text"] == "keep me"
+
+
+def test_apply_edit_rejects_a_stale_edit_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(id="msg-1", text="newer text", edited_at=200.0)
+    )
+
+    # An edit older than the stored one must not overwrite it, even
+    # when the caller's snapshot check already passed — the transaction
+    # re-checks after its reload.
+    assert (
+        inbox.apply_edit(
+            "msg-1", "older text", edited_at=100.0, newer_than_existing=True
+        )
+        is None
+    )
+    assert inbox.list_messages()[0]["text"] == "newer text"
+    assert inbox.list_messages()[0]["edited_at"] == 200.0
+
+    updated = inbox.apply_edit(
+        "msg-1", "newest text", edited_at=300.0, newer_than_existing=True
+    )
+    assert updated is not None
+    assert updated["text"] == "newest text"
+    assert updated["edited_at"] == 300.0
+
+
+def test_apply_edit_rechecks_direction_inside_the_transaction(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="msg-1",
+            text="mine",
+            direction="out",
+            destination="ab" * 16,
+        )
+    )
+
+    # A record that is not inbound to the caller cannot be edited by
+    # them, even when the caller's snapshot said otherwise.
+    assert (
+        inbox.apply_edit(
+            "msg-1",
+            "not yours",
+            edited_at=42.0,
+            direction="in",
+            destination="ab" * 16,
+        )
+        is None
+    )
+    assert inbox.list_messages(direction="out")[0]["text"] == "mine"
+
+    updated = inbox.apply_edit(
+        "msg-1",
+        "fixed here",
+        edited_at=42.0,
+        direction="out",
+        destination="ab" * 16,
+    )
+    assert updated is not None
+    assert updated["text"] == "fixed here"
+
+
+def test_edited_at_survives_reload(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1", text="original", edited_at=7.0))
+
+    reloaded = Inbox(path)
+    assert reloaded.list_messages()[0]["edited_at"] == 7.0
+
+
+def test_corrupt_edited_at_drops_the_record(tmp_path):
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="msg-1", text="original", edited_at=7.0))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["messages"][0]["edited_at"] = "not-a-time"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    reloaded = Inbox(path)
+    assert reloaded.list_messages() == []
 
 
 def test_export_document_round_trips_through_import(tmp_path):
@@ -882,6 +1142,29 @@ def test_new_messages_are_unread_until_marked_read(tmp_path):
     assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
 
 
+def test_unread_counts_ignore_sent_records(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="a2", destination="aa" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    # A sent record past the cursor is your own mail, never unread
+    # for you — it must not inflate the counts.
+    inbox.append(
+        _record(
+            id="sent-1",
+            destination="aa" * 16,
+            received_at=3.0,
+            direction="out",
+        )
+    )
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+    # Received mail after the sent record still counts.
+    inbox.append(_record(id="a3", destination="aa" * 16, received_at=4.0))
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
 def test_mark_read_advances_only_to_up_to(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", received_at=1.0))
@@ -894,6 +1177,125 @@ def test_mark_read_advances_only_to_up_to(tmp_path):
     listed = inbox.list_messages()
     assert [entry["id"] for entry in listed] == ["a3", "a2", "a1"]
     assert [entry["unread"] for entry in listed] == [True, False, False]
+
+
+def test_mark_unread_marks_newest_message_unread_again(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_all_marks_whole_conversation_unread(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    assert all(entry["unread"] for entry in inbox.list_messages())
+
+
+def test_mark_unread_is_noop_when_nothing_was_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_on_peer_with_no_messages_is_a_noop(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+
+    assert inbox.mark_unread(peer="bb" * 16) is None
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_leaves_other_peers_alone(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", destination="aa" * 16, received_at=1.0))
+    inbox.append(_record(id="b1", destination="bb" * 16, received_at=2.0))
+    inbox.mark_read()
+
+    inbox.mark_unread(peer="aa" * 16)
+    assert inbox.unread_counts() == {"per_peer": {"aa" * 16: 1}, "total": 1}
+
+
+def test_mark_unread_ignores_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=3.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["a2", "a1"]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_mark_unread_does_not_mark_unread_messages_read(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.append(_record(id="a3", received_at=3.0))
+    inbox.mark_read(up_to_seq=1)
+
+    counts = inbox.mark_unread(peer="ab" * 16)
+    assert counts == {"per_peer": {"ab" * 16: 2}, "total": 2}
+    listed = inbox.list_messages()
+    assert [entry["unread"] for entry in listed] == [True, True, False]
+
+
+def test_sent_records_do_not_inflate_unread_counts(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.mark_read()
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+
+    # A reply this node sent is never unread for its owner.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+
+def test_mark_unread_and_unread_counts_agree_with_a_trailing_sent_record(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="s1", direction="out", text="reply", received_at=2.0))
+    inbox.mark_read()
+
+    counts = inbox.mark_unread(peer="ab" * 16, all=True)
+    assert counts == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    assert inbox.unread_counts() == counts
+
+
+def test_mark_unread_raises_when_the_cursor_cannot_persist(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="a1", received_at=1.0))
+    inbox.append(_record(id="a2", received_at=2.0))
+    inbox.mark_read()
+
+    def _fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Inbox, "_save", _fail)
+    with pytest.raises(OSError):
+        inbox.mark_unread(peer="ab" * 16)
+
+    # The in-memory cursor is restored, and the on-disk state is untouched.
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert Inbox(tmp_path / "inbox.json").unread_counts() == {
+        "per_peer": {},
+        "total": 0,
+    }
 
 
 def test_mark_read_never_moves_a_cursor_backward(tmp_path):
@@ -1063,6 +1465,70 @@ def test_find_prefix_needs_a_unique_match_in_the_conversation(tmp_path):
     assert len(inbox.find_prefix("abc", peer="ab" * 16)) == 2
     assert inbox.find_prefix("abc", peer="cd" * 16)[0]["id"] == "abc333"
     assert inbox.find_prefix("zzz", peer="ab" * 16) == []
+
+
+def test_find_matches_group_send_leg_ids(tmp_path):
+    """One record per group send keeps every leg id: any leg resolves."""
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(
+        _record(
+            id="leg-1",
+            leg_ids=["leg-1", "leg-2"],
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+            direction="out",
+            destination="",
+            text="hello group",
+        )
+    )
+
+    for leg_id in ("leg-1", "leg-2"):
+        assert inbox.find(leg_id, group="a" * 32)["text"] == "hello group"
+        assert len(inbox.find_prefix(leg_id[:4], group="a" * 32)) == 1
+    assert inbox.find("leg-2", group="b" * 32) is None
+    assert inbox.find("missing", group="a" * 32) is None
+
+
+def test_find_by_excerpt_needs_one_author(tmp_path):
+    from tau.protocol import excerpt_hash
+
+    inbox = Inbox(tmp_path / "inbox.json")
+    excerpt = excerpt_hash("same words")
+    inbox.append(
+        _record(
+            id="m-1",
+            destination="ab" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    inbox.append(
+        _record(
+            id="m-2",
+            destination="ab" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    # Same author repeating the text still attributes to that author.
+    assert inbox.find_by_excerpt(excerpt, group="a" * 32)["id"] == "m-2"
+    inbox.append(
+        _record(
+            id="m-3",
+            destination="cd" * 16,
+            text="same words",
+            kind="group",
+            group="a" * 32,
+            group_name="weekend",
+        )
+    )
+    # Two authors, same text: the quote cannot be attributed.
+    assert inbox.find_by_excerpt(excerpt, group="a" * 32) is None
 
 
 def test_record_keeps_reply_reference_and_direction(tmp_path):
@@ -1346,6 +1812,36 @@ def test_append_group_message_purges_and_appends_in_one_persist(
     assert shown[0]["destination"] == "ab" * 16
 
 
+def test_append_group_message_skips_duplicate_id(tmp_path):
+    # CodeRabbit Major (inbox.py:1267): the append persisted before
+    # the seen marker, with no id check — a retry after a failed
+    # seen-marker write appended a second copy, which at the cap
+    # evicted unrelated history.  A duplicate id now skips the
+    # append (the reconcile/purge still run, and the tombstones
+    # return) so the retry can finish mark_seen.
+    inbox = Inbox(tmp_path / "inbox.json")
+    members = {"ab" * 16, "aa" * 16}
+    first = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert first == []
+    assert len(inbox.list_messages()) == 1
+    again = inbox.append_group_message(
+        _group_copy(),
+        group="cd" * 16,
+        author="aa" * 16,
+        sent_at=100.0,
+        members=members,
+    )
+    assert again == []
+    assert len(inbox.list_messages()) == 1
+    assert inbox.find("local-copy-1") is not None
+
+
 def test_append_group_message_reconcile_failure_does_not_break_arrival(
     tmp_path, monkeypatch
 ):
@@ -1420,6 +1916,19 @@ def test_resolve_exact_id_beats_a_longer_prefix(tmp_path):
     assert inbox.resolve("abcdef")["text"] == "long"
 
 
+def test_resolve_matches_a_group_leg_id(tmp_path):
+    # CodeRabbit Major: a group send stores one leg id as the record
+    # id and the rest in leg_ids — resolve must match any leg, exactly
+    # as find() already does, or a reaction naming the other leg
+    # never resolves to the stored record.
+    inbox = Inbox(tmp_path / "inbox.json")
+    inbox.append(_record(id="g-1", leg_ids=["g-1", "g-2"]))
+    assert inbox.resolve("g-2")["id"] == "g-1"
+    assert inbox.resolve("g-1")["id"] == "g-1"
+    with pytest.raises(ValueError, match="unknown message"):
+        inbox.resolve("g-3")
+
+
 def _reaction(**overrides):
     record = {
         "target": "msg-1",
@@ -1451,6 +1960,32 @@ def test_expired_messages_are_purged_on_load(tmp_path):
     ]
     # The purge is persisted: a later load does not resurrect the entry.
     assert "gone" not in path.read_text(encoding="utf-8")
+
+
+def test_read_only_prune_dry_run_does_not_persist_expiry_purge(tmp_path):
+    import json as _json
+    import time as _time
+
+    now = _time.time()
+    path = tmp_path / "inbox.json"
+    inbox = Inbox(path)
+    inbox.append(_record(id="gone", received_at=10.0, expires_at=now + 3600))
+    inbox.append(_record(id="kept", received_at=10.0))
+    # Expire "gone" on disk without the instance noticing.
+    raw = _json.loads(path.read_text(encoding="utf-8"))
+    for entry in raw["messages"]:
+        if entry["id"] == "gone":
+            entry["expires_at"] = now - 10
+    path.write_text(_json.dumps(raw), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+
+    preview = Inbox(path, read_only=True)
+    result = preview.prune(1000.0, dry_run=True, now=now)
+    assert result["pruned"] == 1
+    assert result["dry_run"] is True
+    # The expired record is not in the preview and nothing was written.
+    assert [entry["id"] for entry in preview.list_messages()] == ["kept"]
+    assert path.read_text(encoding="utf-8") == before
 
 
 def test_expiry_is_recorded(tmp_path):
@@ -1615,3 +2150,96 @@ def test_reload_runs_under_the_cross_process_lock(tmp_path):
     assert finished.wait(timeout=5.0)
     worker.join(timeout=5.0)
     assert len(inbox) == 1
+
+
+def test_add_note_stores_a_read_note_from_self(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    own = "cc" * 16
+    entry = inbox.add_note(
+        "  buy milk on the way home  ", sender_name="alice", destination=own
+    )
+
+    assert entry["kind"] == "note"
+    assert entry["direction"] == "in"
+    assert entry["from"] == "alice"
+    assert entry["destination"] == own
+    assert entry["text"] == "buy milk on the way home"
+    assert entry["id"] and len(entry["id"]) == 32
+
+    # Read the moment it is written: no unread marker, no count.
+    listed = inbox.list_messages()
+    assert [item["id"] for item in listed] == [entry["id"]]
+    assert listed[0]["unread"] is False
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+
+    # Found by the kind filter and by search, hidden by other kinds.
+    assert [item["id"] for item in inbox.list_messages(kind="note")] == [
+        entry["id"]
+    ]
+    assert inbox.list_messages(kind="chat") == []
+    assert [item["id"] for item in inbox.list_messages(query="MILK")] == [
+        entry["id"]
+    ]
+
+
+def test_add_note_rejects_empty_text(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    with pytest.raises(ProtocolError):
+        inbox.add_note("   ", sender_name="alice", destination="cc" * 16)
+    assert len(inbox) == 0
+
+
+def test_note_survives_export_import(tmp_path):
+    source = Inbox(tmp_path / "source.json")
+    entry = source.add_note("remember the mesh node", sender_name="alice", destination="cc" * 16)
+
+    target = Inbox(tmp_path / "target.json")
+    result = target.import_messages(source.export_document())
+    assert result == {"imported": 1, "present": 0, "skipped": 0, "errors": []}
+    imported = target.list_messages(kind="note")
+    assert [item["id"] for item in imported] == [entry["id"]]
+    assert imported[0]["text"] == "remember the mesh node"
+    # Read state does not travel with an export — cursors are not in
+    # the document — so an imported note is unread in the new inbox,
+    # like any other imported message; listing it marks it read.
+    assert imported[0]["unread"] is True
+    target.mark_read(peer="cc" * 16)
+    assert target.list_messages(kind="note")[0]["unread"] is False
+
+
+def test_note_cursor_does_not_cover_peer_mail(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    note = inbox.add_note("a note", sender_name="alice", destination="cc" * 16)
+    inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
+
+    # The note's own-hash cursor advanced, the peer's did not.
+    assert inbox.unread_counts() == {"per_peer": {"ab" * 16: 1}, "total": 1}
+    listed = inbox.list_messages()
+    assert [entry["id"] for entry in listed] == ["peer-1", note["id"]]
+    assert [entry["unread"] for entry in listed] == [True, False]
+
+
+def test_add_note_raises_when_persist_fails(tmp_path, monkeypatch):
+    inbox = Inbox(tmp_path / "inbox.json")
+
+    def _failing_save(*, strict=False):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(inbox, "_save", _failing_save)
+    with pytest.raises(OSError):
+        inbox.add_note("lost note", sender_name="alice", destination="cc" * 16)
+    # Nothing was kept in memory, and nothing landed on disk.
+    assert len(inbox) == 0
+    assert inbox.unread_counts() == {"per_peer": {}, "total": 0}
+    assert len(Inbox(tmp_path / "inbox.json")) == 0
+
+
+def test_unreceipted_excludes_notes(tmp_path):
+    inbox = Inbox(tmp_path / "inbox.json")
+    note = inbox.add_note("a note", sender_name="alice", destination="cc" * 16)
+    peer = inbox.append(_record(id="peer-1", destination="ab" * 16, text="hello"))
+    # Both displayed: the serving node's receipt sweep must only ever
+    # see the peer's message, never the note.
+    inbox.mark_read([note["id"], peer["id"]])
+    assert [item["id"] for item in inbox.read_unreceipted()] == ["peer-1"]
+    assert [item["id"] for item in inbox.unreceipted()] == ["peer-1"]
