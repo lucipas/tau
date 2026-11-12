@@ -1122,6 +1122,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     messages_import.set_defaults(func=cmd_messages_import)
 
+    messages_prune = messages_sub.add_parser(
+        "prune",
+        parents=[common],
+        help="delete stored messages older than a cutoff",
+    )
+    messages_prune.add_argument(
+        "--older-than",
+        required=True,
+        metavar="DURATION",
+        help="delete messages older than this (e.g. 30s, 5m, 2h, 7d, 90d; at most 10y)",
+    )
+    messages_prune.add_argument(
+        "--peer",
+        # SUPPRESS, not None: the parent `messages` parser also defines
+        # --peer, and a subparser default of None would silently discard
+        # a scope flag given before `prune` (e.g. `messages --peer alice
+        # prune ...`). With SUPPRESS the parent value survives.
+        default=argparse.SUPPRESS,
+        metavar="NAME|HASH",
+        help="only prune messages exchanged with this peer (name, hash or hash prefix)",
+    )
+    messages_prune.add_argument(
+        "--group",
+        # Same as --peer above: preserve a --group given before `prune`.
+        default=argparse.SUPPRESS,
+        metavar="ID|NAME",
+        help="only prune messages from this group (id, id prefix or name)",
+    )
+    messages_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be pruned without deleting anything",
+    )
+    messages_prune.set_defaults(func=cmd_messages_prune)
+
     group = subparsers.add_parser(
         "group",
         parents=[common],
@@ -2026,20 +2061,57 @@ def _next_try_at(entry: Any) -> Optional[float]:
 
 
 
-_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 7 * 86400,
+    "y": 365 * 86400,
+}
+
+# A prune cutoff may reach years back; the 30-day mail TTL cap only
+# applies to disappearing messages, never to pruning old history.
+_PRUNE_MAX_SECONDS = 10 * 365 * 24 * 60 * 60
 
 
-def _parse_duration(value: str, *, flag: str = "--expire") -> float:
-    """Parse a ``--expire``/``--delay`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
+def _describe_duration(seconds: float) -> str:
+    """Shortest whole-unit rendering of a duration in seconds."""
+    for suffix, size in (
+        ("y", 365 * 86400),
+        ("w", 7 * 86400),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60),
+        ("s", 1),
+    ):
+        if seconds >= size and seconds % size == 0:
+            return f"{int(seconds // size)}{suffix}"
+    return f"{seconds:g}s"
+
+
+def _parse_duration(
+    value: str,
+    *,
+    max_seconds: float = MAX_MAIL_TTL,
+    label: str = "--expire",
+    flag: Optional[str] = None,
+) -> float:
+    """Parse a ``--expire``/``--delay``/``--older-than`` duration like ``30s``, ``5m``, ``2h``, ``7d``.
 
     A bare number means seconds.  Returns the duration in seconds;
     raises ``ValueError`` for anything unparseable, non-positive, or
-    longer than the mail TTL (a disappearing message cannot outlive
-    the store-and-forward envelope that might carry it).
+    longer than *max_seconds* (the mail TTL by default: a disappearing
+    message cannot outlive the store-and-forward envelope that might
+    carry it).
     """
+    if flag is not None:
+        # Main's `--delay` caller names the flag this way; the prune
+        # caller names it `label`.  Both mean the flag shown in errors.
+        label = flag
     text = (value or "").strip().lower()
     if not text:
-        raise ValueError(f"{flag} needs a duration like 30s, 5m, 2h or 7d")
+        raise ValueError(f"{label} needs a duration like 30s, 5m, 2h or 7d")
     unit = 1.0
     if text[-1] in _DURATION_UNITS:
         unit = float(_DURATION_UNITS[text[-1]])
@@ -2048,13 +2120,15 @@ def _parse_duration(value: str, *, flag: str = "--expire") -> float:
         amount = float(text)
     except ValueError as exc:
         raise ValueError(
-            f"invalid {flag} duration {value!r} (try 30s, 5m, 2h or 7d)"
+            f"invalid {label} duration {value!r} (try 30s, 5m, 2h or 7d)"
         ) from exc
     seconds = amount * unit
     if not seconds > 0:
-        raise ValueError(f"{flag} duration must be positive")
-    if seconds > MAX_MAIL_TTL:
-        raise ValueError(f"{flag} duration must be at most 30d")
+        raise ValueError(f"{label} duration must be positive")
+    if seconds > max_seconds:
+        raise ValueError(
+            f"{label} duration must be at most {_describe_duration(max_seconds)}"
+        )
     return seconds
 
 def _print_peer_table(
@@ -6322,6 +6396,58 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
             ref = error["id"] if error["id"] else "?"
             print(f"  skipped {ref}: {error['error']}")
     return _EXIT_OK if result["skipped"] == 0 else _EXIT_ERROR
+
+
+def cmd_messages_prune(args: argparse.Namespace) -> int:
+    config = _make_config(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    # A dry run must not persist an expiry purge: open the inbox read-only.
+    inbox = Inbox(config.inbox_path, read_only=dry_run)
+    registry = PeerRegistry(config.peers_path)
+    older_than = _parse_duration(
+        args.older_than,
+        max_seconds=_PRUNE_MAX_SECONDS,
+        label="--older-than",
+    )
+    peer_hash = None
+    group_id = None
+    scope_parts = []
+    if getattr(args, "peer", None):
+        peer_hash = _resolve_inbox_peer(inbox, registry, args.peer)
+        peer = registry.get(peer_hash)
+        scope_parts.append(
+            "with "
+            + (peer.display_name if peer is not None else short_hash(peer_hash))
+        )
+    if getattr(args, "group", None):
+        group = GroupStore(config.groups_path).find(args.group)
+        group_id = group["id"]
+        scope_parts.append(f"in group {group['name']}")
+    result = inbox.prune(
+        older_than,
+        peer=peer_hash,
+        group=group_id,
+        dry_run=dry_run,
+    )
+    scope = " ".join(scope_parts) if scope_parts else "from all senders"
+    if _json_mode(args):
+        _emit(result, True)
+    else:
+        verb = "Would prune" if result["dry_run"] else "Pruned"
+        print(
+            f"{verb} {result['pruned']} messages older than {args.older_than} ({scope})"
+        )
+        if result["dry_run"]:
+            print("dry run — nothing was deleted.")
+        else:
+            print(
+                "note: only this node's stored inbox copies were deleted"
+                " (received and sent); the other parties keep theirs, and"
+                " sealed copies already held by relays are unaffected."
+                " Sent history shown by `tau messages --sent` and messages"
+                " still queued in the outbox remain stored locally."
+            )
+    return _EXIT_OK
 
 
 def cmd_archive(args: argparse.Namespace) -> int:
