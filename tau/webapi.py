@@ -3243,6 +3243,14 @@ class WebBridge:
             )
             if entry is None:
                 raise ValueError(f"unknown message: {target!r}")
+            expires_at = entry.get("expires_at")
+            if (
+                isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and float(expires_at) <= time.time()
+            ):
+                # Expired disappearing messages are treated as unknown.
+                raise ValueError(f"unknown message: {target!r}")
             if entry.get("group"):
                 raise ValueError("group messages cannot be forwarded")
             if entry.get("file"):
@@ -3262,10 +3270,11 @@ class WebBridge:
             blocklist = getattr(self.node, "blocklist", None)
             if blocklist is None:
                 raise ValueError("cannot forward: the block-list could not be read")
-            if (
-                isinstance(peer_hash, str)
-                and peer_hash
-                and blocklist.is_blocked(peer_hash)
+            # Mirror the feed's visibility rule: an entry without a peer
+            # is checked as None, which fails closed when the list is
+            # non-empty or unreadable.
+            if blocklist.is_blocked(
+                peer_hash if isinstance(peer_hash, str) and peer_hash else None
             ):
                 raise ValueError("cannot forward a message from a blocked peer")
             label = None
