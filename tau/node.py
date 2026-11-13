@@ -3537,45 +3537,9 @@ class TauNode:
         # Flushed after the mail lock is released: resolving an
         # unknown sender can wait seconds for discovery, and that
         # wait must not stall other mail rounds.
-        self._discover_due_scheduled(to=to, timeout=timeout, deadline=deadline)
         if to is None and message_id is None:
             summary["receipts"] += self._flush_read_receipts()
         return summary
-
-    def _discover_due_scheduled(
-        self,
-        *,
-        to: Optional[bytes],
-        timeout: float,
-        deadline: Optional[float],
-    ) -> None:
-        """Find recipients of due scheduled legs that are not in the registry.
-
-        The mail sweep only visits registered peers, so a scheduled group
-        leg whose recipient is in the roster but absent from the registry
-        would never be attempted.  Once such a leg is due, resolve its
-        recipient here (after the mail lock is released, as discovery can
-        wait) so the registry holds it and the next round delivers it.
-        """
-        if not self.started or self.destination is None:
-            return
-        seen: Set[bytes] = set()
-        for entry in self.mailbox.outbox_list():
-            if entry.send_after is None or entry.is_scheduled():
-                continue
-            if to is not None and entry.to != to:
-                continue
-            if entry.to in seen or self.registry.get(entry.to) is not None:
-                continue
-            seen.add(entry.to)
-            if _past(deadline):
-                break
-            budget = _remaining(deadline)
-            wait = timeout if budget is None else min(timeout, budget)
-            try:
-                self.wait_for_peer(entry.to, timeout=wait)
-            except NodeError:
-                log.debug("Could not discover scheduled recipient", exc_info=True)
 
     def _flush_peer(
         self,
@@ -6649,10 +6613,6 @@ class TauNode:
         cancelled: List[str] = []
         requeue_failed: List[Dict[str, Any]] = []
         requeued: List[str] = []
-        # Members whose scheduled leg was re-queued with the edited text.
-        # They get no live edit now: the edit must not reach them before
-        # the scheduled time, and the queued leg delivers the edited text.
-        scheduled_members: Set[str] = set()
         for entry in self.mailbox.outbox_list():
             if (
                 entry.group_id == group["id"]
@@ -6686,8 +6646,6 @@ class TauNode:
                             edited_at=float(payload["sent_at"]),
                         )
                         requeued.append(entry.id)
-                        if entry.is_scheduled():
-                            scheduled_members.add(entry.to_hex)
                     except MailboxError as queue_exc:
                         requeue_failed.append(
                             {
@@ -6700,10 +6658,6 @@ class TauNode:
                         )
         results: List[Dict[str, Any]] = list(requeue_failed)
         for member in members:
-            if member in scheduled_members:
-                # Still scheduled: the re-queued leg carries the edited
-                # text and goes out at its time, so no live edit here.
-                continue
             # One deadline bounds each leg, exactly as in
             # send_group_message: the stages of a single delivery
             # share the leg's budget, but one member's leg must not
