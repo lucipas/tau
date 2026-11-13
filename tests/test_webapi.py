@@ -9628,6 +9628,37 @@ def test_delete_sent_by_wire_id_removes_only_the_outbound_copy(bridge):
     assert deleted_events[0]["message_id"] == sent["id"]
 
 
+def test_retracted_sent_id_does_not_suppress_later_inbound(bridge):
+    # Regression test (Qodo on PR #328): deleting a sent entry must not
+    # put its wire id in the inbound removal set, or a peer reusing
+    # that id could hide a later inbound message from the console.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="take this back",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+    )
+    assert bridge.delete_sent_by_wire_id("wire-1") is not None
+    arrived = bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "same id, later message",
+            "sent_at": 102.0,
+            "received_at": 103.0,
+            "id": "wire-1",
+        }
+    )
+    assert arrived is not None
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["wire-1"]
+    assert feed["messages"][0]["direction"] == "in"
+
+
 def test_delete_sent_group_removes_only_the_matching_legs(bridge):
     group = "cd" * 16
     leg_one = bridge._append_message(

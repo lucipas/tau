@@ -4198,7 +4198,12 @@ class WebBridge:
 
 
     def _remove_history_entry(
-        self, target: int, removed: Dict[str, Any], *, publish_unread: bool
+        self,
+        target: int,
+        removed: Dict[str, Any],
+        *,
+        publish_unread: bool,
+        remember_wire_id: bool = True,
     ) -> None:
         """Remove one console history entry and tell connected tabs.
 
@@ -4214,7 +4219,10 @@ class WebBridge:
         badge when the caller consulted the node inbox.  The wire id
         stays remembered even when the save fails and the entry is
         restored: the message is back in history, so a later append
-        of the same id would only duplicate it.
+        of the same id would only duplicate it.  Pass
+        ``remember_wire_id=False`` for a sent entry: its id must not
+        enter the inbound removal set, or a peer reusing that id
+        could hide a later inbound message from the console.
         """
         wire_id = removed.get("wire_id")
         # Hold the save lock across removal, strict persistence and
@@ -4231,7 +4239,7 @@ class WebBridge:
                 ]
                 self._messages.clear()
                 self._messages.extend(kept)
-                if isinstance(wire_id, str) and wire_id:
+                if remember_wire_id and isinstance(wire_id, str) and wire_id:
                     # Recorded under the same lock as the append
                     # check, so the two cannot interleave.
                     self._remember_removed_wire_id(wire_id)
@@ -4325,7 +4333,10 @@ class WebBridge:
         after a restart.  Only an outbound entry can match, mirroring
         :meth:`delete_by_wire_id` for the inbound side.  Returns the
         delete result, or ``None`` when no outbound entry carries that
-        wire id (the console window may not cover it).
+        wire id (the console window may not cover it).  The id is
+        deliberately not remembered in the inbound removal set: that
+        set suppresses inbound appends, and a peer reusing a retracted
+        sent id must not be able to hide a later inbound message.
         """
         if not isinstance(wire_id, str) or not wire_id:
             return None
@@ -4340,13 +4351,11 @@ class WebBridge:
                 None,
             )
             if removed is None:
-                # No entry to remove, but the retraction succeeded:
-                # remember the id so a pending delivery callback
-                # cannot append the message afterwards.
-                self._remember_removed_wire_id(wire_id)
                 return None
             target = removed.get("id")
-        self._remove_history_entry(target, removed, publish_unread=True)
+        self._remove_history_entry(
+            target, removed, publish_unread=True, remember_wire_id=False
+        )
         return {
             "ok": True,
             "deleted": {"id": target, "wire_id": wire_id},
@@ -4389,7 +4398,7 @@ class WebBridge:
         removed_ids = []
         for leg in legs:
             self._remove_history_entry(
-                leg["id"], leg, publish_unread=True
+                leg["id"], leg, publish_unread=True, remember_wire_id=False
             )
             removed_ids.append(leg["id"])
         return {
