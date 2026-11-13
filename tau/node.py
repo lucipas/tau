@@ -5982,8 +5982,10 @@ class TauNode:
             if record is None and len(group.strip()) == 32:
                 # An unresolved exact id (e.g. retired before retained
                 # records existed) must not fall back to a live group
-                # that merely shares its name.
-                raise NodeError(f"unknown group: {group!r}")
+                # that merely shares its name.  ValueError, like
+                # find(): this is an unknown group, not a delivery
+                # failure, and the CLI reports the two differently.
+                raise ValueError(f"unknown group: {group!r}")
             group = record if record is not None else self.groups.find(group)
         own_hash = self.destination_hexhash
         members = [m for m in group["members"] if m != own_hash]

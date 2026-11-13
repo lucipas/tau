@@ -685,6 +685,31 @@ def test_send_group_retraction_retired_id_never_resolves_to_namesake(
     assert set(calls) == {alice.hexhash, bob.hexhash}
 
 
+def test_send_group_retraction_unresolved_id_never_resolves_to_namesake(
+    tmp_path, monkeypatch
+):
+    node, _, alice, _ = _group_reaction_node(tmp_path)
+    carol = make_peer("carol")
+    # A live group named after a 32-hex id that is neither live nor
+    # retained (e.g. retired before retention landed): the retract
+    # must fail as an unknown group, never fan out to the namesake.
+    orphan_id = "ff" * 16
+    node.groups.create(
+        orphan_id,
+        [alice.hexhash, carol.hexhash],
+        created_by=alice.hexhash,
+    )
+    assert node.groups.find(orphan_id)["name"] == orphan_id
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no leg may be attempted for an unknown group")
+
+    monkeypatch.setattr(node, "_request", _boom)
+
+    with pytest.raises(ValueError, match="unknown group"):
+        node.send_group_retraction(orphan_id, "leg-1", target_sent_at=100.0)
+
+
 def test_send_group_retraction_needs_the_shared_send_time(tmp_path):
     node, _, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(NodeError, match="shared send time"):
