@@ -132,6 +132,10 @@ def build_bundle(
         if entry.expires_at <= timestamp:
             skipped.append({"id": entry.id, "reason": "expired"})
             continue
+        if entry.is_scheduled(timestamp):
+            # Not due yet: a scheduled leg must not leave the node early
+            # inside a bundle.  It is exported once its time has arrived.
+            continue
         peer = registry.get(entry.to)
         if peer is None or not peer.public_key:
             skipped.append({"id": entry.id, "reason": "unknown recipient key"})
