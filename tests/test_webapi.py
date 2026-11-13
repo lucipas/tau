@@ -9914,6 +9914,139 @@ def test_delete_sent_group_removes_only_the_matching_legs(bridge):
     ]
 
 
+def test_delete_sent_group_persists_all_legs_in_one_write(
+    node, tmp_path, monkeypatch
+):
+    """A multi-leg group delete is one strict write, not one per leg.
+
+    Regression test for issue #330 finding 4: the per-leg loop
+    persisted each leg separately, so a disk error mid-way left a
+    partially deleted group with no inbox record to retry from.
+    """
+    import tau.webapi
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        real_write = tau.webapi.atomic_write_json
+        writes = []
+
+        def counting_write(path, obj, mode=None):
+            writes.append(path)
+            return real_write(path, obj, mode=mode)
+
+        monkeypatch.setattr(tau.webapi, "atomic_write_json", counting_write)
+        group = "cd" * 16
+        leg_one = bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-1",
+        )
+        leg_two = bridge._append_message(
+            direction="out",
+            peer="ef" * 16,
+            peer_name="bob",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-2",
+        )
+        writes.clear()
+        result = bridge.delete_sent_group(group, 100.0)
+        assert result["deleted_ids"] == [leg_one["id"], leg_two["id"]]
+        assert len(writes) == 1
+        deleted_events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_deleted"
+        ]
+        assert [event["message_id"] for event in deleted_events] == [
+            leg_one["id"],
+            leg_two["id"],
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_delete_sent_group_restores_all_legs_when_the_write_fails(
+    node, tmp_path, monkeypatch
+):
+    """A failed group delete restores every leg and publishes nothing.
+
+    Regression test for issue #330 finding 4: with one strict write
+    for the whole batch, a disk error restores the complete group
+    instead of leaving some legs deleted, and no tab is told the
+    legs are gone.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        import tau.webapi
+
+        group = "cd" * 16
+        bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-1",
+        )
+        bridge._append_message(
+            direction="out",
+            peer="ef" * 16,
+            peer_name="bob",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-2",
+        )
+        # Same group, a different send: untouched by the delete.
+        bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="later group hello",
+            sent_at=200.0,
+            received_at=201.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-3",
+        )
+
+        def _failing_write(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(tau.webapi, "atomic_write_json", _failing_write)
+        with pytest.raises(OSError, match="disk full"):
+            bridge.delete_sent_group(group, 100.0)
+        _, _, feed = _json(bridge, "/api/messages")
+        assert [entry["wire_id"] for entry in feed["messages"]] == [
+            "leg-1",
+            "leg-2",
+            "leg-3",
+        ]
+        deleted_events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_deleted"
+        ]
+        assert deleted_events == []
+    finally:
+        bridge.stop()
+
+
 def test_retract_removes_the_recipients_console_copy(tmp_path):
     # End to end: a retract accepted by the node also drops the
     # console's copy, so /api/messages stops showing the text.
