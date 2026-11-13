@@ -5596,7 +5596,7 @@ def _edit_group_local_message(
     message_id: str,
     text: str,
     target_sent_at: float,
-    timeout: float = 20.0,
+    leg_timeout: float = 20.0,
     discover_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Edit one group message on the running node, for the local send server."""
@@ -5604,7 +5604,7 @@ def _edit_group_local_message(
         group,
         message_id,
         text,
-        timeout=float(timeout),
+        timeout=float(leg_timeout),
         discover_timeout=discover_timeout,
         target_sent_at=float(target_sent_at),
     )
@@ -5865,13 +5865,15 @@ def _retract_group_via_running_node(
     from .local_send import send_running
 
     try:
+        # The per-leg timeout travels in the request; the reply wait stays
+        # unbounded because a fan-out can outlast any single leg's bound.
         return send_running(
             config.data_dir,
             op="retract_group",
             group=group_id,
             message_id=message_id,
             target_sent_at=target_sent_at,
-            timeout=timeout,
+            leg_timeout=timeout,
             discover_timeout=discover_timeout,
         )
     except LocalIPCUnavailable as exc:
