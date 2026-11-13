@@ -9914,6 +9914,139 @@ def test_delete_sent_group_removes_only_the_matching_legs(bridge):
     ]
 
 
+def test_delete_sent_group_persists_all_legs_in_one_write(
+    node, tmp_path, monkeypatch
+):
+    """A multi-leg group delete is one strict write, not one per leg.
+
+    Regression test for issue #330 finding 4: the per-leg loop
+    persisted each leg separately, so a disk error mid-way left a
+    partially deleted group with no inbox record to retry from.
+    """
+    import tau.webapi
+
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        real_write = tau.webapi.atomic_write_json
+        writes = []
+
+        def counting_write(path, obj, mode=None):
+            writes.append(path)
+            return real_write(path, obj, mode=mode)
+
+        monkeypatch.setattr(tau.webapi, "atomic_write_json", counting_write)
+        group = "cd" * 16
+        leg_one = bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-1",
+        )
+        leg_two = bridge._append_message(
+            direction="out",
+            peer="ef" * 16,
+            peer_name="bob",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-2",
+        )
+        writes.clear()
+        result = bridge.delete_sent_group(group, 100.0)
+        assert result["deleted_ids"] == [leg_one["id"], leg_two["id"]]
+        assert len(writes) == 1
+        deleted_events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_deleted"
+        ]
+        assert [event["message_id"] for event in deleted_events] == [
+            leg_one["id"],
+            leg_two["id"],
+        ]
+    finally:
+        bridge.stop()
+
+
+def test_delete_sent_group_restores_all_legs_when_the_write_fails(
+    node, tmp_path, monkeypatch
+):
+    """A failed group delete restores every leg and publishes nothing.
+
+    Regression test for issue #330 finding 4: with one strict write
+    for the whole batch, a disk error restores the complete group
+    instead of leaving some legs deleted, and no tab is told the
+    legs are gone.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        import tau.webapi
+
+        group = "cd" * 16
+        bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-1",
+        )
+        bridge._append_message(
+            direction="out",
+            peer="ef" * 16,
+            peer_name="bob",
+            text="group hello",
+            sent_at=100.0,
+            received_at=101.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-2",
+        )
+        # Same group, a different send: untouched by the delete.
+        bridge._append_message(
+            direction="out",
+            peer=PEER_HASH,
+            peer_name="alice",
+            text="later group hello",
+            sent_at=200.0,
+            received_at=201.0,
+            status="delivered",
+            group=group,
+            wire_id="leg-3",
+        )
+
+        def _failing_write(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(tau.webapi, "atomic_write_json", _failing_write)
+        with pytest.raises(OSError, match="disk full"):
+            bridge.delete_sent_group(group, 100.0)
+        _, _, feed = _json(bridge, "/api/messages")
+        assert [entry["wire_id"] for entry in feed["messages"]] == [
+            "leg-1",
+            "leg-2",
+            "leg-3",
+        ]
+        deleted_events = [
+            event
+            for event in bridge.bus.replay()
+            if event.get("type") == "message_deleted"
+        ]
+        assert deleted_events == []
+    finally:
+        bridge.stop()
+
+
 def test_retract_removes_the_recipients_console_copy(tmp_path):
     # End to end: a retract accepted by the node also drops the
     # console's copy, so /api/messages stops showing the text.
@@ -10802,6 +10935,85 @@ def test_delete_message_rollback_survives_append_to_full_log(
         assert 250 in ids  # the deleted entry was restored
         assert 501 in ids  # the interleaved append survived
         assert ids == sorted(ids)  # the restore kept id order
+    finally:
+        bridge.stop()
+
+
+def test_delete_sent_group_rollback_keeps_all_legs_on_full_log(
+    node, tmp_path, monkeypatch
+):
+    """Rolling back a group delete never evicts a restored leg.
+
+    The group legs are the oldest entries in a full log, and an append
+    refills the log while the strict write is in flight. Every leg must
+    come back, not just the last one restored.
+    """
+    bridge = _bridge_with_data_dir(node, tmp_path)
+    try:
+        group = "ab" * 16
+        for wire_id, peer in (("leg-1", PEER_HASH), ("leg-2", "ef" * 16)):
+            bridge._append_message(
+                direction="out",
+                peer=peer,
+                peer_name="peer",
+                text="group hello",
+                sent_at=100.0,
+                received_at=101.0,
+                status="delivered",
+                group=group,
+                wire_id=wire_id,
+            )
+        leg_ids = [
+            message["id"]
+            for message in bridge._messages
+            if message.get("group") == group
+        ]
+        # Fill the rest of the bounded log with console-only messages.
+        next_id = max(leg_ids) + 1
+        while len(bridge._messages) < bridge._messages.maxlen:
+            bridge._messages.append(
+                {
+                    "id": next_id,
+                    "direction": "inbound",
+                    "peer": PEER_HASH,
+                    "peer_name": "alice",
+                    "text": f"m{next_id}",
+                    "sent_at": float(next_id),
+                    "received_at": float(next_id),
+                    "status": "received",
+                }
+            )
+            next_id += 1
+        bridge._next_message_id = next_id
+
+        def _append_then_fail(*args, **kwargs):
+            # Two appends refill the log during the failing write.
+            for _ in range(2):
+                bridge._messages.append(
+                    {
+                        "id": bridge._next_message_id,
+                        "direction": "inbound",
+                        "peer": PEER_HASH,
+                        "peer_name": "alice",
+                        "text": "late",
+                        "sent_at": 900.0,
+                        "received_at": 900.0,
+                        "status": "received",
+                    }
+                )
+                bridge._next_message_id += 1
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "tau.webapi.atomic_write_json", _append_then_fail
+        )
+        with pytest.raises(OSError, match="disk full"):
+            bridge.delete_sent_group(group, 100.0)
+        restored = [m["id"] for m in bridge._messages if m.get("group") == group]
+        assert restored == leg_ids
+        ids = [message["id"] for message in bridge._messages]
+        assert ids == sorted(ids)
+        assert len(ids) == bridge._messages.maxlen
     finally:
         bridge.stop()
 

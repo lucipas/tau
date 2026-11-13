@@ -4171,10 +4171,13 @@ class WebBridge:
         for wire_id in wire_ids:
             self.node.mailbox.discard_sent(wire_id)
         removed_ids = [leg["id"] for leg in legs]
-        for leg in legs:
-            self._remove_history_entry(
-                leg["id"], leg, publish_unread=inbox is not None
-            )
+        # One strict write for every leg, like delete_sent_group: a
+        # disk error mid-way used to leave a partially deleted group
+        # with no inbox record to retry from.
+        self._remove_history_entries(
+            [(leg["id"], leg) for leg in legs],
+            publish_unread=inbox is not None,
+        )
         delivered = [result for result in results if result.get("delivered")]
         return {
             "ok": True,
@@ -4386,6 +4389,105 @@ class WebBridge:
         return {"ok": True, "pinned" if pinned else "unpinned": state}
 
 
+    def _remove_history_entries(
+        self,
+        entries: List[Tuple[int, Dict[str, Any]]],
+        *,
+        publish_unread: bool,
+        remember_wire_id: bool = True,
+    ) -> None:
+        """Remove several console history entries with one strict write.
+
+        The batch form of :meth:`_remove_history_entry`: every entry
+        leaves the in-memory log under one save-lock-protected update
+        and a single strict persistence, so a disk error mid-way can
+        never leave a partially deleted group — the whole batch is
+        restored in memory and the error reported instead, with no
+        event published.  Events go out only after the write succeeds:
+        one ``message_deleted`` per entry and a single ``unread``
+        re-publish.  ``entries`` is a list of ``(console id, entry)``
+        pairs; wire ids are remembered exactly as the single-entry
+        form remembers them.
+        """
+        targets = {target for target, _ in entries}
+        # Hold the save lock across removal, strict persistence and
+        # failure rollback: no other history save can persist the
+        # transiently deleted deque between the failed write and the
+        # in-memory restore. (Appends may still interleave, but their
+        # saves wait on this lock and persist the restored log.)
+        with self._save_lock:
+            with self._lock:
+                kept = [
+                    message
+                    for message in self._messages
+                    if message.get("id") not in targets
+                ]
+                self._messages.clear()
+                self._messages.extend(kept)
+                if remember_wire_id:
+                    for _, removed in entries:
+                        wire_id = removed.get("wire_id")
+                        if isinstance(wire_id, str) and wire_id:
+                            # Recorded under the same lock as the
+                            # append check, so the two cannot interleave.
+                            self._remember_removed_wire_id(wire_id)
+            # Persist the console history strictly: a failed write
+            # restores every entry and reports an error, so success is
+            # never reported for a delete that a restart would undo.
+            try:
+                self._save_messages_locked(strict=True)
+            except Exception:
+                with self._lock:
+                    # A message can arrive while the strict write is in
+                    # flight (the save lock serialises saves, not
+                    # appends), refilling a bounded log. Make room for
+                    # the whole batch up front by evicting the oldest
+                    # entries that are NOT part of this batch, so that
+                    # no restored leg is evicted by a later insertion
+                    # in this same rollback.
+                    if self._messages.maxlen is not None:
+                        overflow = (
+                            len(self._messages)
+                            + len(entries)
+                            - self._messages.maxlen
+                        )
+                        if overflow > 0:
+                            survivors = []
+                            for message in self._messages:
+                                if (
+                                    overflow > 0
+                                    and message.get("id") not in targets
+                                ):
+                                    overflow -= 1
+                                    continue
+                                survivors.append(message)
+                            self._messages.clear()
+                            self._messages.extend(survivors)
+                    # Restore in id order, so each entry lands at the
+                    # position the single-entry restore would have
+                    # chosen for it.
+                    for target, removed in sorted(
+                        entries, key=lambda pair: pair[0]
+                    ):
+                        index = next(
+                            (
+                                i
+                                for i, message in enumerate(self._messages)
+                                if message.get("id", 0) > target
+                            ),
+                            len(self._messages),
+                        )
+                        self._messages.insert(index, removed)
+                raise
+        # The bus stamps its own sequence into ``id``, so the deleted
+        # console id rides under ``message_id`` instead: using ``id``
+        # would make other tabs drop whichever bubble shares the
+        # event's sequence number.
+        for target, _ in entries:
+            self.bus.publish({"type": "message_deleted", "message_id": target})
+        if publish_unread:
+            self.bus.publish({"type": "unread", "unread": self.unread()})
+
     def _remove_history_entry(
         self,
         target: int,
@@ -4413,61 +4515,11 @@ class WebBridge:
         enter the inbound removal set, or a peer reusing that id
         could hide a later inbound message from the console.
         """
-        wire_id = removed.get("wire_id")
-        # Hold the save lock across removal, strict persistence and
-        # failure rollback: no other history save can persist the
-        # transiently deleted deque between the failed write and the
-        # in-memory restore. (Appends may still interleave, but their
-        # saves wait on this lock and persist the restored log.)
-        with self._save_lock:
-            with self._lock:
-                kept = [
-                    message
-                    for message in self._messages
-                    if message.get("id") != target
-                ]
-                self._messages.clear()
-                self._messages.extend(kept)
-                if remember_wire_id and isinstance(wire_id, str) and wire_id:
-                    # Recorded under the same lock as the append
-                    # check, so the two cannot interleave.
-                    self._remember_removed_wire_id(wire_id)
-            # Persist the console history strictly: a failed write
-            # restores the entry and reports an error, so success is
-            # never reported for a delete that a restart would undo.
-            try:
-                self._save_messages_locked(strict=True)
-            except Exception:
-                with self._lock:
-                    # A message can arrive while the strict write is in
-                    # flight (the save lock serialises saves, not
-                    # appends): with a full log the append refills the
-                    # deque, and insert() on a full bounded deque raises
-                    # instead of restoring the entry. Drop the oldest
-                    # first — the same eviction an append would have
-                    # caused — so the restore always lands.
-                    if (
-                        self._messages.maxlen is not None
-                        and len(self._messages) >= self._messages.maxlen
-                    ):
-                        self._messages.popleft()
-                    index = next(
-                        (
-                            i
-                            for i, message in enumerate(self._messages)
-                            if message.get("id", 0) > target
-                        ),
-                        len(self._messages),
-                    )
-                    self._messages.insert(index, removed)
-                raise
-        # The bus stamps its own sequence into ``id``, so the deleted
-        # console id rides under ``message_id`` instead: using ``id``
-        # would make other tabs drop whichever bubble shares the
-        # event's sequence number.
-        self.bus.publish({"type": "message_deleted", "message_id": target})
-        if publish_unread:
-            self.bus.publish({"type": "unread", "unread": self.unread()})
+        self._remove_history_entries(
+            [(target, removed)],
+            publish_unread=publish_unread,
+            remember_wire_id=remember_wire_id,
+        )
 
     def delete_by_wire_id(self, wire_id: str) -> Optional[Dict[str, Any]]:
         """Delete the console history entry for one retracted DM, by wire id.
@@ -4602,15 +4654,17 @@ class WebBridge:
             ]
         if not legs:
             return None
-        removed_ids = []
-        for leg in legs:
-            self._remove_history_entry(
-                leg["id"], leg, publish_unread=True, remember_wire_id=False
-            )
-            removed_ids.append(leg["id"])
+        # One strict write for every leg: a disk error mid-way used to
+        # leave a partially deleted group with no inbox record to retry
+        # from, so the batch helper restores the whole group instead.
+        self._remove_history_entries(
+            [(leg["id"], leg) for leg in legs],
+            publish_unread=True,
+            remember_wire_id=False,
+        )
         return {
             "ok": True,
-            "deleted_ids": removed_ids,
+            "deleted_ids": [leg["id"] for leg in legs],
             "group": group_id,
             "sent_at": float(sent_at),
         }
