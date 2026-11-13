@@ -119,6 +119,18 @@ MAX_GROUP_RETRACTED = 1024
 MAX_SENT = 256
 MAX_RECEIPTS = 256
 SENT_RETENTION = 30 * 24 * 60 * 60
+# Sent-retraction markers (see record_sent_retraction): the owner
+# retracted their own sent message.  They guard the console history,
+# not the import path — the bridge drops an outbound entry carrying
+# one at load, so a CLI retract that ran while `tau serve` was down
+# still leaves the feed agreeing with the inbox.  They live as long
+# as a sent record (SENT_RETENTION), not just a delivery lifetime:
+# the console log has no time-based expiry of its own, so a
+# seven-day marker could let a retracted entry resurface after a
+# long gap between the retract and the next serve start.
+SENT_RETRACTED_RETENTION = SENT_RETENTION
+MAX_SENT_RETRACTED = 1024
+MAX_SENT_GROUP_RETRACTED = 1024
 
 
 def _retraction_key(sender_hash: str, message_id: str) -> str:
@@ -139,10 +151,22 @@ def _group_retraction_key(
     return f"{sender_hash}:{group_id}:{float(sent_at)!r}"
 
 
-def _parse_retraction_markers(raw_value: Any) -> Dict[str, float]:
+def _sent_group_retraction_key(group_id: str, sent_at: float) -> str:
+    """One flat key for a retracted own group message.
+
+    Same shape as :func:`_group_retraction_key` without the sender:
+    a sent marker always names this node's own message, so no sender
+    is needed to disambiguate it.
+    """
+    return f"{group_id}:{float(sent_at)!r}"
+
+
+def _parse_retraction_markers(
+    raw_value: Any, *, retention: float = RETRACTED_RETENTION
+) -> Dict[str, float]:
     """Parse one retraction-marker map from a mailbox document.
 
-    A marker is written as now + RETRACTED_RETENTION, so any expiry
+    A marker is written as now + *retention*, so any expiry
     beyond that (or non-finite, or too large to convert) is malformed:
     drop it rather than let it suppress a message indefinitely or
     abort the load. A bounded backward wall-clock correction (an NTP
@@ -154,7 +178,7 @@ def _parse_retraction_markers(raw_value: Any) -> Dict[str, float]:
     markers: Dict[str, float] = {}
     if not isinstance(raw_value, dict):
         return markers
-    latest = time.time() + RETRACTED_RETENTION + RETRACTED_CLOCK_SKEW_TOLERANCE
+    latest = time.time() + retention + RETRACTED_CLOCK_SKEW_TOLERANCE
     for key, value in raw_value.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
@@ -733,6 +757,16 @@ class Mailbox:
         # _evict_group_retracted).
         self._group_retracted: Dict[str, float] = {}
         self._group_retracted_unknown: Dict[str, float] = {}
+        # Sent-retraction markers, keyed by message id (DM) or by
+        # (group id, shared send time) for a group message (see
+        # _sent_group_retraction_key).  The owner recorded them when
+        # retracting their own sent message; the bridge consults them
+        # at load so a retract that ran while `tau serve` was down
+        # still drops the console's outbound entry (see
+        # record_sent_retraction).  No sender is keyed: a sent marker
+        # always names this node's own message.
+        self._sent_retracted: Dict[str, float] = {}
+        self._sent_group_retracted: Dict[str, float] = {}
         if self.path is not None:
             self.load()
 
@@ -850,6 +884,8 @@ class Mailbox:
             self._retracted_unknown = state["retracted_unknown"]
             self._group_retracted = state["group_retracted"]
             self._group_retracted_unknown = state["group_retracted_unknown"]
+            self._sent_retracted = state["sent_retracted"]
+            self._sent_group_retracted = state["sent_group_retracted"]
             self._sent = state["sent"]
             self._receipts = state["receipts"]
         log.debug(
@@ -999,6 +1035,13 @@ class Mailbox:
         group_retracted_unknown = _parse_retraction_markers(
             raw.get("group_retracted_unknown")
         )
+        sent_retracted = _parse_retraction_markers(
+            raw.get("sent_retracted"), retention=SENT_RETRACTED_RETENTION
+        )
+        sent_group_retracted = _parse_retraction_markers(
+            raw.get("sent_group_retracted"),
+            retention=SENT_RETRACTED_RETENTION,
+        )
 
         sent: Dict[str, Dict[str, Any]] = {}
         raw_sent = raw.get("sent")
@@ -1095,6 +1138,8 @@ class Mailbox:
             "retracted_unknown": retracted_unknown,
             "group_retracted": group_retracted,
             "group_retracted_unknown": group_retracted_unknown,
+            "sent_retracted": sent_retracted,
+            "sent_group_retracted": sent_group_retracted,
             "sent": sent,
             "receipts": receipts,
         }
@@ -1124,6 +1169,8 @@ class Mailbox:
                 "group_retracted_unknown": dict(
                     self._group_retracted_unknown
                 ),
+                "sent_retracted": dict(self._sent_retracted),
+                "sent_group_retracted": dict(self._sent_group_retracted),
                 "pending_acks": {
                     holder: list(ids)
                     for holder, ids in self._pending_acks.items()
@@ -1145,6 +1192,8 @@ class Mailbox:
                 + len(self._retracted_unknown)
                 + len(self._group_retracted)
                 + len(self._group_retracted_unknown),
+                "sent_retracted": len(self._sent_retracted)
+                + len(self._sent_group_retracted),
             }
 
     # -- outbox ------------------------------------------------------------
@@ -2095,6 +2144,103 @@ class Mailbox:
                     return True
             return False
 
+    # -- sent-retraction markers -------------------------------------------
+
+    def record_sent_retraction(
+        self, message_id: str, *, now: Optional[float] = None
+    ) -> None:
+        """Remember that this node retracted its own sent message.
+
+        The marker is the durable half of a CLI retract: the retract
+        deletes the inbox copy and drops the sent record, but the
+        console's outbound entry lives in a separate log
+        (``messages.json``) that a retract running while ``tau serve``
+        is down cannot reach.  The bridge drops an outbound entry
+        carrying a live marker when it loads (see
+        :meth:`tau.webapi.WebBridge._load_messages`), so the feed
+        agrees with the inbox at the next serve start.  It lives for
+        SENT_RETRACTED_RETENTION, as long as a sent record, and
+        recording the same retraction again refreshes it.
+        """
+        timestamp = now if now is not None else time.time()
+        with self._transaction():
+            self._sent_retracted[message_id] = (
+                timestamp + SENT_RETRACTED_RETENTION
+            )
+            self._evict_sent_retracted()
+            self.save()
+
+    def is_sent_retracted(
+        self, message_id: str, *, now: Optional[float] = None
+    ) -> bool:
+        """True while a live sent-retraction marker covers this message.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away.
+        """
+        with self._lock:
+            timestamp = now if now is not None else time.time()
+            until = self._sent_retracted.get(message_id)
+            return until is not None and timestamp < until
+
+    def _evict_sent_retracted(self) -> None:
+        """Drop earliest-expiry sent markers until the pool fits the cap.
+
+        Call with the transaction held.
+        """
+        while len(self._sent_retracted) > MAX_SENT_RETRACTED:
+            oldest = min(self._sent_retracted.items(), key=lambda kv: kv[1])
+            del self._sent_retracted[oldest[0]]
+
+    def record_sent_group_retraction(
+        self, group_id: str, sent_at: float, *, now: Optional[float] = None
+    ) -> None:
+        """Remember that this node retracted its own sent group message.
+
+        Keyed by the logical message — (group id, shared send time) —
+        because legs carry different wire ids, like
+        :meth:`record_group_retraction`.  The bridge drops every
+        outbound leg carrying a live marker when it loads.  Recording
+        the same retraction again refreshes the marker.
+        """
+        timestamp = now if now is not None else time.time()
+        key = _sent_group_retraction_key(group_id, sent_at)
+        with self._transaction():
+            self._sent_group_retracted[key] = (
+                timestamp + SENT_RETRACTED_RETENTION
+            )
+            self._evict_sent_group_retracted()
+            self.save()
+
+    def is_sent_group_retracted(
+        self, group_id: str, sent_at: float, *, now: Optional[float] = None
+    ) -> bool:
+        """True while a live sent group-retraction marker covers this send.
+
+        An expired marker reads as absent even before :meth:`prune`
+        sweeps it away; a non-numeric send time cannot match a
+        recorded marker.
+        """
+        with self._lock:
+            timestamp = now if now is not None else time.time()
+            try:
+                key = _sent_group_retraction_key(group_id, float(sent_at))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            until = self._sent_group_retracted.get(key)
+            return until is not None and timestamp < until
+
+    def _evict_sent_group_retracted(self) -> None:
+        """Drop earliest-expiry sent group markers until the pool fits.
+
+        Call with the transaction held.
+        """
+        while len(self._sent_group_retracted) > MAX_SENT_GROUP_RETRACTED:
+            oldest = min(
+                self._sent_group_retracted.items(), key=lambda kv: kv[1]
+            )
+            del self._sent_group_retracted[oldest[0]]
+
     # -- pending fetch acknowledgements --------------------------------------
 
     def add_pending_acks(self, holder_hexhash: str, message_ids: List[str]) -> None:
@@ -2203,6 +2349,20 @@ class Mailbox:
             ]
             for key in dead_group_retracted_unknown:
                 del self._group_retracted_unknown[key]
+            dead_sent_retracted = [
+                key
+                for key, until in self._sent_retracted.items()
+                if until <= timestamp
+            ]
+            for key in dead_sent_retracted:
+                del self._sent_retracted[key]
+            dead_sent_group_retracted = [
+                key
+                for key, until in self._sent_group_retracted.items()
+                if until <= timestamp
+            ]
+            for key in dead_sent_group_retracted:
+                del self._sent_group_retracted[key]
             if (
                 dead_outbox
                 or dead_held
@@ -2214,6 +2374,8 @@ class Mailbox:
                 or dead_retracted_unknown
                 or dead_group_retracted
                 or dead_group_retracted_unknown
+                or dead_sent_retracted
+                or dead_sent_group_retracted
             ):
                 self.save()
             return {
@@ -2227,6 +2389,8 @@ class Mailbox:
                 + len(dead_retracted_unknown)
                 + len(dead_group_retracted)
                 + len(dead_group_retracted_unknown),
+                "sent_retracted": len(dead_sent_retracted)
+                + len(dead_sent_group_retracted),
             }
 
 

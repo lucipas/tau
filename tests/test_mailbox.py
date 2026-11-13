@@ -14,6 +14,7 @@ from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
     RETRACTED_CLOCK_SKEW_TOLERANCE,
     RETRACTED_RETENTION,
+    SENT_RETRACTED_RETENTION,
     Mailbox,
     MailboxError,
     MailboxFull,
@@ -52,6 +53,7 @@ def test_enqueue_and_reload_roundtrip(tmp_path):
         "sent": 0,
         "receipts": 0,
         "retracted": 0,
+        "sent_retracted": 0,
     }
 
     reloaded = Mailbox(path)
@@ -319,7 +321,7 @@ def test_load_dedupes_duplicate_message_ids(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
+    assert box.counts() == {"outbox": 2, "held": 1, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0, "sent_retracted": 0}
     kept = box.get_outbox("dup-id")
     assert kept is not None
     assert kept.text == "newer copy"
@@ -378,7 +380,7 @@ def test_load_skips_nonfinite_timestamps(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     box = Mailbox(path)
-    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0}
+    assert box.counts() == {"outbox": 1, "held": 0, "seen": 0, "sent": 0, "receipts": 0, "retracted": 0, "sent_retracted": 0}
     assert box.get_outbox("nan-created") is None
     assert box.get_outbox("good-id") is not None
 
@@ -833,6 +835,7 @@ def test_prune_expires_everything(tmp_path):
         "receipts": 0,
         "dropped_held": 1,
         "retracted": 0,
+        "sent_retracted": 0,
     }
     assert box.counts() == {
         "outbox": 0,
@@ -841,6 +844,7 @@ def test_prune_expires_everything(tmp_path):
         "sent": 0,
         "receipts": 0,
         "retracted": 0,
+        "sent_retracted": 0,
     }
 
 
@@ -929,6 +933,82 @@ def test_group_retraction_markers_persist_and_expire(tmp_path):
     assert removed["retracted"] == 1
     assert reloaded.counts()["retracted"] == 0
     assert reloaded.is_group_retracted(sender, group, 100.0) is False
+
+
+def test_sent_retraction_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    assert box.is_sent_retracted("msg-1") is False
+
+    recorded_at = time.time()
+    box.record_sent_retraction("msg-1", now=recorded_at)
+    assert box.is_sent_retracted("msg-1") is True
+    # Keyed by message id alone: another id is unaffected.
+    assert box.is_sent_retracted("msg-2") is False
+    assert box.counts()["sent_retracted"] == 1
+    # A sent marker never reads as a received one.
+    assert box.is_retracted("aa" * 32, "msg-1") is False
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_sent_retracted("msg-1") is True
+    assert (
+        reloaded.is_sent_retracted(
+            "msg-1", now=recorded_at + SENT_RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_sent_retracted(
+            "msg-1", now=recorded_at + SENT_RETRACTED_RETENTION
+        )
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + SENT_RETRACTED_RETENTION)
+    assert removed["sent_retracted"] == 1
+    assert reloaded.counts()["sent_retracted"] == 0
+    assert reloaded.is_sent_retracted("msg-1") is False
+
+
+def test_sent_group_retraction_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    group = "cc" * 16
+    assert box.is_sent_group_retracted(group, 100.0) is False
+
+    recorded_at = time.time()
+    box.record_sent_group_retraction(group, 100.0, now=recorded_at)
+    assert box.is_sent_group_retracted(group, 100.0) is True
+    # Keyed by (group, send time): any other pair is unaffected, and
+    # a non-numeric send time never matches.
+    assert box.is_sent_group_retracted("dd" * 16, 100.0) is False
+    assert box.is_sent_group_retracted(group, 101.0) is False
+    assert box.is_sent_group_retracted(group, "soon") is False
+    assert box.counts()["sent_retracted"] == 1
+    # A sent group marker never reads as a received one.
+    assert box.is_group_retracted("aa" * 32, group, 100.0) is False
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_sent_group_retracted(group, 100.0) is True
+    assert (
+        reloaded.is_sent_group_retracted(
+            group, 100.0, now=recorded_at + SENT_RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_sent_group_retracted(
+            group, 100.0, now=recorded_at + SENT_RETRACTED_RETENTION
+        )
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + SENT_RETRACTED_RETENTION)
+    assert removed["sent_retracted"] == 1
+    assert reloaded.counts()["sent_retracted"] == 0
+    assert reloaded.is_sent_group_retracted(group, 100.0) is False
 
 
 def test_group_retraction_markers_are_capped(tmp_path, monkeypatch):

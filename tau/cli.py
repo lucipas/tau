@@ -8475,6 +8475,13 @@ def _retract_group_message(
     mailbox = Mailbox(config.mailbox_path)
     for leg_id in target.get("leg_ids") or [target["id"]]:
         mailbox.discard_sent(str(leg_id))
+    # Record the retraction durably too, so the bridge drops the
+    # console's outbound legs when it loads after a retract that ran
+    # while `tau serve` was down (see
+    # Mailbox.record_sent_group_retraction).  Only on a full fan-out:
+    # a partial fan-out keeps the local copy — and the console legs —
+    # so the retract stays retryable.
+    mailbox.record_sent_group_retraction(group_id, float(leg_sent_at))
     return _EXIT_OK
 
 
@@ -8565,8 +8572,16 @@ def cmd_retract(args: argparse.Namespace) -> int:
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Only after the retract and the inbox delete succeeded, so a
-    # failed retract never erases the sent record.
-    Mailbox(config.mailbox_path).discard_sent(str(target["id"]))
+    # failed retract never erases the sent record.  Record the
+    # retraction durably as well: the console's outbound entry lives
+    # in a separate log the CLI cannot reach while `tau serve` is
+    # down, and the bridge drops entries carrying this marker when it
+    # loads (see Mailbox.record_sent_retraction).  The live-serving
+    # path already drops the entry through the dispatch; the marker
+    # heals that drop if it failed, at the next serve start.
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.discard_sent(str(target["id"]))
+    mailbox.record_sent_retraction(str(target["id"]))
 
     peer = registry.get(recipient)
     name = peer.display_name if peer is not None else short_hash(recipient)

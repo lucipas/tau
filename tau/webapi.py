@@ -998,6 +998,29 @@ class WebBridge:
         ]
         purged = len(loaded) - len(kept)
         loaded = kept
+        # Own sent messages retracted while `tau serve` was down carry
+        # a durable marker in the mailbox (see
+        # Mailbox.record_sent_retraction): the CLI could not reach the
+        # console log then, so drop those outbound entries here, or a
+        # restarted console resurrects a message the inbox no longer
+        # has.  Inbound entries never match — a sent marker names this
+        # node's own message — and the ids are deliberately not added
+        # to the inbound removal set, so a peer reusing a retracted
+        # sent id cannot hide a later inbound message.
+        mailbox = getattr(self.node, "mailbox", None)
+        dropped_retracted = 0
+        if mailbox is not None:
+            # Read under the mailbox transaction so a marker written
+            # by a one-shot `tau retract` after this process started
+            # is visible instead of a stale snapshot.
+            with mailbox.transaction():
+                kept = [
+                    message
+                    for message in loaded
+                    if not self._is_sent_retracted_entry(message, mailbox)
+                ]
+            dropped_retracted = len(loaded) - len(kept)
+            loaded = kept
         self._messages.extend(loaded)
         saved_next = raw.get("next_message_id")
         max_id = max((message["id"] for message in loaded), default=0)
@@ -1005,8 +1028,33 @@ class WebBridge:
             self._next_message_id = max(saved_next, max_id + 1, 1)
         else:
             self._next_message_id = max(max_id + 1, 1)
-        if purged:
+        if purged or dropped_retracted:
             self._save_messages()
+
+    def _is_sent_retracted_entry(self, message: Dict[str, Any], mailbox: Any) -> bool:
+        """True when a loaded outbound entry carries a sent-retraction marker.
+
+        A DM entry matches by wire id; a group entry matches by group
+        and shared send time, since legs carry different wire ids.
+        Anything else — inbound entries, entries without an id — never
+        matches.
+        """
+        if message.get("direction") != "out":
+            return False
+        group = message.get("group")
+        if isinstance(group, str) and group:
+            sent_at = message.get("sent_at")
+            if isinstance(sent_at, (int, float)) and not isinstance(
+                sent_at, bool
+            ):
+                return bool(
+                    mailbox.is_sent_group_retracted(group, float(sent_at))
+                )
+            return False
+        wire_id = message.get("wire_id")
+        if isinstance(wire_id, str) and wire_id:
+            return bool(mailbox.is_sent_retracted(wire_id))
+        return False
 
     def _save_messages(self, *, strict: bool = False) -> None:
         """Persist the current message log to ``messages.json``.
