@@ -717,6 +717,9 @@ def retract_dict(
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
     signature: Optional[str] = None,
+    group: Optional[str] = None,
+    target_author: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The ``/tau/dm/retract`` payload as a dict, unsigned unless signed.
 
@@ -727,6 +730,13 @@ def retract_dict(
     independently of the transport.  A retract names only the target
     message id; the receiver checks that the caller is that message's
     original sender before deleting anything.
+
+    ``group`` / ``target_author`` / ``target_sent_at`` name the group
+    message being retracted, when the target is one: group messages
+    carry a different wire id per recipient leg, so the target id
+    alone only matches the author's sent record.  A receiver that
+    does not hold the target id can resolve its own copy from this
+    context instead (see :func:`tau.node.TauNode._handle_retract`).
     """
     target = _clean_message_id(target)
     payload: Dict[str, Any] = {
@@ -738,6 +748,16 @@ def retract_dict(
     }
     if message_id:
         payload["id"] = message_id
+    if group is not None:
+        payload["group"] = _clean_hexhash(group, "group")
+    if target_author is not None:
+        payload["target_author"] = _clean_hexhash(target_author, "target_author")
+    if target_sent_at is not None:
+        if not isinstance(target_sent_at, (int, float)) or isinstance(
+            target_sent_at, bool
+        ):
+            raise ProtocolError("target_sent_at must be a number")
+        payload["target_sent_at"] = target_sent_at
     if signature is not None:
         payload["sig"] = signature
     return payload
@@ -749,6 +769,9 @@ def encode_retract(
     message_id: Optional[str] = None,
     sent_at: Optional[float] = None,
     signature: Optional[str] = None,
+    group: Optional[str] = None,
+    target_author: Optional[str] = None,
+    target_sent_at: Optional[float] = None,
 ) -> bytes:
     """Encode a DM retract for the ``/tau/dm/retract`` request.
 
@@ -762,6 +785,9 @@ def encode_retract(
             message_id=message_id,
             sent_at=sent_at,
             signature=signature,
+            group=group,
+            target_author=target_author,
+            target_sent_at=target_sent_at,
         ),
         max_bytes=MAX_REQUEST_BYTES,
     )
@@ -789,11 +815,47 @@ def parse_retract(raw: Any) -> Dict[str, Any]:
             raise ProtocolError(
                 "retraction signature is not valid base64"
             ) from exc
+    # Group context is advisory: it lets a receiver resolve its own
+    # copy of a group message when the target id is not one it holds.
+    # Malformed context is dropped, never a reason to reject the
+    # retract — the target id alone is still a valid retract.
+    group = payload.get("group")
+    if not isinstance(group, str):
+        group = None
+    else:
+        try:
+            group = _clean_hexhash(group, "group")
+        except ProtocolError:
+            group = None
+    target_author = payload.get("target_author")
+    if not isinstance(target_author, str):
+        target_author = None
+    else:
+        try:
+            target_author = _clean_hexhash(target_author, "target_author")
+        except ProtocolError:
+            target_author = None
+    target_sent_at = payload.get("target_sent_at")
+    if not isinstance(target_sent_at, (int, float)) or isinstance(
+        target_sent_at, bool
+    ):
+        target_sent_at = None
+    else:
+        # A send time must convert to a finite float: an oversized integer
+        # overflows float() later, and a non-finite one names no message.
+        try:
+            if not math.isfinite(float(target_sent_at)):
+                target_sent_at = None
+        except OverflowError:
+            target_sent_at = None
     return {
         "target": target,
         "sent_at": sent_at,
         "id": message_id,
         "sig": signature,
+        "group": group,
+        "target_author": target_author,
+        "target_sent_at": target_sent_at,
     }
 
 

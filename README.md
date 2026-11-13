@@ -722,15 +722,31 @@ earliest-expiry markers are evicted, even unexpired ones — so a
 sealed relay copy that arrives after the retract — or after the
 id leaves the receiver's seen cache — is dropped instead of stored,
 and `tau messages import` skips the message instead of resurrecting
-it. Group messages cannot be retracted in v1 — a group
-message lives in every member's inbox, and deleting it from one member
-alone would silently half-retract it.
+it.
+
+Group messages retract the same way, fanned out: `tau retract
+<message-id>` on a sent group message sends one signed retract —
+carrying the group, the author, and the legs' shared send time,
+since legs carry different wire ids — to every member except this
+node, and each member deletes their own copy. A member the retract
+reaches before their copy arrives records a group marker keyed by
+(sender, group, send time), so a copy arriving later still loses to
+it, and a leg still queued in the outbox is cancelled instead of
+sent. A member who is offline when the retract runs keeps their
+copy: the retract reports per member, and the sender's own copy
+stays until every member received it, so the retract can be
+retried. Messages sent before group retracts landed carry no shared
+send time and cannot be retracted. The web console cannot retract
+group messages yet — that is a follow-up.
 
 Retracts are delivered live in v1, like reactions: the peer must be
-online. A message still queued in the outbox is cancelled with
-`tau outbox cancel` instead. A peer running a version that predates
+online. A DM still queued in the outbox is cancelled with
+`tau outbox cancel` instead; a queued group leg is cancelled by the
+retract itself. A peer running a version that predates
 retracts rejects the unknown path, so a retract to an old peer fails
-instead of silently succeeding.
+instead of silently succeeding. A peer that predates group retracts
+accepts the DM retract but does not acknowledge the group context, so
+that group leg is reported as failed and the sender keeps its copy.
 
 ### DM edits
 

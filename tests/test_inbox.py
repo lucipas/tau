@@ -867,6 +867,77 @@ def test_import_skips_retracted_messages(tmp_path):
     assert len(inbox) == 2  # the sent record was imported, not skipped
 
 
+def test_import_skips_retracted_group_messages(tmp_path):
+    # Regression test (CodeRabbit Major on PR #322): group messages
+    # are retractable, so an import must check a received group record
+    # against both its per-ID marker and its group-context marker.
+    inbox = Inbox(tmp_path / "inbox.json")
+    sender = "aa" * 32
+    group = "cc" * 16
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            # Retracted by group context only: its leg id was never recorded.
+            _record(
+                id="leg-1",
+                destination=sender,
+                kind="group",
+                group=group,
+                sent_at=100.0,
+                text="retracted group",
+            ),
+            # Retracted by per-ID marker only.
+            _record(
+                id="leg-2",
+                destination=sender,
+                kind="group",
+                group=group,
+                sent_at=101.0,
+                text="retracted by id",
+            ),
+            # Same group, different send time: no marker covers it.
+            _record(
+                id="leg-3",
+                destination=sender,
+                kind="group",
+                group=group,
+                sent_at=102.0,
+                received_at=30.0,
+                text="still here",
+            ),
+            _record(
+                id="kept",
+                destination=sender,
+                received_at=20.0,
+                text="still here",
+            ),
+        ],
+    }
+    result = inbox.import_messages(
+        document,
+        is_retracted=lambda sender_hash, message_id: message_id == "leg-2",
+        is_group_retracted=(
+            lambda sender_hash, group_id, sent_at: (
+                sender_hash,
+                group_id,
+                sent_at,
+            )
+            == (sender, group, 100.0)
+        ),
+    )
+    assert result["imported"] == 2
+    assert result["skipped"] == 2
+    assert result["errors"] == [
+        {"id": "leg-1", "error": "message was retracted by its sender"},
+        {"id": "leg-2", "error": "message was retracted by its sender"},
+    ]
+    assert sorted(entry["id"] for entry in inbox.list_messages()) == [
+        "kept",
+        "leg-3",
+    ]
+
+
 def test_export_document_filters_by_peer(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16))
