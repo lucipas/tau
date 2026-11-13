@@ -42,8 +42,10 @@ script) can read what arrives from the mesh and send messages back:
                            the console history (and the node inbox, when the
                            message carries a wire id)
     POST /api/messages/retract retract ``{"id": <console message id>}``: ask
-                           the peer to delete your sent DM, then drop the
-                           local copies too (``tau retract`` from the console)
+                           the peer to delete your sent DM, or fan a
+                           retract out to every member of your sent group
+                           message, then drop the local copies too
+                           (``tau retract`` from the console)
     POST /api/messages/forward forward ``{"id": <console message id>, "to": "<peer>"}``:
                            send the message on as a new DM prefixed with
                            ``Forwarded from <name>:`` (``tau forward`` from
@@ -2862,7 +2864,15 @@ class WebBridge:
                 peer=peer_hash or None,
                 peer_name=sanitize_name(peer_name, fallback="unknown"),
                 text=text,
-                sent_at=_as_float(record.get("sent_at")),
+                # A group send's legs share the fan-out's wire time
+                # (``leg_sent_at``); the record's ``sent_at`` is the
+                # later write time, which members cannot match.
+                sent_at=(
+                    _as_float(record.get("leg_sent_at"))
+                    if direction == "out" and isinstance(group, str)
+                    and record.get("leg_sent_at") is not None
+                    else _as_float(record.get("sent_at"))
+                ),
                 received_at=_as_float(record.get("received_at"), default=time.time()),
                 status="received" if direction == "in" else "delivered",
                 group=group if isinstance(group, str) else None,
@@ -3662,18 +3672,19 @@ class WebBridge:
         gone on both sides.  A peer who had no copy answers ``deleted``
         False, which is not an error — the local copies still go.
 
-        Only your own sent DMs can be retracted: group messages are
-        not retractable in v1, a file transfer's saved copy lives on
-        the recipient's disk (the peer refuses those retracts), a
-        message still queued has not reached its recipient yet
-        (cancel it from the outbox instead), and a message delivered
-        over LXMF is stored by the recipient under an LXMF id the
-        retract cannot name — that copy stays until LXMF carries the
-        tau id (see #248).  The route is stamped on the console entry
-        when delivery is confirmed (and falls back to the mailbox
-        sent record for older entries), so it survives the sent
-        record being evicted.  Retracts ride the live link only, so
-        an unreachable peer is a failure, not a silent queue.
+        Only your own sent messages can be retracted: a file
+        transfer's saved copy lives on the recipient's disk (the peer
+        refuses those retracts), a message still queued has not reached
+        its recipient yet (cancel it from the outbox instead), and a
+        message delivered over LXMF is stored by the recipient under
+        an LXMF id the retract cannot name — that copy stays until
+        LXMF carries the tau id (see #248).  A sent group message
+        fans out instead (see :meth:`_retract_group_message`).  The
+        route is stamped on the console entry when delivery is
+        confirmed (and falls back to the mailbox sent record for older
+        entries), so it survives the sent record being evicted.
+        Retracts ride the live link only, so an unreachable peer is a
+        failure, not a silent queue.
 
         Ordering keeps every failure retryable from the console: the
         retract goes first, so a failed retract never erases the local
@@ -3704,8 +3715,14 @@ class WebBridge:
                 raise ValueError(
                     "only your own sent messages can be retracted"
                 )
-            if removed.get("group"):
-                raise ValueError("group messages cannot be retracted in v1")
+        if removed.get("group"):
+            # The group path takes the lock itself to gather the legs,
+            # so this stays outside the block above: re-entering it
+            # here would deadlock the handler thread.
+            return self._retract_group_message(
+                target, removed, timeout=timeout
+            )
+        with self._lock:
             if removed.get("file"):
                 raise ValueError("file transfers cannot be retracted")
             if removed.get("status") == "queued":
@@ -3777,6 +3794,206 @@ class WebBridge:
             },
             "deleted": bool(response.get("deleted")),
             "id": response.get("id") if isinstance(response.get("id"), str) else None,
+        }
+
+    def _retract_group_message(
+        self, target: int, removed: Dict[str, Any], *, timeout: float = 20.0
+    ) -> Dict[str, Any]:
+        """Retract one of this node's sent group messages, from the console.
+
+        Mirrors ``tau retract`` for a group message (see
+        :meth:`tau.node.TauNode.send_group_retraction`): the retract
+        fans out to every member, a leg still queued in the outbox is
+        cancelled by the fan-out itself, and the local copies go only
+        when every member received it — a partial fan-out keeps the
+        bubbles, so the members still holding the message stay
+        retryable, exactly as on the CLI.
+
+        The console records one history entry per leg, all sharing the
+        group's id and the send's shared wire time, so the clicked
+        entry names the logical message: the fan-out carries that
+        shared send time every member needs to resolve their own copy,
+        and on success every leg entry leaves the feed.  The shared
+        time is recovered from the stored inbox record before the
+        fan-out: an entry restored from before the shared time was
+        stamped carries its write time instead, which members cannot
+        match — they answer ``delivered`` with ``deleted`` False —
+        so such a message is refused rather than fanned out, or the
+        local copies would go while the members keep the message.
+        A failed leg carries no wire id, so the retract names the
+        first leg that has one; a message no leg delivered has
+        nothing to retract.
+        """
+        group_id = removed.get("group")
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("that group message has no group to retract from")
+        sent_at = removed.get("sent_at")
+        if (
+            not isinstance(sent_at, (int, float))
+            or isinstance(sent_at, bool)
+        ):
+            raise ValueError(
+                "that group message carries no send time to retract by"
+            )
+        try:
+            sent_at = float(sent_at)
+        except (OverflowError, ValueError):
+            raise ValueError(
+                "that group message carries no send time to retract by"
+            ) from None
+        if not math.isfinite(sent_at):
+            raise ValueError(
+                "that group message carries no send time to retract by"
+            )
+        with self._lock:
+            legs = [
+                message
+                for message in self._messages
+                if message.get("direction") == "out"
+                and message.get("group") == group_id
+                and message.get("sent_at") == sent_at
+            ]
+        wire_ids = [
+            leg.get("wire_id")
+            for leg in legs
+            if isinstance(leg.get("wire_id"), str) and leg.get("wire_id")
+        ]
+        if not wire_ids:
+            raise ValueError(
+                "that group message was never delivered to any member, "
+                "so there is nothing to retract"
+            )
+        target_wire_id = removed.get("wire_id")
+        if not isinstance(target_wire_id, str) or not target_wire_id:
+            target_wire_id = wire_ids[0]
+        # Reload the persisted store first: a group created or deleted
+        # by another process (``tau group``) must be seen by this
+        # retract.  Resolve the stored id exactly: the fan-out takes a
+        # record, never a name lookup — a retired id that also matches
+        # a group name must not resolve to that other group and send
+        # the retract to its members.
+        self.node.groups.list_groups()
+        group = self.node.groups.get(group_id)
+        if group is None:
+            raise ValueError(f"unknown group: {group_id!r}")
+        # Resolve the authoritative shared send time from the stored
+        # inbox record before fanning out: the console entry's
+        # ``sent_at`` is only the shared time when the send stamped
+        # it — a live send, or a restore that found ``leg_sent_at``.
+        # A restored entry from before group retracts landed carries
+        # its write time instead, which members cannot match: they
+        # answer ``delivered`` with ``deleted`` False, and the fan-out
+        # below treats delivery as success, so fanning that out would
+        # delete the local copies while the members keep the message.
+        # Refuse when no stored record names the shared time, exactly
+        # as the CLI refuses (see ``tau.cli._retract_group_message``).
+        # Only this node's own sent record for this group names the
+        # send: resolve() matches the wire id alone, so a record of
+        # another kind must not supply the time.
+        inbox = getattr(self.node, "inbox", None)
+        stored = None
+        if inbox is not None:
+            try:
+                stored = inbox.resolve(target_wire_id)
+            except ValueError:
+                stored = None
+        leg_sent_at = None
+        if (
+            stored is not None
+            and stored.get("direction") == "out"
+            and stored.get("group") == group_id
+        ):
+            leg_sent_at = stored.get("leg_sent_at")
+        if (
+            not isinstance(leg_sent_at, (int, float))
+            or isinstance(leg_sent_at, bool)
+            or not math.isfinite(leg_sent_at)
+        ):
+            raise ValueError(
+                "that group message was sent before group retracts "
+                "landed; it carries no leg send time, so it cannot "
+                "be retracted"
+            )
+        sent_at = float(leg_sent_at)
+        response = self.node.send_group_retraction(
+            group,
+            target_wire_id,
+            timeout=timeout,
+            target_sent_at=float(sent_at),
+        )
+        results = response.get("results") or []
+        failed = [result for result in results if not result.get("delivered")]
+        if failed:
+            # Keep the local copies: the failed members still hold the
+            # message, and the legs carry the send time a retry needs.
+            # A failed retract never erases the local copy.
+            raise NodeError(
+                "group retract reached only some members: "
+                + "; ".join(
+                    f"{result.get('to_name') or short_hash(str(result.get('to') or ''))}: "
+                    f"{result.get('error') or 'unknown error'}"
+                    for result in failed
+                )
+                + "; retry the retract when they are online"
+            )
+        # Every member received the retract: drop this node's own
+        # copies too.  The node stores one inbox record for the whole
+        # send (its id is the first leg id, the rest in leg_ids), so
+        # resolve any leg to it and delete by the record's own id.
+        inbox = getattr(self.node, "inbox", None)
+        if inbox is not None:
+            try:
+                record = inbox.resolve(wire_ids[0])
+            except ValueError:
+                record = None
+            if record is not None:
+                # Only this node's own sent record for this group
+                # names the send: resolve() matches the wire id
+                # alone, so after the sent copy is pruned it can
+                # return an inbound record instead — deleting that
+                # would drop a received message.  The legs still go
+                # through discard_sent below either way.
+                if (
+                    record.get("direction") == "out"
+                    and record.get("group") == group_id
+                ):
+                    # Every leg of the send has its own sent record; the
+                    # inbox record names them all, including legs the
+                    # feed does not mirror.
+                    for leg_id in record.get("leg_ids") or []:
+                        if isinstance(leg_id, str) and leg_id not in wire_ids:
+                            wire_ids.append(leg_id)
+                    try:
+                        inbox.delete(str(record["id"]))
+                    except InboxError as exc:
+                        # A record that is already gone is fine; any other
+                        # inbox failure leaves the bubbles in place, so
+                        # the retract can be retried.
+                        if str(exc).startswith("could not persist"):
+                            raise OSError(str(exc)) from exc
+                        if not str(exc).startswith("unknown message"):
+                            raise ValueError(str(exc)) from exc
+        # Each leg has its own sent record, so drop every leg id.
+        for wire_id in wire_ids:
+            self.node.mailbox.discard_sent(wire_id)
+        removed_ids = [leg["id"] for leg in legs]
+        for leg in legs:
+            self._remove_history_entry(
+                leg["id"], leg, publish_unread=inbox is not None
+            )
+        delivered = [result for result in results if result.get("delivered")]
+        return {
+            "ok": True,
+            "retracted": {"id": target, "wire_id": target_wire_id},
+            "retracted_ids": removed_ids,
+            "deleted": bool(delivered)
+            and all(result.get("deleted") for result in delivered),
+            "results": results,
+            "cancelled_queued": response.get("cancelled_queued") or [],
+            "group": group_id,
+            "id": response.get("id")
+            if isinstance(response.get("id"), str)
+            else None,
         }
 
     def forward_message(

@@ -758,13 +758,18 @@ export function useTau() {
       { id },
     );
     // The retract already succeeded: drop the bubble locally at once,
-    // and let the message_deleted event reconcile other tabs.
-    removedMessageIds.current.add(result.retracted.id);
+    // and let the message_deleted event reconcile other tabs. A group
+    // retract removes every leg, so drop all of them, not just the
+    // one the user tapped.
+    const removedIds = result.retracted_ids ?? [result.retracted.id];
+    for (const removedId of removedIds) {
+      removedMessageIds.current.add(removedId);
+    }
     setMessages((previous) =>
-      previous.filter((entry) => entry.id !== result.retracted.id),
+      previous.filter((entry) => !removedIds.includes(entry.id)),
     );
     setSearchResults((previous) =>
-      previous.filter((entry) => entry.id !== result.retracted.id),
+      previous.filter((entry) => !removedIds.includes(entry.id)),
     );
     return result;
   }, []);

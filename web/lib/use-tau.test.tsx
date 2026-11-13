@@ -1149,6 +1149,46 @@ describe("useTau retractMessage", () => {
     });
     expect(result.current.messages).toEqual([]);
   });
+
+  it("drops every leg of a retracted group message at once", async () => {
+    const firstLeg = makeMessage({
+      id: 1,
+      direction: "out",
+      status: "delivered",
+      group: "ab".repeat(16),
+      group_name: "crew",
+      wire_id: "a".repeat(32),
+    });
+    const secondLeg = makeMessage({
+      id: 2,
+      direction: "out",
+      status: "delivered",
+      group: "ab".repeat(16),
+      group_name: "crew",
+      wire_id: "b".repeat(32),
+    });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 1, wire_id: "a".repeat(32) },
+      retracted_ids: [1, 2],
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+    act(() => {
+      FakeEventSource.instances[0].emit("snapshot", {
+        snapshot: makeSnapshot([makePeer()], [firstLeg, secondLeg]),
+      });
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.retractMessage(1);
+    });
+
+    expect(result.current.messages).toEqual([]);
+  });
 });
 
 describe("useTau pinned view", () => {

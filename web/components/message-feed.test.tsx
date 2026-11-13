@@ -440,17 +440,22 @@ describe("MessageFeed retract", () => {
     expect(screen.queryByTitle("Retract this message")).toBeNull();
   });
 
-  it("shows no retract button on group messages", () => {
+  it("shows a retract button on your own sent group messages", async () => {
+    const message = sent({ group: "ab".repeat(16), group_name: "crew" });
     const onRetract = vi.fn(async () => {});
     render(
       <MessageFeed
-        messages={[sent({ group: "ab".repeat(16), group_name: "crew" })]}
+        messages={[message]}
         node={null}
         live={true}
         onRetract={onRetract}
       />,
     );
-    expect(screen.queryByTitle("Retract this message")).toBeNull();
+
+    fireEvent.click(screen.getByTitle("Retract this message"));
+    fireEvent.click(screen.getByText("confirm retract"));
+    expect(onRetract).toHaveBeenCalledTimes(1);
+    expect(onRetract).toHaveBeenCalledWith(message);
   });
 
   it("shows no retract button on file entries", () => {
