@@ -231,7 +231,9 @@ export function useTau() {
   const removedMessageIds = useRef(new Set<number>());
   const pinnedSeq = useRef(0);
   // Bumped on every live pin or unpin, so a pinned GET that raced one
-  // is asked again rather than overwriting the newer event.
+  // is asked again rather than overwriting the newer event. Deletions
+  // bump it too: a pinned GET that raced a retract must not reinstate
+  // the removed entry.
   const pinnedEvents = useRef(0);
   // Re-reads the pinned view on a reconnect; set once showPinned exists.
   const refreshPinnedView = useRef<(() => void) | null>(null);
@@ -395,6 +397,9 @@ export function useTau() {
       const payload = readEventData<{ message_id: number }>(event);
       if (!payload || typeof payload.message_id !== "number") return;
       removedMessageIds.current.add(payload.message_id);
+      // A delete that lands while a pinned GET is in flight makes its
+      // snapshot stale: force the fetch to retry, like a pin or unpin.
+      pinnedEvents.current += 1;
       setMessages((previous) =>
         previous.filter((entry) => entry.id !== payload.message_id),
       );
@@ -723,6 +728,11 @@ export function useTau() {
     setSearchResults((previous) =>
       previous.filter((entry) => entry.id !== result.deleted.id),
     );
+    setPinnedMessages((previous) =>
+      previous === null
+        ? null
+        : previous.filter((entry) => entry.id !== result.deleted.id),
+    );
     return result.deleted;
   }, []);
 
@@ -778,6 +788,11 @@ export function useTau() {
     );
     setSearchResults((previous) =>
       previous.filter((entry) => !removedIds.includes(entry.id)),
+    );
+    setPinnedMessages((previous) =>
+      previous === null
+        ? null
+        : previous.filter((entry) => !removedIds.includes(entry.id)),
     );
     return result;
   }, []);
@@ -1627,13 +1642,21 @@ export function useTau() {
       do {
         events = pinnedEvents.current;
         result = await apiGet<MessagesResponse>("/api/messages?pinned=1");
-        // A pin or unpin that landed while this GET was in flight may
-        // be missing from it: fetch again rather than apply it over the event.
+        // A pin, unpin, or deletion that landed while this GET was in
+        // flight may be missing from it: fetch again rather than apply
+        // it over the event.
       } while (seq === pinnedSeq.current && events !== pinnedEvents.current);
       if (seq !== pinnedSeq.current) return;
       // The endpoint returns oldest first; the view shows newest first,
-      // like search results.
-      setPinnedMessages([...result.messages].reverse());
+      // like search results. A delete that landed after the final GET
+      // returned is already in removedMessageIds, so filter the
+      // snapshot against it — otherwise the late set would reinstate
+      // an entry the delete event already dropped.
+      setPinnedMessages(
+        [...result.messages]
+          .filter((entry) => !removedMessageIds.current.has(entry.id))
+          .reverse(),
+      );
       setPinnedError(null);
       clearSearch();
     } catch (caught) {

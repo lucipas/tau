@@ -1346,4 +1346,104 @@ describe("useTau pinned view", () => {
       { ...pin, pinned: true, status: "read" },
     ]);
   });
+
+  it("drops a retracted message from an open pinned view at once", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 2, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+    expect(result.current.pinnedMessages).toEqual([pin]);
+
+    await act(async () => {
+      await result.current.retractMessage(2);
+    });
+
+    expect(result.current.pinnedMessages).toEqual([]);
+  });
+
+  it("drops a deleted message from an open pinned view at once", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      deleted: { id: 2, wire_id: "a".repeat(32) },
+    });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+    expect(result.current.pinnedMessages).toEqual([pin]);
+
+    await act(async () => {
+      await result.current.deleteMessage(2);
+    });
+
+    expect(result.current.pinnedMessages).toEqual([]);
+  });
+
+  it("does not reinstate a locally removed message from a stale snapshot", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    mockedPost.mockResolvedValue({
+      ok: true,
+      retracted: { id: 2, wire_id: "a".repeat(32) },
+      deleted: true,
+      id: "retract-1",
+    });
+    // The pinned endpoint still lists the entry: the snapshot started
+    // before the retract, so it must be filtered against the removed ids.
+    mockedGet.mockResolvedValue({ messages: [pin], count: 1 });
+
+    const { result } = renderHook(() => useTau());
+
+    await act(async () => {
+      await result.current.retractMessage(2);
+    });
+    await act(async () => {
+      await result.current.showPinned();
+    });
+
+    expect(result.current.pinnedMessages).toEqual([]);
+  });
+
+  it("re-fetches when a deletion lands while the pinned GET is in flight", async () => {
+    const pin = makeMessage({ id: 2, text: "a pin", pinned: true });
+    const { result } = renderHook(() => useTau());
+
+    // Installed after mount so the hook's background reads keep their
+    // default answers; only the pinned endpoint counts calls.
+    let pinnedCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/messages?pinned=1") {
+        pinnedCalls += 1;
+        if (pinnedCalls === 1) {
+          // Another tab retracts the pin while this GET is in flight.
+          FakeEventSource.instances[0].emit("message_deleted", {
+            message_id: 2,
+          });
+          return Promise.resolve({ messages: [pin], count: 1 });
+        }
+        return Promise.resolve({ messages: [], count: 0 });
+      }
+      return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+    });
+
+    await act(async () => {
+      await result.current.showPinned();
+    });
+
+    expect(pinnedCalls).toBe(2);
+    expect(result.current.pinnedMessages).toEqual([]);
+  });
 });
