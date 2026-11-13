@@ -1606,4 +1606,73 @@ describe("useTau allowlist polling", () => {
     });
     expect(allowlistCalls).toBe(2);
   });
+
+  it("resumes polling after a stalled write times out", async () => {
+    const before = { enabled: false, entries: [] };
+    let allowlistCalls = 0;
+    mockedGet.mockImplementation((path: string) => {
+      if (path === "/api/allowlist") {
+        allowlistCalls += 1;
+        return Promise.resolve(before);
+      }
+      if (path === "/api/peers") {
+        return Promise.resolve({ peers: [], count: 0 });
+      }
+      if (path === "/api/outbox") {
+        return Promise.resolve({ outbox: [], count: 0, held_for_others: 0 });
+      }
+      return Promise.resolve({ groups: [], count: 0 });
+    });
+    // The bridge accepts the add but never answers — until the write
+    // timeout aborts it, like fetch would.
+    mockedPost.mockImplementation(
+      (_path: string, _body: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () =>
+            reject(
+              new DOMException("The operation was aborted.", "AbortError"),
+            ),
+          );
+        }),
+    );
+
+    const { result } = renderHook(() => useTau());
+    const source = FakeEventSource.instances[0];
+
+    await act(async () => {
+      source.emit("snapshot", { snapshot: makeSnapshot() });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.allowlist).toEqual(before);
+    expect(allowlistCalls).toBe(1);
+
+    // Start an add that stalls: the next poll skips the allow-list
+    // while the write is pending.
+    let addSettled = false;
+    act(() => {
+      result.current.addAllowlistPeer(PEER_HASH).then(
+        () => {
+          addSettled = true;
+        },
+        () => {
+          addSettled = true;
+        },
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(allowlistCalls).toBe(1);
+    expect(addSettled).toBe(false);
+
+    // The 30s write timeout aborts the stalled POST, the pending
+    // counter clears, and the next tick polls again.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(addSettled).toBe(true);
+    expect(allowlistCalls).toBeGreaterThanOrEqual(2);
+  });
 });
