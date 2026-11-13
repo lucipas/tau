@@ -8778,7 +8778,15 @@ def _edit_group_message(
             peer = registry.get(member)
             name = peer.display_name if peer is not None else short_hash(member)
             if result.get("delivered"):
-                if result.get("edited"):
+                if result.get("deferred"):
+                    # The member's leg is still scheduled: the edit
+                    # rides the re-queued leg instead of a live edit,
+                    # so the replacement text stays unsent until then.
+                    print(
+                        f"edit is queued for {name} — it goes out with "
+                        "the scheduled message at its time"
+                    )
+                elif result.get("edited"):
                     print(
                         f"edited your group message "
                         f"{_safe_id_prefix(str(target['id']))} for {name}"

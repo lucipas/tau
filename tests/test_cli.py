@@ -6285,6 +6285,52 @@ def test_edit_sends_group_edit_to_every_member(
     assert node.sent == [("ab" * 16, "m-10", "group fixed", 100.0)]
 
 
+def test_edit_reports_deferred_scheduled_member(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _DeferredEditNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": ["m-10"],
+                "requeued": ["m-10"],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "deferred": True,
+                        "edited": False,
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _DeferredEditNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "edit is queued for alice" in out
+    assert "re-queued leg" in out
+
+
 def test_edit_keeps_group_copy_when_a_member_is_unreachable(
     tmp_path, capsys, monkeypatch
 ):
