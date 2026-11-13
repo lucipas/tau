@@ -8601,6 +8601,39 @@ def test_retract_message_endpoint_retracts_group_message(bridge, node):
     ]
 
 
+def test_retract_message_endpoint_retracts_group_message_after_roster_change(
+    bridge, node
+):
+    crew = node.groups.list_groups()[0]
+    old_id = crew["id"]
+    # A rename retires the id the message was sent under, with the
+    # same roster: the retract must still fan out to that roster.
+    node.groups.rename(old_id, "road trip", created_by=PEER_HASH)
+    assert node.groups.get(old_id) is None
+    assert node.groups.get_retired(old_id) is not None
+    entries = _sent_group_console_entries(bridge, node, old_id)
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/retract",
+        method="POST",
+        body={"id": entries[0]["id"]},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["retracted"] == {
+        "id": entries[0]["id"],
+        "wire_id": "wire-alice",
+    }
+    assert payload["group"] == old_id
+    assert [result["to"] for result in payload["results"]] == [
+        PEER_HASH,
+        BOB_HASH,
+    ]
+    assert node.group_retractions == [("crew", "wire-alice", 1000.0)]
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"] == []
+
+
 def test_retract_message_endpoint_keeps_group_bubbles_on_partial_fanout(
     bridge, node
 ):
