@@ -2305,21 +2305,41 @@ class Mailbox:
                 "edited_at": float(edited_at),
                 "until": timestamp + RETRACTED_RETENTION,
             }
-            self._evict_group_pending_edits()
+            self._evict_group_pending_edits(sender_hash)
             self.save()
             return True
 
-    def _evict_group_pending_edits(self) -> None:
-        """Drop earliest-expiry pending edits until the pool fits the cap.
+    def _evict_group_pending_edits(self, sender_hash: str) -> None:
+        """Keep the pending-edit pool within its caps, sender-fairly.
+
+        First the sender that just recorded a marker drops its own
+        earliest-expiry markers past its per-sender share.  Then the
+        global cap is enforced by evicting the earliest-expiry marker
+        of whichever sender holds the most markers, so a flood from one
+        sender never displaces another sender's live marker.
 
         Call with the transaction held.
         """
-        while len(self._group_pending_edits) > MAX_GROUP_PENDING_EDITS:
+        pool = self._group_pending_edits
+
+        def owner(key: str) -> str:
+            return key.partition(":")[0]
+
+        own = [key for key in pool if owner(key) == sender_hash]
+        while len(own) > MAX_GROUP_PENDING_EDITS_PER_SENDER:
+            oldest = min(own, key=lambda key: pool[key]["until"])
+            own.remove(oldest)
+            del pool[oldest]
+        while len(pool) > MAX_GROUP_PENDING_EDITS:
+            counts: Dict[str, int] = {}
+            for key in pool:
+                counts[owner(key)] = counts.get(owner(key), 0) + 1
+            heaviest = max(counts, key=lambda s: counts[s])
             oldest = min(
-                self._group_pending_edits.items(),
-                key=lambda kv: kv[1]["until"],
+                (key for key in pool if owner(key) == heaviest),
+                key=lambda key: pool[key]["until"],
             )
-            del self._group_pending_edits[oldest[0]]
+            del pool[oldest]
 
     def pending_group_edit(
         self,
