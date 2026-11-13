@@ -3426,6 +3426,14 @@ class WebBridge:
                     # was still in flight: the leg went out (or
                     # queued) on the wire, so the response still
                     # reports it, but there is no record to show.
+                    # Drop any delivery report or read receipt that
+                    # beat the record, as nothing will consume them.
+                    with self._lock:
+                        if mail_id is not None:
+                            self._early_deliveries.pop(mail_id, None)
+                        read_key = wire_id or mail_id
+                        if read_key is not None:
+                            self._early_reads.pop((member, read_key), None)
                     continue
                 with self._lock:
                     if mail_id is not None and mail_id in self._early_deliveries:
