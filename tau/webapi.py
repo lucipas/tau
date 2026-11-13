@@ -3282,10 +3282,16 @@ class WebBridge:
                 # The send was retracted while its console record was
                 # still in flight: the wire send already succeeded, so
                 # report that and no record — there is nothing to
-                # reconcile, publish, or show.  A delivery report or
-                # read receipt that beat the record stays buffered;
-                # both are keyed by this send's unique ids, so they
-                # can never flip a later message.
+                # reconcile, publish, or show.  Drop any delivery
+                # report or read receipt that beat the record, as
+                # nothing will consume them (same eviction the group
+                # legs do on a skipped append).
+                with self._lock:
+                    if mail_id is not None:
+                        self._early_deliveries.pop(mail_id, None)
+                    read_key = wire_id or mail_id
+                    if read_key is not None:
+                        self._early_reads.pop((peer.hexhash, read_key), None)
                 return None, response
             # The route read takes the mailbox lock, so fetch it
             # before the bridge lock (same deadlock as record_delivery).
