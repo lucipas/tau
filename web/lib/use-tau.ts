@@ -587,7 +587,13 @@ export function useTau() {
     [],
   );
 
+  // Count of allow-list writes in flight. A poll must not bump the
+  // sequence while one is pending: that would discard the write's
+  // successful response and could apply a pre-write snapshot.
+  const allowlistPending = useRef(0);
+
   const refreshAllowlist = useCallback(async () => {
+    if (allowlistPending.current > 0) return;
     const requestId = ++allowlistSeq.current;
     const result = await apiGet<AllowlistResponse>("/api/allowlist");
     applyAllowlist(requestId, result);
@@ -632,25 +638,35 @@ export function useTau() {
 
   const removeAllowlistPeer = useCallback(
     async (target: string) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
-        target,
-      });
-      applyAllowlist(requestId, result);
-      return result;
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
+          target,
+        });
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );
 
   const setAllowlistEnabled = useCallback(
     async (enabled: boolean) => {
-      const requestId = ++allowlistSeq.current;
-      const result = await apiPost<AllowlistResponse>(
-        "/api/allowlist/set-enabled",
-        { enabled },
-      );
-      applyAllowlist(requestId, result);
-      return result;
+      allowlistPending.current++;
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await apiPost<AllowlistResponse>(
+          "/api/allowlist/set-enabled",
+          { enabled },
+        );
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        allowlistPending.current--;
+      }
     },
     [applyAllowlist],
   );
