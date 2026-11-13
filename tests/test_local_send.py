@@ -274,6 +274,73 @@ def test_group_retract_uses_running_node(tmp_path, capsys, monkeypatch):
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_group_retract_unknown_group_via_running_node_reports_usage_error(
+    tmp_path, capsys, monkeypatch
+):
+    # Regression test (Qodo warning on PR #327): the serving node's
+    # unknown-group ValueError must cross local IPC as that error —
+    # the CLI reports it plainly, never as a delivery failure.
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-10", to=recipient_hash, text="group hello"
+    )
+    node = _FakeRunningNode(config)
+
+    def _unknown_group(*args, **kwargs):
+        raise ValueError("unknown group: 'abababababababababababababababab'")
+
+    monkeypatch.setattr(node, "send_group_retraction", _unknown_group)
+    server = SendServer(
+        data_dir, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-10"]) != 0
+        # No one-shot node started: the serving node carried the retract.
+        assert _FakeLocalNode.instances == []
+        err = capsys.readouterr().err
+        assert "unknown group" in err
+        assert "could not deliver group retract" not in err
+        assert "members online" not in err
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
 def test_edit_uses_running_node(tmp_path, capsys, monkeypatch):
     import RNS
 

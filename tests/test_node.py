@@ -710,6 +710,38 @@ def test_send_group_retraction_unresolved_id_never_resolves_to_namesake(
         node.send_group_retraction(orphan_id, "leg-1", target_sent_at=100.0)
 
 
+def test_send_group_retraction_still_resolves_32_char_name(
+    tmp_path, monkeypatch
+):
+    # A 32-character name that is not hex can never be an id: the
+    # unresolved-id guard must not fire, and find() still resolves
+    # the name.
+    node, group, alice, bob = _group_reaction_node(tmp_path)
+    named = node.groups.create(
+        "n" * 32,
+        [alice.hexhash, bob.hexhash, node.destination.hexhash],
+        created_by=alice.hexhash,
+    )
+    assert named["name"] == "n" * 32
+    calls = []
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        calls.append(peer_arg.hexhash)
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction("n" * 32, "leg-1", target_sent_at=100.0)
+
+    assert response["ok"] is True
+    assert response["group"] == named["id"]
+    assert {r["to"] for r in response["results"]} == {
+        alice.hexhash,
+        bob.hexhash,
+    }
+    assert set(calls) == {alice.hexhash, bob.hexhash}
+
+
 def test_send_group_retraction_needs_the_shared_send_time(tmp_path):
     node, _, _, _ = _group_reaction_node(tmp_path)
     with pytest.raises(NodeError, match="shared send time"):
