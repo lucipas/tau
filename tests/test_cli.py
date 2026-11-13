@@ -4351,6 +4351,52 @@ def test_messages_export_import_round_trip(tmp_path, capsys):
     assert "Imported 0 messages (2 already present, 0 skipped)" in capsys.readouterr().out
 
 
+def test_messages_import_skips_retracted_group_messages(tmp_path, capsys):
+    # Regression test (CodeRabbit Major on PR #322): a group message
+    # retracted on the target node must not come back through an
+    # export made before the retract.
+    source_dir, sender_hash = _seed_messages(tmp_path)
+    config = TauConfig.resolve(data_dir=source_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "alice",
+            "destination": sender_hash.hex(),
+            "text": "crew hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "g-1",
+            "kind": "group",
+            "group": "cc" * 16,
+        }
+    )
+    export_path = tmp_path / "messages-backup.json"
+
+    code = cli.main(
+        ["messages", "export", "--data-dir", str(source_dir), "--output", str(export_path)]
+    )
+    assert code == 0
+
+    target_dir = tmp_path / "other-node"
+    # The sender retracted the group message on the target node before
+    # the import.
+    mailbox = Mailbox(target_dir / "mailbox.json")
+    mailbox.record_group_retraction(sender_hash.hex(), "cc" * 16, 12.0)
+
+    code = cli.main(
+        ["messages", "import", "--data-dir", str(target_dir), str(export_path)]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "Imported 2 messages (0 already present, 1 skipped)" in out
+    assert "skipped g-1: message was retracted by its sender" in out
+
+    code = cli.main(["messages", "--data-dir", str(target_dir), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["id"] for item in payload["messages"]] == ["m-2", "m-1"]
+
+
 def test_messages_import_skips_retracted_messages(tmp_path, capsys):
     source_dir, sender_hash = _seed_messages(tmp_path)
     export_path = tmp_path / "messages-backup.json"

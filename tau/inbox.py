@@ -1934,6 +1934,7 @@ class Inbox:
         inserted: Optional[List[Dict[str, Any]]] = None,
         *,
         is_retracted: Optional[Any] = None,
+        is_group_retracted: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Merge every message in an export document into the inbox.
 
@@ -1956,6 +1957,11 @@ class Inbox:
         bool`` check), a received record its sender retracted is
         skipped with its reason recorded instead of being stored: an
         export made before the retract must not resurrect the message.
+        With ``is_group_retracted`` given (a
+        ``(sender_hash, group_id, sent_at) -> bool`` check), a received
+        group record is also checked against its group-context marker:
+        group messages are retractable, so a per-leg id alone cannot
+        guard a copy whose leg id was never recorded.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
@@ -1996,14 +2002,33 @@ class Inbox:
                     present += 1
                     continue
                 if (
-                    is_retracted is not None
-                    and record.get("direction") == "in"
-                    # Group and file records are never retractable (see
-                    # the retract handler), so a marker can't cover them.
-                    and record.get("kind") not in ("group", "file")
+                    record.get("direction") == "in"
                     and isinstance(record.get("destination"), str)
                     and isinstance(record.get("id"), str)
-                    and is_retracted(record["destination"], record["id"])
+                    and (
+                        (
+                            is_retracted is not None
+                            # File records are never retractable (see
+                            # the retract handler), so a marker can't
+                            # cover them.
+                            and record.get("kind") != "file"
+                            and is_retracted(
+                                record["destination"], record["id"]
+                            )
+                        )
+                        or (
+                            is_group_retracted is not None
+                            and record.get("kind") == "group"
+                            and isinstance(record.get("group"), str)
+                            and isinstance(record.get("sent_at"), (int, float))
+                            and not isinstance(record.get("sent_at"), bool)
+                            and is_group_retracted(
+                                record["destination"],
+                                record["group"],
+                                record["sent_at"],
+                            )
+                        )
+                    )
                 ):
                     # A retracted message stays retracted: an export
                     # made before the retract must not resurrect it.

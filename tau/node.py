@@ -2775,6 +2775,7 @@ class TauNode:
                 target=retract["target"],
                 received_at=received_at,
                 deleted=True,
+                group_retract=has_group_context,
             )
 
 

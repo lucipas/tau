@@ -2773,6 +2773,7 @@ class WebBridge:
                     document,
                     inserted=inserted,
                     is_retracted=mailbox.is_retracted,
+                    is_group_retracted=mailbox.is_group_retracted,
                 )
         else:
             result = inbox.import_messages(document, inserted=inserted)

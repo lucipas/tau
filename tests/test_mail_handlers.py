@@ -3806,6 +3806,40 @@ def test_retract_resolves_group_copy_by_context(tmp_path):
     assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is True
 
 
+def test_retract_response_reports_group_retract_after_deleting_copy(tmp_path):
+    # Regression test (CodeRabbit Major on PR #322): the successful
+    # deletion response must carry group_retract, or the sender's
+    # fan-out reports the member as unsupported and keeps its own
+    # copy until a second attempt.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
+    )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert response["group_retract"] is True
+
+
 def test_retract_records_group_marker_for_unknown_group_copy(tmp_path):
     # No copy held yet: the retract still records the group-context
     # marker, and a copy arriving later loses to it instead of

@@ -7176,7 +7176,11 @@ def cmd_messages_import(args: argparse.Namespace) -> int:
     # markers from disk, so a retract persisted by a running `tau serve`
     # is seen, and it cannot land between the check and the insert.
     with mailbox.transaction():
-        result = inbox.import_messages(document, is_retracted=mailbox.is_retracted)
+        result = inbox.import_messages(
+            document,
+            is_retracted=mailbox.is_retracted,
+            is_group_retracted=mailbox.is_group_retracted,
+        )
     if _json_mode(args):
         _emit(result, True)
     else:
