@@ -348,6 +348,7 @@ Global options may appear before or after the command:
 | `tau init` | Create the data directory, identity and Reticulum config |
 | `tau serve` | Announce this node and answer requests until interrupted |
 | `tau discover` | Listen for announces for `--duration` seconds |
+| `tau heard` | Listen for non-tau announces for `--duration` seconds |
 | `tau send --to PEER TEXT` | Send a message over an encrypted link (queued if the peer is offline) |
 | `tau ping --to PEER` | Check reachability and measure round-trip time |
 | `tau info --to PEER` | Fetch a remote node's information |
@@ -447,7 +448,7 @@ tau send --to alice "hi" --json
 
 `serve` emits one JSON object per line with `--json` (`ready`, `peer`,
 `message` events), which makes it easy to feed into another process.
-`discover`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
+`discover`, `heard`, `peers`, `send`, `ping`, `info` and `id` emit a single JSON object.
 
 Full command and flag reference: [FLAGS.md](FLAGS.md).
 

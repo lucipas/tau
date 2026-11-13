@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import RNS
 import pytest
@@ -11,9 +12,9 @@ import pytest
 from tau.config import TauConfig
 from tau.inbox import Inbox
 from tau.mailbox import Mailbox, MailboxError
-from tau.node import NodeError, NotAllowedError, TauNode
+from tau.node import NodeError, NotAllowedError, TauNode, _AnnounceHandler
 from tau.peers import Peer, PeerRegistry
-from tau.protocol import APP_NAME, ASPECT, parse_message
+from tau.protocol import APP_NAME, ASPECT, build_announce, parse_message
 
 
 def make_peer(name: str = "alice") -> Peer:
@@ -2431,3 +2432,113 @@ def test_flush_outbox_with_deadline_returns_when_mailbox_lock_stalls(
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
     assert node.mailbox.get_outbox(entry.id) is not None
+
+
+def _heard_node(tmp_path, monkeypatch, *, hops=2):
+    """A node far enough along to take announces, without a transport."""
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(hash=b"\x00" * 16)
+    monkeypatch.setattr(RNS.Transport, "hops_to", lambda digest: hops)
+    return node
+
+
+def _foreign_identity():
+    identity = RNS.Identity()
+    announced_hash = RNS.Destination.hash(identity, "lxmf", "delivery")
+    return identity, announced_hash
+
+
+def test_announce_handler_listens_to_all_aspects(tmp_path):
+    # Reticulum treats a None aspect filter as "no filter": the
+    # handler receives every announce and the node filters locally.
+    node = make_node(tmp_path)
+    assert _AnnounceHandler(node).aspect_filter is None
+
+
+def test_on_announce_records_foreign_announce(tmp_path, monkeypatch):
+    seen = []
+    node = _heard_node(tmp_path, monkeypatch, hops=2)
+    node.on_foreign = seen.append
+    saved = []
+    monkeypatch.setattr(node, "_save_peers", lambda: saved.append(True))
+    identity, announced_hash = _foreign_identity()
+
+    node._on_announce(announced_hash, identity, None)
+
+    assert node.registry.all() == []
+    assert saved == []
+    assert node._mail_round_threads == set()
+    heard = node.foreign_announces()
+    assert len(heard) == 1
+    assert heard[0]["destination"] == announced_hash.hex()
+    assert heard[0]["hops"] == 2
+    assert heard[0]["count"] == 1
+    assert heard[0]["first_seen"] <= heard[0]["last_seen"]
+    assert len(seen) == 1
+    assert seen[0]["destination"] == announced_hash.hex()
+
+    # Hearing it again bumps the count, not the entry — and does not
+    # call on_foreign a second time.
+    node._on_announce(announced_hash, identity, None)
+    heard = node.foreign_announces()
+    assert len(heard) == 1
+    assert heard[0]["count"] == 2
+    assert len(seen) == 1
+
+
+def test_on_announce_ignores_own_destination(tmp_path, monkeypatch):
+    node = _heard_node(tmp_path, monkeypatch)
+    identity, _ = _foreign_identity()
+    node._on_announce(node.destination.hash, identity, None)
+    assert node.foreign_announces() == []
+    assert node.registry.all() == []
+
+
+def test_on_announce_still_registers_tau_peer(tmp_path, monkeypatch):
+    node = _heard_node(tmp_path, monkeypatch, hops=1)
+    rounds = []
+    saved = []
+    monkeypatch.setattr(node, "_spawn_mail_round", lambda peer: rounds.append(peer))
+    monkeypatch.setattr(node, "_save_peers", lambda: saved.append(True))
+    identity = RNS.Identity()
+    announced_hash = RNS.Destination.hash(identity, APP_NAME, ASPECT)
+
+    node._on_announce(announced_hash, identity, build_announce("alice"))
+
+    assert node.foreign_announces() == []
+    peers = node.registry.all()
+    assert len(peers) == 1
+    assert peers[0].name == "alice"
+    assert peers[0].hexhash == announced_hash.hex()
+    assert len(rounds) == 1
+    assert len(saved) == 1
+
+
+def test_foreign_announces_capped(tmp_path, monkeypatch):
+    from tau.node import MAX_FOREIGN_ANNOUNCES
+
+    node = _heard_node(tmp_path, monkeypatch)
+    first = bytes([0, 0]) + b"\x00" * 14
+    for index in range(MAX_FOREIGN_ANNOUNCES + 5):
+        digest = bytes([index // 256, index % 256]) + b"\x00" * 14
+        node._record_foreign_announce(digest)
+    heard = node.foreign_announces()
+    assert len(heard) == MAX_FOREIGN_ANNOUNCES
+    destinations = {entry["destination"] for entry in heard}
+    assert first.hex() not in destinations
+    assert (bytes([0, MAX_FOREIGN_ANNOUNCES + 4]) + b"\x00" * 14).hex() in destinations
+
+
+def test_foreign_announces_newest_first(tmp_path, monkeypatch):
+    node = _heard_node(tmp_path, monkeypatch)
+    older = bytes([0, 1]) + b"\x00" * 14
+    newer = bytes([0, 2]) + b"\x00" * 14
+    node._record_foreign_announce(older)
+    node._record_foreign_announce(newer)
+    node._foreign_announces[older.hex()]["last_seen"] = 1000.0
+    node._foreign_announces[newer.hex()]["last_seen"] = 2000.0
+    heard = node.foreign_announces()
+    assert [entry["destination"] for entry in heard] == [
+        newer.hex(),
+        older.hex(),
+    ]

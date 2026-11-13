@@ -1379,6 +1379,81 @@ def test_peers_on_empty_registry(tmp_path, capsys):
     assert "No peers known" in capsys.readouterr().out
 
 
+# -- heard --------------------------------------------------------------------
+
+_HEARD_RECORD = {
+    "destination": "ab" * 16,
+    "hops": 2,
+    "first_seen": 1000.0,
+    "last_seen": 2000.0,
+    "count": 3,
+}
+
+
+class _FakeHeardNode:
+    """Stub TauNode for `tau heard`: records how it was started."""
+
+    def __init__(self, config, name=None, on_foreign=None):
+        self.started = {}
+        self.on_foreign = on_foreign
+        if on_foreign is not None:
+            on_foreign(dict(_HEARD_RECORD))
+
+    def start(self, **kwargs):
+        self.started.update(kwargs)
+
+    def stop(self):
+        pass
+
+    def foreign_announces(self):
+        return [dict(_HEARD_RECORD)]
+
+
+def test_heard_lists_foreign_announces(tmp_path, capsys, monkeypatch):
+    started = {}
+
+    def _factory(config, name=None, on_foreign=None):
+        node = _FakeHeardNode(config, name=name, on_foreign=on_foreign)
+        started.update(node.started)
+        started["node"] = node
+        return node
+
+    monkeypatch.setattr(cli, "TauNode", _factory)
+    code = cli.main(["heard", "--data-dir", str(tmp_path / "node"), "--duration", "0"])
+    assert code == 0
+    assert started["node"].started.get("announce") is False
+    out = capsys.readouterr().out
+    assert "ab" * 16 in out
+    assert "1 non-tau announce(s) in 0.0s" in out
+
+
+def test_heard_json(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "TauNode", _FakeHeardNode)
+    code = cli.main(
+        ["heard", "--data-dir", str(tmp_path / "node"), "--duration", "0", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["heard"][0]["destination"] == "ab" * 16
+    assert payload["heard"][0]["count"] == 3
+    assert payload["duration"] == 0.0
+
+
+def test_heard_on_empty_air(tmp_path, capsys, monkeypatch):
+    class _SilentHeardNode(_FakeHeardNode):
+        def __init__(self, config, name=None, on_foreign=None):
+            self.started = {}
+
+        def foreign_announces(self):
+            return []
+
+    monkeypatch.setattr(cli, "TauNode", _SilentHeardNode)
+    code = cli.main(["heard", "--data-dir", str(tmp_path / "node"), "--duration", "0"])
+    assert code == 0
+    assert "No non-tau announces heard." in capsys.readouterr().out
+
+
 # -- peers show ---------------------------------------------------------------
 
 def _seed_peer_show(tmp_path):
