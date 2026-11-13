@@ -9,6 +9,7 @@ import {
   formatExpiresIn,
   formatFileSize,
   formatRtt,
+  formatSendsIn,
   formatTime,
   shortHash,
 } from "@/lib/format";
@@ -391,6 +392,15 @@ function MessageBubble({
   const peerHash = message.peer ?? "";
   const initial = (message.peer_name || "?").slice(0, 1).toUpperCase();
   const expiry = formatExpiresIn(message.expires_at);
+  // Re-render scheduled bubbles so the countdown stays current, and falls
+  // back to "queued" once due, even while the live feed is not polling.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (!message.send_after) return;
+    const timer = setInterval(() => setClockTick((tick) => tick + 1), 30000);
+    return () => clearInterval(timer);
+  }, [message.send_after]);
+  const scheduled = formatSendsIn(message.send_after);
   const quote = resolveQuote(messages, message);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -719,7 +729,7 @@ function MessageBubble({
           <span>
             {outbound
               ? message.status === "queued"
-                ? "queued"
+                ? (scheduled ?? "queued")
                 : message.status === "read"
                   ? "read"
                   : message.status === "failed"

@@ -32,6 +32,7 @@ export function Composer({
     text: string,
     expiresIn?: number,
     replyTo?: string,
+    sendIn?: number,
   ) => Promise<TauMessage>;
   onSendGroup: (group: string, text: string) => Promise<TauMessage[]>;
   onSendFile?: (to: string, file: File) => Promise<TauMessage>;
@@ -42,6 +43,7 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expireSeconds, setExpireSeconds] = useState<number | null>(null);
+  const [sendSeconds, setSendSeconds] = useState<number | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -53,6 +55,12 @@ export function Composer({
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  // Group sends never take a delay: drop a peer delay picked before the
+  // switch so it cannot ride along (and the picker is gone anyway).
+  useEffect(() => {
+    if (groupMode) setSendSeconds(null);
+  }, [groupMode]);
 
   async function submit() {
     const trimmedTarget = target.trim();
@@ -101,9 +109,13 @@ export function Composer({
           text,
           expireSeconds === null ? undefined : expireSeconds,
           replyTo?.wire_id,
+          sendSeconds === null ? undefined : sendSeconds,
         );
       }
       setText("");
+      // A delay applies to one send only: the next message goes now
+      // unless the picker is set again.
+      setSendSeconds(null);
       onCancelReply?.();
       textareaRef.current?.focus();
     } catch (caught) {
@@ -318,7 +330,13 @@ export function Composer({
         >
           <SendIcon className="h-4 w-4" />
           <span className="hidden sm:inline">
-            {sending ? "sending…" : file ? "send file" : "send"}
+            {sending
+              ? "sending…"
+              : file
+                ? "send file"
+                : groupMode || sendSeconds === null
+                  ? "send"
+                  : "schedule"}
           </span>
         </button>
       </div>
@@ -340,27 +358,47 @@ export function Composer({
         </span>
         {groupMode ? (
           <span className="font-mono text-[10px] text-mist/70">
-            replies and expiry are peer DMs only
+            replies, expiry and scheduling are peer DMs only
           </span>
         ) : (
-          <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
-            disappears
-            <select
-              aria-label="Message expiry"
-              value={expireSeconds === null ? "" : String(expireSeconds)}
-              onChange={(event) => {
-                const value = event.target.value;
-                setExpireSeconds(value === "" ? null : Number(value));
-              }}
-              className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
-            >
-              <option value="">never</option>
-              <option value="300">in 5 minutes</option>
-              <option value="3600">in 1 hour</option>
-              <option value="86400">in 1 day</option>
-              <option value="604800">in 7 days</option>
-            </select>
-          </label>
+          <>
+            <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+              send later
+              <select
+                aria-label="Send later"
+                value={sendSeconds === null ? "" : String(sendSeconds)}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setSendSeconds(value === "" ? null : Number(value));
+                }}
+                className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+              >
+                <option value="">now</option>
+                <option value="1800">in 30 minutes</option>
+                <option value="3600">in 1 hour</option>
+                <option value="10800">in 3 hours</option>
+                <option value="86400">in 24 hours</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 font-mono text-[10px] text-mist/70">
+              disappears
+              <select
+                aria-label="Message expiry"
+                value={expireSeconds === null ? "" : String(expireSeconds)}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setExpireSeconds(value === "" ? null : Number(value));
+                }}
+                className="h-7 rounded-lg border border-line bg-void/70 px-1.5 font-mono text-[11px] text-zinc-200 outline-none transition focus:border-signal/60"
+              >
+                <option value="">never</option>
+                <option value="300">in 5 minutes</option>
+                <option value="3600">in 1 hour</option>
+                <option value="86400">in 1 day</option>
+                <option value="604800">in 7 days</option>
+              </select>
+            </label>
+          </>
         )}
       </div>
     </section>

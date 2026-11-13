@@ -32,6 +32,10 @@ export interface TauMessage {
   // Sender-set expiry (epoch seconds). Absent when the message never
   // expires; the console purges it once the deadline passes.
   expires_at?: number;
+  // Scheduled send time (epoch seconds), set by `tau send --delay` or
+  // the console's send-later picker. Present only while the message is
+  // queued for a future send; the console shows "sends in …" until then.
+  send_after?: number;
   // Reticulum wire id: how replies name this message, and how
   // reactions are matched to it.
   wire_id?: string;
@@ -324,6 +328,9 @@ export interface OutboxEntry {
   last_attempt_at: number | null;
   last_error: string | null;
   held_by: string[];
+  // Scheduled send time (epoch seconds), or null for a message queued
+  // because the peer is offline rather than scheduled for later.
+  send_after: number | null;
 }
 
 export interface OutboxResponse {

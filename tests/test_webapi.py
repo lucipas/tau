@@ -303,9 +303,11 @@ class FakeNode:
         discover_timeout=None,
         in_reply_to=None,
         expires_at=None,
+        send_after=None,
     ):
         self.sent.append((peer.name, text, in_reply_to))
         self.last_expires_at = expires_at
+        self.last_send_after = send_after
         # A distinct wire id per send, like the real node's generated id.
         wire_id = f"{len(self.sent):032d}"
         return {
@@ -5911,6 +5913,7 @@ def _queue_send(node, mail_id="mail-1"):
     """Make the fake node report a queued send with the given outbox id."""
 
     def _send(peer, text, **kwargs):
+        node.last_send_kwargs = kwargs
         return {
             "ok": True,
             "v": 1,
@@ -9987,7 +9990,7 @@ def test_reactions_and_wire_id_survive_bridge_restart(node, tmp_path):
 
 
 def test_send_message_records_wire_id(node, tmp_path):
-    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None, expires_at=None):
+    def send_with_id(peer, text, *, timeout=20.0, discover_timeout=None, in_reply_to=None, expires_at=None, send_after=None):
         return {"ok": True, "echo": text, "server": "tester", "id": "wire-9"}
 
     node.send_message = send_with_id
@@ -10119,6 +10122,73 @@ def test_send_with_expires_in_records_deadline(bridge, node):
 
     _, _, feed = _json(bridge, "/api/messages")
     assert feed["messages"][0]["expires_at"] == expires_at
+
+
+def test_send_rejects_bad_send_in(bridge):
+    for bad in (0, -5, "soon", True, 30 * 86400, 10**400):
+        status, _, payload = _json(
+            bridge,
+            "/api/messages",
+            method="POST",
+            body={"to": "alice", "text": "hi", "send_in": bad},
+        )
+        assert status == 400
+        assert "send_in" in payload["error"]["message"]
+
+
+def test_send_with_send_in_records_schedule(bridge, node):
+    _queue_send(node)
+    before = time.time()
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "later", "send_in": 3600},
+    )
+    assert status == 200
+    send_after = payload["message"]["send_after"]
+    assert before + 3590 <= send_after <= time.time() + 3610
+    assert node.last_send_kwargs["send_after"] == send_after
+    assert payload["message"]["status"] == "queued"
+
+    _, _, feed = _json(bridge, "/api/messages")
+    assert feed["messages"][0]["send_after"] == send_after
+
+
+def test_send_rejects_send_in_past_expiry(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"to": "alice", "text": "hi", "send_in": 7200, "expires_in": 3600},
+    )
+    assert status == 400
+    assert "send_in" in payload["error"]["message"]
+
+
+def test_send_rejects_send_in_for_group(bridge):
+    status, _, payload = _json(
+        bridge,
+        "/api/messages",
+        method="POST",
+        body={"group": "crew", "text": "hi", "send_in": 3600},
+    )
+    assert status == 400
+    assert "send_in" in payload["error"]["message"]
+
+
+def test_send_maps_mailbox_error_to_503(bridge, node, monkeypatch):
+    from tau.mailbox import MailboxFull
+
+    def _full(peer, text, **kwargs):
+        raise MailboxFull("outbox is full (10 messages)")
+
+    monkeypatch.setattr(node, "send_message", _full)
+    status, _, payload = _json(
+        bridge, "/api/messages", method="POST", body={"to": "alice", "text": "hi"}
+    )
+    assert status == 503
+    assert "outbox is full" in payload["error"]["message"]
 
 
 # -- sneakernet bundles ----------------------------------------------------

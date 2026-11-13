@@ -70,6 +70,17 @@ export function formatExpiresIn(expiresAt: number | null | undefined): string | 
   return `disappears in ${Math.floor(seconds / 86400)}d`;
 }
 
+/** "sends in 5m" for a scheduled send time, or null when unscheduled or due. */
+export function formatSendsIn(sendAfter: number | null | undefined): string | null {
+  if (!sendAfter) return null;
+  const seconds = Math.floor(sendAfter - Date.now() / 1000);
+  if (seconds <= 0) return null;
+  if (seconds < 60) return `sends in ${seconds}s`;
+  if (seconds < 3600) return `sends in ${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `sends in ${Math.floor(seconds / 3600)}h`;
+  return `sends in ${Math.floor(seconds / 86400)}d`;
+}
+
 export function peerLabel(name: string, hash: string): string {
   return `${name || "unknown"} · ${shortHash(hash, 8)}`;
 }

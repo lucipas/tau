@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { formatAge, formatDateTime, peerLabel } from "@/lib/format";
+import { formatAge, formatDateTime, formatSendsIn, peerLabel } from "@/lib/format";
 import type { HeldMailEntry, OutboxEntry, RetryOutboxResponse } from "@/lib/types";
 
 import { useNow } from "@/lib/use-now";
@@ -179,11 +179,13 @@ export function OutboxSection({
       ) : null}
 
       <ul className="mt-3 flex flex-col gap-3">
-        {entries.map((entry) => (
-          <li
-            key={entry.id}
-            className="rounded-xl border border-line/70 bg-void/50 p-3"
-          >
+        {entries.map((entry) => {
+          const sendsIn = formatSendsIn(entry.send_after);
+          return (
+            <li
+              key={entry.id}
+              className="rounded-xl border border-line/70 bg-void/50 p-3"
+            >
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <p className="truncate font-mono text-[12px] font-semibold text-zinc-100">
@@ -231,6 +233,7 @@ export function OutboxSection({
               {formatAge(now - entry.created_at)} · {entry.attempts}{" "}
               {entry.attempts === 1 ? "try" : "tries"} · expires{" "}
               {formatDateTime(entry.expires_at)}
+              {sendsIn ? ` · ${sendsIn}` : ""}
               {entry.held_by.length > 0
                 ? ` · sealed copy held by ${entry.held_by.length} ${entry.held_by.length === 1 ? "peer" : "peers"}`
                 : ""}
@@ -240,8 +243,9 @@ export function OutboxSection({
                 last try: {entry.last_error}
               </p>
             ) : null}
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ul>
 
       {held.length > 0 ? (
