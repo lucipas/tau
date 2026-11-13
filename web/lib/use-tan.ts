@@ -758,7 +758,9 @@ export function useTan() {
   }, []);
 
   const refreshScheduledIfLoaded = useCallback(async () => {
-    if (scheduledLoadedRef.current) {
+    // A load already in flight may have captured the queue before this
+    // schedule, so refresh then too; the newer request supersedes it.
+    if (scheduledLoadedRef.current || scheduledGenerationRef.current > 0) {
       await loadScheduled();
     }
   }, [loadScheduled]);
@@ -772,7 +774,13 @@ export function useTan() {
           send_in: sendIn,
           ...(replyTo ? { reply_to: replyTo } : {}),
         });
-        await refreshScheduledIfLoaded();
+        // The post is already queued: a failed list refresh must not
+        // reject, or the composer keeps the draft and a retry duplicates it.
+        try {
+          await refreshScheduledIfLoaded();
+        } catch {
+          setError("post scheduled, but the scheduled list could not refresh");
+        }
       } finally {
         setPosting(false);
       }
