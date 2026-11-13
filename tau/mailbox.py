@@ -136,7 +136,7 @@ def _group_retraction_key(
     send time does.  The float is keyed by repr so the exact value a
     sender signed round-trips through the marker store.
     """
-    return f"{sender_hash}:{group_id}:{sent_at!r}"
+    return f"{sender_hash}:{group_id}:{float(sent_at)!r}"
 
 
 def _parse_retraction_markers(raw_value: Any) -> Dict[str, float]:
@@ -2030,7 +2030,7 @@ class Mailbox:
                 key = _group_retraction_key(
                     sender_hash, group_id, float(sent_at)
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return False
             until = self._group_retracted.get(key)
             return until is not None and timestamp < until

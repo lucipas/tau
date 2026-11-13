@@ -840,6 +840,14 @@ def parse_retract(raw: Any) -> Dict[str, Any]:
         target_sent_at, bool
     ):
         target_sent_at = None
+    else:
+        # A send time must convert to a finite float: an oversized integer
+        # overflows float() later, and a non-finite one names no message.
+        try:
+            if not math.isfinite(float(target_sent_at)):
+                target_sent_at = None
+        except OverflowError:
+            target_sent_at = None
     return {
         "target": target,
         "sent_at": sent_at,

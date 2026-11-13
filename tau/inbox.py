@@ -1257,7 +1257,7 @@ class Inbox:
         """
         try:
             wanted_at = float(sent_at)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         # Read through the transaction path, like reactions(): a copy
         # imported by another process (``tau import`` while ``tau
