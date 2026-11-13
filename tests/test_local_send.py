@@ -55,12 +55,31 @@ class _FakeRunningNode:
 
     def send_retraction(self, target, message_id, **kwargs):
         self.calls.append(("retract", target, message_id))
+        if self.behaviour.get("retract") == "error":
+            raise NodeError(f"no path to {target}")
         return {"ok": True, "target": message_id, "deleted": True, "id": "r-1"}
 
     def send_group_retraction(self, group, message_id, **kwargs):
         self.calls.append(
             ("retract_group", group, message_id, kwargs.get("target_sent_at"))
         )
+        if self.behaviour.get("retract_group") == "partial":
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": "ab" * 16,
+                        "to_name": "alice",
+                        "ok": False,
+                        "error": "offline",
+                        "id": "r-1",
+                    }
+                ],
+            }
         return {
             "ok": True,
             "group": group,
@@ -89,6 +108,22 @@ class _FakeRunningNode:
                 # The real node records delivery before leaving the outbox.
                 self.mailbox.record_delivered(entry.id)
                 self.mailbox.remove_outbox(entry.id)
+
+
+class _FakeBridge:
+    """Stub WebBridge: records the sent-copy drops the dispatch asks for."""
+
+    def __init__(self):
+        self.deleted_wire_ids: list = []
+        self.deleted_groups: list = []
+
+    def delete_sent_by_wire_id(self, wire_id):
+        self.deleted_wire_ids.append(wire_id)
+        return {"ok": True, "deleted": {"id": 1, "wire_id": wire_id}}
+
+    def delete_sent_group(self, group_id, sent_at):
+        self.deleted_groups.append((group_id, sent_at))
+        return {"ok": True, "deleted_ids": [1, 2]}
 
 
 class _FakeLocalNode:
@@ -268,6 +303,231 @@ def test_group_retract_uses_running_node(tmp_path, capsys, monkeypatch):
         assert "retracted your group message" in capsys.readouterr().out
         assert Inbox(config.inbox_path).list_messages(direction="out") == []
         assert Mailbox(config.mailbox_path).sent_list() == []
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_dispatch_retract_drops_sent_console_copy(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    bridge = _FakeBridge()
+    result = cli._dispatch_local_send(
+        node, bridge=bridge, op="retract", target="alice", message_id="m-9"
+    )
+    assert result["deleted"] is True
+    assert bridge.deleted_wire_ids == ["m-9"]
+    assert bridge.deleted_groups == []
+
+
+def test_dispatch_retract_without_bridge_is_a_noop(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node, op="retract", target="alice", message_id="m-9"
+    )
+    assert result["deleted"] is True
+
+
+def test_dispatch_retract_failure_leaves_console_copy(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config, behaviour={"retract": "error"})
+    bridge = _FakeBridge()
+    with pytest.raises(NodeError, match="no path to alice"):
+        cli._dispatch_local_send(
+            node, bridge=bridge, op="retract", target="alice", message_id="m-9"
+        )
+    assert bridge.deleted_wire_ids == []
+    assert bridge.deleted_groups == []
+
+
+def test_dispatch_group_retract_drops_legs_only_on_full_fanout(tmp_path):
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    bridge = _FakeBridge()
+    cli._dispatch_local_send(
+        node,
+        bridge=bridge,
+        op="retract_group",
+        group="ab" * 16,
+        message_id="m-10",
+        target_sent_at=100.0,
+    )
+    assert bridge.deleted_groups == [("ab" * 16, 100.0)]
+
+    partial = _FakeRunningNode(config, behaviour={"retract_group": "partial"})
+    bridge = _FakeBridge()
+    result = cli._dispatch_local_send(
+        partial,
+        bridge=bridge,
+        op="retract_group",
+        group="ab" * 16,
+        message_id="m-10",
+        target_sent_at=100.0,
+    )
+    assert result["ok"] is False
+    assert bridge.deleted_groups == []
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_retract_via_running_node_drops_console_copy(tmp_path, capsys, monkeypatch):
+    # End to end: a console-sent DM retracted through the CLI while the
+    # console serves leaves the feed, and the persisted log agrees so a
+    # restart cannot resurrect it.
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+    from tau.webapi import WebBridge
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-9",
+            "direction": "out",
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+    node = _FakeRunningNode(config)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge._append_message(
+        direction="out",
+        peer=recipient_hash.hex(),
+        peer_name="alice",
+        text="sent hello",
+        sent_at=10.0,
+        received_at=20.0,
+        status="delivered",
+        wire_id="m-9",
+    )
+    assert len(bridge.messages()) == 1
+    server = SendServer(
+        data_dir,
+        lambda **request: cli._dispatch_local_send(
+            node, bridge=bridge, **request
+        ),
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-9"]) == 0
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [("retract", recipient_hash.hex(), "m-9")]
+        assert "retracted" in capsys.readouterr().out
+        assert Inbox(config.inbox_path).list_messages(direction="out") == []
+        assert Mailbox(config.mailbox_path).sent_list() == []
+        assert bridge.messages() == []
+        persisted = json.loads(bridge._messages_path.read_text(encoding="utf-8"))
+        assert persisted["messages"] == []
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_group_retract_via_running_node_drops_console_legs(
+    tmp_path, capsys, monkeypatch
+):
+    # End to end: a console-sent group message retracted through the CLI
+    # drops every leg entry from the feed, and leaves a later send in
+    # the same group alone.
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+    from tau.webapi import WebBridge
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-10", to=recipient_hash, text="group hello"
+    )
+    node = _FakeRunningNode(config)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    for wire_id, sent_at in (("m-10", 100.0), ("m-11", 100.0), ("m-12", 200.0)):
+        bridge._append_message(
+            direction="out",
+            peer=recipient_hash.hex(),
+            peer_name="alice",
+            text="group hello",
+            sent_at=sent_at,
+            received_at=sent_at + 1.0,
+            status="delivered",
+            group="ab" * 16,
+            wire_id=wire_id,
+        )
+    assert len(bridge.messages()) == 3
+    server = SendServer(
+        data_dir,
+        lambda **request: cli._dispatch_local_send(
+            node, bridge=bridge, **request
+        ),
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-10"]) == 0
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [("retract_group", "ab" * 16, "m-10", 100.0)]
+        assert "retracted your group message" in capsys.readouterr().out
+        assert Inbox(config.inbox_path).list_messages(direction="out") == []
+        assert Mailbox(config.mailbox_path).sent_list() == []
+        assert [entry["wire_id"] for entry in bridge.messages()] == ["m-12"]
     finally:
         server.stop()
     assert not server.path.exists()
