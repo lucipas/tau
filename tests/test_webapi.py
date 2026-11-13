@@ -9245,6 +9245,18 @@ def test_edit_message_endpoint_refuses_group_message_with_queued_leg(
         second_status="queued",
         second_wire_id="mail-bob-1",
     )
+    node.mailbox.enqueue(
+        to=bytes.fromhex(BOB_HASH),
+        text="hello",
+        message_id="mail-bob-1",
+        group={
+            "id": crew["id"],
+            "name": "crew",
+            "creator": PEER_HASH,
+            "members": [PEER_HASH, BOB_HASH],
+        },
+        sent_at=1000.0,
+    )
     status, _, payload = _json(
         bridge,
         "/api/messages/edit",
@@ -9260,6 +9272,23 @@ def test_edit_message_endpoint_refuses_group_message_with_queued_leg(
         "hello",
         "hello",
     ]
+    # The prescribed recovery completes the edit: once the queued leg
+    # is cancelled from the outbox, the stale console status must not
+    # keep blocking it (see CodeRabbit on #341).
+    assert node.mailbox.remove_outbox("mail-bob-1")
+    status, _, payload = _json(
+        bridge,
+        "/api/messages/edit",
+        method="POST",
+        body={"id": entries[0]["id"], "text": "hello again"},
+    )
+    assert status == 200
+    assert payload["ok"] is True
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["text"] for entry in feed["messages"]] == [
+        "hello again",
+        "hello again",
+    ]
 
 
 def test_edit_message_endpoint_refuses_group_message_still_in_the_outbox(
@@ -9267,11 +9296,23 @@ def test_edit_message_endpoint_refuses_group_message_still_in_the_outbox(
 ):
     # The bubbles say delivered, but the mailbox still holds a leg:
     # the outbox check, not just the bubble status, refuses the edit,
-    # or a sweep could deliver the old leg after the edit.
+    # or a sweep could deliver the old leg after the edit. The check
+    # scans the mailbox for the whole logical send (group id plus the
+    # shared send time), so it also catches a leg whose console entry
+    # left the history (see CodeRabbit on #341).
     crew = node.groups.list_groups()[0]
     entries = _sent_group_console_entries(bridge, node, crew["id"])
     node.mailbox.enqueue(
-        to=bytes.fromhex(BOB_HASH), text="hello", message_id="wire-bob"
+        to=bytes.fromhex(BOB_HASH),
+        text="hello",
+        message_id="wire-bob",
+        group={
+            "id": crew["id"],
+            "name": "crew",
+            "creator": PEER_HASH,
+            "members": [PEER_HASH, BOB_HASH],
+        },
+        sent_at=1000.0,
     )
     status, _, payload = _json(
         bridge,

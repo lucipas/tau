@@ -3932,23 +3932,6 @@ class WebBridge:
                 "that group message was never delivered to any member, "
                 "so there is nothing to edit"
             )
-        if any(leg.get("status") == "queued" for leg in legs):
-            # Group edits are live-only: a queued leg must not be
-            # cancelled and re-queued with the edited text, which would
-            # store-and-forward an edit to an offline member.
-            raise ValueError(
-                "this group message is still queued for an offline member; "
-                "cancel it from the outbox first"
-            )
-        with self.node.mailbox.transaction():
-            if any(
-                self.node.mailbox.get_outbox(leg_wire_id) is not None
-                for leg_wire_id in wire_ids
-            ):
-                raise ValueError(
-                    "this group message is still queued for an offline member; "
-                    "cancel it from the outbox first"
-                )
         target_wire_id = entry.get("wire_id")
         if not isinstance(target_wire_id, str) or not target_wire_id:
             target_wire_id = wire_ids[0]
@@ -4006,6 +3989,29 @@ class WebBridge:
                 "be edited"
             )
         sent_at = float(leg_sent_at)
+        # Group edits are live-only: a leg still queued in the outbox
+        # is refused instead of cancelled and re-queued, which would
+        # store-and-forward an edit to an offline member — and a
+        # concurrent mail sweep could deliver the queued leg with the
+        # old text after the edit was acknowledged (see Qodo on #341).
+        # Check the mailbox for the complete logical send — group id
+        # plus the shared send time, the same predicate
+        # send_group_edit's own cancel loop uses — not just the legs
+        # this console retained: a leg whose entry left the history
+        # still counts.  The console entry's status is not consulted:
+        # it goes stale when a leg is cancelled from the outbox, so it
+        # must not block an edit after the prescribed recovery.
+        queued = [
+            outbox_entry.id
+            for outbox_entry in self.node.mailbox.outbox_list()
+            if outbox_entry.group_id == group_id
+            and outbox_entry.wire_sent_at == sent_at
+        ]
+        if queued:
+            raise ValueError(
+                "this group message is still queued for an offline member; "
+                "cancel it from the outbox first"
+            )
         # Edit by the record's canonical id: a secondary leg's wire id
         # does not match the inbox record, so the local update would
         # silently miss it.
