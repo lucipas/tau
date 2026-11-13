@@ -2350,7 +2350,9 @@ class WebBridge:
             publish_at=time.time() + float(send_in),
             reply_to=reply_to,
             ttl=MAX_GOSSIP_TTL,
-            name=getattr(config, "name", None),
+            # Validate against the name the serving app publishes with
+            # (node.name, refreshed at startup), not the configured name.
+            name=getattr(self.node, "name", None),
         )
         return post.to_dict()
 
