@@ -5549,6 +5549,25 @@ def _retract_local_message(
     )
 
 
+def _retract_group_local_message(
+    node: TauNode,
+    *,
+    group: str,
+    message_id: str,
+    target_sent_at: float,
+    timeout: float = 20.0,
+    discover_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Retract a group message on the running node, for the local send server."""
+    return node.send_group_retraction(
+        group,
+        message_id,
+        timeout=float(timeout),
+        discover_timeout=discover_timeout,
+        target_sent_at=target_sent_at,
+    )
+
+
 def _edit_local_message(
     node: TauNode,
     *,
@@ -5569,17 +5588,21 @@ def _edit_local_message(
 
 
 def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
-    """Serve one local send-socket request: a DM send, a retraction, or an edit.
+    """Serve one local send-socket request: a DM send, a retraction, a
+    group retraction, or an edit.
 
-    The socket carries all three, distinguished by ``op``: ``"send"`` (the
+    The socket carries all four, distinguished by ``op``: ``"send"`` (the
     default, so older one-shot clients keep working) runs
-    :func:`_send_local_message`, while ``"retract"`` and ``"edit"`` run the
-    retraction and the edit on the serving node, so ``tau retract`` and
-    ``tau edit`` work while ``tau serve`` holds the data directory.
+    :func:`_send_local_message`, while ``"retract"``, ``"retract_group"``
+    and ``"edit"`` run the retraction, the group retraction and the edit
+    on the serving node, so ``tau retract`` and ``tau edit`` work while
+    ``tau serve`` holds the data directory.
     """
     op = request.pop("op", "send")
     if op == "retract":
         return _retract_local_message(node, **request)
+    if op == "retract_group":
+        return _retract_group_local_message(node, **request)
     if op == "edit":
         return _edit_local_message(node, **request)
     if op == "send":
@@ -5726,6 +5749,35 @@ def _retract_via_running_node(
             op="retract",
             target=recipient,
             message_id=message_id,
+            timeout=timeout,
+            discover_timeout=discover_timeout,
+        )
+    except LocalIPCUnavailable as exc:
+        raise NodeError(
+            "the running node stopped answering mid-retract; retry the retract"
+        ) from exc
+
+
+def _retract_group_via_running_node(
+    config: TauConfig,
+    group_id: str,
+    message_id: str,
+    target_sent_at: float,
+    *,
+    timeout: float,
+    discover_timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Retract a group message through the serving node on its local socket."""
+    from .local_ipc import LocalIPCUnavailable
+    from .local_send import send_running
+
+    try:
+        return send_running(
+            config.data_dir,
+            op="retract_group",
+            group=group_id,
+            message_id=message_id,
+            target_sent_at=target_sent_at,
             timeout=timeout,
             discover_timeout=discover_timeout,
         )
@@ -8202,6 +8254,152 @@ def cmd_react(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _retract_group_message(
+    args: argparse.Namespace,
+    config: TauConfig,
+    inbox: Inbox,
+    registry: PeerRegistry,
+    target: Dict[str, Any],
+) -> int:
+    """Retract a sent group message, fanning out to every member.
+
+    Queued legs are cancelled by the fan-out (see
+    :meth:`tau.node.TauNode.send_group_retraction`), so a member whose
+    leg never left never receives the message.  The local sent copy is
+    dropped only when every member received the retract: a partial
+    fan-out keeps it, so the user can retry the members still holding
+    the message — re-sending is idempotent, and a member who already
+    deleted their copy answers ``deleted`` False.
+    """
+    group_id = target.get("group") or ""
+    if not group_id:
+        raise NodeError("that group message has no group to retract from")
+    leg_sent_at = target.get("leg_sent_at")
+    if leg_sent_at is None:
+        raise NodeError(
+            "that group message was sent before group retracts landed; "
+            "it carries no leg send time, so it cannot be retracted"
+        )
+    timeout = float(getattr(args, "timeout", 20.0))
+    discover_timeout = float(getattr(args, "discover_timeout", 10.0))
+    if _send_routes_via_running_node(config):
+        # A serving node owns the data directory: retract through it
+        # instead of starting a second Reticulum instance on the same
+        # identity — a second instance exits when it cannot bind the
+        # TCP listen port the serving node holds (see cmd_send).
+        try:
+            response = _retract_group_via_running_node(
+                config,
+                group_id,
+                str(target["id"]),
+                float(leg_sent_at),
+                timeout=timeout,
+                discover_timeout=discover_timeout,
+            )
+        except NodeError as exc:
+            # Retracts ride the live link only in v1 — there is no
+            # outbox queue for them yet — so an unreachable member is
+            # a plain failure, not a silent queue.
+            raise NodeError(
+                f"could not deliver group retract: {exc} "
+                "(retracts need the members online in v1)"
+            ) from exc
+    else:
+        node = TauNode(config, name=config.name)
+        node.start()
+        try:
+            try:
+                response = node.send_group_retraction(
+                    group_id,
+                    str(target["id"]),
+                    timeout=timeout,
+                    discover_timeout=discover_timeout,
+                    target_sent_at=float(leg_sent_at),
+                )
+            except NodeError as exc:
+                # Retracts ride the live link only in v1 — there is no
+                # outbox queue for them yet — so an unreachable member
+                # is a plain failure, not a silent queue.
+                raise NodeError(
+                    f"could not deliver group retract: {exc} "
+                    "(retracts need the members online in v1)"
+                ) from exc
+        finally:
+            node.stop()
+
+    results = response.get("results") or []
+    failed = [r for r in results if not r.get("delivered")]
+    if _json_mode(args):
+        _emit(
+            {
+                "target": target["id"],
+                "group": group_id,
+                "ok": bool(response.get("ok")),
+                "cancelled_queued": response.get("cancelled_queued") or [],
+                "results": results,
+                "id": response.get("id"),
+            },
+            True,
+        )
+    else:
+        for result in results:
+            member = result.get("to") or ""
+            peer = registry.get(member)
+            name = peer.display_name if peer is not None else short_hash(member)
+            if result.get("delivered"):
+                if result.get("deleted"):
+                    print(
+                        f"retracted your group message "
+                        f"{_safe_id_prefix(str(target['id']))} from {name}'s inbox"
+                    )
+                else:
+                    print(
+                        f"{name} had no copy of "
+                        f"{_safe_id_prefix(str(target['id']))} to retract"
+                    )
+            else:
+                print(
+                    f"could not retract from {name}: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+        for leg_id in response.get("cancelled_queued") or []:
+            print(
+                f"cancelled queued leg {_safe_id_prefix(str(leg_id))} — "
+                "that member never receives the message"
+            )
+    if failed:
+        # Keep the local sent copy: the failed members still hold the
+        # message, and the record carries the leg ids and send time a
+        # retry needs.  A failed retract never erases the local copy.
+        raise NodeError(
+            "group retract reached only some members: "
+            + "; ".join(
+                f"{short_hash(str(r.get('to') or ''))}: "
+                f"{r.get('error') or 'unknown error'}"
+                for r in failed
+            )
+            + "; retry `tau retract` when they are online"
+        )
+
+    # Every member received the retract: drop this node's own sent copy
+    # too, so the message is gone on all sides.  A local delete failure
+    # is reported, not hidden — the retract itself already succeeded.
+    try:
+        inbox.delete(str(target["id"]))
+    except InboxError as exc:
+        raise NodeError(
+            "group retract delivered but the local copy could not be deleted:"
+            f" {exc}"
+        ) from exc
+    # The sent record lives in mailbox.json, not the inbox: drop it
+    # too, or `tau messages --sent` keeps showing the retracted text.
+    # Each leg has its own sent record, so drop every leg id.
+    mailbox = Mailbox(config.mailbox_path)
+    for leg_id in target.get("leg_ids") or [target["id"]]:
+        mailbox.discard_sent(str(leg_id))
+    return _EXIT_OK
+
+
 def cmd_retract(args: argparse.Namespace) -> int:
     config = _make_config(args)
     inbox = Inbox(config.inbox_path)
@@ -8218,7 +8416,7 @@ def cmd_retract(args: argparse.Namespace) -> int:
             " only your own sent messages can be retracted"
         )
     if target.get("kind") == "group":
-        raise NodeError("group messages cannot be retracted in v1")
+        return _retract_group_message(args, config, inbox, registry, target)
     recipient = target.get("destination") or ""
     if not recipient:
         raise NodeError("that message has no known recipient to retract from")

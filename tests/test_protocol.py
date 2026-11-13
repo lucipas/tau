@@ -387,6 +387,46 @@ def test_retract_roundtrip():
     assert isinstance(parsed["sent_at"], float)
 
 
+def test_retract_group_context_roundtrip():
+    from tau.protocol import encode_retract, parse_retract
+
+    data = encode_retract(
+        "leg-1",
+        message_id="retract-1",
+        group="ab" * 16,
+        target_author="cd" * 16,
+        target_sent_at=100.0,
+    )
+    parsed = parse_retract(data)
+    assert parsed["target"] == "leg-1"
+    assert parsed["group"] == "ab" * 16
+    assert parsed["target_author"] == "cd" * 16
+    assert parsed["target_sent_at"] == 100.0
+
+
+def test_retract_drops_malformed_group_context():
+    from tau.protocol import encode, parse_retract
+
+    # Malformed context is advisory: the retract still parses, with
+    # the context dropped — the target id alone is still valid.
+    parsed = parse_retract(
+        encode(
+            {
+                "type": "retraction",
+                "target": "msg-1",
+                "sent_at": 10.0,
+                "group": "not-hex",
+                "target_author": 42,
+                "target_sent_at": "soon",
+            }
+        )
+    )
+    assert parsed["target"] == "msg-1"
+    assert parsed["group"] is None
+    assert parsed["target_author"] is None
+    assert parsed["target_sent_at"] is None
+
+
 def test_parse_retract_rejects_wrong_shape():
     from tau.protocol import encode_retract, parse_retract
 

@@ -57,6 +57,27 @@ class _FakeRunningNode:
         self.calls.append(("retract", target, message_id))
         return {"ok": True, "target": message_id, "deleted": True, "id": "r-1"}
 
+    def send_group_retraction(self, group, message_id, **kwargs):
+        self.calls.append(
+            ("retract_group", group, message_id, kwargs.get("target_sent_at"))
+        )
+        return {
+            "ok": True,
+            "group": group,
+            "target": message_id,
+            "id": "r-1",
+            "cancelled_queued": [],
+            "results": [
+                {
+                    "to": "ab" * 16,
+                    "to_name": "alice",
+                    "delivered": True,
+                    "deleted": True,
+                    "id": "r-1",
+                }
+            ],
+        }
+
     def send_edit(self, target, message_id, text, **kwargs):
         self.calls.append(("edit", target, message_id, text))
         return {"ok": True, "target": message_id, "edited": True, "id": "e-1"}
@@ -186,6 +207,65 @@ def test_retract_uses_running_node(tmp_path, capsys, monkeypatch):
         assert _FakeLocalNode.instances == []
         assert node.calls == [("retract", recipient_hash.hex(), "m-9")]
         assert "retracted" in capsys.readouterr().out
+        assert Inbox(config.inbox_path).list_messages(direction="out") == []
+        assert Mailbox(config.mailbox_path).sent_list() == []
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_group_retract_uses_running_node(tmp_path, capsys, monkeypatch):
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-10", to=recipient_hash, text="group hello"
+    )
+    node = _FakeRunningNode(config)
+    server = SendServer(
+        data_dir, lambda **request: cli._dispatch_local_send(node, **request)
+    )
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-10"]) == 0
+        # No one-shot node started: the serving node carried the retract.
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [
+            ("retract_group", "ab" * 16, "m-10", 100.0)
+        ]
+        assert "retracted your group message" in capsys.readouterr().out
         assert Inbox(config.inbox_path).list_messages(direction="out") == []
         assert Mailbox(config.mailbox_path).sent_list() == []
     finally:

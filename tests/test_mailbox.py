@@ -891,6 +891,63 @@ def test_retraction_markers_persist_and_expire(tmp_path):
     assert reloaded.is_retracted(sender, "msg-1") is False
 
 
+def test_group_retraction_markers_persist_and_expire(tmp_path):
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    sender = "aa" * 32
+    group = "cc" * 16
+    assert box.is_group_retracted(sender, group, 100.0) is False
+
+    recorded_at = time.time()
+    box.record_group_retraction(sender, group, 100.0, now=recorded_at)
+    assert box.is_group_retracted(sender, group, 100.0) is True
+    # Keyed by (sender, group, send time): any other triple is
+    # unaffected, and a non-numeric send time never matches.
+    assert box.is_group_retracted("bb" * 32, group, 100.0) is False
+    assert box.is_group_retracted(sender, "dd" * 16, 100.0) is False
+    assert box.is_group_retracted(sender, group, 101.0) is False
+    assert box.is_group_retracted(sender, group, "soon") is False
+    assert box.counts()["retracted"] == 1
+
+    # The marker survives a reload, and lifts once its retention ends.
+    reloaded = Mailbox(path)
+    assert reloaded.is_group_retracted(sender, group, 100.0) is True
+    assert (
+        reloaded.is_group_retracted(
+            sender, group, 100.0, now=recorded_at + RETRACTED_RETENTION - 1
+        )
+        is True
+    )
+    assert (
+        reloaded.is_group_retracted(
+            sender, group, 100.0, now=recorded_at + RETRACTED_RETENTION
+        )
+        is False
+    )
+
+    removed = reloaded.prune(now=recorded_at + RETRACTED_RETENTION)
+    assert removed["retracted"] == 1
+    assert reloaded.counts()["retracted"] == 0
+    assert reloaded.is_group_retracted(sender, group, 100.0) is False
+
+
+def test_group_retraction_markers_are_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(mailbox_module, "MAX_GROUP_RETRACTED", 2)
+    box = Mailbox(tmp_path / "mailbox.json")
+    sender = "aa" * 32
+    box.record_group_retraction(sender, "cc" * 16, 100.0, now=1000.0)
+    box.record_group_retraction(sender, "dd" * 16, 100.0, now=1001.0)
+    assert box.counts()["retracted"] == 2
+    # The third marker evicts the one expiring soonest.
+    box.record_group_retraction(sender, "ee" * 16, 100.0, now=1002.0)
+    assert box.counts()["retracted"] == 2
+    assert box.is_group_retracted(sender, "cc" * 16, 100.0, now=1002.0) is False
+    assert box.is_group_retracted(sender, "ee" * 16, 100.0, now=1002.0) is True
+    # Re-recording a marker refreshes it instead of growing the set.
+    box.record_group_retraction(sender, "dd" * 16, 100.0, now=2000.0)
+    assert box.counts()["retracted"] == 2
+
+
 def test_retraction_markers_are_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(mailbox_module, "MAX_RETRACTED", 3)
     box = Mailbox(tmp_path / "mailbox.json")

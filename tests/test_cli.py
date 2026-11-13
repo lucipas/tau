@@ -5837,22 +5837,169 @@ def test_retract_refuses_a_received_message(tmp_path, capsys, monkeypatch):
     assert _FakeRetractNode.instances == []
 
 
-def test_retract_refuses_group_messages(tmp_path, capsys, monkeypatch):
+def test_retract_sends_group_retract_and_deletes_the_local_copy(
+    tmp_path, capsys, monkeypatch
+):
     data_dir, recipient_hash = _seed_sent_message(tmp_path)
     config = TauConfig.resolve(data_dir=data_dir, name="bob")
     inbox = Inbox(config.inbox_path)
     inbox.append(
         {
             "from": "bob",
-            "destination": recipient_hash.hex(),
+            "destination": "",
             "text": "group hello",
             "sent_at": 12.0,
             "received_at": 22.0,
             "id": "m-10",
             "direction": "out",
             "kind": "group",
-            "group": "c" * 32,
+            "group": "ab" * 16,
             "group_name": "team",
+            "leg_ids": ["m-10", "m-11"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    mailbox = Mailbox(config.mailbox_path)
+    mailbox.record_sent("m-10", to=recipient_hash, text="group hello")
+    mailbox.record_sent("m-11", to=recipient_hash, text="group hello")
+
+    class _GroupNode(_FakeRetractNode):
+        def send_group_retraction(
+            self,
+            group,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, target_sent_at))
+            return {
+                "ok": True,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "deleted": True,
+                        "id": "r-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _GroupNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "retracted your group message" in out
+    assert "alice" in out
+    node = _FakeRetractNode.instances[0]
+    assert node.started is False
+    assert node.sent == [("ab" * 16, "m-10", 100.0)]
+    # The local sent copy is gone too (the seeded m-9 DM stays).
+    outbox = Inbox(config.inbox_path).list_messages(direction="out")
+    assert [m["id"] for m in outbox] == ["m-9"]
+    # So are the sent records for every leg: `tau messages --sent`
+    # must not keep showing the retracted text.
+    assert Mailbox(config.mailbox_path).sent_list() == []
+
+
+def test_retract_keeps_group_copy_when_a_member_is_unreachable(
+    tmp_path, capsys, monkeypatch
+):
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
+            "leg_sent_at": 100.0,
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-10", to=recipient_hash, text="group hello"
+    )
+
+    class _PartialNode(_FakeRetractNode):
+        def send_group_retraction(
+            self,
+            group,
+            message_id,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            return {
+                "ok": False,
+                "group": group,
+                "target": message_id,
+                "id": "r-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "ok": False,
+                        "error": "no route to peer",
+                        "id": "r-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _PartialNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "some members" in err
+    assert "no route to peer" in err
+    # The failed retract leaves the local sent copy in place, so the
+    # user can retry once the member is online (the seeded m-9 DM
+    # stays alongside it).
+    outbox = Inbox(config.inbox_path).list_messages(direction="out")
+    assert {m["id"] for m in outbox} == {"m-9", "m-10"}
+    assert len(Mailbox(config.mailbox_path).sent_list()) == 1
+
+
+def test_retract_refuses_group_message_without_leg_send_time(
+    tmp_path, capsys, monkeypatch
+):
+    # A group message sent before group retracts landed carries no
+    # shared leg send time, so no context can name it for the members.
+    data_dir, recipient_hash = _seed_sent_message(tmp_path)
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": "",
+            "text": "group hello",
+            "sent_at": 12.0,
+            "received_at": 22.0,
+            "id": "m-10",
+            "direction": "out",
+            "kind": "group",
+            "group": "ab" * 16,
+            "group_name": "team",
+            "leg_ids": ["m-10"],
         }
     )
     monkeypatch.setattr(cli, "TauNode", _FakeRetractNode)
@@ -5860,7 +6007,7 @@ def test_retract_refuses_group_messages(tmp_path, capsys, monkeypatch):
 
     code = cli.main(["retract", "--data-dir", str(data_dir), "m-10"])
     assert code == cli._EXIT_ERROR
-    assert "group messages cannot be retracted" in capsys.readouterr().err
+    assert "no leg send time" in capsys.readouterr().err
     assert _FakeRetractNode.instances == []
 
 

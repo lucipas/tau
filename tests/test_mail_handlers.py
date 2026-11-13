@@ -3579,11 +3579,27 @@ def test_send_reaction_validates_before_resolving(tmp_path):
         node.send_reaction("alice", "msg-1", "x" * 33)
 
 
-def signed_retract(sender, target, message_id, *, sent_at=None):
+def signed_retract(
+    sender,
+    target,
+    message_id,
+    *,
+    sent_at=None,
+    group=None,
+    target_author=None,
+    target_sent_at=None,
+):
     """A retract payload signed by *sender*, as send_retraction builds it."""
     import base64
 
-    payload = retract_dict(target, message_id=message_id, sent_at=sent_at)
+    payload = retract_dict(
+        target,
+        message_id=message_id,
+        sent_at=sent_at,
+        group=group,
+        target_author=target_author,
+        target_sent_at=target_sent_at,
+    )
     signature = sender.sign(encode(payload))
     payload["sig"] = base64.b64encode(signature).decode("ascii")
     return encode(payload)
@@ -3725,30 +3741,173 @@ def test_retract_denied_by_allow_list(tmp_path):
     assert len(node.inbox.list_messages()) == 1
 
 
-def test_retract_refuses_group_messages(tmp_path):
+def test_retract_deletes_the_senders_own_group_message(tmp_path):
     node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
     sender = RNS.Identity()
     sender_hash = destination_hash(sender).hex()
-    node.inbox.append(
-        {
-            "from": "alice",
-            "destination": sender_hash,
-            "text": "group hello",
-            "sent_at": 10.0,
-            "received_at": 20.0,
-            "id": "msg-1",
-            "kind": "group",
-            "group": "c" * 32,
-            "group_name": "team",
-        }
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
     )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(sender, "msg-1", "retract-1"),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["target"] == "msg-1"
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+    # The id marker guards a relayed copy arriving later.
+    assert node.mailbox.is_retracted(sender_hash, "msg-1") is True
+
+
+def test_retract_resolves_group_copy_by_context(tmp_path):
+    # Group sends carry a different wire id per leg: the retract names
+    # the author's leg id, not this node's copy.  The signed group
+    # context resolves this node's own copy instead.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node,
+        group=group,
+        author=sender_hash,
+        sent_at=100.0,
+        message_id="local-leg-9",
+    )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is True
+    assert node.inbox.list_messages() == []
+    # The group marker guards a copy arriving later under any leg id.
+    assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is True
+
+
+def test_retract_records_group_marker_for_unknown_group_copy(tmp_path):
+    # No copy held yet: the retract still records the group-context
+    # marker, and a copy arriving later loses to it instead of
+    # showing a message that was already retracted.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is True
+
+    late = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="late-leg-5",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert late["ok"] is True
+    assert late["duplicate"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_refuses_group_message_from_non_author(tmp_path):
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    other = RNS.Identity()
+    members = [
+        "ab" * 16,
+        sender_hash,
+        destination_hash(other).hex(),
+    ]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
+    )
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(other, "msg-1", "retract-1"),
+        remote_identity=other,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_sender"
+    assert len(node.inbox.list_messages()) == 1
+
+
+def test_retract_refuses_group_message_from_non_member(tmp_path):
+    # The author left the group after the message arrived: the roster
+    # no longer names them, so the retract fails closed — exactly as
+    # a group reaction from a non-member does.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = [
+        "ab" * 16,
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+    _seed_group_copy(
+        node, group=group, author=sender_hash, sent_at=100.0, message_id="msg-1"
+    )
+
     response = call_handler(
         node._handle_retract,
         signed_retract(sender, "msg-1", "retract-1"),
         remote_identity=sender,
     )
     assert response["ok"] is False
-    assert response["error"]["code"] == "not_supported"
+    assert response["error"]["code"] == "not_a_member"
     assert len(node.inbox.list_messages()) == 1
 
 

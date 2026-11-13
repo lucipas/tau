@@ -1868,6 +1868,15 @@ class TauNode:
         # probe marks unseen ids as seen. Only the expired path above is
         # closed; scoping seen entries per group/sender is still open.
         duplicate = bool(message_id and self.mailbox.is_seen(message_id))
+        if not duplicate and message_id:
+            # A retract that arrived before this copy suppresses it:
+            # the group marker names the logical message, so a copy
+            # arriving after the retract still loses to it even though
+            # its wire id differs per leg.  Answered as a duplicate
+            # so the sender does not retry or queue it.
+            duplicate = self.mailbox.is_group_retracted(
+                caller_hash, group["id"], message.get("sent_at")
+            )
         if not duplicate:
             record = {
                 "from": caller_name,
@@ -1930,6 +1939,16 @@ class TauNode:
                             # current on-disk state — skip the append
                             # and the notification, exactly as the
                             # relayed path does (see _deliver_collected).
+                            duplicate = True
+                        elif self.mailbox.is_group_retracted(
+                            caller_hash,
+                            group["id"],
+                            message.get("sent_at"),
+                        ):
+                            # A retract landed between the pre-check
+                            # and the append: the copy still loses to
+                            # it, and the sender is told it is a
+                            # duplicate so it is not retried.
                             duplicate = True
                         else:
                             voided = self.inbox.append_group_message(
@@ -2566,7 +2585,37 @@ class TauNode:
                 stored = self.inbox.resolve(retract["target"])
             except ValueError:
                 stored = None
-            if stored is None or stored.get("id") != retract["target"]:
+            # Group legs carry a different wire id per recipient, so
+            # the target id alone only matches the author's sent
+            # record — never this node's copy.  When the signed group
+            # context is present, resolve this node's copy from it
+            # instead (see _handle_reaction): the context is covered
+            # by the signature verified above, so a relay cannot
+            # retarget the retract onto a different message.  A copy
+            # resolved this way deletes by its own id below.
+            group_id = retract.get("group")
+            target_author = retract.get("target_author")
+            target_sent_at = retract.get("target_sent_at")
+            has_group_context = (
+                group_id is not None
+                and target_author is not None
+                and target_sent_at is not None
+            )
+            target_id = retract["target"]
+            if stored is not None and stored.get("id") == retract["target"]:
+                pass
+            elif has_group_context:
+                local = self.inbox.find_group_message(
+                    group_id, target_author, target_sent_at
+                )
+                if local is None:
+                    stored = None
+                else:
+                    stored = local
+                    target_id = str(local["id"])
+            else:
+                stored = None
+            if stored is None:
                 # No stored copy to check the sender against — the message
                 # may already be deleted or never have arrived.  Record the
                 # marker anyway: the retract is authenticated, and a copy
@@ -2574,9 +2623,16 @@ class TauNode:
                 # seen cache) must still lose to it.  The key carries the
                 # caller's own hash, so a sender can only ever suppress
                 # their own messages this way.  If the marker cannot be
-                # persisted the retract is not confirmed.
+                # persisted the retract is not confirmed.  A group
+                # retract also records the group-context marker, so a
+                # copy arriving later under its own leg id still loses
+                # to it even though no per-leg id can name it.
                 try:
                     self._record_retraction(caller_hash, retract["target"])
+                    if has_group_context:
+                        self.mailbox.record_group_retraction(
+                            caller_hash, group_id, target_sent_at
+                        )
                 except Exception as exc:
                     log.warning(
                         "Could not record retraction marker for %s",
@@ -2606,27 +2662,42 @@ class TauNode:
                     "file transfers cannot be retracted",
                 )
             if stored.get("kind") == "group":
-                # A group message lives in every member's inbox; deleting
-                # it from one member alone would silently half-retract it.
-                # Group fan-out retract is a follow-up, not v1.
-                return response_error(
-                    "not_supported",
-                    "group messages cannot be retracted in v1",
-                )
+                # A group message lives in every member's inbox; this
+                # leg deletes only this member's copy, and the sender
+                # fans the retract out to the rest.  Membership is
+                # checked against the pinned roster, exactly as for a
+                # group reaction: an allow-listed outsider who learned
+                # a group id must not retract a retained copy, and a
+                # missing roster fails closed (the group was deleted,
+                # so there is no membership to verify).  The author
+                # check above already ran: a group record's
+                # destination is its author.
+                pinned = pinned_group(self.groups, stored.get("group") or "")
+                if pinned is None or caller_hash not in (
+                    pinned.get("members") or []
+                ):
+                    return response_error(
+                        "not_a_member",
+                        "sender is not a group member",
+                    )
             # Record the marker before deleting the copy: if it cannot be
             # persisted, nothing is deleted and the retract fails cleanly.
             # (A refused retract records nothing: the message stays, so it
             # must stay deliverable.)  The marker is confirmed: the
             # retract was honoured against a stored copy, so a flood of
-            # unknown-ID markers must not evict it at the cap.
+            # unknown-ID markers must not evict it at the cap.  A group
+            # retract also records the group-context marker, so a copy
+            # arriving later under another leg id still loses to it.
             try:
-                self._record_retraction(
-                    caller_hash, retract["target"], confirmed=True
-                )
+                self._record_retraction(caller_hash, target_id, confirmed=True)
+                if has_group_context:
+                    self.mailbox.record_group_retraction(
+                        caller_hash, group_id, target_sent_at
+                    )
             except Exception as exc:
                 log.warning(
                     "Could not record retraction marker for %s",
-                    retract["target"][:8],
+                    target_id[:8],
                     exc_info=True,
                 )
                 return response_error(
@@ -2641,7 +2712,7 @@ class TauNode:
             # stale between here and the delete.
             try:
                 removed = self.inbox.delete_authorized(
-                    retract["target"], direction="in", destination=caller_hash
+                    target_id, direction="in", destination=caller_hash
                 )
             except InboxError as exc:
                 return response_error(
@@ -4190,8 +4261,9 @@ class TauNode:
         # same transaction, so a concurrent retract cannot land
         # between the marker check and the append — the marker
         # outlives the seen cache, so a relayed copy arriving after
-        # the id was evicted still loses to it.  Group messages are
-        # not retractable in v1, so they never match a marker.
+        # the id was evicted still loses to it.  Group copies check
+        # the group-context marker as well as the id marker, since
+        # legs carry different wire ids.
         publish_ok = True
         recorded = False
         if pinned is not None:
@@ -4210,6 +4282,30 @@ class TauNode:
                             f"held envelope {held_id} no longer held"
                         )
                     if self.mailbox.is_seen(message["id"]):
+                        return False
+                    if self.mailbox.is_group_retracted(
+                        message.get("from")
+                        if isinstance(message.get("from"), str)
+                        else "",
+                        pinned["id"],
+                        message.get("sent_at"),
+                    ) or self.mailbox.is_retracted(
+                        message.get("from")
+                        if isinstance(message.get("from"), str)
+                        else "",
+                        message["id"],
+                    ):
+                        # A retract that arrived before this relayed
+                        # copy suppresses it: the group marker names
+                        # the logical message, so a copy arriving
+                        # after the retract still loses to it even
+                        # though its wire id differs per leg, and the
+                        # id marker covers a copy retracted after it
+                        # arrived.  The copy is dropped, never stored.
+                        log.info(
+                            "Dropping retracted relayed group message %s",
+                            message["id"],
+                        )
                         return False
                     voided = self.inbox.append_group_message(
                         record,
@@ -4258,8 +4354,9 @@ class TauNode:
                 ):
                     # A retract the sender issued after this copy was sealed
                     # still wins: the marker outlives the seen cache, so a
-                    # relayed copy is dropped, never stored.  Group messages
-                    # are not retractable in v1, so they never match a marker.
+                    # relayed copy is dropped, never stored.  (Group
+                    # copies are checked in the branch above, against
+                    # the group-context marker as well as the id one.)
                     log.info("Dropping retracted relayed message %s", message["id"])
                 else:
                     self.mailbox.mark_seen(message["id"])
@@ -5157,7 +5254,10 @@ class TauNode:
         # and evict sent DMs from the shared sent cap.  The record
         # carries every delivered-or-queued leg id so any leg can be
         # quoted; it has no single member destination, so a direct
-        # reply can never resolve against it.
+        # reply can never resolve against it.  ``leg_sent_at`` is the
+        # legs' shared send time: a later retract names the logical
+        # message by (group, author, leg_sent_at), since the legs
+        # carry different wire ids.
         if sent_leg_ids:
             self._record_sent(
                 {
@@ -5171,6 +5271,7 @@ class TauNode:
                     "received_at": time.time(),
                     "id": sent_leg_ids[0],
                     "leg_ids": list(sent_leg_ids),
+                    "leg_sent_at": sent_at,
                     "direction": "out",
                     **({"in_reply_to": reply_to} if reply_to is not None else {}),
                 }
@@ -5744,14 +5845,9 @@ class TauNode:
             raise NodeError("retract target must be a message id of 1-64 characters")
         if self.identity is None:
             raise NodeError("node has not been started")
-        retract_id = generate_message_id()
-        payload = retract_dict(target_id, message_id=retract_id)
-        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
-        signature = self.identity.sign(canonical)
-        if signature is None:  # pragma: no cover - identity without private keys
-            raise NodeError("could not sign retraction")
-        payload["sig"] = base64.b64encode(signature).decode("ascii")
-        payload_bytes = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        payload_bytes, retract_id, _sent_at = self._signed_retraction_payload(
+            target_id
+        )
         peer = self.resolve_peer(
             target,
             timeout=discover_timeout
@@ -5760,6 +5856,196 @@ class TauNode:
         )
         response = self._request(peer, REQUEST_RETRACT, payload_bytes, timeout)
         return dict(response, id=retract_id)
+
+    def _signed_retraction_payload(
+        self,
+        target_id: str,
+        *,
+        group: Optional[str] = None,
+        target_author: Optional[str] = None,
+        target_sent_at: Optional[float] = None,
+    ) -> Tuple[bytes, str, float]:
+        """Build and sign one retract payload.
+
+        Returns ``(payload_bytes, retract_id, sent_at)``.  The
+        retract id is part of the signed payload, so a fan-out that
+        reuses these bytes sends every member the same retract — one
+        id, one signature — instead of a fresh retract per leg.
+
+        ``group`` / ``target_author`` / ``target_sent_at`` name the
+        group message being retracted, when the target is one: group
+        sends carry a different wire id per leg, so the target id
+        alone only matches the author's sent record, and a receiver
+        needs the context to find its own copy.
+        """
+        if self.identity is None:
+            raise NodeError("node has not been started")
+        retract_id = generate_message_id()
+        sent_at = time.time()
+        payload = retract_dict(
+            target_id,
+            message_id=retract_id,
+            sent_at=sent_at,
+            group=group,
+            target_author=target_author,
+            target_sent_at=target_sent_at,
+        )
+        canonical = encode(payload, max_bytes=MAX_REQUEST_BYTES)
+        signature = self.identity.sign(canonical)
+        if signature is None:  # pragma: no cover - identity without private keys
+            raise NodeError("could not sign retraction")
+        payload["sig"] = base64.b64encode(signature).decode("ascii")
+        return encode(payload, max_bytes=MAX_REQUEST_BYTES), retract_id, sent_at
+
+    def send_group_retraction(
+        self,
+        group: Union[str, Dict[str, Any]],
+        message_id: str,
+        *,
+        timeout: float = 20.0,
+        discover_timeout: Optional[float] = None,
+        target_sent_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fan a retraction of a group message out to every member.
+
+        *group* is a group id, id prefix, name, or group record.
+        The retract is built and signed once — one retract id — and
+        the same bytes go to every member except this node, one leg
+        per member with the same per-leg timeout a group send uses,
+        so one slow member cannot starve the rest.  The payload
+        carries the signed group context (group, author, shared send
+        time), so each member resolves its own copy even though legs
+        carry different wire ids (see :meth:`_handle_retract`).
+
+        A leg still queued in the outbox when the retract runs is
+        cancelled first, so an offline member never receives a message
+        that was already retracted — the live retract still goes out
+        to them, so a copy that reached them another way (a relay
+        holder) is deleted and the group marker suppresses any copy
+        arriving later.  Returns a per-member result list; ``ok`` is
+        true only when every member received the retract.  A failed
+        leg reports an ``error`` instead of queueing: like DM
+        retracts, group retracts are live-only in v1.
+        """
+        target_id = message_id.strip() if isinstance(message_id, str) else ""
+        if not target_id or len(target_id) > 64:
+            raise NodeError("retract target must be a message id of 1-64 characters")
+        if (
+            target_sent_at is None
+            or isinstance(target_sent_at, bool)
+            or not isinstance(target_sent_at, (int, float))
+        ):
+            raise NodeError(
+                "group retract needs the message's shared send time; "
+                "messages sent before group retracts landed carry no "
+                "leg send time, so this one cannot be retracted"
+            )
+        if isinstance(group, str):
+            group = self.groups.find(group)
+        own_hash = self.destination_hexhash
+        members = [m for m in group["members"] if m != own_hash]
+        if not members:
+            # A usage error, not a delivery failure: the console maps
+            # it to a 400 and the CLI prints it plain, instead of a
+            # 502 / a misleading "peer offline" suffix.
+            raise ValueError("group has no other members to retract from")
+        cancelled: List[str] = []
+        for entry in self.mailbox.outbox_list():
+            if (
+                entry.group_id == group["id"]
+                and entry.wire_sent_at == float(target_sent_at)
+            ):
+                if self.mailbox.remove_outbox(entry.id):
+                    cancelled.append(entry.id)
+        payload_bytes, retract_id, _sent_at = self._signed_retraction_payload(
+            target_id,
+            group=group["id"],
+            target_author=own_hash,
+            target_sent_at=float(target_sent_at),
+        )
+        results: List[Dict[str, Any]] = []
+        for member in members:
+            # One deadline bounds each leg, exactly as in
+            # send_group_message: the stages of a single delivery
+            # share the leg's budget, but one member's leg must not
+            # consume another's.
+            deadline = time.monotonic() + timeout
+            budget = _remaining(deadline) or 0.0
+            if budget <= 0.0:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": "",
+                        "ok": False,
+                        "error": "not attempted: group retract time limit reached",
+                        "id": retract_id,
+                    }
+                )
+                continue
+            peer: Optional[Peer] = None
+            try:
+                peer = self.resolve_peer(
+                    member,
+                    timeout=min(
+                        discover_timeout
+                        if discover_timeout is not None
+                        else min(timeout, 10.0),
+                        budget,
+                    ),
+                )
+                response = self._request(
+                    peer,
+                    REQUEST_RETRACT,
+                    payload_bytes,
+                    _remaining(deadline) or 0.0,
+                    deadline=deadline,
+                )
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name,
+                        "delivered": True,
+                        "deleted": bool(response.get("deleted")),
+                        "id": retract_id,
+                        "rtt": response.get("_rtt"),
+                    }
+                )
+            except (NotAllowedError, NotAMemberError) as exc:
+                # The member is online and explicitly refused; a
+                # retract has no outbox to queue into, so the leg
+                # is simply reported as failed.
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": "not_allowed"
+                        if isinstance(exc, NotAllowedError)
+                        else "not_a_member",
+                        "id": retract_id,
+                    }
+                )
+            except NodeError as exc:
+                results.append(
+                    {
+                        "to": member,
+                        "to_name": peer.display_name if peer is not None else "",
+                        "ok": False,
+                        "error": str(exc),
+                        "id": retract_id,
+                    }
+                )
+        all_ok = all(result.get("delivered") for result in results)
+        return {
+            "ok": all_ok,
+            "v": PROTOCOL_VERSION,
+            "group": group["id"],
+            "name": group["name"],
+            "target": target_id,
+            "id": retract_id,
+            "cancelled_queued": cancelled,
+            "results": results,
+        }
 
 
     def send_edit(

@@ -199,6 +199,22 @@ def _valid_record(raw: Any) -> Optional[Dict[str, Any]]:
                 cleaned_legs.append(leg)
         if cleaned_legs:
             record["leg_ids"] = cleaned_legs
+    leg_sent_at = raw.get("leg_sent_at")
+    if leg_sent_at is not None:
+        # The shared send time of a group fan-out's legs: a later
+        # retract names the logical message by (group, author,
+        # leg_sent_at), since legs carry different wire ids.  A
+        # malformed value drops the field instead of the record —
+        # the message is still readable, just not retractable as a
+        # group message.
+        try:
+            leg_sent_at = float(leg_sent_at)
+        except (TypeError, ValueError):
+            leg_sent_at = None
+        if leg_sent_at is not None and not math.isfinite(leg_sent_at):
+            leg_sent_at = None
+        if leg_sent_at is not None:
+            record["leg_sent_at"] = leg_sent_at
     if raw.get("pinned"):
         record["pinned"] = True
     kind = raw.get("kind")
