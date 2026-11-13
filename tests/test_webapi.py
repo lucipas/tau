@@ -9546,6 +9546,129 @@ def test_delete_by_wire_id_removes_the_console_copy(bridge):
     assert deleted_events[0]["message_id"] == 1
 
 
+def test_delete_sent_by_wire_id_removes_only_the_outbound_copy(bridge):
+    sent = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="take this back",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        wire_id="wire-1",
+    )
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="keep me",
+        sent_at=102.0,
+        received_at=103.0,
+        status="delivered",
+        wire_id="wire-2",
+    )
+    # An inbound message carrying the same wire id is a different
+    # record: the sent delete must not touch it.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "same id, other direction",
+            "sent_at": 104.0,
+            "received_at": 105.0,
+            "id": "wire-1",
+        }
+    )
+    assert bridge.delete_sent_by_wire_id("missing") is None
+    assert bridge.delete_sent_by_wire_id("") is None
+
+    result = bridge.delete_sent_by_wire_id("wire-1")
+    assert result == {"ok": True, "deleted": {"id": sent["id"], "wire_id": "wire-1"}}
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["wire-2", "wire-1"]
+    deleted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert len(deleted_events) == 1
+    assert deleted_events[0]["message_id"] == sent["id"]
+
+
+def test_delete_sent_group_removes_only_the_matching_legs(bridge):
+    group = "cd" * 16
+    leg_one = bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="group hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        group=group,
+        wire_id="leg-1",
+    )
+    leg_two = bridge._append_message(
+        direction="out",
+        peer="ef" * 16,
+        peer_name="bob",
+        text="group hello",
+        sent_at=100.0,
+        received_at=101.0,
+        status="delivered",
+        group=group,
+        wire_id="leg-2",
+    )
+    # Same group, a different send: its leg stays.
+    bridge._append_message(
+        direction="out",
+        peer=PEER_HASH,
+        peer_name="alice",
+        text="later group hello",
+        sent_at=200.0,
+        received_at=201.0,
+        status="delivered",
+        group=group,
+        wire_id="leg-3",
+    )
+    # An inbound message in the same group at the same time stays too.
+    bridge.record_inbound(
+        {
+            "from": "alice",
+            "destination": PEER_HASH,
+            "text": "their group hello",
+            "sent_at": 100.0,
+            "received_at": 101.0,
+            "id": "leg-9",
+            "kind": "group",
+            "group": group,
+        }
+    )
+    assert bridge.delete_sent_group("missing", 100.0) is None
+    assert bridge.delete_sent_group(group, 999.0) is None
+    assert bridge.delete_sent_group("", 100.0) is None
+    assert bridge.delete_sent_group(group, float("nan")) is None
+
+    result = bridge.delete_sent_group(group, 100.0)
+    assert result == {
+        "ok": True,
+        "deleted_ids": [leg_one["id"], leg_two["id"]],
+        "group": group,
+        "sent_at": 100.0,
+    }
+    _, _, feed = _json(bridge, "/api/messages")
+    assert [entry["wire_id"] for entry in feed["messages"]] == ["leg-3", "leg-9"]
+    deleted_events = [
+        event
+        for event in bridge.bus.replay()
+        if event.get("type") == "message_deleted"
+    ]
+    assert [event["message_id"] for event in deleted_events] == [
+        leg_one["id"],
+        leg_two["id"],
+    ]
+
+
 def test_retract_removes_the_recipients_console_copy(tmp_path):
     # End to end: a retract accepted by the node also drops the
     # console's copy, so /api/messages stops showing the text.

@@ -4309,6 +4309,91 @@ class WebBridge:
             "deleted": {"id": target, "wire_id": wire_id},
         }
 
+    def delete_sent_by_wire_id(self, wire_id: str) -> Optional[Dict[str, Any]]:
+        """Delete the console history entry for one of this node's sent DMs.
+
+        Called when this node retracts its own sent message through the
+        CLI while the console is serving: the peer already deleted
+        their copy and the CLI deletes the local inbox copy next, so
+        the console's outbound entry goes too — otherwise the feed
+        keeps showing a message the inbox no longer has, including
+        after a restart.  Only an outbound entry can match, mirroring
+        :meth:`delete_by_wire_id` for the inbound side.  Returns the
+        delete result, or ``None`` when no outbound entry carries that
+        wire id (the console window may not cover it).
+        """
+        if not isinstance(wire_id, str) or not wire_id:
+            return None
+        with self._lock:
+            removed = next(
+                (
+                    message
+                    for message in self._messages
+                    if message.get("direction") == "out"
+                    and message.get("wire_id") == wire_id
+                ),
+                None,
+            )
+            if removed is None:
+                # No entry to remove, but the retraction succeeded:
+                # remember the id so a pending delivery callback
+                # cannot append the message afterwards.
+                self._remember_removed_wire_id(wire_id)
+                return None
+            target = removed.get("id")
+        self._remove_history_entry(target, removed, publish_unread=True)
+        return {
+            "ok": True,
+            "deleted": {"id": target, "wire_id": wire_id},
+        }
+
+    def delete_sent_group(
+        self, group_id: str, sent_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """Delete the console history entries for one sent group message.
+
+        A group send records one outbound entry per leg, all sharing
+        the group's id and the send's shared wire time, so the legs
+        are gathered the same way :meth:`_retract_group_message`
+        gathers them — by group and shared send time, not by wire id,
+        since the legs carry different ids.  Called when this node
+        retracts its own sent group message through the CLI after the
+        fan-out reached every member; a partial fan-out never calls
+        it, so the bubbles stay retryable.  Returns the delete result
+        with every removed console id, or ``None`` when no outbound
+        entry matches (the console window may not cover the send).
+        """
+        if not isinstance(group_id, str) or not group_id:
+            return None
+        if (
+            not isinstance(sent_at, (int, float))
+            or isinstance(sent_at, bool)
+            or not math.isfinite(sent_at)
+        ):
+            return None
+        with self._lock:
+            legs = [
+                message
+                for message in self._messages
+                if message.get("direction") == "out"
+                and message.get("group") == group_id
+                and message.get("sent_at") == float(sent_at)
+            ]
+        if not legs:
+            return None
+        removed_ids = []
+        for leg in legs:
+            self._remove_history_entry(
+                leg["id"], leg, publish_unread=True
+            )
+            removed_ids.append(leg["id"])
+        return {
+            "ok": True,
+            "deleted_ids": removed_ids,
+            "group": group_id,
+            "sent_at": float(sent_at),
+        }
+
     def outbox(self) -> Dict[str, Any]:
         """Queued mail waiting on offline peers, with recipient names.
 

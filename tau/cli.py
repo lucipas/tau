@@ -4661,7 +4661,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try:
             send_server = SendServer(
                 config.data_dir,
-                lambda **request: _dispatch_local_send(node, **request),
+                lambda **request: _dispatch_local_send(
+                    node, bridge=bridge, **request
+                ),
             )
         except Exception:
             # The send socket is best-effort: a data directory too long
@@ -5587,7 +5589,9 @@ def _edit_local_message(
     )
 
 
-def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
+def _dispatch_local_send(
+    node: TauNode, *, bridge: Any = None, **request: Any
+) -> Dict[str, Any]:
     """Serve one local send-socket request: a DM send, a retraction, a
     group retraction, or an edit.
 
@@ -5597,17 +5601,81 @@ def _dispatch_local_send(node: TauNode, **request: Any) -> Dict[str, Any]:
     and ``"edit"`` run the retraction, the group retraction and the edit
     on the serving node, so ``tau retract`` and ``tau edit`` work while
     ``tau serve`` holds the data directory.
+
+    With a console bridge attached, a retract that succeeds also drops
+    the serving console's copy of the sent message: the peer deleted
+    their copy and the CLI deletes the local inbox copy next, so the
+    feed must match the inbox — otherwise the console keeps showing a
+    message that is gone on both sides, including after a restart.
+    A group retract drops the legs only when the fan-out reached every
+    member (``ok``), mirroring the CLI, which keeps its copy on a
+    partial fan-out so the retract stays retryable.  The console drop
+    is best-effort and never fails the retract itself: the retraction
+    already succeeded on the wire, so a console failure only logs —
+    the entry stays, exactly as before this change.
     """
     op = request.pop("op", "send")
     if op == "retract":
-        return _retract_local_message(node, **request)
+        result = _retract_local_message(node, **request)
+        _drop_sent_console_copy(bridge, request.get("message_id"))
+        return result
     if op == "retract_group":
-        return _retract_group_local_message(node, **request)
+        result = _retract_group_local_message(node, **request)
+        if result.get("ok"):
+            _drop_sent_console_group(
+                bridge,
+                request.get("group"),
+                request.get("target_sent_at"),
+            )
+        return result
     if op == "edit":
         return _edit_local_message(node, **request)
     if op == "send":
         return _send_local_message(node, **request)
     raise NodeError(f"unknown local send operation: {op!r}")
+
+
+def _drop_sent_console_copy(bridge: Any, message_id: Any) -> None:
+    """Drop the serving console's outbound entry for one retracted DM.
+
+    Best-effort: a console that cannot drop its copy (or has no entry
+    for it) leaves the retract itself untouched — the CLI still deletes
+    the local inbox copy, and the entry stays as it did before.
+    """
+    if bridge is None:
+        return
+    if not isinstance(message_id, str) or not message_id:
+        return
+    try:
+        bridge.delete_sent_by_wire_id(message_id)
+    except Exception:  # pragma: no cover - console callback
+        log.warning("could not drop retracted message from console", exc_info=True)
+
+
+def _drop_sent_console_group(
+    bridge: Any, group: Any, target_sent_at: Any
+) -> None:
+    """Drop the serving console's outbound legs for one retracted group send.
+
+    Best-effort, like :func:`_drop_sent_console_copy`: the fan-out
+    already reached every member, so a console failure only logs.
+    """
+    if bridge is None:
+        return
+    if not isinstance(group, str) or not group:
+        return
+    if (
+        not isinstance(target_sent_at, (int, float))
+        or isinstance(target_sent_at, bool)
+    ):
+        return
+    try:
+        bridge.delete_sent_group(group, float(target_sent_at))
+    except Exception:  # pragma: no cover - console callback
+        log.warning(
+            "could not drop retracted group message from console",
+            exc_info=True,
+        )
 
 
 def _send_via_local_node(
