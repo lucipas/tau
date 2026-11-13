@@ -4734,7 +4734,24 @@ def test_edit_refuses_a_group_message(tmp_path):
     assert node.inbox.list_messages()[0]["text"] == "group hello"
 
 
-def _seed_group_leg(node, sender, *, leg_id="leg-9", text="group typo"):
+def _seed_group_leg(
+    node, sender, *, leg_id="leg-9", text="group typo", members=None,
+    created_by=None,
+):
+    # The group record pins the roster the edit handler checks the
+    # editor against, like a group retract: the sender must be a
+    # current member.  `members` / `created_by` override the roster,
+    # so an edit from a sender the roster does not name can be tested.
+    own_hash = "ab" * 16  # node.destination hexhash in these tests
+    if members is None:
+        members = [destination_hash(sender).hex(), own_hash]
+    if created_by is None:
+        created_by = destination_hash(sender).hex()
+    group = node.groups.create(
+        "weekend",
+        members,
+        created_by=created_by,
+    )
     node.inbox.append(
         {
             "from": "alice",
@@ -4744,14 +4761,15 @@ def _seed_group_leg(node, sender, *, leg_id="leg-9", text="group typo"):
             "received_at": 20.0,
             "id": leg_id,
             "kind": "group",
-            "group": "c" * 32,
+            "group": group["id"],
             "group_name": "weekend",
         }
     )
+    return group
 
 
 def _signed_group_edit(
-    sender, target, text, message_id, *, sent_at=30.0, author=None
+    sender, target, text, message_id, *, sent_at=30.0, author=None, group=None
 ):
     return signed_edit(
         sender,
@@ -4759,7 +4777,7 @@ def _signed_group_edit(
         text,
         message_id,
         sent_at=sent_at,
-        group="c" * 32,
+        group=group or "c" * 32,
         target_author=destination_hash(author or sender).hex(),
         target_sent_at=100.0,
     )
@@ -4774,12 +4792,14 @@ def test_edit_applies_a_group_edit_via_group_context(tmp_path):
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     sender = RNS.Identity()
-    _seed_group_leg(node, sender)
+    group = _seed_group_leg(node, sender)
     seen = []
     node.on_edit = seen.append
     response = call_handler(
         node._handle_dm_edit,
-        _signed_group_edit(sender, "leg-1", "group fixed", "edit-1"),
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
         remote_identity=sender,
     )
     assert response["ok"] is True
@@ -4818,16 +4838,20 @@ def test_edit_group_ignores_a_stale_edit(tmp_path):
         hexhash="ab" * 16, hash=b"\xab" * 16
     )
     sender = RNS.Identity()
-    _seed_group_leg(node, sender)
+    group = _seed_group_leg(node, sender)
     first = call_handler(
         node._handle_dm_edit,
-        _signed_group_edit(sender, "leg-1", "newer text", "edit-1", sent_at=40.0),
+        _signed_group_edit(
+            sender, "leg-1", "newer text", "edit-1", sent_at=40.0, group=group["id"]
+        ),
         remote_identity=sender,
     )
     assert first["edited"] is True
     second = call_handler(
         node._handle_dm_edit,
-        _signed_group_edit(sender, "leg-1", "older text", "edit-2", sent_at=30.0),
+        _signed_group_edit(
+            sender, "leg-1", "older text", "edit-2", sent_at=30.0, group=group["id"]
+        ),
         remote_identity=sender,
     )
     assert second["ok"] is True
@@ -4843,17 +4867,47 @@ def test_edit_group_rejects_a_non_sender(tmp_path):
     )
     sender = RNS.Identity()
     other = RNS.Identity()
-    _seed_group_leg(node, sender)
+    group = _seed_group_leg(node, sender)
     # The edit is signed by `other` but names the real sender as the
     # group author, so the context resolves the leg — and the author
     # check must still refuse it.
     response = call_handler(
         node._handle_dm_edit,
-        _signed_group_edit(other, "leg-1", "group fixed", "edit-1", author=sender),
+        _signed_group_edit(
+            other, "leg-1", "group fixed", "edit-1", author=sender, group=group["id"]
+        ),
         remote_identity=other,
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "not_sender"
+    assert node.inbox.list_messages()[0]["text"] == "group typo"
+
+
+def test_edit_group_rejects_a_removed_member(tmp_path):
+    # Like a group retract, an edit must come from a current member: a
+    # sender the pinned roster does not name — removed, or never a
+    # member — may not rewrite a retained copy.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    other = RNS.Identity()
+    group = _seed_group_leg(
+        node,
+        sender,
+        members=[destination_hash(other).hex(), "ab" * 16],
+        created_by=destination_hash(other).hex(),
+    )
+    response = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
     assert node.inbox.list_messages()[0]["text"] == "group typo"
 
 

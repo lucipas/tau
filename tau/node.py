@@ -6256,6 +6256,7 @@ class TauNode:
             raise ValueError("group has no other members to edit for")
         cancelled: List[str] = []
         requeue_failed: List[Dict[str, Any]] = []
+        requeued: List[str] = []
         for entry in self.mailbox.outbox_list():
             if (
                 entry.group_id == group["id"]
@@ -6284,6 +6285,7 @@ class TauNode:
                             send_after=entry.send_after,
                             in_reply_to=entry.in_reply_to,
                         )
+                        requeued.append(entry.id)
                     except MailboxError as queue_exc:
                         requeue_failed.append(
                             {
@@ -6430,7 +6432,10 @@ class TauNode:
                         cleaned,
                         edited_at=float(payload["sent_at"]),
                     )
-                except MailboxError as exc:
+                except (MailboxError, OSError) as exc:
+                    # A failed save surfaces as OSError (see
+                    # Mailbox.update_sent_text): it is a local write
+                    # failure like any other, not a crash.
                     log.warning("Could not update sent group edit: %s", exc)
                     local_errors.append(f"sent copy not updated: {exc}")
         return {
@@ -6443,6 +6448,7 @@ class TauNode:
             "id": edit_id,
             "sent_at": float(payload["sent_at"]),
             "cancelled_queued": cancelled,
+            "requeued": requeued,
             "results": results,
         }
 

@@ -520,6 +520,36 @@ def test_dispatch_group_edit_runs_on_the_serving_node(tmp_path):
     assert result["ok"] is False
 
 
+def test_dispatch_group_ops_accept_leg_timeout(tmp_path):
+    # A fan-out client forwards its per-leg bound as `leg_timeout` in
+    # the request (the reply wait stays unbounded, so the operation
+    # timeout cannot travel as `timeout` — send_running swallows that
+    # keyword).  Both fan-out ops must accept it, or the dispatch
+    # raises on the unexpected keyword and the CLI path breaks.
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    node = _FakeRunningNode(config)
+    result = cli._dispatch_local_send(
+        node,
+        op="edit_group",
+        group="ab" * 16,
+        message_id="m-10",
+        text="group fixed",
+        target_sent_at=100.0,
+        leg_timeout=5.0,
+    )
+    assert result["ok"] is True
+    result = cli._dispatch_local_send(
+        node,
+        op="retract_group",
+        group="ab" * 16,
+        message_id="m-10",
+        target_sent_at=100.0,
+        leg_timeout=5.0,
+    )
+    assert result["ok"] is True
+
+
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
 def test_retract_via_running_node_drops_console_copy(tmp_path, capsys, monkeypatch):
     # End to end: a console-sent DM retracted through the CLI while the

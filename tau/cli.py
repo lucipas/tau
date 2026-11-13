@@ -5558,13 +5558,22 @@ def _retract_group_local_message(
     message_id: str,
     target_sent_at: float,
     timeout: float = 20.0,
+    leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Retract a group message on the running node, for the local send server."""
+    """Retract a group message on the running node, for the local send server.
+
+    ``leg_timeout`` is the per-leg bound the client forwards in the
+    request (see :func:`_retract_group_via_running_node`): the reply
+    wait on the socket is unbounded for a fan-out, so the operation
+    timeout cannot travel as ``timeout`` — send_running swallows that
+    keyword as the reply wait.  An older client sends no leg timeout
+    and the default bound applies.
+    """
     return node.send_group_retraction(
         group,
         message_id,
-        timeout=float(timeout),
+        timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=target_sent_at,
     )
@@ -5596,15 +5605,24 @@ def _edit_group_local_message(
     message_id: str,
     text: str,
     target_sent_at: float,
-    leg_timeout: float = 20.0,
+    timeout: float = 20.0,
+    leg_timeout: Optional[float] = None,
     discover_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Edit one group message on the running node, for the local send server."""
+    """Edit one group message on the running node, for the local send server.
+
+    ``leg_timeout`` is the per-leg bound the client forwards in the
+    request (see :func:`_edit_group_via_running_node`): the reply
+    wait on the socket is unbounded for a fan-out, so the operation
+    timeout cannot travel as ``timeout`` — send_running swallows that
+    keyword as the reply wait.  An older client sends no leg timeout
+    and the default bound applies.
+    """
     return node.send_group_edit(
         group,
         message_id,
         text,
-        timeout=float(leg_timeout),
+        timeout=float(leg_timeout if leg_timeout is not None else timeout),
         discover_timeout=discover_timeout,
         target_sent_at=float(target_sent_at),
     )
@@ -5897,6 +5915,8 @@ def _edit_group_via_running_node(
     from .local_send import send_running
 
     try:
+        # The per-leg timeout travels in the request; the reply wait stays
+        # unbounded because a fan-out can outlast any single leg's bound.
         return send_running(
             config.data_dir,
             op="edit_group",
@@ -5904,7 +5924,7 @@ def _edit_group_via_running_node(
             message_id=message_id,
             text=text,
             target_sent_at=target_sent_at,
-            timeout=timeout,
+            leg_timeout=timeout,
             discover_timeout=discover_timeout,
         )
     except LocalIPCUnavailable as exc:
@@ -8723,7 +8743,17 @@ def _edit_group_message(
                     f"could not edit for {name}: "
                     f"{result.get('error') or 'unknown error'}"
                 )
+        requeued = set(response.get("requeued") or [])
         for leg_id in response.get("cancelled_queued") or []:
+            if str(leg_id) in requeued:
+                # The leg went back in the outbox carrying the edited
+                # text, so the offline member still receives the
+                # message — edited — on a later retry.
+                print(
+                    f"re-queued leg {_safe_id_prefix(str(leg_id))} "
+                    "with the edited text"
+                )
+                continue
             # The leg is gone from this node's outbox, so no further
             # attempt goes out from here — but a sealed copy already
             # held by another peer may still arrive if the edit does
@@ -8746,6 +8776,17 @@ def _edit_group_message(
                 for r in failed
             )
             + "; retry `tau edit` when they are online"
+        )
+    local_errors = response.get("local_errors") or []
+    if local_errors:
+        # Every member received the edit, but this node's own copies
+        # did not update: report it instead of a silent success, so
+        # the edit stays retryable — a retry sends a newer edit and
+        # retries the local update.
+        raise NodeError(
+            "group edit delivered but the local copy could not be updated: "
+            + "; ".join(str(e) for e in local_errors)
+            + "; retry `tau edit`"
         )
     return _EXIT_OK
 

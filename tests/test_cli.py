@@ -6192,6 +6192,55 @@ def test_edit_keeps_group_copy_when_a_member_is_unreachable(
     assert "edited_at" not in kept
 
 
+def test_edit_reports_when_the_local_copy_could_not_update(
+    tmp_path, capsys, monkeypatch
+):
+    # Every member received the edit, but the node's own copies did not
+    # update: the CLI must report it instead of a silent success, so
+    # the edit stays retryable.
+    data_dir, recipient_hash = _seed_sent_group_message(tmp_path)
+
+    class _StaleLocalNode(_FakeRetractNode):
+        def send_group_edit(
+            self,
+            group,
+            message_id,
+            text,
+            *,
+            timeout=20.0,
+            discover_timeout=None,
+            target_sent_at=None,
+        ):
+            self.sent.append((group, message_id, text, target_sent_at))
+            return {
+                "ok": False,
+                "local_errors": ["sent copy not updated: disk full"],
+                "group": group,
+                "target": message_id,
+                "id": "e-1",
+                "cancelled_queued": [],
+                "results": [
+                    {
+                        "to": recipient_hash.hex(),
+                        "to_name": "alice",
+                        "delivered": True,
+                        "edited": True,
+                        "id": "e-1",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli, "TauNode", _StaleLocalNode)
+    _FakeRetractNode.instances.clear()
+
+    code = cli.main(["edit", "--data-dir", str(data_dir), "m-10", "group fixed"])
+    assert code == cli._EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "local copy could not be updated" in err
+    assert "disk full" in err
+    assert "retry `tau edit`" in err
+
+
 def test_edit_refuses_group_message_without_leg_send_time(
     tmp_path, capsys, monkeypatch
 ):

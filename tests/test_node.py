@@ -890,7 +890,9 @@ def test_send_group_edit_reports_member_without_group_edit(
     )
 
 
-def test_send_group_edit_cancels_queued_legs(tmp_path, monkeypatch):
+def test_send_group_edit_requeues_cancelled_legs_with_edited_text(
+    tmp_path, monkeypatch
+):
     node, group, alice, bob = _group_reaction_node(tmp_path)
     # Bob's leg never left: it sits in the outbox with the shared
     # send time of the original fan-out.
@@ -919,11 +921,16 @@ def test_send_group_edit_cancels_queued_legs(tmp_path, monkeypatch):
         "crew", "leg-1", "fixed here", target_sent_at=100.0
     )
 
-    # The queued leg is gone, so Bob never receives the message — and
-    # the live edit still went out to him, so a copy that reached
-    # him another way is rewritten.
+    # The queued leg is re-queued under its own id carrying the edited
+    # text, so Bob still receives the message — edited — instead of
+    # losing it entirely; the live edit still went out to him, so a
+    # copy that reached him another way is rewritten.
     assert response["cancelled_queued"] == ["bob-leg-1"]
-    assert node.mailbox.get_outbox("bob-leg-1") is None
+    assert response["requeued"] == ["bob-leg-1"]
+    requeued = node.mailbox.get_outbox("bob-leg-1")
+    assert requeued is not None
+    assert requeued.text == "fixed here"
+    assert requeued.wire_sent_at == 100.0
     assert response["ok"] is True
     assert set(calls) == {alice.hexhash, bob.hexhash}
 
