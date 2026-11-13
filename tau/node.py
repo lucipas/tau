@@ -2001,6 +2001,20 @@ class TauNode:
                             publish_ok = False
             else:
                 with self.mailbox.transaction():
+                    # An idless copy takes this path, so it must consult
+                    # the pending-edit marker too (see the id branch).
+                    pending = self.mailbox.pending_group_edit(
+                        caller_hash,
+                        group["id"],
+                        message.get("sent_at"),
+                    )
+                    if pending is not None and (
+                        record.get("edited_at") is None
+                        or float(pending["edited_at"])
+                        > float(record["edited_at"])
+                    ):
+                        record["text"] = pending["text"]
+                        record["edited_at"] = pending["edited_at"]
                     self._record_received(record)
             if not duplicate:
                 self._notify_message(record, publish_ok=publish_ok)
