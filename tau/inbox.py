@@ -501,11 +501,24 @@ def _dedupe_key(record: Dict[str, Any]) -> Any:
     A record with a message id dedupes on that id; one without an id
     (older stores predate ids) dedupes on sender, destination, text
     and send time, so re-importing the same export is a no-op either
-    way.
+    way.  Id-less group records are the exception: their text can
+    change under them when a pending group edit lands (see
+    import_messages), so they dedupe on sender, destination, group
+    and send time instead — the same (sender, group, sent_at)
+    identity the pending-edit markers use, which stays stable after
+    the marker expires.
     """
     message_id = record.get("id")
     if message_id is not None and str(message_id):
         return ("id", str(message_id))
+    if record.get("kind") == "group" and record.get("group"):
+        return (
+            "content-group",
+            str(record.get("from") or ""),
+            str(record.get("destination") or ""),
+            str(record.get("group") or ""),
+            float(record.get("sent_at") or 0.0),
+        )
     return (
         "content",
         str(record.get("from") or ""),
@@ -2004,6 +2017,35 @@ class Inbox:
                         }
                     )
                     continue
+                if (
+                    pending_group_edit is not None
+                    and record.get("direction") == "in"
+                    and record.get("kind") == "group"
+                    and isinstance(record.get("destination"), str)
+                    and isinstance(record.get("group"), str)
+                    and isinstance(record.get("sent_at"), (int, float))
+                    and not isinstance(record.get("sent_at"), bool)
+                ):
+                    # An edit answered against this copy before it was
+                    # imported: the imported copy lands already edited,
+                    # as a live delivery does (see _handle_group_message).
+                    # A copy already carrying a newer edit keeps its text.
+                    # This runs before the dedupe key is computed so the
+                    # stored copy and the key agree; the key itself does
+                    # not depend on the text (see _dedupe_key), so a
+                    # re-import still matches after the marker expires.
+                    pending = pending_group_edit(
+                        record["destination"],
+                        record["group"],
+                        record["sent_at"],
+                    )
+                    if pending is not None and (
+                        record.get("edited_at") is None
+                        or float(pending["edited_at"])
+                        > float(record["edited_at"])
+                    ):
+                        record["text"] = pending["text"]
+                        record["edited_at"] = pending["edited_at"]
                 key = _dedupe_key(record)
                 if key in seen:
                     present += 1
@@ -2050,31 +2092,6 @@ class Inbox:
                         }
                     )
                     continue
-                if (
-                    pending_group_edit is not None
-                    and record.get("direction") == "in"
-                    and record.get("kind") == "group"
-                    and isinstance(record.get("destination"), str)
-                    and isinstance(record.get("group"), str)
-                    and isinstance(record.get("sent_at"), (int, float))
-                    and not isinstance(record.get("sent_at"), bool)
-                ):
-                    # An edit answered against this copy before it was
-                    # imported: the imported copy lands already edited,
-                    # as a live delivery does (see _handle_group_message).
-                    # A copy already carrying a newer edit keeps its text.
-                    pending = pending_group_edit(
-                        record["destination"],
-                        record["group"],
-                        record["sent_at"],
-                    )
-                    if pending is not None and (
-                        record.get("edited_at") is None
-                        or float(pending["edited_at"])
-                        > float(record["edited_at"])
-                    ):
-                        record["text"] = pending["text"]
-                        record["edited_at"] = pending["edited_at"]
                 seen.add(key)
                 self._messages.append(record)
                 added.append(record)

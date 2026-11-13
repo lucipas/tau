@@ -988,6 +988,53 @@ def test_import_applies_a_pending_group_edit(tmp_path):
     assert entries["leg-2"]["edited_at"] == 200.0
 
 
+def test_import_dedupes_idless_group_record_after_pending_edit(tmp_path):
+    # CodeRabbit Major on PR #344: an id-less group record deduped on
+    # its text, so a pending edit changed the stored copy's text and
+    # every re-import appended another copy — and after the marker
+    # expired the export text still mismatched. Id-less group records
+    # now dedupe on (sender, group, sent_at), which never depends on
+    # the edited text.
+    inbox = Inbox(tmp_path / "inbox.json")
+    sender = "aa" * 32
+    group = "cc" * 16
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            {
+                "from": "alice",
+                "destination": sender,
+                "kind": "group",
+                "group": group,
+                "sent_at": 100.0,
+                "received_at": 110.0,
+                "text": "group typo",
+            },
+        ],
+    }
+
+    def pending(sender_hash, group_id, sent_at):
+        if (sender_hash, group_id, sent_at) == (sender, group, 100.0):
+            return {"text": "group fixed", "edited_at": 150.0}
+        return None
+
+    first = inbox.import_messages(document, pending_group_edit=pending)
+    assert first["imported"] == 1
+    assert inbox.list_messages()[0]["text"] == "group fixed"
+    # Re-import while the marker is still live: no duplicate.
+    second = inbox.import_messages(document, pending_group_edit=pending)
+    assert second["imported"] == 0
+    assert second["present"] == 1
+    # Re-import after the marker expires: still no duplicate, and the
+    # edited text is not resurrected into the old text.
+    third = inbox.import_messages(document)
+    assert third["imported"] == 0
+    assert third["present"] == 1
+    assert len(inbox) == 1
+    assert inbox.list_messages()[0]["text"] == "group fixed"
+
+
 def test_export_document_filters_by_peer(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16))
