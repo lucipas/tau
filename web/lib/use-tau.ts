@@ -128,6 +128,12 @@ export function fileToBase64(file: File): Promise<string> {
   });
 }
 
+// Bound on an allow-list write: a POST to the local bridge settles
+// in milliseconds, so 30s means the bridge is hung, not slow —
+// aborting lets the pending-write guard clear and the next poll
+// reconcile.
+const ALLOWLIST_WRITE_TIMEOUT_MS = 30000;
+
 export function useTau() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -589,8 +595,37 @@ export function useTau() {
 
   // Count of allow-list writes in flight. A poll must not bump the
   // sequence while one is pending: that would discard the write's
-  // successful response and could apply a pre-write snapshot.
+  // successful response and could apply a pre-write snapshot. Each
+  // write is bounded by an abort (below), so a stalled POST cannot
+  // freeze polling: the counter always clears and the next tick
+  // reconciles whatever reached the server.
   const allowlistPending = useRef(0);
+
+  // An allow-list write that never settles (a hung bridge) must not
+  // hold the pending counter forever: abort it after a generous
+  // bound for a local bridge, and let the next poll reconcile.
+  const runAllowlistWrite = useCallback(
+    async (
+      write: (signal: AbortSignal) => Promise<AllowlistResponse>,
+    ): Promise<AllowlistResponse> => {
+      allowlistPending.current++;
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(),
+        ALLOWLIST_WRITE_TIMEOUT_MS,
+      );
+      try {
+        const requestId = ++allowlistSeq.current;
+        const result = await write(controller.signal);
+        applyAllowlist(requestId, result);
+        return result;
+      } finally {
+        clearTimeout(timer);
+        allowlistPending.current--;
+      }
+    },
+    [applyAllowlist],
+  );
 
   const refreshAllowlist = useCallback(async () => {
     if (allowlistPending.current > 0) return;
@@ -625,57 +660,35 @@ export function useTau() {
   }, [connection, refreshOutbox, refreshHeldMail, refreshGroups, refreshSettings, refreshAllowlist]);
 
   const addAllowlistPeer = useCallback(
-    async (target: string) => {
-      // Same pending-write guard as the other allow-list writes: a
-      // poll must not supersede this add with a pre-write snapshot.
-      allowlistPending.current++;
-      try {
-        const requestId = ++allowlistSeq.current;
-        const result = await apiPost<AllowlistResponse>("/api/allowlist/add", {
-          target,
-        });
-        applyAllowlist(requestId, result);
-        return result;
-      } finally {
-        allowlistPending.current--;
-      }
-    },
-    [applyAllowlist],
+    (target: string) =>
+      runAllowlistWrite((signal) =>
+        apiPost<AllowlistResponse>("/api/allowlist/add", { target }, signal),
+      ),
+    [runAllowlistWrite],
   );
 
   const removeAllowlistPeer = useCallback(
-    async (target: string) => {
-      allowlistPending.current++;
-      try {
-        const requestId = ++allowlistSeq.current;
-        const result = await apiPost<AllowlistResponse>("/api/allowlist/remove", {
-          target,
-        });
-        applyAllowlist(requestId, result);
-        return result;
-      } finally {
-        allowlistPending.current--;
-      }
-    },
-    [applyAllowlist],
+    (target: string) =>
+      runAllowlistWrite((signal) =>
+        apiPost<AllowlistResponse>(
+          "/api/allowlist/remove",
+          { target },
+          signal,
+        ),
+      ),
+    [runAllowlistWrite],
   );
 
   const setAllowlistEnabled = useCallback(
-    async (enabled: boolean) => {
-      allowlistPending.current++;
-      try {
-        const requestId = ++allowlistSeq.current;
-        const result = await apiPost<AllowlistResponse>(
+    (enabled: boolean) =>
+      runAllowlistWrite((signal) =>
+        apiPost<AllowlistResponse>(
           "/api/allowlist/set-enabled",
           { enabled },
-        );
-        applyAllowlist(requestId, result);
-        return result;
-      } finally {
-        allowlistPending.current--;
-      }
-    },
-    [applyAllowlist],
+          signal,
+        ),
+      ),
+    [runAllowlistWrite],
   );
 
   const cancelOutbox = useCallback(
