@@ -5886,14 +5886,14 @@ def _drop_console_copy_via_running_node(
         if group is None:
             send_running(
                 config.data_dir,
-                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
+                reply_timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_copy",
                 message_id=message_id,
             )
         else:
             send_running(
                 config.data_dir,
-                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
+                reply_timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_group",
                 group=group,
                 target_sent_at=target_sent_at,
