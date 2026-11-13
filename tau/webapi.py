@@ -858,6 +858,13 @@ class WebBridge:
         if self._server is not None:
             raise WebBridgeError("web bridge is already running")
         self._closing.clear()
+        # A one-shot CLI retract can write its marker after the
+        # load-time check but before the node takes the data-directory
+        # lock; reconcile again here, once the node owns the directory
+        # and no one-shot retract can be mid-flight (later retracts
+        # route through the serving node and drop the entry live).
+        # See the Qodo review on PR #331.
+        self._reconcile_sent_retracted()
         try:
             server = _WebServer((self.host, self.port), _WebHandler)
         except OSError as exc:
@@ -1055,6 +1062,40 @@ class WebBridge:
         if isinstance(wire_id, str) and wire_id:
             return bool(mailbox.is_sent_retracted(wire_id))
         return False
+
+    def _reconcile_sent_retracted(self) -> None:
+        """Drop outbound entries covered by sent-retraction markers.
+
+        Second-chance pass for the startup race (see :meth:`start`):
+        the load-time check runs before the node takes the
+        data-directory lock, so a marker written by a one-shot CLI
+        retract in between would otherwise stay visible for the whole
+        session.  Best-effort per entry — a console that cannot drop
+        its copy only logs — so a disk error never fails startup.
+        """
+        mailbox = getattr(self.node, "mailbox", None)
+        if mailbox is None:
+            return
+        with mailbox.transaction():
+            with self._lock:
+                dropped = [
+                    message
+                    for message in self._messages
+                    if self._is_sent_retracted_entry(message, mailbox)
+                ]
+        for entry in dropped:
+            try:
+                self._remove_history_entry(
+                    entry["id"],
+                    entry,
+                    publish_unread=True,
+                    remember_wire_id=False,
+                )
+            except Exception:  # pragma: no cover - console callback
+                log.warning(
+                    "could not drop retracted message from console",
+                    exc_info=True,
+                )
 
     def _save_messages(self, *, strict: bool = False) -> None:
         """Persist the current message log to ``messages.json``.

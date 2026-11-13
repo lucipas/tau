@@ -6487,6 +6487,40 @@ def test_message_history_load_drops_sent_retracted_entries(node, tmp_path):
         bridge.stop()
 
 
+def test_bridge_start_reconciles_sent_retracted_after_load(node, tmp_path):
+    """A marker written after the load-time check but before the bridge
+    starts (a one-shot CLI retract landing in the startup window) is
+    applied when the bridge starts, so the retracted message is not
+    served for the whole session."""
+    from tau.config import TauConfig
+    from tau.mailbox import Mailbox
+
+    node.config = TauConfig.resolve(data_dir=tmp_path, name="tester")
+    entry = _stored_message(
+        1, "retracted in the startup window", direction="out"
+    )
+    entry["wire_id"] = "gone-dm"
+    (tmp_path / "messages.json").write_text(
+        json.dumps({"messages": [entry], "next_message_id": 2}),
+        encoding="utf-8",
+    )
+    bridge = WebBridge(node, host="127.0.0.1", port=0)
+    try:
+        assert [m["text"] for m in bridge.messages()] == [
+            "retracted in the startup window"
+        ]
+        # A one-shot CLI retract lands after the load-time check.
+        Mailbox(tmp_path / "mailbox.json").record_sent_retraction("gone-dm")
+        bridge.start()
+        assert bridge.messages() == []
+        stored = json.loads(
+            (tmp_path / "messages.json").read_text(encoding="utf-8")
+        )
+        assert stored["messages"] == []
+    finally:
+        bridge.stop()
+
+
 def test_message_history_load_recomputes_excerpt_hash(node, tmp_path):
     """A stored excerpt hash is never trusted on load: the hash is
     derived from the stored text, so a hand-edited history that
