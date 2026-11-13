@@ -2616,14 +2616,18 @@ class TauNode:
             else:
                 stored = None
             if stored is None:
-                # A group-context marker is keyed by the group, so only a
-                # pinned member of that group may write one: otherwise any
-                # authenticated caller could flood the bounded marker store
-                # and evict real markers.  Checked before anything is
-                # recorded, like the copy-present path.
+                # A group-context marker is keyed by the group, so a
+                # caller the pinned roster does not name must not
+                # write one: otherwise any authenticated caller could
+                # flood the bounded marker store and evict real
+                # markers.  But a missing roster must not refuse: a
+                # member who has not received any group traffic yet
+                # has no pinned roster, and their retract is exactly
+                # what must record the marker, so a copy arriving
+                # later still loses to it.
                 if has_group_context:
                     pinned = pinned_group(self.groups, group_id)
-                    if pinned is None or caller_hash not in (
+                    if pinned is not None and caller_hash not in (
                         pinned.get("members") or []
                     ):
                         return response_error(

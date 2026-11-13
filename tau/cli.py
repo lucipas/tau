@@ -8363,9 +8363,15 @@ def _retract_group_message(
                     f"{result.get('error') or 'unknown error'}"
                 )
         for leg_id in response.get("cancelled_queued") or []:
+            # The leg is gone from this node's outbox, so no further
+            # attempt goes out from here — but a sealed copy already
+            # held by another peer may still arrive if the retract
+            # does not reach that member (the same caveat as
+            # `tau outbox cancel`).
             print(
                 f"cancelled queued leg {_safe_id_prefix(str(leg_id))} — "
-                "that member never receives the message"
+                "no further delivery attempts from this node; a sealed "
+                "copy already held by another peer may still arrive"
             )
     if failed:
         # Keep the local sent copy: the failed members still hold the

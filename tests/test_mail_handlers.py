@@ -3853,6 +3853,92 @@ def test_retract_records_group_marker_for_unknown_group_copy(tmp_path):
     assert node.inbox.list_messages() == []
 
 
+def test_retract_records_group_marker_without_a_pinned_roster(tmp_path):
+    # Regression test: a member who has not received any group
+    # traffic yet has no pinned roster — their retract must still
+    # record the marker, or the copy arriving later would show a
+    # message that was already retracted.  (A Qodo autofix refused
+    # this case; the roster check must only refuse when a roster
+    # exists and excludes the caller.)
+    from tau.protocol import derive_group_id
+
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = ["ab" * 16, sender_hash, destination_hash(RNS.Identity()).hex()]
+    group = derive_group_id("ab" * 16, "crew", members)
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is True
+    assert response["deleted"] is False
+    assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is True
+
+    late = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "crew hello",
+            message_id="late-leg-5",
+            group_id=group,
+            group_name="crew",
+            creator="ab" * 16,
+            members=members,
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert late["ok"] is True
+    assert late["duplicate"] is True
+    assert node.inbox.list_messages() == []
+
+
+def test_retract_refuses_group_marker_from_non_member(tmp_path):
+    # The roster is pinned and does not name the caller: no marker
+    # is recorded, so an allow-listed outsider cannot flood the
+    # bounded group-marker store.
+    node = make_node(tmp_path)
+    node.destination = SimpleNamespace(
+        hexhash="ab" * 16, hash=b"\xab" * 16
+    )
+    sender = RNS.Identity()
+    sender_hash = destination_hash(sender).hex()
+    members = [
+        "ab" * 16,
+        destination_hash(RNS.Identity()).hex(),
+        destination_hash(RNS.Identity()).hex(),
+    ]
+    group = _pinned_group(node, members=members, creator="ab" * 16)
+
+    response = call_handler(
+        node._handle_retract,
+        signed_retract(
+            sender,
+            "author-leg-1",
+            "retract-1",
+            group=group,
+            target_author=sender_hash,
+            target_sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_a_member"
+    assert node.mailbox.is_group_retracted(sender_hash, group, 100.0) is False
+
+
 def test_retract_refuses_group_message_from_non_author(tmp_path):
     node = make_node(tmp_path)
     node.destination = SimpleNamespace(

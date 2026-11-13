@@ -482,7 +482,7 @@ def test_send_group_retraction_fans_out_one_signed_payload(tmp_path, monkeypatch
 
     def fake_request(peer_arg, path, payload, timeout, deadline=None):
         calls.append((peer_arg, path, payload))
-        return {"ok": True, "deleted": True, "_rtt": 0.004}
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
 
     monkeypatch.setattr(node, "_request", fake_request)
 
@@ -520,7 +520,7 @@ def test_send_group_retraction_reports_failed_leg(tmp_path, monkeypatch):
     def fake_request(peer_arg, path, payload, timeout, deadline=None):
         if peer_arg.hexhash == bob.hexhash:
             raise NotAllowedError("peer rejected the request: not allowed")
-        return {"ok": True, "deleted": True, "_rtt": 0.004}
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
 
     monkeypatch.setattr(node, "_request", fake_request)
 
@@ -530,6 +530,33 @@ def test_send_group_retraction_reports_failed_leg(tmp_path, monkeypatch):
     by_to = {r["to"]: r for r in response["results"]}
     assert by_to[alice.hexhash].get("delivered") is True
     assert by_to[bob.hexhash].get("error") == "not_allowed"
+
+
+def test_send_group_retraction_reports_member_without_group_retract(
+    tmp_path, monkeypatch
+):
+    # An older member answers the DM retract ok but never saw the
+    # group context: it kept its copy, so the leg is not delivered
+    # and the sender keeps its own copy for a retry.
+    node, _, alice, bob = _group_reaction_node(tmp_path)
+
+    def fake_request(peer_arg, path, payload, timeout, deadline=None):
+        if peer_arg.hexhash == bob.hexhash:
+            return {"ok": True, "deleted": False, "_rtt": 0.004}
+        return {"ok": True, "deleted": True, "group_retract": True, "_rtt": 0.004}
+
+    monkeypatch.setattr(node, "_request", fake_request)
+
+    response = node.send_group_retraction("crew", "leg-1", target_sent_at=100.0)
+
+    assert response["ok"] is False
+    by_to = {r["to"]: r for r in response["results"]}
+    assert by_to[alice.hexhash].get("delivered") is True
+    assert by_to[bob.hexhash].get("delivered") is None
+    assert (
+        by_to[bob.hexhash].get("error")
+        == "member runs a version without group retract"
+    )
 
 
 def test_send_group_retraction_cancels_queued_legs(tmp_path, monkeypatch):
@@ -553,7 +580,7 @@ def test_send_group_retraction_cancels_queued_legs(tmp_path, monkeypatch):
 
     def fake_request(peer_arg, path, payload, timeout, deadline=None):
         calls.append(peer_arg.hexhash)
-        return {"ok": True, "deleted": False, "_rtt": 0.004}
+        return {"ok": True, "deleted": False, "group_retract": True, "_rtt": 0.004}
 
     monkeypatch.setattr(node, "_request", fake_request)
 
