@@ -3770,10 +3770,9 @@ class WebBridge:
         if entry.get("group"):
             # The group path takes the lock itself to gather the legs,
             # so this stays outside the block above: re-entering it
-            # here would deadlock the handler thread.  A queued leg is
-            # cancelled and re-queued with the edited text by the
-            # fan-out itself, so the queued check below must not
-            # refuse group messages.
+            # here would deadlock the handler thread.  Queued legs are
+            # refused inside that path: a group edit must not re-queue
+            # an edit for an offline member.
             return self._edit_group_message(
                 target, entry, cleaned, timeout=timeout
             )
@@ -3929,6 +3928,23 @@ class WebBridge:
                 "that group message was never delivered to any member, "
                 "so there is nothing to edit"
             )
+        if any(leg.get("status") == "queued" for leg in legs):
+            # Group edits are live-only: a queued leg must not be
+            # cancelled and re-queued with the edited text, which would
+            # store-and-forward an edit to an offline member.
+            raise ValueError(
+                "this group message is still queued for an offline member; "
+                "cancel it from the outbox first"
+            )
+        with self.node.mailbox.transaction():
+            if any(
+                self.node.mailbox.get_outbox(leg_wire_id) is not None
+                for leg_wire_id in wire_ids
+            ):
+                raise ValueError(
+                    "this group message is still queued for an offline member; "
+                    "cancel it from the outbox first"
+                )
         target_wire_id = entry.get("wire_id")
         if not isinstance(target_wire_id, str) or not target_wire_id:
             target_wire_id = wire_ids[0]
@@ -3986,9 +4002,18 @@ class WebBridge:
                 "be edited"
             )
         sent_at = float(leg_sent_at)
+        # Edit by the record's canonical id: a secondary leg's wire id
+        # does not match the inbox record, so the local update would
+        # silently miss it.
+        canonical_id = stored.get("id")
+        edit_wire_id = (
+            canonical_id
+            if isinstance(canonical_id, str) and canonical_id
+            else target_wire_id
+        )
         response = self.node.send_group_edit(
             group,
-            target_wire_id,
+            edit_wire_id,
             cleaned,
             timeout=timeout,
             target_sent_at=sent_at,
@@ -4058,7 +4083,6 @@ class WebBridge:
             "group": group_id,
             "results": results,
             "cancelled_queued": response.get("cancelled_queued") or [],
-            "requeued": response.get("requeued") or [],
             "id": response.get("id")
             if isinstance(response.get("id"), str)
             else None,
