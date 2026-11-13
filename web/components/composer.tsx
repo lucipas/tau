@@ -33,9 +33,9 @@ export function Composer({
     expiresIn?: number,
     replyTo?: string,
     sendIn?: number,
-  ) => Promise<TauMessage>;
+  ) => Promise<TauMessage | null>;
   onSendGroup: (group: string, text: string) => Promise<TauMessage[]>;
-  onSendFile?: (to: string, file: File) => Promise<TauMessage>;
+  onSendFile?: (to: string, file: File) => Promise<TauMessage | null>;
   replyTo?: TauMessage | null;
   onCancelReply?: () => void;
 }) {

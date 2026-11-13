@@ -291,7 +291,9 @@ export interface VerifyState {
 
 export interface SendResponse {
   ok: boolean;
-  message: TauMessage;
+  // Null when the send went out but was retracted before the console
+  // record landed: the send succeeded, there is just no record to show.
+  message: TauMessage | null;
   response: Record<string, unknown>;
 }
 
@@ -313,7 +315,10 @@ export interface SendGroupResponse {
 
 export interface SendFileResponse {
   ok: boolean;
-  message: TauMessage;
+  // Null when the file send went out but was retracted before the
+  // console record landed: the transfer succeeded, there is just no
+  // record to show.
+  message: TauMessage | null;
   response: Record<string, unknown>;
 }
 
@@ -416,10 +421,11 @@ export interface GroupMemberResult {
 }
 
 // POST /api/messages/forward: the forwarded copy, as recorded by the
-// bridge's send path, plus the node's send response.
+// bridge's send path, plus the node's send response. The copy is null
+// when it was retracted before the console record landed.
 export interface ForwardMessageResponse {
   ok: boolean;
-  message: TauMessage;
+  message: TauMessage | null;
   response: Record<string, unknown>;
 }
 

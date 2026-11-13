@@ -946,7 +946,7 @@ describe("useTau send", () => {
 
     const { result } = renderHook(() => useTau());
 
-    let sent: TauMessage | undefined;
+    let sent: TauMessage | null | undefined;
     await act(async () => {
       sent = await result.current.send(PEER_HASH, "later", undefined, undefined, 3600);
     });
@@ -958,6 +958,20 @@ describe("useTau send", () => {
     });
     expect(sent).toEqual(message);
     expect(result.current.messages).toContainEqual(message);
+  });
+
+  it("resolves null and appends nothing when the send was retracted first", async () => {
+    mockedPost.mockResolvedValue({ ok: true, message: null, response: {} });
+
+    const { result } = renderHook(() => useTau());
+
+    let sent: TauMessage | null | undefined;
+    await act(async () => {
+      sent = await result.current.send(PEER_HASH, "now");
+    });
+
+    expect(sent).toBeNull();
+    expect(result.current.messages).toEqual([]);
   });
 
   it("omits send_in when no delay is picked", async () => {
