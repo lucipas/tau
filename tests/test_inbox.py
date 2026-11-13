@@ -938,6 +938,56 @@ def test_import_skips_retracted_group_messages(tmp_path):
     ]
 
 
+def test_import_applies_a_pending_group_edit(tmp_path):
+    # Qodo warning on PR #344: an old export imported after a live
+    # edit was answered against an absent copy must land already
+    # edited, not resurrect the old text — like the retraction markers
+    # above, the import consults the pending edit.
+    inbox = Inbox(tmp_path / "inbox.json")
+    sender = "aa" * 32
+    group = "cc" * 16
+    document = {
+        "format": "tau-messages-export",
+        "version": 1,
+        "messages": [
+            _record(
+                id="leg-1",
+                destination=sender,
+                kind="group",
+                group=group,
+                sent_at=100.0,
+                text="group typo",
+            ),
+            # A copy that already carries a newer edit keeps its own text.
+            _record(
+                id="leg-2",
+                destination=sender,
+                kind="group",
+                group=group,
+                sent_at=101.0,
+                text="newer fix",
+                edited_at=200.0,
+            ),
+        ],
+    }
+
+    def pending(sender_hash, group_id, sent_at):
+        if (sender_hash, group_id, sent_at) == (sender, group, 100.0):
+            return {"text": "group fixed", "edited_at": 150.0}
+        if (sender_hash, group_id, sent_at) == (sender, group, 101.0):
+            return {"text": "older fix", "edited_at": 140.0}
+        return None
+
+    result = inbox.import_messages(document, pending_group_edit=pending)
+    assert result["imported"] == 2
+    assert result["skipped"] == 0
+    entries = {entry["id"]: entry for entry in inbox.list_messages()}
+    assert entries["leg-1"]["text"] == "group fixed"
+    assert entries["leg-1"]["edited_at"] == 150.0
+    assert entries["leg-2"]["text"] == "newer fix"
+    assert entries["leg-2"]["edited_at"] == 200.0
+
+
 def test_export_document_filters_by_peer(tmp_path):
     inbox = Inbox(tmp_path / "inbox.json")
     inbox.append(_record(id="a1", destination="aa" * 16))

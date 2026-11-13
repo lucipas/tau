@@ -12,6 +12,7 @@ import tau.mailbox as mailbox_module
 from tau.config import TauConfig
 from tau.identity import destination_hash, load_public_key
 from tau.mailbox import (
+    MAX_GROUP_PENDING_EDITS_PER_SENDER,
     RETRACTED_CLOCK_SKEW_TOLERANCE,
     RETRACTED_RETENTION,
     SENT_RETRACTED_RETENTION,
@@ -1030,6 +1031,43 @@ def test_group_pending_edit_markers_persist_and_expire(tmp_path):
 
     reloaded.prune(now=recorded_at + 20 + RETRACTED_RETENTION)
     assert reloaded.pending_group_edit(sender, group, 100.0) is None
+
+
+def test_group_pending_edit_markers_bound_each_sender(tmp_path):
+    # Qodo warning on PR #344: one allow-listed peer flooding the pool
+    # with edits for absent copies must not evict another sender's
+    # live markers.  Each sender is bounded independently, before the
+    # global cap applies.
+    path = tmp_path / "mailbox.json"
+    box = Mailbox(path)
+    flooder = "aa" * 32
+    victim = "bb" * 32
+    group = "cc" * 16
+    box.record_group_pending_edit(
+        victim, group, 100.0, "victim text", 150.0
+    )
+    for index in range(MAX_GROUP_PENDING_EDITS_PER_SENDER + 5):
+        box.record_group_pending_edit(
+            flooder,
+            f"group-{index}",
+            100.0 + index,
+            f"flood {index}",
+            150.0 + index,
+        )
+    # The victim's marker survives the flood.
+    assert box.pending_group_edit(victim, group, 100.0) == {
+        "text": "victim text",
+        "edited_at": 150.0,
+    }
+    # The flooder keeps only their newest markers, up to their cap.
+    kept = [
+        index
+        for index in range(MAX_GROUP_PENDING_EDITS_PER_SENDER + 5)
+        if box.pending_group_edit(flooder, f"group-{index}", 100.0 + index)
+        is not None
+    ]
+    assert len(kept) == MAX_GROUP_PENDING_EDITS_PER_SENDER
+    assert kept == list(range(5, MAX_GROUP_PENDING_EDITS_PER_SENDER + 5))
 
 
 def test_group_pending_edit_markers_drop_malformed_entries():

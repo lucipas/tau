@@ -117,6 +117,10 @@ MAX_GROUP_RETRACTED = 1024
 # keeps the same earliest-expiry eviction without sharing the
 # per-message marker budget.
 MAX_GROUP_PENDING_EDITS = 1024
+# One sender may hold at most this many pending edits: an allow-listed
+# peer flooding the pool with edits for absent copies must not evict
+# another sender's live markers (see _evict_group_pending_edits).
+MAX_GROUP_PENDING_EDITS_PER_SENDER = 64
 # Sent-message history (for read receipts) and queued receipts waiting
 # on an unreachable sender.  Both are small metadata records, capped
 # like the seen set; sent entries also keep the text so `tau messages

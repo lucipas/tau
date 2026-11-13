@@ -4909,6 +4909,39 @@ def test_group_edit_before_copy_lands_already_edited(tmp_path):
     assert node.inbox.list_messages()[0]["text"] == "group fixed"
 
 
+def test_group_edit_before_idless_copy_lands_already_edited(tmp_path):
+    # Qodo warning on PR #344: the protocol accepts group messages
+    # without an id, and those took a separate path that skipped the
+    # pending-edit lookup — an idless old copy would store its
+    # original text outright.
+    node, sender, sender_hash, group = _group_edit_before_copy_setup(tmp_path)
+    edit = call_handler(
+        node._handle_dm_edit,
+        _signed_group_edit(
+            sender, "leg-1", "group fixed", "edit-1", group=group["id"]
+        ),
+        remote_identity=sender,
+    )
+    assert edit["edited"] is False
+    delivered = call_handler(
+        node._handle_group_message,
+        encode_group_message(
+            "group typo",
+            group_id=group["id"],
+            group_name="weekend",
+            creator=sender_hash,
+            members=[sender_hash, "ab" * 16],
+            sent_at=100.0,
+        ),
+        remote_identity=sender,
+    )
+    assert delivered["ok"] is True
+    assert delivered["duplicate"] is False
+    record = node.inbox.list_messages()[0]
+    assert record["text"] == "group fixed"
+    assert record["edited_at"] == 30.0
+
+
 def test_pending_group_edit_keeps_the_newest_edit(tmp_path):
     # Two edits arrive before the copy: the older one must not win
     # over the newer one, whichever order they arrive in.

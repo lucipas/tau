@@ -1962,7 +1962,13 @@ class Inbox:
         ``(sender_hash, group_id, sent_at) -> bool`` check), a received
         group record is also checked against its group-context marker:
         group messages are retractable, so a per-leg id alone cannot
-        guard a copy whose leg id was never recorded.
+        guard a copy whose leg id was never recorded.  With
+        ``pending_group_edit`` given (a ``(sender_hash, group_id,
+        sent_at) -> {"text", "edited_at"} | None`` check), a received
+        group record its sender edited before it arrived is stored
+        with the edited text when the marker is newer than the
+        record's own edit time: an export made before the edit must
+        not resurrect the old text.
         """
         if not isinstance(document, dict):
             raise ValueError("export file must contain a JSON object")
