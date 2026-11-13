@@ -349,6 +349,44 @@ def test_dispatch_drop_console_copy_without_bridge_is_a_noop(tmp_path):
     assert result["ok"] is True
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_send_running_timeout_bounds_slow_reply(tmp_path):
+    # A bounded send_running gives up on a serving node that stalls
+    # instead of waiting forever (Qodo informational on PR #332: the
+    # console-drop notification must not hang the retract).
+    from tau.local_ipc import LocalIPCUnavailable
+    from tau.local_send import send_running
+
+    def _slow(**request):
+        time.sleep(3)
+        return {"ok": True}
+
+    server = SendServer(tmp_path, _slow)
+    try:
+        assert send_server_available(tmp_path)
+        start = time.monotonic()
+        with pytest.raises(LocalIPCUnavailable):
+            send_running(
+                tmp_path, timeout=0.2, op="send", target="alice", text="hi"
+            )
+        assert time.monotonic() - start < 2.0
+    finally:
+        server.stop()
+
+
+def test_drop_console_copy_via_running_node_without_server_is_best_effort(
+    tmp_path,
+):
+    # No serving node answering: the drop is swallowed, never raised —
+    # the retract already succeeded on the wire.
+    config = TauConfig.resolve(data_dir=tmp_path)
+    config.prepare()
+    cli._drop_console_copy_via_running_node(config, message_id="m-9")
+    cli._drop_console_copy_via_running_node(
+        config, group="ab" * 16, target_sent_at=100.0
+    )
+
+
 def test_dispatch_retract_without_bridge_is_a_noop(tmp_path):
     config = TauConfig.resolve(data_dir=tmp_path)
     config.prepare()
@@ -572,6 +610,93 @@ def test_retract_via_running_node_keeps_console_copy_when_inbox_delete_fails(
         assert Inbox(config.inbox_path).list_messages(direction="out") != []
         assert len(bridge.messages()) == 1
         assert bridge.messages()[0]["wire_id"] == "m-9"
+    finally:
+        server.stop()
+    assert not server.path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets required")
+def test_retract_via_running_node_records_marker_before_slow_console_drop(
+    tmp_path, capsys, monkeypatch
+):
+    # Regression test (Qodo informational on PR #332): a serving node
+    # that stalls on the console-drop op must not leave the retract
+    # unrecorded — the durable marker is written before the
+    # notification is sent, and the notification itself is bounded,
+    # so the CLI returns promptly and the marker heals the console
+    # copy at the next serve start.
+    import RNS
+
+    from tau.identity import destination_hash
+    from tau.peers import PeerRegistry
+    from tau.webapi import WebBridge
+
+    data_dir = tmp_path / "node"
+    config = TauConfig.resolve(data_dir=data_dir, name="bob")
+    config.prepare()
+    recipient = RNS.Identity()
+    recipient_hash = destination_hash(recipient)
+    registry = PeerRegistry(config.peers_path)
+    registry.upsert(
+        recipient_hash, recipient.get_public_key(), name="alice", now=100.0
+    )
+    registry.save()
+    inbox = Inbox(config.inbox_path)
+    inbox.append(
+        {
+            "from": "bob",
+            "destination": recipient_hash.hex(),
+            "text": "sent hello",
+            "sent_at": 10.0,
+            "received_at": 20.0,
+            "id": "m-9",
+            "direction": "out",
+        }
+    )
+    Mailbox(config.mailbox_path).record_sent(
+        "m-9", to=recipient_hash, text="sent hello"
+    )
+    node = _FakeRunningNode(config)
+    web_dir = tmp_path / "out"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>tau console</html>", encoding="utf-8")
+    bridge = WebBridge(node, host="127.0.0.1", port=0, web_dir=web_dir)
+    bridge._append_message(
+        direction="out",
+        peer=recipient_hash.hex(),
+        peer_name="alice",
+        text="sent hello",
+        sent_at=10.0,
+        received_at=20.0,
+        status="delivered",
+        wire_id="m-9",
+    )
+    assert len(bridge.messages()) == 1
+
+    def _stalling_dispatch(**request):
+        if request.get("op") == "drop_console_copy":
+            time.sleep(3)
+        return cli._dispatch_local_send(node, bridge=bridge, **request)
+
+    monkeypatch.setattr(cli, "_DROP_CONSOLE_COPY_TIMEOUT_SECONDS", 0.2)
+    server = SendServer(data_dir, _stalling_dispatch)
+    try:
+        assert send_server_available(data_dir)
+        _FakeLocalNode.instances.clear()
+        monkeypatch.setattr(cli, "TauNode", _FakeLocalNode)
+        start = time.monotonic()
+        assert cli.main(["retract", "--data-dir", str(data_dir), "m-9"]) == 0
+        assert time.monotonic() - start < 2.0
+        assert _FakeLocalNode.instances == []
+        assert node.calls == [("retract", recipient_hash.hex(), "m-9")]
+        assert "retracted" in capsys.readouterr().out
+        assert Inbox(config.inbox_path).list_messages(direction="out") == []
+        assert Mailbox(config.mailbox_path).sent_list() == []
+        # The marker is durable even though the drop never landed.
+        assert Mailbox(config.mailbox_path).is_sent_retracted("m-9")
+        # The console copy is still there at this instant — the marker
+        # heals it at the next serve start.
+        assert len(bridge.messages()) == 1
     finally:
         server.stop()
     assert not server.path.exists()

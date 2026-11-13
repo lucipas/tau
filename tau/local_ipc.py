@@ -16,7 +16,7 @@ import socket
 import socketserver
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from .identity import IdentityError
 from .mailbox import MailboxError
@@ -113,15 +113,24 @@ class LocalServer:
         self.path.unlink(missing_ok=True)
 
 
-def call_local(path: Path, **request: Any) -> Dict[str, Any]:
-    """Send once: a lost reply may mean the request was already handled."""
+def call_local(path: Path, *, timeout: Optional[float] = None, **request: Any) -> Dict[str, Any]:
+    """Send once: a lost reply may mean the request was already handled.
+
+    ``timeout`` bounds the wait for the reply in seconds.  Without it
+    the read waits indefinitely — the right default for sends and
+    retracts, whose handling can wait on network peers — but a
+    best-effort notification (the console-copy drop) must never hang
+    the caller, so it passes a bound.
+    """
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(10)
             client.connect(str(path))
             client.sendall(json.dumps(request).encode() + b"\n")
             # Handling can wait on network peers. Do not retry on timeout.
-            client.settimeout(None)
+            # A caller that passes `timeout` keeps that bound instead:
+            # the reply read then fails with LocalIPCUnavailable.
+            client.settimeout(timeout)
             with client.makefile("rb") as stream:
                 response = _read(stream, _MAX_RESPONSE_BYTES)
     except (OSError, ValueError) as exc:

@@ -5857,6 +5857,13 @@ def _retract_group_via_running_node(
         ) from exc
 
 
+#: How long the best-effort console-copy drop waits for the serving
+#: node before giving up.  The durable retraction marker is recorded
+#: before the notification is sent, so a slow drop heals at the next
+#: serve start instead of hanging the retract.
+_DROP_CONSOLE_COPY_TIMEOUT_SECONDS = 10.0
+
+
 def _drop_console_copy_via_running_node(
     config: TauConfig,
     *,
@@ -5866,11 +5873,12 @@ def _drop_console_copy_via_running_node(
 ) -> None:
     """Ask the serving node to drop its console copy of a retracted send.
 
-    Called only after the local inbox delete succeeded.  Best-effort:
-    the retract already succeeded on the wire, so a failure here only
-    logs and never fails the retract.  The durable sent-retraction
-    marker (see Mailbox.record_sent_retraction) heals a missed drop
-    at the next serve start.
+    Called only after the local inbox delete succeeded and the
+    durable retraction marker is recorded.  Best-effort: the retract
+    already succeeded on the wire, so a failure — including a serving
+    node too slow to answer within the bound — only logs and never
+    fails the retract.  The marker heals a missed drop at the next
+    serve start.
     """
     from .local_send import send_running
 
@@ -5878,12 +5886,14 @@ def _drop_console_copy_via_running_node(
         if group is None:
             send_running(
                 config.data_dir,
+                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_copy",
                 message_id=message_id,
             )
         else:
             send_running(
                 config.data_dir,
+                timeout=_DROP_CONSOLE_COPY_TIMEOUT_SECONDS,
                 op="drop_console_group",
                 group=group,
                 target_sent_at=target_sent_at,
@@ -8510,26 +8520,29 @@ def _retract_group_message(
             "group retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
-    if via_running_node:
-        # The inbox copy is gone, so the serving console may drop its legs.
-        _drop_console_copy_via_running_node(
-            config,
-            group=group_id,
-            target_sent_at=float(leg_sent_at),
-        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Each leg has its own sent record, so drop every leg id.
     mailbox = Mailbox(config.mailbox_path)
     for leg_id in target.get("leg_ids") or [target["id"]]:
         mailbox.discard_sent(str(leg_id))
-    # Record the retraction durably too, so the bridge drops the
-    # console's outbound legs when it loads after a retract that ran
-    # while `tau serve` was down (see
-    # Mailbox.record_sent_group_retraction).  Only on a full fan-out:
-    # a partial fan-out keeps the local copy — and the console legs —
-    # so the retract stays retryable.
+    # Record the retraction durably too, BEFORE telling the serving
+    # console, so the bridge drops the console's outbound legs when
+    # it loads after a retract that ran while `tau serve` was down
+    # (see Mailbox.record_sent_group_retraction) — and so a console
+    # notification that hangs or fails cannot leave the retraction
+    # unrecorded.  Only on a full fan-out: a partial fan-out keeps
+    # the local copy — and the console legs — so the retract stays
+    # retryable.
     mailbox.record_sent_group_retraction(group_id, float(leg_sent_at))
+    if via_running_node:
+        # The inbox copy is gone and the marker is durable, so the
+        # serving console may drop its legs now.
+        _drop_console_copy_via_running_node(
+            config,
+            group=group_id,
+            target_sent_at=float(leg_sent_at),
+        )
     return _EXIT_OK
 
 
@@ -8618,24 +8631,27 @@ def cmd_retract(args: argparse.Namespace) -> int:
             "retract delivered but the local copy could not be deleted:"
             f" {exc}"
         ) from exc
-    if via_running_node:
-        # The inbox copy is gone, so the serving console may drop its own.
-        _drop_console_copy_via_running_node(
-            config, message_id=str(target["id"])
-        )
     # The sent record lives in mailbox.json, not the inbox: drop it
     # too, or `tau messages --sent` keeps showing the retracted text.
     # Only after the retract and the inbox delete succeeded, so a
     # failed retract never erases the sent record.  Record the
-    # retraction durably as well: the console's outbound entry lives
-    # in a separate log the CLI cannot reach while `tau serve` is
-    # down, and the bridge drops entries carrying this marker when it
-    # loads (see Mailbox.record_sent_retraction).  The live-serving
-    # path already drops the entry through the dispatch; the marker
-    # heals that drop if it failed, at the next serve start.
+    # retraction durably as well, BEFORE telling the serving console:
+    # the console's outbound entry lives in a separate log the CLI
+    # cannot reach while `tau serve` is down, and the bridge drops
+    # entries carrying this marker when it loads (see
+    # Mailbox.record_sent_retraction).  The marker is recorded first
+    # so a console notification that hangs or fails cannot leave the
+    # retraction unrecorded — the marker heals a missed drop at the
+    # next serve start.
     mailbox = Mailbox(config.mailbox_path)
     mailbox.discard_sent(str(target["id"]))
     mailbox.record_sent_retraction(str(target["id"]))
+    if via_running_node:
+        # The inbox copy is gone and the marker is durable, so the
+        # serving console may drop its own copy now.
+        _drop_console_copy_via_running_node(
+            config, message_id=str(target["id"])
+        )
 
     peer = registry.get(recipient)
     name = peer.display_name if peer is not None else short_hash(recipient)
